@@ -32,11 +32,12 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           DAILYWOMBAT_TOKEN: ${{ secrets.DAILYWOMBAT_TOKEN }}
-        run: ./gradlew build
+        run: ./gradlew build -Pgpr.user=topwombat -Pgpr.key=$DAILYWOMBAT_TOKEN
 
       - name: Build and push Docker image
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DAILYWOMBAT_TOKEN: ${{ secrets.DAILYWOMBAT_TOKEN }}
           GITHUB_RELEASE_TAG: latest
-        run: ./gradlew :apps:main:jib
+        run: ./gradlew :apps:main:jib -Pgpr.user=topwombat -Pgpr.key=$DAILYWOMBAT_TOKEN
