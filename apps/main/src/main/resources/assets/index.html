@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8"/>
+    <link rel="icon" type="image/svg+xml" href="/favicon.ico"/>
+    <link rel="stylesheet" href="/assets/css/output.css"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+    <title>Sample Connect Business</title>
+</head>
+<body>
+<div class="App">
+    <div class="container">
+        <div class="logo">Sample Connect Business | Dashboard</div>
+
+        <form id="create-account-form" class="form-group">
+            <div class="form-group">
+                <label for="email">Email for Connected account:</label>
+                <input type="email" id="email" required/>
+            </div>
+            <button class="button" type="submit">Create Connect Account</button>
+        </form>
+
+        <div id="account-status"></div>
+
+        <button id="add-product" class="button hidden">Add New Product</button>
+        <form id="create-product-form" class="hidden">
+            <div class="form-group">
+                <label>Product Name</label>
+                <input type="text" id="productName" required/>
+            </div>
+            <div class="form-group">
+                <label>Description</label>
+                <input type="text" id="productDescription"/>
+            </div>
+            <div class="form-group">
+                <label>Price (in cents)</label>
+                <input type="number" id="productPrice" value="1000" required/>
+            </div>
+            <button type="submit" class="button">Create Product</button>
+        </form>
+
+        <div id="products-section" class="hidden">
+            <button id="toggle-products" class="button">Show Products</button>
+            <div id="products-list" class="hidden">
+                <div class="product hidden">
+                    <div class="product-info">
+                        <img class="product-image" src="https://i.imgur.com/6Mvijcm.png" alt="{product.name}"/>
+                        <div class="description">
+                            <h3 class="product-name">${product.name}</h3>
+                            <h5 class="product-price">${product.price}${product.period ? ` / ${product.period}` :
+                                ''}</h5>
+                        </div>
+                    </div>
+                    <form action="/api/create-checkout-session" method="POST">
+                        <input type="hidden" name="priceId" value="{priceId}"/>
+                        <input type="hidden" name="accountId" value={accountId}/>
+                        <button type="submit" class="button checkout-button">Checkout</button>
+                    </form>
+                </div>
+            </div>
+
+        </div>
+
+        <div id="subscription-section"></div>
+
+        <div id="storefronts"></div>
+        <script type="module" src="/assets/js/connect.js"></script>
+    </div>
+</div>
+</body>
+</html>
+

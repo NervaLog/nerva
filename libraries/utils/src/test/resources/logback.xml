@@ -1,0 +1,39 @@
+<configuration scan="true">
+
+    <!-- Suppress Logback's interminal startup diagnostics.
+        Comment out if you're trying to diagnose Logback configuration. -->
+    <statusListener class="ch.qos.logback.core.status.NopStatusListener"/>
+
+    <!-- Enable env-based profile -->
+    <property name="LOG_FORMAT" value="${LOG_FORMAT:-pretty}"/>
+
+    <!-- Pretty console logs for local dev -->
+    <appender name="PRETTY_CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder class="ch.qos.logback.classic.encoder.PatternLayoutEncoder">
+            <pattern>%highlight(%-5level) [%logger{20}] %msg%n</pattern>
+        </encoder>
+    </appender>
+
+    <!-- JSON logs for production -->
+    <appender name="JSON_CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder class="net.logstash.logback.encoder.LogstashEncoder"/>
+    </appender>
+
+    <!-- Select appender based on env -->
+    <root level="INFO">
+        <if condition='property("LOG_FORMAT").equals("json")'>
+            <then>
+                <appender-ref ref="JSON_CONSOLE"/>
+            </then>
+            <else>
+                <appender-ref ref="PRETTY_CONSOLE"/>
+            </else>
+        </if>
+    </root>
+
+    <!-- Optional: More verbose logging for specific subsystems -->
+    <logger name="com.zaxxer.hikari" level="WARN"/>
+    <logger name="org.flywaydb" level="INFO"/>
+    <logger name="org.http4k" level="INFO"/>
+
+</configuration>

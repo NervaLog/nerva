@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en" class="h-full bg-surface-muted">
+<head>
+    <meta charset="UTF-8"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+    <title>{% block title %}Creator Vortex{% endblock %}</title>
+    <link rel="stylesheet" href="/assets/css/output.css"/>
+    <script src="https://unpkg.com/htmx.org@1.9.10"></script>
+</head>
+<body class="h-full">
+    <div class="min-h-full flex flex-col justify-center py-12 sm:px-6 lg:px-8">
+        <!-- Logo -->
+        <div class="sm:mx-auto sm:w-full sm:max-w-md">
+            <div class="flex justify-center">
+                <span class="text-2xl font-bold text-primary-600">Creator Vortex</span>
+            </div>
+            {% block header %}{% endblock %}
+        </div>
+
+        <!-- Content Card -->
+        <div class="mt-8 sm:mx-auto sm:w-full sm:max-w-md">
+            <div class="card py-8 px-4 sm:px-10">
+                {% block content %}{% endblock %}
+            </div>
+        </div>
+
+        <!-- Footer -->
+        <div class="mt-8 sm:mx-auto sm:w-full sm:max-w-md">
+            <p class="text-center text-sm text-text-subtle">
+                <a href="#" class="hover:text-text-muted">Terms</a>
+                <span class="mx-2">·</span>
+                <a href="#" class="hover:text-text-muted">Privacy</a>
+            </p>
+        </div>
+    </div>
+</body>
+</html>

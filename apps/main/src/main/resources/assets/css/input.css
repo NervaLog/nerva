@@ -1,0 +1,212 @@
+@import "tailwindcss";
+
+/*
+ * =============================================================================
+ * CREATOR VORTEX DESIGN SYSTEM
+ * =============================================================================
+ *
+ * To swap the color palette, update the values in @theme below.
+ * All components reference these semantic tokens.
+ *
+ * Current palette: Indigo primary, dark sidebar
+ */
+
+@theme {
+  /* ---------------------------------------------------------------------
+   * PRIMARY - Main brand/action color
+   * Used for: buttons, links, focus rings, active states
+   * --------------------------------------------------------------------- */
+  --color-primary-50: oklch(96.9% .016 293.756);
+  --color-primary-100: oklch(94.3% .029 294.588);
+  --color-primary-200: oklch(89.4% .057 293.283);
+  --color-primary-300: oklch(81.1% .111 293.571);
+  --color-primary-400: oklch(70.7% .165 295.164);
+  --color-primary-500: oklch(58.5% .233 277.117);
+  --color-primary-600: oklch(51.1% .262 276.966);  /* Main action color */
+  --color-primary-700: oklch(45.7% .24 277.023);
+  --color-primary-800: oklch(39.8% .195 277.366);
+  --color-primary-900: oklch(35.9% .144 278.697);
+  --color-primary-950: oklch(25.7% .09 281.288);
+
+  /* ---------------------------------------------------------------------
+   * SIDEBAR - Dark navigation chrome
+   * Used for: sidebar background, nav items, org switcher
+   * --------------------------------------------------------------------- */
+  --color-sidebar-bg: oklch(20.8% .042 265.755);       /* gray-900 */
+  --color-sidebar-bg-hover: oklch(26.9% .046 264.695); /* gray-800 */
+  --color-sidebar-text: oklch(70.7% .022 261.325);     /* gray-400 */
+  --color-sidebar-text-active: oklch(98.5% 0 0);       /* white */
+  --color-sidebar-border: oklch(32.7% .034 264.182);   /* gray-700 */
+  --color-sidebar-accent: oklch(51.1% .262 276.966);   /* primary-600 */
+
+  /* ---------------------------------------------------------------------
+   * STATUS - Semantic feedback colors
+   * Used for: badges, alerts, status indicators
+   * --------------------------------------------------------------------- */
+  --color-success-50: oklch(98.2% .018 155.826);
+  --color-success-100: oklch(96.2% .044 156.743);
+  --color-success-500: oklch(72.3% .219 149.579);
+  --color-success-600: oklch(62.7% .194 149.214);
+  --color-success-700: oklch(52.7% .154 150.069);
+
+  --color-warning-50: oklch(98.7% .026 102.212);
+  --color-warning-100: oklch(96.2% .059 95.277);
+  --color-warning-500: oklch(79.5% .184 86.047);
+  --color-warning-600: oklch(68.1% .162 75.834);
+  --color-warning-700: oklch(55.4% .135 66.442);
+
+  --color-error-50: oklch(97.1% .013 17.38);
+  --color-error-100: oklch(93.6% .032 17.717);
+  --color-error-500: oklch(63.7% .237 25.331);
+  --color-error-600: oklch(57.7% .245 27.325);
+  --color-error-700: oklch(50.5% .213 27.518);
+
+  /* ---------------------------------------------------------------------
+   * SURFACE - Card and content backgrounds
+   * Used for: cards, modals, dropdowns
+   * --------------------------------------------------------------------- */
+  --color-surface: oklch(100% 0 0);                    /* white */
+  --color-surface-elevated: oklch(100% 0 0);           /* white */
+  --color-surface-muted: oklch(98.5% .002 247.839);    /* gray-50 */
+
+  /* ---------------------------------------------------------------------
+   * BORDER - Dividers and outlines
+   * --------------------------------------------------------------------- */
+  --color-border: oklch(92.2% .004 286.32);            /* gray-200 */
+  --color-border-muted: oklch(96.7% .003 264.542);     /* gray-100 */
+
+  /* ---------------------------------------------------------------------
+   * TEXT - Content colors
+   * --------------------------------------------------------------------- */
+  --color-text: oklch(14.5% .044 285.823);             /* gray-950 */
+  --color-text-muted: oklch(55.1% .027 264.364);       /* gray-500 */
+  --color-text-subtle: oklch(70.7% .022 261.325);      /* gray-400 */
+}
+
+/* =============================================================================
+ * COMPONENT STYLES
+ * ============================================================================= */
+
+@layer components {
+  /* Buttons */
+  .btn {
+    @apply px-4 py-2 rounded-lg font-medium transition-colors focus:outline-none focus:ring-2 focus:ring-offset-2;
+  }
+  .btn-primary {
+    @apply bg-primary-600 text-white hover:bg-primary-700 focus:ring-primary-500;
+  }
+  .btn-secondary {
+    @apply bg-white text-gray-700 border border-gray-300 hover:bg-gray-50 focus:ring-primary-500;
+  }
+  .btn-danger {
+    @apply bg-error-600 text-white hover:bg-error-700 focus:ring-error-500;
+  }
+
+  /* Cards */
+  .card {
+    @apply bg-surface rounded-xl shadow-sm ring-1 ring-border p-6;
+  }
+  .card-header {
+    @apply px-6 py-4 border-b border-border;
+  }
+  .card-body {
+    @apply px-6 py-4;
+  }
+  .card-footer {
+    @apply px-6 py-4 border-t border-border bg-surface-muted rounded-b-xl;
+  }
+
+  /* Badges */
+  .badge {
+    @apply inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium;
+  }
+  .badge-success {
+    @apply bg-success-50 text-success-700 ring-1 ring-inset ring-success-600/20;
+  }
+  .badge-warning {
+    @apply bg-warning-50 text-warning-700 ring-1 ring-inset ring-warning-600/20;
+  }
+  .badge-error {
+    @apply bg-error-50 text-error-700 ring-1 ring-inset ring-error-600/20;
+  }
+  .badge-neutral {
+    @apply bg-gray-50 text-gray-600 ring-1 ring-inset ring-gray-500/10;
+  }
+
+  /* Form inputs */
+  .input {
+    @apply block w-full rounded-lg border border-border px-4 py-2 text-text
+           placeholder:text-text-subtle
+           focus:border-primary-500 focus:ring-2 focus:ring-primary-500 focus:outline-none
+           transition-colors;
+  }
+
+  /* Pills (for entitlements) */
+  .pill {
+    @apply inline-flex items-center gap-1 rounded-md bg-primary-50 px-2 py-1 text-xs font-medium text-primary-700 ring-1 ring-inset ring-primary-700/10;
+  }
+
+  /* Code/monospace inline */
+  .code-inline {
+    @apply font-mono text-sm bg-gray-100 px-1.5 py-0.5 rounded text-gray-700;
+  }
+
+  /* Empty state container */
+  .empty-state {
+    @apply text-center py-12;
+  }
+  .empty-state-icon {
+    @apply mx-auto h-12 w-12 text-gray-400;
+  }
+  .empty-state-title {
+    @apply mt-4 text-sm font-semibold text-text;
+  }
+  .empty-state-description {
+    @apply mt-2 text-sm text-text-muted;
+  }
+
+  /* Stats tiles */
+  .stat-tile {
+    @apply bg-surface rounded-xl shadow-sm ring-1 ring-border px-4 py-5 sm:p-6;
+  }
+  .stat-tile-label {
+    @apply text-sm font-medium text-text-muted truncate;
+  }
+  .stat-tile-value {
+    @apply mt-1 text-3xl font-semibold text-text tracking-tight;
+  }
+  .stat-value {
+    @apply text-2xl font-semibold text-text;
+  }
+  .stat-label {
+    @apply text-sm font-medium text-text-muted;
+  }
+  .stat-change {
+    @apply text-xs text-text-subtle;
+  }
+
+  /* Page layout */
+  .page-container {
+    @apply max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8;
+  }
+  .page-header {
+    @apply mb-8;
+  }
+  .page-title {
+    @apply text-2xl font-bold text-text;
+  }
+  .page-subtitle {
+    @apply mt-1 text-sm text-text-muted;
+  }
+
+  /* Sidebar navigation */
+  .sidebar-nav-item {
+    @apply flex items-center gap-3 rounded-lg px-3 py-2 text-sm font-medium transition-colors;
+  }
+  .sidebar-nav-item-inactive {
+    @apply text-sidebar-text hover:bg-sidebar-bg-hover hover:text-sidebar-text-active;
+  }
+  .sidebar-nav-item-active {
+    @apply bg-sidebar-bg-hover text-sidebar-text-active;
+  }
+}
