@@ -126,12 +126,12 @@ object IngestEvents {
             ifRight = { result ->
                 responseLens(
                     IngestEventResponse(
-                        event_id = result.eventId,
-                        attention_id = result.attentionId,
-                        was_created = result.wasCreated,
-                        job_id = result.jobId
+                        event_id = result.event_id,
+                        attention_id = result.attention_id,
+                        was_created = result.was_created,
+                        job_id = result.job_id
                     ),
-                    Response(if (result.wasCreated) Status.CREATED else Status.OK)
+                    Response(if (result.was_created) Status.CREATED else Status.OK)
                 )
             }
         )
