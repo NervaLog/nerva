@@ -730,7 +730,34 @@ All tools must pass with zero errors. Warnings should be reviewed and addressed 
 
 ---
 
-## 18. Bot Instruction Summary (TL;DR)
+## 18. Docker Image Tags
+
+### Rules
+
+* **Never use `latest` tag** — Always use immutable, content-addressable tags
+* **Use commit SHA for tags** — `ghcr.io/org/app:abc123def` not `ghcr.io/org/app:latest`
+* **Deployments reference specific SHAs** — Image tags in Kubernetes manifests must be commit SHAs
+
+### Rationale
+
+* `latest` is mutable — the same tag can point to different images over time
+* Rollbacks are impossible without knowing which image was running
+* Debugging production issues requires knowing exactly what code is deployed
+* GitOps requires immutable references for reproducibility
+
+### Examples
+
+```yaml
+# ❌ BAD — mutable tag
+image: ghcr.io/topwombat/nerva-main:latest
+
+# ✅ GOOD — immutable SHA tag
+image: ghcr.io/topwombat/nerva-main:db6622b0bd7870a3380dd9cbef02abe56321cbce
+```
+
+---
+
+## 19. Bot Instruction Summary (TL;DR)
 
 > If you are a coding bot:
 >
