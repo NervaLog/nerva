@@ -29,6 +29,9 @@ jobs:
         uses: gradle/actions/setup-gradle@v4
 
       - name: Build and test
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DAILYWOMBAT_TOKEN: ${{ secrets.DAILYWOMBAT_TOKEN }}
         run: ./gradlew build
 
       - name: Build and push Docker image
