@@ -55,7 +55,8 @@ object App {
         val devMode = System.getenv("DEV_MODE")?.toBoolean() == true
 
         val result = either {
-            val baseEnv = ENV overrides catch { fromResource(".env") }.bind()
+            // ENV first, .env overrides if present (optional in production)
+            val baseEnv = catch { fromResource(".env") }.getOrNull()?.let { ENV overrides it } ?: ENV
 
             // In dev mode, start containers and override DB configs
             val (env, devRuntime) = if (devMode) {
