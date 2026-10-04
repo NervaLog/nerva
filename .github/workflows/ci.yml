@@ -1,6 +1,7 @@
 # Every push and pull request to main, and every release (release.yml calls this first).
 # Every job runs on Botpike's own runners (Botpike/ci-runners): a Fly Machine started for the
 # job, performance-2x with 8 GB and a 10 GB volume that keeps the Zig cache between jobs.
+# The jobs run in parallel, balanced so none is much longer than the others (N50).
 name: CI
 
 on:
@@ -18,8 +19,38 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  # Installs the Zig pinned by zig/download.sh. Checkout removes ./zig's toolchain, so it is kept
+  # on the Machine's volume, under the cache directory, keyed by download.sh's hash (which holds
+  # the version and checksums), and linked back in; Zig finds its lib next to the real binary.
+  # A copy is used only if complete (written aside, then renamed) and it runs; otherwise it is
+  # replaced by a fresh download. download.sh then checks the version, as before.
+  INSTALL_ZIG: |
+    set -eu
+    cache="${XDG_CACHE_HOME:-$HOME/.cache}/nerva-toolchain"
+    toolchain="$cache/zig-$(sha256sum zig/download.sh | cut -c1-16)"
+    if [ -x "$toolchain/zig" ] && [ -f "$toolchain/lib/std/std.zig" ]; then
+      rm -rf zig/zig zig/lib
+      ln -s "$toolchain/zig" zig/zig
+      ln -s "$toolchain/lib" zig/lib
+    fi
+    if ! ./zig/zig env > /dev/null 2>&1 || [ ! -f zig/lib/std/std.zig ]; then
+      rm -rf zig/zig zig/lib
+      ./zig/download.sh
+      mkdir -p "$cache"
+      rm -rf "$toolchain" "$toolchain.partial"
+      mkdir "$toolchain.partial"
+      cp -a zig/zig zig/lib "$toolchain.partial/"
+      mv "$toolchain.partial" "$toolchain"
+    fi
+    echo "Zig $(./zig/zig version) from $(readlink -f zig/zig)"
+    ./zig/download.sh
+
 jobs:
-  test:
+  # The typecheck builds the nerva binary that the integration, API and view tests run, so it goes
+  # with them; the unit tests, the longest step, run alone.
+  system:
+    name: check, integration, API, views
     runs-on: [self-hosted, fly]
     timeout-minutes: 60
     steps:
@@ -28,19 +59,13 @@ jobs:
           persist-credentials: false
 
       - name: Install the pinned Zig
-        run: ./zig/download.sh
+        run: eval "$INSTALL_ZIG"
 
       - name: Typecheck
         run: ./zig/zig build check
 
       - name: Format
         run: ./zig/zig build test:fmt
-
-      # `benchmark.perf: usage example` skips itself where perf_event_open is denied, as on
-      # GitHub's runners and Botpike's (jobs run as a user, perf_event_paranoid 2); it fails only
-      # where it is allowed without hardware counters (UPSTREAM.md).
-      - name: Unit tests
-        run: ./zig/zig build test:unit
 
       - name: Integration (three real replicas)
         run: ./zig/zig build test:integration
@@ -51,20 +76,54 @@ jobs:
       - name: Declared views (against a model)
         run: ./zig/zig build test:views
 
-  # The demos, three replicas and all, while processes are crashed and restarted.
-  demo:
+  unit:
     runs-on: [self-hosted, fly]
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           persist-credentials: false
 
       - name: Install the pinned Zig
-        run: ./zig/download.sh
+        run: eval "$INSTALL_ZIG"
 
-      - name: Seat and canvas demos under crashes
-        run: ./zig/zig build -Drelease test:demo -- --seconds=75
+      # `benchmark.perf: usage example` skips itself where perf_event_open is denied, as on
+      # GitHub's runners and Botpike's (jobs run as a user, perf_event_paranoid 2); it fails only
+      # where it is allowed without hardware counters (UPSTREAM.md).
+      - name: Unit tests
+        run: ./zig/zig build test:unit
+
+  # The demos, three replicas and all, while processes are crashed and restarted: each demo on its
+  # own Machine, run exactly as `zig build -Drelease test:demo -- --seconds=75` runs it.
+  demo:
+    runs-on: [self-hosted, fly]
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        demo: [seats_chaos.py, canvas_chaos.py]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+
+      # The list above must stay the one test:demo runs (build.zig).
+      - name: Every demo test:demo runs is in the matrix
+        run: |
+          listed=$(grep -o '"[a-z_]*_chaos\.py"' build.zig | tr -d '"' | sort | tr '\n' ' ')
+          if [ "$listed" != "canvas_chaos.py seats_chaos.py " ]; then
+            echo "::error::build.zig's test:demo runs '$listed'; update the demo matrix in ci.yml"
+            exit 1
+          fi
+
+      - name: Install the pinned Zig
+        run: eval "$INSTALL_ZIG"
+
+      - name: Build (release)
+        run: ./zig/zig build -Drelease
+
+      - name: ${{ matrix.demo }} under crashes
+        run: python3 tests/demo/${{ matrix.demo }} zig-out/bin/nerva --seconds=75
 
   vopr:
     runs-on: [self-hosted, fly]
@@ -79,7 +138,7 @@ jobs:
           persist-credentials: false
 
       - name: Install the pinned Zig
-        run: ./zig/download.sh
+        run: eval "$INSTALL_ZIG"
 
       # A failure replays exactly with `./zig/zig build vopr -- <seed>`.
       - name: VOPR

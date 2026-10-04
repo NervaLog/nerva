@@ -335,3 +335,16 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
   any run's feed), and a put carrying `op_seen` accepted (3/4; only `entry_status_check`
   catches it, as the model shares `entry_validate`).
 
+## 2026-10-04 — Faster CI: parallel test jobs, demos split, Zig kept on the volume (N50)
+
+- `.github/workflows/ci.yml`: `test` split into `unit` (unit tests) and `system` (typecheck,
+  format, integration, API, views); `demo` split into one job per demo, each building with
+  `-Drelease` and running its script as `test:demo` does, with a step that fails if build.zig's
+  demo list and the matrix differ; every job installs Zig from a copy kept on the runner's
+  volume, keyed by `zig/download.sh`'s hash, downloading only when it is missing or broken.
+- Before (run 37240753012): critical path `test` 7m05, `demo` 6m03. After: the pull request's
+  own CI run (see the pull request).
+- Verified locally: the install snippet downloads once, then links the copy (0.03 s instead of
+  9 s), and recovers from a damaged copy; `zig build check` passes through the links;
+  actionlint is clean apart from the custom `fly` label.
+
