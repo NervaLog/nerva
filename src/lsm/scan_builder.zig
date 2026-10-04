@@ -124,6 +124,33 @@ pub fn ScanBuilderType(
             return scan;
         }
 
+        /// Initializes a Scan over the secondary index specified by `index`, for values from
+        /// `value_min` to `value_max` inclusive (Nerva: backfill and view reads, N49).
+        /// Results are ordered by value, then by `timestamp`.
+        pub fn scan_range(
+            self: *ScanBuilder,
+            comptime index: std.meta.FieldEnum(Groove.IndexTrees),
+            buffer: *ScanBuffer,
+            snapshot: u64,
+            value_min: CompositeKeyPrefixType(index),
+            value_max: CompositeKeyPrefixType(index),
+            direction: Direction,
+        ) *Scan {
+            assert(value_min <= value_max);
+            const field = comptime std.enums.nameCast(std.meta.FieldEnum(Scan.Dispatcher), index);
+            const scan = self.scan_add(field) catch unreachable;
+            const scan_impl = &@field(scan.dispatcher, @tagName(field));
+            scan_impl.init(
+                &@field(self.groove().indexes, @tagName(index)),
+                buffer,
+                snapshot,
+                key_from_value(index, value_min, TimestampRange.timestamp_min),
+                key_from_value(index, value_max, TimestampRange.timestamp_max),
+                direction,
+            );
+            return scan;
+        }
+
         /// Initializes a Scan over a unique key searching for an exact match.
         /// Produces the criteria equivalent to `WHERE id = $value`.
         /// Results are always unique.

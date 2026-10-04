@@ -32,6 +32,13 @@ const Entry = nerva.Entry;
 const EntryResult = nerva.EntryResult;
 const EntryStatus = nerva.EntryStatus;
 const Add = nerva.Add;
+const View = nerva.View;
+const Group = nerva.Group;
+const ViewDefinition = nerva.ViewDefinition;
+const ViewQuery = nerva.ViewQuery;
+const ViewRecord = nerva.ViewRecord;
+const DeclareResult = nerva.DeclareResult;
+const views = @import("views.zig");
 const RowKey = nerva.RowKey;
 const RowValue = nerva.RowValue;
 const Change = nerva.Change;
@@ -55,10 +62,23 @@ pub fn StateMachineType(comptime Storage: type) type {
         pub const changes_limit_max =
             Operation.get_changes.result_max(constants.message_body_size_max) - 1;
 
+        /// Timestamps a commit entry takes: its change, then one per view of its table, for a
+        /// group the entry creates (N49).
+        pub const entry_timestamps = 1 + nerva.views_per_table_max;
+        /// Groups one op can write (N49).
+        pub const groups_per_op_max: u32 = nerva.view_group_writes_max;
+        comptime {
+            assert(nerva.backfill_rows_per_op <= groups_per_op_max);
+        }
+        /// -1 for the header record.
+        pub const view_groups_limit_max =
+            Operation.get_view.result_max(constants.message_body_size_max) - 1;
+
         comptime {
             assert(commit_entries_max > 0);
             assert(lookup_rows_max > 0);
             assert(changes_limit_max > 0);
+            assert(view_groups_limit_max > 0);
         }
 
         pub const Options = struct {
@@ -66,6 +86,7 @@ pub fn StateMachineType(comptime Storage: type) type {
             lsm_forest_compaction_block_count: u32 = Forest.Options.compaction_block_count_min,
             lsm_forest_node_count: u32,
             cache_entries_rows: u32 = RowsGroove.ObjectsCache.Cache.value_count_max_multiple,
+            cache_entries_groups: u32 = GroupsGroove.ObjectsCache.Cache.value_count_max_multiple,
         };
 
         const RowsGroove = GrooveType(
@@ -122,10 +143,70 @@ pub fn StateMachineType(comptime Storage: type) type {
             },
         );
 
+        const ViewsGroove = GrooveType(
+            Storage,
+            View,
+            .{
+                .ids = tree_ids.View,
+                .batch_value_count_max = .{
+                    .timestamp = nerva.views_max,
+                    .id = nerva.views_max,
+                },
+                .primary_key = "id",
+                .primary_key_orphaned = false,
+                .unique_keys = &[_][:0]const u8{"id"},
+                .ignored = &[_][:0]const u8{
+                    "declared_op",
+                    "backfill_cursor",
+                    "group_count",
+                    "state",
+                    "reserved_a",
+                    "hash",
+                    "definition",
+                    "reserved_b",
+                },
+                .optional = &[_][:0]const u8{},
+                .derived = .{},
+                .objects_cache = true,
+            },
+        );
+
+        const GroupsGroove = GrooveType(
+            Storage,
+            Group,
+            .{
+                .ids = tree_ids.Group,
+                .batch_value_count_max = .{
+                    .timestamp = groups_per_op_max,
+                    .key = groups_per_op_max,
+                },
+                .primary_key = "key",
+                .primary_key_orphaned = false,
+                .unique_keys = &[_][:0]const u8{"key"},
+                .ignored = &[_][:0]const u8{ "count", "group_key", "sums", "reserved" },
+                .optional = &[_][:0]const u8{},
+                .derived = .{},
+                .objects_cache = true,
+            },
+        );
+
         pub const Forest = ForestType(Storage, .{
             .rows = RowsGroove,
             .changes = ChangesGroove,
+            .views = ViewsGroove,
+            .groups = GroupsGroove,
         });
+
+        const RowsScanLookup = ScanLookupType(
+            RowsGroove,
+            RowsGroove.ScanBuilder.Scan,
+            Storage,
+        );
+        const GroupsScanLookup = ScanLookupType(
+            GroupsGroove,
+            GroupsGroove.ScanBuilder.Scan,
+            Storage,
+        );
 
         const ChangesScanTree = ScanTreeType(void, ChangesGroove.ObjectTree, Storage);
         const HistoryScanLookup = ScanLookupType(
@@ -167,6 +248,27 @@ pub fn StateMachineType(comptime Storage: type) type {
 
         forest_callback: ?*const fn (*StateMachine) void = null,
 
+        // ---- Views (N49) ----
+
+        /// The number of views declared, once known (null after a reset: every id is probed).
+        view_count: ?u32 = null,
+        /// Whether a view is building, once known (null after a reset: a pulse finds out).
+        view_building: ?bool = null,
+        views_prefetch_context: ViewsGroove.PrefetchContext = undefined,
+        groups_prefetch_context: GroupsGroove.PrefetchContext = undefined,
+        rows_scan_lookup: RowsScanLookup = undefined,
+        groups_scan_lookup: GroupsScanLookup = undefined,
+        /// The views as this op found them (`views_stored`) and as it leaves them (`views_op`).
+        views_op: [nerva.views_max]View = undefined,
+        views_stored: [nerva.views_max]View = undefined,
+        views_op_count: u32 = 0,
+        /// Rows a pulse scanned (one more than it adds, to know whether the table has more).
+        backfill_rows: []Row,
+        backfill_count: ?u32 = null,
+        /// Groups a `get_view` scanned (one more than its limit, to know whether there are more).
+        view_groups: []Group,
+        view_groups_count: ?u32 = null,
+
         pub fn init(
             self: *StateMachine,
             allocator: std.mem.Allocator,
@@ -178,6 +280,7 @@ pub fn StateMachineType(comptime Storage: type) type {
             assert(options.batch_size_limit <= constants.message_body_size_max);
 
             const commit_entries_limit = Operation.commit.event_max(options.batch_size_limit);
+            const groups_limit: u32 = groups_per_op_max;
             const lookup_rows_limit = Operation.lookup_rows.event_max(options.batch_size_limit);
             assert(commit_entries_limit <= commit_entries_max);
             assert(lookup_rows_limit <= lookup_rows_max);
@@ -187,6 +290,8 @@ pub fn StateMachineType(comptime Storage: type) type {
                 .forest = undefined,
                 .changes_scan_buffer = undefined,
                 .write_keys = undefined,
+                .backfill_rows = undefined,
+                .view_groups = undefined,
             };
 
             try self.forest.init(
@@ -219,6 +324,24 @@ pub fn StateMachineType(comptime Storage: type) type {
                             .row_key = .{ .batch_value_count_limit = commit_entries_limit },
                         },
                     },
+                    .views = .{
+                        .cache_entries_max = ViewsGroove.ObjectsCache.Cache.value_count_max_multiple,
+                        .prefetch_entries_for_read_max = nerva.views_max,
+                        .prefetch_entries_for_update_max = nerva.views_max,
+                        .tree_options_object = .{ .batch_value_count_limit = nerva.views_max },
+                        .tree_options_index = .{
+                            .id = .{ .batch_value_count_limit = nerva.views_max },
+                        },
+                    },
+                    .groups = .{
+                        .cache_entries_max = options.cache_entries_groups,
+                        .prefetch_entries_for_read_max = 0,
+                        .prefetch_entries_for_update_max = groups_limit,
+                        .tree_options_object = .{ .batch_value_count_limit = groups_limit },
+                        .tree_options_index = .{
+                            .key = .{ .batch_value_count_limit = groups_limit },
+                        },
+                    },
                 },
             );
             errdefer self.forest.deinit(allocator);
@@ -231,9 +354,17 @@ pub fn StateMachineType(comptime Storage: type) type {
 
             try self.add_rows.ensureTotalCapacity(allocator, commit_entries_limit);
             errdefer self.add_rows.deinit(allocator);
+
+            self.backfill_rows = try allocator.alloc(Row, nerva.backfill_rows_per_op + 1);
+            errdefer allocator.free(self.backfill_rows);
+
+            self.view_groups = try allocator.alloc(Group, view_groups_limit_max + 1);
+            errdefer allocator.free(self.view_groups);
         }
 
         pub fn deinit(self: *StateMachine, allocator: std.mem.Allocator) void {
+            allocator.free(self.view_groups);
+            allocator.free(self.backfill_rows);
             self.add_rows.deinit(allocator);
             allocator.free(self.write_keys);
             allocator.free(self.changes_scan_buffer);
@@ -248,6 +379,8 @@ pub fn StateMachineType(comptime Storage: type) type {
                 .changes_scan_buffer = self.changes_scan_buffer,
                 .write_keys = self.write_keys,
                 .add_rows = self.add_rows,
+                .backfill_rows = self.backfill_rows,
+                .view_groups = self.view_groups,
             };
             self.add_rows.clearRetainingCapacity();
         }
@@ -282,10 +415,10 @@ pub fn StateMachineType(comptime Storage: type) type {
             callback(self);
         }
 
+        /// Pulses backfill building views (N49). Unknown after a reset: one pulse finds out.
         pub fn pulse_needed(self: *const StateMachine, timestamp: u64) bool {
-            _ = self;
             _ = timestamp;
-            return false; // Nerva has no timeouts.
+            return self.view_building orelse true;
         }
 
         pub fn input_valid(
@@ -351,15 +484,17 @@ pub fn StateMachineType(comptime Storage: type) type {
                     }) catch unreachable; // Already validated by `input_valid()`.
                     break :payload body_decoder.payload;
                 },
-                .get_changes, .get_history => message_body_used,
+                .get_changes, .get_history, .get_view, .declare_view, .pulse => message_body_used,
             };
             self.prepare_timestamp += prepare_delta(operation, payload);
         }
 
         fn prepare_delta(operation: Operation, events: []const u8) u64 {
             return switch (operation) {
-                .commit => @divExact(events.len, @sizeOf(Entry)),
-                .lookup_rows, .get_changes, .get_history => 0,
+                .commit => @divExact(events.len, @sizeOf(Entry)) * entry_timestamps,
+                .declare_view => 1,
+                .pulse => nerva.backfill_rows_per_op,
+                .lookup_rows, .get_changes, .get_history, .get_view => 0,
             };
         }
 
@@ -388,6 +523,7 @@ pub fn StateMachineType(comptime Storage: type) type {
                 .commit => self.prefetch_rows(Entry, message_body_used),
                 .get_changes => self.prefetch_changes(message_body_used),
                 .get_history => self.prefetch_history(message_body_used),
+                .get_view, .declare_view, .pulse => self.prefetch_views(),
             }
         }
 
@@ -595,6 +731,14 @@ pub fn StateMachineType(comptime Storage: type) type {
                 ),
                 .get_changes => self.execute_get_changes(op, message_body_used, output_buffer),
                 .get_history => self.execute_get_history(op, message_body_used, output_buffer),
+                .get_view => self.execute_get_view(op, message_body_used, output_buffer),
+                .declare_view => self.execute_declare_view(
+                    op,
+                    timestamp,
+                    message_body_used,
+                    output_buffer,
+                ),
+                .pulse => self.execute_pulse(timestamp),
             };
         }
 
@@ -631,7 +775,9 @@ pub fn StateMachineType(comptime Storage: type) type {
                         batch,
                         reply_encoder.writable().?,
                     ),
-                    .get_changes, .get_history => comptime unreachable,
+                    .get_changes, .get_history, .get_view, .declare_view, .pulse => {
+                        comptime unreachable;
+                    },
                 };
                 reply_encoder.add(@intCast(bytes_written));
             }
@@ -697,7 +843,8 @@ pub fn StateMachineType(comptime Storage: type) type {
                 }
             } else {
                 for (entries, results, 0..) |*entry, *result, index| {
-                    const entry_timestamp = timestamp - entries.len + index + 1;
+                    const entry_timestamp =
+                        timestamp - entries.len * entry_timestamps + index * entry_timestamps + 1;
                     assert(TimestampRange.valid(entry_timestamp));
                     assert(result.status == .ok);
                     switch (entry.kind) {
@@ -930,6 +1077,87 @@ pub fn StateMachineType(comptime Storage: type) type {
                 .timestamp = timestamp,
                 .value = value.*,
             });
+        }
+
+        // ---- Views (N49) ----
+
+        /// Prefetches every declared view (stage 0 of `commit`, `get_view`, `declare_view` and
+        /// `pulse`), then the operation's own stage.
+        fn prefetch_views(self: *StateMachine) void {
+            _ = self;
+            @panic("TODO");
+        }
+
+        /// Prefetches the groups a commit may touch (stage 2, after the rows).
+        fn prefetch_commit_groups(self: *StateMachine) void {
+            _ = self;
+            @panic("TODO");
+        }
+
+        /// Loads the views prefetched for this op into `views_op` and `views_stored`.
+        fn views_load(self: *StateMachine) void {
+            _ = self;
+            @panic("TODO");
+        }
+
+        /// Writes back the views this op changed.
+        fn views_store(self: *StateMachine) void {
+            _ = self;
+            @panic("TODO");
+        }
+
+        /// Keeps the views over `table` exact after one row changed from `old` to `new` (null:
+        /// absent). `timestamp` is the entry's: groups it creates take the ones after it.
+        fn views_row_changed(
+            self: *StateMachine,
+            table: u32,
+            id: u64,
+            old: ?*const [nerva.value_size]u8,
+            new: ?*const [nerva.value_size]u8,
+            timestamp: u64,
+        ) void {
+            _ = self;
+            _ = table;
+            _ = id;
+            _ = old;
+            _ = new;
+            _ = timestamp;
+            @panic("TODO");
+        }
+
+        fn execute_get_view(
+            self: *StateMachine,
+            op: u64,
+            message_body_used: []align(constants.cache_line_size) const u8,
+            output_buffer: *align(constants.cache_line_size) [constants.message_body_size_max]u8,
+        ) usize {
+            _ = self;
+            _ = op;
+            _ = message_body_used;
+            _ = output_buffer;
+            @panic("TODO");
+        }
+
+        fn execute_declare_view(
+            self: *StateMachine,
+            op: u64,
+            timestamp: u64,
+            message_body_used: []align(constants.cache_line_size) const u8,
+            output_buffer: *align(constants.cache_line_size) [constants.message_body_size_max]u8,
+        ) usize {
+            _ = self;
+            _ = op;
+            _ = timestamp;
+            _ = message_body_used;
+            _ = output_buffer;
+            @panic("TODO");
+        }
+
+        /// Adds the rows the pulse scanned to the building view's groups. Replies nothing.
+        fn execute_pulse(self: *StateMachine, timestamp: u64) usize {
+            _ = self;
+            _ = timestamp;
+            @panic("TODO");
         }
 
         fn execute_get_changes(
