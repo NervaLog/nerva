@@ -5,6 +5,9 @@
 //! Model: a row is identified by (table, id) and versioned by `op`, the log position of its last
 //! write. A transaction is one batch of `Entry`s: reads assert the version they saw, puts and
 //! deletes are applied only if every read still holds. Every applied write appends a `Change`.
+//!
+//! An `add` changes one 64-bit field of a row inside the commit, without a read: adds to one row
+//! never conflict, they apply in log order, within optional bounds (docs/DECISIONS.md N42).
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -64,6 +67,8 @@ pub const EntryKind = enum(u8) {
     read = 1,
     put = 2,
     delete = 3,
+    /// Adds a delta to one field of the row, inside the commit; parameters in `value` (`Add`).
+    add = 4,
     _,
 };
 
@@ -77,7 +82,7 @@ pub const Entry = extern struct {
     /// Reads only: the version observed. Zero means the row has never existed.
     op_seen: u64,
     reserved_b: u64 = 0,
-    /// Puts only; must be zero for reads and deletes.
+    /// Puts: the new value. Adds: the `Add` parameters. Zero for reads and deletes.
     value: [value_size]u8,
     reserved_c: [16]u8 = @splat(0),
 
@@ -100,21 +105,90 @@ pub const EntryStatus = enum(u32) {
     value_not_zero = 6,
     /// A put or delete carries `op_seen`.
     op_seen_not_zero = 7,
-    /// The same row is written twice in one transaction.
+    /// The same row is written twice in one transaction (several adds to one row are allowed,
+    /// but not mixed with a put or delete of it).
     write_duplicate = 8,
+    /// An add would move its field past a bound (or out of its type's range), without `clamp`.
+    out_of_bounds = 9,
+    /// An add to a row that does not exist, without `create`.
+    row_absent = 10,
+    /// An add's field, bounds or delta are invalid.
+    field_invalid = 11,
+    /// An add's `delta_from` does not name an earlier add of the same transaction.
+    delta_from_invalid = 12,
 };
 
 /// The `commit` result, one per entry.
 pub const EntryResult = extern struct {
     status: EntryStatus,
-    reserved: u32 = 0,
+    reserved_a: u32 = 0,
     /// `ok`: the op the transaction committed at. `conflict`: the row's current version.
     /// Otherwise zero.
     op: u64,
+    /// `add`, when `ok`: the amount added, after clamping. Otherwise zero.
+    applied: i64 = 0,
+    /// `add`, when `ok`: the field after the add. `out_of_bounds`: the field before it.
+    /// Otherwise zero. An `i64` field's value is its two's complement bits.
+    value: u64 = 0,
 
     comptime {
-        assert(@sizeOf(EntryResult) == 16);
+        assert(@sizeOf(EntryResult) == 32);
         assert(stdx.no_padding(EntryResult));
+    }
+};
+
+/// An `add` entry's parameters, carried in `Entry.value`.
+///
+/// The field is the 8 bytes at `offset` of the row's value, little-endian, as `field`. The new
+/// value is the field plus `delta` (or, with `flags.delta_from`, minus the amount the earlier
+/// add at entry index `delta_from` applied). An add never moves the field past a bound in the
+/// direction it moves (`min` when the delta is negative, `max` when positive; absent bounds are
+/// the type's range): it fails with `out_of_bounds`, or with `flags.clamp` adds as much as fits,
+/// possibly nothing. A row that does not exist fails with `row_absent`, or with `flags.create`
+/// starts as all zeros.
+pub const Add = extern struct {
+    delta: i64,
+    /// As the field's type (an `i64` bound is its two's complement bits). Zero unless
+    /// `flags.min` (respectively `flags.max`).
+    min: u64,
+    max: u64,
+    /// Zero unless `flags.delta_from`.
+    delta_from: u32,
+    /// At most `value_size - 8`.
+    offset: u8,
+    field: AddField,
+    flags: AddFlags,
+    reserved_a: u8 = 0,
+    reserved_b: [48]u8 = @splat(0),
+
+    pub const AddField = enum(u8) {
+        u64 = 1,
+        i64 = 2,
+        _,
+    };
+
+    pub const AddFlags = packed struct(u8) {
+        min: bool = false,
+        max: bool = false,
+        clamp: bool = false,
+        create: bool = false,
+        /// `delta` must be zero.
+        delta_from: bool = false,
+        padding: u3 = 0,
+    };
+
+    comptime {
+        assert(@sizeOf(Add) == value_size);
+        assert(stdx.no_padding(Add));
+    }
+
+    pub fn from_entry(entry: *const Entry) Add {
+        assert(entry.kind == .add);
+        return std.mem.bytesToValue(Add, &entry.value);
+    }
+
+    pub fn value(add: *const Add) [value_size]u8 {
+        return std.mem.toBytes(add.*);
     }
 };
 
@@ -340,9 +414,79 @@ pub fn entry_validate(entry: *const Entry) ?EntryStatus {
             if (!stdx.zeroed(&entry.value)) return .value_not_zero;
             if (entry.op_seen != 0) return .op_seen_not_zero;
         },
+        .add => {
+            if (entry.op_seen != 0) return .op_seen_not_zero;
+            return add_validate(&Add.from_entry(entry));
+        },
         _ => return .kind_invalid,
     }
     return null;
+}
+
+/// An add's static checks; `delta_from`'s index is checked against the transaction at commit.
+fn add_validate(add: *const Add) ?EntryStatus {
+    if (add.reserved_a != 0 or !stdx.zeroed(&add.reserved_b) or add.flags.padding != 0) {
+        return .reserved_not_zero;
+    }
+    if (add.field != .u64 and add.field != .i64) return .field_invalid;
+    if (add.offset > value_size - 8) return .field_invalid;
+    if (!add.flags.min and add.min != 0) return .field_invalid;
+    if (!add.flags.max and add.max != 0) return .field_invalid;
+    if (add.flags.min and add.flags.max) {
+        const ordered = switch (add.field) {
+            .u64 => add.min <= add.max,
+            .i64 => @as(i64, @bitCast(add.min)) <= @as(i64, @bitCast(add.max)),
+            _ => unreachable,
+        };
+        if (!ordered) return .field_invalid;
+    }
+    // So that any amount applied can be negated (`delta_from`).
+    if (add.delta == std.math.minInt(i64)) return .field_invalid;
+    if (add.flags.delta_from) {
+        if (add.delta != 0) return .delta_from_invalid;
+    } else {
+        if (add.delta_from != 0) return .delta_from_invalid;
+    }
+    return null;
+}
+
+/// The amount an add applies to a field holding `old`, given its (resolved) `delta`, or null if
+/// it would cross a bound without `clamp`. Pure: the state machine, the VOPR model and tests
+/// share it.
+pub fn add_amount(add: *const Add, old: u64, delta: i64) ?i64 {
+    assert(delta != std.math.minInt(i64));
+    if (delta == 0) return 0;
+    const old_wide: i128 = switch (add.field) {
+        .u64 => old,
+        .i64 => @as(i64, @bitCast(old)),
+        _ => unreachable,
+    };
+    // The bound in the direction of the move.
+    const bound: i128 = if (delta > 0) switch (add.field) {
+        .u64 => if (add.flags.max) add.max else std.math.maxInt(u64),
+        .i64 => if (add.flags.max) @as(i64, @bitCast(add.max)) else std.math.maxInt(i64),
+        _ => unreachable,
+    } else switch (add.field) {
+        .u64 => if (add.flags.min) add.min else 0,
+        .i64 => if (add.flags.min) @as(i64, @bitCast(add.min)) else std.math.minInt(i64),
+        _ => unreachable,
+    };
+    // Room left before the bound, never negative: a field already past it can move back.
+    const room: i128 = @max(0, if (delta > 0) bound - old_wide else old_wide - bound);
+    const magnitude: i128 = @abs(delta);
+    if (magnitude <= room) return delta;
+    if (!add.flags.clamp) return null;
+    const applied: i64 = @intCast(room);
+    return if (delta > 0) applied else -applied;
+}
+
+/// The field's bits after adding `applied` (as returned by `add_amount`).
+pub fn add_apply(add: *const Add, old: u64, applied: i64) u64 {
+    return switch (add.field) {
+        .u64 => @intCast(@as(i128, old) + applied),
+        .i64 => @bitCast(@as(i64, @intCast(@as(i128, @as(i64, @bitCast(old))) + applied))),
+        _ => unreachable,
+    };
 }
 
 test entry_validate {
@@ -387,6 +531,107 @@ test entry_validate {
     entry = valid_read;
     entry.kind = @enumFromInt(9);
     try std.testing.expectEqual(EntryStatus.kind_invalid, entry_validate(&entry).?);
+}
+
+test add_validate {
+    const valid: Add = .{
+        .delta = 5,
+        .min = 0,
+        .max = 0,
+        .delta_from = 0,
+        .offset = 72,
+        .field = .u64,
+        .flags = .{},
+    };
+    const entry_valid: Entry = .{
+        .id = 1,
+        .table = 1,
+        .kind = .add,
+        .op_seen = 0,
+        .value = valid.value(),
+    };
+    try std.testing.expectEqual(null, entry_validate(&entry_valid));
+
+    var entry = entry_valid;
+    entry.op_seen = 1;
+    try std.testing.expectEqual(EntryStatus.op_seen_not_zero, entry_validate(&entry).?);
+
+    const Case = struct { add: Add, status: EntryStatus };
+    var cases: [9]Case = @splat(.{ .add = valid, .status = .field_invalid });
+    cases[0].add.offset = 73;
+    cases[1].add.field = @enumFromInt(3);
+    cases[2].add.min = 1; // Without `flags.min`.
+    cases[3].add.flags = .{ .min = true, .max = true };
+    cases[3].add.min = 2;
+    cases[3].add.max = 1;
+    cases[4].add.field = .i64;
+    cases[4].add.flags = .{ .min = true, .max = true };
+    cases[4].add.min = @bitCast(@as(i64, 1));
+    cases[4].add.max = @bitCast(@as(i64, -1));
+    cases[5].add.delta = std.math.minInt(i64);
+    cases[6].add.flags = .{ .delta_from = true }; // With a delta.
+    cases[6].status = .delta_from_invalid;
+    cases[7].add.delta_from = 1; // Without `flags.delta_from`.
+    cases[7].status = .delta_from_invalid;
+    cases[8].add.reserved_b[47] = 1;
+    cases[8].status = .reserved_not_zero;
+    for (cases) |case| {
+        entry.op_seen = 0;
+        entry.value = case.add.value();
+        try std.testing.expectEqual(case.status, entry_validate(&entry).?);
+    }
+}
+
+test add_amount {
+    const u: Add = .{
+        .delta = 0,
+        .min = 0,
+        .max = 0,
+        .delta_from = 0,
+        .offset = 0,
+        .field = .u64,
+        .flags = .{},
+    };
+    // Within range, and past the type's range.
+    try std.testing.expectEqual(@as(?i64, 5), add_amount(&u, 10, 5));
+    try std.testing.expectEqual(@as(?i64, -10), add_amount(&u, 10, -10));
+    try std.testing.expectEqual(@as(?i64, null), add_amount(&u, 10, -11));
+    try std.testing.expectEqual(@as(?i64, null), add_amount(&u, std.math.maxInt(u64), 1));
+    try std.testing.expectEqual(@as(?i64, 0), add_amount(&u, 3, 0));
+
+    // "Reserve up to 30 from 20": clamped at the minimum.
+    var reserve = u;
+    reserve.flags = .{ .min = true, .clamp = true };
+    try std.testing.expectEqual(@as(?i64, -20), add_amount(&reserve, 20, -30));
+    try std.testing.expectEqual(@as(?i64, -5), add_amount(&reserve, 20, -5));
+    try std.testing.expectEqual(@as(?i64, 0), add_amount(&reserve, 0, -5));
+
+    // Only the bound in the direction of the move applies: a field below its minimum can rise.
+    var bounded = u;
+    bounded.flags = .{ .min = true, .max = true };
+    bounded.min = 10;
+    bounded.max = 20;
+    try std.testing.expectEqual(@as(?i64, 3), add_amount(&bounded, 2, 3));
+    try std.testing.expectEqual(@as(?i64, null), add_amount(&bounded, 2, -1));
+    try std.testing.expectEqual(@as(?i64, null), add_amount(&bounded, 18, 3));
+    bounded.flags.clamp = true;
+    try std.testing.expectEqual(@as(?i64, 2), add_amount(&bounded, 18, 3));
+    try std.testing.expectEqual(@as(?i64, 0), add_amount(&bounded, 25, 3));
+
+    // i64: negative values, and both ends of the range.
+    var signed = u;
+    signed.field = .i64;
+    const minus_five: u64 = @bitCast(@as(i64, -5));
+    try std.testing.expectEqual(@as(?i64, -10), add_amount(&signed, minus_five, -10));
+    const minus_fifteen: u64 = @bitCast(@as(i64, -15));
+    try std.testing.expectEqual(minus_fifteen, add_apply(&signed, minus_five, -10));
+    const max: u64 = @bitCast(@as(i64, std.math.maxInt(i64)));
+    try std.testing.expectEqual(@as(?i64, null), add_amount(&signed, max, 1));
+    const min: u64 = @bitCast(@as(i64, std.math.minInt(i64)));
+    try std.testing.expectEqual(@as(?i64, null), add_amount(&signed, min, -1));
+    signed.flags = .{ .min = true, .clamp = true };
+    signed.min = @bitCast(@as(i64, -100));
+    try std.testing.expectEqual(@as(?i64, -95), add_amount(&signed, minus_five, -1000));
 }
 
 test row_key {

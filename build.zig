@@ -234,13 +234,19 @@ pub fn build(b: *std.Build) !void {
     run_integration_tests.has_side_effects = true; // Never cache: it runs real processes.
     steps.test_integration.dependOn(&run_integration_tests.step);
 
-    // zig build test:api: the JSON API against a model.
-    const run_api_test = b.addSystemCommand(&.{ "python3", "tests/api/api.py" });
-    run_api_test.addFileArg(nerva.getEmittedBin());
-    if (b.args) |args| run_api_test.addArgs(args);
-    run_api_test.setCwd(b.path("."));
-    run_api_test.has_side_effects = true;
-    steps.test_api.dependOn(&run_api_test.step);
+    // zig build test:api: the JSON API against a model, then adds (one after the other: each
+    // runs a cluster).
+    var api_previous: ?*std.Build.Step = null;
+    for ([_][]const u8{ "api.py", "adds.py" }) |script| {
+        const run_api_test = b.addSystemCommand(&.{ "python3", b.fmt("tests/api/{s}", .{script}) });
+        run_api_test.addFileArg(nerva.getEmittedBin());
+        if (b.args) |args| run_api_test.addArgs(args);
+        run_api_test.setCwd(b.path("."));
+        run_api_test.has_side_effects = true;
+        if (api_previous) |previous| run_api_test.step.dependOn(previous);
+        api_previous = &run_api_test.step;
+        steps.test_api.dependOn(&run_api_test.step);
+    }
 
     // zig build test:views: declared views against a model.
     const run_views_test = b.addSystemCommand(&.{ "python3", "tests/views/declared.py" });

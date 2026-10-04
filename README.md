@@ -64,12 +64,21 @@ stay exact. Four operations:
 | Operation | Event → result | Semantics |
 |---|---|---|
 | `lookup_rows` | `RowKey` → `RowValue` | Point reads: value, `exists`, and version. |
-| `commit` | `Entry` → `EntryResult` | One batch is one transaction of `read` (asserts `op_seen`), `put` and `delete` entries. If any read is stale (`conflict`) or any entry invalid, nothing applies and the other entries report `aborted`; otherwise every entry reports `ok` with the commit op. |
+| `commit` | `Entry` → `EntryResult` | One batch is one transaction of `read` (asserts `op_seen`), `put`, `delete` and `add` entries. If any read is stale (`conflict`), any add cannot apply, or any entry is invalid, nothing applies and the other entries report `aborted`; otherwise every entry reports `ok` with the commit op, and each add what it applied and the field's new value. |
 | `get_changes` | `ChangesFilter` → `Change[]` | Committed writes in op order from a timestamp cursor, ending with an `end` record that carries the next cursor and, when complete, the op the feed reflects. |
 | `get_history` | `HistoryFilter` → `Change[]` | One row's writes, newest first, through an index on the change feed. With `op_max = N`, the first change returned is the row as of op `N` (`Client.row_as_of`). |
 
 Commits execute serially in op order, so validating each read's version at commit time gives
-serializable transactions over point reads. The VOPR workload checks every reply against an
+serializable transactions over point reads.
+
+An **add** changes one 64-bit field (`u64` or `i64`, at a byte offset) inside the commit, with
+no read: adds to one row never conflict, they apply in log order. An add never moves a field
+past a bound (`min`, `max`, or the type's range) in the direction it moves: it fails the
+transaction with `out_of_bounds`, or with `clamp` adds as much as fits. `delta_from` moves what
+an earlier add of the transaction applied, so "reserve up to 30, and hold what was taken" is two
+adds that can never overdraw and never retry. A row that does not exist is `row_absent` unless
+the add has `create`. Each add is an ordinary change in the feed (the whole new row), so
+history, as-of reads and views see it like a put. The VOPR workload checks every reply against an
 in-memory model replayed in op order.
 
 ## Building
@@ -122,7 +131,7 @@ curl -H 'X-Nerva-Key: secret' -d '{"entries":[{"kind":"put","table":1,"id":"5","
 | Route | Does |
 |---|---|
 | `POST /v1/lookup` `{"rows":[{"table","id"}]}` | Point reads: `exists`, version `op`, `value_hex`, and the `op` read at. |
-| `POST /v1/commit` `{"entries":[…]}` | One transaction of `read` (with `op_seen`), `put` (with `value_hex`) and `delete`. `200` committed with its `op`; `409` conflict with the stale entry's `index` and the row's current `op`; `400` invalid. |
+| `POST /v1/commit` `{"entries":[…]}` | One transaction of `read` (with `op_seen`), `put` (with `value_hex`), `delete` and `add` (`field`, or `offset` and `type`; `delta` or `delta_from`; optional `min`, `max`, `clamp`, `create`). `200` committed with its `op` and each add's `applied` and `value`; `409` conflict with the stale entry's `index` and the row's current `op`, or `out_of_bounds` (with the field's `value`) or `row_absent` for an add; `400` invalid. |
 | `GET /v1/changes?cursor=&limit=` | The change feed, paged. |
 | `GET /v1/history?table=&id=&op_max=&cursor=&limit=` | One row's writes, newest first, up to `op_max`. |
 | `GET /v1/row?table=&id=&as_of=` | One row as it was at an op (refused for an op not yet committed). |
@@ -131,7 +140,8 @@ curl -H 'X-Nerva-Key: secret' -d '{"entries":[{"kind":"put","table":1,"id":"5","
 
 64-bit numbers (ids, ops, cursors) are decimal strings; values are the 80 bytes as hex. Layouts
 live in the log, in a reserved catalog table; the core still stores bytes and never reads them.
-`zig build test:api` checks every route against a model, and races eight writers on one row.
+`zig build test:api` checks every route against a model, races eight writers on one row, and
+races fifty reservations on one budget with adds (none retried).
 
 ## Declared views
 

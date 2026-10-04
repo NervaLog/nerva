@@ -6,6 +6,10 @@
 //! checker asserts, independently of the model, that every receipt's sequence advances by exactly
 //! one per winning claim, so no (receipt, seq) is ever claimed twice.
 //!
+//! And it plays hot budgets (G8, N42): clients fund, reserve and release against a few shared
+//! budgets with adds only (no reads), never conflicting. The checker asserts, independently of
+//! the model, that each budget's available plus held equals what was funded, after every add.
+//!
 //! The simulator delivers replies in op order, so the workload checks each reply against an
 //! in-memory model of the committed state at that op: every status, version, value and change
 //! must match exactly. This checks strict serializability of commits and the change feed.
@@ -24,6 +28,7 @@ const MultiBatchEncoder = vsr.multi_batch.MultiBatchEncoder;
 const Entry = nerva.Entry;
 const EntryResult = nerva.EntryResult;
 const EntryStatus = nerva.EntryStatus;
+const Add = nerva.Add;
 const RowKey = nerva.RowKey;
 const RowValue = nerva.RowValue;
 const Change = nerva.Change;
@@ -76,6 +81,43 @@ pub fn receipt_claim(id: u64, op_seen: u64, seq_seen: u64, owner: u64) [2]Entry 
     };
 }
 
+/// The table holding hot budgets: `available` at offset 0, `held` at offset 8 (u64s).
+pub const budgets_table: u32 = 101;
+
+fn budget_add(id: u64, offset: u8, delta: i64, delta_from: ?u32) Entry {
+    const parameters: Add = .{
+        .delta = delta,
+        .min = 0,
+        .max = 0,
+        .delta_from = delta_from orelse 0,
+        .offset = offset,
+        .field = .u64,
+        // Clamped at the type's minimum (zero): a reservation takes what there is.
+        .flags = .{ .clamp = true, .create = true, .delta_from = delta_from != null },
+    };
+    return .{
+        .id = id,
+        .table = budgets_table,
+        .kind = .add,
+        .op_seen = 0,
+        .value = parameters.value(),
+    };
+}
+
+/// A signed integer in `[min, max]` (the PRNG draws unsigned ones).
+fn signed_range(prng: *stdx.PRNG, min: i64, max: i64) i64 {
+    assert(min <= max);
+    const span: u64 = @intCast(@as(i128, max) - min);
+    return @intCast(@as(i128, min) + prng.int_inclusive(u64, span));
+}
+
+fn budget_is(entries: []const Entry) bool {
+    for (entries) |*entry| {
+        if (entry.table != budgets_table) return false;
+    }
+    return entries.len > 0;
+}
+
 fn receipt_claim_is(entries: []const Entry) bool {
     return entries.len == 2 and
         entries[0].table == receipts_table and entries[0].kind == .read and
@@ -95,7 +137,13 @@ pub fn WorkloadType(comptime StateMachine: type) type {
             value: [value_size]u8,
         };
 
-        const Failure = struct { index: usize, status: EntryStatus, op: u64 };
+        const Failure = struct { index: usize, status: EntryStatus, op: u64, value: u64 = 0 };
+        /// An add's expected result.
+        const Expected = struct { applied: i64 = 0, value: u64 = 0 };
+        const transaction_entries_max = 64;
+
+        /// Per hot budget, from the adds' results alone: what was funded, and where it is.
+        const Budget = struct { funded: u64 = 0, available: u64 = 0, held: u64 = 0 };
 
         allocator: std.mem.Allocator,
         prng: *stdx.PRNG,
@@ -121,6 +169,13 @@ pub fn WorkloadType(comptime StateMachine: type) type {
         history_returned: u64 = 0,
         history_skipped: u64 = 0,
 
+        budgets: std.AutoHashMapUnmanaged(u64, Budget) = .{},
+        budget_transactions: u64 = 0,
+        adds_applied: u64 = 0,
+        adds_clamped: u64 = 0,
+        /// Scratch: the expected results of the transaction being checked.
+        expected: [transaction_entries_max]Expected = undefined,
+
         pub const Options = struct {
             batch_size_limit: u32,
             multi_batch_per_request_limit: u32,
@@ -133,6 +188,8 @@ pub fn WorkloadType(comptime StateMachine: type) type {
             invalid_entry_probability: stdx.PRNG.Ratio,
             /// Few receipts, so that claims contend.
             receipt_count: u64,
+            /// Few budgets, so that adds contend.
+            budget_count: u64,
 
             pub fn generate(prng: *stdx.PRNG, options: struct {
                 batch_size_limit: u32,
@@ -149,6 +206,7 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                     .stale_read_probability = stdx.PRNG.ratio(prng.int_inclusive(u64, 20), 100),
                     .invalid_entry_probability = stdx.PRNG.ratio(prng.int_inclusive(u64, 3), 100),
                     .receipt_count = prng.range_inclusive(u64, 1, 4),
+                    .budget_count = prng.range_inclusive(u64, 1, 3),
                 };
             }
         };
@@ -162,13 +220,15 @@ pub fn WorkloadType(comptime StateMachine: type) type {
             assert(options.id_count > 0);
             assert(options.entries_per_transaction_max > 0);
             assert(options.receipt_count > 0);
+            assert(options.budget_count > 0);
+            assert(options.entries_per_transaction_max <= transaction_entries_max);
             assert(options.table_count < receipts_table);
             return .{ .allocator = allocator, .prng = prng, .options = options };
         }
 
         pub fn deinit(workload: *Workload, allocator: std.mem.Allocator) void {
             log.info("transactions committed={} failed={} changes={} claims won={} lost={} " ++
-                "history returned={} skipped={}", .{
+                "history returned={} skipped={} budget transactions={} adds={} clamped={}", .{
                 workload.transactions_committed,
                 workload.transactions_failed,
                 workload.changes.items.len,
@@ -176,7 +236,11 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                 workload.claims_lost,
                 workload.history_returned,
                 workload.history_skipped,
+                workload.budget_transactions,
+                workload.adds_applied,
+                workload.adds_clamped,
             });
+            workload.budgets.deinit(allocator);
             workload.receipt_seqs.deinit(allocator);
             workload.rows.deinit(allocator);
             workload.changes.deinit(allocator);
@@ -197,6 +261,7 @@ pub fn WorkloadType(comptime StateMachine: type) type {
             return switch (workload.prng.chances(.{
                 .commit = 8,
                 .claim = 4,
+                .budget = 4,
                 .lookup_rows = 3,
                 .get_changes = 2,
                 .get_history = 2,
@@ -205,6 +270,10 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                 .claim => .{
                     .operation = .commit,
                     .size = workload.build_claims(body_limited, client_index),
+                },
+                .budget => .{
+                    .operation = .commit,
+                    .size = workload.build_budgets(body_limited),
                 },
                 .lookup_rows => .{
                     .operation = .lookup_rows,
@@ -275,6 +344,40 @@ pub fn WorkloadType(comptime StateMachine: type) type {
             return encoder.finish();
         }
 
+        /// One budget transaction per batch: fund, reserve (take up to X from available, hold
+        /// what was taken) or release (the reverse). Adds only: they never conflict.
+        fn build_budgets(workload: *Workload, body: []align(constants.cache_line_size) u8) usize {
+            const prng = workload.prng;
+            var encoder = MultiBatchEncoder.init(body, .{ .element_size = @sizeOf(Entry) });
+            const batch_count = prng.range_inclusive(
+                u32,
+                1,
+                workload.options.multi_batch_per_request_limit,
+            );
+            for (0..batch_count) |_| {
+                const writable = encoder.writable() orelse break;
+                const entries_free = stdx.bytes_as_slice(.inexact, Entry, writable);
+                if (entries_free.len < 2) {
+                    encoder.add(0);
+                    break;
+                }
+                const id = prng.int_inclusive(u64, workload.options.budget_count - 1);
+                const amount: i64 = @intCast(prng.range_inclusive(u64, 1, 1000));
+                const entries: []const Entry = switch (prng.chances(.{
+                    .fund = 1,
+                    .reserve = 4,
+                    .release = 3,
+                })) {
+                    .fund => &.{budget_add(id, 0, amount, null)},
+                    .reserve => &.{ budget_add(id, 0, -amount, null), budget_add(id, 8, 0, 0) },
+                    .release => &.{ budget_add(id, 8, -amount, null), budget_add(id, 0, 0, 0) },
+                };
+                stdx.copy_disjoint(.inexact, Entry, entries_free, entries);
+                encoder.add(@intCast(entries.len * @sizeOf(Entry)));
+            }
+            return encoder.finish();
+        }
+
         fn build_transaction(workload: *Workload, entries: []Entry) void {
             const prng = workload.prng;
             for (entries, 0..) |*entry, index| {
@@ -284,28 +387,31 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                     .read = 4,
                     .put = 4,
                     .delete = 1,
+                    .add = 3,
                 })) {
                     .read => .read,
                     .put => .put,
                     .delete => .delete,
+                    .add => .add,
                 };
 
-                // Keep duplicate writes rare: they abort the whole transaction.
+                // Keep duplicate writes rare: they abort the whole transaction. (Several adds to
+                // one row are not duplicates.)
                 if (kind != .read and !prng.chance(stdx.PRNG.ratio(1, 50))) {
                     for (entries[0..index]) |*previous| {
                         // Not `row_key()`: an earlier entry may have been made invalid.
                         if (previous.kind != .read and previous.table == table and
-                            previous.id == id)
+                            previous.id == id and !(previous.kind == .add and kind == .add))
                         {
                             entry.* = workload.entry_read(table, id);
                             break;
                         }
-                    } else entry.* = workload.entry_write(kind, table, id);
+                    } else entry.* = workload.entry_write(kind, table, id, entries[0..index]);
                 } else {
                     entry.* = if (kind == .read)
                         workload.entry_read(table, id)
                     else
-                        workload.entry_write(kind, table, id);
+                        workload.entry_write(kind, table, id, entries[0..index]);
                 }
 
                 if (prng.chance(workload.options.invalid_entry_probability)) {
@@ -313,7 +419,7 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                         .table => entry.table = 0,
                         .reserved => entry.reserved_b = 1,
                         .value => entry.value[prng.index(&entry.value)] = 1,
-                        .kind => entry.kind = @enumFromInt(prng.range_inclusive(u8, 4, 255)),
+                        .kind => entry.kind = @enumFromInt(prng.range_inclusive(u8, 5, 255)),
                     }
                 }
             }
@@ -334,8 +440,14 @@ pub fn WorkloadType(comptime StateMachine: type) type {
             };
         }
 
-        fn entry_write(workload: *Workload, kind: nerva.EntryKind, table: u32, id: u64) Entry {
-            assert(kind == .put or kind == .delete);
+        fn entry_write(
+            workload: *Workload,
+            kind: nerva.EntryKind,
+            table: u32,
+            id: u64,
+            previous: []const Entry,
+        ) Entry {
+            assert(kind == .put or kind == .delete or kind == .add);
             var entry: Entry = .{
                 .id = id,
                 .table = table,
@@ -343,8 +455,65 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                 .op_seen = 0,
                 .value = @splat(0),
             };
-            if (kind == .put) workload.prng.fill(&entry.value);
+            switch (kind) {
+                .put => workload.prng.fill(&entry.value),
+                .add => entry.value = workload.add_random(previous).value(),
+                else => {},
+            }
             return entry;
+        }
+
+        /// Random parameters, valid unless `entry_write`'s caller corrupts them: small deltas
+        /// near small bounds (so that bounds bind), sometimes huge ones (overflow).
+        fn add_random(workload: *Workload, previous: []const Entry) Add {
+            const prng = workload.prng;
+            const field: Add.AddField = if (prng.boolean()) .u64 else .i64;
+            var add: Add = .{
+                .delta = switch (prng.chances(.{ .small = 8, .huge = 1, .zero = 1 })) {
+                    .small => signed_range(prng, -100, 100),
+                    .huge => if (prng.boolean())
+                        std.math.maxInt(i64)
+                    else
+                        std.math.minInt(i64) + 1,
+                    .zero => 0,
+                },
+                .min = 0,
+                .max = 0,
+                .delta_from = 0,
+                // Mostly the first two fields, so that adds in a transaction meet.
+                .offset = if (prng.boolean())
+                    8 * prng.int_inclusive(u8, 1)
+                else
+                    prng.int_inclusive(u8, value_size - 8),
+                .field = field,
+                .flags = .{ .clamp = prng.boolean(), .create = prng.chance(stdx.PRNG.ratio(3, 4)) },
+            };
+            if (prng.chance(stdx.PRNG.ratio(1, 2))) {
+                add.flags.min = true;
+                add.min = switch (field) {
+                    .u64 => prng.int_inclusive(u64, 50),
+                    .i64 => @bitCast(signed_range(prng, -50, 0)),
+                    _ => unreachable,
+                };
+            }
+            if (prng.chance(stdx.PRNG.ratio(1, 2))) {
+                add.flags.max = true;
+                add.max = switch (field) {
+                    .u64 => prng.range_inclusive(u64, 50, 300),
+                    .i64 => @bitCast(signed_range(prng, 1, 300)),
+                    _ => unreachable,
+                };
+            }
+            // Move what an earlier add applied, mostly naming an add (else `delta_from_invalid`).
+            if (previous.len > 0 and prng.chance(stdx.PRNG.ratio(1, 4))) {
+                add.flags.delta_from = true;
+                add.delta = 0;
+                add.delta_from = @intCast(prng.index(previous));
+                for (previous, 0..) |*entry, index| {
+                    if (entry.kind == .add and prng.boolean()) add.delta_from = @intCast(index);
+                }
+            }
+            return add;
         }
 
         fn build_lookup_rows(
@@ -502,7 +671,10 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                 if (entries.len == 0) continue;
 
                 const claim = receipt_claim_is(entries);
+                const budget = budget_is(entries);
                 if (workload.commit_failure(entries)) |failure| {
+                    // Adds alone, clamped and creating, never fail (G8).
+                    assert(!budget);
                     workload.transactions_failed += 1;
                     if (claim) {
                         // Claims are always well-formed: they lose only to another claim.
@@ -514,29 +686,35 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                         if (index == failure.index) {
                             assert(result.status == failure.status);
                             assert(result.op == failure.op);
+                            assert(result.value == failure.value);
                         } else {
                             assert(result.status == .aborted);
                             assert(result.op == 0);
+                            assert(result.value == 0);
                         }
+                        assert(result.applied == 0);
                     }
                     continue;
                 }
 
                 workload.transactions_committed += 1;
                 const op = results[0].op;
-                for (results) |result| {
+                for (results, workload.expected[0..results.len]) |result, expected| {
                     assert(result.status == .ok);
                     assert(result.op == op);
+                    assert(result.applied == expected.applied);
+                    assert(result.value == expected.value);
                 }
                 if (op_request) |op_request_| assert(op == op_request_);
                 assert(op > workload.op_max);
                 op_request = op;
 
                 if (claim) workload.check_claim_won(&entries[1]);
+                if (budget) workload.check_budget(entries, results);
 
-                for (entries, 0..) |*entry, index| {
+                for (entries, results, 0..) |*entry, *result, index| {
                     const entry_timestamp = batch_timestamp - entries.len + index + 1;
-                    workload.apply(op, entry_timestamp, entry);
+                    workload.apply(op, entry_timestamp, entry, result);
                 }
             }
             assert(reply.pop() == null);
@@ -555,19 +733,59 @@ pub fn WorkloadType(comptime StateMachine: type) type {
             workload.claims_won += 1;
         }
 
-        /// The model's expectation, computed independently of the state machine.
+        /// The invariant of hot budgets, from the adds' results alone (independent of the row
+        /// model): every add moves money within one budget, or funds it, and available plus
+        /// held is always what was funded.
+        fn check_budget(
+            workload: *Workload,
+            entries: []const Entry,
+            results: []const EntryResult,
+        ) void {
+            workload.budget_transactions += 1;
+            const id = entries[0].id;
+            const entry = workload.budgets.getOrPut(workload.allocator, id) catch @panic("OOM");
+            if (!entry.found_existing) entry.value_ptr.* = .{};
+            const budget = entry.value_ptr;
+            for (entries, results) |*add_entry, result| {
+                assert(add_entry.id == id);
+                const add = Add.from_entry(add_entry);
+                const field = if (add.offset == 0) &budget.available else &budget.held;
+                field.* = nerva.add_apply(&add, field.*, result.applied);
+                assert(result.value == field.*);
+                if (entries.len == 1) budget.funded += @intCast(result.applied);
+            }
+            if (entries.len == 2) {
+                // What one side lost, the other gained.
+                assert(results[0].applied <= 0);
+                assert(results[1].applied == -results[0].applied);
+            }
+            assert(budget.available + budget.held == budget.funded);
+        }
+
+        /// The model's expectation, computed independently of the state machine. On success,
+        /// fills `expected` with each entry's result.
         fn commit_failure(workload: *Workload, entries: []const Entry) ?Failure {
+            assert(entries.len <= transaction_entries_max);
             for (entries, 0..) |*entry, index| {
                 if (nerva.entry_validate(entry)) |status| {
                     return .{ .index = index, .status = status, .op = 0 };
                 }
+                if (entry.kind == .add) {
+                    const add = Add.from_entry(entry);
+                    if (add.flags.delta_from and (add.delta_from >= index or
+                        entries[add.delta_from].kind != .add))
+                    {
+                        return .{ .index = index, .status = .delta_from_invalid, .op = 0 };
+                    }
+                }
             }
-            // The earliest write whose row an earlier write already wrote.
+            // The earliest write whose row an earlier write already wrote (adds may share one).
             for (entries, 0..) |*entry, index| {
                 if (entry.kind == .read) continue;
                 for (entries[0..index]) |*previous| {
                     if (previous.kind != .read and previous.table == entry.table and
-                        previous.id == entry.id)
+                        previous.id == entry.id and
+                        !(previous.kind == .add and entry.kind == .add))
                     {
                         return .{ .index = index, .status = .write_duplicate, .op = 0 };
                     }
@@ -580,21 +798,90 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                     return .{ .index = index, .status = .conflict, .op = version.op };
                 }
             }
+            // Adds in order, each seeing the earlier adds of the transaction to its row.
+            const expected = workload.expected[0..entries.len];
+            @memset(expected, .{});
+            for (entries, 0..) |*entry, index| {
+                if (entry.kind != .add) continue;
+                const add = Add.from_entry(entry);
+                // The row before this add: the last earlier add to it, else the model.
+                const earlier: ?usize = for (0..index) |i| {
+                    const j = index - 1 - i;
+                    if (entries[j].kind == .add and entries[j].table == entry.table and
+                        entries[j].id == entry.id) break j;
+                } else null;
+                var row: [value_size]u8 = if (earlier) |j|
+                    workload.add_row(entries[0 .. j + 1], j)
+                else row: {
+                    const version = workload.row_version(nerva.row_key(entry.table, entry.id));
+                    if (!version.exists and !add.flags.create) {
+                        return .{ .index = index, .status = .row_absent, .op = 0 };
+                    }
+                    break :row version.value;
+                };
+                const old = std.mem.readInt(u64, row[add.offset..][0..8], .little);
+                const delta = if (add.flags.delta_from)
+                    -expected[add.delta_from].applied
+                else
+                    add.delta;
+                const applied = nerva.add_amount(&add, old, delta) orelse
+                    return .{ .index = index, .status = .out_of_bounds, .op = 0, .value = old };
+                expected[index] = .{
+                    .applied = applied,
+                    .value = nerva.add_apply(&add, old, applied),
+                };
+                std.mem.writeInt(u64, row[add.offset..][0..8], expected[index].value, .little);
+            }
             return null;
         }
 
-        fn apply(workload: *Workload, op: u64, timestamp: u64, entry: *const Entry) void {
+        /// The row as the adds `entries[..=last]` to its row left it (`expected` filled in for
+        /// them), starting from the model.
+        fn add_row(workload: *Workload, entries: []const Entry, last: usize) [value_size]u8 {
+            const table = entries[last].table;
+            const id = entries[last].id;
+            var row = workload.row_version(nerva.row_key(table, id)).value;
+            for (entries, 0..) |*entry, index| {
+                if (entry.kind != .add or entry.table != table or entry.id != id) continue;
+                const add = Add.from_entry(entry);
+                const field = row[add.offset..][0..8];
+                std.mem.writeInt(u64, field, workload.expected[index].value, .little);
+            }
+            return row;
+        }
+
+        fn apply(
+            workload: *Workload,
+            op: u64,
+            timestamp: u64,
+            entry: *const Entry,
+            result: *const EntryResult,
+        ) void {
             const key = nerva.row_key(entry.table, entry.id);
             const change_kind: nerva.ChangeKind = switch (entry.kind) {
                 .read => return,
-                .put => .put,
+                .put, .add => .put,
                 .delete => kind: {
                     if (!workload.row_version(key).exists) return; // No-op.
                     break :kind .delete;
                 },
                 _ => unreachable,
             };
-            const value: [value_size]u8 = if (change_kind == .put) entry.value else @splat(0);
+            const value: [value_size]u8 = switch (entry.kind) {
+                .put => entry.value,
+                .delete => @splat(0),
+                .add => value: {
+                    const add = Add.from_entry(entry);
+                    var value = workload.row_version(key).value;
+                    std.mem.writeInt(u64, value[add.offset..][0..8], result.value, .little);
+                    workload.adds_applied += 1;
+                    if (result.applied != add.delta and !add.flags.delta_from) {
+                        workload.adds_clamped += 1;
+                    }
+                    break :value value;
+                },
+                else => unreachable,
+            };
             workload.rows.put(workload.allocator, key, .{
                 .op = op,
                 .exists = change_kind == .put,

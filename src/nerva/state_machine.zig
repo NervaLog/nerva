@@ -31,6 +31,7 @@ const Row = nerva.Row;
 const Entry = nerva.Entry;
 const EntryResult = nerva.EntryResult;
 const EntryStatus = nerva.EntryStatus;
+const Add = nerva.Add;
 const RowKey = nerva.RowKey;
 const RowValue = nerva.RowValue;
 const Change = nerva.Change;
@@ -136,7 +137,7 @@ pub fn StateMachineType(comptime Storage: type) type {
         /// The first write of a transaction that duplicates an earlier write's row.
         const WriteKey = struct { key: u128, index: u32 };
 
-        const Failure = struct { index: u32, status: EntryStatus, op: u64 };
+        const Failure = struct { index: u32, status: EntryStatus, op: u64, value: u64 = 0 };
 
         batch_size_limit: u32,
         forest: Forest,
@@ -160,6 +161,9 @@ pub fn StateMachineType(comptime Storage: type) type {
 
         /// Scratch space for duplicate-write detection.
         write_keys: []WriteKey,
+        /// Scratch space for resolving one transaction's adds: each added row's value so far.
+        /// Looked up by key only, never iterated (determinism).
+        add_rows: std.AutoHashMapUnmanaged(u128, [nerva.value_size]u8) = .{},
 
         forest_callback: ?*const fn (*StateMachine) void = null,
 
@@ -224,9 +228,13 @@ pub fn StateMachineType(comptime Storage: type) type {
 
             self.write_keys = try allocator.alloc(WriteKey, commit_entries_limit);
             errdefer allocator.free(self.write_keys);
+
+            try self.add_rows.ensureTotalCapacity(allocator, commit_entries_limit);
+            errdefer self.add_rows.deinit(allocator);
         }
 
         pub fn deinit(self: *StateMachine, allocator: std.mem.Allocator) void {
+            self.add_rows.deinit(allocator);
             allocator.free(self.write_keys);
             allocator.free(self.changes_scan_buffer);
             self.forest.deinit(allocator);
@@ -239,7 +247,9 @@ pub fn StateMachineType(comptime Storage: type) type {
                 .forest = self.forest,
                 .changes_scan_buffer = self.changes_scan_buffer,
                 .write_keys = self.write_keys,
+                .add_rows = self.add_rows,
             };
+            self.add_rows.clearRetainingCapacity();
         }
 
         pub fn open(self: *StateMachine, callback: *const fn (*StateMachine) void) void {
@@ -676,25 +686,29 @@ pub fn StateMachineType(comptime Storage: type) type {
             const results = stdx.bytes_as_slice(.inexact, EntryResult, output)[0..entries.len];
             assert(entries.len <= self.write_keys.len);
 
-            if (self.commit_failure(entries)) |failure| {
+            // Resolving the adds fills in each add's result (`applied`, `value`).
+            const failure = self.commit_failure(entries) orelse self.adds_resolve(entries, results);
+            if (failure) |f| {
                 for (results, 0..) |*result, index| {
-                    result.* = if (index == failure.index)
-                        .{ .status = failure.status, .op = failure.op }
+                    result.* = if (index == f.index)
+                        .{ .status = f.status, .op = f.op, .value = f.value }
                     else
                         .{ .status = .aborted, .op = 0 };
                 }
             } else {
-                for (entries, 0..) |*entry, index| {
+                for (entries, results, 0..) |*entry, *result, index| {
                     const entry_timestamp = timestamp - entries.len + index + 1;
                     assert(TimestampRange.valid(entry_timestamp));
+                    assert(result.status == .ok);
                     switch (entry.kind) {
                         .read => {},
-                        .put => self.row_put(op, entry_timestamp, entry),
+                        .put => self.row_put(op, entry_timestamp, entry, &entry.value),
                         .delete => self.row_delete(op, entry_timestamp, entry),
+                        .add => self.row_add(op, entry_timestamp, entry, result),
                         _ => unreachable, // Rejected by `entry_validate()`.
                     }
+                    result.op = op;
                 }
-                @memset(results, .{ .status = .ok, .op = op });
             }
             return entries.len * @sizeOf(EntryResult);
         }
@@ -705,6 +719,18 @@ pub fn StateMachineType(comptime Storage: type) type {
             for (entries, 0..) |*entry, index| {
                 if (nerva.entry_validate(entry)) |status| {
                     return .{ .index = @intCast(index), .status = status, .op = 0 };
+                }
+                if (entry.kind == .add) {
+                    const add = Add.from_entry(entry);
+                    if (add.flags.delta_from and (add.delta_from >= index or
+                        entries[add.delta_from].kind != .add))
+                    {
+                        return .{
+                            .index = @intCast(index),
+                            .status = .delta_from_invalid,
+                            .op = 0,
+                        };
+                    }
                 }
             }
             if (self.write_duplicate(entries)) |index| {
@@ -744,6 +770,8 @@ pub fn StateMachineType(comptime Storage: type) type {
             for (write_keys[0..count -| 1], write_keys[@min(1, count)..]) |a, b| {
                 if (a.key != b.key) continue;
                 assert(a.index < b.index);
+                // Several adds may change one row; a put or delete must be its only write.
+                if (entries[a.index].kind == .add and entries[b.index].kind == .add) continue;
                 duplicate = @min(duplicate orelse b.index, b.index);
             }
             return duplicate;
@@ -757,8 +785,14 @@ pub fn StateMachineType(comptime Storage: type) type {
             };
         }
 
-        fn row_put(self: *StateMachine, op: u64, timestamp: u64, entry: *const Entry) void {
-            assert(entry.kind == .put);
+        fn row_put(
+            self: *StateMachine,
+            op: u64,
+            timestamp: u64,
+            entry: *const Entry,
+            value: *const [nerva.value_size]u8,
+        ) void {
+            assert(entry.kind == .put or entry.kind == .add);
             const rows = &self.forest.grooves.rows;
             const key = nerva.row_key(entry.table, entry.id);
             switch (rows.get(key)) {
@@ -766,20 +800,96 @@ pub fn StateMachineType(comptime Storage: type) type {
                     // Equal when an earlier transaction in the same request wrote the row.
                     assert(row_old.op <= op);
                     var row_new = row_old;
-                    row_new.value = entry.value;
+                    row_new.value = value.*;
                     row_new.op = op;
                     row_new.flags.deleted = false;
-                    rows.update(.{ .old = &row_old, .new = &row_new });
+                    // Unchanged when an earlier write in the same op left the same bytes (the
+                    // groove refuses a no-op update); the change is still recorded.
+                    if (!stdx.equal_bytes(Row, &row_old, &row_new)) {
+                        rows.update(.{ .old = &row_old, .new = &row_new });
+                    }
                 },
                 .not_found => rows.insert(&.{
                     .key = key,
-                    .value = entry.value,
+                    .value = value.*,
                     .op = op,
                     .timestamp = timestamp,
                     .flags = .{},
                 }),
             }
-            self.change_insert(op, timestamp, entry, .put);
+            self.change_insert(op, timestamp, entry, .put, value);
+        }
+
+        /// Applies an add resolved by `adds_resolve`: writes the row with the field changed, as
+        /// a put of the whole value.
+        fn row_add(
+            self: *StateMachine,
+            op: u64,
+            timestamp: u64,
+            entry: *const Entry,
+            result: *const EntryResult,
+        ) void {
+            const add = Add.from_entry(entry);
+            var value: [nerva.value_size]u8 = switch (self.forest.grooves.rows.get(
+                nerva.row_key(entry.table, entry.id),
+            )) {
+                .found_object => |row| if (row.flags.deleted) @splat(0) else row.value,
+                .not_found => @splat(0),
+            };
+            const field = value[add.offset..][0..8];
+            const old = std.mem.readInt(u64, field, .little);
+            assert(nerva.add_apply(&add, old, result.applied) == result.value);
+            std.mem.writeInt(u64, field, result.value, .little);
+            self.row_put(op, timestamp, entry, &value);
+        }
+
+        /// Resolves the transaction's adds in order against the rows (and the earlier adds of the
+        /// same transaction), without writing: the first add that cannot apply, or null with
+        /// every result `ok` and each add's `applied` and `value` filled in.
+        fn adds_resolve(
+            self: *StateMachine,
+            entries: []const Entry,
+            results: []EntryResult,
+        ) ?Failure {
+            assert(entries.len == results.len);
+            self.add_rows.clearRetainingCapacity();
+            for (entries, results, 0..) |*entry, *result, index| {
+                result.* = .{ .status = .ok, .op = 0 };
+                if (entry.kind != .add) continue;
+                const add = Add.from_entry(entry);
+
+                const key = nerva.row_key(entry.table, entry.id);
+                const row = self.add_rows.getOrPutAssumeCapacity(key);
+                if (!row.found_existing) {
+                    const rows = &self.forest.grooves.rows;
+                    const current: ?[nerva.value_size]u8 = switch (rows.get(key)) {
+                        .found_object => |found| if (found.flags.deleted) null else found.value,
+                        .not_found => null,
+                    };
+                    if (current == null and !add.flags.create) {
+                        return .{ .index = @intCast(index), .status = .row_absent, .op = 0 };
+                    }
+                    row.value_ptr.* = current orelse @splat(0);
+                }
+
+                const field = row.value_ptr[add.offset..][0..8];
+                const old = std.mem.readInt(u64, field, .little);
+                const delta = if (add.flags.delta_from) delta: {
+                    assert(add.delta_from < index);
+                    assert(entries[add.delta_from].kind == .add);
+                    break :delta -results[add.delta_from].applied;
+                } else add.delta;
+                const applied = nerva.add_amount(&add, old, delta) orelse return .{
+                    .index = @intCast(index),
+                    .status = .out_of_bounds,
+                    .op = 0,
+                    .value = old,
+                };
+                result.applied = applied;
+                result.value = nerva.add_apply(&add, old, applied);
+                std.mem.writeInt(u64, field, result.value, .little);
+            }
+            return null;
         }
 
         /// Deleting a row that does not exist (or is already deleted) is a no-op.
@@ -798,7 +908,7 @@ pub fn StateMachineType(comptime Storage: type) type {
                 },
                 .not_found => return,
             }
-            self.change_insert(op, timestamp, entry, .delete);
+            self.change_insert(op, timestamp, entry, .delete, &@splat(0));
         }
 
         fn change_insert(
@@ -807,8 +917,10 @@ pub fn StateMachineType(comptime Storage: type) type {
             timestamp: u64,
             entry: *const Entry,
             kind: nerva.ChangeKind,
+            value: *const [nerva.value_size]u8,
         ) void {
             assert(kind == .put or kind == .delete);
+            assert(kind == .put or stdx.zeroed(value));
             self.forest.grooves.changes.insert(&.{
                 .id = entry.id,
                 .table = entry.table,
@@ -816,7 +928,7 @@ pub fn StateMachineType(comptime Storage: type) type {
                 .flags = .{},
                 .op = op,
                 .timestamp = timestamp,
-                .value = if (kind == .put) entry.value else @splat(0),
+                .value = value.*,
             });
         }
 

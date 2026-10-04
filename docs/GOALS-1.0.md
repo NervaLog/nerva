@@ -99,5 +99,9 @@ holding facts, receipts and views. Nerva must support the second arrangement eit
    latest or as of any op, with a hash per answer (N34, N35); demonstrated by the seat and
    canvas demos under crashes (N36, N38).
 6. **Effect sinks** (G5) and **conditional operations for hot balances** (G8).
+   - G8 ✅ adds: bounded, clampable changes to a 64-bit field inside the commit, which never
+     conflict; `delta_from` moves exactly what an earlier add took (N42). The VOPR checks that
+     hot budgets conserve what was funded under crashes and faults. The decision whether
+     balances move to Nerva stays open.
 7. **First production use**: the dog-fooding service's facts, receipts and views on Nerva
    through the generic API, balances per the G8 decision.

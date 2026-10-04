@@ -5,7 +5,9 @@
 //!     POST /v1/lookup   {"rows": [{"table": 1, "id": "5"}, …]}
 //!     POST /v1/commit   {"entries": [{"kind": "read", "table": 1, "id": "5", "op_seen": "9"},
 //!                                    {"kind": "put", "table": 1, "id": "5", "value_hex": "…"},
-//!                                    {"kind": "delete", "table": 1, "id": "6"}]}
+//!                                    {"kind": "delete", "table": 1, "id": "6"},
+//!                                    {"kind": "add", "table": 1, "id": "7", "field": "stock",
+//!                                     "delta": "-3", "min": "0"}]}
 //!     GET  /v1/changes?cursor=<c>&limit=<n>
 //!     GET  /v1/history?table=<t>&id=<i>&op_max=<n|latest>&cursor=<c>&limit=<n>
 //!     GET  /v1/row?table=<t>&id=<i>&as_of=<op>
@@ -22,6 +24,12 @@
 //! - A commit is one transaction: `200 {"status": "committed", "op"}`, or `409 {"status":
 //!   "conflict", "index", "op"}` (the entry whose read was stale, and the row's current version),
 //!   or `400 {"error", "index"}` for an invalid entry. Nothing applies unless it committed.
+//! - An add (N42) changes one 64-bit field inside the commit, without a read: `field` (by name,
+//!   with a layout) or `offset` and `type` (`u64` or `i64`); `delta` (or `delta_from`, the index
+//!   of an earlier add whose applied amount it moves, negated); optional `min`, `max`, `clamp`
+//!   and `create`. A committed reply lists `adds`: each add's `index`, `applied` and new
+//!   `value`. An add that would cross a bound answers `409 {"status": "out_of_bounds", "index",
+//!   "value"}`; one to an absent row without `create`, `409 {"status": "row_absent", "index"}`.
 //! - A table may have a layout (`catalog.zig`, N34): then puts may give `fields` instead of
 //!   `value_hex`, and every row or change of that table also comes back with `fields`.
 //! - Tables from `catalog.tables_reserved_min` up are Nerva's own: refused here, and left out of
@@ -190,24 +198,24 @@ fn lookup(arena: std.mem.Allocator, client: anytype, layouts: anytype, body: []c
 
 fn commit(arena: std.mem.Allocator, client: anytype, layouts: anytype, body: []const u8) !Reply {
     const Request = struct {
-        entries: []const struct {
-            kind: enum { read, put, delete },
-            table: u32,
-            id: []const u8,
-            op_seen: ?[]const u8 = null,
-            value_hex: ?[]const u8 = null,
-            fields: ?std.json.Value = null,
-        },
+        entries: []const EntryRequest,
     };
     const request = try json_parse(Request, arena, body);
     if (request.entries.len == 0) return bad("entries must not be empty");
 
     const entries = try arena.alloc(Entry, request.entries.len);
-    for (entries, request.entries) |*entry, entry_request| {
+    // Per entry: an add's field type, for rendering its value.
+    const add_fields = try arena.alloc(?nerva.Add.AddField, request.entries.len);
+    for (entries, request.entries, add_fields, 0..) |*entry, entry_request, *add_field, index| {
         try table_check(entry_request.table);
         if (entry_request.kind != .put and entry_request.fields != null) {
             return bad("only a put has fields");
         }
+        if (entry_request.kind != .add and entry_request.add_fields_present()) {
+            return bad("only an add has field, offset, type, delta, min, max, clamp, create " ++
+                "or delta_from");
+        }
+        add_field.* = null;
         entry.* = .{
             .id = try u64_parse(entry_request.id, "id"),
             .table = entry_request.table,
@@ -215,6 +223,7 @@ fn commit(arena: std.mem.Allocator, client: anytype, layouts: anytype, body: []c
                 .read => .read,
                 .put => .put,
                 .delete => .delete,
+                .add => .add,
             },
             .op_seen = 0,
             .value = @splat(0),
@@ -245,6 +254,13 @@ fn commit(arena: std.mem.Allocator, client: anytype, layouts: anytype, body: []c
                 if (entry_request.op_seen != null) return bad("a delete has no op_seen");
                 if (entry_request.value_hex != null) return bad("a delete has no value_hex");
             },
+            .add => {
+                if (entry_request.op_seen != null) return bad("an add has no op_seen");
+                if (entry_request.value_hex != null) return bad("an add has no value_hex");
+                const add = try add_parse(layouts, &entry_request, entries[0..index]);
+                entry.value = add.value();
+                add_field.* = add.field;
+            },
         }
         assert(nerva.entry_validate(entry) == null);
     }
@@ -264,10 +280,21 @@ fn commit(arena: std.mem.Allocator, client: anytype, layouts: anytype, body: []c
             },
             .write_duplicate => {
                 try out.print(
-                    "{{\"error\":\"a transaction writes a row at most once\",\"index\":{}}}",
+                    "{{\"error\":\"a transaction writes a row at most once (adds aside)\"," ++
+                        "\"index\":{}}}",
                     .{index},
                 );
                 return .{ .status = 400, .body = out.items() };
+            },
+            .out_of_bounds => {
+                try out.print("{{\"status\":\"out_of_bounds\",\"index\":{},\"value\":", .{index});
+                try out.field_value(add_fields[index].?, result.value);
+                try out.raw("}");
+                return .{ .status = 409, .body = out.items() };
+            },
+            .row_absent => {
+                try out.print("{{\"status\":\"row_absent\",\"index\":{}}}", .{index});
+                return .{ .status = 409, .body = out.items() };
             },
             // Validated above: the server would be at fault.
             else => std.debug.panic("api: commit rejected entry {}: {s}", .{
@@ -279,8 +306,132 @@ fn commit(arena: std.mem.Allocator, client: anytype, layouts: anytype, body: []c
     assert(results[0].status == .ok);
     try out.raw("{\"status\":\"committed\",\"op\":");
     try out.number(results[0].op);
+    var adds: u32 = 0;
+    for (results, add_fields, 0..) |result, add_field, index| {
+        const field_type = add_field orelse continue;
+        try out.raw(if (adds == 0) ",\"adds\":[" else ",");
+        adds += 1;
+        try out.print("{{\"index\":{},\"applied\":\"{}\",\"value\":", .{ index, result.applied });
+        try out.field_value(field_type, result.value);
+        try out.raw("}");
+    }
+    if (adds > 0) try out.raw("]");
     try out.raw("}");
     return .{ .status = 200, .body = out.items() };
+}
+
+const EntryRequest = struct {
+    kind: enum { read, put, delete, add },
+    table: u32,
+    id: []const u8,
+    op_seen: ?[]const u8 = null,
+    value_hex: ?[]const u8 = null,
+    fields: ?std.json.Value = null,
+    // Adds only.
+    field: ?[]const u8 = null,
+    offset: ?u8 = null,
+    type: ?enum { u64, i64 } = null,
+    delta: ?[]const u8 = null,
+    delta_from: ?u32 = null,
+    min: ?[]const u8 = null,
+    max: ?[]const u8 = null,
+    clamp: bool = false,
+    create: bool = false,
+
+    fn add_fields_present(request: *const EntryRequest) bool {
+        return request.field != null or request.offset != null or request.type != null or
+            request.delta != null or request.delta_from != null or request.min != null or
+            request.max != null or request.clamp or request.create;
+    }
+};
+
+/// An add's parameters, checked as the state machine would (`entry_validate`, and `delta_from`
+/// against the entries before it).
+fn add_parse(layouts: anytype, request: *const EntryRequest, previous: []const Entry) !nerva.Add {
+    var add: nerva.Add = .{
+        .delta = 0,
+        .min = 0,
+        .max = 0,
+        .delta_from = 0,
+        .offset = 0,
+        .field = .u64,
+        .flags = .{ .clamp = request.clamp, .create = request.create },
+    };
+    if (request.field) |name| {
+        if (request.offset != null or request.type != null) {
+            return bad("an add has field, or offset and type, not both");
+        }
+        const layout = try layouts.get(request.table) orelse
+            return bad("field needs a layout for the table (PUT /v1/tables/<t>)");
+        const field = layout.field(name) orelse return bad("no such field");
+        add.offset = field.offset;
+        add.field = switch (field.type) {
+            .u64 => .u64,
+            .i64 => .i64,
+            else => return bad("an add's field must be u64 or i64"),
+        };
+    } else {
+        const offset = request.offset orelse return bad("an add needs field, or offset and type");
+        if (offset > value_size - 8) return bad("offset must be at most 72");
+        add.offset = offset;
+        add.field = switch (request.type orelse return bad("an add needs a type with offset")) {
+            .u64 => .u64,
+            .i64 => .i64,
+        };
+    }
+
+    if (request.delta_from) |index| {
+        if (request.delta != null) return bad("an add has delta or delta_from, not both");
+        if (index >= previous.len or previous[index].kind != .add) {
+            return bad("delta_from must be the index of an earlier add");
+        }
+        add.flags.delta_from = true;
+        add.delta_from = index;
+    } else {
+        const delta = request.delta orelse return bad("an add needs delta or delta_from");
+        add.delta = try i64_parse(delta, "delta");
+        if (add.delta == std.math.minInt(i64)) return bad("delta is out of range");
+    }
+
+    if (request.min) |text| {
+        add.flags.min = true;
+        add.min = try bound_parse(add.field, text, "min");
+    }
+    if (request.max) |text| {
+        add.flags.max = true;
+        add.max = try bound_parse(add.field, text, "max");
+    }
+    // The remaining checks (bounds in order) are `entry_validate`'s.
+    if (nerva.entry_validate(&.{
+        .id = 1,
+        .table = 1,
+        .kind = .add,
+        .op_seen = 0,
+        .value = add.value(),
+    })) |status| return switch (status) {
+        .field_invalid => bad("min must not exceed max"),
+        else => unreachable,
+    };
+    return add;
+}
+
+fn bound_parse(field: nerva.Add.AddField, text: []const u8, comptime name: []const u8) !u64 {
+    return switch (field) {
+        .u64 => try u64_parse(text, name),
+        .i64 => @bitCast(try i64_parse(text, name)),
+        _ => unreachable,
+    };
+}
+
+fn i64_parse(text: []const u8, comptime name: []const u8) error{BadRequest}!i64 {
+    const negative = text.len > 0 and text[0] == '-';
+    const magnitude = try u64_parse(if (negative) text[1..] else text, name);
+    if (negative) {
+        if (magnitude > @as(u64, std.math.maxInt(i64)) + 1) return bad(name ++ " is out of range");
+        return @intCast(-@as(i128, magnitude));
+    }
+    if (magnitude > std.math.maxInt(i64)) return bad(name ++ " is out of range");
+    return @intCast(magnitude);
 }
 
 fn changes(arena: std.mem.Allocator, client: anytype, layouts: anytype, query: []const u8) !Reply {
@@ -603,6 +754,15 @@ const Writer = struct {
     /// A 64-bit number, as a decimal string.
     fn number(writer: *Writer, value: u64) !void {
         try writer.print("\"{}\"", .{value});
+    }
+
+    /// An add's field value, as a decimal string of its type.
+    fn field_value(writer: *Writer, field: nerva.Add.AddField, bits: u64) !void {
+        switch (field) {
+            .u64 => try writer.number(bits),
+            .i64 => try writer.print("\"{}\"", .{@as(i64, @bitCast(bits))}),
+            _ => unreachable,
+        }
     }
 
     fn hex(writer: *Writer, bytes: []const u8) !void {

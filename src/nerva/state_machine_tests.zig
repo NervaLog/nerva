@@ -197,6 +197,42 @@ fn delete(table: u32, id: u64) Entry {
     return .{ .id = id, .table = table, .kind = .delete, .op_seen = 0, .value = @splat(0) };
 }
 
+/// An add to the u64 field at `offset`.
+fn add(table: u32, id: u64, offset: u8, delta: i64, options: struct {
+    min: ?u64 = null,
+    max: ?u64 = null,
+    clamp: bool = false,
+    create: bool = false,
+    delta_from: ?u32 = null,
+}) Entry {
+    const parameters: nerva.Add = .{
+        .delta = delta,
+        .min = options.min orelse 0,
+        .max = options.max orelse 0,
+        .delta_from = options.delta_from orelse 0,
+        .offset = offset,
+        .field = .u64,
+        .flags = .{
+            .min = options.min != null,
+            .max = options.max != null,
+            .clamp = options.clamp,
+            .create = options.create,
+            .delta_from = options.delta_from != null,
+        },
+    };
+    return .{
+        .id = id,
+        .table = table,
+        .kind = .add,
+        .op_seen = 0,
+        .value = parameters.value(),
+    };
+}
+
+fn field(row: RowValue, offset: u8) u64 {
+    return std.mem.readInt(u64, row.value[offset..][0..8], .little);
+}
+
 fn expect_statuses(results: []const EntryResult, statuses: []const nerva.EntryStatus) !void {
     try testing.expectEqual(statuses.len, results.len);
     for (results, statuses) |result, status| try testing.expectEqual(status, result.status);
@@ -300,6 +336,26 @@ test "commit: blind writes to one row in one request apply in order" {
     try testing.expectEqual(value(2), changes[1].value);
     try testing.expectEqual(nerva.ChangeKind.delete, changes[2].kind);
     for (changes[0..3]) |change| try testing.expectEqual(op, change.op);
+}
+
+test "commit: identical writes to one row in one request" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const context = try context_init(&arena);
+
+    // The second put leaves the row as the first left it: still a change of its own.
+    const results = try context.commit(&.{ &.{put(1, 1, 7)}, &.{put(1, 1, 7)} });
+    for (results) |result| try expect_statuses(result, &.{.ok});
+    try testing.expectEqual(value(7), (try context.lookup(1, 1)).value);
+    try testing.expectEqual(@as(usize, 3), (try context.changes(0, 10)).len);
+
+    // An add that applies nothing, after an add in the same op.
+    const adds = try context.commit(&.{
+        &.{add(1, 2, 0, 5, .{ .create = true })},
+        &.{add(1, 2, 0, 0, .{})},
+    });
+    for (adds) |result| try expect_statuses(result, &.{.ok});
+    try testing.expectEqual(@as(u64, 5), field(try context.lookup(1, 2), 0));
 }
 
 test "commit: delete leaves a tombstone version, and the row can come back" {
@@ -534,4 +590,134 @@ test "receipt race: a hand-off wins with the new version, a stale retry loses" {
     try testing.expectEqual(op_b, current.op);
     try testing.expectEqual(@as(u64, 2), current.receipt.seq);
     try testing.expectEqual(@as(u64, 2), current.receipt.owner);
+}
+
+test "add: adds to one row never conflict, and apply in log order" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const context = try context_init(&arena);
+
+    // Three transactions in one request, each adding to the same row without reading it.
+    const results = try context.commit(&.{
+        &.{add(1, 1, 0, 100, .{ .create = true })},
+        &.{add(1, 1, 0, -30, .{})},
+        &.{ add(1, 1, 0, 5, .{}), add(1, 1, 8, 7, .{}) },
+    });
+    for (results) |result| for (result) |r| try testing.expectEqual(nerva.EntryStatus.ok, r.status);
+    try testing.expectEqual(@as(u64, 100), results[0][0].value);
+    try testing.expectEqual(@as(u64, 70), results[1][0].value);
+    try testing.expectEqual(@as(i64, -30), results[1][0].applied);
+    try testing.expectEqual(@as(u64, 75), results[2][0].value);
+    try testing.expectEqual(@as(u64, 7), results[2][1].value);
+
+    const row = try context.lookup(1, 1);
+    try testing.expectEqual(@as(u64, 75), field(row, 0));
+    try testing.expectEqual(@as(u64, 7), field(row, 8));
+    try testing.expectEqual(results[0][0].op, row.op);
+
+    // Every add is a put of the whole row in the feed.
+    const changes = try context.changes(0, 10);
+    try testing.expectEqual(@as(usize, 5), changes.len);
+    try testing.expectEqual(nerva.ChangeKind.put, changes[3].kind);
+    try testing.expectEqual(@as(u64, 75), std.mem.readInt(u64, changes[3].value[0..8], .little));
+    try testing.expectEqual(row.value, changes[3].value);
+}
+
+test "add: bounds refuse the transaction, or clamp to what fits" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const context = try context_init(&arena);
+
+    _ = try context.commit(&.{&.{add(1, 1, 0, 20, .{ .create = true })}});
+
+    // Past the bound: out_of_bounds with the current value; the put before it is not applied.
+    const refused = try context.commit(&.{&.{ put(1, 2, 9), add(1, 1, 0, -30, .{ .min = 0 }) }});
+    try expect_statuses(refused[0], &.{ .aborted, .out_of_bounds });
+    try testing.expectEqual(@as(u64, 20), refused[0][1].value);
+    try testing.expect(!(try context.lookup(1, 2)).flags.exists);
+
+    // "Reserve up to 30": takes the 20 there is.
+    const clamped = try context.commit(&.{&.{add(1, 1, 0, -30, .{ .min = 0, .clamp = true })}});
+    try expect_statuses(clamped[0], &.{.ok});
+    try testing.expectEqual(@as(i64, -20), clamped[0][0].applied);
+    try testing.expectEqual(@as(u64, 0), clamped[0][0].value);
+
+    // Nothing left: applies nothing, still commits.
+    const empty = try context.commit(&.{&.{add(1, 1, 0, -30, .{ .min = 0, .clamp = true })}});
+    try expect_statuses(empty[0], &.{.ok});
+    try testing.expectEqual(@as(i64, 0), empty[0][0].applied);
+
+    // Below zero without a bound: out of the type's range.
+    try expect_statuses((try context.commit(&.{&.{add(1, 1, 0, -1, .{})}}))[0], &.{.out_of_bounds});
+    // Past a maximum.
+    try expect_statuses(
+        (try context.commit(&.{&.{add(1, 1, 0, 11, .{ .max = 10 })}}))[0],
+        &.{.out_of_bounds},
+    );
+}
+
+test "add: a reservation with delta_from moves exactly what was taken" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const context = try context_init(&arena);
+
+    // available at offset 0, held at offset 8, in one row.
+    _ = try context.commit(&.{&.{add(1, 1, 0, 50, .{ .create = true })}});
+    const reserve = [_]Entry{
+        add(1, 1, 0, -30, .{ .min = 0, .clamp = true }),
+        add(1, 1, 8, 0, .{ .delta_from = 0 }),
+    };
+    const results = try context.commit(&.{ &reserve, &reserve });
+    try expect_statuses(results[0], &.{ .ok, .ok });
+    try expect_statuses(results[1], &.{ .ok, .ok });
+    try testing.expectEqual(@as(i64, 30), results[0][1].applied);
+    try testing.expectEqual(@as(i64, -20), results[1][0].applied);
+    try testing.expectEqual(@as(i64, 20), results[1][1].applied);
+
+    const row = try context.lookup(1, 1);
+    try testing.expectEqual(@as(u64, 0), field(row, 0));
+    try testing.expectEqual(@as(u64, 50), field(row, 8));
+}
+
+test "add: absent rows, mixed writes and invalid references are refused" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const context = try context_init(&arena);
+
+    try expect_statuses((try context.commit(&.{&.{add(1, 1, 0, 1, .{})}}))[0], &.{.row_absent});
+
+    // A deleted row is absent too; `create` starts it from zeros.
+    _ = try context.commit(&.{&.{put(1, 2, 0xff)}});
+    _ = try context.commit(&.{&.{delete(1, 2)}});
+    try expect_statuses((try context.commit(&.{&.{add(1, 2, 0, 1, .{})}}))[0], &.{.row_absent});
+    const created = try context.commit(&.{&.{add(1, 2, 0, 1, .{ .create = true })}});
+    try testing.expectEqual(@as(u64, 1), created[0][0].value);
+    try testing.expectEqual(value(0)[8..].*, (try context.lookup(1, 2)).value[8..].*);
+
+    // An add and a put of one row in one transaction.
+    try expect_statuses(
+        (try context.commit(&.{&.{ add(1, 2, 0, 1, .{}), put(1, 2, 1) }}))[0],
+        &.{ .aborted, .write_duplicate },
+    );
+    try expect_statuses(
+        (try context.commit(&.{&.{ put(1, 3, 1), add(1, 3, 0, 1, .{ .create = true }) }}))[0],
+        &.{ .aborted, .write_duplicate },
+    );
+
+    // `delta_from` must name an earlier add.
+    try expect_statuses(
+        (try context.commit(&.{&.{add(1, 2, 0, 0, .{ .delta_from = 0 })}}))[0],
+        &.{.delta_from_invalid},
+    );
+    try expect_statuses(
+        (try context.commit(&.{&.{ put(1, 4, 1), add(1, 2, 0, 0, .{ .delta_from = 0 }) }}))[0],
+        &.{ .aborted, .delta_from_invalid },
+    );
+
+    // Reads still come first: a stale read conflicts even if the adds would apply.
+    try expect_statuses(
+        (try context.commit(&.{&.{ add(1, 2, 0, 1, .{}), read(1, 2, 1) }}))[0],
+        &.{ .aborted, .conflict },
+    );
+    try testing.expectEqual(@as(u64, 1), field(try context.lookup(1, 2), 0));
 }
