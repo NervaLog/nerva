@@ -1,0 +1,347 @@
+//! Documents: keys with values of up to 64 KiB, chunked over a table's 80-byte rows, read and
+//! written in optimistic transactions through the client (docs/DECISIONS.md N39).
+//!
+//! The catalog keeps layouts and view declarations this way. Chunk 0 of a document holds a
+//! header, then the key, then the start of the value; chunks 1.. continue the stream. Chunk 0's
+//! id derives from the namespace and the key, and later chunks' ids from chunk 0's id, so a
+//! reader holding only chunk 0 (a view following the feed) can find the rest.
+
+const std = @import("std");
+const assert = std.debug.assert;
+
+const stdx = @import("stdx");
+
+const nerva = @import("../nerva.zig");
+const Client = @import("client.zig").Client;
+
+const Entry = nerva.Entry;
+const EntryResult = nerva.EntryResult;
+const RowKey = nerva.RowKey;
+const RowValue = nerva.RowValue;
+const value_size = nerva.value_size;
+
+pub const value_size_max = 64 * 1024;
+pub const key_size_max = 1024;
+
+/// Chunk 0's header.
+pub const Header = extern struct {
+    namespace: u64,
+    reserved_a: u64 = 0,
+    key_size: u16,
+    reserved_b: u16 = 0,
+    /// Key plus value.
+    payload_size: u32,
+
+    comptime {
+        assert(@sizeOf(Header) == 24);
+        assert(stdx.no_padding(Header));
+    }
+};
+
+const chunk0_payload = value_size - @sizeOf(Header);
+
+/// The number of rows a key of `key_size` with a value of `value_size_` occupies.
+pub fn chunk_count(key_size: usize, value_size_: usize) u32 {
+    const payload = key_size + value_size_;
+    if (payload <= chunk0_payload) return 1;
+    return @intCast(1 + stdx.div_ceil(payload - chunk0_payload, value_size));
+}
+
+/// The row id of chunk `chunk` of `key`.
+pub fn chunk_id(namespace: u64, key: []const u8, chunk: u32) u64 {
+    const id0 = row_id(namespace, key);
+    return if (chunk == 0) id0 else tail_id(id0, chunk);
+}
+
+/// The id of chunk 0 of `key`: the first 8 bytes of SHA-256, little-endian. Persisted: never
+/// change the derivation.
+pub fn row_id(namespace: u64, key: []const u8) u64 {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("nerva.documents.v1");
+    hash.update(std.mem.asBytes(&std.mem.nativeToLittle(u64, namespace)));
+    hash.update(std.mem.asBytes(&std.mem.nativeToLittle(u32, @intCast(key.len))));
+    hash.update(key);
+    hash.update(std.mem.asBytes(&std.mem.nativeToLittle(u32, 0)));
+    const digest = hash.finalResult();
+    return std.mem.readInt(u64, digest[0..8], .little);
+}
+
+/// The id of tail chunk `chunk` (≥ 1) of the document whose chunk 0 has id `id0`.
+pub fn tail_id(id0: u64, chunk: u32) u64 {
+    assert(chunk > 0);
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("nerva.documents.tail.v1");
+    hash.update(std.mem.asBytes(&std.mem.nativeToLittle(u64, id0)));
+    hash.update(std.mem.asBytes(&std.mem.nativeToLittle(u32, chunk)));
+    const digest = hash.finalResult();
+    return std.mem.readInt(u64, digest[0..8], .little);
+}
+
+/// Splits `key` and `value` into row values: chunk 0 first.
+pub fn chunks_encode(
+    arena: std.mem.Allocator,
+    namespace: u64,
+    key: []const u8,
+    value: []const u8,
+) error{OutOfMemory}![]const [value_size]u8 {
+    assert(key.len <= key_size_max);
+    assert(value.len <= value_size_max);
+    const count = chunk_count(key.len, value.len);
+    const chunks = try arena.alloc([value_size]u8, count);
+    for (chunks) |*chunk| chunk.* = @splat(0);
+
+    const header: Header = .{
+        .namespace = namespace,
+        .key_size = @intCast(key.len),
+        .payload_size = @intCast(key.len + value.len),
+    };
+    @memcpy(chunks[0][0..@sizeOf(Header)], std.mem.asBytes(&header));
+
+    // The payload (key, then value) as one stream over the chunks' data regions.
+    var chunk: usize = 0;
+    var offset: usize = @sizeOf(Header);
+    for (&[_][]const u8{ key, value }) |part| {
+        var remaining = part;
+        while (remaining.len > 0) {
+            if (offset == value_size) {
+                chunk += 1;
+                offset = 0;
+            }
+            const size = @min(remaining.len, value_size - offset);
+            @memcpy(chunks[chunk][offset..][0..size], remaining[0..size]);
+            offset += size;
+            remaining = remaining[size..];
+        }
+    }
+    assert(chunk < count);
+    return chunks;
+}
+
+pub const Decoded = struct {
+    namespace: u64,
+    key: []const u8,
+    value: []const u8,
+};
+
+/// Reassembles chunks written by `chunks_encode`. `chunks` must hold `chunk_count` rows.
+pub fn chunks_decode(
+    arena: std.mem.Allocator,
+    chunks: []const [value_size]u8,
+) error{ OutOfMemory, Corrupt }!Decoded {
+    const header = std.mem.bytesToValue(Header, chunks[0][0..@sizeOf(Header)]);
+    if (header.key_size > key_size_max) return error.Corrupt;
+    if (header.payload_size < header.key_size) return error.Corrupt;
+    if (header.payload_size - header.key_size > value_size_max) return error.Corrupt;
+    const value_size_ = header.payload_size - header.key_size;
+    if (chunks.len != chunk_count(header.key_size, value_size_)) return error.Corrupt;
+
+    const payload = try arena.alloc(u8, header.payload_size);
+    var written: usize = 0;
+    for (chunks, 0..) |*chunk, index| {
+        const data = if (index == 0) chunk[@sizeOf(Header)..] else chunk[0..];
+        const size = @min(data.len, payload.len - written);
+        @memcpy(payload[written..][0..size], data[0..size]);
+        written += size;
+    }
+    assert(written == payload.len);
+    return .{
+        .namespace = header.namespace,
+        .key = payload[0..header.key_size],
+        .value = payload[header.key_size..],
+    };
+}
+
+/// From chunk 0's header: how many rows the document occupies.
+pub fn chunk0_count(chunk0: *const [value_size]u8) error{Corrupt}!u32 {
+    const header = std.mem.bytesToValue(Header, chunk0[0..@sizeOf(Header)]);
+    if (header.payload_size < header.key_size) return error.Corrupt;
+    if (header.payload_size - header.key_size > value_size_max) return error.Corrupt;
+    return chunk_count(header.key_size, header.payload_size - header.key_size);
+}
+
+pub const Error = Client.Error || error{
+    OutOfMemory,
+    /// Two keys hash to one row id, or a row does not decode.
+    Corrupt,
+    /// A key or value over the limits, or a transaction over one request.
+    TooLarge,
+};
+
+/// One optimistic transaction over the documents of one namespace in one table.
+pub const Transaction = struct {
+    client: *Client,
+    table: u32,
+    namespace: u64,
+
+    arena: std.mem.Allocator = undefined,
+    /// Row → the version this transaction saw.
+    reads: std.AutoArrayHashMapUnmanaged(u64, u64) = .{},
+    /// Row → the write to commit (a later write to the same row replaces an earlier one).
+    writes: std.AutoArrayHashMapUnmanaged(u64, Entry) = .{},
+    /// Key → value as this transaction sees it, including its own writes.
+    cache: std.StringHashMapUnmanaged(?[]const u8) = .{},
+
+    pub const Outcome = enum { committed, conflict };
+
+    /// Starts a transaction whose memory comes from `arena` (reset by the caller per attempt).
+    pub fn begin(transaction: *Transaction, arena: std.mem.Allocator) void {
+        transaction.arena = arena;
+        transaction.reads = .{};
+        transaction.writes = .{};
+        transaction.cache = .{};
+    }
+
+    pub fn get(transaction: *Transaction, key: []const u8) Error!?[]const u8 {
+        if (transaction.cache.get(key)) |cached| return cached;
+        if (key.len > key_size_max) return error.TooLarge;
+        const arena = transaction.arena;
+
+        const chunk0 = try transaction.lookup(row_id(transaction.namespace, key));
+        const value: ?[]const u8 = if (!chunk0.flags.exists) null else value: {
+            const count = try chunk0_count(&chunk0.value);
+            const chunks = try arena.alloc([value_size]u8, count);
+            chunks[0] = chunk0.value;
+            if (count > 1) {
+                const keys = try arena.alloc(RowKey, count - 1);
+                for (keys, 1..) |*row_key, chunk| {
+                    row_key.* = .{
+                        .id = chunk_id(transaction.namespace, key, @intCast(chunk)),
+                        .table = transaction.table,
+                    };
+                }
+                const rows = try arena.alloc(RowValue, keys.len);
+                try transaction.client.lookup_rows(keys, rows);
+                for (rows, chunks[1..]) |*row, *chunk| {
+                    if (!row.flags.exists) return error.Corrupt;
+                    try transaction.read_record(row);
+                    chunk.* = row.value;
+                }
+            }
+            const decoded = try chunks_decode(arena, chunks);
+            // A hash collision, or a row of another namespace.
+            if (!std.mem.eql(u8, decoded.key, key)) return error.Corrupt;
+            if (decoded.namespace != transaction.namespace) return error.Corrupt;
+            break :value decoded.value;
+        };
+        try transaction.cache.put(arena, try arena.dupe(u8, key), value);
+        return value;
+    }
+
+    pub fn put(transaction: *Transaction, key: []const u8, value: []const u8) Error!void {
+        if (key.len > key_size_max or value.len > value_size_max) return error.TooLarge;
+        const arena = transaction.arena;
+        const chunks = try chunks_encode(arena, transaction.namespace, key, value);
+        for (chunks, 0..) |*chunk, index| {
+            const id = chunk_id(transaction.namespace, key, @intCast(index));
+            try transaction.writes.put(arena, id, .{
+                .id = id,
+                .table = transaction.table,
+                .kind = .put,
+                .op_seen = 0,
+                .value = chunk.*,
+            });
+        }
+        try transaction.cache.put(arena, try arena.dupe(u8, key), try arena.dupe(u8, value));
+    }
+
+    /// Commits every read (at the version seen) and every write as one transaction.
+    pub fn commit(transaction: *Transaction) Error!Outcome {
+        const count = transaction.reads.count() + transaction.writes.count();
+        if (count == 0) return .committed;
+        const batch_size_limit = transaction.client.vsr_client.batch_size_limit.?;
+        if (count > nerva.Operation.commit.event_max(batch_size_limit)) return error.TooLarge;
+
+        const entries = try transaction.arena.alloc(Entry, count);
+        var index: usize = 0;
+        for (transaction.reads.keys(), transaction.reads.values()) |id, op_seen| {
+            entries[index] = .{
+                .id = id,
+                .table = transaction.table,
+                .kind = .read,
+                .op_seen = op_seen,
+                .value = @splat(0),
+            };
+            index += 1;
+        }
+        for (transaction.writes.values()) |entry| {
+            entries[index] = entry;
+            index += 1;
+        }
+        assert(index == count);
+
+        const results = try transaction.arena.alloc(EntryResult, count);
+        try transaction.client.commit(entries, results);
+        for (results) |result| {
+            switch (result.status) {
+                .ok, .aborted => {},
+                .conflict => return .conflict,
+                else => std.debug.panic("documents: commit rejected an entry: {s}", .{
+                    @tagName(result.status),
+                }),
+            }
+        }
+        assert(results[0].status == .ok);
+        return .committed;
+    }
+
+    fn lookup(transaction: *Transaction, id: u64) Error!RowValue {
+        var row: [1]RowValue = undefined;
+        try transaction.client.lookup_rows(&.{.{ .id = id, .table = transaction.table }}, &row);
+        try transaction.read_record(&row[0]);
+        return row[0];
+    }
+
+    /// Records the version seen, unless this transaction already wrote the row.
+    fn read_record(transaction: *Transaction, row: *const RowValue) Error!void {
+        assert(row.table == transaction.table);
+        if (transaction.writes.contains(row.id)) return;
+        const entry = try transaction.reads.getOrPut(transaction.arena, row.id);
+        // Two lookups in one transaction may see different versions; keep the first: commit
+        // reports the conflict.
+        if (!entry.found_existing) entry.value_ptr.* = row.op;
+    }
+};
+
+const testing = std.testing;
+
+test "documents: chunks round-trip" {
+    var arena_instance = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_instance.deinit();
+    const arena = arena_instance.allocator();
+
+    var prng = std.Random.DefaultPrng.init(42);
+    const random = prng.random();
+    for (0..200) |_| {
+        const key = try arena.alloc(u8, random.intRangeAtMost(usize, 1, 200));
+        random.bytes(key);
+        const value = try arena.alloc(u8, random.intRangeAtMost(usize, 0, 3000));
+        random.bytes(value);
+
+        const namespace = random.int(u64);
+        const chunks = try chunks_encode(arena, namespace, key, value);
+        try testing.expectEqual(chunk_count(key.len, value.len), chunks.len);
+        try testing.expectEqual(@as(u32, @intCast(chunks.len)), try chunk0_count(&chunks[0]));
+        const decoded = try chunks_decode(arena, chunks);
+        try testing.expectEqual(namespace, decoded.namespace);
+        try testing.expectEqualSlices(u8, key, decoded.key);
+        try testing.expectEqualSlices(u8, value, decoded.value);
+    }
+}
+
+test "documents: chunk counts at the boundaries" {
+    try testing.expectEqual(@as(u32, 1), chunk_count(10, chunk0_payload - 10));
+    try testing.expectEqual(@as(u32, 2), chunk_count(10, chunk0_payload - 9));
+    try testing.expectEqual(@as(u32, 2), chunk_count(0, chunk0_payload + value_size));
+    try testing.expectEqual(@as(u32, 3), chunk_count(0, chunk0_payload + value_size + 1));
+}
+
+test "documents: row ids are stable and separate keys, chunks and namespaces" {
+    // A fixed vector (computed with Python's hashlib): changing the derivation would orphan
+    // every stored document.
+    try testing.expectEqual(@as(u64, 14508685050127223560), row_id(0, "table.5"));
+    try testing.expect(row_id(0, "table.5") != row_id(1, "table.5"));
+    try testing.expect(row_id(0, "ab") != row_id(0, "a"));
+    try testing.expectEqual(row_id(0, "k"), chunk_id(0, "k", 0));
+    try testing.expectEqual(tail_id(row_id(0, "k"), 3), chunk_id(0, "k", 3));
+    try testing.expect(chunk_id(0, "k", 1) != chunk_id(0, "k", 2));
+}

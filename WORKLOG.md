@@ -48,12 +48,12 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
 
 ## 2026-10-04 — 1.0 design goals
 
-- Added `docs/GOALS-1.0.md`: Nerva 1.0 design goals (G1–G8), with Botpike as the first customer;
-  each goal maps to a gap Botpike's own docs name. Linked from README.md and CLAUDE.md.
+- Added `docs/GOALS-1.0.md`: Nerva 1.0 design goals (G1–G8), each mapped to a gap of the
+  motivating workload (agent budget services). Linked from README.md and CLAUDE.md.
 
 ## 2026-10-04 — 1.0 Milestone 1: the receipt race
 
-- `src/nerva/workload.zig`: Botpike's receipt race. Clients race over 1–4 receipts (table 100);
+- `src/nerva/workload.zig`: the receipt race. Clients race over 1–4 receipts (table 100);
   a claim is `read` at the version seen + `put` of `{seq + 1, owner}`. Independently of the row
   model, the checker asserts each receipt's sequence advances by exactly one per winning claim,
   and that losing claims fail only with `conflict`. Logs claims won/lost.
@@ -85,81 +85,49 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
   fails); `test:integration` passes three times in a row with no leftover processes; VOPR
   seed 1 replays identically (91,649 ticks).
 
-## 2026-10-04 — 1.0 Milestone 2b: `nerva ledgerd`
+## 2026-10-04 — 1.0 Milestone 2b: an application-specific gateway (since removed)
 
-- Read Botpike/runtime and Botpike/app: the runtime already speaks a small ledger protocol to a
-  pluggable backend (`ledger/ledgerd.py`, Botpike's `/runtime-ledger`). Chose to serve that
-  protocol from Nerva instead of inventing a JSON API. Started `docs/DECISIONS.md` (N1–N20).
-- `src/nerva/ledgerd/routes.zig`: a port of `ledgerd.py`'s sixteen routes over a store interface,
-  including Python-compatible UTF-8 replacement and its write-before-error behaviour (N18).
-- `src/nerva/ledgerd/store.zig`: one Nerva transaction per route; values chunked over 80-byte
-  rows with SHA-256-derived ids (collision-checked); generations for `admin/init`; read set with
-  versions; conflict → retry.
-- `src/nerva/ledgerd/server.zig` + `nerva ledgerd`: sequential HTTP server (std.http), key from
-  `LEDGER_KEY`, jittered backoff on conflict (N20).
-- `tests/ledgerd/`: oracle copy of `ledgerd.py` (runtime commit 23010ba), `conformance.py`
-  (differential, byte-identical, scripted + seeded fuzz, ledger isolation) and `race.py` (two
-  gateways, money conservation, single claims, retries exercised). `zig build test:ledgerd`.
-- Found by the race test and fixed: a hot `journal.count` row (N19) and retry storms (N20).
-- Verified: conformance 5 seeds × 2,000 fuzzed requests byte-identical; race passes repeatedly
-  (8 and 16 threads); harness mutation-tested (a one-space journal change is caught);
-  `test:unit` 284/285 (sandbox perf test); `test:integration` passes.
+- Built an HTTP gateway for one application's existing ledger protocol, with differential tests
+  against its reference implementation, and started `docs/DECISIONS.md` (N1–N20). Removed in
+  N39; the chunked storage it introduced lives on in `documents.zig`.
 
 ## 2026-10-04 — 1.0 Milestone 3: positioned reads and the first views
 
 - Core: `RowValue.op_read`, the op a lookup executed at (G2); the VOPR checker asserts it is
   shared by a request's results and increases with op order.
-- ledgerd rows: chunk 0 records ledger and generation; tail chunk ids derive from chunk 0's id,
-  so a view holding only rows can reassemble values (N25).
+- Chunked values: tail chunk ids derive from chunk 0's id, so a reader holding only rows can
+  reassemble values (N25).
 - `src/nerva/view/`: a feed follower (pages `get_changes`, groups by op, applies complete ops,
-  keeps a watermark), the ledgerd views (`journal` in commit order; `spend`, Botpike's agent
-  spend rollup over runtime request ids), and `nerva view` (HTTP, `min_op=<n|latest>`, 504 if
-  not reached in 10 s).
-- `tests/ledgerd/views.py`: journal equal to the oracle's `journal.log`, spend equal to a rollup
-  recomputed from the oracle's `ledger.txt`, same answers after a view restart, 504 past the
-  watermark. Mutation-tested (dropping denied counts is caught).
+  keeps a watermark) and `nerva view` (HTTP, `min_op=<n|latest>`, 504 if not reached in 10 s),
+  first with two application-specific views (since replaced by declared views, N39).
 - Decisions N21–N26 in docs/DECISIONS.md.
-- Verified: `test:unit` 287/288 (sandbox perf test); `test:integration`; `test:ledgerd`
-  (conformance, race, views); views over seeds 1–4; VOPR seeds 1, 2, 5 replay with identical
-  tick counts.
+- Verified: `test:unit` 287/288 (sandbox perf test); `test:integration`; VOPR seeds 1, 2, 5
+  replay with identical tick counts.
 
-## 2026-10-04 — 1.0 Milestone 4 (part): as-of reads and agent state
+## 2026-10-04 — 1.0 Milestone 4 (part): as-of reads
 
 - Core: `get_history` (operation 131), one row's changes newest first, with `op_max` (as of)
   and a counting-down cursor. Served from a derived index on the change feed (`Change.row_key`,
   tree id 4); `Client.get_history` and `Client.row_as_of` (N27).
 - VOPR: random histories checked against the model's change list; mutation-tested (an
   off-by-one in the `op_max` filter is caught).
-- ledgerd: `store.get_as_of` reads a key as of an op (generation, chunk 0 and tails, each as of
-  that op). `nerva view` serves `GET /v1/ledgers/<ledger>/as_of?op=&key_hex=`, and journal
-  lines are now `line=<op>:<hex>` (N28).
-- ledgerd: `/v1/store/get` and `/v1/store/put` for the runtime's `Store` ability, in
-  `table_store` (1002), outside generations (N29).
-- Tests: `views.py` re-reads 65 snapshots of `ledgerd.py`'s files as of their ops (about 2,600
-  reads; mutation-tested: ignoring the op is caught). The new `store.py` covers a model,
-  `admin/init`, concurrent writers and a staged suspend (mutation-tested: storing in the ledger
-  table is caught). Integration test reads as of ops before and after a replica restart.
+- The gateway of the time gained as-of reads of its keys and a key-value route for workflow
+  state (N28, N29; both removed in N39).
+- Integration test reads as of ops before and after a replica restart.
 - Not built, waiting on a decision: approval attribution and a claim lease (N30).
-- Verified: `test:unit` 289/290 (sandbox perf test); `test:fmt`; `test:integration`;
-  `test:ledgerd` (conformance, race, views, store); VOPR seeds 1, 2, 5, 11.
+- Verified: `test:unit` 289/290 (sandbox perf test); `test:fmt`; `test:integration`; VOPR seeds
+  1, 2, 5, 11.
 
-## 2026-10-04 — Botpike integration guide
+## 2026-10-04 — An integration guide (since moved out)
 
-- `docs/BOTPIKE-INTEGRATION.md`: instructions for a coding bot working in Botpike's repositories.
-  Ground rules (dog-fooding, no real money, Nerva as a pinned dependency); building and running
-  Nerva; phase 1 (`nerva ledgerd` as the runtime's HTTP ledger, accepted by an identical demo
-  transcript); phase 2 (a `Store.http` handler, with `daemon.key`/`daemon.pub` kept local and
-  `$STATE/.lock` kept); phase 3 (read-only views and `as_of`); how to report findings.
-- The runbook was run from scratch: release build, a one-replica `--development` cluster (1.1 GiB
-  data file, ~850 MB resident), the gateway, the view, smoke requests, `as_of` at three ops, a
-  restart of every process.
-- Found while writing it: the runtime reads its Ed25519 signing key through `Store`, so a
-  Nerva-backed `Store` must keep `daemon.key` in local files.
-- Decision N31: Botpike is dog-fooding, not a specification.
+- Wrote a guide for integrating the dog-fooding application, and ran its runbook from scratch:
+  release build, a one-replica `--development` cluster (1.1 GiB data file, ~850 MB resident),
+  smoke requests, a restart of every process. The guide now lives outside Nerva (N39).
+- Decision N31: dog-fooding, not a specification.
 
 ## 2026-10-04 — CI and releases
 
-- `.github/workflows/ci.yml`: typecheck, format, unit, integration, ledgerd suites, and VOPR
+- `.github/workflows/ci.yml`: typecheck, format, unit, integration, gateway suites, and VOPR
   seeds 1, 2, 5 and one random seed, on every push and pull request to `main`.
 - `.github/workflows/release.yml`: on a `v*` tag, CI on that commit, then binaries for four
   targets, `SHA256SUMS`, and a GitHub release (prerelease if the tag contains `-`).
@@ -185,8 +153,7 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
   to and from 80-byte values, field values as integers for views (N34).
 - `nerva api`: `PUT`/`GET /v1/tables/<t>`; puts by `fields`; `fields` in lookups, the feed,
   history and `row`; reserved tables refused and left out of the feed.
-  `src/nerva/api/catalog_store.zig` keeps layouts in the log through `ledgerd/store.zig`, which
-  now accepts any non-ledger table.
+  `src/nerva/api/catalog_store.zig` keeps layouts in the log as chunked documents.
 - Tests: unit tests for layouts and for the API with an in-memory catalog; `tests/api/api.py`
   adds layouts end to end, including two gateways declaring at once.
 
@@ -228,4 +195,17 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
 - `tests/demo/canvas_chaos.py`, in `zig build test:demo` with the seat test: confirmed paints
   are on the canvas as of their ops, under crashes. Mutation-tested.
 - Decision N38. Moderation defaults await the owner's policy (task 6).
+
+## 2026-10-04 — No application-specific code (N39)
+
+- Removed the application-specific gateway (routes, key-value routes, server), its two views,
+  its differential and race tests (with the copy of the application's reference
+  implementation), its build and CI steps, and the integration guide.
+- `src/nerva/documents.zig`: chunked documents in optimistic transactions, now used by the
+  catalog (`api/catalog_store.zig`) and decoded by declared views; new id vector pinned.
+- `nerva view` serves declared views only, all replies JSON, key from `NERVA_KEY`.
+- Docs: GOALS-1.0 describes the motivating workload without naming it; superseded decisions keep
+  their numbers; README, CLAUDE.md, UPSTREAM.md updated.
+- Verified: `test:unit` (all but the sandbox perf test), `test:api`, `test:views`, `test:demo`
+  (both demos under crashes).
 

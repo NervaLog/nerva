@@ -12,7 +12,6 @@ const constants = @import("constants.zig");
 const config = constants.config;
 const cli = @import("nerva/cli.zig");
 const Client = @import("nerva/client.zig").Client;
-const ledgerd = @import("nerva/ledgerd/server.zig");
 const view_server = @import("nerva/view/server.zig");
 const api_server = @import("nerva/api/server.zig");
 
@@ -66,10 +65,6 @@ pub fn main() !void {
             try std.io.getStdOut().writer().print("Nerva version {}\n", .{constants.semver});
             return;
         },
-        .ledgerd => |*args| {
-            log_level_runtime = if (args.log_debug) .debug else .info;
-            try command_ledgerd(gpa, args);
-        },
         .view => |*args| {
             log_level_runtime = if (args.log_debug) .debug else .info;
             try command_view(gpa, args);
@@ -107,7 +102,7 @@ pub fn main() !void {
             switch (tag) {
                 .format => try command_format(gpa, &storage, args),
                 .start => try command_start(gpa, &io, time, &tracer, &storage, args),
-                .version, .ledgerd, .view, .api => comptime unreachable,
+                .version, .view, .api => comptime unreachable,
             }
         },
     }
@@ -225,30 +220,9 @@ fn command_start(
     }
 }
 
-fn command_ledgerd(gpa: std.mem.Allocator, args: *const cli.Command.Ledgerd) !void {
-    const key = std.posix.getenv("LEDGER_KEY") orelse "";
-    if (key.len == 0) vsr.fatal(.cli, "ledgerd: set LEDGER_KEY", .{});
-
-    var client: Client = undefined;
-    try client.init(gpa, .{
-        .cluster = args.cluster,
-        .addresses = args.addresses.slice(),
-        .timeout = stdx.Duration.seconds(30),
-    });
-    defer client.deinit();
-
-    try ledgerd.serve(gpa, &client, .{
-        .listen = args.listen,
-        .key = key,
-        .ledger = args.ledger,
-        .on_listening = on_listening,
-    });
-}
-
 fn command_view(gpa: std.mem.Allocator, args: *const cli.Command.View) !void {
-    // NERVA_KEY, or LEDGER_KEY as the ledgerd guide sets it.
-    const key = std.posix.getenv("NERVA_KEY") orelse std.posix.getenv("LEDGER_KEY") orelse "";
-    if (key.len == 0) vsr.fatal(.cli, "view: set NERVA_KEY (or LEDGER_KEY)", .{});
+    const key = std.posix.getenv("NERVA_KEY") orelse "";
+    if (key.len == 0) vsr.fatal(.cli, "view: set NERVA_KEY", .{});
 
     var client: Client = undefined;
     try client.init(gpa, .{

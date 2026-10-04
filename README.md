@@ -88,7 +88,7 @@ in-memory model replayed in op order.
 Linux (io_uring) or macOS; x86_64 with AES or aarch64.
 
 CI (`.github/workflows/ci.yml`) runs on every push and pull request to `main`: typecheck, format,
-unit, integration and ledgerd tests, and the VOPR on seeds 1, 2, 5 and one random seed (printed,
+unit, integration, API, view and demo tests, and the VOPR on seeds 1, 2, 5 and one random seed (printed,
 so a failure replays). Pushing a tag `v*` runs CI on that commit, then publishes binaries for
 Linux and macOS (x86_64, aarch64) as a GitHub release (`release.yml`).
 
@@ -132,30 +132,6 @@ curl -H 'X-Nerva-Key: secret' -d '{"entries":[{"kind":"put","table":1,"id":"5","
 live in the log, in a reserved catalog table; the core still stores bytes and never reads them.
 `zig build test:api` checks every route against a model, and races eight writers on one row.
 
-## The Botpike runtime's ledger
-
-`nerva ledgerd` serves the [Botpike runtime](https://github.com/Botpike/runtime)'s ledger
-protocol (`POST` `key=value` lines, `X-Ledger-Key`) from a Nerva cluster: a drop-in for the
-runtime's reference `ledgerd.py`, with every route one Nerva transaction.
-
-```bash
-LEDGER_KEY=secret ./zig-out/bin/nerva ledgerd --cluster=0 --addresses=3001,3002,3003 \
-    --ledger=1 --listen=127.0.0.1:8090
-./brt backend http://127.0.0.1:8090 secret   # in Botpike/runtime
-```
-
-`zig build test:ledgerd` checks it against `ledgerd.py` request by request (byte-identical
-replies, scripted scenarios plus a seeded fuzzer), races two gateways on one ledger, and checks
-the views below against `ledgerd.py`'s own files.
-
-How to run the runtime on Nerva, phase by phase: [docs/BOTPIKE-INTEGRATION.md](./docs/BOTPIKE-INTEGRATION.md).
-
-`/v1/store/get` and `/v1/store/put` (`name_hex`, `value_hex`) serve the runtime's `Store`
-ability, the agent state its daemon otherwise keeps as files in a state directory:
-continuations, code and receipts. They live outside the ledger's generations, so
-`/v1/admin/init` keeps them. `ledgerd.py` has no such routes; `tests/ledgerd/store.py` checks
-them against a model.
-
 ## Declared views
 
 A view is a declaration in the log, not code. Declare a table's layout, then a view over it,
@@ -174,7 +150,9 @@ curl -H 'X-Nerva-Key: secret' 'http://127.0.0.1:8091/v1/views/revenue?as_of=1234
 answers for any op, including ops before it was declared, and every answer carries the SHA-256
 of its groups, so two view processes can show they agree. v0 keeps tables and their changes in
 `nerva view`'s memory (at most two million changes) and computes a view when it is read.
-`zig build test:views` checks views against a model on two view processes.
+`min_op=<n>` waits until the view process has applied op `n` (read-your-writes); views are
+rebuilt from the feed when the process restarts. `zig build test:views` checks views against a
+model on two view processes.
 
 ## Demos
 
@@ -183,47 +161,21 @@ seats, simulated buyers; buy, rewind the show to any op, crash any process, decl
 a shared canvas (paint, play the timelapse, crash, declare). `zig build test:demo` runs both
 under random crashes.
 
-## Ledgerd views
-
-`nerva view` follows the change feed and also serves derived views of every ledgerd ledger,
-each reply stamped with the op it reflects:
-
-```bash
-LEDGER_KEY=secret ./zig-out/bin/nerva view --cluster=0 --addresses=3001,3002,3003 \
-    --listen=127.0.0.1:8091
-curl -H 'X-Ledger-Key: secret' 'http://127.0.0.1:8091/v1/views/1/spend?min_op=latest'
-```
-
-- `journal`: the ledger's journal lines in commit order, each with the op that wrote it.
-- `spend`: Botpike's agent spend rollup (own and subtree spend, settled and denied counts,
-  depth) over the agent tree in the runtime's request ids.
-
-`min_op=<n>` waits until the view has applied op `n` (read-your-writes); `min_op=latest` first
-reads the feed to its end. Views live in memory and are rebuilt from the feed on restart.
-
-Any ledger key can be read as it was at any op, such as the op of a journal line, to see what
-an agent's allowance was when it decided:
-
-```bash
-curl -H 'X-Ledger-Key: secret' \
-    'http://127.0.0.1:8091/v1/ledgers/1/as_of?op=1234&key_hex=617661696c61626c65'
-```
-
 Decisions and their reasons: [docs/DECISIONS.md](./docs/DECISIONS.md).
 
 ## Roadmap
 
-The 1.0 target, with Botpike as first customer, is in [docs/GOALS-1.0.md](./docs/GOALS-1.0.md).
+The 1.0 target is in [docs/GOALS-1.0.md](./docs/GOALS-1.0.md).
 
 1. **Foundation** — vendored consensus + storage + simulator, placeholder state machine. ✅
 2. **Commit core** — row model, optimistic read-set validation, versioned base rows; VOPR
    workload with a model checker. ✅
 3. **Server and client protocol** — `nerva format` / `nerva start`, a Zig client, and
-   `nerva ledgerd` serving the Botpike runtime's ledger protocol. ✅
-4. **First derived view** — one incremental view, a watermark, and reads at a position. ✅
-   (`nerva view`: `journal` and `spend` over ledgerd ledgers.)
-5. **Snapshots and subscriptions** — reads as of op `N` ✅ (`get_history`, `as_of`); change
-   cursors ✅ (`get_changes`); view snapshots.
+   `nerva api` (JSON over HTTP). ✅
+4. **Declared views** — layouts and views as data in the log, a watermark, reads at a position,
+   a hash per answer. ✅ (v0 computes on read; incremental maintenance next.)
+5. **Snapshots and subscriptions** — reads as of op `N` ✅ (`get_history`, `row?as_of=`, views
+   `as_of`); change cursors ✅ (`get_changes`); view snapshots.
 6. **Object storage tiering**, external operators, effect sinks.
 
 ## License

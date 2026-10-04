@@ -18,8 +18,7 @@ const value_size = nerva.value_size;
 
 /// Tables at or above this are Nerva's own; the API refuses to read or write them directly.
 pub const tables_reserved_min: u32 = 0xFFFF_0000;
-/// Catalog documents, chunked like `ledgerd` values (`ledgerd/store.zig`), keyed `table.<id>` and
-/// `view.<name>`.
+/// Catalog documents (`documents.zig`, namespace 0), keyed `table.<id>` and `view.<name>`.
 pub const table_catalog: u32 = 0xFFFF_0001;
 
 pub const fields_max = 16;

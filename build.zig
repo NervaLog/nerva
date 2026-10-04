@@ -80,7 +80,6 @@ pub fn build(b: *std.Build) !void {
         .test_unit_build = b.step("test:unit:build", "Build unit tests"),
         .test_fmt = b.step("test:fmt", "Check formatting"),
         .test_integration = b.step("test:integration", "Run integration tests (real processes)"),
-        .test_ledgerd = b.step("test:ledgerd", "Check nerva ledgerd against ledgerd.py (python3)"),
         .test_api = b.step("test:api", "Check nerva api against a model (python3)"),
         .test_views = b.step("test:views", "Check declared views against a model (python3)"),
         .test_demo = b.step("test:demo", "Run the demos under crashes (python3)"),
@@ -234,19 +233,6 @@ pub fn build(b: *std.Build) !void {
     run_integration_tests.setCwd(b.path("."));
     run_integration_tests.has_side_effects = true; // Never cache: it runs real processes.
     steps.test_integration.dependOn(&run_integration_tests.step);
-
-    // zig build test:ledgerd: differential and race tests against the runtime's ledgerd.py.
-    for ([_][]const u8{ "conformance.py", "race.py", "views.py", "store.py" }) |script| {
-        const run_script = b.addSystemCommand(&.{
-            "python3",
-            b.fmt("tests/ledgerd/{s}", .{script}),
-        });
-        run_script.addFileArg(nerva.getEmittedBin());
-        if (b.args) |args| run_script.addArgs(args);
-        run_script.setCwd(b.path("."));
-        run_script.has_side_effects = true;
-        steps.test_ledgerd.dependOn(&run_script.step);
-    }
 
     // zig build test:api: the JSON API against a model.
     const run_api_test = b.addSystemCommand(&.{ "python3", "tests/api/api.py" });

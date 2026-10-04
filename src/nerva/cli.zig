@@ -38,14 +38,6 @@ const CLIArgs = union(enum) {
         path: []const u8,
     },
 
-    ledgerd: struct {
-        cluster: u128,
-        addresses: vsr.ClusterAddress,
-        ledger: u64,
-        listen: []const u8,
-        log_debug: bool = false,
-    },
-
     view: struct {
         cluster: u128,
         addresses: vsr.ClusterAddress,
@@ -73,9 +65,6 @@ const CLIArgs = union(enum) {
         \\  nerva start --addresses=<addresses> [--cache-grid=<size><KiB|MiB|GiB>]
         \\              [--development] [--log-debug] <path>
         \\
-        \\  nerva ledgerd --cluster=<integer> --addresses=<addresses> --ledger=<integer>
-        \\                --listen=<host:port> [--log-debug]
-        \\
         \\  nerva view --cluster=<integer> --addresses=<addresses> --listen=<host:port>
         \\             [--log-debug]
         \\
@@ -90,12 +79,8 @@ const CLIArgs = union(enum) {
         \\
         \\  start    Run a replica from the data file at <path>.
         \\
-        \\  ledgerd  Serve the Botpike runtime's ledger protocol from the cluster at
-        \\           <addresses>. The key is read from the LEDGER_KEY environment variable.
-        \\
-        \\  view     Follow the cluster's change feed and serve declared views, and the
-        \\           ledgerd views (journal, spend). The key is read from NERVA_KEY, or
-        \\           LEDGER_KEY.
+        \\  view     Follow the cluster's change feed and serve declared views. The key is
+        \\           read from NERVA_KEY.
         \\
         \\  api      Serve the cluster's operations (lookup, commit, changes, history) as JSON
         \\           over HTTP. The key is read from the NERVA_KEY environment variable.
@@ -121,9 +106,6 @@ const CLIArgs = union(enum) {
         \\  --cache-grid=<size><KiB|MiB|GiB>
         \\        Memory for caching data file blocks.
         \\
-        \\  --ledger=<integer>
-        \\        Which ledger of the cluster to serve; one cluster holds many.
-        \\
         \\  --listen=<host:port>
         \\        Where to serve HTTP. The bound port is printed to stdout (use port 0 for an
         \\        ephemeral one).
@@ -140,7 +122,6 @@ const CLIArgs = union(enum) {
 pub const Command = union(enum) {
     format: Format,
     start: Start,
-    ledgerd: Ledgerd,
     view: View,
     api: Api,
     version,
@@ -155,14 +136,6 @@ pub const Command = union(enum) {
     pub const View = struct {
         cluster: u128,
         addresses: vsr.ClusterAddress,
-        listen: std.net.Address,
-        log_debug: bool,
-    };
-
-    pub const Ledgerd = struct {
-        cluster: u128,
-        addresses: vsr.ClusterAddress,
-        ledger: u64,
         listen: std.net.Address,
         log_debug: bool,
     };
@@ -207,14 +180,6 @@ pub fn parse_args(flags: *stdx.Flags) Command {
             .log_debug = start.log_debug,
             .path = start.path,
         }) catch |err| vsr.fatal(.cli, "start: {s}", .{error_message(err)}) },
-        .ledgerd => |ledgerd| .{ .ledgerd = .{
-            .cluster = ledgerd.cluster,
-            .addresses = ledgerd.addresses,
-            .ledger = ledgerd.ledger,
-            .listen = listen_parse(ledgerd.listen) orelse
-                vsr.fatal(.cli, "ledgerd: --listen must be <ipv4>:<port>", .{}),
-            .log_debug = ledgerd.log_debug,
-        } },
         .view => |view| .{ .view = .{
             .cluster = view.cluster,
             .addresses = view.addresses,

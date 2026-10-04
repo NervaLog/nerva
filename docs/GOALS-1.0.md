@@ -1,30 +1,32 @@
 # Nerva 1.0 — Design goals
 
-**First customer: [Botpike](https://github.com/Botpike/app)**, budget leases for AI agents.
+**Motivating workload: budget and authorization services for AI agents.** Nerva is dog-fooded
+on such a service, but specialized for none (DECISIONS N31, N39): it grows only general
+capabilities, and an application's own rules live in the application.
 
-Nerva 1.0 is done when Botpike can answer an auditor's three questions — *what ran, who
-authorized it, is it current?* — from properties of its database instead of from application
-discipline spread across two stores. The pitch this enables: **every authorization, receipt and
-report is a position in one verifiable log.**
+Nerva 1.0 is done when a service like that can answer an auditor's three questions — *what ran,
+who authorized it, is it current?* — from properties of its database instead of from
+application discipline spread across several stores. The pitch this enables: **every
+authorization, receipt and report is a position in one verifiable log.**
 
 Status of this document: agreed 2026-10-04. v0.1 (the core loop in the
-[README roadmap](../README.md#roadmap)) is a step towards it; 1.0 is "Botpike-ready".
+[README roadmap](../README.md#roadmap)) is a step towards it.
 
-## Why Botpike
+## Why this workload
 
-Botpike today keeps balances in TigerBeetle and facts in PostgreSQL, and its own documents name
-the gaps that follow. Each 1.0 goal below closes one of them.
+A typical agent-budget service keeps balances in one store and facts in another, and the gaps
+that follow are the goals below.
 
-| Botpike today | The gap, in Botpike's own words | Nerva 1.0 goal |
+| Typical arrangement | The gap | Nerva 1.0 goal |
 |---|---|---|
-| TigerBeetle for balances, PostgreSQL for facts, reconciliation rebuilds from TigerBeetle | `AGENTS.md` forbids "any dual truth" and warns against breaking reconciliation | G1 |
-| Freshness from a per-agent sequence counter | The control room "can show a stale question" after a crash | G2 |
-| One receipt should map to one run | "Two daemons … could still both claim it. Closing that needs a lease in the ledger." | G3 |
-| Weekly report, spend rollups, obligations | Built by hand from the facts | G4 |
-| Exactly-once spending | "In-flight provider calls repeat after a crash" | G5 |
-| Allowance answers journalled by hand so re-runs decide the same way | Reconstructing "what did the agent know when it decided?" | G6 |
-| Suspend, resume and approvals in files under a state directory | "Approvals are not signed"; the receipt lock is per state directory | G7 |
-| Many agents spending from one org budget | Contention on hot accounts | G8 |
+| A ledger for balances, a relational database for facts, reconciliation between them | Two truths to keep in step | G1 |
+| Freshness from a counter kept beside the data | A reader can act on a stale question after a crash | G2 |
+| One receipt should map to one run | Two workers can both claim it without a lease in the store | G3 |
+| Reports, spend rollups, obligations | Built by hand from the facts | G4 |
+| Exactly-once spending | In-flight external calls repeat after a crash | G5 |
+| Answers journalled by hand so re-runs decide the same way | Reconstructing "what did the agent know when it decided?" | G6 |
+| Suspend, resume and approvals in local files | Unattributed approvals; locks per directory | G7 |
+| Many agents spending from one budget | Contention on hot accounts | G8 |
 
 ## Goals
 
@@ -51,26 +53,26 @@ during a crash is repeated unless the provider honours that idempotency key.
 **G6. History is queryable as of any op.** "What was this agent's allowance when it decided?"
 is a read at the op of the decision, not a hand-kept journal.
 
-**G7. Durable, attributed workflow state.** Suspended agents, pending approvals and their
-answers live in the replicated log, and every approval is attributed to an identity. No
-per-directory locks, no files that two daemons can both claim.
+**G7. Durable, attributed workflow state.** Suspended work, pending approvals and their answers
+live in the replicated log, and every approval is attributed to an identity. No per-directory
+locks, no files that two workers can both claim.
 
 **G8. Hot balances without conflicts.** Optimistic transactions conflict when many agents draw
 on one budget at once — exactly the contended pattern TigerBeetle was built for. Nerva 1.0
 offers conditional, commutative operations applied inside the commit (for example "reserve up to
 X if the balance allows"), the way TigerBeetle applies transfers, so a hot budget does not
 serialize clients through retries.
-*Open decision:* whether Botpike moves balances to Nerva at 1.0, or keeps TigerBeetle for
-balances and uses Nerva for facts, receipts and views. Nerva must support the second
-arrangement either way.
+*Open decision:* whether balances move to Nerva at 1.0, or stay in a dedicated ledger with Nerva
+holding facts, receipts and views. Nerva must support the second arrangement either way.
 
 ## Non-goals for 1.0
 
 - Holding real money before Nerva has an external correctness review comparable to
-  TigerBeetle's Jepsen analysis. Until then Botpike's balances stay in TigerBeetle.
+  TigerBeetle's Jepsen analysis.
 - SQL and general-purpose queries; full PostgreSQL compatibility.
-- Object-storage tiering, external operators (embeddings) and other north-star features Botpike
-  does not need.
+- Object-storage tiering, external operators (embeddings) and other north-star features the
+  workload does not need.
+- Application-specific protocols or routes (N39).
 
 ## Milestones
 
@@ -79,33 +81,23 @@ arrangement either way.
    The VOPR workload races clients over 1–4 receipts and checks that each receipt's sequence
    advances by exactly one per winning claim; `state_machine_tests.zig` has the deterministic
    cases (`receipt race: …`).
-2. **Server and client** (`nerva format`, `nerva start`, a client library) so Botpike can call
-   Nerva outside the simulator.
+2. **Server and client** (`nerva format`, `nerva start`, client access).
    - 2a ✅ The `nerva` binary and a blocking Zig client (`src/nerva/client.zig`), proven by
      `zig build test:integration`: three real replicas, the receipt race between two clients,
      change-feed paging, and a replica crash and restart.
-   - 2b ✅ `nerva ledgerd`: the Botpike runtime's own ledger protocol over HTTP, served from
-     Nerva (DECISIONS N6–N20). Chosen over a new JSON API because the protocol already exists,
-     has a consumer, a reference implementation and an acceptance bar. Proven by
-     `zig build test:ledgerd`: byte-identical to `ledgerd.py` over ~10k scripted and fuzzed
-     requests, and two gateways racing on one ledger conserve money and claim each sequence
-     number once. Not yet run against the runtime's Unison scenarios (no `ucm` in this sandbox).
-3. ✅ **Positioned reads and the first view** (G2, G4): Botpike's spend rollup maintained from the
-   change feed, read at a position.
-   `lookup_rows` results carry `op_read`; `nerva view` serves `journal` and `spend` (Botpike's
-   agent rollup over runtime request ids) with `min_op` waits, checked against `ledgerd.py`'s
-   own files (DECISIONS N21–N26).
-
+   - 2b ✅ `nerva api`: the core operations as JSON over HTTP (N33), checked against a model.
+     (An earlier, application-specific gateway was removed in N39.)
+3. ✅ **Positioned reads** (G2): `lookup_rows` results carry `op_read`; views answer at a
+   watermark, with `min_op` waits (N21–N23).
 4. **As-of reads and workflow state** (G6, G7).
-   - G6 ✅ `get_history` reads any row as of any op, through an index on the change feed. `nerva
-     view` serves any ledger key `as_of` an op, and stamps each journal line with its op.
-     Checked by the VOPR model and by re-reading `ledgerd.py`'s files as of sampled requests
-     (DECISIONS N27, N28).
-   - G7, agent state ✅ `/v1/store/*` serves the runtime's `Store` ability from Nerva, so
-     suspended agents, their code and their receipts live in the replicated log (N29).
-   - G7, attribution: **waiting on a decision** (N30). The runtime never stores an approval: `brt
-     approve <id> yes|no` hands the answer straight to the resume. Recording who approved needs
-     an identity model that Botpike owns. The claim lease that would replace the runtime's
-     per-directory lock (runtime D43) waits on the same answer.
-5. **Effect sinks** (G5) and **conditional operations for hot balances** (G8).
-6. **Botpike integration**: facts, receipts and views on Nerva, balances per the G8 decision.
+   - G6 ✅ `get_history` reads any row as of any op, through an index on the change feed
+     (N27); `nerva api` serves `row?as_of=`, and declared views answer `as_of` any op.
+   - G7 open: durable workflow state needs larger values than 80-byte rows (applications chunk
+     them today, as `documents.zig` does for the catalog) and attributed approvals, which need
+     an identity model (N30).
+5. ✅ **Declared views** (G4): layouts and view declarations in the log, computed by `nerva view`
+   latest or as of any op, with a hash per answer (N34, N35); demonstrated by the seat and
+   canvas demos under crashes (N36, N38).
+6. **Effect sinks** (G5) and **conditional operations for hot balances** (G8).
+7. **First production use**: the dog-fooding service's facts, receipts and views on Nerva
+   through the generic API, balances per the G8 decision.

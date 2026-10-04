@@ -1,5 +1,5 @@
-//! The catalog as `nerva api` reads and writes it: layout documents in the log, in
-//! `catalog.table_catalog`, chunked by `ledgerd/store.zig` and keyed `table.<id>` (N34).
+//! The catalog as `nerva api` reads and writes it: documents in the log, in
+//! `catalog.table_catalog` (`documents.zig`), keyed `table.<id>` and `view.<name>` (N34, N35).
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -7,7 +7,7 @@ const log = std.log.scoped(.api);
 
 const Client = @import("../client.zig").Client;
 const catalog = @import("../catalog.zig");
-const Store = @import("../ledgerd/store.zig").Store;
+const documents = @import("../documents.zig");
 const LayoutPut = @import("api.zig").LayoutPut;
 const ViewPut = @import("api.zig").ViewPut;
 
@@ -15,15 +15,19 @@ const ViewPut = @import("api.zig").ViewPut;
 const attempts_max = 16;
 
 pub const CatalogStore = struct {
-    store: Store,
+    transaction: documents.Transaction,
 
     pub fn init(client: *Client) CatalogStore {
-        return .{ .store = .{ .client = client, .ledger = 0, .table = catalog.table_catalog } };
+        return .{ .transaction = .{
+            .client = client,
+            .table = catalog.table_catalog,
+            .namespace = 0,
+        } };
     }
 
     pub fn layout(self: *CatalogStore, arena: std.mem.Allocator, table: u32) !?catalog.Layout {
-        try self.store.begin(arena);
-        return layout_read(&self.store, arena, table);
+        self.transaction.begin(arena);
+        return layout_read(&self.transaction, arena, table);
     }
 
     pub fn layout_put(
@@ -35,8 +39,8 @@ pub const CatalogStore = struct {
         const key = try layout_key(arena, table);
         const document = try catalog.layout_render(arena, new);
         for (0..attempts_max) |_| {
-            try self.store.begin(arena);
-            const old = try layout_read(&self.store, arena, table);
+            self.transaction.begin(arena);
+            const old = try layout_read(&self.transaction, arena, table);
             const outcome: LayoutPut = if (old == null)
                 .created
             else if (!catalog.layout_extends(&old.?, new))
@@ -47,8 +51,8 @@ pub const CatalogStore = struct {
                 .extended;
             if (outcome == .incompatible or outcome == .unchanged) return outcome;
 
-            try self.store.put(key, document);
-            switch (try self.store.commit()) {
+            try self.transaction.put(key, document);
+            switch (try self.transaction.commit()) {
                 .committed => return outcome,
                 .conflict => log.info("table {}: layout conflict, retrying", .{table}),
             }
@@ -57,8 +61,8 @@ pub const CatalogStore = struct {
     }
 
     pub fn view(self: *CatalogStore, arena: std.mem.Allocator, name: []const u8) !?catalog.View {
-        try self.store.begin(arena);
-        return view_read(&self.store, arena, name);
+        self.transaction.begin(arena);
+        return view_read(&self.transaction, arena, name);
     }
 
     pub fn view_put(
@@ -70,13 +74,13 @@ pub const CatalogStore = struct {
         const key = try std.fmt.allocPrint(arena, "view.{s}", .{name});
         const document = try catalog.view_render(arena, new);
         for (0..attempts_max) |_| {
-            try self.store.begin(arena);
-            if (try view_read(&self.store, arena, name)) |old| {
+            self.transaction.begin(arena);
+            if (try view_read(&self.transaction, arena, name)) |old| {
                 const same = std.mem.eql(u8, try catalog.view_render(arena, &old), document);
                 return if (same) .unchanged else .different;
             }
-            try self.store.put(key, document);
-            switch (try self.store.commit()) {
+            try self.transaction.put(key, document);
+            switch (try self.transaction.commit()) {
                 .committed => return .created,
                 .conflict => log.info("view {s}: conflict, retrying", .{name}),
             }
@@ -85,9 +89,13 @@ pub const CatalogStore = struct {
     }
 };
 
-fn view_read(store: *Store, arena: std.mem.Allocator, name: []const u8) !?catalog.View {
+fn view_read(
+    transaction: *documents.Transaction,
+    arena: std.mem.Allocator,
+    name: []const u8,
+) !?catalog.View {
     const key = try std.fmt.allocPrint(arena, "view.{s}", .{name});
-    const document = try store.get(key) orelse return null;
+    const document = try transaction.get(key) orelse return null;
     return catalog.view_parse(arena, document) catch |err| switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         error.Invalid => error.Corrupt,
@@ -98,9 +106,13 @@ fn layout_key(arena: std.mem.Allocator, table: u32) ![]const u8 {
     return std.fmt.allocPrint(arena, "table.{}", .{table});
 }
 
-fn layout_read(store: *Store, arena: std.mem.Allocator, table: u32) !?catalog.Layout {
+fn layout_read(
+    transaction: *documents.Transaction,
+    arena: std.mem.Allocator,
+    table: u32,
+) !?catalog.Layout {
     assert(table != 0 and table < catalog.tables_reserved_min);
-    const document = try store.get(try layout_key(arena, table)) orelse return null;
+    const document = try transaction.get(try layout_key(arena, table)) orelse return null;
     // Written by `layout_put`, from a layout that parsed: anything else is corruption.
     return catalog.layout_parse(arena, document) catch |err| switch (err) {
         error.OutOfMemory => error.OutOfMemory,

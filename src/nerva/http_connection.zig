@@ -1,4 +1,4 @@
-//! What Nerva's HTTP gateways (`api`, `view`, `ledgerd`) do with each accepted connection
+//! What Nerva's HTTP gateways (`api`, `view`) do with each accepted connection
 //! (docs/DECISIONS.md N37).
 //!
 //! The gateways serve one request at a time. A connection kept open between requests, or one

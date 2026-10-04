@@ -15,7 +15,7 @@ const log = std.log.scoped(.declared_views);
 
 const nerva = @import("../../nerva.zig");
 const catalog = @import("../catalog.zig");
-const store = @import("../ledgerd/store.zig");
+const documents = @import("../documents.zig");
 
 const Change = nerva.Change;
 const value_size = nerva.value_size;
@@ -117,15 +117,16 @@ pub const DeclaredViews = struct {
     fn catalog_apply(views: *DeclaredViews, id: u64) Error!void {
         const arena = views.catalog_arena.allocator();
         const chunk0 = views.catalog_rows.get(id) orelse return;
-        const count = store.chunk0_count(&chunk0) catch return;
+        const count = documents.chunk0_count(&chunk0) catch return;
         const chunks = try arena.alloc([value_size]u8, count);
         chunks[0] = chunk0;
         for (chunks[1..], 1..) |*chunk, index| {
-            chunk.* = views.catalog_rows.get(store.tail_id(id, @intCast(index))) orelse return;
+            chunk.* = views.catalog_rows.get(documents.tail_id(id, @intCast(index))) orelse
+                return;
         }
-        const decoded = store.chunks_decode(arena, chunks) catch return;
+        const decoded = documents.chunks_decode(arena, chunks) catch return;
         // A tail chunk can look like a header; only a true chunk 0 hashes back to its own id.
-        if (store.row_id(decoded.ledger, decoded.generation, decoded.key, 0) != id) return;
+        if (documents.row_id(decoded.namespace, decoded.key) != id) return;
 
         if (std.mem.startsWith(u8, decoded.key, "table.")) {
             const table = std.fmt.parseInt(u32, decoded.key["table.".len..], 10) catch return;
@@ -195,11 +196,9 @@ pub const DeclaredViews = struct {
     }
 };
 
-/// Tables a declared view may read: not Nerva's own, and not `ledgerd`'s chunked rows (which
-/// `LedgerdViews` mirrors, and which no layout describes).
+/// Tables a declared view may read: any but Nerva's own.
 fn table_viewable(table: u32) bool {
-    return table < catalog.tables_reserved_min and
-        table != store.table_rows and table != store.table_roots and table != store.table_store;
+    return table < catalog.tables_reserved_min;
 }
 
 const Group = struct {
@@ -346,13 +345,13 @@ test "declared views: group, filter, aggregate, as of, catalog from chunked rows
         .{ "table.5", try catalog.layout_render(arena, &layout) },
         .{ "view.revenue", view_json },
     }) |document| {
-        const chunks = try store.chunks_encode(arena, 0, 0, document[0], document[1]);
+        const chunks = try documents.chunks_encode(arena, 0, document[0], document[1]);
         var changes = std.ArrayList(Change).init(arena);
         var index = chunks.len;
         while (index > 0) {
             index -= 1;
             try changes.append(.{
-                .id = store.chunk_id(0, 0, document[0], @intCast(index)),
+                .id = documents.chunk_id(0, document[0], @intCast(index)),
                 .table = catalog.table_catalog,
                 .kind = .put,
                 .flags = .{},

@@ -1,7 +1,7 @@
 //! The VOPR workload for Nerva: random transactions over a small key space (so that conflicts
 //! are common), point lookups, change-feed scans and row histories (as-of reads).
 //!
-//! It also plays Botpike's receipt race: several clients (daemons) race to claim the same few
+//! It also plays a receipt race: several clients (daemons) race to claim the same few
 //! receipts, each claim being a read at the version seen plus a write of the next sequence. The
 //! checker asserts, independently of the model, that every receipt's sequence advances by exactly
 //! one per winning claim, so no (receipt, seq) is ever claimed twice.
@@ -31,12 +31,12 @@ const ChangesFilter = nerva.ChangesFilter;
 const HistoryFilter = nerva.HistoryFilter;
 const value_size = nerva.value_size;
 
-/// The table holding Botpike-style receipts. Random transactions never touch it.
+/// The table holding receipts. Random transactions never touch it.
 pub const receipts_table: u32 = 100;
 
 /// The payload of a receipt row.
 pub const Receipt = extern struct {
-    /// Botpike's per-agent sequence: advances by one per claim.
+    /// A per-agent sequence: advances by one per claim.
     seq: u64,
     /// The client (daemon) that made the last claim.
     owner: u64,
@@ -544,7 +544,7 @@ pub fn WorkloadType(comptime StateMachine: type) type {
             if (op_request) |op| workload.op_max = op;
         }
 
-        /// Botpike's invariant, checked against `receipt_seqs` rather than the row model: a
+        /// The claim invariant, checked against `receipt_seqs` rather than the row model: a
         /// winning claim advances the receipt's sequence by exactly one.
         fn check_claim_won(workload: *Workload, put: *const Entry) void {
             assert(put.table == receipts_table);

@@ -42,10 +42,6 @@ jobs:
       - name: Integration (three real replicas)
         run: ./zig/zig build test:integration
 
-      # One suite at a time: each runs its own cluster, and together they would crowd the runner.
-      - name: ledgerd (against ledgerd.py, race, views and as-of, store)
-        run: ./zig/zig build test:ledgerd -j1
-
       - name: JSON API (against a model)
         run: ./zig/zig build test:api
 
