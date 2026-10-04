@@ -94,7 +94,7 @@ function at a time, running `check` and relevant tests after each.
 ### Pre-existing bugs
 
 Whenever you find a bug that existed before your change (in Nerva's code or a vendored file),
-file a GitHub issue on `topwombat/nerva`, even if you fix it in the same pull request: what
+file a GitHub issue on `Botpike/nerva-ledger`, even if you fix it in the same pull request: what
 fails, how to reproduce it, since when (the commit or release, if known), its impact, and the
 fix or the pull request that carries it. Fixing it in the PR does not replace the issue; link
 them (`Fixes #N`), and close the issue as completed if the fix has already merged.
