@@ -1766,7 +1766,7 @@ fn log_override(
             if (log_performance_mode) {
                 if (scope != .simulator) return;
             } else {
-                // Nerva: also the workload's summary of what it checked (N48).
+                // Nerva: also the workload's summary of what it checked (N49).
                 if (scope != .simulator and scope != .cluster and scope != .workload) return;
             }
         }

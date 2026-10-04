@@ -113,7 +113,7 @@ fn signed_range(prng: *stdx.PRNG, min: i64, max: i64) i64 {
 }
 
 /// A filter limit: usually `[0, small_max]` (zero is invalid, and returns nothing); sometimes at
-/// the largest a reply holds, just past it, or `maxInt(u32)`, which must be clamped (N48).
+/// the largest a reply holds, just past it, or `maxInt(u32)`, which must be clamped (N49).
 fn limit_random(prng: *stdx.PRNG, small_max: u32, limit_max: u32) u32 {
     return switch (prng.chances(.{ .small = 20, .max = 1, .past = 1, .huge = 1 })) {
         .small => prng.int_inclusive(u32, small_max),
@@ -129,7 +129,7 @@ fn timestamp_invalid(prng: *stdx.PRNG) u64 {
 }
 
 /// Checks `entry_validate`'s answer against the rules `EntryStatus` documents, written apart
-/// from it (N48): the entry is valid exactly when it breaks none of them, and otherwise the
+/// from it (N49): the entry is valid exactly when it breaks none of them, and otherwise the
 /// status names one it breaks. (Which one wins when several are broken is `entry_validate`'s
 /// choice.) An add's own parameters are `nerva_adds`'s to fuzz: when only they are wrong, any of
 /// the add statuses may be named.
@@ -241,12 +241,12 @@ pub fn WorkloadType(comptime StateMachine: type) type {
         /// batch).
         expected: []Expected,
 
-        /// The cursor an incomplete `get_changes` reply returned, to continue from (N48).
+        /// The cursor an incomplete `get_changes` reply returned, to continue from (N49).
         changes_cursor: ?u64 = null,
         /// The row and cursor an incomplete `get_history` reply returned, to continue from.
         history_cursor: ?struct { table: u32, id: u64, timestamp_max: u64 } = null,
 
-        /// Coverage of the inputs and limits added in N48.
+        /// Coverage of the inputs and limits added in N49.
         full_batches: u64 = 0,
         invalid_entries: u64 = 0,
         future_reads: u64 = 0,
@@ -395,7 +395,7 @@ pub fn WorkloadType(comptime StateMachine: type) type {
             for (0..batch_count) |_| {
                 const writable = encoder.writable() orelse break;
                 const entries_free = stdx.bytes_as_slice(.inexact, Entry, writable);
-                // Rarely, one transaction as large as the request allows (N48): prefetch and the
+                // Rarely, one transaction as large as the request allows (N49): prefetch and the
                 // state machine's scratch space at capacity.
                 const full = workload.prng.chance(stdx.PRNG.ratio(1, 100));
                 const entries = if (full) entries_free else entries_free[0..workload.prng.int_inclusive(
@@ -545,7 +545,7 @@ pub fn WorkloadType(comptime StateMachine: type) type {
             const op_seen = if (workload.prng.chance(workload.options.stale_read_probability))
                 switch (workload.prng.chances(.{ .stale = 4, .future = 1 })) {
                     .stale => workload.prng.int_inclusive(u64, workload.op_max),
-                    // A version no row has yet (N48): it must conflict too.
+                    // A version no row has yet (N49): it must conflict too.
                     .future => future: {
                         workload.future_reads += 1;
                         break :future workload.op_max + workload.prng.range_inclusive(u64, 1, 100);
@@ -662,7 +662,7 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                     constants.message_body_size_max - reply_trailer_size,
                     @sizeOf(RowValue),
                 ) - keys_total;
-                // Usually a few keys; sometimes as many as the reply can hold (N48).
+                // Usually a few keys; sometimes as many as the reply can hold (N49).
                 const keys_max = @min(keys_free.len, reply_keys_free);
                 const keys = keys_free[0..workload.prng.int_inclusive(
                     usize,
@@ -706,7 +706,7 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                     .start => 0,
                     .known => if (changes.len == 0) 0 else changes[prng.index(changes)].timestamp,
                     .after => if (changes.len == 0) 0 else changes[changes.len - 1].timestamp + 1,
-                    // Where an incomplete reply said to continue (N48).
+                    // Where an incomplete reply said to continue (N49).
                     .cursor => if (workload.changes_cursor) |cursor| cursor: {
                         workload.cursors_continued += 1;
                         break :cursor cursor;
@@ -769,7 +769,7 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                 filter.table = known.?.table;
                 filter.id = known.?.id;
             }
-            // Or continue where an incomplete reply said to (N48).
+            // Or continue where an incomplete reply said to (N49).
             if (workload.history_cursor) |cursor| {
                 if (prng.chance(stdx.PRNG.ratio(1, 4))) {
                     filter.table = cursor.table;
@@ -799,7 +799,7 @@ pub fn WorkloadType(comptime StateMachine: type) type {
             assert(workload.requests_delivered <= workload.requests_sent);
 
             // Every reply is checked against the op its request executed at, not only against
-            // the ops before it (N48).
+            // the ops before it (N49).
             switch (operation) {
                 .commit => workload.check_commit(op, timestamp, request_body, reply_body),
                 .lookup_rows => workload.check_lookup_rows(op, request_body, reply_body),

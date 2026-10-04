@@ -413,7 +413,18 @@ tree ids 1–15, and the trace's tree enum, derived from Nerva's four trees, pan
   redundant guard. The last mutation was caught only after adding header-count properties.)
 - `ci.yml` is unchanged while CI is re-wired; it should run `fuzz -- smoke`.
 
-**N48. The VOPR workload checks exact ops, sends the inputs it never did, and reaches the limits.**
+
+**N47. CI runs on Botpike's own runners.**
+`ci.yml` and `release.yml` run every job on `[self-hosted, fly]`: Botpike/ci-runners starts a Fly
+Machine (performance-2x, 8 GB, its own 10 GB volume) for the job and stops it afterwards, so a
+job waits seconds for a runner and the Zig cache survives between jobs. They behave as GitHub's
+runners do where this repository depends on it: jobs run as a non-root user with
+`perf_event_paranoid` 2, so the perf test still skips itself (N32); the workspace is on the
+volume, which holds the integration test's 3.5 GiB; `xz` and `gh` are installed for Zig's
+download and the release. Nothing else changed: the steps, seeds and release are as N32 and N40
+set them.
+
+**N49. The VOPR workload checks exact ops, sends the inputs it never did, and reaches the limits.**
 An audit of the workload found what it generated and checked well, and what it never touched:
 - **Exact ops.** Replies were checked only to be later than every op seen before. `vopr.zig` now
   passes the op each request committed at, and the workload asserts it exactly: each committed
