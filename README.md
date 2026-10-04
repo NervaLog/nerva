@@ -118,6 +118,8 @@ LEDGER_KEY=secret ./zig-out/bin/nerva ledgerd --cluster=0 --addresses=3001,3002,
 replies, scripted scenarios plus a seeded fuzzer), races two gateways on one ledger, and checks
 the views below against `ledgerd.py`'s own files.
 
+How to run the runtime on Nerva, phase by phase: [docs/BOTPIKE-INTEGRATION.md](./docs/BOTPIKE-INTEGRATION.md).
+
 `/v1/store/get` and `/v1/store/put` (`name_hex`, `value_hex`) serve the runtime's `Store`
 ability, the agent state its daemon otherwise keeps as files in a state directory:
 continuations, code and receipts. They live outside the ledger's generations, so

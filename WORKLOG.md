@@ -142,3 +142,18 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
 - Not built, waiting on a decision: approval attribution and a claim lease (N30).
 - Verified: `test:unit` 289/290 (sandbox perf test); `test:fmt`; `test:integration`;
   `test:ledgerd` (conformance, race, views, store); VOPR seeds 1, 2, 5, 11.
+
+## 2026-10-04 — Botpike integration guide
+
+- `docs/BOTPIKE-INTEGRATION.md`: instructions for a coding bot working in Botpike's repositories.
+  Ground rules (dog-fooding, no real money, Nerva as a pinned dependency); building and running
+  Nerva; phase 1 (`nerva ledgerd` as the runtime's HTTP ledger, accepted by an identical demo
+  transcript); phase 2 (a `Store.http` handler, with `daemon.key`/`daemon.pub` kept local and
+  `$STATE/.lock` kept); phase 3 (read-only views and `as_of`); how to report findings.
+- The runbook was run from scratch: release build, a one-replica `--development` cluster (1.1 GiB
+  data file, ~850 MB resident), the gateway, the view, smoke requests, `as_of` at three ops, a
+  restart of every process.
+- Found while writing it: the runtime reads its Ed25519 signing key through `Store`, so a
+  Nerva-backed `Store` must keep `daemon.key` in local files.
+- Decision N31: Botpike is dog-fooding, not a specification.
+

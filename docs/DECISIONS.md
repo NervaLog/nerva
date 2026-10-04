@@ -223,3 +223,13 @@ Choosing between them settles the wire format, the stored record and key distrib
 it wrong means replacing the stored approval records, so it is not assumed. The claim lease
 that would remove the runtime's per-directory lock (D43) depends on the same question: a lease
 is held by an identity.
+
+**N31. Botpike is dog-fooding, not a specification.**
+Owner's direction (2026-10-04): Nerva is tested on Botpike, not specialized for it. Nerva grows
+only general capabilities (transactions, the change feed, history, views, a key-value store).
+Botpike-specific behaviour stays in adapters at the boundary: `nerva ledgerd` speaks the
+runtime's existing protocol, and the ledgerd views read its rows. A gap Botpike finds is
+reported as the general gap it exposes, not patched with a Botpike-only route.
+`docs/BOTPIKE-INTEGRATION.md` gives the integrating bot these rules, and a phased plan that adds
+Nerva beside Botpike's existing ledger and file store, never in place of them.
+
