@@ -297,6 +297,11 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
   10 s budget); it is a warning, not a failure, and smoke never reached it before this fix.
 
 
+## 2026-10-04 — Repository renamed to `Botpike/nerva-ledger`
+
+- The repository moved from `topwombat/nerva` to `Botpike/nerva-ledger`; CLAUDE.md's issue rule
+  names the new home. (GitHub redirects the old name for now.)
+
 ## 2026-10-04 — Fly.io feasibility probe for nightly performance tests
 
 - `perf/fly/`: `run-probe.sh` creates one Machine and a volume in the `nerva-perf` Fly app,
@@ -322,4 +327,3 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
   spans. Mutation-tested: without the statsd or the trace wiring, the integration test fails.
 - Verified: `check`, `test:fmt`, `test:integration`; `test:unit -Drelease` 305/306 (the
   sandbox-denied perf test).
-
