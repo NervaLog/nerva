@@ -413,7 +413,6 @@ tree ids 1–15, and the trace's tree enum, derived from Nerva's four trees, pan
   redundant guard. The last mutation was caught only after adding header-count properties.)
 - `ci.yml` is unchanged while CI is re-wired; it should run `fuzz -- smoke`.
 
-
 **N47. CI runs on Botpike's own runners.**
 `ci.yml` and `release.yml` run every job on `[self-hosted, fly]`: Botpike/ci-runners starts a Fly
 Machine (performance-2x, 8 GB, its own 10 GB volume) for the job and stops it afterwards, so a
@@ -473,7 +472,27 @@ An audit of the workload found what it generated and checked well, and what it n
 Signed adds were already generated (N42). Proven by planting bugs in the state machine, each
 caught by a VOPR seed: see WORKLOG.
 
-**N50. CI runs its tests as parallel jobs, and keeps the Zig toolchain on the runner's volume.**
+**N50. Replicas export metrics with `--statsd` and spans with `--trace`.**
+Nightly performance tests and anyone running Nerva need the replica's timings, and the vendored
+tracer already records them (request latency per operation, commit stages, compaction, lookups
+and scans per tree, storage IO, cache hits) and emits them every 10 s. `nerva start` simply
+gave it no output. Now:
+- `--statsd=<host:port>` sends them over UDP in TigerBeetle's statsd format (port 8125 by
+  default; a bare port means 127.0.0.1; IPv6 in brackets; port 0 refused). UDP never blocks
+  the replica, and a lost packet loses one window of numbers, not correctness.
+- `--trace=<path>` writes the JSON span trace (Perfetto, chrome://tracing). It writes each span
+  as it happens, unbuffered, so it is for diagnosis, not for timed runs.
+- No vendored file changed. Names keep the `tb.` prefix and TigerBeetle's tag spellings
+  (`operation:Operation.commit`): renaming would patch the vendored tracer for no gain yet.
+- `format`, `api` and `view` export nothing: `format` is brief, and the gateways are measured
+  from outside (load tools see their latency directly).
+- Not done here: the client's round-trip time is still reported as 0 by the vendored VSR client,
+  so `client_request_round_trip` stays empty.
+- `test:integration` starts replica 0 with `--statsd` (to a UDP socket the test binds) and
+  replica 1 with `--trace`, then waits up to 15 s for request, commit and cache metrics and
+  checks the trace holds commit spans. Mutation-tested: dropping either wiring fails it.
+
+**N51. CI runs its tests as parallel jobs, and keeps the Zig toolchain on the runner's volume.**
 Measured on run 37240753012, the single `test` job was the critical path at 7m05 (typecheck 48 s,
 format 0 s, unit 3m06, integration 29 s, API 2m10, views 21 s), then `demo` at 6m03 (a release
 build, the seat demo, then the canvas demo); the VOPR seeds take 40 s to 2m01. `ci.yml` now runs:

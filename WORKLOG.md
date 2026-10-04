@@ -335,7 +335,33 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
   any run's feed), and a put carrying `op_seen` accepted (3/4; only `entry_status_check`
   catches it, as the model shares `entry_validate`).
 
-## 2026-10-04 — Faster CI: parallel test jobs, demos split, Zig kept on the volume (N50)
+## 2026-10-04 — Fly.io feasibility probe for nightly performance tests
+
+- `perf/fly/`: `run-probe.sh` creates one Machine and a volume in the `nerva-perf` Fly app,
+  builds `Dockerfile` (the `nerva` binary, `fio`, `perf`) with Fly's remote builder, runs
+  `probe.sh` at boot, prints its report, and destroys the Machine and volume on exit, failure
+  included. It answers the performance plan's Phase 0 questions about the hardware.
+- Probe results (performance-4x, 10 GB volume, `iad`, binary `0.0.1+3a01765`): production
+  config (Direct IO) formats and starts on the volume; three replicas and `nerva api` work on
+  Fly's private IPv6 addresses; `perf_event_open` works with hardware counters; the volume
+  delivers about 16,500 IOPS and 65 MiB/s, exactly Fly's documented cap for that size. Nightly
+  throughput runs will be IO-capped on Fly and are judged on write amplification instead.
+- Not part of the build or CI; it needs `flyctl` and `FLY_API_TOKEN`.
+
+## 2026-10-04 — Metrics and traces from replicas (N50)
+
+- `nerva start --statsd=<host:port>` sends the replica's metrics (statsd over UDP, every 10 s)
+  and `--trace=<path>` writes its JSON span trace. `src/nerva/cli.zig` parses and validates
+  both (`statsd_parse`, `error.StatsdAddressInvalid`, `error.TracePathEmpty`);
+  `src/nerva_main.zig` hands them to the vendored tracer. No vendored file changed.
+- README: "Metrics and traces", with the metrics the performance plan reads.
+- Tests: `statsd_parse` and `start_resolve` unit tests; `test:integration` checks that replica 0's
+  statsd packets carry request, commit and cache metrics and that replica 1's trace holds commit
+  spans. Mutation-tested: without the statsd or the trace wiring, the integration test fails.
+- Verified: `check`, `test:fmt`, `test:integration`; `test:unit -Drelease` 305/306 (the
+  sandbox-denied perf test).
+
+## 2026-10-04 — Faster CI: parallel test jobs, demos split, Zig kept on the volume (N51)
 
 - `.github/workflows/ci.yml`: `test` split into `unit` (unit tests) and `system` (typecheck,
   format, integration, API, views); `demo` split into one job per demo, each building with

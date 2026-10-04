@@ -98,7 +98,7 @@ Linux (io_uring) or macOS; x86_64 with AES or aarch64.
 
 CI (`.github/workflows/ci.yml`) runs on every push and pull request to `main`: typecheck, format,
 unit, integration, API, view and demo tests, and the VOPR on seeds 1, 2, 5 and one random seed (printed,
-so a failure replays), as parallel jobs (N50). A commit to `main` that changes `VERSION` runs CI on that commit, then
+so a failure replays), as parallel jobs (N51). A commit to `main` that changes `VERSION` runs CI on that commit, then
 publishes binaries for Linux and macOS (x86_64, aarch64) as GitHub release `v<VERSION>`
 (`release.yml`), with that version's section of [CHANGELOG.md](./CHANGELOG.md) as the release
 notes; releasing a version twice, or without notes, fails.
@@ -121,6 +121,29 @@ one cluster, and data files formatted by v0.1.0 (protocol `0.0.1`) must be refor
 
 `--development` relaxes Direct IO and uses small caches. Clients use `src/nerva/client.zig`:
 `lookup_rows`, `commit` and `get_changes`, blocking, one request in flight per client.
+
+### Metrics and traces
+
+`nerva start --statsd=<host:port>` sends the replica's metrics over UDP every 10 seconds, in
+statsd format with DogStatsD tags (`|#cluster:…,replica:N`). `--trace=<path>` writes a JSON span
+trace for [Perfetto](https://ui.perfetto.dev) or `chrome://tracing`; tracing slows the replica,
+so use it to diagnose, not to time. The metrics most useful for performance work:
+
+| Metric | What it measures |
+|---|---|
+| `tb.replica_request_us.*` (tag `operation:Operation.<op>`) | From the primary first seeing a request to this replica committing it (`min`, `max`, `avg`, `sum`, `count`) |
+| `tb.replica_request_local_us.*` (tag `operation`) | This replica's own commit of the request |
+| `tb.replica_request_execute_us.*` (tag `operation`) | Executing the request in the state machine |
+| `tb.replica_commit_us.*` (tag `stage`) | Each commit stage: `prefetch`, `stall`, `execute`, `compact`, `checkpoint_*` and others |
+| `tb.replica_prepare_ok_quorum_us.*` | From prepare to a replication quorum |
+| `tb.compact_beat_us.*`, `tb.compact_mutable_us.*` (tag `tree`) | Compaction work per LSM tree |
+| `tb.lookup_us.*`, `tb.scan_tree_us.*` (tag `tree`) | Point lookups and scans per tree |
+| `tb.storage_read_us.*`, `tb.storage_write_us.*` (tag `zone`) | Disk IO by data file zone |
+| `tb.grid_cache_hits`, `tb.grid_cache_misses` | Block cache effectiveness (gauges) |
+| `tb.replica_commit_min`, `tb.replica_commit_max`, `tb.replica_pipeline_queue_length` | Progress and backlog (gauges) |
+
+Timings are aggregated over each 10-second window. The `tb.` prefix and tag spellings come from
+TigerBeetle's tracer (UPSTREAM.md).
 
 ## JSON API
 
