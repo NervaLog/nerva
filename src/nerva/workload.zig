@@ -1,6 +1,11 @@
 //! The VOPR workload for Nerva: random transactions over a small key space (so that conflicts
 //! are common), point lookups and change-feed scans.
 //!
+//! It also plays Botpike's receipt race: several clients (daemons) race to claim the same few
+//! receipts, each claim being a read at the version seen plus a write of the next sequence. The
+//! checker asserts, independently of the model, that every receipt's sequence advances by exactly
+//! one per winning claim, so no (receipt, seq) is ever claimed twice.
+//!
 //! The simulator delivers replies in op order, so the workload checks each reply against an
 //! in-memory model of the committed state at that op: every status, version, value and change
 //! must match exactly. This checks strict serializability of commits and the change feed.
@@ -24,6 +29,58 @@ const RowValue = nerva.RowValue;
 const Change = nerva.Change;
 const ChangesFilter = nerva.ChangesFilter;
 const value_size = nerva.value_size;
+
+/// The table holding Botpike-style receipts. Random transactions never touch it.
+pub const receipts_table: u32 = 100;
+
+/// The payload of a receipt row.
+pub const Receipt = extern struct {
+    /// Botpike's per-agent sequence: advances by one per claim.
+    seq: u64,
+    /// The client (daemon) that made the last claim.
+    owner: u64,
+    reserved: [64]u8 = @splat(0),
+
+    comptime {
+        assert(@sizeOf(Receipt) == value_size);
+        assert(stdx.no_padding(Receipt));
+    }
+
+    pub fn from_value(value: *const [value_size]u8) Receipt {
+        return std.mem.bytesToValue(Receipt, value);
+    }
+
+    pub fn to_value(receipt: Receipt) [value_size]u8 {
+        return std.mem.toBytes(receipt);
+    }
+};
+
+/// A claim: read the receipt at the version seen, write the next sequence with a new owner.
+pub fn receipt_claim(id: u64, op_seen: u64, seq_seen: u64, owner: u64) [2]Entry {
+    return .{
+        .{
+            .id = id,
+            .table = receipts_table,
+            .kind = .read,
+            .op_seen = op_seen,
+            .value = @splat(0),
+        },
+        .{
+            .id = id,
+            .table = receipts_table,
+            .kind = .put,
+            .op_seen = 0,
+            .value = (Receipt{ .seq = seq_seen + 1, .owner = owner }).to_value(),
+        },
+    };
+}
+
+fn receipt_claim_is(entries: []const Entry) bool {
+    return entries.len == 2 and
+        entries[0].table == receipts_table and entries[0].kind == .read and
+        entries[1].table == receipts_table and entries[1].kind == .put and
+        entries[0].id == entries[1].id;
+}
 
 pub fn WorkloadType(comptime StateMachine: type) type {
     return struct {
@@ -55,6 +112,11 @@ pub fn WorkloadType(comptime StateMachine: type) type {
         transactions_committed: u64 = 0,
         transactions_failed: u64 = 0,
 
+        /// Receipt id → the sequence of its last winning claim, kept apart from `rows`.
+        receipt_seqs: std.AutoHashMapUnmanaged(u64, u64) = .{},
+        claims_won: u64 = 0,
+        claims_lost: u64 = 0,
+
         pub const Options = struct {
             batch_size_limit: u32,
             multi_batch_per_request_limit: u32,
@@ -65,6 +127,8 @@ pub fn WorkloadType(comptime StateMachine: type) type {
             /// Reads that deliberately present a stale version.
             stale_read_probability: stdx.PRNG.Ratio,
             invalid_entry_probability: stdx.PRNG.Ratio,
+            /// Few receipts, so that claims contend.
+            receipt_count: u64,
 
             pub fn generate(prng: *stdx.PRNG, options: struct {
                 batch_size_limit: u32,
@@ -80,6 +144,7 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                     .entries_per_transaction_max = prng.range_inclusive(u32, 1, 32),
                     .stale_read_probability = stdx.PRNG.ratio(prng.int_inclusive(u64, 20), 100),
                     .invalid_entry_probability = stdx.PRNG.ratio(prng.int_inclusive(u64, 3), 100),
+                    .receipt_count = prng.range_inclusive(u64, 1, 4),
                 };
             }
         };
@@ -92,15 +157,20 @@ pub fn WorkloadType(comptime StateMachine: type) type {
             assert(options.table_count > 0);
             assert(options.id_count > 0);
             assert(options.entries_per_transaction_max > 0);
+            assert(options.receipt_count > 0);
+            assert(options.table_count < receipts_table);
             return .{ .allocator = allocator, .prng = prng, .options = options };
         }
 
         pub fn deinit(workload: *Workload, allocator: std.mem.Allocator) void {
-            log.info("transactions committed={} failed={} changes={}", .{
+            log.info("transactions committed={} failed={} changes={} claims won={} lost={}", .{
                 workload.transactions_committed,
                 workload.transactions_failed,
                 workload.changes.items.len,
+                workload.claims_won,
+                workload.claims_lost,
             });
+            workload.receipt_seqs.deinit(allocator);
             workload.rows.deinit(allocator);
             workload.changes.deinit(allocator);
         }
@@ -114,26 +184,29 @@ pub fn WorkloadType(comptime StateMachine: type) type {
             client_index: usize,
             body: []align(constants.cache_line_size) u8,
         ) struct { operation: Operation, size: usize } {
-            _ = client_index;
             workload.requests_sent += 1;
 
-            const operation: Operation = switch (workload.prng.chances(.{
+            const body_limited = body[0..workload.options.batch_size_limit];
+            return switch (workload.prng.chances(.{
                 .commit = 8,
+                .claim = 4,
                 .lookup_rows = 3,
                 .get_changes = 2,
             })) {
-                .commit => .commit,
-                .lookup_rows => .lookup_rows,
-                .get_changes => .get_changes,
+                .commit => .{ .operation = .commit, .size = workload.build_commit(body_limited) },
+                .claim => .{
+                    .operation = .commit,
+                    .size = workload.build_claims(body_limited, client_index),
+                },
+                .lookup_rows => .{
+                    .operation = .lookup_rows,
+                    .size = workload.build_lookup_rows(body_limited),
+                },
+                .get_changes => .{
+                    .operation = .get_changes,
+                    .size = workload.build_get_changes(body),
+                },
             };
-            const size = switch (operation) {
-                .commit => workload.build_commit(body[0..workload.options.batch_size_limit]),
-                .lookup_rows => workload.build_lookup_rows(
-                    body[0..workload.options.batch_size_limit],
-                ),
-                .get_changes => workload.build_get_changes(body),
-            };
-            return .{ .operation = operation, .size = size };
         }
 
         fn build_commit(workload: *Workload, body: []align(constants.cache_line_size) u8) usize {
@@ -152,6 +225,40 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                 )];
                 workload.build_transaction(entries);
                 encoder.add(@intCast(entries.len * @sizeOf(Entry)));
+            }
+            return encoder.finish();
+        }
+
+        /// One claim per batch, against what this client last knew of the receipt. Claims from
+        /// several clients (or several batches of one request) on one receipt race each other.
+        fn build_claims(
+            workload: *Workload,
+            body: []align(constants.cache_line_size) u8,
+            client_index: usize,
+        ) usize {
+            var encoder = MultiBatchEncoder.init(body, .{ .element_size = @sizeOf(Entry) });
+            const batch_count = workload.prng.range_inclusive(
+                u32,
+                1,
+                workload.options.multi_batch_per_request_limit,
+            );
+            for (0..batch_count) |_| {
+                const writable = encoder.writable() orelse break;
+                const entries_free = stdx.bytes_as_slice(.inexact, Entry, writable);
+                if (entries_free.len < 2) {
+                    encoder.add(0);
+                    break;
+                }
+                const id = workload.prng.int_inclusive(u64, workload.options.receipt_count - 1);
+                const version = workload.row_version(nerva.row_key(receipts_table, id));
+                const claim = receipt_claim(
+                    id,
+                    version.op,
+                    Receipt.from_value(&version.value).seq,
+                    client_index,
+                );
+                stdx.copy_disjoint(.exact, Entry, entries_free[0..2], &claim);
+                encoder.add(2 * @sizeOf(Entry));
             }
             return encoder.finish();
         }
@@ -339,8 +446,15 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                 batch_timestamp += entries.len;
                 if (entries.len == 0) continue;
 
+                const claim = receipt_claim_is(entries);
                 if (workload.commit_failure(entries)) |failure| {
                     workload.transactions_failed += 1;
+                    if (claim) {
+                        // Claims are always well-formed: they lose only to another claim.
+                        assert(failure.status == .conflict);
+                        assert(failure.index == 0);
+                        workload.claims_lost += 1;
+                    }
                     for (results, 0..) |result, index| {
                         if (index == failure.index) {
                             assert(result.status == failure.status);
@@ -363,6 +477,8 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                 assert(op > workload.op_max);
                 op_request = op;
 
+                if (claim) workload.check_claim_won(&entries[1]);
+
                 for (entries, 0..) |*entry, index| {
                     const entry_timestamp = batch_timestamp - entries.len + index + 1;
                     workload.apply(op, entry_timestamp, entry);
@@ -371,6 +487,17 @@ pub fn WorkloadType(comptime StateMachine: type) type {
             assert(reply.pop() == null);
             assert(batch_timestamp == timestamp);
             if (op_request) |op| workload.op_max = op;
+        }
+
+        /// Botpike's invariant, checked against `receipt_seqs` rather than the row model: a
+        /// winning claim advances the receipt's sequence by exactly one.
+        fn check_claim_won(workload: *Workload, put: *const Entry) void {
+            assert(put.table == receipts_table);
+            const receipt = Receipt.from_value(&put.value);
+            const seq_previous = workload.receipt_seqs.get(put.id) orelse 0;
+            assert(receipt.seq == seq_previous + 1);
+            workload.receipt_seqs.put(workload.allocator, put.id, receipt.seq) catch @panic("OOM");
+            workload.claims_won += 1;
         }
 
         /// The model's expectation, computed independently of the state machine.

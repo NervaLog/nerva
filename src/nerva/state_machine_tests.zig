@@ -12,6 +12,7 @@ const nerva = @import("../nerva.zig");
 const fixtures = @import("../testing/fixtures.zig");
 const Storage = @import("../testing/storage.zig").Storage;
 const StateMachine = @import("state_machine.zig").StateMachineType(Storage);
+const workload = @import("workload.zig");
 const SuperBlock = vsr.SuperBlockType(Storage);
 const Grid = vsr.GridType(Storage);
 const data_file_size_min = @import("../vsr/superblock.zig").data_file_size_min;
@@ -23,6 +24,8 @@ const Entry = nerva.Entry;
 const EntryResult = nerva.EntryResult;
 const RowValue = nerva.RowValue;
 const Change = nerva.Change;
+const Receipt = workload.Receipt;
+const receipt_claim = workload.receipt_claim;
 
 const Body = [constants.message_body_size_max]u8;
 
@@ -394,4 +397,50 @@ test "get_changes: committed writes in op order, paged by cursor" {
     const none = try context.changes(end.timestamp, 10);
     try testing.expectEqual(@as(usize, 1), none.len);
     try testing.expectEqual(end.timestamp, none[0].timestamp);
+}
+
+fn receipt(context: *Context, id: u64) !struct { op: u64, receipt: Receipt } {
+    const row = try context.lookup(workload.receipts_table, id);
+    return .{ .op = row.op, .receipt = Receipt.from_value(&row.value) };
+}
+
+test "receipt race: two daemons claim one receipt, exactly one wins" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const context = try context_init(&arena);
+
+    // Both daemons saw the receipt before anyone claimed it (version 0, seq 0).
+    const daemon_a = receipt_claim(7, 0, 0, 1);
+    const daemon_b = receipt_claim(7, 0, 0, 2);
+    const results = try context.commit(&.{ &daemon_a, &daemon_b });
+    try expect_statuses(results[0], &.{ .ok, .ok });
+    try expect_statuses(results[1], &.{ .conflict, .aborted });
+    try testing.expectEqual(results[0][0].op, results[1][0].op); // The winner's version.
+
+    const current = try receipt(context, 7);
+    try testing.expectEqual(@as(u64, 1), current.receipt.seq);
+    try testing.expectEqual(@as(u64, 1), current.receipt.owner);
+}
+
+test "receipt race: a hand-off wins with the new version, a stale retry loses" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const context = try context_init(&arena);
+
+    const op_a = (try context.commit(&.{&receipt_claim(3, 0, 0, 1)}))[0][0].op;
+
+    // Daemon B read the receipt after A's claim, and takes it over.
+    const handoff = try context.commit(&.{&receipt_claim(3, op_a, 1, 2)});
+    try expect_statuses(handoff[0], &.{ .ok, .ok });
+    const op_b = handoff[0][0].op;
+
+    // Daemon A retries with what it saw before B's claim: it loses, told B's version.
+    const stale = try context.commit(&.{&receipt_claim(3, op_a, 1, 1)});
+    try expect_statuses(stale[0], &.{ .conflict, .aborted });
+    try testing.expectEqual(op_b, stale[0][0].op);
+
+    const current = try receipt(context, 3);
+    try testing.expectEqual(op_b, current.op);
+    try testing.expectEqual(@as(u64, 2), current.receipt.seq);
+    try testing.expectEqual(@as(u64, 2), current.receipt.owner);
 }

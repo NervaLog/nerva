@@ -38,7 +38,7 @@ property of the store, not a counter maintained beside it.
 
 **G3. Claims are compare-and-set.** Exclusive ownership (a receipt, a lease, an approval) is a
 read at the version seen plus a write; a second claimant gets `conflict`.
-*Delivered by the commit core* — to be demonstrated as a Botpike scenario (see Milestones).
+*Delivered by the commit core, and demonstrated* by the receipt race (Milestone 1).
 
 **G4. Derived state is declared and verifiable.** Reports, rollups and obligations are views
 maintained from the log, each with a watermark, and two copies of a view can compare a hash at
@@ -74,8 +74,11 @@ arrangement either way.
 
 ## Milestones
 
-1. **The receipt race as a simulator scenario.** Two daemons claim the same receipt under crash
+1. **The receipt race as a simulator scenario.** ✅ Two daemons claim the same receipt under crash
    and disk-fault injection; exactly one wins, every time. Uses only the commit core (G3).
+   The VOPR workload races clients over 1–4 receipts and checks that each receipt's sequence
+   advances by exactly one per winning claim; `state_machine_tests.zig` has the deterministic
+   cases (`receipt race: …`).
 2. **Server and client** (`nerva format`, `nerva start`, a client library) so Botpike can call
    Nerva outside the simulator.
 3. **Positioned reads and the first view** (G2, G4): Botpike's spend rollup maintained from the

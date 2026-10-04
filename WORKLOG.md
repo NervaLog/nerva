@@ -50,3 +50,16 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
 
 - Added `docs/GOALS-1.0.md`: Nerva 1.0 design goals (G1–G8), with Botpike as the first customer;
   each goal maps to a gap Botpike's own docs name. Linked from README.md and CLAUDE.md.
+
+## 2026-10-04 — 1.0 Milestone 1: the receipt race
+
+- `src/nerva/workload.zig`: Botpike's receipt race. Clients race over 1–4 receipts (table 100);
+  a claim is `read` at the version seen + `put` of `{seq + 1, owner}`. Independently of the row
+  model, the checker asserts each receipt's sequence advances by exactly one per winning claim,
+  and that losing claims fail only with `conflict`. Logs claims won/lost.
+- `src/nerva/state_machine_tests.zig`: two deterministic cases (simultaneous claims: exactly
+  one wins; hand-off with the new version wins, stale retry loses).
+- No state machine changes: G3 was already delivered by the commit core.
+- Verified: `test:unit` 274/275 (only the sandbox-denied perf test fails); `test:fmt` passes;
+  VOPR passes seeds 1–9 and 42 with 215 claims won and 474 lost in total (seed 5: 3.49M ticks).
+- Marked G3 demonstrated and Milestone 1 done in `docs/GOALS-1.0.md`.
