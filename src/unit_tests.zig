@@ -26,6 +26,7 @@ comptime {
     _ = @import("multiversion.zig");
     _ = @import("nerva.zig");
     _ = @import("nerva/api/api.zig");
+    _ = @import("nerva/catalog.zig");
     _ = @import("nerva/cli.zig");
     _ = @import("nerva/ledgerd/routes.zig");
     _ = @import("nerva/ledgerd/store.zig");

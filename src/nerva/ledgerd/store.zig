@@ -188,7 +188,8 @@ pub const Error = Client.Error || error{
 pub const Store = struct {
     client: *Client,
     ledger: u64,
-    /// `table_rows` (the ledger, with generations) or `table_store` (generation always 0).
+    /// `table_rows` (the ledger, with generations), or any other table (`table_store`, the
+    /// catalog), whose generation is always 0.
     table: u32 = table_rows,
 
     arena: std.mem.Allocator = undefined,
@@ -211,8 +212,8 @@ pub const Store = struct {
         store.writes = .{};
         store.cache = .{};
 
-        assert(store.table == table_rows or store.table == table_store);
-        if (store.table == table_store) {
+        assert(store.table != table_roots);
+        if (store.table != table_rows) {
             store.generation = 0;
             return;
         }

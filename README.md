@@ -125,8 +125,11 @@ curl -H 'X-Nerva-Key: secret' -d '{"entries":[{"kind":"put","table":1,"id":"5","
 | `GET /v1/changes?cursor=&limit=` | The change feed, paged. |
 | `GET /v1/history?table=&id=&op_max=&cursor=&limit=` | One row's writes, newest first, up to `op_max`. |
 | `GET /v1/row?table=&id=&as_of=` | One row as it was at an op (refused for an op not yet committed). |
+| `PUT /v1/tables/<t>` `{"name","fields":[{"name","type"}]}` | Declare a table's layout (u8, u16, u32, u64, i64, bool, bytes), or extend it by appending fields. Then puts may send `fields` instead of `value_hex`, and reads return `fields`. |
+| `GET /v1/tables/<t>` | The table's layout. |
 
-64-bit numbers (ids, ops, cursors) are decimal strings; values are the 80 bytes as hex.
+64-bit numbers (ids, ops, cursors) are decimal strings; values are the 80 bytes as hex. Layouts
+live in the log, in a reserved catalog table; the core still stores bytes and never reads them.
 `zig build test:api` checks every route against a model, and races eight writers on one row.
 
 ## The Botpike runtime's ledger

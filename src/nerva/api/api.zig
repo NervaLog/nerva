@@ -9,6 +9,8 @@
 //!     GET  /v1/changes?cursor=<c>&limit=<n>
 //!     GET  /v1/history?table=<t>&id=<i>&op_max=<n|latest>&cursor=<c>&limit=<n>
 //!     GET  /v1/row?table=<t>&id=<i>&as_of=<op>
+//!     PUT  /v1/tables/<t>   {"name": "seats", "fields": [{"name": "price", "type": "u64"}, …]}
+//!     GET  /v1/tables/<t>
 //!
 //! Conventions:
 //! - 64-bit numbers (`id`, `op`, `op_seen`, cursors) are decimal strings: JSON numbers lose
@@ -18,12 +20,17 @@
 //! - A commit is one transaction: `200 {"status": "committed", "op"}`, or `409 {"status":
 //!   "conflict", "index", "op"}` (the entry whose read was stale, and the row's current version),
 //!   or `400 {"error", "index"}` for an invalid entry. Nothing applies unless it committed.
-//! - Errors are `{"error": "<reason>"}` with 400, 401, 404, 405 or 503.
+//! - A table may have a layout (`catalog.zig`, N34): then puts may give `fields` instead of
+//!   `value_hex`, and every row or change of that table also comes back with `fields`.
+//! - Tables from `catalog.tables_reserved_min` up are Nerva's own: refused here, and left out of
+//!   `changes`.
+//! - Errors are `{"error": "<reason>"}` with 400, 401, 404, 405, 409 or 503.
 
 const std = @import("std");
 const assert = std.debug.assert;
 
 const nerva = @import("../../nerva.zig");
+const catalog = @import("../catalog.zig");
 
 const Change = nerva.Change;
 const Entry = nerva.Entry;
@@ -35,7 +42,7 @@ const value_size = nerva.value_size;
 /// Changes per `changes` or `history` call, at most; larger limits are capped.
 pub const page_limit_max = 1024;
 
-pub const Method = enum { get, post };
+pub const Method = enum { get, post, put };
 
 pub const Reply = struct {
     status: u16,
@@ -43,7 +50,7 @@ pub const Reply = struct {
     body: []const u8,
 };
 
-const Route = enum { lookup, commit, changes, history, row };
+const Route = enum { lookup, commit, changes, history, row, tables };
 
 const routes = [_]struct { path: []const u8, route: Route, method: Method }{
     .{ .path = "/v1/lookup", .route = .lookup, .method = .post },
@@ -53,11 +60,20 @@ const routes = [_]struct { path: []const u8, route: Route, method: Method }{
     .{ .path = "/v1/row", .route = .row, .method = .get },
 };
 
-/// Runs one request against `client` (a `Client`, or anything with its methods).
-/// Client errors other than `TooManyEvents` propagate: the server answers 503.
+const tables_prefix = "/v1/tables/";
+
+/// What `handle` needs of the catalog (`catalog_store.zig` in the server, a map in tests):
+///
+///     layout(arena, table: u32) !?catalog.Layout
+///     layout_put(arena, table: u32, layout: *const catalog.Layout) !LayoutPut
+pub const LayoutPut = enum { created, extended, unchanged, incompatible };
+
+/// Runs one request against `client` (a `Client`, or anything with its methods) and `layouts`
+/// (see `LayoutPut`). Client errors other than `TooManyEvents` propagate: the server answers 503.
 pub fn handle(
     arena: std.mem.Allocator,
     client: anytype,
+    layouts: anytype,
     method: Method,
     target: []const u8,
     body: []const u8,
@@ -66,22 +82,54 @@ pub fn handle(
     const path = target[0..question];
     const query = if (question < target.len) target[question + 1 ..] else "";
 
-    const entry = for (routes) |entry| {
-        if (std.mem.eql(u8, entry.path, path)) break entry;
-    } else return error_reply(arena, 404, "not found");
-    if (entry.method != method) return error_reply(arena, 405, "method not allowed");
+    const route: Route = if (std.mem.startsWith(u8, path, tables_prefix)) route: {
+        if (method != .get and method != .put) {
+            return error_reply(arena, 405, "method not allowed");
+        }
+        if (query.len > 0) return error_reply(arena, 400, "unexpected query");
+        break :route .tables;
+    } else route: {
+        const entry = for (routes) |entry| {
+            if (std.mem.eql(u8, entry.path, path)) break entry;
+        } else return error_reply(arena, 404, "not found");
+        if (entry.method != method) return error_reply(arena, 405, "method not allowed");
+        break :route entry.route;
+    };
     if (method == .get and body.len > 0) return error_reply(arena, 400, "unexpected body");
 
-    return switch (entry.route) {
-        .lookup => lookup(arena, client, body),
-        .commit => commit(arena, client, body),
-        .changes => changes(arena, client, query),
-        .history => history(arena, client, query),
-        .row => row(arena, client, query),
+    var cache: Layouts(@TypeOf(layouts)) = .{ .arena = arena, .layouts = layouts };
+    return switch (route) {
+        .lookup => lookup(arena, client, &cache, body),
+        .commit => commit(arena, client, &cache, body),
+        .changes => changes(arena, client, &cache, query),
+        .history => history(arena, client, &cache, query),
+        .row => row(arena, client, &cache, query),
+        .tables => tables(arena, layouts, method, path[tables_prefix.len..], body),
     } catch |err| switch (err) {
         error.BadRequest => error_reply(arena, 400, bad_request_reason),
         error.TooManyEvents => error_reply(arena, 400, "too many rows or entries for one request"),
+        error.Invalid => error_reply(arena, 400, catalog.invalid_reason),
         else => |e| e,
+    };
+}
+
+/// The layouts one request has read, so that each table's is read at most once per request.
+fn Layouts(comptime Catalog: type) type {
+    return struct {
+        const Self = @This();
+
+        arena: std.mem.Allocator,
+        layouts: Catalog,
+        loaded: std.AutoHashMapUnmanaged(u32, ?catalog.Layout) = .{},
+
+        fn get(self: *Self, table: u32) !?*const catalog.Layout {
+            assert(table != 0 and table < catalog.tables_reserved_min);
+            const entry = try self.loaded.getOrPut(self.arena, table);
+            if (!entry.found_existing) {
+                entry.value_ptr.* = try self.layouts.layout(self.arena, table);
+            }
+            return if (entry.value_ptr.*) |*layout| layout else null;
+        }
     };
 }
 
@@ -95,14 +143,14 @@ fn bad(reason: []const u8) error{BadRequest} {
 
 // ---- Routes ----
 
-fn lookup(arena: std.mem.Allocator, client: anytype, body: []const u8) !Reply {
+fn lookup(arena: std.mem.Allocator, client: anytype, layouts: anytype, body: []const u8) !Reply {
     const Request = struct { rows: []const struct { table: u32, id: []const u8 } };
     const request = try json_parse(Request, arena, body);
     if (request.rows.len == 0) return bad("rows must not be empty");
 
     const keys = try arena.alloc(RowKey, request.rows.len);
     for (keys, request.rows) |*key, row_request| {
-        if (row_request.table == 0) return bad("table must not be zero");
+        try table_check(row_request.table);
         key.* = .{ .table = row_request.table, .id = try u64_parse(row_request.id, "id") };
     }
     const results = try arena.alloc(RowValue, keys.len);
@@ -123,13 +171,14 @@ fn lookup(arena: std.mem.Allocator, client: anytype, body: []const u8) !Reply {
         try out.number(result.op);
         try out.raw(",\"value_hex\":");
         try out.hex(&result.value);
+        if (result.flags.exists) try out.fields(try layouts.get(result.table), &result.value);
         try out.raw("}");
     }
     try out.raw("]}");
     return .{ .status = 200, .body = out.items() };
 }
 
-fn commit(arena: std.mem.Allocator, client: anytype, body: []const u8) !Reply {
+fn commit(arena: std.mem.Allocator, client: anytype, layouts: anytype, body: []const u8) !Reply {
     const Request = struct {
         entries: []const struct {
             kind: enum { read, put, delete },
@@ -137,6 +186,7 @@ fn commit(arena: std.mem.Allocator, client: anytype, body: []const u8) !Reply {
             id: []const u8,
             op_seen: ?[]const u8 = null,
             value_hex: ?[]const u8 = null,
+            fields: ?std.json.Value = null,
         },
     };
     const request = try json_parse(Request, arena, body);
@@ -144,7 +194,10 @@ fn commit(arena: std.mem.Allocator, client: anytype, body: []const u8) !Reply {
 
     const entries = try arena.alloc(Entry, request.entries.len);
     for (entries, request.entries) |*entry, entry_request| {
-        if (entry_request.table == 0) return bad("table must not be zero");
+        try table_check(entry_request.table);
+        if (entry_request.kind != .put and entry_request.fields != null) {
+            return bad("only a put has fields");
+        }
         entry.* = .{
             .id = try u64_parse(entry_request.id, "id"),
             .table = entry_request.table,
@@ -165,9 +218,18 @@ fn commit(arena: std.mem.Allocator, client: anytype, body: []const u8) !Reply {
             },
             .put => {
                 if (entry_request.op_seen != null) return bad("a put has no op_seen");
-                entry.value = try value_parse(
-                    entry_request.value_hex orelse return bad("a put needs value_hex"),
-                );
+                if (entry_request.fields) |fields| {
+                    if (entry_request.value_hex != null) {
+                        return bad("a put has value_hex or fields, not both");
+                    }
+                    const layout = try layouts.get(entry_request.table) orelse
+                        return bad("fields need a layout for the table (PUT /v1/tables/<t>)");
+                    entry.value = try catalog.fields_encode(layout, fields);
+                } else {
+                    const value_hex = entry_request.value_hex orelse
+                        return bad("a put needs value_hex or fields");
+                    entry.value = try value_parse(value_hex);
+                }
             },
             .delete => {
                 if (entry_request.op_seen != null) return bad("a delete has no op_seen");
@@ -211,7 +273,7 @@ fn commit(arena: std.mem.Allocator, client: anytype, body: []const u8) !Reply {
     return .{ .status = 200, .body = out.items() };
 }
 
-fn changes(arena: std.mem.Allocator, client: anytype, query: []const u8) !Reply {
+fn changes(arena: std.mem.Allocator, client: anytype, layouts: anytype, query: []const u8) !Reply {
     const parameters = try query_parse(arena, query, &.{ "cursor", "limit" });
     const limit = try limit_parse(parameters.get("limit"));
     const cursor = if (parameters.get("cursor")) |text| try u64_parse(text, "cursor") else 0;
@@ -219,10 +281,10 @@ fn changes(arena: std.mem.Allocator, client: anytype, query: []const u8) !Reply 
     const page = try arena.alloc(Change, limit + 1);
     const count = try client.get_changes(.{ .timestamp_min = cursor, .limit = limit }, page);
     if (count == 0) return bad("invalid cursor");
-    return page_reply(arena, page[0..count], .ascending);
+    return page_reply(arena, layouts, page[0..count], .ascending);
 }
 
-fn history(arena: std.mem.Allocator, client: anytype, query: []const u8) !Reply {
+fn history(arena: std.mem.Allocator, client: anytype, layouts: anytype, query: []const u8) !Reply {
     const parameters = try query_parse(
         arena,
         query,
@@ -247,12 +309,12 @@ fn history(arena: std.mem.Allocator, client: anytype, query: []const u8) !Reply 
         .timestamp_max = cursor,
     }, page);
     if (count == 0) return bad("invalid cursor");
-    return page_reply(arena, page[0..count], .descending);
+    return page_reply(arena, layouts, page[0..count], .descending);
 }
 
 /// A row as of an op: its last change at or before `as_of`. `as_of` must already be committed,
 /// or the answer could still change.
-fn row(arena: std.mem.Allocator, client: anytype, query: []const u8) !Reply {
+fn row(arena: std.mem.Allocator, client: anytype, layouts: anytype, query: []const u8) !Reply {
     const parameters = try query_parse(arena, query, &.{ "table", "id", "as_of" });
     const table = try table_parse(parameters.get("table"));
     const id = try u64_parse(parameters.get("id") orelse return bad("id is required"), "id");
@@ -298,6 +360,7 @@ fn row(arena: std.mem.Allocator, client: anytype, query: []const u8) !Reply {
         try out.number(change.op);
         try out.raw(",\"value_hex\":");
         try out.hex(&change.value);
+        if (change.kind == .put) try out.fields(try layouts.get(table), &change.value);
     } else {
         try out.raw(",\"exists\":false,\"op\":\"0\",\"value_hex\":");
         try out.hex(&@as([value_size]u8, @splat(0)));
@@ -308,6 +371,7 @@ fn row(arena: std.mem.Allocator, client: anytype, query: []const u8) !Reply {
 
 fn page_reply(
     arena: std.mem.Allocator,
+    layouts: anytype,
     page: []const Change,
     direction: enum { ascending, descending },
 ) !Reply {
@@ -317,9 +381,13 @@ fn page_reply(
 
     var out = Writer.init(arena);
     try out.raw("{\"changes\":[");
-    for (page[0 .. page.len - 1], 0..) |*change, index| {
+    var written: u32 = 0;
+    for (page[0 .. page.len - 1]) |*change| {
         assert(change.kind == .put or change.kind == .delete);
-        if (index > 0) try out.raw(",");
+        // Nerva's own rows (the catalog) are not part of the application's feed.
+        if (change.table >= catalog.tables_reserved_min) continue;
+        if (written > 0) try out.raw(",");
+        written += 1;
         try out.print("{{\"kind\":\"{s}\",\"table\":{},\"id\":", .{
             @tagName(change.kind),
             change.table,
@@ -330,6 +398,7 @@ fn page_reply(
         if (change.kind == .put) {
             try out.raw(",\"value_hex\":");
             try out.hex(&change.value);
+            try out.fields(try layouts.get(change.table), &change.value);
         }
         try out.raw("}");
     }
@@ -345,6 +414,43 @@ fn page_reply(
     if (end.flags.more) try out.raw("null") else try out.number(end.op);
     try out.raw("}");
     return .{ .status = 200, .body = out.items() };
+}
+
+fn tables(
+    arena: std.mem.Allocator,
+    layouts: anytype,
+    method: Method,
+    table_text: []const u8,
+    body: []const u8,
+) !Reply {
+    const table = try table_parse(table_text);
+    var out = Writer.init(arena);
+    switch (method) {
+        .get => {
+            const layout = try layouts.layout(arena, table) orelse
+                return error_reply(arena, 404, "no layout for this table");
+            try out.raw(try catalog.layout_render(arena, &layout));
+            return .{ .status = 200, .body = out.items() };
+        },
+        .put => {
+            const layout = try catalog.layout_parse(arena, body);
+            switch (try layouts.layout_put(arena, table, &layout)) {
+                .incompatible => return error_reply(
+                    arena,
+                    409,
+                    "a layout may only be extended by appending fields",
+                ),
+                inline else => |outcome| {
+                    try out.print("{{\"table\":{},\"layout\":\"{s}\"}}", .{
+                        table,
+                        @tagName(outcome),
+                    });
+                    return .{ .status = 200, .body = out.items() };
+                },
+            }
+        },
+        .post => unreachable,
+    }
 }
 
 // ---- Parsing ----
@@ -367,8 +473,14 @@ fn u64_parse(text: []const u8, comptime name: []const u8) error{BadRequest}!u64 
 
 fn table_parse(text: ?[]const u8) error{BadRequest}!u32 {
     const value = try u64_parse(text orelse return bad("table is required"), "table");
-    if (value == 0 or value > std.math.maxInt(u32)) return bad("table is out of range");
+    if (value > std.math.maxInt(u32)) return bad("table is out of range");
+    try table_check(@intCast(value));
     return @intCast(value);
+}
+
+fn table_check(table: u32) error{BadRequest}!void {
+    if (table == 0) return bad("table must not be zero");
+    if (table >= catalog.tables_reserved_min) return bad("table is reserved");
 }
 
 fn limit_parse(text: ?[]const u8) error{BadRequest}!u32 {
@@ -445,6 +557,13 @@ const Writer = struct {
     fn hex(writer: *Writer, bytes: []const u8) !void {
         try writer.print("\"{s}\"", .{std.fmt.fmtSliceHexLower(bytes)});
     }
+
+    /// `,"fields":{…}` if the table has a layout.
+    fn fields(writer: *Writer, layout: ?*const catalog.Layout, value: *const [value_size]u8) !void {
+        const layout_ = layout orelse return;
+        try writer.raw(",\"fields\":");
+        try catalog.fields_render(writer.list.writer(), layout_, value);
+    }
 };
 
 // ---- Tests ----
@@ -511,6 +630,100 @@ const FakeClient = struct {
     }
 };
 
+/// An in-memory catalog.
+const FakeLayouts = struct {
+    map: std.AutoHashMapUnmanaged(u32, catalog.Layout) = .{},
+    allocator: std.mem.Allocator,
+
+    pub fn layout(fake: *FakeLayouts, _: std.mem.Allocator, table: u32) !?catalog.Layout {
+        return fake.map.get(table);
+    }
+
+    pub fn layout_put(
+        fake: *FakeLayouts,
+        _: std.mem.Allocator,
+        table: u32,
+        new: *const catalog.Layout,
+    ) !LayoutPut {
+        const outcome: LayoutPut = if (fake.map.get(table)) |old| outcome: {
+            if (!catalog.layout_extends(&old, new)) break :outcome .incompatible;
+            break :outcome if (old.fields.len == new.fields.len) .unchanged else .extended;
+        } else .created;
+        if (outcome != .incompatible) try fake.map.put(fake.allocator, table, new.*);
+        return outcome;
+    }
+};
+
+var no_layouts_instance: FakeLayouts = .{ .allocator = testing.failing_allocator };
+const no_layouts = &no_layouts_instance;
+
+test "api: layouts give puts and reads named fields" {
+    var arena_instance = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_instance.deinit();
+    const arena = arena_instance.allocator();
+    var fake: FakeClient = .{ .allocator = arena };
+    var layouts: FakeLayouts = .{ .allocator = arena };
+
+    const declare =
+        \\{"name":"seats","fields":[{"name":"section","type":"u8"},{"name":"price","type":"u64"}]}
+    ;
+    const created = try handle(arena, &fake, &layouts, .put, "/v1/tables/7", declare);
+    try testing.expectEqualStrings(
+        \\{"table":7,"layout":"created"}
+    , created.body);
+    const again = try handle(arena, &fake, &layouts, .put, "/v1/tables/7", declare);
+    try testing.expectEqualStrings(
+        \\{"table":7,"layout":"unchanged"}
+    , again.body);
+    const narrowed = try handle(arena, &fake, &layouts, .put, "/v1/tables/7",
+        \\{"name":"seats","fields":[{"name":"section","type":"u16"}]}
+    );
+    try testing.expectEqual(@as(u16, 409), narrowed.status);
+
+    const put = try handle(arena, &fake, &layouts, .post, "/v1/commit",
+        \\{"entries":[{"kind":"put","table":7,"id":"1","fields":{"section":2,"price":"4500"}}]}
+    );
+    try testing.expectEqual(@as(u16, 200), put.status);
+    const found = try handle(arena, &fake, &layouts, .post, "/v1/lookup",
+        \\{"rows":[{"table":7,"id":"1"}]}
+    );
+    try testing.expect(std.mem.endsWith(u8, found.body,
+        \\,"fields":{"section":2,"price":"4500"}}]}
+    ));
+
+    const get = try handle(arena, &fake, &layouts, .get, "/v1/tables/7", "");
+    try testing.expectEqualStrings(declare, get.body);
+    const missing = try handle(arena, &fake, &layouts, .get, "/v1/tables/8", "");
+    try testing.expectEqual(@as(u16, 404), missing.status);
+
+    // Fields need a layout; an unknown field, both forms, or a reserved table are refused.
+    const refused = [_]struct { target: []const u8, body: []const u8 }{
+        .{ .target = "/v1/commit", .body = 
+        \\{"entries":[{"kind":"put","table":8,"id":"1","fields":{"a":1}}]}
+        },
+        .{ .target = "/v1/commit", .body = 
+        \\{"entries":[{"kind":"put","table":7,"id":"1","fields":{"row":1}}]}
+        },
+        .{ .target = "/v1/commit", .body = 
+        \\{"entries":[{"kind":"put","table":7,"id":"1","fields":{},"value_hex":"00"}]}
+        },
+        .{ .target = "/v1/commit", .body = 
+        \\{"entries":[{"kind":"delete","table":7,"id":"1","fields":{}}]}
+        },
+        .{ .target = "/v1/lookup", .body = 
+        \\{"rows":[{"table":4294901761,"id":"1"}]}
+        },
+    };
+    for (refused) |case| {
+        const reply = try handle(arena, &fake, &layouts, .post, case.target, case.body);
+        try testing.expectEqual(@as(u16, 400), reply.status);
+    }
+    try testing.expectEqual(
+        @as(u16, 400),
+        (try handle(arena, &fake, &layouts, .put, "/v1/tables/4294901761", declare)).status,
+    );
+}
+
 test "api: lookup and commit translate to and from JSON" {
     var arena_instance = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_instance.deinit();
@@ -520,7 +733,7 @@ test "api: lookup and commit translate to and from JSON" {
         \\{"rows":[{"table":1,"id":"5"}]}
     ;
 
-    const absent = try handle(arena, &fake, .post, "/v1/lookup", lookup_5);
+    const absent = try handle(arena, &fake, no_layouts, .post, "/v1/lookup", lookup_5);
     try testing.expectEqual(@as(u16, 200), absent.status);
     try testing.expectEqualStrings(
         \\{"op":"1","rows":[{"table":1,"id":"5","exists":false,"op":"0","value_hex":"
@@ -528,7 +741,7 @@ test "api: lookup and commit translate to and from JSON" {
         \\"}]}
     , absent.body);
 
-    const put = try handle(arena, &fake, .post, "/v1/commit",
+    const put = try handle(arena, &fake, no_layouts, .post, "/v1/commit",
         \\{"entries":[{"kind":"read","table":1,"id":"5","op_seen":"0"},
         \\            {"kind":"put","table":1,"id":"5","value_hex":"c0ffee"}]}
     );
@@ -537,7 +750,7 @@ test "api: lookup and commit translate to and from JSON" {
         \\{"status":"committed","op":"2"}
     , put.body);
 
-    const found = try handle(arena, &fake, .post, "/v1/lookup", lookup_5);
+    const found = try handle(arena, &fake, no_layouts, .post, "/v1/lookup", lookup_5);
     try testing.expectEqualStrings(
         \\{"op":"3","rows":[{"table":1,"id":"5","exists":true,"op":"2","value_hex":"c0ffee
     ++ "00" ** 77 ++
@@ -545,7 +758,7 @@ test "api: lookup and commit translate to and from JSON" {
     , found.body);
 
     // The same read again is stale: 409 with the row's current version, nothing applied.
-    const stale = try handle(arena, &fake, .post, "/v1/commit",
+    const stale = try handle(arena, &fake, no_layouts, .post, "/v1/commit",
         \\{"entries":[{"kind":"delete","table":1,"id":"6"},
         \\            {"kind":"read","table":1,"id":"5","op_seen":"0"}]}
     );
@@ -617,7 +830,7 @@ test "api: bad requests are refused before reaching the cluster" {
     }
 
     for (cases.items) |case| {
-        const reply = try handle(arena, &fake, case.method, case.target, case.body);
+        const reply = try handle(arena, &fake, no_layouts, case.method, case.target, case.body);
         testing.expectEqual(case.status, reply.status) catch |err| {
             std.debug.print("{s} {s}: {s}\n", .{ case.target, case.body, reply.body });
             return err;

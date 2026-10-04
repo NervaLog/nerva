@@ -179,3 +179,14 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
 - Found by the test and fixed: `row?as_of=` answered for an op not yet committed.
 - Mutation-tested: an off-by-one in `op_max` parsing is caught. Seeds 1, 2 and 3 pass.
 
+## 2026-10-04 — Phase 2, step 2a: table layouts
+
+- `src/nerva/catalog.zig`: layouts (parse, validate, pack, render, extend-only check), fields
+  to and from 80-byte values, field values as integers for views (N34).
+- `nerva api`: `PUT`/`GET /v1/tables/<t>`; puts by `fields`; `fields` in lookups, the feed,
+  history and `row`; reserved tables refused and left out of the feed.
+  `src/nerva/api/catalog_store.zig` keeps layouts in the log through `ledgerd/store.zig`, which
+  now accepts any non-ledger table.
+- Tests: unit tests for layouts and for the API with an in-memory catalog; `tests/api/api.py`
+  adds layouts end to end, including two gateways declaring at once.
+

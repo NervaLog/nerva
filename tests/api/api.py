@@ -13,6 +13,9 @@ Runs one replica and two API gateways, then:
 - `/v1/row?as_of=` for random rows and ops, and a refusal for an op not yet committed;
 - eight threads incrementing one counter with read-modify-write through both gateways,
   retrying on 409: no increment lost;
+- layouts (N34): declaring, re-declaring, extending, refusing a change that does not append,
+  two gateways declaring at once; puts by `fields`, read back as `fields` by lookup, the feed,
+  history and `row`; reserved tables refused; catalog rows never in the feed;
 - 401 without the key, 404 and 405.
 
 Usage: api.py <path to nerva> [--seed=N] [--steps=N]
@@ -243,6 +246,67 @@ def counter_race(ports, threads=8, increments=15):
     return conflicts[0]
 
 
+SEATS = {"name": "seats", "fields": [{"name": "section", "type": "u8"},
+                                     {"name": "price", "type": "u64"},
+                                     {"name": "holder", "type": "bytes", "size": 8}]}
+
+
+def check_layouts(ports):
+    table = 5
+    status, body = request(ports[0], "GET", "/v1/changes?limit=1024")
+    while body["more"]:
+        status, body = request(ports[0], "GET", f"/v1/changes?cursor={body['cursor']}&limit=1024")
+    cursor = body["cursor"]
+
+    # Two gateways declare at once: one creates it, the other finds it unchanged.
+    results = [None, None]
+
+    def declare(index):
+        results[index] = request(ports[index], "PUT", f"/v1/tables/{table}", SEATS)
+
+    pool = [threading.Thread(target=declare, args=(i,)) for i in range(2)]
+    for thread in pool:
+        thread.start()
+    for thread in pool:
+        thread.join()
+    outcomes = sorted(body["layout"] for status, body in results)
+    assert [status for status, _ in results] == [200, 200], results
+    assert outcomes == ["created", "unchanged"], outcomes
+    status, body = request(ports[1], "GET", f"/v1/tables/{table}")
+    assert (status, body) == (200, SEATS), (status, body)
+
+    extended = {"name": "seats", "fields": SEATS["fields"] + [{"name": "row", "type": "u16"}]}
+    assert request(ports[0], "PUT", f"/v1/tables/{table}", extended)[1]["layout"] == "extended"
+    assert request(ports[1], "PUT", f"/v1/tables/{table}", SEATS)[0] == 409
+    assert request(ports[0], "PUT", f"/v1/tables/{table}",
+                   {"name": "x", "fields": [{"name": "price", "type": "u32"}]})[0] == 409
+    assert request(ports[0], "PUT", "/v1/tables/4294901761", SEATS)[0] == 400
+    assert request(ports[0], "GET", "/v1/tables/6")[0] == 404
+
+    fields = {"section": 3, "price": "18446744073709551615", "holder": "00112233", "row": 12}
+    status, body = request(ports[0], "POST", "/v1/commit", {"entries": [
+        {"kind": "put", "table": table, "id": "1", "fields": fields}]})
+    assert status == 200, body
+    op = body["op"]
+    expected = {**fields, "holder": "0011223300000000"}
+    status, body = request(ports[1], "POST", "/v1/lookup", {"rows": [{"table": table, "id": "1"}]})
+    assert body["rows"][0]["fields"] == expected, body
+    status, body = request(ports[1], "GET", f"/v1/history?table={table}&id=1&limit=5")
+    assert [c["fields"] for c in body["changes"]] == [expected], body
+    status, body = request(ports[0], "GET", f"/v1/row?table={table}&id=1&as_of={op}")
+    assert body["fields"] == expected, body
+    for bad in ({"price": -1}, {"nope": 1}, {"section": 256}):
+        status, body = request(ports[0], "POST", "/v1/commit", {"entries": [
+            {"kind": "put", "table": table, "id": "2", "fields": bad}]})
+        assert status == 400, (bad, status, body)
+    assert request(ports[0], "POST", "/v1/commit", {"entries": [
+        {"kind": "put", "table": 6, "id": "1", "fields": {}}]})[0] == 400
+
+    # The feed since the layouts were declared: the one put, with fields; no catalog rows.
+    status, body = request(ports[0], "GET", f"/v1/changes?cursor={cursor}&limit=1024")
+    assert [(c["table"], c["fields"]) for c in body["changes"]] == [(table, expected)], body
+
+
 def main():
     nerva = sys.argv[1]
     seed = next((int(a.split("=")[1]) for a in sys.argv[2:] if a.startswith("--seed=")), 1)
@@ -291,6 +355,7 @@ def main():
         assert status == 400 and "not yet committed" in body["error"], body
 
         conflicts = counter_race(ports)
+        check_layouts(ports)
 
         assert request(ports[0], "POST", "/v1/lookup", {"rows": []}, key=None)[0] == 401
         assert request(ports[0], "POST", "/v1/lookup", {"rows": []}, key="wrong")[0] == 401

@@ -8,6 +8,7 @@ const log = std.log.scoped(.api);
 
 const Client = @import("../client.zig").Client;
 const api = @import("api.zig");
+const CatalogStore = @import("catalog_store.zig").CatalogStore;
 
 /// The largest request body: a full commit request in JSON is well under this.
 const body_size_max = 4 * 1024 * 1024;
@@ -26,6 +27,7 @@ pub fn serve(gpa: std.mem.Allocator, client: *Client, options: Options) !noretur
     log.info("listening on {}", .{server.listen_address});
     if (options.on_listening) |on_listening| on_listening(server.listen_address);
 
+    var layouts = CatalogStore.init(client);
     var arena_instance = std.heap.ArenaAllocator.init(gpa);
     defer arena_instance.deinit();
     const read_buffer = try gpa.alloc(u8, 16 * 1024);
@@ -42,7 +44,8 @@ pub fn serve(gpa: std.mem.Allocator, client: *Client, options: Options) !noretur
         while (true) {
             var request = http.receiveHead() catch break;
             _ = arena_instance.reset(.retain_capacity);
-            serve_request(arena_instance.allocator(), client, options, &request) catch |err| {
+            const arena = arena_instance.allocator();
+            serve_request(arena, client, &layouts, options, &request) catch |err| {
                 log.warn("request: {}", .{err});
                 break;
             };
@@ -54,6 +57,7 @@ pub fn serve(gpa: std.mem.Allocator, client: *Client, options: Options) !noretur
 fn serve_request(
     arena: std.mem.Allocator,
     client: *Client,
+    layouts: *CatalogStore,
     options: Options,
     request: *std.http.Server.Request,
 ) !void {
@@ -64,6 +68,7 @@ fn serve_request(
     const method: api.Method = switch (request.head.method) {
         .GET => .get,
         .POST => .post,
+        .PUT => .put,
         else => return respond(request, try api.error_reply(arena, 405, "method not allowed")),
     };
 
@@ -84,13 +89,18 @@ fn serve_request(
         return respond(request, try api.error_reply(arena, 401, "invalid key"));
     }
 
-    const reply = api.handle(arena, client, method, target, body) catch |err| switch (err) {
-        error.Evicted, error.Timeout => {
-            log.err("{s}: {}", .{ target, err });
-            return respond(request, try api.error_reply(arena, 503, "cluster unavailable"));
-        },
-        else => return err,
-    };
+    const reply = api.handle(arena, client, layouts, method, target, body) catch |err|
+        switch (err) {
+            error.Evicted, error.Timeout => {
+                log.err("{s}: {}", .{ target, err });
+                return respond(request, try api.error_reply(arena, 503, "cluster unavailable"));
+            },
+            error.OutOfMemory => return err,
+            else => {
+                log.err("{s}: {}", .{ target, err });
+                return respond(request, try api.error_reply(arena, 500, "internal error"));
+            },
+        };
     return respond(request, reply);
 }
 
