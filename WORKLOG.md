@@ -335,3 +335,13 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
   any run's feed), and a put carrying `op_seen` accepted (3/4; only `entry_status_check`
   catches it, as the model shares `entry_validate`).
 
+## 2026-10-04 — Format guards (N51)
+
+- `src/nerva/format_test.zig`: a snapshot of every wire and storage type's layout, enum values
+  and tree ids, by reflection; golden values for `row_key`, `tail_id` and the catalog's stored
+  JSON and field packing.
+- `src/nerva/state_machine_tests.zig`: "format: what a fixed script commits", a summary and
+  checksum of every result, row, change and history record a fixed script produces.
+- Verified: each of six planted changes (field order, an enum value, a tree id, `row_key`, the
+  layout JSON, change timestamps) fails exactly its guard; then reverted.
+
