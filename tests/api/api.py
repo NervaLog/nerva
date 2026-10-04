@@ -16,11 +16,13 @@ Runs one replica and two API gateways, then:
 - layouts (N34): declaring, re-declaring, extending, refusing a change that does not append,
   two gateways declaring at once; puts by `fields`, read back as `fields` by lookup, the feed,
   history and `row`; reserved tables refused; catalog rows never in the feed;
+- the gateway serves one request per connection: a client holding its connection open, or one
+  that connects and sends nothing, does not hold up the next client for long (N37);
 - 401 without the key, 404 and 405.
 
 Usage: api.py <path to nerva> [--seed=N] [--steps=N]
 """
-import http.client, json, os, random, shutil, subprocess, sys, tempfile, threading
+import http.client, json, os, random, shutil, socket, subprocess, sys, tempfile, threading, time
 
 KEY = "api-test-key"
 TABLES = (1, 2)
@@ -307,6 +309,29 @@ def check_layouts(ports):
     assert [(c["table"], c["fields"]) for c in body["changes"]] == [(table, expected)], body
 
 
+def check_connections(port):
+    # A client that keeps its connection: the server closes it after one reply, so the next
+    # client is served at once.
+    held = http.client.HTTPConnection("127.0.0.1", port, timeout=60)
+    held.request("POST", "/v1/lookup", body=json.dumps({"rows": [{"table": 1, "id": "0"}]}),
+                 headers={"X-Nerva-Key": KEY})
+    response = held.getresponse()
+    assert response.status == 200 and response.getheader("connection") == "close"
+    response.read()
+    started = time.monotonic()
+    assert request(port, "POST", "/v1/lookup", {"rows": [{"table": 1, "id": "0"}]})[0] == 200
+    assert time.monotonic() - started < 2, "a held connection held up the next client"
+    held.close()
+
+    # A client that connects and sends nothing is dropped after the receive deadline (10 s).
+    silent = socket.create_connection(("127.0.0.1", port))
+    started = time.monotonic()
+    assert request(port, "POST", "/v1/lookup", {"rows": [{"table": 1, "id": "0"}]})[0] == 200
+    waited = time.monotonic() - started
+    assert waited < 15, f"a silent connection held up the next client for {waited:.1f} s"
+    silent.close()
+
+
 def main():
     nerva = sys.argv[1]
     seed = next((int(a.split("=")[1]) for a in sys.argv[2:] if a.startswith("--seed=")), 1)
@@ -355,6 +380,7 @@ def main():
         assert status == 400 and "not yet committed" in body["error"], body
 
         conflicts = counter_race(ports)
+        check_connections(ports[0])
         check_layouts(ports)
 
         assert request(ports[0], "POST", "/v1/lookup", {"rows": []}, key=None)[0] == 401

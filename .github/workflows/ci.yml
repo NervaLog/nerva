@@ -52,6 +52,21 @@ jobs:
       - name: Declared views (against a model)
         run: ./zig/zig build test:views
 
+  # The seat demo, three replicas and all, while processes are crashed and restarted.
+  demo:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned Zig
+        run: ./zig/download.sh
+
+      - name: Seat demo under crashes
+        run: ./zig/zig build -Drelease test:demo -- --seconds=90
+
   vopr:
     runs-on: ubuntu-latest
     timeout-minutes: 60

@@ -83,6 +83,7 @@ pub fn build(b: *std.Build) !void {
         .test_ledgerd = b.step("test:ledgerd", "Check nerva ledgerd against ledgerd.py (python3)"),
         .test_api = b.step("test:api", "Check nerva api against a model (python3)"),
         .test_views = b.step("test:views", "Check declared views against a model (python3)"),
+        .test_demo = b.step("test:demo", "Run the seat demo under crashes (python3)"),
         .vopr = b.step("vopr", "Run the VOPR"),
         .vopr_build = b.step("vopr:build", "Build the VOPR"),
         .fuzz = b.step("fuzz", "Run non-VOPR fuzzers"),
@@ -262,6 +263,14 @@ pub fn build(b: *std.Build) !void {
     run_views_test.setCwd(b.path("."));
     run_views_test.has_side_effects = true;
     steps.test_views.dependOn(&run_views_test.step);
+
+    // zig build test:demo: the seat demo under crashes.
+    const run_demo_test = b.addSystemCommand(&.{ "python3", "tests/demo/seats_chaos.py" });
+    run_demo_test.addFileArg(nerva.getEmittedBin());
+    if (b.args) |args| run_demo_test.addArgs(args);
+    run_demo_test.setCwd(b.path("."));
+    run_demo_test.has_side_effects = true;
+    steps.test_demo.dependOn(&run_demo_test.step);
 
     // zig build test:fmt
     const run_fmt = b.addFmt(.{ .paths = &.{ "build.zig", "src" }, .check = true });

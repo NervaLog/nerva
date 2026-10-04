@@ -96,6 +96,9 @@ LEDGER_KEY=<key> nerva view --cluster=1 --addresses=3101 --listen=127.0.0.1:8091
 - The gateway serves one request at a time and retries a transaction that conflicts with
   another gateway (up to 32 times, then `503 ledger busy`). Several gateways may serve the same
   ledger id.
+- Each connection carries one request: replies say `Connection: close`, and a connection that
+  sends nothing for 10 s is dropped. Any HTTP/1.1 client handles this; it means one waiting
+  client cannot hold up the others.
 
 Smoke test, in the runtime's wire format:
 

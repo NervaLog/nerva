@@ -202,3 +202,17 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
   restarted view process, declaration errors, 504 past the op. Mutation-tested (replaying one
   op short is caught).
 
+## 2026-10-04 — Phase 2, steps 3 and 4: the crash supervisor and the seat demo
+
+- `demo/cluster.py`: three replicas, `nerva api`, two `nerva view`; crash (SIGKILL, keeping
+  quorum) and restart. `demo/nerva_http.py`: a client that never retries a commit.
+- `demo/seats/`: the seat race server (venue, views, simulated buyers, visitor endpoints,
+  self-healing) and page (seat map, rewind slider, crash controls, hash agreement, declare a
+  view). Checked in a browser with Playwright: live, after a crash, rewound, after declaring a
+  view, dark mode, phone width (no horizontal scroll).
+- Found and fixed: the gateways' keep-alive starvation (N37); the view's `/healthz` is text;
+  SIGTERM orphaned the cluster; `buy()` asserted on a 503 during recovery.
+- `tests/demo/seats_chaos.py` (`zig build test:demo`, CI job `demo`): a minute of random
+  crashes; no double sale, confirmed sales in the map, views agree, nothing left running.
+  Mutation-tested with blind writes.
+

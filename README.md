@@ -176,6 +176,12 @@ of its groups, so two view processes can show they agree. v0 keeps tables and th
 `nerva view`'s memory (at most two million changes) and computes a view when it is read.
 `zig build test:views` checks views against a model on two view processes.
 
+## Demos
+
+[demo/](./demo/README.md) holds public demos built only on the pieces above. The first is a
+seat race: 512 seats, simulated buyers, and a page to buy, rewind the show to any op, crash
+any process and declare views. `zig build test:demo` runs it under random crashes.
+
 ## Ledgerd views
 
 `nerva view` follows the change feed and also serves derived views of every ledgerd ledger,

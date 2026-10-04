@@ -14,6 +14,7 @@ const log = std.log.scoped(.ledgerd);
 
 const Client = @import("../client.zig").Client;
 const routes = @import("routes.zig");
+const http_connection = @import("../http_connection.zig");
 const store_routes = @import("store_routes.zig");
 const store_module = @import("store.zig");
 const Store = store_module.Store;
@@ -58,22 +59,17 @@ pub fn serve(gpa: std.mem.Allocator, client: *Client, options: Options) !noretur
         };
         defer connection.stream.close();
 
+        // One request per connection, sent within a deadline (N37).
+        http_connection.deadline(connection.stream);
         var http = std.http.Server.init(connection, read_buffer);
-        while (true) {
-            var request = http.receiveHead() catch |err| switch (err) {
-                error.HttpConnectionClosing => break,
-                else => {
-                    log.debug("receive: {}", .{err});
-                    break;
-                },
-            };
-            _ = arena_instance.reset(.retain_capacity);
-            serve_request(arena_instance.allocator(), &stores, options, &request) catch |err| {
-                log.warn("request: {}", .{err});
-                break;
-            };
-            if (!request.head.keep_alive) break;
-        }
+        var request = http.receiveHead() catch |err| {
+            log.debug("receive: {}", .{err});
+            continue;
+        };
+        _ = arena_instance.reset(.retain_capacity);
+        serve_request(arena_instance.allocator(), &stores, options, &request) catch |err| {
+            log.warn("request: {}", .{err});
+        };
     }
 }
 
@@ -150,7 +146,7 @@ fn serve_request(
 fn respond(request: *std.http.Server.Request, status: u16, body: []const u8) !void {
     try request.respond(body, .{
         .status = @enumFromInt(status),
-        .keep_alive = request.head.keep_alive,
+        .keep_alive = false,
         .extra_headers = &.{
             .{ .name = "content-type", .value = "text/plain; charset=utf-8" },
         },

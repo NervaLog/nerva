@@ -30,6 +30,7 @@ const log = std.log.scoped(.view);
 const nerva = @import("../../nerva.zig");
 const Client = @import("../client.zig").Client;
 const store = @import("../ledgerd/store.zig");
+const http_connection = @import("../http_connection.zig");
 const FollowerType = @import("follower.zig").FollowerType;
 const LedgerdViews = @import("ledgerd.zig").LedgerdViews;
 const DeclaredViews = @import("declared.zig").DeclaredViews;
@@ -102,17 +103,15 @@ pub fn serve(gpa: std.mem.Allocator, client: *Client, options: Options) !noretur
             continue;
         };
         defer connection.stream.close();
+        // One request per connection, sent within a deadline (N37).
+        http_connection.deadline(connection.stream);
         var http = std.http.Server.init(connection, read_buffer);
-        while (true) {
-            var request = http.receiveHead() catch break;
-            _ = arena_instance.reset(.retain_capacity);
-            const allocator = arena_instance.allocator();
-            serve_request(allocator, &follower, &views, options, &request) catch |err| {
-                log.warn("request: {}", .{err});
-                break;
-            };
-            if (!request.head.keep_alive) break;
-        }
+        var request = http.receiveHead() catch continue;
+        _ = arena_instance.reset(.retain_capacity);
+        const allocator = arena_instance.allocator();
+        serve_request(allocator, &follower, &views, options, &request) catch |err| {
+            log.warn("request: {}", .{err});
+        };
     }
 }
 
@@ -325,7 +324,7 @@ fn serve_declared(
 fn respond_json(request: *std.http.Server.Request, status: u16, body: []const u8) !void {
     try request.respond(body, .{
         .status = @enumFromInt(status),
-        .keep_alive = request.head.keep_alive,
+        .keep_alive = false,
         .extra_headers = &.{
             .{ .name = "content-type", .value = "application/json" },
         },
@@ -416,7 +415,7 @@ fn target_parse(arena: std.mem.Allocator, target: []const u8) !?Target {
 fn respond(request: *std.http.Server.Request, status: u16, body: []const u8) !void {
     try request.respond(body, .{
         .status = @enumFromInt(status),
-        .keep_alive = request.head.keep_alive,
+        .keep_alive = false,
         .extra_headers = &.{
             .{ .name = "content-type", .value = "text/plain; charset=utf-8" },
         },

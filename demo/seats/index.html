@@ -1,0 +1,378 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Nerva seat race</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect x='2' y='4' width='12' height='9' rx='2' fill='%233b5bdb'/%3E%3C/svg%3E">
+<style>
+:root {
+  --bg: #f7f7f5; --surface: #ffffff; --surface-2: #f0f0ed; --line: #e3e2de;
+  --text: #1c1b19; --text-2: #5d5b55; --text-3: #8f8c84;
+  --primary: #3b5bdb; --primary-soft: #dbe4ff; --mine: #e8590c; --mine-soft: #ffe8cc;
+  --ok: #2b8a3e; --ok-soft: #d3f9d8; --bad: #c92a2a; --bad-soft: #ffe3e3;
+  --seat-free: #ffffff; --seat-free-line: #c9c7c0;
+  --radius: 8px; --shadow: 0 1px 2px rgba(0,0,0,.06), 0 2px 8px rgba(0,0,0,.04);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #141412; --surface: #1d1c1a; --surface-2: #262522; --line: #34322e;
+    --text: #f2f1ee; --text-2: #b4b1a9; --text-3: #7d7a72;
+    --primary: #748ffc; --primary-soft: #263266; --mine: #ff922b; --mine-soft: #4a2a0c;
+    --ok: #51cf66; --ok-soft: #173d22; --bad: #ff6b6b; --bad-soft: #4a1c1c;
+    --seat-free: #1d1c1a; --seat-free-line: #4a4842;
+    --shadow: 0 1px 2px rgba(0,0,0,.4);
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text);
+  font: 15px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
+.wrap { max-width: 1180px; margin: 0 auto; padding: 32px 16px 64px; }
+header { margin-bottom: 32px; max-width: 70ch; }
+.brand { font-weight: 700; letter-spacing: .02em; color: var(--text-3); font-size: 13px;
+  text-transform: uppercase; }
+h1 { font-size: 28px; line-height: 1.2; margin: 8px 0 12px; }
+header p { margin: 0; color: var(--text-2); }
+.grid { display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 1fr); gap: 24px; }
+@media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+.card { background: var(--surface); border-radius: var(--radius); box-shadow: var(--shadow);
+  padding: 16px; }
+.stack > * + * { margin-top: 16px; }
+h2 { font-size: 13px; font-weight: 600; color: var(--text-2); margin: 0 0 12px;
+  text-transform: uppercase; letter-spacing: .04em; }
+.muted { color: var(--text-3); font-size: 13px; }
+.stage { text-align: center; font-size: 12px; color: var(--text-3); letter-spacing: .3em;
+  border-bottom: 2px solid var(--line); padding-bottom: 4px; margin: 0 auto 16px; width: 60%; }
+.section { margin-bottom: 16px; }
+.section-head { display: flex; justify-content: space-between; font-size: 13px;
+  color: var(--text-2); margin-bottom: 4px; }
+.rows { display: grid; gap: 3px; justify-content: center; }
+.seat-row { display: grid; grid-auto-flow: column; gap: 3px; }
+.seat { width: 18px; height: 14px; border-radius: 3px; border: 1px solid var(--seat-free-line);
+  background: var(--seat-free); padding: 0; cursor: pointer; }
+.seat.sold { background: var(--primary); border-color: var(--primary); cursor: default; }
+.seat.mine { background: var(--mine); border-color: var(--mine); }
+.seat.fresh { animation: pop .6s ease-out; }
+@keyframes pop { from { transform: scale(1.6); } to { transform: scale(1); } }
+.rewinding .seat { cursor: default; }
+.legend { display: flex; gap: 16px; font-size: 13px; color: var(--text-2); margin-top: 8px;
+  justify-content: center; flex-wrap: wrap; }
+.legend i { display: inline-block; width: 12px; height: 10px; border-radius: 2px;
+  vertical-align: -1px; margin-right: 6px; border: 1px solid var(--seat-free-line); }
+.timeline { display: flex; gap: 12px; align-items: center; }
+.timeline input { flex: 1; accent-color: var(--primary); }
+.op { font-variant-numeric: tabular-nums; }
+button { font: inherit; border-radius: 6px; border: 0; padding: 6px 12px; cursor: pointer; }
+.primary { background: var(--primary); color: #fff; }
+.quiet { background: var(--surface-2); color: var(--text); }
+.danger-quiet { background: transparent; color: var(--bad); padding: 4px 8px; }
+.danger-quiet:hover { background: var(--bad-soft); }
+.tiles { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.tile .value { font-size: 24px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.tile .label { font-size: 13px; color: var(--text-2); }
+.tile.zero .value { color: var(--ok); }
+.agree { display: flex; gap: 12px; align-items: flex-start; }
+.dot { width: 10px; height: 10px; border-radius: 50%; flex: none; margin-top: 6px; }
+.dot.ok { background: var(--ok); } .dot.wait { background: var(--text-3); } .dot.bad { background: var(--bad); }
+code, .mono { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px; }
+.procs { list-style: none; margin: 0; padding: 0; }
+.procs li { display: flex; align-items: center; gap: 8px; padding: 4px 0; }
+.procs .name { flex: 1; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; font-variant-numeric: tabular-nums; }
+th { text-align: left; font-weight: 500; color: var(--text-3); padding: 4px 8px 4px 0; }
+td { padding: 4px 8px 4px 0; border-top: 1px solid var(--line); }
+td.n, th.n { text-align: right; }
+.events { list-style: none; margin: 0; padding: 0; max-height: 220px; overflow: auto; font-size: 13px; }
+.events li { padding: 4px 0; cursor: pointer; color: var(--text-2); }
+.events li:hover { color: var(--text); }
+textarea, input[type=text] { width: 100%; font: 12px/1.4 ui-monospace, Menlo, monospace;
+  background: var(--surface-2); color: var(--text); border: 1px solid var(--line);
+  border-radius: 6px; padding: 8px; }
+textarea { min-height: 120px; resize: vertical; }
+select { width: 100%; font: inherit; font-size: 13px; background: var(--surface-2);
+  color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; }
+.live-only { font-size: 11px; color: var(--text-3); margin-left: 4px; display: none; }
+.rewinding .live-only { display: inline; }
+.row-gap { display: flex; gap: 8px; align-items: center; margin-top: 8px; }
+.toast { position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
+  background: var(--text); color: var(--bg); padding: 8px 16px; border-radius: 6px;
+  box-shadow: var(--shadow); opacity: 0; transition: opacity .2s; pointer-events: none; }
+.toast.on { opacity: 1; }
+.banner { background: var(--primary-soft); border-radius: var(--radius); padding: 8px 12px;
+  font-size: 13px; display: none; margin-bottom: 12px; }
+.rewinding .banner { display: block; }
+.empty { color: var(--text-3); font-size: 13px; padding: 8px 0; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="brand">Nerva · live demo</div>
+    <h1>Every seat sold once, even while you crash the database.</h1>
+    <p>Twenty-four buyers race for the best seats. Every number here is derived from one
+    replicated log: rewind it to any moment, crash any process, or declare a new number and
+    watch it answer for the whole show.</p>
+  </header>
+
+  <div class="grid" id="app">
+    <div class="stack">
+      <div class="card" id="venue">
+        <div class="banner" id="banner">Rewound to op <span class="op" id="banner-op"></span>.
+          This is the venue exactly as the log had it then.</div>
+        <div class="stage">STAGE</div>
+        <div id="map"></div>
+        <div class="legend">
+          <span><i></i>Free: click to buy</span>
+          <span><i style="background:var(--primary);border-color:var(--primary)"></i>Sold</span>
+          <span><i style="background:var(--mine);border-color:var(--mine)"></i>Yours</span>
+        </div>
+      </div>
+      <div class="card">
+        <h2>Rewind</h2>
+        <div class="timeline">
+          <input type="range" id="slider" min="0" max="0" value="0" aria-label="Op">
+          <span class="op muted" id="slider-op"></span>
+          <button class="quiet" id="live">Live</button>
+        </div>
+        <p class="muted" style="margin:8px 0 0">Drag through this show's history, or click a sale
+          below. Each position is a read of the views <em>as of</em> that op.</p>
+      </div>
+      <div class="card">
+        <h2>Declare a view</h2>
+        <p class="muted" style="margin-top:0">Fields: <code>section</code> (0 floor … 3 balcony),
+          <code>row</code>, <code>number</code>, <code>sold</code>, <code>price</code>,
+          <code>buyer</code>. It answers for the whole show, rewind included.</p>
+        <textarea id="spec">{
+  "where": [{"field": "sold", "op": "eq", "value": true}],
+  "group_by": ["section", "row"],
+  "aggregates": [{"fn": "count"}, {"fn": "sum", "field": "price"}]
+}</textarea>
+        <div class="row-gap">
+          <input type="text" id="view-name" placeholder="name, e.g. sold_by_row" style="flex:1">
+          <button class="primary" id="declare">Declare</button>
+        </div>
+        <div class="row-gap"><select id="view-pick" aria-label="View to show"></select></div>
+        <div id="view-out"></div>
+      </div>
+    </div>
+
+    <div class="stack">
+      <div class="card">
+        <div class="tiles">
+          <div class="tile"><div class="value" id="t-sold">–</div><div class="label">seats sold</div></div>
+          <div class="tile"><div class="value" id="t-revenue">–</div><div class="label">revenue</div></div>
+          <div class="tile"><div class="value" id="t-lost">–</div><div class="label">races lost<span class="live-only">· live</span></div></div>
+          <div class="tile zero"><div class="value" id="t-double">–</div><div class="label">seats sold twice<span class="live-only">· live</span></div></div>
+        </div>
+      </div>
+      <div class="card">
+        <h2>Two views, one answer</h2>
+        <div class="agree"><span class="dot wait" id="agree-dot"></span>
+          <div><div id="agree-text">Waiting for the views</div>
+          <div class="muted mono" id="agree-hashes"></div></div></div>
+        <p class="muted" style="margin:8px 0 0">Two separate view processes compute sales by
+          section from the log. The hash of their answers must match.</p>
+      </div>
+      <div class="card">
+        <h2>Crash something</h2>
+        <ul class="procs" id="procs"></ul>
+        <p class="muted" style="margin:8px 0 0">A crash is a SIGKILL. One replica may be down
+          at a time. Crashed processes come back on their own after 20 s.</p>
+      </div>
+      <div class="card">
+        <h2>Sales by section</h2>
+        <table><thead><tr><th>Section</th><th class="n">Sold</th><th class="n">Revenue</th></tr></thead>
+        <tbody id="sales"></tbody></table>
+      </div>
+      <div class="card">
+        <h2>Latest sales</h2>
+        <ul class="events" id="events"></ul>
+      </div>
+    </div>
+  </div>
+</div>
+<div class="toast" id="toast"></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const fmt = (n) => Number(n).toLocaleString();
+const money = (n) => "$" + fmt(n);
+let sections = [], rewindOp = null, lastSold = new Set(), mine = new Set();
+try { mine = new Set(JSON.parse(localStorage.getItem("nerva-mine") || "[]")); } catch (_) {}
+const seatId = (s, r, n) => s * 10000 + r * 100 + n;
+
+function toast(text) {
+  const t = $("toast"); t.textContent = text; t.classList.add("on");
+  clearTimeout(toast.timer); toast.timer = setTimeout(() => t.classList.remove("on"), 2200);
+}
+
+async function api(path, body) {
+  const r = await fetch(path, body ? { method: "POST", body: JSON.stringify(body) } : {});
+  return [r.status, await r.json().catch(() => ({}))];
+}
+
+function buildMap() {
+  const map = $("map"); map.innerHTML = "";
+  sections.forEach((sec, s) => {
+    const el = document.createElement("div"); el.className = "section";
+    el.innerHTML = `<div class="section-head"><span>${sec.name}</span><span>${money(sec.price)}</span></div>`;
+    const rows = document.createElement("div"); rows.className = "rows";
+    for (let r = 0; r < sec.rows; r++) {
+      const row = document.createElement("div"); row.className = "seat-row";
+      for (let n = 0; n < sec.per_row; n++) {
+        const b = document.createElement("button");
+        b.className = "seat"; b.id = "s" + seatId(s, r, n);
+        b.title = `${sec.name}, row ${r + 1}, seat ${n + 1} · ${money(sec.price)}`;
+        b.onclick = () => buy(seatId(s, r, n), b);
+        row.appendChild(b);
+      }
+      rows.appendChild(row);
+    }
+    el.appendChild(rows); map.appendChild(el);
+  });
+}
+
+async function buy(id, el) {
+  if (rewindOp !== null || el.classList.contains("sold")) return;
+  const [status, body] = await api("/api/buy", { seat: id });
+  if (status !== 200) return toast(body.error || "Nerva is unavailable; try again");
+  if (body.outcome === "sold") {
+    mine.add(String(body.buyer));
+    try { localStorage.setItem("nerva-mine", JSON.stringify([...mine])); } catch (_) {}
+    toast("It's yours.");
+  } else if (body.outcome === "lost race") toast("Someone committed first. You lost the race.");
+  else toast("Already sold.");
+  refresh();
+}
+
+function render(state) {
+  if (!sections.length && state.sections) { sections = state.sections; buildMap(); }
+  const live = rewindOp === null;
+  if (state.seats) {
+    const sold = new Set();
+    for (const g of state.seats) {
+      const el = $("s" + seatId(g.section, g.row, g.number)); if (!el) continue;
+      const isSold = g.max_sold === "1";
+      el.classList.toggle("sold", isSold);
+      el.classList.toggle("mine", isSold && mine.has(g.max_buyer));
+      if (isSold) {
+        sold.add(el.id);
+        if (live && !lastSold.has(el.id) && lastSold.size) {
+          el.classList.remove("fresh"); void el.offsetWidth; el.classList.add("fresh");
+        }
+        el.title = el.title.split(" · bought")[0] + ` · bought by ${Number(g.max_buyer) >= 1000000 ? "a visitor" : "buyer " + g.max_buyer}`;
+      }
+    }
+    if (live) lastSold = sold;
+  }
+  let soldCount = 0, revenue = 0;
+  const rows = (state.sales || []).map((g) => {
+    soldCount += Number(g.count); revenue += Number(g.sum_price);
+    return `<tr><td>${sections[g.section]?.name ?? g.section}</td><td class="n">${fmt(g.count)}</td><td class="n">${money(g.sum_price)}</td></tr>`;
+  });
+  const total = sections.reduce((a, s) => a + s.rows * s.per_row, 0);
+  $("sales").innerHTML = rows.join("") || `<tr><td colspan="3" class="empty">Nothing sold yet</td></tr>`;
+  $("t-sold").textContent = `${fmt(soldCount)} / ${fmt(total)}`;
+  $("t-revenue").textContent = money(revenue);
+  if (live) {
+    $("t-lost").textContent = fmt(state.stats.lost_race);
+    $("t-double").textContent = fmt(state.stats.double_sold);
+    const [a, b] = state.hashes;
+    const dot = $("agree-dot");
+    if (a && b && a.op === b.op) {
+      const same = a.hash === b.hash;
+      dot.className = "dot " + (same ? "ok" : "bad");
+      $("agree-text").textContent = same ? `Identical at op ${fmt(a.op)}` : `Disagree at op ${fmt(a.op)}`;
+    } else if (a && b) {
+      dot.className = "dot wait";
+      $("agree-text").textContent = "One view is a few ops ahead; comparing at the next read";
+    } else {
+      dot.className = "dot wait";
+      $("agree-text").textContent = `${a ? "View b" : "View a"} is down; the other is answering`;
+    }
+    $("agree-hashes").textContent = [a, b].map((h, i) => `${"ab"[i]} ${h ? h.hash.slice(0, 16) : "down"}`).join("  ");
+    renderProcs(state.cluster);
+    renderEvents(state.events);
+    const slider = $("slider");
+    slider.min = state.show_start_op; slider.max = state.op || state.show_start_op; slider.value = slider.max;
+    $("slider-op").textContent = "op " + fmt(slider.value);
+    renderViewPicker(state.visitor_views);
+  }
+}
+
+function renderProcs(procs) {
+  $("procs").innerHTML = procs.map((p) => `<li><span class="dot ${p.alive ? "ok" : "bad"}"></span>
+    <span class="name">${p.name}${p.crashes ? ` <span class="muted">· crashed ${p.crashes}×</span>` : ""}</span>
+    <button class="${p.alive ? "danger-quiet" : "quiet"}" data-p="${p.name}" data-a="${p.alive ? "crash" : "restart"}">${p.alive ? "Crash" : "Restart"}</button></li>`).join("");
+}
+$("procs").onclick = async (e) => {
+  const b = e.target.closest("button"); if (!b) return;
+  const [status, body] = await api("/api/" + b.dataset.a, { process: b.dataset.p });
+  toast(status === 200 ? `${b.dataset.p}: ${b.dataset.a === "crash" ? "killed" : "restarting"}` : body.error);
+  refresh();
+};
+
+function renderEvents(events) {
+  const label = (id) => { const s = Math.floor(id / 10000), r = Math.floor(id / 100) % 100, n = id % 100;
+    return `${sections[s]?.name} row ${r + 1} seat ${n + 1}`; };
+  $("events").innerHTML = events.map((e) => `<li data-op="${e.op}">op ${fmt(e.op)} · ${label(e.seat)} · ${e.buyer >= 1000000 ? "a visitor" : "buyer " + e.buyer}</li>`).join("")
+    || `<li class="empty">The show is starting</li>`;
+}
+$("events").onclick = (e) => { const li = e.target.closest("li[data-op]"); if (li) rewindTo(li.dataset.op); };
+
+let timer = null;
+$("slider").oninput = () => { $("slider-op").textContent = "op " + fmt($("slider").value);
+  clearTimeout(timer); timer = setTimeout(() => rewindTo($("slider").value), 120); };
+$("live").onclick = () => { rewindOp = null; $("app").classList.remove("rewinding"); refresh(); };
+
+async function rewindTo(op) {
+  rewindOp = op; $("app").classList.add("rewinding"); $("banner-op").textContent = fmt(op);
+  $("slider").value = op; $("slider-op").textContent = "op " + fmt(op);
+  const [status, state] = await api("/api/state?as_of=" + op);
+  if (status === 200 && rewindOp === op) render(state);
+  showView();
+}
+
+async function refresh() {
+  if (rewindOp !== null) return;
+  const [status, state] = await api("/api/state");
+  if (status === 200 && rewindOp === null) { render(state); showView(); }
+}
+
+function renderViewPicker(names) {
+  const pick = $("view-pick"), current = pick.value;
+  const options = ["sales_by_section", "remaining_by_price", ...names];
+  if (pick.options.length !== options.length) {
+    pick.innerHTML = options.map((n) => `<option>${n}</option>`).join("");
+    if (options.includes(current)) pick.value = current;
+  }
+}
+$("view-pick").onchange = showView;
+
+async function showView() {
+  const name = $("view-pick").value; if (!name) return;
+  const [status, view] = await api(`/api/views/${name}` + (rewindOp !== null ? `?as_of=${rewindOp}` : ""));
+  if (status !== 200) { $("view-out").innerHTML = `<p class="empty">${view.error || "unavailable"}</p>`; return; }
+  const groups = view.groups;
+  if (!groups.length) { $("view-out").innerHTML = `<p class="empty">No rows match, as of op ${fmt(view.op)}</p>`; return; }
+  const cols = Object.keys(groups[0]);
+  $("view-out").innerHTML = `<p class="muted mono" style="margin:8px 0">op ${fmt(view.op)} · hash ${view.hash.slice(0, 16)}</p>
+    <div style="max-height:240px;overflow:auto"><table><thead><tr>${cols.map((c) => `<th>${c}</th>`).join("")}</tr></thead>
+    <tbody>${groups.map((g) => `<tr>${cols.map((c) => `<td>${g[c]}</td>`).join("")}</tr>`).join("")}</tbody></table></div>`;
+}
+
+$("declare").onclick = async () => {
+  let spec;
+  try { spec = JSON.parse($("spec").value); } catch (_) { return toast("The view is not valid JSON"); }
+  const [status, body] = await api("/api/views", { name: $("view-name").value.trim(), spec });
+  if (status !== 200) return toast(body.error || "Could not declare it");
+  toast(`Declared ${body.name}: it already knows the whole show`);
+  await refresh();
+  $("view-pick").value = body.name; showView();
+};
+
+refresh();
+setInterval(refresh, 1000);
+</script>
+</body>
+</html>

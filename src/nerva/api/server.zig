@@ -8,6 +8,7 @@ const log = std.log.scoped(.api);
 
 const Client = @import("../client.zig").Client;
 const api = @import("api.zig");
+const http_connection = @import("../http_connection.zig");
 const CatalogStore = @import("catalog_store.zig").CatalogStore;
 
 /// The largest request body: a full commit request in JSON is well under this.
@@ -40,17 +41,15 @@ pub fn serve(gpa: std.mem.Allocator, client: *Client, options: Options) !noretur
         };
         defer connection.stream.close();
 
+        // One request per connection, sent within a deadline (N37).
+        http_connection.deadline(connection.stream);
         var http = std.http.Server.init(connection, read_buffer);
-        while (true) {
-            var request = http.receiveHead() catch break;
-            _ = arena_instance.reset(.retain_capacity);
-            const arena = arena_instance.allocator();
-            serve_request(arena, client, &layouts, options, &request) catch |err| {
-                log.warn("request: {}", .{err});
-                break;
-            };
-            if (!request.head.keep_alive) break;
-        }
+        var request = http.receiveHead() catch continue;
+        _ = arena_instance.reset(.retain_capacity);
+        const arena = arena_instance.allocator();
+        serve_request(arena, client, &layouts, options, &request) catch |err| {
+            log.warn("request: {}", .{err});
+        };
     }
 }
 
@@ -107,7 +106,7 @@ fn serve_request(
 fn respond(request: *std.http.Server.Request, reply: api.Reply) !void {
     try request.respond(reply.body, .{
         .status = @enumFromInt(reply.status),
-        .keep_alive = request.head.keep_alive,
+        .keep_alive = false,
         .extra_headers = &.{
             .{ .name = "content-type", .value = "application/json" },
         },
