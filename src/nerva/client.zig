@@ -138,6 +138,11 @@ pub const Client = struct {
         client.* = undefined;
     }
 
+    /// The most entries one `commit` carries.
+    pub fn commit_entries_max(client: *const Client) u32 {
+        return Operation.commit.event_max(client.vsr_client.batch_size_limit.?);
+    }
+
     /// Point reads. `results.len == keys.len`.
     pub fn lookup_rows(client: *Client, keys: []const RowKey, results: []RowValue) Error!void {
         assert(results.len == keys.len);

@@ -301,3 +301,13 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
 
 - The repository moved from `topwombat/nerva` to `Botpike/nerva-ledger`; CLAUDE.md's issue rule
   names the new home. (GitHub redirects the old name for now.)
+
+## 2026-10-04 — Consistent document reads in `Transaction.get` (#7)
+
+- `documents.Transaction.get` read chunk 0 and the tail chunks in two lookups; a write landing
+  between them could make a read-only caller (the catalog) fail with `Corrupt` or decode a value
+  mixed from two versions. A tail whose op differs from chunk 0's is now read from its history at
+  chunk 0's version, as `/v1/documents/get` already did (N41).
+- `Transaction` is now `TransactionType(Client)`, so a test drives it with a stub that rewrites
+  the document between the lookups (same size, and shrunk to one chunk). The test fails without
+  the fix. `Client.commit_entries_max` replaces a reach into the VSR client.
