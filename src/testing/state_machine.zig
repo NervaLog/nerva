@@ -346,11 +346,13 @@ fn WorkloadType(comptime StateMachine: type) type {
             workload: *Workload,
             client_index: usize,
             operation: StateMachine.Operation,
+            op: u64,
             timestamp: u64,
             request_body: []align(constants.cache_line_size) const u8,
             reply_body: []align(constants.cache_line_size) const u8,
         ) void {
             _ = client_index;
+            _ = op;
             _ = timestamp;
 
             workload.requests_delivered += 1;
