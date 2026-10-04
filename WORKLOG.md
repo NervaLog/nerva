@@ -261,3 +261,8 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
 - `CHANGELOG.md`: a "what's new" section per release (v0.2.0, and v0.1.0 after the fact).
 - `release.yml` publishes the version's section as the release notes and refuses a version
   without one (`.github/scripts/release_notes.sh`); CLAUDE.md and README describe the step.
+
+## 2026-10-04 — Release v0.2.0
+
+- `VERSION`: `0.2.0`. Documents (N41), adds (N42), the protocol release `0.0.2` (N43, data
+  files from v0.1.0 must be reformatted), fixes #4 and #5. Notes: CHANGELOG.md.
