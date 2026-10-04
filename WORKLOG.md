@@ -335,3 +335,9 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
   any run's feed), and a put carrying `op_seen` accepted (3/4; only `entry_status_check`
   catches it, as the model shares `entry_validate`).
 
+## 2026-10-04 — CI runs the fuzzers' smoke pass (N50)
+
+- `.github/workflows/ci.yml`: the `test` job runs `zig build fuzz -- smoke` after the unit tests.
+  README lists it among CI's steps.
+- Verified locally: the smoke pass passes on `main`.
+
