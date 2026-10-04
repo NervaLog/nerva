@@ -296,3 +296,8 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
 - Smoke reports the vendored `lsm_segmented_array` as slow in Debug (about 20 s against its
   10 s budget); it is a warning, not a failure, and smoke never reached it before this fix.
 
+
+## 2026-10-04 — Repository renamed to `Botpike/nerva-ledger`
+
+- The repository moved from `topwombat/nerva` to `Botpike/nerva-ledger`; CLAUDE.md's issue rule
+  names the new home. (GitHub redirects the old name for now.)
