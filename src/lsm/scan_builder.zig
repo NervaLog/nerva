@@ -124,16 +124,17 @@ pub fn ScanBuilderType(
             return scan;
         }
 
-        /// Initializes a Scan over the secondary index specified by `index`, for values from
-        /// `value_min` to `value_max` inclusive (Nerva: backfill and view reads, N49).
-        /// Results are ordered by value, then by `timestamp`.
-        pub fn scan_range(
+        /// Initializes a Scan over a unique key, for values from `value_min` to `value_max`
+        /// inclusive (Nerva: backfill and view reads, N49).
+        /// Produces the criteria equivalent to `WHERE key BETWEEN $min AND $max`.
+        /// Results are ordered by key.
+        pub fn scan_unique_key_range(
             self: *ScanBuilder,
             comptime index: std.meta.FieldEnum(Groove.IndexTrees),
             buffer: *ScanBuffer,
             snapshot: u64,
-            value_min: CompositeKeyPrefixType(index),
-            value_max: CompositeKeyPrefixType(index),
+            value_min: UniqueKeyType(index),
+            value_max: UniqueKeyType(index),
             direction: Direction,
         ) *Scan {
             assert(value_min <= value_max);
@@ -144,8 +145,8 @@ pub fn ScanBuilderType(
                 &@field(self.groove().indexes, @tagName(index)),
                 buffer,
                 snapshot,
-                key_from_value(index, value_min, TimestampRange.timestamp_min),
-                key_from_value(index, value_max, TimestampRange.timestamp_max),
+                value_min,
+                value_max,
                 direction,
             );
             return scan;

@@ -262,12 +262,16 @@ pub fn StateMachineType(comptime Storage: type) type {
         views_op: [nerva.views_max]View = undefined,
         views_stored: [nerva.views_max]View = undefined,
         views_op_count: u32 = 0,
+        /// This op's group writes charged so far (`view_group_writes_max`).
+        view_group_writes: u32 = 0,
         /// Rows a pulse scanned (one more than it adds, to know whether the table has more).
         backfill_rows: []Row,
         backfill_count: ?u32 = null,
         /// Groups a `get_view` scanned (one more than its limit, to know whether there are more).
         view_groups: []Group,
         view_groups_count: ?u32 = null,
+        /// The building view a pulse backfills (an index into `views_op`), if any.
+        backfill_view: ?u32 = null,
 
         pub fn init(
             self: *StateMachine,
@@ -520,7 +524,7 @@ pub fn StateMachineType(comptime Storage: type) type {
 
             switch (operation) {
                 .lookup_rows => self.prefetch_rows(RowKey, message_body_used),
-                .commit => self.prefetch_rows(Entry, message_body_used),
+                .commit => self.prefetch_views(),
                 .get_changes => self.prefetch_changes(message_body_used),
                 .get_history => self.prefetch_history(message_body_used),
                 .get_view, .declare_view, .pulse => self.prefetch_views(),
@@ -552,7 +556,11 @@ pub fn StateMachineType(comptime Storage: type) type {
             const self: *StateMachine = @alignCast(
                 @fieldParentPtr("rows_prefetch_context", context),
             );
-            self.prefetch_finish();
+            switch (self.prefetch_operation.?) {
+                .commit => self.prefetch_commit_groups(),
+                .lookup_rows => self.prefetch_finish(),
+                else => unreachable,
+            }
         }
 
         fn prefetch_changes(
@@ -783,6 +791,10 @@ pub fn StateMachineType(comptime Storage: type) type {
             }
             assert(batch_timestamp == timestamp);
             assert(body_decoder.batch_count() == reply_encoder.batch_count);
+            if (operation == .commit) {
+                assert(self.view_group_writes <= nerva.view_group_writes_max);
+                self.views_store();
+            }
             return reply_encoder.finish();
         }
 
@@ -861,11 +873,32 @@ pub fn StateMachineType(comptime Storage: type) type {
         }
 
         /// The first reason the transaction cannot commit, or null.
-        /// Static checks come first, then duplicate writes, then read conflicts.
+        /// The views budget comes first (it is charged in transaction order whatever happens
+        /// next, so that prefetch and commit agree on it), then static checks, then duplicate
+        /// writes, then read conflicts.
         fn commit_failure(self: *StateMachine, entries: []const Entry) ?Failure {
+            if (!self.view_writes_charge(entries)) {
+                const index = for (entries, 0..) |*entry, index| {
+                    if (self.view_write_cost(entry) > 0) break index;
+                } else unreachable;
+                return .{ .index = @intCast(index), .status = .views_busy, .op = 0 };
+            }
             for (entries, 0..) |*entry, index| {
                 if (nerva.entry_validate(entry)) |status| {
                     return .{ .index = @intCast(index), .status = status, .op = 0 };
+                }
+                if (entry.kind == .add) {
+                    const add = Add.from_entry(entry);
+                    for (self.views_op[0..self.views_op_count]) |*view| {
+                        if (!view_maintained(view, entry.table)) continue;
+                        if (views.add_touches_key(&view.definition, add.offset)) {
+                            return .{
+                                .index = @intCast(index),
+                                .status = .view_key_field,
+                                .op = 0,
+                            };
+                        }
+                    }
                 }
                 if (entry.kind == .add) {
                     const add = Add.from_entry(entry);
@@ -942,6 +975,17 @@ pub fn StateMachineType(comptime Storage: type) type {
             assert(entry.kind == .put or entry.kind == .add);
             const rows = &self.forest.grooves.rows;
             const key = nerva.row_key(entry.table, entry.id);
+            const value_old: ?[nerva.value_size]u8 = switch (rows.get(key)) {
+                .found_object => |row| if (row.flags.deleted) null else row.value,
+                .not_found => null,
+            };
+            self.views_row_changed(
+                entry.table,
+                entry.id,
+                if (value_old) |*old| old else null,
+                value,
+                timestamp,
+            );
             switch (rows.get(key)) {
                 .found_object => |row_old| {
                     // Equal when an earlier transaction in the same request wrote the row.
@@ -1047,6 +1091,7 @@ pub fn StateMachineType(comptime Storage: type) type {
                 .found_object => |row_old| {
                     if (row_old.flags.deleted) return;
                     assert(row_old.op <= op);
+                    self.views_row_changed(entry.table, entry.id, &row_old.value, null, timestamp);
                     var row_new = row_old;
                     row_new.value = @splat(0);
                     row_new.op = op;
@@ -1082,32 +1127,164 @@ pub fn StateMachineType(comptime Storage: type) type {
         // ---- Views (N49) ----
 
         /// Prefetches every declared view (stage 0 of `commit`, `get_view`, `declare_view` and
-        /// `pulse`), then the operation's own stage.
+        /// `pulse`), loads them, then runs the operation's own stage.
         fn prefetch_views(self: *StateMachine) void {
-            _ = self;
-            @panic("TODO");
+            const groove = &self.forest.grooves.views;
+            groove.prefetch_setup(self.prefetch_snapshot.?);
+            const count = self.view_count orelse nerva.views_max;
+            for (1..count + 1) |id| groove.prefetch_enqueue(.{ .id = id });
+            groove.prefetch(prefetch_views_callback, &self.views_prefetch_context);
         }
 
-        /// Prefetches the groups a commit may touch (stage 2, after the rows).
+        fn prefetch_views_callback(context: *ViewsGroove.PrefetchContext) void {
+            const self: *StateMachine = @alignCast(
+                @fieldParentPtr("views_prefetch_context", context),
+            );
+            self.views_load();
+            switch (self.prefetch_operation.?) {
+                .commit => self.prefetch_rows(Entry, self.prefetch_input.?),
+                .declare_view => self.prefetch_finish(),
+                .get_view => self.prefetch_view_groups(),
+                .pulse => self.prefetch_backfill_rows(),
+                else => unreachable,
+            }
+        }
+
+        /// Prefetches the groups a commit may touch (stage 2, after the rows): for every write
+        /// of a transaction that the views budget admits, in each view of its table, the old
+        /// row's group and the put's (or a creating add's empty row's) group.
         fn prefetch_commit_groups(self: *StateMachine) void {
-            _ = self;
-            @panic("TODO");
+            const body_decoder = MultiBatchDecoder.init(self.prefetch_input.?, .{
+                .element_size = @sizeOf(Entry),
+            }) catch unreachable; // Already validated by `input_valid()`.
+            var decoder = body_decoder;
+
+            const groups = &self.forest.grooves.groups;
+            groups.prefetch_setup(self.prefetch_snapshot.?);
+            const charged = self.view_group_writes;
+            defer self.view_group_writes = charged; // Commit charges again, the same way.
+            while (decoder.pop()) |batch| {
+                const entries = stdx.bytes_as_slice(.exact, Entry, batch);
+                if (!self.view_writes_charge(entries)) continue;
+                for (entries) |*entry| {
+                    if (self.view_write_cost(entry) == 0) continue;
+                    self.prefetch_entry_groups(entry);
+                }
+            }
+            groups.prefetch(prefetch_groups_callback, &self.groups_prefetch_context);
         }
 
-        /// Loads the views prefetched for this op into `views_op` and `views_stored`.
+        fn prefetch_entry_groups(self: *StateMachine, entry: *const Entry) void {
+            const groups = &self.forest.grooves.groups;
+            const value_old: ?[nerva.value_size]u8 =
+                switch (self.forest.grooves.rows.get(nerva.row_key(entry.table, entry.id))) {
+                    .found_object => |row| if (row.flags.deleted) null else row.value,
+                    .not_found => null,
+                };
+            for (self.views_op[0..self.views_op_count]) |*view| {
+                if (!view_maintained(view, entry.table)) continue;
+                if (view.state == .building and entry.id >= view.backfill_cursor) continue;
+                const definition = &view.definition;
+                var candidates: [2]?[nerva.value_size]u8 = .{ value_old, null };
+                switch (entry.kind) {
+                    .put => candidates[1] = entry.value,
+                    .add => if (Add.from_entry(entry).flags.create) {
+                        candidates[1] = @as([nerva.value_size]u8, @splat(0));
+                    },
+                    else => {},
+                }
+                for (&candidates) |*candidate| {
+                    const value = candidate.* orelse continue;
+                    if (!views.row_matches(definition, &value)) continue;
+                    const key = views.group_key(definition, &value);
+                    groups.prefetch_enqueue(.{ .key = views.group_tree_key(view.id, &key) });
+                }
+            }
+        }
+
+        fn prefetch_groups_callback(context: *GroupsGroove.PrefetchContext) void {
+            const self: *StateMachine = @alignCast(
+                @fieldParentPtr("groups_prefetch_context", context),
+            );
+            self.prefetch_finish();
+        }
+
+        /// Charges the transaction's view group writes to this op's budget, if they fit.
+        fn view_writes_charge(self: *StateMachine, entries: []const Entry) bool {
+            var cost: u32 = 0;
+            for (entries) |*entry| cost += self.view_write_cost(entry);
+            if (self.view_group_writes + cost > nerva.view_group_writes_max) return false;
+            self.view_group_writes += cost;
+            return true;
+        }
+
+        /// An entry's view group writes, at most: its old and new group in each view of its
+        /// table, whatever the view's state (so that the cost cannot change during the op).
+        fn view_write_cost(self: *const StateMachine, entry: *const Entry) u32 {
+            if (entry.table == 0) return 0;
+            switch (entry.kind) {
+                .put, .delete, .add => {},
+                else => return 0,
+            }
+            var cost: u32 = 0;
+            for (self.views_op[0..self.views_op_count]) |*view| {
+                if (view.definition.table == entry.table) cost += 2;
+            }
+            return cost;
+        }
+
+        /// Whether `view` is kept up to date with writes to `table`.
+        fn view_maintained(view: *const View, table: u32) bool {
+            return view.definition.table == table and
+                (view.state == .building or view.state == .ready);
+        }
+
+        /// Loads the views prefetched for this op into `views_op` and `views_stored`, and resets
+        /// the op's budget.
         fn views_load(self: *StateMachine) void {
-            _ = self;
-            @panic("TODO");
+            const groove = &self.forest.grooves.views;
+            const count = self.view_count orelse nerva.views_max;
+            var loaded: u32 = 0;
+            var building = false;
+            for (1..count + 1) |id| {
+                switch (groove.get(id)) {
+                    .found_object => |view| {
+                        // Ids are dense: 1, 2, … in declaration order.
+                        assert(view.id == loaded + 1);
+                        self.views_op[loaded] = view;
+                        self.views_stored[loaded] = view;
+                        loaded += 1;
+                        building = building or view.state == .building;
+                    },
+                    .not_found => break,
+                }
+            }
+            if (self.view_count) |known| assert(known == loaded);
+            self.view_count = loaded;
+            self.view_building = building;
+            self.views_op_count = loaded;
+            self.view_group_writes = 0;
         }
 
         /// Writes back the views this op changed.
         fn views_store(self: *StateMachine) void {
-            _ = self;
-            @panic("TODO");
+            const groove = &self.forest.grooves.views;
+            var building = false;
+            for (
+                self.views_op[0..self.views_op_count],
+                self.views_stored[0..self.views_op_count],
+            ) |*view, *stored| {
+                building = building or view.state == .building;
+                if (stdx.equal_bytes(View, view, stored)) continue;
+                groove.update(.{ .old = stored, .new = view });
+                stored.* = view.*;
+            }
+            self.view_building = building;
         }
 
         /// Keeps the views over `table` exact after one row changed from `old` to `new` (null:
-        /// absent). `timestamp` is the entry's: groups it creates take the ones after it.
+        /// absent). `timestamp` is the entry's: a group it creates in the table's `n`th view
+        /// takes `timestamp + 1 + n`.
         fn views_row_changed(
             self: *StateMachine,
             table: u32,
@@ -1116,13 +1293,176 @@ pub fn StateMachineType(comptime Storage: type) type {
             new: ?*const [nerva.value_size]u8,
             timestamp: u64,
         ) void {
-            _ = self;
-            _ = table;
-            _ = id;
-            _ = old;
-            _ = new;
-            _ = timestamp;
-            @panic("TODO");
+            var slot: u64 = 0;
+            for (self.views_op[0..self.views_op_count]) |*view| {
+                if (view.definition.table != table) continue;
+                defer slot += 1;
+                assert(slot < nerva.views_per_table_max);
+                if (!view_maintained(view, table)) continue;
+                // A building view adds rows from its cursor on when the pulse reaches them.
+                if (view.state == .building and id >= view.backfill_cursor) continue;
+
+                if (old) |value| {
+                    if (views.row_matches(&view.definition, value)) {
+                        self.group_change(view, value, .remove, 0);
+                    }
+                }
+                if (new) |value| {
+                    if (views.row_matches(&view.definition, value)) {
+                        self.group_change(view, value, .add, timestamp + 1 + slot);
+                    }
+                }
+            }
+        }
+
+        /// Adds the row to, or removes it from, its group of `view`, keeping the view's hash and
+        /// group count. `timestamp` is for a group created now.
+        fn group_change(
+            self: *StateMachine,
+            view: *View,
+            value: *const [nerva.value_size]u8,
+            sign: enum { add, remove },
+            timestamp: u64,
+        ) void {
+            if (view.state == .failed) return; // An earlier collision in this op.
+            const groups = &self.forest.grooves.groups;
+            const key = views.group_key(&view.definition, value);
+            const tree_key = views.group_tree_key(view.id, &key);
+            const found: ?Group = switch (groups.get(tree_key)) {
+                .found_object => |group| group,
+                .not_found => null,
+            };
+            if (found) |group| {
+                if (!std.mem.eql(u8, &group.group_key, &key)) {
+                    // Two group keys hashed alike: every replica fails the view at this op.
+                    log.warn("view {}: group hash collision; the view fails", .{view.id});
+                    view.state = .failed;
+                    return;
+                }
+            } else {
+                // A row leaves only a group it is counted in.
+                assert(sign == .add);
+                assert(TimestampRange.valid(timestamp));
+            }
+
+            var group: Group = found orelse .{
+                .key = tree_key,
+                .timestamp = timestamp,
+                .count = 0,
+                .group_key = key,
+                .sums = @splat(@splat(0)),
+            };
+            const group_old = group;
+            views.hash_update(&view.hash, &views.group_digest(view.id, &group), .remove);
+            views.group_apply(&view.definition, &group, value, switch (sign) {
+                .add => .add,
+                .remove => .remove,
+            });
+            views.hash_update(&view.hash, &views.group_digest(view.id, &group), .add);
+            if (group_old.count == 0 and group.count > 0) view.group_count += 1;
+            if (group_old.count > 0 and group.count == 0) view.group_count -= 1;
+
+            if (found == null) {
+                groups.insert(&group);
+            } else {
+                groups.update(.{ .old = &group_old, .new = &group });
+            }
+        }
+
+        /// Stage 1 of `get_view`: scans the view's groups from the query's cursor.
+        fn prefetch_view_groups(self: *StateMachine) void {
+            assert(self.view_groups_count == null);
+            const query = view_query(self.prefetch_input.?);
+            const limit = view_query_limit(query) orelse return self.prefetch_finish();
+            if (query.view_id == 0 or query.view_id > self.views_op_count) {
+                return self.prefetch_finish();
+            }
+
+            const groups = &self.forest.grooves.groups;
+            const scan = groups.scan_builder.scan_unique_key_range(
+                .key,
+                self.forest.scan_buffer_pool.acquire_assume_capacity(),
+                self.prefetch_snapshot.?,
+                @as(u128, query.view_id) << 64 | query.group_hash_min,
+                @as(u128, query.view_id) << 64 | std.math.maxInt(u64),
+                .ascending,
+            );
+            self.groups_scan_lookup = GroupsScanLookup.init(groups, scan);
+            self.groups_scan_lookup.read(self.view_groups[0 .. limit + 1], prefetch_view_groups_callback);
+        }
+
+        fn prefetch_view_groups_callback(
+            scan_lookup: *GroupsScanLookup,
+            results: []const Group,
+        ) void {
+            const self: *StateMachine =
+                @alignCast(@fieldParentPtr("groups_scan_lookup", scan_lookup));
+            assert(results.len == 0 or results.ptr == self.view_groups.ptr);
+            self.view_groups_count = @intCast(results.len);
+            self.forest.scan_buffer_pool.reset();
+            self.forest.grooves.groups.scan_builder.reset();
+            self.prefetch_finish();
+        }
+
+        fn view_query(body: []align(constants.cache_line_size) const u8) *const ViewQuery {
+            assert(body.len == @sizeOf(ViewQuery));
+            return @alignCast(std.mem.bytesAsValue(ViewQuery, body[0..@sizeOf(ViewQuery)]));
+        }
+
+        /// The effective limit of a valid query, or null if the query is invalid.
+        fn view_query_limit(query: *const ViewQuery) ?u32 {
+            if (query.limit == 0) return null;
+            if (!stdx.zeroed(&query.reserved)) return null;
+            return @min(query.limit, view_groups_limit_max);
+        }
+
+        /// Stage 1 of `pulse`: scans the rows of the oldest building view's table from its
+        /// cursor, then (stage 2) prefetches their groups.
+        fn prefetch_backfill_rows(self: *StateMachine) void {
+            assert(self.backfill_count == null);
+            assert(self.backfill_view == null);
+            const index = for (self.views_op[0..self.views_op_count], 0..) |*view, index| {
+                if (view.state == .building) break index;
+            } else return self.prefetch_finish();
+            self.backfill_view = @intCast(index);
+            const view = &self.views_op[index];
+
+            const rows = &self.forest.grooves.rows;
+            const scan = rows.scan_builder.scan_unique_key_range(
+                .key,
+                self.forest.scan_buffer_pool.acquire_assume_capacity(),
+                self.prefetch_snapshot.?,
+                nerva.row_key(view.definition.table, view.backfill_cursor),
+                nerva.row_key(view.definition.table, std.math.maxInt(u64)),
+                .ascending,
+            );
+            self.rows_scan_lookup = RowsScanLookup.init(rows, scan);
+            self.rows_scan_lookup.read(self.backfill_rows, prefetch_backfill_rows_callback);
+        }
+
+        fn prefetch_backfill_rows_callback(
+            scan_lookup: *RowsScanLookup,
+            results: []const Row,
+        ) void {
+            const self: *StateMachine =
+                @alignCast(@fieldParentPtr("rows_scan_lookup", scan_lookup));
+            assert(results.len == 0 or results.ptr == self.backfill_rows.ptr);
+            self.backfill_count = @intCast(results.len);
+            self.forest.scan_buffer_pool.reset();
+            self.forest.grooves.rows.scan_builder.reset();
+
+            // Stage 2: the groups of the rows this pulse adds.
+            const view = &self.views_op[self.backfill_view.?];
+            const groups = &self.forest.grooves.groups;
+            groups.prefetch_setup(self.prefetch_snapshot.?);
+            const count = @min(results.len, nerva.backfill_rows_per_op);
+            for (results[0..count]) |*row| {
+                if (row.flags.deleted) continue;
+                if (!views.row_matches(&view.definition, &row.value)) continue;
+                const key = views.group_key(&view.definition, &row.value);
+                groups.prefetch_enqueue(.{ .key = views.group_tree_key(view.id, &key) });
+            }
+            groups.prefetch(prefetch_groups_callback, &self.groups_prefetch_context);
         }
 
         fn execute_get_view(
@@ -1131,11 +1471,53 @@ pub fn StateMachineType(comptime Storage: type) type {
             message_body_used: []align(constants.cache_line_size) const u8,
             output_buffer: *align(constants.cache_line_size) [constants.message_body_size_max]u8,
         ) usize {
-            _ = self;
-            _ = op;
-            _ = message_body_used;
-            _ = output_buffer;
-            @panic("TODO");
+            defer self.view_groups_count = null;
+            const query = view_query(message_body_used);
+            const limit = view_query_limit(query) orelse {
+                assert(self.view_groups_count == null);
+                return 0;
+            };
+            const records = stdx.bytes_as_slice(.inexact, ViewRecord, output_buffer);
+            const header = &records[0];
+            header.* = std.mem.zeroes(ViewRecord);
+            header.kind = .header;
+            header.view_id = query.view_id;
+            header.op = op;
+            if (query.view_id == 0 or query.view_id > self.views_op_count) {
+                assert(self.view_groups_count == null);
+                header.state = .missing;
+                return @sizeOf(ViewRecord);
+            }
+
+            const view = &self.views_op[query.view_id - 1];
+            assert(view.id == query.view_id);
+            header.state = view.state;
+            header.declared_op = view.declared_op;
+            header.group_count = view.group_count;
+            header.hash = view.hash;
+
+            const scanned = self.view_groups[0..self.view_groups_count.?];
+            assert(scanned.len <= limit + 1);
+            var count: usize = 0;
+            for (scanned[0..@min(scanned.len, limit)]) |*group| {
+                assert(group.key >> 64 == view.id);
+                // Empty groups are kept (their history stays readable), but not listed.
+                if (group.count == 0) continue;
+                const record = &records[1 + count];
+                record.* = std.mem.zeroes(ViewRecord);
+                record.kind = .group;
+                record.view_id = view.id;
+                record.group_hash = @truncate(group.key);
+                record.count = group.count;
+                record.group_key = group.group_key;
+                record.sums = group.sums;
+                count += 1;
+            }
+            if (scanned.len > limit) {
+                header.flags.more = true;
+                header.cursor = @truncate(scanned[limit].key);
+            }
+            return (1 + count) * @sizeOf(ViewRecord);
         }
 
         fn execute_declare_view(
@@ -1145,19 +1527,97 @@ pub fn StateMachineType(comptime Storage: type) type {
             message_body_used: []align(constants.cache_line_size) const u8,
             output_buffer: *align(constants.cache_line_size) [constants.message_body_size_max]u8,
         ) usize {
-            _ = self;
-            _ = op;
-            _ = timestamp;
-            _ = message_body_used;
-            _ = output_buffer;
-            @panic("TODO");
+            assert(message_body_used.len == @sizeOf(ViewDefinition));
+            const definition: *const ViewDefinition = @alignCast(
+                std.mem.bytesAsValue(ViewDefinition, message_body_used[0..@sizeOf(ViewDefinition)]),
+            );
+            const result: *DeclareResult = @alignCast(
+                std.mem.bytesAsValue(DeclareResult, output_buffer[0..@sizeOf(DeclareResult)]),
+            );
+            result.* = self.view_declare(op, timestamp, definition);
+            self.views_store();
+            return @sizeOf(DeclareResult);
+        }
+
+        fn view_declare(
+            self: *StateMachine,
+            op: u64,
+            timestamp: u64,
+            definition: *const ViewDefinition,
+        ) DeclareResult {
+            if (views.definition_validate(definition)) |status| {
+                return .{ .status = status, .view_id = 0, .op = 0 };
+            }
+            const name = views.definition_name(definition);
+            var table_views: u32 = 0;
+            for (self.views_op[0..self.views_op_count]) |*view| {
+                if (std.mem.eql(u8, views.definition_name(&view.definition), name)) {
+                    if (stdx.equal_bytes(ViewDefinition, &view.definition, definition)) {
+                        return .{ .status = .exists, .view_id = view.id, .op = view.declared_op };
+                    }
+                    return .{ .status = .different, .view_id = 0, .op = 0 };
+                }
+                if (view.definition.table == definition.table) table_views += 1;
+            }
+            if (self.views_op_count == nerva.views_max) {
+                return .{ .status = .views_full, .view_id = 0, .op = 0 };
+            }
+            if (table_views == nerva.views_per_table_max) {
+                return .{ .status = .table_views_full, .view_id = 0, .op = 0 };
+            }
+
+            const index = self.views_op_count;
+            // Every view starts building: pulses add the rows already written (none, possibly).
+            const view: View = .{
+                .id = index + 1,
+                .timestamp = timestamp,
+                .declared_op = op,
+                .backfill_cursor = 0,
+                .group_count = 0,
+                .state = .building,
+                .hash = @splat(0),
+                .definition = definition.*,
+            };
+            self.forest.grooves.views.insert(&view);
+            self.views_op[index] = view;
+            self.views_stored[index] = view;
+            self.views_op_count += 1;
+            self.view_count = self.views_op_count;
+            return .{ .status = .created, .view_id = view.id, .op = op };
         }
 
         /// Adds the rows the pulse scanned to the building view's groups. Replies nothing.
         fn execute_pulse(self: *StateMachine, timestamp: u64) usize {
-            _ = self;
-            _ = timestamp;
-            @panic("TODO");
+            defer {
+                self.backfill_view = null;
+                self.backfill_count = null;
+            }
+            const index = self.backfill_view orelse {
+                assert(self.view_building == false);
+                return 0;
+            };
+            const view = &self.views_op[index];
+            assert(view.state == .building);
+            const scanned = self.backfill_rows[0..self.backfill_count.?];
+            const count = @min(scanned.len, nerva.backfill_rows_per_op);
+            const timestamp_base = timestamp - nerva.backfill_rows_per_op;
+            for (scanned[0..count], 0..) |*row, k| {
+                const id: u64 = @truncate(row.key);
+                assert(row.key >> 64 == view.definition.table);
+                assert(id >= view.backfill_cursor);
+                if (row.flags.deleted) continue;
+                if (!views.row_matches(&view.definition, &row.value)) continue;
+                self.group_change(view, &row.value, .add, timestamp_base + k + 1);
+            }
+            if (view.state == .building) {
+                if (scanned.len > nerva.backfill_rows_per_op) {
+                    view.backfill_cursor = @truncate(scanned[nerva.backfill_rows_per_op].key);
+                } else {
+                    view.state = .ready;
+                }
+            }
+            self.views_store();
+            return 0;
         }
 
         fn execute_get_changes(
