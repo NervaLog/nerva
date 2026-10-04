@@ -35,6 +35,10 @@ const Change = nerva.Change;
 const ChangesFilter = nerva.ChangesFilter;
 const HistoryFilter = nerva.HistoryFilter;
 const value_size = nerva.value_size;
+const ViewDefinition = nerva.ViewDefinition;
+const ViewRecord = nerva.ViewRecord;
+const DeclareResult = nerva.DeclareResult;
+const views = @import("views.zig");
 
 /// The table holding receipts. Random transactions never touch it.
 pub const receipts_table: u32 = 100;
@@ -170,6 +174,14 @@ pub fn WorkloadType(comptime StateMachine: type) type {
         history_skipped: u64 = 0,
         pulses: u64 = 0,
 
+        /// Views declared (N49), in id order, and whether each was seen ready (never undone).
+        model_views: std.ArrayListUnmanaged(ModelView) = .{},
+        /// This request's view group writes, charged per transaction as the state machine does.
+        view_group_writes: u32 = 0,
+        view_reads_ready: u64 = 0,
+        view_reads_building: u64 = 0,
+        views_busy: u64 = 0,
+
         budgets: std.AutoHashMapUnmanaged(u64, Budget) = .{},
         budget_transactions: u64 = 0,
         adds_applied: u64 = 0,
@@ -212,6 +224,13 @@ pub fn WorkloadType(comptime StateMachine: type) type {
             }
         };
 
+        const ModelView = struct { id: u64, declared_op: u64, definition: ViewDefinition, ready: bool };
+
+        /// The state machine's `group_writes_limit` for this batch size.
+        fn group_writes_limit(workload: *const Workload) u32 {
+            return @max(1, @divFloor(Operation.commit.event_max(workload.options.batch_size_limit), 2));
+        }
+
         pub fn init(
             allocator: std.mem.Allocator,
             prng: *stdx.PRNG,
@@ -241,6 +260,14 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                 workload.adds_applied,
                 workload.adds_clamped,
             });
+            log.info("views declared={} reads ready={} building={} pulses={} views_busy={}", .{
+                workload.model_views.items.len,
+                workload.view_reads_ready,
+                workload.view_reads_building,
+                workload.pulses,
+                workload.views_busy,
+            });
+            workload.model_views.deinit(allocator);
             workload.budgets.deinit(allocator);
             workload.receipt_seqs.deinit(allocator);
             workload.rows.deinit(allocator);
@@ -266,6 +293,8 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                 .lookup_rows = 3,
                 .get_changes = 2,
                 .get_history = 2,
+                .declare_view = 1,
+                .get_view = 6,
             })) {
                 .commit => .{ .operation = .commit, .size = workload.build_commit(body_limited) },
                 .claim => .{
@@ -288,7 +317,62 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                     .operation = .get_history,
                     .size = workload.build_get_history(body),
                 },
+                .declare_view => .{
+                    .operation = .declare_view,
+                    .size = workload.build_declare_view(body),
+                },
+                .get_view => .{
+                    .operation = .get_view,
+                    .size = workload.build_get_view(body),
+                },
             };
+        }
+
+        /// A random view over one of the random tables: filters and groups on byte fields (so
+        /// that groups are few), sums a 64-bit field; sometimes a name already declared, or an
+        /// invalid definition.
+        fn build_declare_view(workload: *Workload, body: []align(constants.cache_line_size) u8) usize {
+            const prng = workload.prng;
+            const definition: *ViewDefinition =
+                @alignCast(std.mem.bytesAsValue(ViewDefinition, body[0..@sizeOf(ViewDefinition)]));
+            definition.* = std.mem.zeroes(ViewDefinition);
+            const name_index = prng.int_inclusive(u8, @intCast(@min(workload.model_views.items.len + 1, 70)));
+            _ = std.fmt.bufPrint(&definition.name, "v{}", .{name_index}) catch unreachable;
+            definition.table = prng.range_inclusive(u32, 1, workload.options.table_count);
+            definition.where_count = prng.int_inclusive(u8, 2);
+            for (definition.where[0..definition.where_count]) |*clause| {
+                clause.* = .{
+                    .field = .{ .offset = prng.int_inclusive(u8, value_size - 1), .size = 1, .kind = .unsigned },
+                    .comparison = @enumFromInt(prng.range_inclusive(u8, 1, 6)),
+                    .value = std.mem.toBytes(std.mem.nativeToLittle(i128, prng.int_inclusive(u8, 255))),
+                };
+            }
+            definition.group_by_count = prng.int_inclusive(u8, 2);
+            for (definition.group_by[0..definition.group_by_count]) |*field| {
+                field.* = .{ .offset = prng.int_inclusive(u8, value_size - 1), .size = 1, .kind = .unsigned };
+            }
+            definition.aggregate_count = 2;
+            definition.aggregates[0] = .{ .function = .count, .field = std.mem.zeroes(nerva.FieldRef) };
+            definition.aggregates[1] = .{
+                .function = .sum,
+                .field = .{ .offset = 8 * prng.int_inclusive(u8, 9), .size = 8, .kind = .unsigned },
+            };
+            if (prng.chance(stdx.PRNG.ratio(1, 20))) definition.reserved_b[0] = 1;
+            if (prng.chance(stdx.PRNG.ratio(1, 20))) definition.aggregates[1].function = .max;
+            return @sizeOf(ViewDefinition);
+        }
+
+        fn build_get_view(workload: *Workload, body: []align(constants.cache_line_size) u8) usize {
+            const prng = workload.prng;
+            const query: *nerva.ViewQuery =
+                @alignCast(std.mem.bytesAsValue(nerva.ViewQuery, body[0..@sizeOf(nerva.ViewQuery)]));
+            query.* = .{
+                .view_id = prng.int_inclusive(u64, workload.model_views.items.len + 1),
+                .group_hash_min = if (prng.chance(stdx.PRNG.ratio(3, 4))) 0 else prng.int(u64),
+                // Zero is an invalid limit, and must return nothing.
+                .limit = prng.int_inclusive(u32, 8),
+            };
+            return @sizeOf(nerva.ViewQuery);
         }
 
         fn build_commit(workload: *Workload, body: []align(constants.cache_line_size) u8) usize {
@@ -638,7 +722,9 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                 .lookup_rows => workload.check_lookup_rows(request_body, reply_body),
                 .get_changes => workload.check_get_changes(request_body, reply_body),
                 .get_history => workload.check_get_history(request_body, reply_body),
-                .get_view, .declare_view, .pulse => unreachable, // Not sent yet.
+                .declare_view => workload.check_declare_view(request_body, reply_body),
+                .get_view => workload.check_get_view(request_body, reply_body),
+                .pulse => unreachable, // Sent by the replica, reported to `on_pulse`.
             }
         }
 
@@ -664,6 +750,7 @@ pub fn WorkloadType(comptime StateMachine: type) type {
             assert(request.batch_count() == reply.batch_count());
 
             var op_request: ?u64 = null;
+            workload.view_group_writes = 0;
             // Each entry takes a block of `entry_timestamps`: its change takes the first (N49).
             const block = StateMachine.entry_timestamps;
             var batch_timestamp =
@@ -772,9 +859,29 @@ pub fn WorkloadType(comptime StateMachine: type) type {
         /// fills `expected` with each entry's result.
         fn commit_failure(workload: *Workload, entries: []const Entry) ?Failure {
             assert(entries.len <= transaction_entries_max);
+            // The views budget: charged per transaction in request order, before anything else.
+            var cost: u32 = 0;
+            for (entries) |*entry| cost += workload.view_write_cost(entry);
+            if (workload.view_group_writes + cost > workload.group_writes_limit()) {
+                workload.views_busy += 1;
+                const index = for (entries, 0..) |*entry, index| {
+                    if (workload.view_write_cost(entry) > 0) break index;
+                } else unreachable;
+                return .{ .index = index, .status = .views_busy, .op = 0 };
+            }
+            workload.view_group_writes += cost;
             for (entries, 0..) |*entry, index| {
                 if (nerva.entry_validate(entry)) |status| {
                     return .{ .index = index, .status = status, .op = 0 };
+                }
+                if (entry.kind == .add) {
+                    const add = Add.from_entry(entry);
+                    for (workload.model_views.items) |*view| {
+                        if (view.definition.table != entry.table) continue;
+                        if (views.add_touches_key(&view.definition, add.offset)) {
+                            return .{ .index = index, .status = .view_key_field, .op = 0 };
+                        }
+                    }
                 }
                 if (entry.kind == .add) {
                     const add = Add.from_entry(entry);
@@ -905,6 +1012,155 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                 .timestamp = timestamp,
                 .value = value,
             }) catch @panic("OOM");
+        }
+
+        fn view_write_cost(workload: *const Workload, entry: *const Entry) u32 {
+            if (entry.table == 0) return 0;
+            switch (entry.kind) {
+                .put, .delete, .add => {},
+                else => return 0,
+            }
+            var cost: u32 = 0;
+            for (workload.model_views.items) |*view| {
+                if (view.definition.table == entry.table) cost += 2;
+            }
+            return cost;
+        }
+
+        fn check_declare_view(
+            workload: *Workload,
+            request_body: []align(constants.cache_line_size) const u8,
+            reply_body: []align(constants.cache_line_size) const u8,
+        ) void {
+            const definition: *const ViewDefinition = @alignCast(
+                std.mem.bytesAsValue(ViewDefinition, request_body[0..@sizeOf(ViewDefinition)]),
+            );
+            const results = stdx.bytes_as_slice(.exact, DeclareResult, reply_body);
+            assert(results.len == 1);
+            const result = results[0];
+
+            const expected: nerva.DeclareStatus = expected: {
+                if (views.definition_validate(definition)) |status| break :expected status;
+                var table_views: u32 = 0;
+                for (workload.model_views.items) |*view| {
+                    const name = views.definition_name(&view.definition);
+                    if (std.mem.eql(u8, name, views.definition_name(definition))) {
+                        if (stdx.equal_bytes(ViewDefinition, &view.definition, definition)) {
+                            assert(result.view_id == view.id);
+                            assert(result.op == view.declared_op);
+                            break :expected .exists;
+                        }
+                        break :expected .different;
+                    }
+                    if (view.definition.table == definition.table) table_views += 1;
+                }
+                if (workload.model_views.items.len == nerva.views_max) break :expected .views_full;
+                if (table_views == nerva.views_per_table_max) break :expected .table_views_full;
+                break :expected .created;
+            };
+            assert(result.status == expected);
+            if (expected == .created) {
+                assert(result.view_id == workload.model_views.items.len + 1);
+                assert(result.op > workload.op_max);
+                workload.op_max = result.op;
+                workload.model_views.append(workload.allocator, .{
+                    .id = result.view_id,
+                    .declared_op = result.op,
+                    .definition = definition.*,
+                    .ready = false,
+                }) catch @panic("OOM");
+            } else if (expected != .exists) {
+                assert(result.view_id == 0 and result.op == 0);
+            }
+        }
+
+        /// A ready view's groups must be the model's, computed from the rows; a building view's
+        /// reply need only agree with itself.
+        fn check_get_view(
+            workload: *Workload,
+            request_body: []align(constants.cache_line_size) const u8,
+            reply_body: []align(constants.cache_line_size) const u8,
+        ) void {
+            const query: *const nerva.ViewQuery = @alignCast(
+                std.mem.bytesAsValue(nerva.ViewQuery, request_body[0..@sizeOf(nerva.ViewQuery)]),
+            );
+            const records = stdx.bytes_as_slice(.exact, ViewRecord, reply_body);
+            if (query.limit == 0) {
+                assert(records.len == 0);
+                return;
+            }
+            assert(records.len >= 1);
+            const header = records[0];
+            assert(header.kind == .header);
+            assert(header.view_id == query.view_id);
+            assert(header.op > workload.op_max);
+            workload.op_max = header.op;
+            if (query.view_id == 0 or query.view_id > workload.model_views.items.len) {
+                assert(header.state == .missing);
+                assert(records.len == 1);
+                return;
+            }
+            const view = &workload.model_views.items[query.view_id - 1];
+            assert(header.declared_op == view.declared_op);
+            assert(records.len - 1 <= @min(query.limit, StateMachine.view_groups_limit_max));
+            for (records[1..]) |*record| {
+                assert(record.kind == .group);
+                assert(record.count > 0);
+                assert(record.group_hash >= query.group_hash_min);
+                if (header.flags.more) assert(record.group_hash < header.cursor);
+            }
+            switch (header.state) {
+                .building => {
+                    assert(!view.ready); // A ready view never builds again.
+                    workload.view_reads_building += 1;
+                    return;
+                },
+                .ready => {},
+                .missing, .failed => unreachable, // No collisions among a few hundred groups.
+            }
+            view.ready = true;
+            workload.view_reads_ready += 1;
+
+            // The model's groups, from the rows as of this op.
+            var groups: std.AutoArrayHashMapUnmanaged([nerva.group_key_size_max]u8, nerva.Group) = .{};
+            defer groups.deinit(workload.allocator);
+            var rows = workload.rows.iterator();
+            while (rows.next()) |row| {
+                if (@as(u32, @intCast(row.key_ptr.* >> 64)) != view.definition.table) continue;
+                if (!row.value_ptr.exists) continue;
+                if (!views.row_matches(&view.definition, &row.value_ptr.value)) continue;
+                const key = views.group_key(&view.definition, &row.value_ptr.value);
+                const entry = groups.getOrPut(workload.allocator, key) catch @panic("OOM");
+                if (!entry.found_existing) {
+                    entry.value_ptr.* = std.mem.zeroes(nerva.Group);
+                    entry.value_ptr.group_key = key;
+                }
+                views.group_apply(&view.definition, entry.value_ptr, &row.value_ptr.value, .add);
+            }
+
+            var hash: [32]u8 = @splat(0);
+            for (groups.values()) |*group| {
+                views.hash_update(&hash, &views.group_digest(view.id, group), .add);
+            }
+            assert(std.mem.eql(u8, &header.hash, &hash));
+            assert(header.group_count == groups.count());
+
+            // The page: exactly the model's groups between the query's cursor and the next.
+            const end: u64 = if (header.flags.more) header.cursor else std.math.maxInt(u64);
+            var in_range: usize = 0;
+            for (groups.keys(), groups.values()) |*key, *group| {
+                const group_hash: u64 = @truncate(views.group_tree_key(view.id, key));
+                if (group_hash < query.group_hash_min) continue;
+                if (header.flags.more and group_hash >= end) continue;
+                in_range += 1;
+                const record = for (records[1..]) |*record| {
+                    if (record.group_hash == group_hash) break record;
+                } else unreachable; // A group the page left out.
+                assert(std.mem.eql(u8, &record.group_key, &group.group_key));
+                assert(record.count == group.count);
+                assert(std.mem.eql(u8, std.mem.sliceAsBytes(&record.sums), std.mem.sliceAsBytes(&group.sums)));
+            }
+            assert(in_range == records.len - 1);
         }
 
         fn row_version(workload: *const Workload, key: u128) Version {
