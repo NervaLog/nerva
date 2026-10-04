@@ -81,6 +81,7 @@ pub fn build(b: *std.Build) !void {
         .test_fmt = b.step("test:fmt", "Check formatting"),
         .test_integration = b.step("test:integration", "Run integration tests (real processes)"),
         .test_ledgerd = b.step("test:ledgerd", "Check nerva ledgerd against ledgerd.py (python3)"),
+        .test_api = b.step("test:api", "Check nerva api against a model (python3)"),
         .vopr = b.step("vopr", "Run the VOPR"),
         .vopr_build = b.step("vopr:build", "Build the VOPR"),
         .fuzz = b.step("fuzz", "Run non-VOPR fuzzers"),
@@ -244,6 +245,14 @@ pub fn build(b: *std.Build) !void {
         run_script.has_side_effects = true;
         steps.test_ledgerd.dependOn(&run_script.step);
     }
+
+    // zig build test:api: the JSON API against a model.
+    const run_api_test = b.addSystemCommand(&.{ "python3", "tests/api/api.py" });
+    run_api_test.addFileArg(nerva.getEmittedBin());
+    if (b.args) |args| run_api_test.addArgs(args);
+    run_api_test.setCwd(b.path("."));
+    run_api_test.has_side_effects = true;
+    steps.test_api.dependOn(&run_api_test.step);
 
     // zig build test:fmt
     const run_fmt = b.addFmt(.{ .paths = &.{ "build.zig", "src" }, .check = true });

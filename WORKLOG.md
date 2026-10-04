@@ -168,3 +168,14 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
   from Linux; the step commands are the ones run throughout this session. The first run on
   GitHub is the real test.
 
+## 2026-10-04 — Phase 2, step 1: the JSON API
+
+- `src/nerva/api/`: `nerva api` serves `lookup`, `commit`, `changes`, `history` and `row`
+  (as of an op) as JSON over HTTP (N33). Unit tests use an in-memory fake client.
+- `tests/api/api.py` (`zig build test:api`, and in CI): random transactions through two
+  gateways checked against a model (statuses, conflict index and version, ops), lookups, the
+  whole change feed, every row's history at random `op_max`, as-of reads, a refusal for a future
+  op, eight writers racing on one counter with retries (no increment lost), 401/404/405.
+- Found by the test and fixed: `row?as_of=` answered for an op not yet committed.
+- Mutation-tested: an off-by-one in `op_max` parsing is caught. Seeds 1, 2 and 3 pass.
+

@@ -107,6 +107,28 @@ Linux and macOS (x86_64, aarch64) as a GitHub release (`release.yml`).
 `--development` relaxes Direct IO and uses small caches. Clients use `src/nerva/client.zig`:
 `lookup_rows`, `commit` and `get_changes`, blocking, one request in flight per client.
 
+## JSON API
+
+`nerva api` serves the core operations as JSON over HTTP, for any language:
+
+```bash
+NERVA_KEY=secret ./zig-out/bin/nerva api --cluster=1 --addresses=3001,3002,3003 \
+    --listen=127.0.0.1:8080
+curl -H 'X-Nerva-Key: secret' -d '{"entries":[{"kind":"put","table":1,"id":"5","value_hex":"c0ffee"}]}' \
+    http://127.0.0.1:8080/v1/commit        # {"status":"committed","op":"42"}
+```
+
+| Route | Does |
+|---|---|
+| `POST /v1/lookup` `{"rows":[{"table","id"}]}` | Point reads: `exists`, version `op`, `value_hex`, and the `op` read at. |
+| `POST /v1/commit` `{"entries":[…]}` | One transaction of `read` (with `op_seen`), `put` (with `value_hex`) and `delete`. `200` committed with its `op`; `409` conflict with the stale entry's `index` and the row's current `op`; `400` invalid. |
+| `GET /v1/changes?cursor=&limit=` | The change feed, paged. |
+| `GET /v1/history?table=&id=&op_max=&cursor=&limit=` | One row's writes, newest first, up to `op_max`. |
+| `GET /v1/row?table=&id=&as_of=` | One row as it was at an op (refused for an op not yet committed). |
+
+64-bit numbers (ids, ops, cursors) are decimal strings; values are the 80 bytes as hex.
+`zig build test:api` checks every route against a model, and races eight writers on one row.
+
 ## The Botpike runtime's ledger
 
 `nerva ledgerd` serves the [Botpike runtime](https://github.com/Botpike/runtime)'s ledger

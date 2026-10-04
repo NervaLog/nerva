@@ -53,6 +53,13 @@ const CLIArgs = union(enum) {
         log_debug: bool = false,
     },
 
+    api: struct {
+        cluster: u128,
+        addresses: vsr.ClusterAddress,
+        listen: []const u8,
+        log_debug: bool = false,
+    },
+
     version: struct {},
 
     pub const help =
@@ -72,6 +79,9 @@ const CLIArgs = union(enum) {
         \\  nerva view --cluster=<integer> --addresses=<addresses> --listen=<host:port>
         \\             [--log-debug]
         \\
+        \\  nerva api --cluster=<integer> --addresses=<addresses> --listen=<host:port>
+        \\            [--log-debug]
+        \\
         \\  nerva version
         \\
         \\Commands:
@@ -85,6 +95,9 @@ const CLIArgs = union(enum) {
         \\
         \\  view     Follow the cluster's change feed and serve the ledgerd views
         \\           (journal, spend). The key is read from LEDGER_KEY.
+        \\
+        \\  api      Serve the cluster's operations (lookup, commit, changes, history) as JSON
+        \\           over HTTP. The key is read from the NERVA_KEY environment variable.
         \\
         \\  version  Print the version.
         \\
@@ -128,7 +141,15 @@ pub const Command = union(enum) {
     start: Start,
     ledgerd: Ledgerd,
     view: View,
+    api: Api,
     version,
+
+    pub const Api = struct {
+        cluster: u128,
+        addresses: vsr.ClusterAddress,
+        listen: std.net.Address,
+        log_debug: bool,
+    };
 
     pub const View = struct {
         cluster: u128,
@@ -199,6 +220,13 @@ pub fn parse_args(flags: *stdx.Flags) Command {
             .listen = listen_parse(view.listen) orelse
                 vsr.fatal(.cli, "view: --listen must be <ipv4>:<port>", .{}),
             .log_debug = view.log_debug,
+        } },
+        .api => |api| .{ .api = .{
+            .cluster = api.cluster,
+            .addresses = api.addresses,
+            .listen = listen_parse(api.listen) orelse
+                vsr.fatal(.cli, "api: --listen must be <ipv4>:<port>", .{}),
+            .log_debug = api.log_debug,
         } },
         .version => .version,
     };
