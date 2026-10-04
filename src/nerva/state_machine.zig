@@ -515,7 +515,11 @@ pub fn StateMachineType(comptime Storage: type) type {
             while (body_decoder.pop()) |batch| {
                 batch_timestamp += prepare_delta(operation, batch);
                 const bytes_written: usize = switch (operation) {
-                    .lookup_rows => self.execute_lookup_rows(batch, reply_encoder.writable().?),
+                    .lookup_rows => self.execute_lookup_rows(
+                        op,
+                        batch,
+                        reply_encoder.writable().?,
+                    ),
                     .commit => self.execute_commit(
                         op,
                         batch_timestamp,
@@ -531,7 +535,12 @@ pub fn StateMachineType(comptime Storage: type) type {
             return reply_encoder.finish();
         }
 
-        fn execute_lookup_rows(self: *StateMachine, batch: []const u8, output: []u8) usize {
+        fn execute_lookup_rows(
+            self: *StateMachine,
+            op: u64,
+            batch: []const u8,
+            output: []u8,
+        ) usize {
             const keys = stdx.bytes_as_slice(.exact, RowKey, batch);
             const results = stdx.bytes_as_slice(.inexact, RowValue, output)[0..keys.len];
 
@@ -541,6 +550,7 @@ pub fn StateMachineType(comptime Storage: type) type {
                     .table = key.table,
                     .flags = .{},
                     .op = 0,
+                    .op_read = op,
                     .value = @splat(0),
                 };
                 if (key.table == 0 or key.reserved != 0) continue;

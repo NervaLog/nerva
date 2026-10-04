@@ -114,7 +114,26 @@ LEDGER_KEY=secret ./zig-out/bin/nerva ledgerd --cluster=0 --addresses=3001,3002,
 ```
 
 `zig build test:ledgerd` checks it against `ledgerd.py` request by request (byte-identical
-replies, scripted scenarios plus a seeded fuzzer) and races two gateways on one ledger.
+replies, scripted scenarios plus a seeded fuzzer), races two gateways on one ledger, and checks
+the views below against `ledgerd.py`'s own files.
+
+## Views
+
+`nerva view` follows the change feed and serves derived views of every ledgerd ledger, each
+reply stamped with the op it reflects:
+
+```bash
+LEDGER_KEY=secret ./zig-out/bin/nerva view --cluster=0 --addresses=3001,3002,3003 \
+    --listen=127.0.0.1:8091
+curl -H 'X-Ledger-Key: secret' 'http://127.0.0.1:8091/v1/views/1/spend?min_op=latest'
+```
+
+- `journal`: the ledger's journal lines in commit order.
+- `spend`: Botpike's agent spend rollup (own and subtree spend, settled and denied counts,
+  depth) over the agent tree in the runtime's request ids.
+
+`min_op=<n>` waits until the view has applied op `n` (read-your-writes); `min_op=latest` first
+reads the feed to its end. Views live in memory and are rebuilt from the feed on restart.
 Decisions and their reasons: [docs/DECISIONS.md](./docs/DECISIONS.md).
 
 ## Roadmap
@@ -126,7 +145,8 @@ The 1.0 target, with Botpike as first customer, is in [docs/GOALS-1.0.md](./docs
    workload with a model checker. ✅
 3. **Server and client protocol** — `nerva format` / `nerva start`, a Zig client, and
    `nerva ledgerd` serving the Botpike runtime's ledger protocol. ✅
-4. **First derived view** — one incremental view, a watermark, and reads at a position.
+4. **First derived view** — one incremental view, a watermark, and reads at a position. ✅
+   (`nerva view`: `journal` and `spend` over ledgerd ledgers.)
 5. **Snapshots and subscriptions** — reads as of op `N`; change cursors.
 6. **Object storage tiering**, external operators, effect sinks.
 

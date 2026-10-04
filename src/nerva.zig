@@ -136,7 +136,8 @@ pub const RowValue = extern struct {
     /// The row's version: zero if it has never existed, else the op of its last write
     /// (including a delete). Use it as `Entry.op_seen`.
     op: u64,
-    reserved_a: u64 = 0,
+    /// The op at which this lookup executed: the result reflects every commit before it (G2).
+    op_read: u64,
     /// Zero unless `flags.exists`.
     value: [value_size]u8,
     reserved_b: [16]u8 = @splat(0),

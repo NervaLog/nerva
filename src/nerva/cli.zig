@@ -46,6 +46,13 @@ const CLIArgs = union(enum) {
         log_debug: bool = false,
     },
 
+    view: struct {
+        cluster: u128,
+        addresses: vsr.ClusterAddress,
+        listen: []const u8,
+        log_debug: bool = false,
+    },
+
     version: struct {},
 
     pub const help =
@@ -62,6 +69,9 @@ const CLIArgs = union(enum) {
         \\  nerva ledgerd --cluster=<integer> --addresses=<addresses> --ledger=<integer>
         \\                --listen=<host:port> [--log-debug]
         \\
+        \\  nerva view --cluster=<integer> --addresses=<addresses> --listen=<host:port>
+        \\             [--log-debug]
+        \\
         \\  nerva version
         \\
         \\Commands:
@@ -72,6 +82,9 @@ const CLIArgs = union(enum) {
         \\
         \\  ledgerd  Serve the Botpike runtime's ledger protocol from the cluster at
         \\           <addresses>. The key is read from the LEDGER_KEY environment variable.
+        \\
+        \\  view     Follow the cluster's change feed and serve the ledgerd views
+        \\           (journal, spend). The key is read from LEDGER_KEY.
         \\
         \\  version  Print the version.
         \\
@@ -114,7 +127,15 @@ pub const Command = union(enum) {
     format: Format,
     start: Start,
     ledgerd: Ledgerd,
+    view: View,
     version,
+
+    pub const View = struct {
+        cluster: u128,
+        addresses: vsr.ClusterAddress,
+        listen: std.net.Address,
+        log_debug: bool,
+    };
 
     pub const Ledgerd = struct {
         cluster: u128,
@@ -171,6 +192,13 @@ pub fn parse_args(flags: *stdx.Flags) Command {
             .listen = listen_parse(ledgerd.listen) orelse
                 vsr.fatal(.cli, "ledgerd: --listen must be <ipv4>:<port>", .{}),
             .log_debug = ledgerd.log_debug,
+        } },
+        .view => |view| .{ .view = .{
+            .cluster = view.cluster,
+            .addresses = view.addresses,
+            .listen = listen_parse(view.listen) orelse
+                vsr.fatal(.cli, "view: --listen must be <ipv4>:<port>", .{}),
+            .log_debug = view.log_debug,
         } },
         .version => .version,
     };

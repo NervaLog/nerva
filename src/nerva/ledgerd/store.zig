@@ -31,14 +31,18 @@ pub const table_roots: u32 = 1001;
 pub const value_size_max = 64 * 1024;
 pub const key_size_max = 1024;
 
-const Header = extern struct {
+/// Chunk 0's header. Ledger and generation let a view attribute the row (N25).
+pub const Header = extern struct {
+    ledger: u64,
+    generation: u64,
     key_size: u16,
     reserved: u16 = 0,
     /// Key plus value.
     payload_size: u32,
 
     comptime {
-        assert(@sizeOf(Header) == 8);
+        assert(@sizeOf(Header) == 24);
+        assert(stdx.no_padding(Header));
     }
 };
 
@@ -51,7 +55,25 @@ pub fn chunk_count(key_size: usize, value_size_: usize) u32 {
     return @intCast(1 + stdx.div_ceil(payload - chunk0_payload, value_size));
 }
 
-/// The row id of `chunk` of `key` (N13): the first 8 bytes of SHA-256, little-endian.
+/// The row id of chunk `chunk` of `key`: chunk 0 from the key (N13), later chunks from chunk 0's
+/// id, so that a reader holding only chunk 0 can find the rest (N25).
+pub fn chunk_id(ledger: u64, generation: u64, key: []const u8, chunk: u32) u64 {
+    const id0 = row_id(ledger, generation, key, 0);
+    return if (chunk == 0) id0 else tail_id(id0, chunk);
+}
+
+/// The id of tail chunk `chunk` (≥ 1) of the value whose chunk 0 has id `id0`.
+pub fn tail_id(id0: u64, chunk: u32) u64 {
+    assert(chunk > 0);
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("nerva.ledgerd.tail.v1");
+    hash.update(std.mem.asBytes(&std.mem.nativeToLittle(u64, id0)));
+    hash.update(std.mem.asBytes(&std.mem.nativeToLittle(u32, chunk)));
+    const digest = hash.finalResult();
+    return std.mem.readInt(u64, digest[0..8], .little);
+}
+
+/// The id of chunk 0 of `key` (N13): the first 8 bytes of SHA-256, little-endian.
 pub fn row_id(ledger: u64, generation: u64, key: []const u8, chunk: u32) u64 {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     hash.update("nerva.ledgerd.v1");
@@ -67,6 +89,8 @@ pub fn row_id(ledger: u64, generation: u64, key: []const u8, chunk: u32) u64 {
 /// Splits `key` and `value` into row values: chunk 0 first.
 pub fn chunks_encode(
     arena: std.mem.Allocator,
+    ledger: u64,
+    generation: u64,
     key: []const u8,
     value: []const u8,
 ) error{OutOfMemory}![]const [value_size]u8 {
@@ -77,6 +101,8 @@ pub fn chunks_encode(
     for (chunks) |*chunk| chunk.* = @splat(0);
 
     const header: Header = .{
+        .ledger = ledger,
+        .generation = generation,
         .key_size = @intCast(key.len),
         .payload_size = @intCast(key.len + value.len),
     };
@@ -102,7 +128,12 @@ pub fn chunks_encode(
     return chunks;
 }
 
-pub const Decoded = struct { key: []const u8, value: []const u8 };
+pub const Decoded = struct {
+    ledger: u64,
+    generation: u64,
+    key: []const u8,
+    value: []const u8,
+};
 
 /// Reassembles chunks written by `chunks_encode`. `chunks` must hold `chunk_count` rows.
 pub fn chunks_decode(
@@ -125,7 +156,12 @@ pub fn chunks_decode(
         written += size;
     }
     assert(written == payload.len);
-    return .{ .key = payload[0..header.key_size], .value = payload[header.key_size..] };
+    return .{
+        .ledger = header.ledger,
+        .generation = header.generation,
+        .key = payload[0..header.key_size],
+        .value = payload[header.key_size..],
+    };
 }
 
 /// Chunk 0's header: how many rows the value occupies.
@@ -188,7 +224,7 @@ pub const Store = struct {
                 const keys = try store.arena.alloc(RowKey, count - 1);
                 for (keys, 1..) |*row_key, chunk| {
                     row_key.* = .{
-                        .id = row_id(store.ledger, store.generation, key, @intCast(chunk)),
+                        .id = chunk_id(store.ledger, store.generation, key, @intCast(chunk)),
                         .table = table_rows,
                     };
                 }
@@ -201,7 +237,10 @@ pub const Store = struct {
                 }
             }
             const decoded = try chunks_decode(store.arena, chunks);
-            if (!std.mem.eql(u8, decoded.key, key)) return error.Corrupt; // A hash collision.
+            // A hash collision, or a row of another ledger or generation.
+            if (!std.mem.eql(u8, decoded.key, key)) return error.Corrupt;
+            if (decoded.ledger != store.ledger) return error.Corrupt;
+            if (decoded.generation != store.generation) return error.Corrupt;
             break :value decoded.value;
         };
         try store.cache.put(store.arena, try store.arena.dupe(u8, key), value);
@@ -210,10 +249,10 @@ pub const Store = struct {
 
     pub fn put(store: *Store, key: []const u8, value: []const u8) Error!void {
         if (key.len > key_size_max or value.len > value_size_max) return error.TooLarge;
-        const chunks = try chunks_encode(store.arena, key, value);
+        const chunks = try chunks_encode(store.arena, store.ledger, store.generation, key, value);
         for (chunks, 0..) |*chunk, index| {
             try store.write(.{
-                .id = row_id(store.ledger, store.generation, key, @intCast(index)),
+                .id = chunk_id(store.ledger, store.generation, key, @intCast(index)),
                 .table = table_rows,
                 .kind = .put,
                 .op_seen = 0,
@@ -343,10 +382,14 @@ test "ledgerd store: chunks round-trip" {
         const value = try arena.alloc(u8, random.intRangeAtMost(usize, 0, 3000));
         random.bytes(value);
 
-        const chunks = try chunks_encode(arena, key, value);
+        const ledger = random.int(u64);
+        const generation = random.int(u64);
+        const chunks = try chunks_encode(arena, ledger, generation, key, value);
         try testing.expectEqual(chunk_count(key.len, value.len), chunks.len);
         try testing.expectEqual(@as(u32, @intCast(chunks.len)), try chunk0_count(&chunks[0]));
         const decoded = try chunks_decode(arena, chunks);
+        try testing.expectEqual(ledger, decoded.ledger);
+        try testing.expectEqual(generation, decoded.generation);
         try testing.expectEqualSlices(u8, key, decoded.key);
         try testing.expectEqualSlices(u8, value, decoded.value);
     }
@@ -367,4 +410,7 @@ test "ledgerd store: row ids are stable and separate keys, chunks and generation
     try testing.expect(row_id(7, 0, "available", 0) != row_id(7, 1, "available", 0));
     try testing.expect(row_id(7, 0, "available", 0) != row_id(8, 0, "available", 0));
     try testing.expect(row_id(7, 0, "ab", 0) != row_id(7, 0, "a", 0));
+    try testing.expectEqual(row_id(7, 0, "available", 0), chunk_id(7, 0, "available", 0));
+    try testing.expectEqual(tail_id(row_id(7, 0, "k", 0), 3), chunk_id(7, 0, "k", 3));
+    try testing.expect(chunk_id(7, 0, "k", 1) != chunk_id(7, 0, "k", 2));
 }

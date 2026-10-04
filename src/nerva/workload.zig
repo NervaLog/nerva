@@ -575,6 +575,7 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                 .element_size = @sizeOf(RowValue),
             }) catch unreachable;
 
+            var op_read: ?u64 = null;
             while (request.pop()) |batch| {
                 const keys = stdx.bytes_as_slice(.exact, RowKey, batch);
                 const results = stdx.bytes_as_slice(.exact, RowValue, reply.pop().?);
@@ -582,7 +583,11 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                 for (keys, results) |*key, *result| {
                     assert(result.id == key.id);
                     assert(result.table == key.table);
-                    assert(stdx.zeroed(std.mem.asBytes(&result.reserved_a)));
+                    // Every result of one request was read at the same op, after every op
+                    // checked so far (G2).
+                    if (op_read) |op| assert(result.op_read == op);
+                    assert(result.op_read > workload.op_max);
+                    op_read = result.op_read;
                     assert(stdx.zeroed(&result.reserved_b));
                     const expected: Version = if (key.table == 0 or key.reserved != 0)
                         .{ .op = 0, .exists = false, .value = @splat(0) }
@@ -594,6 +599,7 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                 }
             }
             assert(reply.pop() == null);
+            if (op_read) |op| workload.op_max = op;
         }
 
         fn check_get_changes(

@@ -104,3 +104,21 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
 - Verified: conformance 5 seeds × 2,000 fuzzed requests byte-identical; race passes repeatedly
   (8 and 16 threads); harness mutation-tested (a one-space journal change is caught);
   `test:unit` 284/285 (sandbox perf test); `test:integration` passes.
+
+## 2026-10-04 — 1.0 Milestone 3: positioned reads and the first views
+
+- Core: `RowValue.op_read`, the op a lookup executed at (G2); the VOPR checker asserts it is
+  shared by a request's results and increases with op order.
+- ledgerd rows: chunk 0 records ledger and generation; tail chunk ids derive from chunk 0's id,
+  so a view holding only rows can reassemble values (N25).
+- `src/nerva/view/`: a feed follower (pages `get_changes`, groups by op, applies complete ops,
+  keeps a watermark), the ledgerd views (`journal` in commit order; `spend`, Botpike's agent
+  spend rollup over runtime request ids), and `nerva view` (HTTP, `min_op=<n|latest>`, 504 if
+  not reached in 10 s).
+- `tests/ledgerd/views.py`: journal equal to the oracle's `journal.log`, spend equal to a rollup
+  recomputed from the oracle's `ledger.txt`, same answers after a view restart, 504 past the
+  watermark. Mutation-tested (dropping denied counts is caught).
+- Decisions N21–N26 in docs/DECISIONS.md.
+- Verified: `test:unit` 287/288 (sandbox perf test); `test:integration`; `test:ledgerd`
+  (conformance, race, views); views over seeds 1–4; VOPR seeds 1, 2, 5 replay with identical
+  tick counts.

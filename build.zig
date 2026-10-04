@@ -233,7 +233,7 @@ pub fn build(b: *std.Build) !void {
     steps.test_integration.dependOn(&run_integration_tests.step);
 
     // zig build test:ledgerd: differential and race tests against the runtime's ledgerd.py.
-    for ([_][]const u8{ "conformance.py", "race.py" }) |script| {
+    for ([_][]const u8{ "conformance.py", "race.py", "views.py" }) |script| {
         const run_script = b.addSystemCommand(&.{
             "python3",
             b.fmt("tests/ledgerd/{s}", .{script}),

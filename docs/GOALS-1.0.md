@@ -90,8 +90,12 @@ arrangement either way.
      `zig build test:ledgerd`: byte-identical to `ledgerd.py` over ~10k scripted and fuzzed
      requests, and two gateways racing on one ledger conserve money and claim each sequence
      number once. Not yet run against the runtime's Unison scenarios (no `ucm` in this sandbox).
-3. **Positioned reads and the first view** (G2, G4): Botpike's spend rollup maintained from the
+3. ✅ **Positioned reads and the first view** (G2, G4): Botpike's spend rollup maintained from the
    change feed, read at a position.
+   `lookup_rows` results carry `op_read`; `nerva view` serves `journal` and `spend` (Botpike's
+   agent rollup over runtime request ids) with `min_op` waits, checked against `ledgerd.py`'s
+   own files (DECISIONS N21–N26).
+
 4. **As-of reads and workflow state** (G6, G7).
 5. **Effect sinks** (G5) and **conditional operations for hot balances** (G8).
 6. **Botpike integration**: facts, receipts and views on Nerva, balances per the G8 decision.

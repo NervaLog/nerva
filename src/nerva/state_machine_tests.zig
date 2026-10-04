@@ -216,6 +216,7 @@ test "commit: blind put, then lookup" {
     const row = try context.lookup(1, 10);
     try testing.expect(row.flags.exists);
     try testing.expectEqual(op_commit, row.op);
+    try testing.expectEqual(op_commit + 1, row.op_read); // The lookup's own op.
     try testing.expectEqual(value(0xaa), row.value);
 
     const missing = try context.lookup(1, 11);

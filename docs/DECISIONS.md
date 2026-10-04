@@ -131,3 +131,46 @@ Also found by the race test: immediate retries let two gateways keep colliding. 
 1..min(2^attempt, 64) ms. A 503 is safe: the runtime treats it as a crash and every route is
 safe to repeat (runtime README). Contention on the shared balance (`available`) remains
 inherent to one budget; that is G8's problem, not the gateway's.
+
+## Milestone 3: positioned reads and the first views
+
+**N21. `lookup_rows` results carry the op they were read at (`RowValue.op_read`).**
+G2: every read names its position. The field replaces `reserved_a` (same size and offset), so
+the wire format grows no larger. `get_changes` already carries its op in the `end` record.
+
+**N22. Views run in a separate process, `nerva view`, that follows the change feed.**
+As in the white paper: the core only commits; a view process pages through `get_changes`,
+groups changes by op, applies complete ops, and keeps a watermark (the op through which it is
+complete). v0.1 state is in memory and rebuilt from the start of the feed on restart. Cost:
+restart time grows with history until views snapshot (later).
+
+**N23. View reads wait for a position: `min_op=<n>` or `min_op=latest`.**
+A reader that knows the op of its write passes it and gets read-your-writes. A reader that does
+not (the runtime never sees ops) passes `latest`: the view first pages the feed to its end,
+which reaches past every write committed before the read began. Every reply starts `op=<n>`,
+the watermark it reflects (G2). A wait that does not reach the position within 10 s answers
+504. The wire style is the ledger protocol's: `key=value` lines, `X-Ledger-Key`, `ok=true`.
+
+**N24. (assumed) The first views are over `nerva ledgerd` ledgers: `journal` and `spend`.**
+GOALS-1.0 Milestone 3 names "Botpike's spend rollup". Botpike's own rollup
+(`Botpike/app`, `modules/delegation`, `agent_spend_rollup`) gives per agent: own spend, subtree
+spend, admitted and rejected counts, and depth in the agent tree. The runtime ledger carries the
+same tree in its request ids (runtime D6: `agent:sequence:step`, `/child:step` per sub-agent),
+so `spend` applies Botpike's definition to it: own = sum of settled `done.` amounts whose request
+id's agent path is that agent's, subtree = own plus descendants', settled and denied counts,
+depth. `journal` is the ledger's journal lines in commit order, which N19 left to the change
+feed. Botpike's production rollup stays in PostgreSQL (N7); these are the first real consumers
+of the view machinery, chosen because they can be checked against `ledgerd.py`.
+
+**N25. A ledgerd row's chunk 0 records its ledger and generation.**
+A view sees only rows; to attribute a row to a ledger, and to recompute its tail chunks' ids,
+it needs both. The header grows from 8 to 24 bytes (chunk 0 carries 56 bytes of key and value
+instead of 72). Tail chunks' ids now derive from chunk 0's id rather than from the key: a view
+holding chunk 0 of a long key could not otherwise find the chunks that hold the rest of the key.
+Changed now because no ledgerd data has been deployed.
+
+**N26. Views are checked against `ledgerd.py`'s files.**
+After driving both services with the same requests, the `journal` view must equal the oracle's
+`journal.log` line for line, and the `spend` view must equal the rollup recomputed independently
+from the oracle's `ledger.txt` (`done.` and `denied.` lines). A restarted view process must give
+the same answers.
