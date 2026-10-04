@@ -67,9 +67,9 @@ jobs:
       - name: Install the pinned Zig
         run: ./zig/download.sh
 
-      # Every target is cross-compiled from Linux. The binary reports `0.0.1+<commit>`: `0.0.1`
-      # is the data file and protocol release, changed deliberately (N32); VERSION names the
-      # release.
+      # Every target is cross-compiled from Linux. The binary reports `<protocol>+<commit>`: the
+      # protocol is the data file and protocol release (`release` in build.zig), changed
+      # deliberately (N32, N43); VERSION names the release.
       - name: Build
         run: |
           mkdir dist
@@ -87,6 +87,7 @@ jobs:
           tar -xzf "dist/nerva-$TAG-x86_64-linux.tar.gz"
           "./nerva-$TAG-x86_64-linux/nerva" version | tee version.txt
           grep -q "+$(git rev-parse --short=7 HEAD)" version.txt
+          echo "BINARY_VERSION=$(sed 's/^Nerva version //' version.txt)" >> "$GITHUB_ENV"
 
       # Creates the tag on exactly this commit, then the release.
       - name: Publish
@@ -97,4 +98,4 @@ jobs:
           case "$TAG" in *-*) prerelease=(--prerelease) ;; esac
           gh release create "$TAG" dist/* "${prerelease[@]}" --target "$GITHUB_SHA" \
             --title "Nerva $TAG" \
-            --notes "Nerva at commit $GITHUB_SHA. Binaries report \`0.0.1+${GITHUB_SHA:0:7}\`. Changes: WORKLOG.md. Check downloads against SHA256SUMS."
+            --notes "Nerva at commit $GITHUB_SHA. Binaries report \`$BINARY_VERSION\`. Changes: WORKLOG.md. Check downloads against SHA256SUMS."

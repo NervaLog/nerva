@@ -9,8 +9,8 @@ const VoprStateMachine = enum { nerva, testing };
 const VoprLog = enum { short, full };
 
 // Nerva has no client releases yet; every build is "the" release.
-const release = "0.0.1";
-const release_client_min = "0.0.1";
+const release = "0.0.2";
+const release_client_min = "0.0.2";
 
 const zig_version = std.SemanticVersion{
     .major = 0,
@@ -234,10 +234,10 @@ pub fn build(b: *std.Build) !void {
     run_integration_tests.has_side_effects = true; // Never cache: it runs real processes.
     steps.test_integration.dependOn(&run_integration_tests.step);
 
-    // zig build test:api: the JSON API, then its documents, against models (one after the
+    // zig build test:api: the JSON API, its documents, then adds, against models (one after the
     // other: each runs a cluster).
     var api_previous: ?*std.Build.Step = null;
-    for ([_][]const u8{ "api.py", "documents.py" }) |script| {
+    for ([_][]const u8{ "api.py", "documents.py", "adds.py" }) |script| {
         const run_api_test = b.addSystemCommand(&.{ "python3", b.fmt("tests/api/{s}", .{script}) });
         run_api_test.addFileArg(nerva.getEmittedBin());
         if (b.args) |args| run_api_test.addArgs(args);

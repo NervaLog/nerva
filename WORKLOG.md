@@ -232,3 +232,26 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
   two namespaces against a model, reads latest and as of, feeds with small pages, limits, and
   an eight-thread counter race on one document. Mutation-tested: reading tail chunks without
   checking their version, and pages that split an op, both fail it.
+
+## 2026-10-04 — Adds: conditional operations for hot rows (N42)
+
+- `src/nerva.zig`: `EntryKind.add`, `Add` (parameters in the entry's value), `add_amount` and
+  `add_apply` (the shared arithmetic), four new statuses, and a 32-byte `EntryResult` with
+  `applied` and `value`.
+- `src/nerva/state_machine.zig`: adds are resolved in entry order against the rows and the
+  transaction's earlier adds (a preallocated scratch map, looked up only), then applied as puts
+  of the whole row. Several adds may share a row; `delta_from` is checked statically.
+- Fixed: a write that leaves a row's bytes unchanged within one op (two identical puts in one
+  request, or an add of nothing) crashed the groove; it now skips the update. Regression test.
+- `nerva api`: `"kind": "add"` by field name or offset and type; replies list each add's
+  `applied` and `value`; `409` for `out_of_bounds` and `row_absent`.
+- VOPR workload: random adds in the model, and hot budgets with an independent conservation
+  check. `tests/api/adds.py` (in `test:api`): fifty threads reserving and releasing on one
+  budget, never retried. Mutation-tested: a clamp that under-takes and a `delta_from` that
+  does not negate both fail the tests.
+- Open for the owner: whether to bump the release string for the protocol change (N42).
+- Release string `0.0.2` (N43, owner's decision): replicas refuse older clients; v0.1.0 data
+  files (superblock version 0, TigerBeetle's development format for `0.0.1`) must be
+  reformatted. Golden format checksum updated for that reason only. Release notes take the
+  binary's version from the binary.
+- CLAUDE.md: every pre-existing bug found gets a GitHub issue (#4, #5 filed).
