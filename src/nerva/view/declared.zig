@@ -127,16 +127,18 @@ pub const DeclaredViews = struct {
         const decoded = documents.chunks_decode(arena, chunks) catch return;
         // A tail chunk can look like a header; only a true chunk 0 hashes back to its own id.
         if (documents.row_id(decoded.namespace, decoded.key) != id) return;
+        // The catalog never deletes; a tombstone is not a declaration.
+        const value = decoded.value orelse return;
 
         if (std.mem.startsWith(u8, decoded.key, "table.")) {
             const table = std.fmt.parseInt(u32, decoded.key["table.".len..], 10) catch return;
-            const layout = catalog.layout_parse(arena, decoded.value) catch |err| switch (err) {
+            const layout = catalog.layout_parse(arena, value) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.Invalid => return log.warn("{s}: invalid layout", .{decoded.key}),
             };
             try views.layouts.put(views.allocator, table, layout);
         } else if (std.mem.startsWith(u8, decoded.key, "view.")) {
-            const view = catalog.view_parse(arena, decoded.value) catch |err| switch (err) {
+            const view = catalog.view_parse(arena, value) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.Invalid => return log.warn("{s}: invalid view", .{decoded.key}),
             };

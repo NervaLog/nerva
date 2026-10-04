@@ -20,6 +20,8 @@ const value_size = nerva.value_size;
 pub const tables_reserved_min: u32 = 0xFFFF_0000;
 /// Catalog documents (`documents.zig`, namespace 0), keyed `table.<id>` and `view.<name>`.
 pub const table_catalog: u32 = 0xFFFF_0001;
+/// Applications' documents (`documents.zig`, any namespace), through `/v1/documents/*` (N41).
+pub const table_documents: u32 = 0xFFFF_0002;
 
 pub const fields_max = 16;
 pub const name_size_max = 32;
