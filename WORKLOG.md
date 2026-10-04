@@ -250,3 +250,8 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
   budget, never retried. Mutation-tested: a clamp that under-takes and a `delta_from` that
   does not negate both fail the tests.
 - Open for the owner: whether to bump the release string for the protocol change (N42).
+- Release string `0.0.2` (N43, owner's decision): replicas refuse older clients; v0.1.0 data
+  files (superblock version 0, TigerBeetle's development format for `0.0.1`) must be
+  reformatted. Golden format checksum updated for that reason only. Release notes take the
+  binary's version from the binary.
+- CLAUDE.md: every pre-existing bug found gets a GitHub issue (#4, #5 filed).

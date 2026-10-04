@@ -457,7 +457,7 @@ test "format" {
     // This doesn't match the output from `tigerbeetle format ...` since the testing storage / slot
     // counts are lower.
     try std.testing.expectEqual(
-        234838825150141811691318382366967529672,
+        339529914272821912685300045374558551362,
         vsr.checksum(storage.memory),
     );
 }
