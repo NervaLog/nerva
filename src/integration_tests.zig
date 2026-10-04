@@ -50,6 +50,8 @@ const Cluster = struct {
     addresses_flag: []const u8,
     addresses: [replica_count]stdx.SocketAddress,
     processes: [replica_count]?std.process.Child,
+    /// Replica 0 sends its metrics here (`--statsd`).
+    statsd: StatsdListener,
 
     fn init() !*Cluster {
         const cluster = try gpa.create(Cluster);
@@ -76,12 +78,16 @@ const Cluster = struct {
         );
         errdefer gpa.free(addresses_flag);
 
+        var statsd = try StatsdListener.init();
+        errdefer statsd.deinit();
+
         cluster.* = .{
             .gpa = gpa,
             .tmp_path = tmp_path,
             .addresses_flag = addresses_flag,
             .addresses = undefined,
             .processes = @splat(null),
+            .statsd = statsd,
         };
         const parsed = try vsr.parse_addresses(addresses_flag, &cluster.addresses);
         assert(parsed.len == replica_count);
@@ -93,6 +99,7 @@ const Cluster = struct {
 
     fn deinit(cluster: *Cluster) void {
         for (0..replica_count) |replica| cluster.stop(@intCast(replica));
+        cluster.statsd.deinit();
         cluster.gpa.free(cluster.addresses_flag);
         std.fs.deleteTreeAbsolute(cluster.tmp_path) catch {};
         cluster.gpa.free(cluster.tmp_path);
@@ -101,6 +108,12 @@ const Cluster = struct {
 
     fn data_file(cluster: *const Cluster, buffer: []u8, replica: u8) []const u8 {
         return std.fmt.bufPrint(buffer, "{s}/0_{}.nerva", .{ cluster.tmp_path, replica }) catch
+            unreachable;
+    }
+
+    /// Replica 1 writes its span trace here (`--trace`).
+    fn trace_file(cluster: *const Cluster, buffer: []u8) []const u8 {
+        return std.fmt.bufPrint(buffer, "{s}/trace_1.json", .{cluster.tmp_path}) catch
             unreachable;
     }
 
@@ -131,13 +144,29 @@ const Cluster = struct {
         assert(cluster.processes[replica] == null);
         var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
         var addresses_buffer: [256]u8 = undefined;
-        var process = std.process.Child.init(&.{
-            nerva_exe,
-            "start",
-            try std.fmt.bufPrint(&addresses_buffer, "--addresses={s}", .{cluster.addresses_flag}),
-            "--development",
-            cluster.data_file(&path_buffer, replica),
-        }, cluster.gpa);
+        var trace_buffer: [std.fs.max_path_bytes]u8 = undefined;
+        var observe_buffer: [std.fs.max_path_bytes + 16]u8 = undefined;
+        var argv: stdx.BoundedArrayType([]const u8, 6) = .{};
+        argv.push(nerva_exe);
+        argv.push("start");
+        argv.push(try std.fmt.bufPrint(
+            &addresses_buffer,
+            "--addresses={s}",
+            .{cluster.addresses_flag},
+        ));
+        argv.push("--development");
+        // Replica 0 sends metrics and replica 1 writes a trace; replica 2 does neither.
+        switch (replica) {
+            0 => argv.push(try std.fmt.bufPrint(&observe_buffer, "--statsd=127.0.0.1:{}", .{
+                cluster.statsd.port,
+            })),
+            1 => argv.push(try std.fmt.bufPrint(&observe_buffer, "--trace={s}", .{
+                cluster.trace_file(&trace_buffer),
+            })),
+            else => {},
+        }
+        argv.push(cluster.data_file(&path_buffer, replica));
+        var process = std.process.Child.init(argv.const_slice(), cluster.gpa);
         process.stdin_behavior = .Ignore;
         process.stdout_behavior = .Ignore;
         process.stderr_behavior = .Ignore;
@@ -166,6 +195,63 @@ const Cluster = struct {
     fn client_deinit(cluster: *Cluster, client_: *Client) void {
         client_.deinit();
         cluster.gpa.destroy(client_);
+    }
+};
+
+/// A UDP socket that collects statsd packets from a replica.
+const StatsdListener = struct {
+    socket: std.posix.socket_t,
+    port: u16,
+
+    /// Replicas emit metrics every 10 s; allow for one full interval plus slack.
+    const wait_max = stdx.Duration.seconds(15);
+
+    fn init() !StatsdListener {
+        const socket = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.DGRAM, 0);
+        errdefer std.posix.close(socket);
+
+        var address = try std.net.Address.parseIp4("127.0.0.1", 0);
+        try std.posix.bind(socket, &address.any, address.getOsSockLen());
+        var address_length = address.getOsSockLen();
+        try std.posix.getsockname(socket, &address.any, &address_length);
+
+        // A receive wakes at least once a second, so the deadline below is checked.
+        const receive_timeout: std.posix.timeval = .{ .sec = 1, .usec = 0 };
+        try std.posix.setsockopt(
+            socket,
+            std.posix.SOL.SOCKET,
+            std.posix.SO.RCVTIMEO,
+            std.mem.asBytes(&receive_timeout),
+        );
+        return .{ .socket = socket, .port = address.getPort() };
+    }
+
+    fn deinit(listener: *StatsdListener) void {
+        std.posix.close(listener.socket);
+        listener.* = undefined;
+    }
+
+    /// Waits until every needle has appeared in some received packet.
+    fn expect_metrics(listener: *StatsdListener, needles: []const []const u8) !void {
+        assert(needles.len > 0);
+        assert(needles.len <= 8);
+        var found: [8]bool = @splat(false);
+        var timer = try std.time.Timer.start();
+        var packet: [2048]u8 = undefined;
+        while (timer.read() < wait_max.ns) {
+            const size = std.posix.recv(listener.socket, &packet, 0) catch |err| switch (err) {
+                error.WouldBlock => continue,
+                else => return err,
+            };
+            for (needles, found[0..needles.len]) |needle, *seen| {
+                if (std.mem.indexOf(u8, packet[0..size], needle) != null) seen.* = true;
+            }
+            if (std.mem.allEqual(bool, found[0..needles.len], true)) return;
+        }
+        for (needles, found[0..needles.len]) |needle, seen| {
+            if (!seen) std.debug.print("statsd: never received {s}\n", .{needle});
+        }
+        return error.StatsdMetricsMissing;
     }
 };
 
@@ -278,6 +364,26 @@ fn scenario_cluster() !void {
     try expect_as_of(daemon_a, std.math.maxInt(u64), 0xbb);
     try testing.expect(op_put > 1); // Client registration commits first.
     try testing.expectEqual(null, try daemon_b.row_as_of(1, 1, op_put - 1));
+
+    // Observability: replica 0 (the primary) sends request timings and gauges over statsd, and
+    // replica 1 has written commit spans to its trace file.
+    try cluster.statsd.expect_metrics(&.{
+        "tb.replica_request_us.count:",
+        "operation:Operation.commit",
+        "tb.replica_commit_us.avg:",
+        "tb.grid_cache_hits:",
+    });
+    {
+        var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const trace = try std.fs.cwd().readFileAlloc(
+            gpa,
+            cluster.trace_file(&path_buffer),
+            64 * stdx.MiB,
+        );
+        defer gpa.free(trace);
+        try testing.expect(std.mem.startsWith(u8, trace, "[\n"));
+        try testing.expect(std.mem.indexOf(u8, trace, "\"replica_commit\"") != null);
+    }
 
     // Crash replica 2: the other two still form a quorum.
     cluster.stop(2);

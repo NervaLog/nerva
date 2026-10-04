@@ -309,3 +309,17 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
   delivers about 16,500 IOPS and 65 MiB/s, exactly Fly's documented cap for that size. Nightly
   throughput runs will be IO-capped on Fly and are judged on write amplification instead.
 - Not part of the build or CI; it needs `flyctl` and `FLY_API_TOKEN`.
+
+## 2026-10-04 — Metrics and traces from replicas (N47)
+
+- `nerva start --statsd=<host:port>` sends the replica's metrics (statsd over UDP, every 10 s)
+  and `--trace=<path>` writes its JSON span trace. `src/nerva/cli.zig` parses and validates
+  both (`statsd_parse`, `error.StatsdAddressInvalid`, `error.TracePathEmpty`);
+  `src/nerva_main.zig` hands them to the vendored tracer. No vendored file changed.
+- README: "Metrics and traces", with the metrics the performance plan reads.
+- Tests: `statsd_parse` and `start_resolve` unit tests; `test:integration` checks that replica 0's
+  statsd packets carry request, commit and cache metrics and that replica 1's trace holds commit
+  spans. Mutation-tested: without the statsd or the trace wiring, the integration test fails.
+- Verified: `check`, `test:fmt`, `test:integration`; `test:unit -Drelease` 305/306 (the
+  sandbox-denied perf test).
+
