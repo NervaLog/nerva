@@ -1,0 +1,291 @@
+//! Integration tests: a three-replica Nerva cluster of real `nerva` processes on local ports,
+//! driven through the client library.
+//!
+//! Run with `zig build test:integration`. Needs about 3.5 GiB of disk and 3 GiB of memory.
+//!
+//! An executable rather than a `zig test` binary: test binaries use the `test_min` configuration,
+//! but the client must share the production configuration of the `nerva` binary it talks to.
+
+const std = @import("std");
+const assert = std.debug.assert;
+const testing = std.testing;
+
+const stdx = @import("stdx");
+const vsr = @import("vsr.zig");
+const nerva = @import("nerva.zig");
+const Client = @import("nerva/client.zig").Client;
+const workload = @import("nerva/workload.zig");
+
+const Entry = nerva.Entry;
+const EntryResult = nerva.EntryResult;
+const RowValue = nerva.RowValue;
+const Change = nerva.Change;
+const Receipt = workload.Receipt;
+
+const nerva_exe = @import("integration_tests_options").nerva_exe;
+
+pub const tigerbeetle_config = @import("config.zig").configs.default_production;
+
+var gpa: std.mem.Allocator = undefined;
+
+pub fn main() !void {
+    var gpa_instance: std.heap.GeneralPurposeAllocator(.{}) = .init;
+    defer switch (gpa_instance.deinit()) {
+        .ok => {},
+        .leak => @panic("memory leaked"),
+    };
+    gpa = gpa_instance.allocator();
+
+    try scenario_cluster();
+    std.debug.print("integration: PASSED\n", .{});
+}
+
+const cluster_id: u128 = 0; // Test binaries refuse any other cluster id.
+const replica_count = 3;
+const timeout = stdx.Duration.seconds(60);
+
+const Cluster = struct {
+    gpa: std.mem.Allocator,
+    tmp_path: []const u8,
+    addresses_flag: []const u8,
+    addresses: [replica_count]stdx.SocketAddress,
+    processes: [replica_count]?std.process.Child,
+
+    fn init() !*Cluster {
+        const cluster = try gpa.create(Cluster);
+        errdefer gpa.destroy(cluster);
+
+        var tmp_name_buffer: [128]u8 = undefined;
+        const tmp_name = try std.fmt.bufPrint(
+            &tmp_name_buffer,
+            ".zig-cache/tmp/nerva-integration-{x}",
+            .{stdx.crypto_u128()},
+        );
+        try std.fs.cwd().makePath(tmp_name);
+        errdefer std.fs.cwd().deleteTree(tmp_name) catch {};
+        const tmp_path = try std.fs.cwd().realpathAlloc(gpa, tmp_name);
+        errdefer gpa.free(tmp_path);
+
+        // Reserve ports by binding to port 0, then release them for the replicas.
+        var ports: [replica_count]u16 = undefined;
+        for (&ports) |*port| port.* = try port_free();
+        const addresses_flag = try std.fmt.allocPrint(
+            gpa,
+            "127.0.0.1:{},127.0.0.1:{},127.0.0.1:{}",
+            .{ ports[0], ports[1], ports[2] },
+        );
+        errdefer gpa.free(addresses_flag);
+
+        cluster.* = .{
+            .gpa = gpa,
+            .tmp_path = tmp_path,
+            .addresses_flag = addresses_flag,
+            .addresses = undefined,
+            .processes = @splat(null),
+        };
+        const parsed = try vsr.parse_addresses(addresses_flag, &cluster.addresses);
+        assert(parsed.len == replica_count);
+
+        for (0..replica_count) |replica| try cluster.format(@intCast(replica));
+        for (0..replica_count) |replica| try cluster.start(@intCast(replica));
+        return cluster;
+    }
+
+    fn deinit(cluster: *Cluster) void {
+        for (0..replica_count) |replica| cluster.stop(@intCast(replica));
+        cluster.gpa.free(cluster.addresses_flag);
+        std.fs.deleteTreeAbsolute(cluster.tmp_path) catch {};
+        cluster.gpa.free(cluster.tmp_path);
+        cluster.gpa.destroy(cluster);
+    }
+
+    fn data_file(cluster: *const Cluster, buffer: []u8, replica: u8) []const u8 {
+        return std.fmt.bufPrint(buffer, "{s}/0_{}.nerva", .{ cluster.tmp_path, replica }) catch
+            unreachable;
+    }
+
+    fn format(cluster: *Cluster, replica: u8) !void {
+        var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+        var replica_buffer: [32]u8 = undefined;
+        const result = try std.process.Child.run(.{
+            .allocator = cluster.gpa,
+            .argv = &.{
+                nerva_exe,
+                "format",
+                "--cluster=0",
+                try std.fmt.bufPrint(&replica_buffer, "--replica={}", .{replica}),
+                std.fmt.comptimePrint("--replica-count={}", .{replica_count}),
+                "--development",
+                cluster.data_file(&path_buffer, replica),
+            },
+        });
+        defer cluster.gpa.free(result.stdout);
+        defer cluster.gpa.free(result.stderr);
+        if (result.term != .Exited or result.term.Exited != 0) {
+            std.debug.print("format failed: {s}\n", .{result.stderr});
+            return error.FormatFailed;
+        }
+    }
+
+    fn start(cluster: *Cluster, replica: u8) !void {
+        assert(cluster.processes[replica] == null);
+        var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+        var addresses_buffer: [256]u8 = undefined;
+        var process = std.process.Child.init(&.{
+            nerva_exe,
+            "start",
+            try std.fmt.bufPrint(&addresses_buffer, "--addresses={s}", .{cluster.addresses_flag}),
+            "--development",
+            cluster.data_file(&path_buffer, replica),
+        }, cluster.gpa);
+        process.stdin_behavior = .Ignore;
+        process.stdout_behavior = .Ignore;
+        process.stderr_behavior = .Ignore;
+        try process.spawn();
+        cluster.processes[replica] = process;
+    }
+
+    fn stop(cluster: *Cluster, replica: u8) void {
+        if (cluster.processes[replica]) |*process| {
+            _ = process.kill() catch {};
+            cluster.processes[replica] = null;
+        }
+    }
+
+    fn client(cluster: *Cluster) !*Client {
+        const result = try cluster.gpa.create(Client);
+        errdefer cluster.gpa.destroy(result);
+        try result.init(cluster.gpa, .{
+            .cluster = cluster_id,
+            .addresses = &cluster.addresses,
+            .timeout = timeout,
+        });
+        return result;
+    }
+
+    fn client_deinit(cluster: *Cluster, client_: *Client) void {
+        client_.deinit();
+        cluster.gpa.destroy(client_);
+    }
+};
+
+fn port_free() !u16 {
+    const address = try std.net.Address.parseIp4("127.0.0.1", 0);
+    var server = try address.listen(.{ .reuse_address = true });
+    defer server.deinit();
+    return server.listen_address.getPort();
+}
+
+fn value(byte: u8) [nerva.value_size]u8 {
+    return @splat(byte);
+}
+
+fn put(id: u64, byte: u8) Entry {
+    return .{ .id = id, .table = 1, .kind = .put, .op_seen = 0, .value = value(byte) };
+}
+
+fn read(id: u64, op_seen: u64) Entry {
+    return .{ .id = id, .table = 1, .kind = .read, .op_seen = op_seen, .value = @splat(0) };
+}
+
+fn lookup(client: *Client, table: u32, id: u64) !RowValue {
+    var result: [1]RowValue = undefined;
+    try client.lookup_rows(&.{.{ .id = id, .table = table }}, &result);
+    return result[0];
+}
+
+fn commit(client: *Client, entries: []const Entry) ![]const EntryResult {
+    const results = try gpa.alloc(EntryResult, entries.len);
+    try client.commit(entries, results);
+    return results;
+}
+
+fn expect_statuses(results: []const EntryResult, statuses: []const nerva.EntryStatus) !void {
+    try testing.expectEqual(statuses.len, results.len);
+    for (results, statuses) |result, status| try testing.expectEqual(status, result.status);
+}
+
+/// A three-replica cluster commits, conflicts, races and survives a crash.
+fn scenario_cluster() !void {
+    const cluster = try Cluster.init();
+    defer cluster.deinit();
+
+    const daemon_a = try cluster.client();
+    defer cluster.client_deinit(daemon_a);
+    const daemon_b = try cluster.client();
+    defer cluster.client_deinit(daemon_b);
+
+    // Blind put, then lookup.
+    const put_results = try commit(daemon_a, &.{put(1, 0xaa)});
+    defer gpa.free(put_results);
+    try expect_statuses(put_results, &.{.ok});
+    const op_put = put_results[0].op;
+    const row = try lookup(daemon_b, 1, 1);
+    try testing.expect(row.flags.exists);
+    try testing.expectEqual(op_put, row.op);
+    try testing.expectEqual(value(0xaa), row.value);
+
+    // Read at the current version commits; the same read is then stale.
+    const fresh = try commit(daemon_a, &.{ read(1, op_put), put(1, 0xbb) });
+    defer gpa.free(fresh);
+    try expect_statuses(fresh, &.{ .ok, .ok });
+    const stale = try commit(daemon_b, &.{ read(1, op_put), put(1, 0xcc) });
+    defer gpa.free(stale);
+    try expect_statuses(stale, &.{ .conflict, .aborted });
+    try testing.expectEqual(fresh[0].op, stale[0].op);
+
+    // The receipt race: both daemons see the same receipt, both claim it, one wins.
+    const receipt_before = try lookup(daemon_a, workload.receipts_table, 7);
+    try testing.expectEqual(@as(u64, 0), receipt_before.op);
+    const claim_a = workload.receipt_claim(7, receipt_before.op, 0, 1);
+    const claim_b = workload.receipt_claim(7, receipt_before.op, 0, 2);
+    const won = try commit(daemon_a, &claim_a);
+    defer gpa.free(won);
+    const lost = try commit(daemon_b, &claim_b);
+    defer gpa.free(lost);
+    try expect_statuses(won, &.{ .ok, .ok });
+    try expect_statuses(lost, &.{ .conflict, .aborted });
+    const receipt_after = try lookup(daemon_b, workload.receipts_table, 7);
+    try testing.expectEqual(@as(u64, 1), Receipt.from_value(&receipt_after.value).owner);
+
+    // The change feed, paged two at a time, reassembles every committed write.
+    var changes_all = std.ArrayList(Change).init(gpa);
+    defer changes_all.deinit();
+    var cursor: u64 = 0;
+    var buffer: [3]Change = undefined;
+    while (true) {
+        const count = try daemon_a.get_changes(.{ .timestamp_min = cursor, .limit = 2 }, &buffer);
+        try testing.expect(count >= 1);
+        const end = buffer[count - 1];
+        try testing.expectEqual(nerva.ChangeKind.end, end.kind);
+        try changes_all.appendSlice(buffer[0 .. count - 1]);
+        cursor = end.timestamp;
+        if (!end.flags.more) break;
+    }
+    try testing.expectEqual(@as(usize, 3), changes_all.items.len); // Two puts and one claim.
+    try testing.expectEqual(op_put, changes_all.items[0].op);
+    try testing.expectEqual(workload.receipts_table, changes_all.items[2].table);
+
+    // Crash replica 2: the other two still form a quorum.
+    cluster.stop(2);
+    var expected: [16]u8 = undefined;
+    for (&expected, 0..) |*byte, id| {
+        byte.* = @intCast(id + 1);
+        const results = try commit(daemon_a, &.{put(100 + id, byte.*)});
+        defer gpa.free(results);
+        try expect_statuses(results, &.{.ok});
+    }
+
+    // Restart replica 2, then crash replica 0: every commit now needs replica 2, so it must
+    // have caught up on the writes it missed.
+    try cluster.start(2);
+    cluster.stop(0);
+    for (expected, 0..) |byte, id| {
+        const row_back = try lookup(daemon_b, 1, 100 + id);
+        try testing.expect(row_back.flags.exists);
+        try testing.expectEqual(value(byte), row_back.value);
+    }
+    const after_failover = try commit(daemon_b, &.{put(200, 0xdd)});
+    defer gpa.free(after_failover);
+    try expect_statuses(after_failover, &.{.ok});
+}

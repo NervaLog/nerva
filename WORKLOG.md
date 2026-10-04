@@ -63,3 +63,24 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
 - Verified: `test:unit` 274/275 (only the sandbox-denied perf test fails); `test:fmt` passes;
   VOPR passes seeds 1–9 and 42 with 215 claims won and 474 lost in total (seed 5: 3.49M ticks).
 - Marked G3 demonstrated and Milestone 1 done in `docs/GOALS-1.0.md`.
+
+## 2026-10-04 — 1.0 Milestone 2a: server binary and Zig client
+
+- `src/nerva_main.zig`: the `nerva` binary (`format`, `start`, `version`), trimmed from
+  TigerBeetle's `main.zig`; single release, no AOF. `--addresses=0` prints an ephemeral port and
+  exits when stdin closes.
+- `src/nerva/cli.zig`: arguments via the vendored `stdx.Flags`; validation in pure functions
+  (`format_validate`, `start_resolve`) with unit tests.
+- `src/nerva/client.zig`: a blocking client over the vendored VSR client — `lookup_rows`,
+  `commit`, `get_changes`; all memory allocated in `init`; `Evicted`/`Timeout`/`TooManyEvents`.
+- `src/integration_tests.zig` + `zig build test:integration`: three real replicas on local ports;
+  blind put and lookup, stale-read conflict, the receipt race between two clients, change-feed
+  paging, a replica crash, and a restart that must catch up before reads succeed. It is an
+  executable, not a `zig test`, because test binaries use the `test_min` config and the client
+  must match the server's production config (found when the client rejected the server's batch
+  size limit).
+- Docs: README (running a cluster, roadmap), CLAUDE.md, UPSTREAM.md (derived files, build.zig),
+  GOALS-1.0.md (2a done; 2b is the HTTP/JSON gateway).
+- Verified: `check`, `test:fmt` pass; `test:unit` 276/277 (only the sandbox-denied perf test
+  fails); `test:integration` passes three times in a row with no leftover processes; VOPR
+  seed 1 replays identically (91,649 ticks).

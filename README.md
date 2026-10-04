@@ -80,9 +80,26 @@ in-memory model replayed in op order.
 ./zig/zig build test          # Unit tests + format check
 ./zig/zig build vopr -- 42    # Simulate a cluster under faults with seed 42
 ./zig/zig build fuzz -- smoke # Quick pass over all fuzzers
+./zig/zig build test:integration  # Three real replicas + the client (~3.5 GiB disk, 3 GiB RAM)
+./zig/zig build               # Builds zig-out/bin/nerva
 ```
 
 Linux (io_uring) or macOS; x86_64 with AES or aarch64.
+
+## Running a cluster
+
+```bash
+# One data file per replica (cluster id 0 is reserved for test builds).
+./zig-out/bin/nerva format --cluster=0 --replica=0 --replica-count=3 0_0.nerva
+./zig-out/bin/nerva format --cluster=0 --replica=1 --replica-count=3 0_1.nerva
+./zig-out/bin/nerva format --cluster=0 --replica=2 --replica-count=3 0_2.nerva
+
+# Every replica gets every address, in replica order.
+./zig-out/bin/nerva start --addresses=3001,3002,3003 0_0.nerva   # and 0_1, 0_2
+```
+
+`--development` relaxes Direct IO and uses small caches. Clients use `src/nerva/client.zig`:
+`lookup_rows`, `commit` and `get_changes`, blocking, one request in flight per client.
 
 ## Roadmap
 
@@ -91,7 +108,8 @@ The 1.0 target, with Botpike as first customer, is in [docs/GOALS-1.0.md](./docs
 1. **Foundation** — vendored consensus + storage + simulator, placeholder state machine. ✅
 2. **Commit core** — row model, optimistic read-set validation, versioned base rows; VOPR
    workload with a model checker. ✅
-3. **Server and client protocol** — `nerva format` / `nerva start`, a minimal client.
+3. **Server and client protocol** — `nerva format` / `nerva start` and a Zig client. ✅
+   An HTTP/JSON gateway for non-Zig callers (Botpike) is next.
 4. **First derived view** — one incremental view, a watermark, and reads at a position.
 5. **Snapshots and subscriptions** — reads as of op `N`; change cursors.
 6. **Object storage tiering**, external operators, effect sinks.

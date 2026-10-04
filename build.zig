@@ -73,11 +73,13 @@ pub fn build(b: *std.Build) !void {
     ));
 
     const steps = .{
+        .run = b.step("run", "Run nerva"),
         .check = b.step("check", "Check that Nerva compiles"),
         .@"test" = b.step("test", "Run all tests"),
         .test_unit = b.step("test:unit", "Run unit tests"),
         .test_unit_build = b.step("test:unit:build", "Build unit tests"),
         .test_fmt = b.step("test:fmt", "Check formatting"),
+        .test_integration = b.step("test:integration", "Run integration tests (real processes)"),
         .vopr = b.step("vopr", "Run the VOPR"),
         .vopr_build = b.step("vopr:build", "Build the VOPR"),
         .fuzz = b.step("fuzz", "Run non-VOPR fuzzers"),
@@ -87,7 +89,11 @@ pub fn build(b: *std.Build) !void {
     const options = .{
         .config_verify = b.option(bool, "config_verify", "Enable extra assertions.") orelse
             (mode == .Debug),
-        .git_commit = b.option([]const u8, "git-commit", "The git commit of the source code.") orelse
+        .git_commit = b.option(
+            []const u8,
+            "git-commit",
+            "The git commit of the source code.",
+        ) orelse
             git_commit(b),
         .vopr_state_machine = b.option(
             VoprStateMachine,
@@ -146,6 +152,19 @@ pub fn build(b: *std.Build) !void {
     });
     steps.check.dependOn(&check.step);
 
+    // zig build, zig build run
+    const nerva = nerva_executable(b, .{
+        .stdx_module = stdx_module,
+        .vsr_options = vsr_options,
+        .target = target,
+        .mode = mode,
+    });
+    b.installArtifact(nerva);
+    const nerva_run = b.addRunArtifact(nerva);
+    if (b.args) |args| nerva_run.addArgs(args);
+    steps.run.dependOn(&nerva_run.step);
+    steps.check.dependOn(&nerva.step);
+
     // zig build test:unit
     const stdx_unit_tests = b.addTest(.{
         .name = "test-stdx",
@@ -184,6 +203,33 @@ pub fn build(b: *std.Build) !void {
     }
     steps.test_unit.dependOn(&run_stdx_unit_tests.step);
     steps.test_unit.dependOn(&run_unit_tests.step);
+
+    // zig build test:integration
+    const integration_tests_options = b.addOptions();
+    integration_tests_options.addOptionPath("nerva_exe", nerva.getEmittedBin());
+    // An executable, not a test: it must use the same (production) config as `nerva`.
+    const integration_tests = b.addExecutable(.{
+        .name = "test-integration",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/integration_tests.zig"),
+            .target = target,
+            .optimize = mode,
+        }),
+    });
+    integration_tests.root_module.addImport("stdx", stdx_module);
+    integration_tests.root_module.addImport(
+        "abi",
+        b.createModule(.{ .root_source_file = b.path("src/abi.zig") }),
+    );
+    integration_tests.root_module.addOptions("vsr_options", vsr_options_test);
+    integration_tests.root_module.addOptions(
+        "integration_tests_options",
+        integration_tests_options,
+    );
+    const run_integration_tests = b.addRunArtifact(integration_tests);
+    run_integration_tests.setCwd(b.path("."));
+    run_integration_tests.has_side_effects = true; // Never cache: it runs real processes.
+    steps.test_integration.dependOn(&run_integration_tests.step);
 
     // zig build test:fmt
     const run_fmt = b.addFmt(.{ .paths = &.{ "build.zig", "src" }, .check = true });
@@ -236,6 +282,31 @@ pub fn build(b: *std.Build) !void {
     const fuzz_run = b.addRunArtifact(fuzz);
     if (b.args) |args| fuzz_run.addArgs(args);
     steps.fuzz.dependOn(&fuzz_run.step);
+}
+
+fn nerva_executable(b: *std.Build, options: struct {
+    stdx_module: *std.Build.Module,
+    vsr_options: *std.Build.Step.Options,
+    target: std.Build.ResolvedTarget,
+    mode: std.builtin.OptimizeMode,
+}) *std.Build.Step.Compile {
+    const nerva = b.addExecutable(.{
+        .name = "nerva",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/nerva_main.zig"),
+            .target = options.target,
+            .optimize = options.mode,
+        }),
+    });
+    nerva.root_module.addImport("stdx", options.stdx_module);
+    nerva.root_module.addImport(
+        "abi",
+        b.createModule(.{ .root_source_file = b.path("src/abi.zig") }),
+    );
+    nerva.root_module.addOptions("vsr_options", options.vsr_options);
+    // Keep stack traces in release builds.
+    nerva.root_module.omit_frame_pointer = false;
+    return nerva;
 }
 
 fn vsr_module(b: *std.Build, options: struct {

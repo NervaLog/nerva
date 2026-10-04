@@ -81,6 +81,11 @@ arrangement either way.
    cases (`receipt race: …`).
 2. **Server and client** (`nerva format`, `nerva start`, a client library) so Botpike can call
    Nerva outside the simulator.
+   - 2a ✅ The `nerva` binary and a blocking Zig client (`src/nerva/client.zig`), proven by
+     `zig build test:integration`: three real replicas, the receipt race between two clients,
+     change-feed paging, and a replica crash and restart.
+   - 2b An HTTP/JSON gateway (`nerva gateway`) so Botpike (Kotlin, JDK 21) can call Nerva without
+     native code. Chosen over a C ABI + JNI client (more work) and Java FFM (preview on JDK 21).
 3. **Positioned reads and the first view** (G2, G4): Botpike's spend rollup maintained from the
    change feed, read at a position.
 4. **As-of reads and workflow state** (G6, G7).

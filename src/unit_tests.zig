@@ -25,6 +25,7 @@ comptime {
     _ = @import("message_buffer.zig");
     _ = @import("multiversion.zig");
     _ = @import("nerva.zig");
+    _ = @import("nerva/cli.zig");
     _ = @import("nerva/state_machine_tests.zig");
     _ = @import("queue.zig");
     _ = @import("stack.zig");
