@@ -1,4 +1,6 @@
 # Every push and pull request to main, and every release (release.yml calls this first).
+# Every job runs on Botpike's own runners (Botpike/ci-runners): a Fly Machine started for the
+# job, performance-2x with 8 GB and a 10 GB volume that keeps the Zig cache between jobs.
 name: CI
 
 on:
@@ -18,7 +20,7 @@ concurrency:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, fly]
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
@@ -35,7 +37,8 @@ jobs:
         run: ./zig/zig build test:fmt
 
       # `benchmark.perf: usage example` skips itself where perf_event_open is denied, as on
-      # GitHub's runners; it fails only where it is allowed without hardware counters (UPSTREAM.md).
+      # GitHub's runners and Botpike's (jobs run as a user, perf_event_paranoid 2); it fails only
+      # where it is allowed without hardware counters (UPSTREAM.md).
       - name: Unit tests
         run: ./zig/zig build test:unit
 
@@ -50,7 +53,7 @@ jobs:
 
   # The demos, three replicas and all, while processes are crashed and restarted.
   demo:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, fly]
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
@@ -64,7 +67,7 @@ jobs:
         run: ./zig/zig build -Drelease test:demo -- --seconds=75
 
   vopr:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, fly]
     timeout-minutes: 60
     strategy:
       fail-fast: false

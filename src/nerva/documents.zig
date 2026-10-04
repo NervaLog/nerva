@@ -236,7 +236,7 @@ pub fn TransactionType(comptime ClientType: type) type {
                     }
                     const rows = try arena.alloc(RowValue, keys.len);
                     try transaction.client.lookup_rows(keys, rows);
-                    // The whole document as of chunk 0's version (N47): every write rewrites every
+                    // The whole document as of chunk 0's version (N48): every write rewrites every
                     // chunk in one transaction, so a tail at another op was rewritten since chunk 0
                     // was read, and is read from its history at chunk 0's version.
                     for (rows, chunks[1..]) |*row, *chunk| {
