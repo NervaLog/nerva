@@ -46,6 +46,10 @@ const Fuzzers = .{
     .vsr_superblock = @import("./vsr/superblock_fuzz.zig"),
     .vsr_superblock_quorums = @import("./vsr/superblock_quorums_fuzz.zig"),
     .vsr_multi_batch = @import("./vsr/multi_batch_fuzz.zig"),
+    // Nerva's own (docs/DECISIONS.md N46).
+    .nerva_adds = @import("./nerva/adds_fuzz.zig"),
+    .nerva_http_head = @import("./nerva/http_head_fuzz.zig"),
+    .nerva_documents = @import("./nerva/documents_fuzz.zig"),
     // A fuzzer that intentionally fails, to test fuzzing infrastructure itself
     .canary = {},
     // Quickly run all fuzzers as a smoke test
@@ -128,6 +132,9 @@ fn main_smoke(gpa: std.mem.Allocator) !void {
             .vsr_free_set => 10_000,
             .vsr_multi_batch => 128,
             .vsr_superblock => 3,
+            .nerva_adds => 1_000_000,
+            .nerva_http_head => 50_000,
+            .nerva_documents => 200,
 
             inline .ewah,
             .lsm_segmented_array,
