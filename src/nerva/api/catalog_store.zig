@@ -9,6 +9,7 @@ const Client = @import("../client.zig").Client;
 const catalog = @import("../catalog.zig");
 const Store = @import("../ledgerd/store.zig").Store;
 const LayoutPut = @import("api.zig").LayoutPut;
+const ViewPut = @import("api.zig").ViewPut;
 
 /// A declaration that keeps conflicting with others is refused after this many attempts.
 const attempts_max = 16;
@@ -54,7 +55,44 @@ pub const CatalogStore = struct {
         }
         return error.Timeout;
     }
+
+    pub fn view(self: *CatalogStore, arena: std.mem.Allocator, name: []const u8) !?catalog.View {
+        try self.store.begin(arena);
+        return view_read(&self.store, arena, name);
+    }
+
+    pub fn view_put(
+        self: *CatalogStore,
+        arena: std.mem.Allocator,
+        name: []const u8,
+        new: *const catalog.View,
+    ) !ViewPut {
+        const key = try std.fmt.allocPrint(arena, "view.{s}", .{name});
+        const document = try catalog.view_render(arena, new);
+        for (0..attempts_max) |_| {
+            try self.store.begin(arena);
+            if (try view_read(&self.store, arena, name)) |old| {
+                const same = std.mem.eql(u8, try catalog.view_render(arena, &old), document);
+                return if (same) .unchanged else .different;
+            }
+            try self.store.put(key, document);
+            switch (try self.store.commit()) {
+                .committed => return .created,
+                .conflict => log.info("view {s}: conflict, retrying", .{name}),
+            }
+        }
+        return error.Timeout;
+    }
 };
+
+fn view_read(store: *Store, arena: std.mem.Allocator, name: []const u8) !?catalog.View {
+    const key = try std.fmt.allocPrint(arena, "view.{s}", .{name});
+    const document = try store.get(key) orelse return null;
+    return catalog.view_parse(arena, document) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.Invalid => error.Corrupt,
+    };
+}
 
 fn layout_key(arena: std.mem.Allocator, table: u32) ![]const u8 {
     return std.fmt.allocPrint(arena, "table.{}", .{table});

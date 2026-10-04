@@ -156,10 +156,30 @@ continuations, code and receipts. They live outside the ledger's generations, so
 `/v1/admin/init` keeps them. `ledgerd.py` has no such routes; `tests/ledgerd/store.py` checks
 them against a model.
 
-## Views
+## Declared views
 
-`nerva view` follows the change feed and serves derived views of every ledgerd ledger, each
-reply stamped with the op it reflects:
+A view is a declaration in the log, not code. Declare a table's layout, then a view over it,
+through `nerva api`; read it from `nerva view`, latest or as of any op:
+
+```bash
+curl -X PUT -H 'X-Nerva-Key: secret' http://127.0.0.1:8080/v1/views/revenue -d '{
+  "table": 5, "where": [{"field": "sold", "op": "eq", "value": true}],
+  "group_by": ["section"], "aggregates": [{"fn": "count"}, {"fn": "sum", "field": "price"}]}'
+curl -H 'X-Nerva-Key: secret' 'http://127.0.0.1:8091/v1/views/revenue?as_of=1234'
+# {"view":"revenue","op":"1234","hash":"…","groups":[{"section":1,"count":"12","sum_price":"5400"},…]}
+```
+
+`where` ANDs comparisons (`eq`, `ne`, `lt`, `le`, `gt`, `ge`) on numeric and bool fields;
+`group_by` takes up to three fields; aggregates are `count`, `sum`, `min` and `max`. A view
+answers for any op, including ops before it was declared, and every answer carries the SHA-256
+of its groups, so two view processes can show they agree. v0 keeps tables and their changes in
+`nerva view`'s memory (at most two million changes) and computes a view when it is read.
+`zig build test:views` checks views against a model on two view processes.
+
+## Ledgerd views
+
+`nerva view` follows the change feed and also serves derived views of every ledgerd ledger,
+each reply stamped with the op it reflects:
 
 ```bash
 LEDGER_KEY=secret ./zig-out/bin/nerva view --cluster=0 --addresses=3001,3002,3003 \

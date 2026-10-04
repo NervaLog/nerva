@@ -1,5 +1,5 @@
-//! The catalog: declared table layouts (and, later, views), stored in the log (docs/DECISIONS.md
-//! N34).
+//! The catalog: declared table layouts and views, stored in the log (docs/DECISIONS.md N34,
+//! N35).
 //!
 //! A layout names the fields packed into a table's 80-byte values, so that the JSON API can take
 //! and return `fields` and views can group and aggregate by field. The core never reads layouts:
@@ -18,7 +18,8 @@ const value_size = nerva.value_size;
 
 /// Tables at or above this are Nerva's own; the API refuses to read or write them directly.
 pub const tables_reserved_min: u32 = 0xFFFF_0000;
-/// Catalog documents, chunked like `ledgerd` values (`ledgerd/store.zig`), keyed `table.<id>`.
+/// Catalog documents, chunked like `ledgerd` values (`ledgerd/store.zig`), keyed `table.<id>` and
+/// `view.<name>`.
 pub const table_catalog: u32 = 0xFFFF_0001;
 
 pub const fields_max = 16;
@@ -220,21 +221,167 @@ fn integer_parse(comptime Int: type, json: std.json.Value) error{Invalid}!Int {
 /// Writes the fields of `value` as a JSON object. 64-bit integers are decimal strings (N33).
 pub fn fields_render(writer: anytype, layout: *const Layout, value: *const [value_size]u8) !void {
     try writer.writeAll("{");
-    for (layout.fields, 0..) |field, index| {
+    for (layout.fields, 0..) |*field, index| {
         if (index > 0) try writer.writeAll(",");
         try writer.print("\"{s}\":", .{field.name});
-        const slot = value[field.offset..][0..field.size];
-        switch (field.type) {
-            .bool => try writer.writeAll(if (slot[0] != 0) "true" else "false"),
-            .u8 => try writer.print("{}", .{slot[0]}),
-            .u16 => try writer.print("{}", .{std.mem.readInt(u16, slot[0..2], .little)}),
-            .u32 => try writer.print("{}", .{std.mem.readInt(u32, slot[0..4], .little)}),
-            .u64 => try writer.print("\"{}\"", .{std.mem.readInt(u64, slot[0..8], .little)}),
-            .i64 => try writer.print("\"{}\"", .{std.mem.readInt(i64, slot[0..8], .little)}),
-            .bytes => try writer.print("\"{s}\"", .{std.fmt.fmtSliceHexLower(slot)}),
-        }
+        try field_render(writer, field, value);
     }
     try writer.writeAll("}");
+}
+
+/// Writes one field's value as JSON.
+pub fn field_render(writer: anytype, field: *const Field, value: *const [value_size]u8) !void {
+    const slot = value[field.offset..][0..field.size];
+    switch (field.type) {
+        .bool => try writer.writeAll(if (slot[0] != 0) "true" else "false"),
+        .u8 => try writer.print("{}", .{slot[0]}),
+        .u16 => try writer.print("{}", .{std.mem.readInt(u16, slot[0..2], .little)}),
+        .u32 => try writer.print("{}", .{std.mem.readInt(u32, slot[0..4], .little)}),
+        .u64 => try writer.print("\"{}\"", .{std.mem.readInt(u64, slot[0..8], .little)}),
+        .i64 => try writer.print("\"{}\"", .{std.mem.readInt(i64, slot[0..8], .little)}),
+        .bytes => try writer.print("\"{s}\"", .{std.fmt.fmtSliceHexLower(slot)}),
+    }
+}
+
+// ---- Views (N35) ----
+
+pub const where_max = 4;
+pub const group_by_max = 3;
+pub const aggregates_max = 6;
+
+pub const Comparison = enum { eq, ne, lt, le, gt, ge };
+pub const Aggregate = enum { count, sum, min, max };
+
+/// A declared view: over the rows of `table` as they are at an op, keep those matching every
+/// `where`, group them by `group_by`, and compute `aggregates` per group.
+pub const View = struct {
+    table: u32,
+    where: []const struct { field: []const u8, op: Comparison, value: i128 },
+    group_by: []const []const u8,
+    aggregates: []const struct { function: Aggregate, field: ?[]const u8 },
+};
+
+pub fn view_name_validate(name: []const u8) error{Invalid}!void {
+    return name_validate(name);
+}
+
+/// Parses a declaration: `{"table": 5, "where": [{"field", "op", "value"}], "group_by": […],
+/// "aggregates": [{"fn": "count"}, {"fn": "sum", "field": "price"}]}`. `where` and `group_by`
+/// may be omitted. Field names are checked against a layout by `view_check`.
+pub fn view_parse(arena: std.mem.Allocator, json: []const u8) Error!View {
+    const Declaration = struct {
+        table: u32,
+        where: []const struct { field: []const u8, op: Comparison, value: std.json.Value } = &.{},
+        group_by: []const []const u8 = &.{},
+        aggregates: []const struct { @"fn": Aggregate, field: ?[]const u8 = null },
+    };
+    const declaration = std.json.parseFromSliceLeaky(Declaration, arena, json, .{}) catch |err|
+        switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return invalid(
+                "a view is {\"table\", \"where\": [{\"field\", \"op\", \"value\"}], " ++
+                    "\"group_by\": [field], \"aggregates\": [{\"fn\", \"field\"}]}",
+            ),
+        };
+    if (declaration.table == 0 or declaration.table >= tables_reserved_min) {
+        return invalid("the view's table is out of range");
+    }
+    if (declaration.where.len > where_max) return invalid("a view has at most 4 where clauses");
+    if (declaration.group_by.len > group_by_max) {
+        return invalid("a view groups by at most 3 fields");
+    }
+    if (declaration.aggregates.len == 0 or declaration.aggregates.len > aggregates_max) {
+        return invalid("a view has 1 to 6 aggregates");
+    }
+
+    const Clause = @typeInfo(@FieldType(View, "where")).pointer.child;
+    const where = try arena.alloc(Clause, declaration.where.len);
+    for (where, declaration.where) |*clause, declared| {
+        clause.* = .{
+            .field = declared.field,
+            .op = declared.op,
+            .value = switch (declared.value) {
+                .bool => |b| @intFromBool(b),
+                else => try integer_parse(i128, declared.value),
+            },
+        };
+    }
+    for (declaration.group_by, 0..) |name, index| {
+        for (declaration.group_by[0..index]) |earlier| {
+            if (std.mem.eql(u8, earlier, name)) return invalid("a view groups by a field once");
+        }
+    }
+    const aggregates = try arena.alloc(
+        @typeInfo(@FieldType(View, "aggregates")).pointer.child,
+        declaration.aggregates.len,
+    );
+    for (aggregates, declaration.aggregates, 0..) |*aggregate, declared, index| {
+        if ((declared.@"fn" == .count) != (declared.field == null)) {
+            return invalid("count has no field; sum, min and max need one");
+        }
+        aggregate.* = .{ .function = declared.@"fn", .field = declared.field };
+        for (aggregates[0..index]) |earlier| {
+            const same_field = if (earlier.field) |a|
+                (if (aggregate.field) |b| std.mem.eql(u8, a, b) else false)
+            else
+                aggregate.field == null;
+            if (earlier.function == aggregate.function and same_field) {
+                return invalid("a view computes each aggregate once");
+            }
+        }
+    }
+    return .{
+        .table = declaration.table,
+        .where = where,
+        .group_by = declaration.group_by,
+        .aggregates = aggregates,
+    };
+}
+
+/// Checks a view's fields against its table's layout: `where`, `sum`, `min` and `max` need
+/// numeric (or bool) fields; `group_by` takes any field.
+pub fn view_check(view: *const View, layout: *const Layout) error{Invalid}!void {
+    for (view.where) |clause| {
+        const field = layout.field(clause.field) orelse return invalid("unknown field in where");
+        if (field.type == .bytes) return invalid("where compares numbers and bools only");
+    }
+    for (view.group_by) |name| {
+        _ = layout.field(name) orelse return invalid("unknown field in group_by");
+    }
+    for (view.aggregates) |aggregate| {
+        const name = aggregate.field orelse continue;
+        const field = layout.field(name) orelse return invalid("unknown field in aggregates");
+        if (field.type == .bytes) return invalid("sum, min and max take numbers only");
+    }
+}
+
+/// The view as stored: canonical JSON.
+pub fn view_render(arena: std.mem.Allocator, view: *const View) Error![]const u8 {
+    var out = std.ArrayList(u8).init(arena);
+    const writer = out.writer();
+    try writer.print("{{\"table\":{},\"where\":[", .{view.table});
+    for (view.where, 0..) |clause, index| {
+        if (index > 0) try writer.writeAll(",");
+        try writer.print("{{\"field\":\"{s}\",\"op\":\"{s}\",\"value\":\"{}\"}}", .{
+            clause.field,
+            @tagName(clause.op),
+            clause.value,
+        });
+    }
+    try writer.writeAll("],\"group_by\":[");
+    for (view.group_by, 0..) |name, index| {
+        if (index > 0) try writer.writeAll(",");
+        try writer.print("\"{s}\"", .{name});
+    }
+    try writer.writeAll("],\"aggregates\":[");
+    for (view.aggregates, 0..) |aggregate, index| {
+        if (index > 0) try writer.writeAll(",");
+        try writer.print("{{\"fn\":\"{s}\"", .{@tagName(aggregate.function)});
+        if (aggregate.field) |name| try writer.print(",\"field\":\"{s}\"", .{name});
+        try writer.writeAll("}");
+    }
+    try writer.writeAll("]}");
+    return out.items;
 }
 
 /// A field's value as a signed 128-bit integer, for views to compare and sum. Bytes fields have

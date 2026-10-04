@@ -11,6 +11,8 @@
 //!     GET  /v1/row?table=<t>&id=<i>&as_of=<op>
 //!     PUT  /v1/tables/<t>   {"name": "seats", "fields": [{"name": "price", "type": "u64"}, …]}
 //!     GET  /v1/tables/<t>
+//!     PUT  /v1/views/<name>  {"table": 5, "where": […], "group_by": […], "aggregates": […]}
+//!     GET  /v1/views/<name>  (the declaration; `nerva view` serves the view itself)
 //!
 //! Conventions:
 //! - 64-bit numbers (`id`, `op`, `op_seen`, cursors) are decimal strings: JSON numbers lose
@@ -50,7 +52,7 @@ pub const Reply = struct {
     body: []const u8,
 };
 
-const Route = enum { lookup, commit, changes, history, row, tables };
+const Route = enum { lookup, commit, changes, history, row, tables, views };
 
 const routes = [_]struct { path: []const u8, route: Route, method: Method }{
     .{ .path = "/v1/lookup", .route = .lookup, .method = .post },
@@ -61,12 +63,17 @@ const routes = [_]struct { path: []const u8, route: Route, method: Method }{
 };
 
 const tables_prefix = "/v1/tables/";
+const views_prefix = "/v1/views/";
 
 /// What `handle` needs of the catalog (`catalog_store.zig` in the server, a map in tests):
 ///
 ///     layout(arena, table: u32) !?catalog.Layout
 ///     layout_put(arena, table: u32, layout: *const catalog.Layout) !LayoutPut
+///     view(arena, name: []const u8) !?catalog.View
+///     view_put(arena, name: []const u8, view: *const catalog.View) !ViewPut
 pub const LayoutPut = enum { created, extended, unchanged, incompatible };
+/// A view's declaration is immutable: declaring a different one under the same name conflicts.
+pub const ViewPut = enum { created, unchanged, different };
 
 /// Runs one request against `client` (a `Client`, or anything with its methods) and `layouts`
 /// (see `LayoutPut`). Client errors other than `TooManyEvents` propagate: the server answers 503.
@@ -82,12 +89,14 @@ pub fn handle(
     const path = target[0..question];
     const query = if (question < target.len) target[question + 1 ..] else "";
 
-    const route: Route = if (std.mem.startsWith(u8, path, tables_prefix)) route: {
+    const route: Route = if (std.mem.startsWith(u8, path, tables_prefix) or
+        std.mem.startsWith(u8, path, views_prefix))
+    route: {
         if (method != .get and method != .put) {
             return error_reply(arena, 405, "method not allowed");
         }
         if (query.len > 0) return error_reply(arena, 400, "unexpected query");
-        break :route .tables;
+        break :route if (std.mem.startsWith(u8, path, tables_prefix)) .tables else .views;
     } else route: {
         const entry = for (routes) |entry| {
             if (std.mem.eql(u8, entry.path, path)) break entry;
@@ -105,6 +114,7 @@ pub fn handle(
         .history => history(arena, client, &cache, query),
         .row => row(arena, client, &cache, query),
         .tables => tables(arena, layouts, method, path[tables_prefix.len..], body),
+        .views => views(arena, layouts, method, path[views_prefix.len..], body),
     } catch |err| switch (err) {
         error.BadRequest => error_reply(arena, 400, bad_request_reason),
         error.TooManyEvents => error_reply(arena, 400, "too many rows or entries for one request"),
@@ -453,6 +463,47 @@ fn tables(
     }
 }
 
+fn views(
+    arena: std.mem.Allocator,
+    layouts: anytype,
+    method: Method,
+    name: []const u8,
+    body: []const u8,
+) !Reply {
+    try catalog.view_name_validate(name);
+    var out = Writer.init(arena);
+    switch (method) {
+        .get => {
+            const view = try layouts.view(arena, name) orelse
+                return error_reply(arena, 404, "no such view");
+            try out.raw(try catalog.view_render(arena, &view));
+            return .{ .status = 200, .body = out.items() };
+        },
+        .put => {
+            const view = try catalog.view_parse(arena, body);
+            try table_check(view.table);
+            const layout = try layouts.layout(arena, view.table) orelse
+                return bad("a view needs a layout for its table (PUT /v1/tables/<t>)");
+            try catalog.view_check(&view, &layout);
+            switch (try layouts.view_put(arena, name, &view)) {
+                .different => return error_reply(
+                    arena,
+                    409,
+                    "a view with this name is declared differently; views are immutable",
+                ),
+                inline else => |outcome| {
+                    try out.print("{{\"view\":\"{s}\",\"declared\":\"{s}\"}}", .{
+                        name,
+                        @tagName(outcome),
+                    });
+                    return .{ .status = 200, .body = out.items() };
+                },
+            }
+        },
+        .post => unreachable,
+    }
+}
+
 // ---- Parsing ----
 
 fn json_parse(comptime T: type, arena: std.mem.Allocator, body: []const u8) !T {
@@ -651,6 +702,19 @@ const FakeLayouts = struct {
         } else .created;
         if (outcome != .incompatible) try fake.map.put(fake.allocator, table, new.*);
         return outcome;
+    }
+
+    pub fn view(_: *FakeLayouts, _: std.mem.Allocator, _: []const u8) !?catalog.View {
+        unreachable; // Covered by `tests/api/api.py`.
+    }
+
+    pub fn view_put(
+        _: *FakeLayouts,
+        _: std.mem.Allocator,
+        _: []const u8,
+        _: *const catalog.View,
+    ) !ViewPut {
+        unreachable; // Covered by `tests/api/api.py`.
     }
 };
 

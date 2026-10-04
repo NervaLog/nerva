@@ -190,3 +190,15 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
 - Tests: unit tests for layouts and for the API with an in-memory catalog; `tests/api/api.py`
   adds layouts end to end, including two gateways declaring at once.
 
+## 2026-10-04 — Phase 2, step 2b: declared views
+
+- `catalog.zig`: view declarations (parse, check against a layout, canonical form).
+- `nerva api`: `PUT`/`GET /v1/views/<name>`, stored in the catalog, immutable.
+- `src/nerva/view/declared.zig`: mirrors the catalog and application tables from the feed;
+  computes views latest or as of any op, with a SHA-256 hash (N35).
+- `nerva view`: `GET /v1/views` and `GET /v1/views/<name>?min_op=|as_of=`; NERVA_KEY.
+- `tests/views/declared.py` (`zig build test:views`, in CI): two views (one declared halfway)
+  against a model at sampled ops on two view processes, hashes recomputed and equal, a
+  restarted view process, declaration errors, 504 past the op. Mutation-tested (replaying one
+  op short is caught).
+

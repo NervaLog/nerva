@@ -9,6 +9,12 @@
 //! (the op that wrote it) or `rollup=<path hex>:<depth>:<own>:<subtree>:<settled>:<denied>` per
 //! agent, then `ok=true`.
 //!
+//! Declared views (N35), as JSON:
+//!
+//!     GET /v1/views                                → {"views": [name, …]}
+//!     GET /v1/views/<name>?min_op=<n|latest>       → {"view", "op", "hash", "groups"}
+//!     GET /v1/views/<name>?as_of=<op>              → the same, as of that op
+//!
 //! `as_of` reads one ledger key as it was at an op (G6, N28): `op=<n>`, then `found=false` or
 //! `found=true` and `value_hex=<hex>`, then `ok=true`. It waits until the view has seen op `n`,
 //! so that nothing can still commit at or before it; `latest` reads at the watermark after
@@ -21,17 +27,31 @@ const std = @import("std");
 const assert = std.debug.assert;
 const log = std.log.scoped(.view);
 
+const nerva = @import("../../nerva.zig");
 const Client = @import("../client.zig").Client;
 const store = @import("../ledgerd/store.zig");
 const FollowerType = @import("follower.zig").FollowerType;
 const LedgerdViews = @import("ledgerd.zig").LedgerdViews;
+const DeclaredViews = @import("declared.zig").DeclaredViews;
+const catalog = @import("../catalog.zig");
 
 /// How long a request may wait for its `min_op`.
 const wait_max_ns = 10 * std.time.ns_per_s;
 /// How long to wait for a connection before reading the feed again, when idle.
 const idle_poll_ms = 50;
 
-const Follower = FollowerType(LedgerdViews);
+/// Every view this process maintains, fed the same ops.
+const Views = struct {
+    ledgerd: LedgerdViews,
+    declared: DeclaredViews,
+
+    pub fn apply(views: *Views, op: u64, changes: []const nerva.Change) !void {
+        try views.ledgerd.apply(op, changes);
+        try views.declared.apply(op, changes);
+    }
+};
+
+const Follower = FollowerType(Views);
 
 pub const Options = struct {
     listen: std.net.Address,
@@ -41,8 +61,12 @@ pub const Options = struct {
 
 pub fn serve(gpa: std.mem.Allocator, client: *Client, options: Options) !noreturn {
     assert(options.key.len > 0);
-    var views = LedgerdViews.init(gpa);
-    defer views.deinit();
+    var views: Views = .{
+        .ledgerd = LedgerdViews.init(gpa),
+        .declared = DeclaredViews.init(gpa),
+    };
+    defer views.ledgerd.deinit();
+    defer views.declared.deinit();
     var follower = try Follower.init(gpa, client, &views);
     defer follower.deinit(gpa);
 
@@ -95,7 +119,7 @@ pub fn serve(gpa: std.mem.Allocator, client: *Client, options: Options) !noretur
 fn serve_request(
     arena: std.mem.Allocator,
     follower: *Follower,
-    views: *LedgerdViews,
+    views: *Views,
     options: Options,
     request: *std.http.Server.Request,
 ) !void {
@@ -106,10 +130,18 @@ fn serve_request(
     var key_header: ?[]const u8 = null;
     var headers = request.iterateHeaders();
     while (headers.next()) |header| {
-        if (std.ascii.eqlIgnoreCase(header.name, "x-ledger-key")) key_header = header.value;
+        if (std.ascii.eqlIgnoreCase(header.name, "x-ledger-key") or
+            std.ascii.eqlIgnoreCase(header.name, "x-nerva-key"))
+        {
+            key_header = header.value;
+        }
     }
     if (key_header == null or !std.mem.eql(u8, key_header.?, options.key)) {
         return respond(request, 401, "error=invalid ledger key");
+    }
+
+    if (declared_target(target)) |declared| {
+        return serve_declared(arena, follower, &views.declared, declared, request);
     }
 
     const parsed = try target_parse(arena, target) orelse
@@ -155,7 +187,7 @@ fn serve_request(
         },
         .journal => {
             try writer.print("op={}\n", .{follower.watermark});
-            for (views.journal(parsed.ledger)) |entry| {
+            for (views.ledgerd.journal(parsed.ledger)) |entry| {
                 try writer.print("line={}:", .{entry.op});
                 for (entry.line) |byte| try writer.print("{x:0>2}", .{byte});
                 try writer.writeAll("\n");
@@ -163,7 +195,7 @@ fn serve_request(
         },
         .spend => {
             try writer.print("op={}\n", .{follower.watermark});
-            for (try views.rollup(arena, parsed.ledger)) |row| {
+            for (try views.ledgerd.rollup(arena, parsed.ledger)) |row| {
                 try writer.writeAll("rollup=");
                 for (row.path) |byte| try writer.print("{x:0>2}", .{byte});
                 try writer.print(":{}:{}:{}:{}:{}\n", .{
@@ -178,6 +210,137 @@ fn serve_request(
     }
     try writer.writeAll("ok=true");
     return respond(request, 200, body.items);
+}
+
+/// A request for a declared view, or for their list.
+const DeclaredTarget = struct {
+    /// Null for the list.
+    name: ?[]const u8,
+    query: []const u8,
+};
+
+/// `/v1/views` or `/v1/views/<name>[?…]`, where a name starts with a letter or `_`, so it never
+/// collides with `/v1/views/<ledger>/…`.
+fn declared_target(target: []const u8) ?DeclaredTarget {
+    const question = std.mem.indexOfScalar(u8, target, '?') orelse target.len;
+    const path = target[0..question];
+    const query = if (question < target.len) target[question + 1 ..] else "";
+    if (std.mem.eql(u8, path, "/v1/views")) return .{ .name = null, .query = query };
+    const prefix = "/v1/views/";
+    if (!std.mem.startsWith(u8, path, prefix)) return null;
+    const name = path[prefix.len..];
+    if (name.len == 0 or std.mem.indexOfScalar(u8, name, '/') != null) return null;
+    if (!(name[0] == '_' or (name[0] >= 'a' and name[0] <= 'z'))) return null;
+    return .{ .name = name, .query = query };
+}
+
+fn serve_declared(
+    arena: std.mem.Allocator,
+    follower: *Follower,
+    declared: *const DeclaredViews,
+    target: DeclaredTarget,
+    request: *std.http.Server.Request,
+) !void {
+    var out = std.ArrayList(u8).init(arena);
+    const writer = out.writer();
+    const name = target.name orelse {
+        if (target.query.len > 0) {
+            return respond_json(request, 400, "{\"error\":\"unexpected query\"}");
+        }
+        try follower.catch_up();
+        try writer.writeAll("{\"views\":[");
+        for (try declared.view_names(arena), 0..) |view_name, index| {
+            if (index > 0) try writer.writeAll(",");
+            try writer.print("\"{s}\"", .{view_name});
+        }
+        try writer.writeAll("]}");
+        return respond_json(request, 200, out.items);
+    };
+
+    // `min_op=<n|latest>` (default latest), or `as_of=<n>`: never both.
+    var min_op: union(enum) { op: u64, latest } = .latest;
+    var as_of: ?u64 = null;
+    var parameters = std.mem.splitScalar(u8, target.query, '&');
+    while (parameters.next()) |parameter| {
+        if (parameter.len == 0) continue;
+        const equals = std.mem.indexOfScalar(u8, parameter, '=') orelse
+            return respond_json(request, 400, "{\"error\":\"malformed query\"}");
+        const value = parameter[equals + 1 ..];
+        if (std.mem.eql(u8, parameter[0..equals], "min_op")) {
+            min_op = if (std.mem.eql(u8, value, "latest")) .latest else .{
+                .op = std.fmt.parseInt(u64, value, 10) catch
+                    return respond_json(request, 400, "{\"error\":\"min_op is malformed\"}"),
+            };
+        } else if (std.mem.eql(u8, parameter[0..equals], "as_of")) {
+            as_of = std.fmt.parseInt(u64, value, 10) catch
+                return respond_json(request, 400, "{\"error\":\"as_of is malformed\"}");
+            if (as_of.? == 0) {
+                return respond_json(request, 400, "{\"error\":\"as_of must be positive\"}");
+            }
+        } else {
+            return respond_json(request, 400, "{\"error\":\"unknown query parameter\"}");
+        }
+    }
+    if (as_of != null and std.mem.indexOf(u8, target.query, "min_op=") != null) {
+        return respond_json(request, 400, "{\"error\":\"min_op or as_of, not both\"}");
+    }
+
+    // An answer as of op n waits until the view has seen n, so that nothing can still commit at
+    // or before it (as for ledger `as_of`, N28).
+    const wait_op: ?u64 = if (as_of) |op| op else switch (min_op) {
+        .op => |op| op,
+        .latest => null,
+    };
+    if (wait_op) |op| {
+        var timer = try std.time.Timer.start();
+        while (follower.watermark < op) {
+            if (timer.read() > wait_max_ns) {
+                return respond_json(request, 504, "{\"error\":\"view did not reach the op\"}");
+            }
+            _ = try follower.poll();
+        }
+    } else {
+        try follower.catch_up();
+    }
+
+    const result = declared.compute(arena, name, as_of) catch |err| switch (err) {
+        error.NoSuchView => return respond_json(request, 404, "{\"error\":\"no such view\"}"),
+        error.NoLayout, error.Invalid => return respond_json(
+            request,
+            409,
+            "{\"error\":\"the view does not match its table's layout\"}",
+        ),
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    try writer.print("{{\"view\":\"{s}\",\"op\":\"{}\",\"hash\":\"{s}\",\"groups\":", .{
+        name,
+        as_of orelse follower.watermark,
+        std.fmt.fmtSliceHexLower(&result.hash),
+    });
+    try writer.writeAll(result.groups);
+    try writer.writeAll("}");
+    return respond_json(request, 200, out.items);
+}
+
+fn respond_json(request: *std.http.Server.Request, status: u16, body: []const u8) !void {
+    try request.respond(body, .{
+        .status = @enumFromInt(status),
+        .keep_alive = request.head.keep_alive,
+        .extra_headers = &.{
+            .{ .name = "content-type", .value = "application/json" },
+        },
+    });
+}
+
+test declared_target {
+    const testing = std.testing;
+    try testing.expectEqual(null, declared_target("/v1/views").?.name);
+    const revenue = declared_target("/v1/views/revenue?as_of=3").?;
+    try testing.expectEqualStrings("revenue", revenue.name.?);
+    try testing.expectEqualStrings("as_of=3", declared_target("/v1/views/revenue?as_of=3").?.query);
+    try testing.expectEqual(null, declared_target("/v1/views/1/journal"));
+    try testing.expectEqual(null, declared_target("/v1/views/revenue/x"));
+    try testing.expectEqual(null, declared_target("/v1/ledgers/1/as_of"));
 }
 
 const Target = struct {

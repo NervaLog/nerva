@@ -49,6 +49,9 @@ jobs:
       - name: JSON API (against a model)
         run: ./zig/zig build test:api
 
+      - name: Declared views (against a model)
+        run: ./zig/zig build test:views
+
   vopr:
     runs-on: ubuntu-latest
     timeout-minutes: 60

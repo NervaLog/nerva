@@ -93,8 +93,9 @@ const CLIArgs = union(enum) {
         \\  ledgerd  Serve the Botpike runtime's ledger protocol from the cluster at
         \\           <addresses>. The key is read from the LEDGER_KEY environment variable.
         \\
-        \\  view     Follow the cluster's change feed and serve the ledgerd views
-        \\           (journal, spend). The key is read from LEDGER_KEY.
+        \\  view     Follow the cluster's change feed and serve declared views, and the
+        \\           ledgerd views (journal, spend). The key is read from NERVA_KEY, or
+        \\           LEDGER_KEY.
         \\
         \\  api      Serve the cluster's operations (lookup, commit, changes, history) as JSON
         \\           over HTTP. The key is read from the NERVA_KEY environment variable.

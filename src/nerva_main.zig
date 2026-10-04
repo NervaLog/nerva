@@ -246,8 +246,9 @@ fn command_ledgerd(gpa: std.mem.Allocator, args: *const cli.Command.Ledgerd) !vo
 }
 
 fn command_view(gpa: std.mem.Allocator, args: *const cli.Command.View) !void {
-    const key = std.posix.getenv("LEDGER_KEY") orelse "";
-    if (key.len == 0) vsr.fatal(.cli, "view: set LEDGER_KEY", .{});
+    // NERVA_KEY, or LEDGER_KEY as the ledgerd guide sets it.
+    const key = std.posix.getenv("NERVA_KEY") orelse std.posix.getenv("LEDGER_KEY") orelse "";
+    if (key.len == 0) vsr.fatal(.cli, "view: set NERVA_KEY (or LEDGER_KEY)", .{});
 
     var client: Client = undefined;
     try client.init(gpa, .{
