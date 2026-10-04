@@ -86,6 +86,8 @@ Linux (io_uring) or macOS; x86_64 with AES or aarch64.
 
 ## Roadmap
 
+The 1.0 target, with Botpike as first customer, is in [docs/GOALS-1.0.md](./docs/GOALS-1.0.md).
+
 1. **Foundation** — vendored consensus + storage + simulator, placeholder state machine. ✅
 2. **Commit core** — row model, optimistic read-set validation, versioned base rows; VOPR
    workload with a model checker. ✅

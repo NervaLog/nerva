@@ -45,3 +45,8 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
 - Verified: `check` and `test:fmt` pass; `test:unit` 272/273 (only the sandbox-denied perf
   test fails); VOPR passes seeds 1–9 and 42 (seed 8 ran 2.49M ticks; seed 1 checked 90
   committed and 56 failed transactions and 185 changes against the model).
+
+## 2026-10-04 — 1.0 design goals
+
+- Added `docs/GOALS-1.0.md`: Nerva 1.0 design goals (G1–G8), with Botpike as the first customer;
+  each goal maps to a gap Botpike's own docs name. Linked from README.md and CLAUDE.md.

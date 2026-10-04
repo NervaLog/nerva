@@ -2,8 +2,10 @@
 
 Guidance for Claude Code when working in this repository.
 
-**Read first, every session:** [README.md](./README.md) (design), [UPSTREAM.md](./UPSTREAM.md)
-(what is vendored), and [docs/TIGER_STYLE.md](./docs/TIGER_STYLE.md) (coding style, mandatory).
+**Read first, every session:** [README.md](./README.md) (design),
+[docs/GOALS-1.0.md](./docs/GOALS-1.0.md) (1.0 goals; Botpike is the first customer),
+[UPSTREAM.md](./UPSTREAM.md) (what is vendored), and [docs/TIGER_STYLE.md](./docs/TIGER_STYLE.md)
+(coding style, mandatory).
 
 ## Project
 
