@@ -296,7 +296,6 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
 - Smoke reports the vendored `lsm_segmented_array` as slow in Debug (about 20 s against its
   10 s budget); it is a warning, not a failure, and smoke never reached it before this fix.
 
-
 ## 2026-10-04 — Repository renamed to `Botpike/nerva-ledger`
 
 - The repository moved from `topwombat/nerva` to `Botpike/nerva-ledger`; CLAUDE.md's issue rule
@@ -308,6 +307,33 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
   Machines of Botpike/ci-runners, instead of `ubuntu-latest`. Steps unchanged.
 - Verified on the pull request's own CI run: unit tests (the perf test skips), integration,
   API, views, demos and the four VOPR seeds pass on the new runners.
+
+## 2026-10-04 — Consistent document reads in `documents.Transaction` (N48; #7)
+
+- `src/nerva/documents.zig`: `Transaction.get` reads every tail chunk at chunk 0's version,
+  from history when a rewrite landed between its two lookups, and records every chunk as read
+  at that version. `Transaction` is `TransactionType(Client)`, so tests can use a stub client.
+- Tests: a rewrite between the lookups (fails with the previous code: a value stitched from
+  two versions), a read with no race, and a tail older than chunk 0.
+
+## 2026-10-04 — VOPR workload: exact ops, unsent inputs, limits, cursors (N49)
+
+- `src/vopr.zig` passes the op each request committed at; `src/nerva/workload.zig` checks
+  replies against it exactly. The testing workload takes the argument, unused.
+- The workload generates `op_seen` on writes, kind zero, `reserved_a`/`reserved_c`, future
+  reads, `RowKey.reserved`, and invalid feed and history filters (reserved bytes, timestamps
+  past `maxInt(u63)`); checks `entry_validate` against the documented rules
+  (`entry_status_check`); reaches `changes_limit_max` and past it, full lookup batches and
+  full commit batches; and continues from cursors that incomplete replies returned.
+- Short-log VOPR runs print the workload's summary, with coverage counters.
+- Verified: seeds 1, 2, 5 and 20 random seeds pass; across them 38 full batches, 171 invalid
+  entries, 117 future reads, 26 invalid filters, 115 clamped limits, 48 cursors continued.
+- Planted bugs, each caught on seeds chosen for exercising it (then reverted): `op_read`
+  reported one op late (4/4 seeds; only the exact-op check catches it), `RowKey.reserved`
+  ignored (4/4), `ChangesFilter.reserved` unchecked (2/4), the limit clamp removed (4/4) or
+  off by one (4/4; the simulator's small messages make `changes_limit_max` a few dozen, within
+  any run's feed), and a put carrying `op_seen` accepted (3/4; only `entry_status_check`
+  catches it, as the model shares `entry_validate`).
 
 ## 2026-10-04 — Fly.io feasibility probe for nightly performance tests
 
@@ -322,7 +348,7 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
   throughput runs will be IO-capped on Fly and are judged on write amplification instead.
 - Not part of the build or CI; it needs `flyctl` and `FLY_API_TOKEN`.
 
-## 2026-10-04 — Metrics and traces from replicas (N48)
+## 2026-10-04 — Metrics and traces from replicas (N50)
 
 - `nerva start --statsd=<host:port>` sends the replica's metrics (statsd over UDP, every 10 s)
   and `--trace=<path>` writes its JSON span trace. `src/nerva/cli.zig` parses and validates

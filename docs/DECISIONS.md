@@ -423,7 +423,56 @@ volume, which holds the integration test's 3.5 GiB; `xz` and `gh` are installed 
 download and the release. Nothing else changed: the steps, seeds and release are as N32 and N40
 set them.
 
-**N48. Replicas export metrics with `--statsd` and spans with `--trace`.**
+**N48. A document read through `documents.Transaction` is read whole at chunk 0's version.**
+`Transaction.get` read chunk 0, then the tail chunks, in two lookups that can execute at
+different ops. A rewrite committed between them made the read decode chunk 0 of one version
+with tails of the next: a spurious `Corrupt`, or a value stitched from both (#7). A transaction
+that went on to commit got `conflict`, so no write was ever based on it; but read-only callers
+(the API reading table layouts and view declarations through `catalog_store.zig`) could see the
+mix. Amends N41, whose public route already read this way:
+- Every write rewrites every chunk of a document in one transaction, so in a consistent read
+  every tail has chunk 0's op. A tail at a later op is read from its history at chunk 0's
+  version (`Client.row_as_of`), as `documents_routes.zig` does; a tail at an earlier op cannot
+  happen, and is `Corrupt`. A read without a race costs nothing more: still two lookups.
+- Every chunk is recorded as read at chunk 0's version, not at the version its row holds now,
+  so a transaction that commits after such a read conflicts, as it should.
+- `Transaction` is now `TransactionType(Client)`, so a test can give it a stub client and land
+  a rewrite between the two lookups. Callers are unchanged.
+Tests (`documents.zig`): the rewrite between the lookups returns the old document whole, with
+every chunk recorded at the old version (with the previous code the same test returns a value
+stitched from both versions, differing from byte 49, where the first tail starts); a read
+without a race reads no history; a tail older than chunk 0 is `Corrupt`.
+
+**N49. The VOPR workload checks exact ops, sends the inputs it never did, and reaches the limits.**
+An audit of the workload found what it generated and checked well, and what it never touched:
+- **Exact ops.** Replies were checked only to be later than every op seen before. `vopr.zig` now
+  passes the op each request committed at, and the workload asserts it exactly: each committed
+  transaction's `op`, each lookup's `op_read`, and a complete feed or history reply's `end.op`.
+  A reply reporting a later op than it executed at passed before.
+- **Inputs never sent.** `op_seen` on a put, delete or add; kind zero; non-zero `reserved_a` or
+  `reserved_c`; reads asserting a version no row has yet (they conflict); lookups with
+  `RowKey.reserved` set (not found); and feed and history filters with reserved bytes set or a
+  timestamp past `maxInt(u63)` (invalid: an empty reply).
+- **Validation checked apart from itself.** The model took each entry's status from
+  `nerva.entry_validate`, the state machine's own function, so a mistake there could not fail.
+  `entry_status_check` now derives, from the rules `EntryStatus` documents, the set of rules an
+  entry breaks, and requires `entry_validate` to accept exactly the entries breaking none and
+  otherwise to name one it breaks. Which rule wins when several are broken stays
+  `entry_validate`'s choice; an add's own parameters are `nerva_adds`'s (N46).
+- **Limits.** Feed and history limits sometimes sit at `changes_limit_max`, just past it, or at
+  `maxInt(u32)`, and must be clamped; lookups sometimes fill a batch to what the reply holds;
+  about one commit request in a hundred is one transaction as large as the request allows,
+  which runs prefetch and the state machine's scratch space at capacity. The model's scratch
+  for a transaction's expected results is sized for that (`commit_entries_max`).
+- **Cursors fed back.** The cursor an incomplete feed or history reply returns is kept and,
+  sometimes, the next request continues from it, so the cursors the state machine hands out are
+  themselves checked.
+- In short-log mode the VOPR now prints the workload's end-of-run summary, with counters for
+  each of the above, so a run shows what it exercised.
+Signed adds were already generated (N42). Proven by planting bugs in the state machine, each
+caught by a VOPR seed: see WORKLOG.
+
+**N50. Replicas export metrics with `--statsd` and spans with `--trace`.**
 Nightly performance tests and anyone running Nerva need the replica's timings, and the vendored
 tracer already records them (request latency per operation, commit stages, compaction, lookups
 and scans per tree, storage IO, cache hits) and emits them every 10 s. `nerva start` simply
