@@ -5,6 +5,10 @@
 //! header, then the key, then the start of the value; chunks 1.. continue the stream. Chunk 0's
 //! id derives from the namespace and the key, and later chunks' ids from chunk 0's id, so a
 //! reader holding only chunk 0 (a view following the feed) can find the rest.
+//!
+//! A deleted document is a tombstone: chunk 0 (and any tails the key needs) written with the
+//! `deleted` flag and the key, but no value. So the feed names the key of every delete, and the
+//! document's version (chunk 0's op) still advances. `nerva api` deletes this way (N41).
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -28,9 +32,15 @@ pub const Header = extern struct {
     namespace: u64,
     reserved_a: u64 = 0,
     key_size: u16,
-    reserved_b: u16 = 0,
+    flags: Flags = .{},
     /// Key plus value.
     payload_size: u32,
+
+    pub const Flags = packed struct(u16) {
+        /// A tombstone: the payload is the key alone.
+        deleted: bool = false,
+        padding: u15 = 0,
+    };
 
     comptime {
         assert(@sizeOf(Header) == 24);
@@ -77,13 +87,14 @@ pub fn tail_id(id0: u64, chunk: u32) u64 {
     return std.mem.readInt(u64, digest[0..8], .little);
 }
 
-/// Splits `key` and `value` into row values: chunk 0 first.
+/// Splits `key` and `value` into row values: chunk 0 first. A null `value` is a tombstone.
 pub fn chunks_encode(
     arena: std.mem.Allocator,
     namespace: u64,
     key: []const u8,
-    value: []const u8,
+    value_or_deleted: ?[]const u8,
 ) error{OutOfMemory}![]const [value_size]u8 {
+    const value = value_or_deleted orelse "";
     assert(key.len <= key_size_max);
     assert(value.len <= value_size_max);
     const count = chunk_count(key.len, value.len);
@@ -93,6 +104,7 @@ pub fn chunks_encode(
     const header: Header = .{
         .namespace = namespace,
         .key_size = @intCast(key.len),
+        .flags = .{ .deleted = value_or_deleted == null },
         .payload_size = @intCast(key.len + value.len),
     };
     @memcpy(chunks[0][0..@sizeOf(Header)], std.mem.asBytes(&header));
@@ -120,7 +132,8 @@ pub fn chunks_encode(
 pub const Decoded = struct {
     namespace: u64,
     key: []const u8,
-    value: []const u8,
+    /// Null for a tombstone.
+    value: ?[]const u8,
 };
 
 /// Reassembles chunks written by `chunks_encode`. `chunks` must hold `chunk_count` rows.
@@ -128,10 +141,7 @@ pub fn chunks_decode(
     arena: std.mem.Allocator,
     chunks: []const [value_size]u8,
 ) error{ OutOfMemory, Corrupt }!Decoded {
-    const header = std.mem.bytesToValue(Header, chunks[0][0..@sizeOf(Header)]);
-    if (header.key_size > key_size_max) return error.Corrupt;
-    if (header.payload_size < header.key_size) return error.Corrupt;
-    if (header.payload_size - header.key_size > value_size_max) return error.Corrupt;
+    const header = try header_check(&chunks[0]);
     const value_size_ = header.payload_size - header.key_size;
     if (chunks.len != chunk_count(header.key_size, value_size_)) return error.Corrupt;
 
@@ -147,16 +157,27 @@ pub fn chunks_decode(
     return .{
         .namespace = header.namespace,
         .key = payload[0..header.key_size],
-        .value = payload[header.key_size..],
+        .value = if (header.flags.deleted) null else payload[header.key_size..],
     };
 }
 
 /// From chunk 0's header: how many rows the document occupies.
 pub fn chunk0_count(chunk0: *const [value_size]u8) error{Corrupt}!u32 {
-    const header = std.mem.bytesToValue(Header, chunk0[0..@sizeOf(Header)]);
-    if (header.payload_size < header.key_size) return error.Corrupt;
-    if (header.payload_size - header.key_size > value_size_max) return error.Corrupt;
+    const header = try header_check(chunk0);
     return chunk_count(header.key_size, header.payload_size - header.key_size);
+}
+
+/// Chunk 0's header, if it could be one. (A tail chunk can pass: only a decoded key that hashes
+/// back to chunk 0's id proves it.)
+fn header_check(chunk0: *const [value_size]u8) error{Corrupt}!Header {
+    const header = std.mem.bytesToValue(Header, chunk0[0..@sizeOf(Header)]);
+    if (header.reserved_a != 0 or header.flags.padding != 0) return error.Corrupt;
+    if (header.key_size > key_size_max) return error.Corrupt;
+    if (header.payload_size < header.key_size) return error.Corrupt;
+    const value_size_ = header.payload_size - header.key_size;
+    if (value_size_ > value_size_max) return error.Corrupt;
+    if (header.flags.deleted and value_size_ != 0) return error.Corrupt;
+    return header;
 }
 
 pub const Error = Client.Error || error{
@@ -324,7 +345,56 @@ test "documents: chunks round-trip" {
         const decoded = try chunks_decode(arena, chunks);
         try testing.expectEqual(namespace, decoded.namespace);
         try testing.expectEqualSlices(u8, key, decoded.key);
-        try testing.expectEqualSlices(u8, value, decoded.value);
+        try testing.expectEqualSlices(u8, value, decoded.value.?);
+
+        const tombstone = try chunks_encode(arena, namespace, key, null);
+        try testing.expectEqual(chunk_count(key.len, 0), tombstone.len);
+        const deleted = try chunks_decode(arena, tombstone);
+        try testing.expectEqualSlices(u8, key, deleted.key);
+        try testing.expectEqual(null, deleted.value);
+    }
+}
+
+test "documents: headers that cannot be chunk 0 are refused" {
+    var arena_instance = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_instance.deinit();
+    const arena = arena_instance.allocator();
+
+    const chunks = try chunks_encode(arena, 7, "key", "value");
+    const header = std.mem.bytesToValue(Header, chunks[0][0..@sizeOf(Header)]);
+    const cases = [_]Header{
+        h: {
+            var h = header;
+            h.reserved_a = 1;
+            break :h h;
+        },
+        h: {
+            var h = header;
+            h.flags.padding = 1;
+            break :h h;
+        },
+        h: {
+            var h = header;
+            h.payload_size = h.key_size - 1;
+            break :h h;
+        },
+        h: {
+            var h = header;
+            h.key_size = key_size_max + 1;
+            h.payload_size = key_size_max + 1;
+            break :h h;
+        },
+        h: {
+            // A tombstone has no value.
+            var h = header;
+            h.flags.deleted = true;
+            break :h h;
+        },
+    };
+    for (cases) |case| {
+        var chunk0 = chunks[0];
+        @memcpy(chunk0[0..@sizeOf(Header)], std.mem.asBytes(&case));
+        try testing.expectError(error.Corrupt, chunk0_count(&chunk0));
     }
 }
 
