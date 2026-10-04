@@ -24,6 +24,8 @@ comptime {
     _ = @import("lsm/zig_zag_merge.zig");
     _ = @import("message_buffer.zig");
     _ = @import("multiversion.zig");
+    _ = @import("nerva.zig");
+    _ = @import("nerva/state_machine_tests.zig");
     _ = @import("queue.zig");
     _ = @import("stack.zig");
     _ = @import("testing/exhaustigen.zig");

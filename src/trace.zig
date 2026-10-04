@@ -518,7 +518,7 @@ test "trace json and statsd" {
         \\{"pid":0,"tid":140,"ph":"B","ts":0,"cat":"metrics_emit","name":"metrics_emit  ","args":""},
         \\{"pid":0,"tid":140,"ph":"E","ts":100000},
         \\{"pid":1,"tid":0,"ph":"B","ts":100000,"cat":"replica_commit","name":"replica_commit  stage=idle","args":{"stage":"idle","op":123}},
-        \\{"pid":1,"tid":12,"ph":"B","ts":110000,"cat":"compact_beat","name":"compact_beat  tree=Thing.timestamp","args":{"tree":"Thing.timestamp","level_b":1}},
+        \\{"pid":1,"tid":12,"ph":"B","ts":110000,"cat":"compact_beat","name":"compact_beat  tree=Row.timestamp","args":{"tree":"Row.timestamp","level_b":1}},
         \\{"pid":1,"tid":12,"ph":"E","ts":130000},
         \\{"pid":1,"tid":0,"ph":"E","ts":160000},
         \\
@@ -540,11 +540,11 @@ test "trace json and statsd" {
         \\tb.replica_commit_us.avg:60000|g|#cluster:00000000000000000000000000000001,replica:1,stage:idle
         \\tb.replica_commit_us.sum:60000|c|#cluster:00000000000000000000000000000001,replica:1,stage:idle
         \\tb.replica_commit_us.count:1|c|#cluster:00000000000000000000000000000001,replica:1,stage:idle
-        \\tb.compact_beat_us.min:20000|g|#cluster:00000000000000000000000000000001,replica:1,tree:Thing.timestamp
-        \\tb.compact_beat_us.max:20000|g|#cluster:00000000000000000000000000000001,replica:1,tree:Thing.timestamp
-        \\tb.compact_beat_us.avg:20000|g|#cluster:00000000000000000000000000000001,replica:1,tree:Thing.timestamp
-        \\tb.compact_beat_us.sum:20000|c|#cluster:00000000000000000000000000000001,replica:1,tree:Thing.timestamp
-        \\tb.compact_beat_us.count:1|c|#cluster:00000000000000000000000000000001,replica:1,tree:Thing.timestamp
+        \\tb.compact_beat_us.min:20000|g|#cluster:00000000000000000000000000000001,replica:1,tree:Row.timestamp
+        \\tb.compact_beat_us.max:20000|g|#cluster:00000000000000000000000000000001,replica:1,tree:Row.timestamp
+        \\tb.compact_beat_us.avg:20000|g|#cluster:00000000000000000000000000000001,replica:1,tree:Row.timestamp
+        \\tb.compact_beat_us.sum:20000|c|#cluster:00000000000000000000000000000001,replica:1,tree:Row.timestamp
+        \\tb.compact_beat_us.count:1|c|#cluster:00000000000000000000000000000001,replica:1,tree:Row.timestamp
         \\tb.metrics_emit_us.min:10000|g|#cluster:00000000000000000000000000000001,replica:1
         \\tb.metrics_emit_us.max:100000|g|#cluster:00000000000000000000000000000001,replica:1
         \\tb.metrics_emit_us.avg:53333|g|#cluster:00000000000000000000000000000001,replica:1

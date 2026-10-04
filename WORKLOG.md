@@ -21,3 +21,27 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
 - Verified: `zig build check`, `zig build test:fmt` pass; `zig build test:unit` 262/263 pass (the
   one failure is the perf-counter test, denied by the sandbox and failing identically upstream);
   VOPR passes with the Nerva state machine (seeds listed in the commit message).
+
+## 2026-10-04 — Commit core
+
+- Defined the commit core's wire and storage types in `src/nerva.zig`: `Row` (128 bytes, 80-byte
+  value, version = op of last write, tombstone flag), `Entry`/`EntryResult`, `RowKey`/`RowValue`,
+  `ChangesFilter`/`Change`, and the operations `lookup_rows`, `commit`, `get_changes`. Replaced
+  the placeholder `echo` operation and `Thing` tree ids (nothing was persisted yet).
+- Implemented `src/nerva/state_machine.zig`: rows keyed by `(table, id)`; one batch = one
+  transaction with per-entry results; optimistic validation of read versions; static entry
+  validation; duplicate-write detection by sorting in preallocated scratch space; deletes as
+  tombstones (upstream `Groove.remove` is untested and verify-only); an append-only change groove
+  scanned by timestamp for `get_changes`.
+- Added `src/nerva/state_machine_tests.zig` (8 deterministic tests) and
+  `src/nerva/workload.zig`: a VOPR workload that checks every reply, in op order, against an
+  in-memory model (statuses, versions, values, change feed).
+- Bugs found by the simulator and fixed: a version assertion that was too strict when two
+  transactions in one request write the same row (regression test added); two workload
+  generator bugs (lookup replies exceeding the message size; a duplicate check on a deliberately
+  invalid entry).
+- Updated the `trace.zig` snapshot (tree id 1 is now `Row.timestamp`), README (commit core
+  section, roadmap) and UPSTREAM.md.
+- Verified: `check` and `test:fmt` pass; `test:unit` 272/273 (only the sandbox-denied perf
+  test fails); VOPR passes seeds 1–9 and 42 (seed 8 ran 2.49M ticks; seed 1 checked 90
+  committed and 56 failed transactions and 185 changes against the model).
