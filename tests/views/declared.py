@@ -12,11 +12,14 @@ op and a model of the table. Halfway, declares a second view. Then requires:
 - a restarted view process (rebuilt from the log) to give the same answers;
 - declarations to be checked: unknown fields, no layout, a different view under an existing
   name (409), the same view again ("unchanged");
-- `as_of` past the cluster's op to wait, then answer 504.
+- `as_of` or `min_op` past the cluster's op to answer 504 at once, as the op is not committed
+  yet (N45);
+- a client sending its request a byte at a time, or a malformed one, not to hold up the
+  next reader (N45).
 
 Usage: declared.py <path to nerva> [--seed=N] [--steps=N]
 """
-import hashlib, http.client, json, os, random, shutil, subprocess, sys, tempfile, time
+import hashlib, http.client, json, os, random, shutil, socket, subprocess, sys, tempfile, time
 
 KEY = "views-test-key"
 TABLE = 5
@@ -204,9 +207,27 @@ def main():
         assert request(ports[1], "GET", "/v1/views/nope")[0] == 404
         assert request(ports[1], "GET", "/v1/views/revenue?as_of=0")[0] == 400
         assert request(ports[1], "GET", "/v1/views/revenue?as_of=1&min_op=1")[0] == 400
-        started = time.monotonic()
-        status, _ = request(ports[1], "GET", f"/v1/views/revenue?as_of={history[-1][0] + 10**9}")
-        assert status == 504 and time.monotonic() - started >= 9, status
+        for query in ("as_of", "min_op"):
+            started = time.monotonic()
+            status, body = request(ports[1], "GET",
+                                   f"/v1/views/revenue?{query}={history[-1][0] + 10**9}")
+            assert status == 504 and "not committed" in body["error"], (status, body)
+            assert time.monotonic() - started < 2, "a future op held up the view process"
+
+        # A slow client, and a malformed one, hold up no reader.
+        drip = socket.create_connection(("127.0.0.1", ports[1]))
+        drip.sendall(b"GET /v1/views HTTP/1.1\r\n")
+        bad = socket.create_connection(("127.0.0.1", ports[1]), timeout=10)
+        bad.sendall(b"GET /v1/views HTTP/1.1\r\n\n\r\n")
+        assert bad.recv(4096).startswith(b"HTTP/1.1 400 ")
+        bad.close()
+        for _ in range(3):
+            drip.sendall(b"x")
+            started = time.monotonic()
+            assert request(ports[1], "GET", "/v1/views/revenue?min_op=latest")[0] == 200
+            assert time.monotonic() - started < 2, "a dripping connection held up a reader"
+            time.sleep(1)
+        drip.close()
 
         print(f"declared views: PASSED ({steps} writes; {len(samples)} ops checked as of, for 2 "
               f"views on 2 processes, plus a restart; seed {seed})")

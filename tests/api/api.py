@@ -16,8 +16,11 @@ Runs one replica and two API gateways, then:
 - layouts (N34): declaring, re-declaring, extending, refusing a change that does not append,
   two gateways declaring at once; puts by `fields`, read back as `fields` by lookup, the feed,
   history and `row`; reserved tables refused; catalog rows never in the feed;
-- the gateway serves one request per connection: a client holding its connection open, or one
-  that connects and sends nothing, does not hold up the next client for long (N37);
+- the gateway serves one request per connection and reads many at once: a client holding its
+  connection open, one that connects and sends nothing, or one that sends a byte at a time does
+  not hold up the next client (N37, N45);
+- malformed request heads (a bare LF, folded lines, `Transfer-Encoding`, ...) answer 400 or are
+  dropped, and the gateway serves the next request (N45);
 - 401 without the key, 404 and 405.
 
 Usage: api.py <path to nerva> [--seed=N] [--steps=N]
@@ -323,13 +326,64 @@ def check_connections(port):
     assert time.monotonic() - started < 2, "a held connection held up the next client"
     held.close()
 
-    # A client that connects and sends nothing is dropped after the receive deadline (10 s).
+    # A client that connects and sends nothing holds up nobody (N45).
     silent = socket.create_connection(("127.0.0.1", port))
     started = time.monotonic()
     assert request(port, "POST", "/v1/lookup", {"rows": [{"table": 1, "id": "0"}]})[0] == 200
     waited = time.monotonic() - started
-    assert waited < 15, f"a silent connection held up the next client for {waited:.1f} s"
+    assert waited < 2, f"a silent connection held up the next client for {waited:.1f} s"
+
+    # Nor does one that sends a byte at a time: the deadline is for the whole request (N45).
+    drip = socket.create_connection(("127.0.0.1", port))
+    drip.sendall(b"GET /healthz HTTP/1.1\r\n")
+    started = time.monotonic()
+    for _ in range(6):
+        drip.sendall(b"x")
+        before = time.monotonic()
+        assert request(port, "POST", "/v1/lookup", {"rows": [{"table": 1, "id": "0"}]})[0] == 200
+        assert time.monotonic() - before < 2, "a dripping connection held up the next client"
+        time.sleep(2)
+    # It is closed at the deadline, 10 s after it connected, though it kept sending.
+    drip.settimeout(5)
+    try:
+        closed = drip.recv(1) == b""
+    except ConnectionResetError:
+        closed = True
+    assert closed and time.monotonic() - started < 16, "a dripping connection outlived the deadline"
+    drip.close()
     silent.close()
+
+
+MALFORMED = [
+    b"POST /v1/lookupaa HTTP/1.1\r\n\n\r\n",  # A bare LF ends the head (issue #8).
+    b"GET /healthz HTTP/1.1\n\n",
+    b"GET /healthz HTTP/1.1\r\nA: b\rc\r\n\r\n",
+    b"GET /healthz HTTP/1.1\r\nA: b\x00c\r\n\r\n",
+    b"GET /healthz HTTP/1.1\r\nA: b\r\n folded\r\n\r\n",
+    b"GET /healthz HTTP/1.1\r\nno colon\r\n\r\n",
+    b"POST /v1/lookup HTTP/1.1\r\nContent-Length: 2\r\nContent-Length: 2\r\n\r\n{}",
+    b"POST /v1/lookup HTTP/1.1\r\nContent-Length: +2\r\n\r\n{}",
+    b"POST /v1/lookup HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n{}\r\n0\r\n\r\n",
+    b"GET /healthz HTTP/1.1\r\nX-Nerva-Key: a\r\nX-Nerva-Key: b\r\n\r\n",
+    b"GET /healthz HTTP/2.0\r\n\r\n",
+    b"GET /healthz HTTP/1.1\r\nA: " + b"a" * 20000 + b"\r\n\r\n",
+    b"POST /v1/lookup HTTP/1.1\r\nContent-Length: 4294967295\r\n\r\n",
+]
+
+
+def check_malformed(port):
+    # Each is refused with 400 (or the connection is dropped), and the gateway still serves.
+    for raw in MALFORMED:
+        connection = socket.create_connection(("127.0.0.1", port), timeout=10)
+        try:
+            connection.sendall(raw)
+            reply = connection.recv(4096)
+        except (ConnectionResetError, BrokenPipeError):
+            reply = b""
+        finally:
+            connection.close()
+        assert reply == b"" or reply.startswith(b"HTTP/1.1 400 "), (raw[:60], reply)
+        assert request(port, "GET", "/healthz", key=None)[0] == 200, raw[:60]
 
 
 def main():
@@ -381,6 +435,7 @@ def main():
 
         conflicts = counter_race(ports)
         check_connections(ports[0])
+        check_malformed(ports[0])
         check_layouts(ports)
 
         assert request(ports[0], "POST", "/v1/lookup", {"rows": []}, key=None)[0] == 401

@@ -146,6 +146,12 @@ curl -H 'X-Nerva-Key: secret' -d '{"entries":[{"kind":"put","table":1,"id":"5","
 64-bit numbers (ids, ops, cursors) are decimal strings; values are the 80 bytes as hex. Layouts
 live in the log, in a reserved catalog table; the core still stores bytes and never reads them.
 
+Both gateways (`nerva api`, `nerva view`) execute one request at a time but read up to 16
+connections at once, so a slow client holds up nobody. A request must arrive whole within 10 s
+of connecting and carries one request per connection (`Connection: close`). Heads are parsed
+strictly: lines end in CRLF, bodies have a `Content-Length` (no `Transfer-Encoding`), and
+anything malformed answers `400`.
+
 **Documents** hold values larger than a row: up to 64 KiB under a string key (up to 1024 bytes
 of UTF-8) in a namespace (a `u64`, as a decimal string). Nerva chunks them over rows of a
 reserved table:
@@ -178,8 +184,8 @@ curl -H 'X-Nerva-Key: secret' 'http://127.0.0.1:8091/v1/views/revenue?as_of=1234
 answers for any op, including ops before it was declared, and every answer carries the SHA-256
 of its groups, so two view processes can show they agree. v0 keeps tables and their changes in
 `nerva view`'s memory (at most two million changes) and computes a view when it is read.
-`min_op=<n>` waits until the view process has applied op `n` (read-your-writes); views are
-rebuilt from the feed when the process restarts. `zig build test:views` checks views against a
+`min_op=<n>` answers once the view process has applied op `n` (read-your-writes), and `504` at
+once for an op not yet committed; views are rebuilt from the feed when the process restarts. `zig build test:views` checks views against a
 model on two view processes.
 
 ## Demos

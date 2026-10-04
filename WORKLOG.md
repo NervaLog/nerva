@@ -266,3 +266,19 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
 
 - `VERSION`: `0.2.0`. Documents (N41), adds (N42), the protocol release `0.0.2` (N43, data
   files from v0.1.0 must be reformatted), fixes #4 and #5. Notes: CHANGELOG.md.
+
+## 2026-10-04 — Gateway hardening (N45; #8, #9, #10)
+
+- `src/nerva/http_connection.zig`: a strict request-head parser (`head_parse`), a constant-time
+  key check (`key_matches`), and a `Receiver` that reads up to 16 connections at once with a
+  total 10 s deadline per request and hands out complete requests one at a time. Replaces
+  `std.http.Server` in both gateways.
+- `nerva api` and `nerva view` serve from the `Receiver`; their handlers return replies as
+  values. `nerva view` answers 504 at once for an op not yet committed, after one `catch_up`,
+  instead of waiting up to 10 s on its only thread.
+- Fixed #8 (a bare-LF head crashed both gateways before auth), #9 (a slow client stalled a
+  gateway; the deadline was per read) and #10 (key compared in variable time).
+- Tests: unit tests for `head_parse`, `key_matches` and the `Receiver` on loopback;
+  `tests/api/api.py` sends malformed heads and a dripping client alongside normal ones;
+  `tests/views/declared.py` checks the immediate 504, a dripping and a malformed client.
+

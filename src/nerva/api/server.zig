@@ -13,6 +13,8 @@ const CatalogStore = @import("catalog_store.zig").CatalogStore;
 
 /// The largest request body: a full commit request in JSON is well under this.
 const body_size_max = 4 * 1024 * 1024;
+/// Connections whose requests are read at once (N45): each holds a buffer of `body_size_max`.
+const connections_max = 16;
 
 pub const Options = struct {
     listen: std.net.Address,
@@ -23,33 +25,29 @@ pub const Options = struct {
 
 pub fn serve(gpa: std.mem.Allocator, client: *Client, options: Options) !noreturn {
     assert(options.key.len > 0);
-    var server = try options.listen.listen(.{ .reuse_address = true });
-    defer server.deinit();
-    log.info("listening on {}", .{server.listen_address});
-    if (options.on_listening) |on_listening| on_listening(server.listen_address);
+    var receiver = try http_connection.Receiver.init(gpa, options.listen, .{
+        .connections_max = connections_max,
+        .body_size_max = body_size_max,
+    });
+    defer receiver.deinit(gpa);
+    log.info("listening on {}", .{receiver.listen_address()});
+    if (options.on_listening) |on_listening| on_listening(receiver.listen_address());
 
     var layouts = CatalogStore.init(client);
     var arena_instance = std.heap.ArenaAllocator.init(gpa);
     defer arena_instance.deinit();
-    const read_buffer = try gpa.alloc(u8, 16 * 1024);
-    defer gpa.free(read_buffer);
 
     while (true) {
-        const connection = server.accept() catch |err| {
-            log.warn("accept: {}", .{err});
-            continue;
-        };
-        defer connection.stream.close();
-
-        // One request per connection, sent within a deadline, answered without delay (N37).
-        http_connection.prepare(connection.stream);
-        var http = std.http.Server.init(connection, read_buffer);
-        var request = http.receiveHead() catch continue;
+        // Requests are read from many connections at once, and served one at a time (N45).
+        const received = try receiver.next(-1) orelse continue;
         _ = arena_instance.reset(.retain_capacity);
         const arena = arena_instance.allocator();
-        serve_request(arena, client, &layouts, options, &request) catch |err| {
-            log.warn("request: {}", .{err});
-        };
+        const reply = serve_request(arena, client, &layouts, options, &received.request) catch |err|
+            reply: {
+                log.warn("request: {}", .{err});
+                break :reply api.Reply{ .status = 500, .body = "{\"error\":\"internal error\"}" };
+            };
+        receiver.respond(received, reply.status, reply.body);
     }
 }
 
@@ -58,57 +56,32 @@ fn serve_request(
     client: *Client,
     layouts: *CatalogStore,
     options: Options,
-    request: *std.http.Server.Request,
-) !void {
-    const target = request.head.target;
-    if (request.head.method == .GET and std.mem.eql(u8, target, "/healthz")) {
-        return respond(request, .{ .status = 200, .body = "{\"ok\":true}" });
+    request: *const http_connection.Request,
+) !api.Reply {
+    const target = request.target;
+    if (request.method == .get and std.mem.eql(u8, target, "/healthz")) {
+        return .{ .status = 200, .body = "{\"ok\":true}" };
     }
-    const method: api.Method = switch (request.head.method) {
-        .GET => .get,
-        .POST => .post,
-        .PUT => .put,
-        else => return respond(request, try api.error_reply(arena, 405, "method not allowed")),
+    const method: api.Method = switch (request.method) {
+        .get => .get,
+        .post => .post,
+        .put => .put,
+        .other => return api.error_reply(arena, 405, "method not allowed"),
     };
-
-    var key_header: ?[]const u8 = null;
-    var headers = request.iterateHeaders();
-    while (headers.next()) |header| {
-        if (std.ascii.eqlIgnoreCase(header.name, "x-nerva-key")) key_header = header.value;
-    }
-    const body = (try request.reader()).readAllAlloc(arena, body_size_max) catch |err|
-        switch (err) {
-            error.StreamTooLong => return respond(
-                request,
-                try api.error_reply(arena, 400, "body too large"),
-            ),
-            else => return err,
-        };
-    if (key_header == null or !std.mem.eql(u8, key_header.?, options.key)) {
-        return respond(request, try api.error_reply(arena, 401, "invalid key"));
+    if (!http_connection.key_matches(request.key, options.key)) {
+        return api.error_reply(arena, 401, "invalid key");
     }
 
-    const reply = api.handle(arena, client, layouts, method, target, body) catch |err|
+    return api.handle(arena, client, layouts, method, target, request.body) catch |err|
         switch (err) {
             error.Evicted, error.Timeout => {
                 log.err("{s}: {}", .{ target, err });
-                return respond(request, try api.error_reply(arena, 503, "cluster unavailable"));
+                return api.error_reply(arena, 503, "cluster unavailable");
             },
             error.OutOfMemory => return err,
             else => {
                 log.err("{s}: {}", .{ target, err });
-                return respond(request, try api.error_reply(arena, 500, "internal error"));
+                return api.error_reply(arena, 500, "internal error");
             },
         };
-    return respond(request, reply);
-}
-
-fn respond(request: *std.http.Server.Request, reply: api.Reply) !void {
-    try request.respond(reply.body, .{
-        .status = @enumFromInt(reply.status),
-        .keep_alive = false,
-        .extra_headers = &.{
-            .{ .name = "content-type", .value = "application/json" },
-        },
-    });
 }
