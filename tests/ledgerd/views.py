@@ -7,12 +7,19 @@ fuzzer), then requires:
 - the `journal` view to equal the oracle's `journal.log`, line for line, byte for byte;
 - the `spend` view to equal the agent spend rollup recomputed from the oracle's `ledger.txt`;
 - a restarted `nerva view` (rebuilt from the feed) to give the same answers;
+- every journal line to carry the op that wrote it;
+- `as_of` reads to reproduce the oracle's files as they were after sampled requests: every key
+  of `ledger.txt` and `results.txt` read at that request's op, and keys that did not exist yet
+  read as absent (G6, docs/DECISIONS.md N28);
 - `min_op` past the watermark to wait, then answer 504.
 
 Usage: views.py <path to nerva> [--seed=N] [--steps=N]
 """
-import http.client, os, sys, time
+import http.client, os, random, sys, time
 from conformance import Services, Checker, KEY, scenarios, fuzz, isolation
+
+SNAPSHOT_EVERY = 7
+KEYS_PER_SNAPSHOT = 40
 
 
 def view_get(port, path):
@@ -33,9 +40,84 @@ def view_lines(port, ledger, view):
 
 
 def journal_view(port, ledger):
+    """The journal's lines, and the op that wrote each."""
     op, lines = view_lines(port, ledger, "journal")
-    assert all(line.startswith("line_hex=") for line in lines), lines
-    return op, [bytes.fromhex(line[len("line_hex="):]) for line in lines]
+    entries = []
+    for line in lines:
+        assert line.startswith("line="), line
+        line_op, _, line_hex = line[len("line="):].partition(":")
+        assert 0 < int(line_op) <= op, (line_op, op)
+        entries.append((int(line_op), bytes.fromhex(line_hex)))
+    assert [o for o, _ in entries] == sorted(o for o, _ in entries), "journal out of op order"
+    return op, [line for _, line in entries]
+
+
+def as_of(port, ledger, key, op):
+    """`(op, value or None)`: a ledger key as it was at `op` ("latest" for now)."""
+    status, body = view_get(port, f"/v1/ledgers/{ledger}/as_of?op={op}&key_hex={key.encode().hex()}")
+    assert status == 200, (status, body)
+    lines = body.split("\n")
+    assert lines[0].startswith("op=") and lines[-1] == "ok=true", body
+    if lines[1] == "found=false":
+        assert len(lines) == 3, body
+        return int(lines[0][3:]), None
+    assert lines[1] == "found=true" and lines[2].startswith("value_hex=") and len(lines) == 4, body
+    return int(lines[0][3:]), bytes.fromhex(lines[2][len("value_hex="):]).decode()
+
+
+def oracle_state(oracle_dir):
+    """`ledger.txt` and `results.txt` as one map of ledgerd keys (results under `result.`)."""
+    state = {}
+    ledger = os.path.join(oracle_dir, "ledger.txt")
+    if os.path.exists(ledger):
+        for line in open(ledger, encoding="utf-8").read().split("\n"):
+            if line:
+                key, _, value = line.partition("=")
+                state[key] = value
+    results = os.path.join(oracle_dir, "results.txt")
+    if os.path.exists(results):
+        for line in open(results, encoding="utf-8").read().split("\n"):
+            if line:
+                rid, _, value_hex = line.partition("=")
+                state.setdefault("result." + rid, value_hex)  # `recall` finds the first.
+    return state
+
+
+class SnapshotChecker(Checker):
+    """Records the oracle's state, and the op it corresponds to, every few requests."""
+
+    def __init__(self, services, view_port):
+        super().__init__(services)
+        self.view_port = view_port
+        self.oracle_dir = os.path.join(services.tmp, "oracle")
+        self.snapshots = []
+
+    def same(self, route, fields, key=KEY):
+        actual = super().same(route, fields, key)
+        if self.requests % SNAPSHOT_EVERY == 0:
+            # Requests are sequential: the watermark after catching up is at or after this
+            # request's commit, and before the next one's.
+            op, available = as_of(self.view_port, 1, "available", "latest")
+            state = oracle_state(self.oracle_dir)
+            assert available == state.get("available"), (available, state.get("available"))
+            self.snapshots.append((op, state))
+        return actual
+
+
+def check_snapshots(port, snapshots, seed):
+    """Every snapshot, re-read as of its op: present keys equal, other keys absent."""
+    rng = random.Random(seed)
+    every_key = sorted(set().union(*(state.keys() for _, state in snapshots)))
+    reads = 0
+    for op, state in snapshots:
+        keys = set(rng.sample(every_key, min(KEYS_PER_SNAPSHOT, len(every_key))))
+        keys |= {"available", "held", "settled"}
+        for key in sorted(keys):
+            read_op, value = as_of(port, 1, key, op)
+            assert read_op == op, (read_op, op)
+            assert value == state.get(key), (op, key, value, state.get(key))
+            reads += 1
+    return reads
 
 
 def spend_view(port, ledger):
@@ -100,7 +182,7 @@ def main():
             return process, int(process.stdout.readline())
 
         view_process, view_port = start_view()
-        check = Checker(services)
+        check = SnapshotChecker(services, view_port)
         scenarios(check)
         fuzz(check, seed, steps)
         isolation(services)
@@ -112,6 +194,8 @@ def main():
         _, spend = spend_view(view_port, 1)
         assert spend == rollup_from_oracle(oracle_dir), (spend, rollup_from_oracle(oracle_dir))
         assert journal_view(view_port, 2)[1] == [] and spend_view(view_port, 2)[1] == []
+        reads = check_snapshots(view_port, check.snapshots, seed)
+        assert len(check.snapshots) > 10, len(check.snapshots)
 
         # A restarted view rebuilds from the feed and answers the same.
         view_process.kill()
@@ -126,7 +210,8 @@ def main():
         assert status == 504 and time.monotonic() - started >= 9, status
 
         print(f"ledgerd views: PASSED (journal {len(journal)} lines, spend {len(spend)} agents, "
-              f"through op {op}, seed {seed})")
+              f"{reads} as-of reads over {len(check.snapshots)} snapshots, through op {op}, "
+              f"seed {seed})")
     finally:
         services.close()
 

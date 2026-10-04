@@ -59,13 +59,14 @@ simulator workload and tests).
 
 Rows are identified by `(table, id)` and hold a fixed 80-byte value. A row's **version** is the
 op of its last write; zero means it has never existed, and deletes leave a tombstone so versions
-stay exact. Three operations:
+stay exact. Four operations:
 
 | Operation | Event → result | Semantics |
 |---|---|---|
 | `lookup_rows` | `RowKey` → `RowValue` | Point reads: value, `exists`, and version. |
 | `commit` | `Entry` → `EntryResult` | One batch is one transaction of `read` (asserts `op_seen`), `put` and `delete` entries. If any read is stale (`conflict`) or any entry invalid, nothing applies and the other entries report `aborted`; otherwise every entry reports `ok` with the commit op. |
 | `get_changes` | `ChangesFilter` → `Change[]` | Committed writes in op order from a timestamp cursor, ending with an `end` record that carries the next cursor and, when complete, the op the feed reflects. |
+| `get_history` | `HistoryFilter` → `Change[]` | One row's writes, newest first, through an index on the change feed. With `op_max = N`, the first change returned is the row as of op `N` (`Client.row_as_of`). |
 
 Commits execute serially in op order, so validating each read's version at commit time gives
 serializable transactions over point reads. The VOPR workload checks every reply against an
@@ -117,6 +118,12 @@ LEDGER_KEY=secret ./zig-out/bin/nerva ledgerd --cluster=0 --addresses=3001,3002,
 replies, scripted scenarios plus a seeded fuzzer), races two gateways on one ledger, and checks
 the views below against `ledgerd.py`'s own files.
 
+`/v1/store/get` and `/v1/store/put` (`name_hex`, `value_hex`) serve the runtime's `Store`
+ability, the agent state its daemon otherwise keeps as files in a state directory:
+continuations, code and receipts. They live outside the ledger's generations, so
+`/v1/admin/init` keeps them. `ledgerd.py` has no such routes; `tests/ledgerd/store.py` checks
+them against a model.
+
 ## Views
 
 `nerva view` follows the change feed and serves derived views of every ledgerd ledger, each
@@ -128,12 +135,21 @@ LEDGER_KEY=secret ./zig-out/bin/nerva view --cluster=0 --addresses=3001,3002,300
 curl -H 'X-Ledger-Key: secret' 'http://127.0.0.1:8091/v1/views/1/spend?min_op=latest'
 ```
 
-- `journal`: the ledger's journal lines in commit order.
+- `journal`: the ledger's journal lines in commit order, each with the op that wrote it.
 - `spend`: Botpike's agent spend rollup (own and subtree spend, settled and denied counts,
   depth) over the agent tree in the runtime's request ids.
 
 `min_op=<n>` waits until the view has applied op `n` (read-your-writes); `min_op=latest` first
 reads the feed to its end. Views live in memory and are rebuilt from the feed on restart.
+
+Any ledger key can be read as it was at any op, such as the op of a journal line, to see what
+an agent's allowance was when it decided:
+
+```bash
+curl -H 'X-Ledger-Key: secret' \
+    'http://127.0.0.1:8091/v1/ledgers/1/as_of?op=1234&key_hex=617661696c61626c65'
+```
+
 Decisions and their reasons: [docs/DECISIONS.md](./docs/DECISIONS.md).
 
 ## Roadmap
@@ -147,7 +163,8 @@ The 1.0 target, with Botpike as first customer, is in [docs/GOALS-1.0.md](./docs
    `nerva ledgerd` serving the Botpike runtime's ledger protocol. ✅
 4. **First derived view** — one incremental view, a watermark, and reads at a position. ✅
    (`nerva view`: `journal` and `spend` over ledgerd ledgers.)
-5. **Snapshots and subscriptions** — reads as of op `N`; change cursors.
+5. **Snapshots and subscriptions** — reads as of op `N` ✅ (`get_history`, `as_of`); change
+   cursors ✅ (`get_changes`); view snapshots.
 6. **Object storage tiering**, external operators, effect sinks.
 
 ## License

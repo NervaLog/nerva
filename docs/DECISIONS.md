@@ -174,3 +174,52 @@ After driving both services with the same requests, the `journal` view must equa
 `journal.log` line for line, and the `spend` view must equal the rollup recomputed independently
 from the oracle's `ledger.txt` (`done.` and `denied.` lines). A restarted view process must give
 the same answers.
+
+**N27. History is an index on the change feed: `get_history`.**
+G6 asks for any row as of any op. The change feed already keeps every write with its op and
+value, so history needs no second copy of the data: a derived index `row_key(table, id)` on
+`Change` (tree id 4) orders each row's writes by timestamp, and timestamps increase with op.
+`get_history` scans one row's changes newest first from a cursor (`timestamp_max`) and returns
+those with `op <= op_max`. Changes after `op_max` are skipped, but they count toward `limit`,
+so every call is bounded and pages on. The cursor counts down, and `end.op` is the query's op
+once the history is exhausted (as for `get_changes`). `op_max = 0` is invalid rather than
+meaning "no bound", because "as of op 0" must not quietly read the latest (caught by the first
+unit test); clients pass `maxInt(u64)` for the latest. Cost: 32 bytes of index per write. History
+is kept forever: pruning is not a 1.0 goal. Changed now because no Nerva data has been deployed.
+
+**N28. ledgerd keys are readable as of an op, through `nerva view`.**
+`GET /v1/ledgers/<ledger>/as_of?op=<n|latest>&key_hex=<hex>` reads a key as it was at op `n`:
+the ledger's generation as of `n`, then the key's chunk 0 as of `n`, then its tails, each of
+which must carry chunk 0's op. A read at `n` waits until the view has seen op `n` (else 504), so
+nothing can still commit at or before it; `latest` reads at the watermark. Journal lines are now
+`line=<op>:<hex>`, so "what did the ledger hold when this line was written" is one read. It is
+served by `nerva view` rather than the gateway because it is a read at a position, like the
+views, and the runtime never sees ops. Checked by snapshotting `ledgerd.py`'s `ledger.txt` and
+`results.txt` every 7th request and re-reading sampled keys (present and absent) as of each
+snapshot's op.
+
+**N29. (assumed) The runtime's `Store` ability is served as `/v1/store/get` and `/v1/store/put`.**
+G7 wants suspended agents in the log, not in files that two daemons can both claim. The runtime
+already funnels all agent state through one ability (`Store`: `get : Text -> Optional Bytes`,
+`put : Text -> Bytes -> ()`, runtime.u), whose production handler writes files. A Nerva handler
+needs only these two routes: `name_hex` and `value_hex`, replies in the ledger protocol's style.
+The values are chunked like ledger values but stored in table 1002 with no generations, because
+`/v1/admin/init` resets the ledger and must not erase agents. There is no delete route because
+the ability has none. The 64 KiB value limit holds: the runtime's demo suspends at 2–5 KB
+(`demo-output.txt`). The runtime's crash-safe suspend (staged `.next.*` files, committed by the
+sequence advance; runtime D34) works unchanged on top. An atomic suspend route, which would
+remove the staging, is a later proposal to the runtime, not an assumption made here.
+
+**N30. Not built: approval attribution and a claim lease. They wait on Botpike's identity model.**
+G7 also asks that every approval be attributed to an identity. The runtime never stores an
+approval: `brt approve <id> yes|no` passes the answer straight to `resume.plan`. The ledger
+protocol authenticates with one shared `X-Ledger-Key`, so Nerva cannot tell one approver from
+another. Attribution needs one of these:
+(a) the caller asserts an approver id, and the gateway records it beside the claim in one
+transaction (this trusts whoever holds the key);
+(b) each approver signs the answer with a key Botpike issues, and the gateway verifies the
+signature before recording it.
+Choosing between them settles the wire format, the stored record and key distribution. Getting
+it wrong means replacing the stored approval records, so it is not assumed. The claim lease
+that would remove the runtime's per-directory lock (D43) depends on the same question: a lease
+is held by an identity.

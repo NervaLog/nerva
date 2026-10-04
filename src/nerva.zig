@@ -25,6 +25,8 @@ pub const tree_ids = struct {
 
     pub const Change = .{
         .timestamp = 3,
+        // `row_key(table, id)`: a row's history, in timestamp order (`get_history`).
+        .row_key = 4,
     };
 };
 
@@ -167,10 +169,33 @@ pub const ChangesFilter = extern struct {
     }
 };
 
+/// The `get_history` event: one row's changes, newest first.
+///
+/// Changes are scanned newest first from `timestamp_max`, at most `limit` of them; those with
+/// `op <= op_max` are returned. The first returned change is the row as of `op_max`: its value if
+/// `put`, absent if `delete`; no change at all means the row did not exist at `op_max`.
+pub const HistoryFilter = extern struct {
+    id: u64,
+    table: u32,
+    /// The maximum number of changes to scan, excluding the final `end` record.
+    limit: u32,
+    /// Return changes with `op <= op_max`: `maxInt(u64)` for the latest. Zero is invalid (no op
+    /// is zero), so that "as of op 0" cannot be mistaken for "no bound".
+    op_max: u64,
+    /// The cursor: scan changes with `timestamp <= timestamp_max`. Zero means from the newest.
+    timestamp_max: u64,
+    reserved: [32]u8 = @splat(0),
+
+    comptime {
+        assert(@sizeOf(HistoryFilter) == 64);
+        assert(stdx.no_padding(HistoryFilter));
+    }
+};
+
 pub const ChangeKind = enum(u8) {
     put = 1,
     delete = 2,
-    /// The last record of every `get_changes` reply.
+    /// The last record of every `get_changes` and `get_history` reply.
     end = 3,
 };
 
@@ -178,6 +203,8 @@ pub const ChangeKind = enum(u8) {
 ///
 /// Every `get_changes` reply ends with one `end` record: its `timestamp` is the cursor for the
 /// next call. If `flags.more` is unset, the feed is complete through `op`, the op of the query.
+/// `get_history` replies end the same way, except that the cursor counts down: the next call's
+/// `timestamp_max`, or zero once the row's history is exhausted.
 pub const Change = extern struct {
     id: u64,
     table: u32,
@@ -207,12 +234,14 @@ pub const Operation = enum(u8) {
     lookup_rows = constants.vsr_operations_reserved + 0,
     commit = constants.vsr_operations_reserved + 1,
     get_changes = constants.vsr_operations_reserved + 2,
+    get_history = constants.vsr_operations_reserved + 3,
 
     pub fn EventType(comptime operation: Operation) type {
         return switch (operation) {
             .lookup_rows => RowKey,
             .commit => Entry,
             .get_changes => ChangesFilter,
+            .get_history => HistoryFilter,
         };
     }
 
@@ -220,7 +249,7 @@ pub const Operation = enum(u8) {
         return switch (operation) {
             .lookup_rows => RowValue,
             .commit => EntryResult,
-            .get_changes => Change,
+            .get_changes, .get_history => Change,
         };
     }
 
@@ -240,7 +269,7 @@ pub const Operation = enum(u8) {
     pub inline fn is_batchable(operation: Operation) bool {
         return switch (operation) {
             .lookup_rows, .commit => true,
-            .get_changes => false,
+            .get_changes, .get_history => false,
         };
     }
 
@@ -248,7 +277,7 @@ pub const Operation = enum(u8) {
     pub inline fn is_multi_batch(operation: Operation) bool {
         return switch (operation) {
             .lookup_rows, .commit => true,
-            .get_changes => false,
+            .get_changes, .get_history => false,
         };
     }
 
@@ -270,11 +299,9 @@ pub const Operation = enum(u8) {
                 batch.len,
                 @sizeOf(operation_comptime.EventType()),
             )),
-            .get_changes => count: {
-                const filter = std.mem.bytesAsValue(
-                    ChangesFilter,
-                    batch[0..@sizeOf(ChangesFilter)],
-                );
+            inline .get_changes, .get_history => |operation_comptime| count: {
+                const Filter = operation_comptime.EventType();
+                const filter = std.mem.bytesAsValue(Filter, batch[0..@sizeOf(Filter)]);
                 // +1 for the `end` record.
                 break :count @min(
                     filter.limit +| 1,

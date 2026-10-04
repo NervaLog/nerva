@@ -4,6 +4,9 @@
 //! closes, run each route as one Nerva transaction (N11), and answer exactly as `ledgerd.py`
 //! does: `401` for a wrong `X-Ledger-Key`, `404` for an unknown route, `400` for a bad request,
 //! `GET /healthz` for liveness.
+//!
+//! `/v1/store/*` (not in `ledgerd.py`) serves the runtime's `Store` ability from `table_store`,
+//! in the same transaction-and-retry loop (N29).
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -11,7 +14,9 @@ const log = std.log.scoped(.ledgerd);
 
 const Client = @import("../client.zig").Client;
 const routes = @import("routes.zig");
-const Store = @import("store.zig").Store;
+const store_routes = @import("store_routes.zig");
+const store_module = @import("store.zig");
+const Store = store_module.Store;
 
 /// A route that keeps conflicting is answered 503 after this many attempts (N20).
 const attempts_max = 32;
@@ -36,7 +41,10 @@ pub fn serve(gpa: std.mem.Allocator, client: *Client, options: Options) !noretur
     log.info("ledger {}: listening on {}", .{ options.ledger, server.listen_address });
     if (options.on_listening) |on_listening| on_listening(server.listen_address);
 
-    var store: Store = .{ .client = client, .ledger = options.ledger };
+    var stores: Stores = .{
+        .ledger = .{ .client = client, .ledger = options.ledger },
+        .state = .{ .client = client, .ledger = options.ledger, .table = store_module.table_store },
+    };
     var arena_instance = std.heap.ArenaAllocator.init(gpa);
     defer arena_instance.deinit();
 
@@ -60,7 +68,7 @@ pub fn serve(gpa: std.mem.Allocator, client: *Client, options: Options) !noretur
                 },
             };
             _ = arena_instance.reset(.retain_capacity);
-            serve_request(arena_instance.allocator(), &store, options, &request) catch |err| {
+            serve_request(arena_instance.allocator(), &stores, options, &request) catch |err| {
                 log.warn("request: {}", .{err});
                 break;
             };
@@ -69,9 +77,16 @@ pub fn serve(gpa: std.mem.Allocator, client: *Client, options: Options) !noretur
     }
 }
 
+const Stores = struct {
+    /// The ledger: the routes of `ledgerd.py`.
+    ledger: Store,
+    /// Agent state: `/v1/store/*`.
+    state: Store,
+};
+
 fn serve_request(
     arena: std.mem.Allocator,
-    store: *Store,
+    stores: *Stores,
     options: Options,
     request: *std.http.Server.Request,
 ) !void {
@@ -96,9 +111,15 @@ fn serve_request(
     }
 
     const fields = try routes.fields_parse(arena, body);
+    const state = std.mem.startsWith(u8, target, store_routes.prefix);
+    const store = if (state) &stores.state else &stores.ledger;
     for (0..attempts_max) |attempt| {
         try store.begin(arena);
-        const reply = routes.handle(arena, store, target, &fields) catch |err| {
+        const handled = if (state)
+            store_routes.handle(arena, store, target, &fields)
+        else
+            routes.handle(arena, store, target, &fields);
+        const reply = handled catch |err| {
             log.err("{s}: {}", .{ target, err });
             return switch (err) {
                 error.Evicted, error.Timeout => respond(request, 503, "error=ledger unavailable"),

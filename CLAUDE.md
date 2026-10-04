@@ -35,7 +35,7 @@ the VOPR simulator are vendored from TigerBeetle; Nerva's own code is `src/nerva
 ./zig/zig build vopr -- <seed>  # Simulator; a seed reproduces a run exactly (~5 min ReleaseSafe)
 ./zig/zig build fuzz -- smoke
 ./zig/zig build test:integration  # Real 3-replica cluster + client (~20 s, ~3.5 GiB disk)
-./zig/zig build test:ledgerd  # nerva ledgerd vs Botpike's ledgerd.py + a race (python3, ~2 min)
+./zig/zig build test:ledgerd  # ledgerd vs Botpike's ledgerd.py, race, views/as-of, store (~3 min)
 ./zig/zig build               # zig-out/bin/nerva
 ./zig/zig fmt src build.zig
 ```

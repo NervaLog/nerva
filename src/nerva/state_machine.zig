@@ -5,6 +5,8 @@
 //!   stale, or any entry is invalid, nothing is applied. Otherwise every write is applied at
 //!   this op and appended to the change feed.
 //! - `get_changes`: the change feed, scanned in timestamp (and therefore op) order.
+//! - `get_history`: one row's changes, newest first, through an index on the change feed: the
+//!   row as of any op (G6).
 //!
 //! All IO happens in `prefetch`; `commit` is synchronous and deterministic.
 
@@ -20,6 +22,7 @@ const nerva = @import("../nerva.zig");
 const GrooveType = @import("../lsm/groove.zig").GrooveType;
 const ForestType = @import("../lsm/forest.zig").ForestType;
 const ScanTreeType = @import("../lsm/scan_tree.zig").ScanTreeType;
+const ScanLookupType = @import("../lsm/scan_lookup.zig").ScanLookupType;
 const TimestampRange = @import("../lsm/timestamp_range.zig").TimestampRange;
 const MultiBatchDecoder = vsr.multi_batch.MultiBatchDecoder;
 const MultiBatchEncoder = vsr.multi_batch.MultiBatchEncoder;
@@ -32,6 +35,7 @@ const RowKey = nerva.RowKey;
 const RowValue = nerva.RowValue;
 const Change = nerva.Change;
 const ChangesFilter = nerva.ChangesFilter;
+const HistoryFilter = nerva.HistoryFilter;
 const tree_ids = nerva.tree_ids;
 
 pub fn StateMachineType(comptime Storage: type) type {
@@ -87,7 +91,10 @@ pub fn StateMachineType(comptime Storage: type) type {
             Change,
             .{
                 .ids = tree_ids.Change,
-                .batch_value_count_max = .{ .timestamp = commit_entries_max },
+                .batch_value_count_max = .{
+                    .timestamp = commit_entries_max,
+                    .row_key = commit_entries_max,
+                },
                 .primary_key = "timestamp",
                 .primary_key_orphaned = false,
                 .unique_keys = &[_][:0]const u8{},
@@ -102,8 +109,14 @@ pub fn StateMachineType(comptime Storage: type) type {
                     "reserved_b",
                 },
                 .optional = &[_][:0]const u8{},
-                .derived = .{},
-                // Append only: never looked up or updated.
+                .derived = .{
+                    .row_key = struct {
+                        fn row_key(change: *const Change) ?u128 {
+                            return nerva.row_key(change.table, change.id);
+                        }
+                    }.row_key,
+                },
+                // Append only: never looked up by key or updated; scans read it from storage.
                 .objects_cache = false,
             },
         );
@@ -114,6 +127,11 @@ pub fn StateMachineType(comptime Storage: type) type {
         });
 
         const ChangesScanTree = ScanTreeType(void, ChangesGroove.ObjectTree, Storage);
+        const HistoryScanLookup = ScanLookupType(
+            ChangesGroove,
+            ChangesGroove.ScanBuilder.Scan,
+            Storage,
+        );
 
         /// The first write of a transaction that duplicates an earlier write's row.
         const WriteKey = struct { key: u128, index: u32 };
@@ -134,7 +152,8 @@ pub fn StateMachineType(comptime Storage: type) type {
         rows_prefetch_context: RowsGroove.PrefetchContext = undefined,
 
         changes_scan_tree: ChangesScanTree = undefined,
-        /// Results of the last `get_changes` prefetch, consumed by its commit.
+        history_scan_lookup: HistoryScanLookup = undefined,
+        /// Results of the last `get_changes` or `get_history` prefetch, consumed by its commit.
         changes_scan_buffer: []Change,
         /// The number of changes scanned, or null if the filter was invalid.
         changes_scan_count: ?u32 = null,
@@ -192,7 +211,9 @@ pub fn StateMachineType(comptime Storage: type) type {
                         .tree_options_object = .{
                             .batch_value_count_limit = commit_entries_limit,
                         },
-                        .tree_options_index = .{},
+                        .tree_options_index = .{
+                            .row_key = .{ .batch_value_count_limit = commit_entries_limit },
+                        },
                     },
                 },
             );
@@ -320,7 +341,7 @@ pub fn StateMachineType(comptime Storage: type) type {
                     }) catch unreachable; // Already validated by `input_valid()`.
                     break :payload body_decoder.payload;
                 },
-                .get_changes => message_body_used,
+                .get_changes, .get_history => message_body_used,
             };
             self.prepare_timestamp += prepare_delta(operation, payload);
         }
@@ -328,7 +349,7 @@ pub fn StateMachineType(comptime Storage: type) type {
         fn prepare_delta(operation: Operation, events: []const u8) u64 {
             return switch (operation) {
                 .commit => @divExact(events.len, @sizeOf(Entry)),
-                .lookup_rows, .get_changes => 0,
+                .lookup_rows, .get_changes, .get_history => 0,
             };
         }
 
@@ -356,6 +377,7 @@ pub fn StateMachineType(comptime Storage: type) type {
                 .lookup_rows => self.prefetch_rows(RowKey, message_body_used),
                 .commit => self.prefetch_rows(Entry, message_body_used),
                 .get_changes => self.prefetch_changes(message_body_used),
+                .get_history => self.prefetch_history(message_body_used),
             }
         }
 
@@ -456,6 +478,78 @@ pub fn StateMachineType(comptime Storage: type) type {
             self.prefetch_finish();
         }
 
+        fn prefetch_history(
+            self: *StateMachine,
+            body: []align(constants.cache_line_size) const u8,
+        ) void {
+            assert(self.changes_scan_count == null);
+            const filter = history_filter(body);
+
+            const limit = history_limit(filter) orelse {
+                log.debug("get_history: invalid filter {}", .{filter});
+                return self.prefetch_finish();
+            };
+            assert(limit > 0);
+            assert(limit <= changes_limit_max);
+
+            const changes = &self.forest.grooves.changes;
+            const scan = changes.scan_builder.scan_prefix(
+                .row_key,
+                self.forest.scan_buffer_pool.acquire_assume_capacity(),
+                self.prefetch_snapshot.?,
+                nerva.row_key(filter.table, filter.id),
+                .{
+                    .min = TimestampRange.timestamp_min,
+                    .max = if (filter.timestamp_max == 0)
+                        TimestampRange.timestamp_max
+                    else
+                        filter.timestamp_max,
+                },
+                .descending,
+            );
+            self.changes_scan_count = 0;
+            self.history_scan_lookup = HistoryScanLookup.init(changes, scan);
+            self.history_scan_lookup.read(
+                self.changes_scan_buffer[0..limit],
+                prefetch_history_callback,
+            );
+        }
+
+        fn prefetch_history_callback(
+            scan_lookup: *HistoryScanLookup,
+            results: []const Change,
+        ) void {
+            const self: *StateMachine =
+                @alignCast(@fieldParentPtr("history_scan_lookup", scan_lookup));
+            assert(self.changes_scan_count.? == 0);
+            assert(results.len <= history_limit(history_filter(self.prefetch_input.?)).?);
+            assert(results.len == 0 or results.ptr == self.changes_scan_buffer.ptr);
+
+            self.changes_scan_count = @intCast(results.len);
+            self.forest.scan_buffer_pool.reset();
+            self.forest.grooves.changes.scan_builder.reset();
+            self.prefetch_finish();
+        }
+
+        fn history_filter(body: []align(constants.cache_line_size) const u8) *const HistoryFilter {
+            assert(body.len == @sizeOf(HistoryFilter));
+            return @alignCast(
+                std.mem.bytesAsValue(HistoryFilter, body[0..@sizeOf(HistoryFilter)]),
+            );
+        }
+
+        /// The effective limit of a valid filter, or null if the filter is invalid.
+        fn history_limit(filter: *const HistoryFilter) ?u32 {
+            if (filter.table == 0) return null;
+            if (filter.limit == 0) return null;
+            if (filter.op_max == 0) return null;
+            if (!stdx.zeroed(&filter.reserved)) return null;
+            if (filter.timestamp_max != 0 and !TimestampRange.valid(filter.timestamp_max)) {
+                return null;
+            }
+            return @min(filter.limit, changes_limit_max);
+        }
+
         fn prefetch_finish(self: *StateMachine) void {
             assert(self.prefetch_operation != null);
             assert(self.prefetch_input != null);
@@ -490,6 +584,7 @@ pub fn StateMachineType(comptime Storage: type) type {
                     output_buffer,
                 ),
                 .get_changes => self.execute_get_changes(op, message_body_used, output_buffer),
+                .get_history => self.execute_get_history(op, message_body_used, output_buffer),
             };
         }
 
@@ -526,7 +621,7 @@ pub fn StateMachineType(comptime Storage: type) type {
                         batch,
                         reply_encoder.writable().?,
                     ),
-                    .get_changes => comptime unreachable,
+                    .get_changes, .get_history => comptime unreachable,
                 };
                 reply_encoder.add(@intCast(bytes_written));
             }
@@ -762,6 +857,56 @@ pub fn StateMachineType(comptime Storage: type) type {
                 .value = @splat(0),
             };
             return (count + 1) * @sizeOf(Change);
+        }
+
+        fn execute_get_history(
+            self: *StateMachine,
+            op: u64,
+            message_body_used: []align(constants.cache_line_size) const u8,
+            output_buffer: *align(constants.cache_line_size) [constants.message_body_size_max]u8,
+        ) usize {
+            defer self.changes_scan_count = null;
+            const filter = history_filter(message_body_used);
+            const limit = history_limit(filter) orelse {
+                assert(self.changes_scan_count == null);
+                return 0;
+            };
+            const count = self.changes_scan_count.?;
+            assert(count <= limit);
+            const scanned = self.changes_scan_buffer[0..count];
+
+            const results = stdx.bytes_as_slice(.inexact, Change, output_buffer)[0 .. count + 1];
+            var returned: u32 = 0;
+            for (scanned, 0..) |*change, index| {
+                assert(change.table == filter.table);
+                assert(change.id == filter.id);
+                assert(change.kind == .put or change.kind == .delete);
+                assert(change.op < op);
+                if (filter.timestamp_max != 0) assert(change.timestamp <= filter.timestamp_max);
+                if (index > 0) {
+                    assert(change.timestamp < scanned[index - 1].timestamp);
+                    assert(change.op <= scanned[index - 1].op);
+                }
+                if (change.op > filter.op_max) {
+                    // Newest first: changes after `op_max` all come before the first returned.
+                    assert(returned == 0);
+                    continue;
+                }
+                results[returned] = change.*;
+                returned += 1;
+            }
+
+            const more = count == limit;
+            results[returned] = .{
+                .id = 0,
+                .table = 0,
+                .kind = .end,
+                .flags = .{ .more = more },
+                .op = if (more) 0 else op,
+                .timestamp = if (more) scanned[count - 1].timestamp - 1 else 0,
+                .value = @splat(0),
+            };
+            return (returned + 1) * @sizeOf(Change);
         }
     };
 }

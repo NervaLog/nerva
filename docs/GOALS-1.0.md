@@ -97,5 +97,15 @@ arrangement either way.
    own files (DECISIONS N21–N26).
 
 4. **As-of reads and workflow state** (G6, G7).
+   - G6 ✅ `get_history` reads any row as of any op, through an index on the change feed. `nerva
+     view` serves any ledger key `as_of` an op, and stamps each journal line with its op.
+     Checked by the VOPR model and by re-reading `ledgerd.py`'s files as of sampled requests
+     (DECISIONS N27, N28).
+   - G7, agent state ✅ `/v1/store/*` serves the runtime's `Store` ability from Nerva, so
+     suspended agents, their code and their receipts live in the replicated log (N29).
+   - G7, attribution: **waiting on a decision** (N30). The runtime never stores an approval: `brt
+     approve <id> yes|no` hands the answer straight to the resume. Recording who approved needs
+     an identity model that Botpike owns. The claim lease that would replace the runtime's
+     per-directory lock (runtime D43) waits on the same answer.
 5. **Effect sinks** (G5) and **conditional operations for hot balances** (G8).
 6. **Botpike integration**: facts, receipts and views on Nerva, balances per the G8 decision.

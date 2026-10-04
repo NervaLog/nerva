@@ -1,5 +1,5 @@
 //! The VOPR workload for Nerva: random transactions over a small key space (so that conflicts
-//! are common), point lookups and change-feed scans.
+//! are common), point lookups, change-feed scans and row histories (as-of reads).
 //!
 //! It also plays Botpike's receipt race: several clients (daemons) race to claim the same few
 //! receipts, each claim being a read at the version seen plus a write of the next sequence. The
@@ -28,6 +28,7 @@ const RowKey = nerva.RowKey;
 const RowValue = nerva.RowValue;
 const Change = nerva.Change;
 const ChangesFilter = nerva.ChangesFilter;
+const HistoryFilter = nerva.HistoryFilter;
 const value_size = nerva.value_size;
 
 /// The table holding Botpike-style receipts. Random transactions never touch it.
@@ -116,6 +117,9 @@ pub fn WorkloadType(comptime StateMachine: type) type {
         receipt_seqs: std.AutoHashMapUnmanaged(u64, u64) = .{},
         claims_won: u64 = 0,
         claims_lost: u64 = 0,
+        /// Changes returned by `get_history`, and those skipped for being after `op_max`.
+        history_returned: u64 = 0,
+        history_skipped: u64 = 0,
 
         pub const Options = struct {
             batch_size_limit: u32,
@@ -163,12 +167,15 @@ pub fn WorkloadType(comptime StateMachine: type) type {
         }
 
         pub fn deinit(workload: *Workload, allocator: std.mem.Allocator) void {
-            log.info("transactions committed={} failed={} changes={} claims won={} lost={}", .{
+            log.info("transactions committed={} failed={} changes={} claims won={} lost={} " ++
+                "history returned={} skipped={}", .{
                 workload.transactions_committed,
                 workload.transactions_failed,
                 workload.changes.items.len,
                 workload.claims_won,
                 workload.claims_lost,
+                workload.history_returned,
+                workload.history_skipped,
             });
             workload.receipt_seqs.deinit(allocator);
             workload.rows.deinit(allocator);
@@ -192,6 +199,7 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                 .claim = 4,
                 .lookup_rows = 3,
                 .get_changes = 2,
+                .get_history = 2,
             })) {
                 .commit => .{ .operation = .commit, .size = workload.build_commit(body_limited) },
                 .claim => .{
@@ -205,6 +213,10 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                 .get_changes => .{
                     .operation = .get_changes,
                     .size = workload.build_get_changes(body),
+                },
+                .get_history => .{
+                    .operation = .get_history,
+                    .size = workload.build_get_history(body),
                 },
             };
         }
@@ -397,6 +409,48 @@ pub fn WorkloadType(comptime StateMachine: type) type {
             return @sizeOf(ChangesFilter);
         }
 
+        fn build_get_history(
+            workload: *Workload,
+            body: []align(constants.cache_line_size) u8,
+        ) usize {
+            const prng = workload.prng;
+            const changes = workload.changes.items;
+            const filter: *HistoryFilter = @alignCast(
+                std.mem.bytesAsValue(HistoryFilter, body[0..@sizeOf(HistoryFilter)]),
+            );
+            const known: ?*const Change = if (changes.len == 0) null else &changes[
+                prng.index(changes)
+            ];
+            filter.* = .{
+                // Table zero is invalid, and must return nothing.
+                .table = if (prng.chance(stdx.PRNG.ratio(1, 4)))
+                    receipts_table
+                else
+                    prng.int_inclusive(u32, workload.options.table_count),
+                .id = prng.int_inclusive(u64, @max(
+                    workload.options.id_count,
+                    workload.options.receipt_count,
+                ) - 1),
+                // Zero is an invalid limit, and must return nothing.
+                .limit = prng.int_inclusive(u32, 16),
+                .op_max = switch (prng.chances(.{ .latest = 2, .past = 4, .invalid = 1 })) {
+                    .latest => std.math.maxInt(u64),
+                    .past => prng.range_inclusive(u64, 1, @max(1, workload.op_max)),
+                    .invalid => 0,
+                },
+                .timestamp_max = switch (prng.chances(.{ .newest = 3, .known = 2 })) {
+                    .newest => 0,
+                    .known => if (known) |change| change.timestamp else 0,
+                },
+            };
+            // Mostly ask about rows that have a history.
+            if (known != null and prng.chance(stdx.PRNG.ratio(1, 2))) {
+                filter.table = known.?.table;
+                filter.id = known.?.id;
+            }
+            return @sizeOf(HistoryFilter);
+        }
+
         pub fn on_reply(
             workload: *Workload,
             client_index: usize,
@@ -413,6 +467,7 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                 .commit => workload.check_commit(timestamp, request_body, reply_body),
                 .lookup_rows => workload.check_lookup_rows(request_body, reply_body),
                 .get_changes => workload.check_get_changes(request_body, reply_body),
+                .get_history => workload.check_get_history(request_body, reply_body),
             }
         }
 
@@ -643,6 +698,63 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                 filter.timestamp_min
             else
                 results[count - 1].timestamp + 1);
+        }
+
+        /// The model's history of the row: its changes newest first, from `timestamp_max`, at most
+        /// `limit` scanned; those after `op_max` are scanned but not returned (G6).
+        fn check_get_history(
+            workload: *Workload,
+            request_body: []align(constants.cache_line_size) const u8,
+            reply_body: []align(constants.cache_line_size) const u8,
+        ) void {
+            const filter: *const HistoryFilter = @alignCast(
+                std.mem.bytesAsValue(HistoryFilter, request_body[0..@sizeOf(HistoryFilter)]),
+            );
+            const results = stdx.bytes_as_slice(.exact, Change, reply_body);
+            if (filter.table == 0 or filter.limit == 0 or filter.op_max == 0) {
+                assert(results.len == 0);
+                return;
+            }
+            const limit = @min(filter.limit, StateMachine.changes_limit_max);
+            assert(results.len >= 1);
+
+            var scanned: u32 = 0;
+            var returned: usize = 0;
+            var timestamp_last: u64 = 0;
+            var index = workload.changes.items.len;
+            while (index > 0 and scanned < limit) {
+                index -= 1;
+                const expected = &workload.changes.items[index];
+                if (expected.table != filter.table or expected.id != filter.id) continue;
+                if (filter.timestamp_max != 0 and expected.timestamp > filter.timestamp_max) {
+                    continue;
+                }
+                scanned += 1;
+                timestamp_last = expected.timestamp;
+                if (expected.op > filter.op_max) {
+                    workload.history_skipped += 1;
+                    continue;
+                }
+                assert(returned < results.len - 1);
+                assert(stdx.equal_bytes(Change, &results[returned], expected));
+                returned += 1;
+                workload.history_returned += 1;
+            }
+            assert(results.len == returned + 1);
+
+            const end = results[returned];
+            assert(end.kind == .end);
+            assert(end.id == 0 and end.table == 0);
+            assert(stdx.zeroed(&end.value));
+            assert(end.flags.more == (scanned == limit));
+            if (end.flags.more) {
+                assert(end.op == 0);
+                assert(end.timestamp == timestamp_last - 1);
+            } else {
+                assert(end.op > workload.op_max);
+                assert(end.timestamp == 0);
+                workload.op_max = end.op;
+            }
         }
     };
 }

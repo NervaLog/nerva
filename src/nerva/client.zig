@@ -26,10 +26,14 @@ const RowValue = nerva.RowValue;
 const Entry = nerva.Entry;
 const EntryResult = nerva.EntryResult;
 const ChangesFilter = nerva.ChangesFilter;
+const HistoryFilter = nerva.HistoryFilter;
 const Change = nerva.Change;
 
 const VSRClient = vsr.ClientType(Operation, MessageBus);
 const Body = [constants.message_body_size_max]u8;
+
+/// Changes per `get_history` call in `row_as_of`.
+const history_page_limit = 64;
 
 pub const Client = struct {
     pub const Options = struct {
@@ -175,6 +179,60 @@ pub const Client = struct {
         assert(reply.len <= changes.len);
         stdx.copy_disjoint(.exact, Change, changes[0..reply.len], reply);
         return reply.len;
+    }
+
+    /// Reads one row's history, newest first (see `HistoryFilter`). `changes.len` must hold
+    /// `filter.limit` changes plus the `end` record. Returns the number of records written (zero
+    /// if the filter is invalid).
+    pub fn get_history(client: *Client, filter: HistoryFilter, changes: []Change) Error!usize {
+        assert(changes.len >= @min(
+            filter.limit +| 1,
+            Operation.get_history.result_max(constants.message_body_size_max),
+        ));
+        try client.ensure_idle();
+        const body = std.mem.asBytes(&filter);
+        stdx.copy_disjoint(.exact, u8, client.request[0..body.len], body);
+        client.vsr_client.request(
+            on_reply,
+            @intFromPtr(client),
+            .get_history,
+            client.request[0..body.len],
+        );
+        try client.run_until_reply();
+
+        const reply = stdx.bytes_as_slice(.exact, Change, client.reply[0..client.reply_size.?]);
+        assert(reply.len <= changes.len);
+        stdx.copy_disjoint(.exact, Change, changes[0..reply.len], reply);
+        return reply.len;
+    }
+
+    /// The row as it was at `op` (G6): its last change at or before `op`, or null if it did not
+    /// exist then (never written, or deleted). Pages through changes made after `op`.
+    pub fn row_as_of(client: *Client, table: u32, id: u64, op: u64) Error!?Change {
+        assert(table != 0);
+        assert(op != 0);
+        var page: [history_page_limit + 1]Change = undefined;
+        var timestamp_max: u64 = 0;
+        while (true) {
+            const count = try client.get_history(.{
+                .table = table,
+                .id = id,
+                .limit = history_page_limit,
+                .op_max = op,
+                .timestamp_max = timestamp_max,
+            }, &page);
+            assert(count >= 1);
+            const end = page[count - 1];
+            assert(end.kind == .end);
+            if (count > 1) {
+                const change = page[0];
+                assert(change.op <= op);
+                return if (change.kind == .put) change else null;
+            }
+            if (!end.flags.more) return null;
+            assert(end.timestamp != 0);
+            timestamp_max = end.timestamp;
+        }
     }
 
     /// Sends `events` as a single batch and returns that batch's results.

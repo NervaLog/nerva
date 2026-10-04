@@ -28,6 +28,7 @@ comptime {
     _ = @import("nerva/cli.zig");
     _ = @import("nerva/ledgerd/routes.zig");
     _ = @import("nerva/ledgerd/store.zig");
+    _ = @import("nerva/ledgerd/store_routes.zig");
     _ = @import("nerva/state_machine_tests.zig");
     _ = @import("nerva/view/ledgerd.zig");
     _ = @import("nerva/view/server.zig");

@@ -174,6 +174,11 @@ const Context = struct {
         );
         return results[0];
     }
+
+    fn history(context: *Context, filter: nerva.HistoryFilter) ![]const Change {
+        const results = try context.execute(.get_history, &.{&.{filter}});
+        return results[0];
+    }
 };
 
 fn value(byte: u8) [nerva.value_size]u8 {
@@ -398,6 +403,91 @@ test "get_changes: committed writes in op order, paged by cursor" {
     const none = try context.changes(end.timestamp, 10);
     try testing.expectEqual(@as(usize, 1), none.len);
     try testing.expectEqual(end.timestamp, none[0].timestamp);
+}
+
+const latest = std.math.maxInt(u64);
+
+fn history_filter(
+    table: u32,
+    id: u64,
+    limit: u32,
+    op_max: u64,
+    timestamp_max: u64,
+) nerva.HistoryFilter {
+    return .{
+        .table = table,
+        .id = id,
+        .limit = limit,
+        .op_max = op_max,
+        .timestamp_max = timestamp_max,
+    };
+}
+
+test "get_history: a row as of any op, newest first, paged by cursor" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const context = try context_init(&arena);
+
+    const op_1 = (try context.commit(&.{&.{ put(1, 1, 1), put(1, 2, 7) }}))[0][0].op;
+    const op_2 = (try context.commit(&.{&.{put(1, 1, 2)}}))[0][0].op;
+    const op_3 = (try context.commit(&.{&.{delete(1, 1)}}))[0][0].op;
+    const op_4 = (try context.commit(&.{&.{put(1, 1, 4)}}))[0][0].op;
+    _ = try context.commit(&.{&.{ read(1, 1, op_1), put(1, 1, 9) }}); // Conflicts: no change.
+
+    // The whole history of (1, 1), newest first; other rows are not in it.
+    const all = try context.history(history_filter(1, 1, 10, latest, 0));
+    try testing.expectEqual(@as(usize, 5), all.len);
+    const ops = [_]u64{ op_4, op_3, op_2, op_1 };
+    const kinds = [_]nerva.ChangeKind{ .put, .delete, .put, .put };
+    const bytes = [_]u8{ 4, 0, 2, 1 };
+    for (all[0..4], ops, kinds, bytes) |change, op, kind, byte| {
+        try testing.expectEqual(op, change.op);
+        try testing.expectEqual(kind, change.kind);
+        try testing.expectEqual(value(byte), change.value);
+        try testing.expectEqual(@as(u64, 1), change.id);
+    }
+    try testing.expectEqual(nerva.ChangeKind.end, all[4].kind);
+    try testing.expect(!all[4].flags.more);
+    try testing.expect(all[4].op > op_4); // The op of the query itself.
+    try testing.expectEqual(@as(u64, 0), all[4].timestamp);
+
+    // As of each op: the first change returned is the row at that op.
+    const as_of_2 = try context.history(history_filter(1, 1, 10, op_2, 0));
+    try testing.expectEqual(@as(usize, 3), as_of_2.len);
+    try testing.expectEqual(op_2, as_of_2[0].op);
+    try testing.expectEqual(value(2), as_of_2[0].value);
+    const as_of_3 = try context.history(history_filter(1, 1, 1, op_3, 0));
+    // The scan reached op 4 first: no change returned yet, page on.
+    try testing.expectEqual(@as(usize, 1), as_of_3.len);
+    try testing.expect(as_of_3[0].flags.more);
+    try testing.expectEqual(all[0].timestamp - 1, as_of_3[0].timestamp);
+    const as_of_3_next = try context.history(history_filter(1, 1, 1, op_3, as_of_3[0].timestamp));
+    try testing.expectEqual(@as(usize, 2), as_of_3_next.len);
+    try testing.expectEqual(nerva.ChangeKind.delete, as_of_3_next[0].kind);
+    try testing.expectEqual(op_3, as_of_3_next[0].op);
+    try testing.expect(as_of_3_next[1].flags.more);
+
+    // Before the row's first write: nothing.
+    _ = try context.commit(&.{&.{put(1, 3, 3)}});
+    const op_5 = (try context.commit(&.{&.{put(1, 4, 5)}}))[0][0].op;
+    const before = try context.history(history_filter(1, 4, 10, op_5 - 1, 0));
+    try testing.expectEqual(@as(usize, 1), before.len);
+    try testing.expect(!before[0].flags.more);
+    const never = try context.history(history_filter(2, 1, 10, latest, 0));
+    try testing.expectEqual(@as(usize, 1), never.len);
+
+    // Invalid filters return nothing at all.
+    const invalid = [_]nerva.HistoryFilter{
+        history_filter(0, 1, 10, latest, 0), // Table zero.
+        history_filter(1, 1, 0, latest, 0), // No limit.
+        history_filter(1, 1, 10, 0, 0), // As of op zero.
+    };
+    for (invalid) |filter| {
+        try testing.expectEqual(@as(usize, 0), (try context.history(filter)).len);
+    }
+    var reserved = history_filter(1, 1, 10, latest, 0);
+    reserved.reserved[31] = 1;
+    try testing.expectEqual(@as(usize, 0), (try context.history(reserved)).len);
 }
 
 fn receipt(context: *Context, id: u64) !struct { op: u64, receipt: Receipt } {

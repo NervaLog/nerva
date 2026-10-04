@@ -9,6 +9,8 @@
 //! ids derived from (ledger, generation, key, chunk). Chunk 0 holds a header, then the key, then
 //! the value; chunks 1.. continue the stream. The ledger's root row (`table_roots`, id = ledger)
 //! holds the generation.
+//!
+//! `get_as_of` reads a key as it was at any op, from the rows' histories (G6).
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -26,6 +28,9 @@ const value_size = nerva.value_size;
 
 pub const table_rows: u32 = 1000;
 pub const table_roots: u32 = 1001;
+/// The runtime's `Store` ability (agent state: continuations, code, receipts): chunked like
+/// `table_rows`, but outside the ledger's generations, so `/v1/admin/init` keeps it (N29).
+pub const table_store: u32 = 1002;
 
 /// The longest value a key may hold.
 pub const value_size_max = 64 * 1024;
@@ -183,6 +188,8 @@ pub const Error = Client.Error || error{
 pub const Store = struct {
     client: *Client,
     ledger: u64,
+    /// `table_rows` (the ledger, with generations) or `table_store` (generation always 0).
+    table: u32 = table_rows,
 
     arena: std.mem.Allocator = undefined,
     generation: u64 = undefined,
@@ -204,6 +211,11 @@ pub const Store = struct {
         store.writes = .{};
         store.cache = .{};
 
+        assert(store.table == table_rows or store.table == table_store);
+        if (store.table == table_store) {
+            store.generation = 0;
+            return;
+        }
         const root = try store.lookup(table_roots, store.ledger);
         store.generation = if (root.flags.exists)
             std.mem.readInt(u64, root.value[0..8], .little)
@@ -215,7 +227,8 @@ pub const Store = struct {
         if (store.cache.get(key)) |cached| return cached;
         if (key.len > key_size_max) return error.TooLarge;
 
-        const chunk0 = try store.lookup(table_rows, row_id(store.ledger, store.generation, key, 0));
+        const id0 = row_id(store.ledger, store.generation, key, 0);
+        const chunk0 = try store.lookup(store.table, id0);
         const value: ?[]const u8 = if (!chunk0.flags.exists) null else value: {
             const count = try chunk0_count(&chunk0.value);
             const chunks = try store.arena.alloc([value_size]u8, count);
@@ -225,7 +238,7 @@ pub const Store = struct {
                 for (keys, 1..) |*row_key, chunk| {
                     row_key.* = .{
                         .id = chunk_id(store.ledger, store.generation, key, @intCast(chunk)),
-                        .table = table_rows,
+                        .table = store.table,
                     };
                 }
                 const rows = try store.arena.alloc(RowValue, keys.len);
@@ -253,7 +266,7 @@ pub const Store = struct {
         for (chunks, 0..) |*chunk, index| {
             try store.write(.{
                 .id = chunk_id(store.ledger, store.generation, key, @intCast(index)),
-                .table = table_rows,
+                .table = store.table,
                 .kind = .put,
                 .op_seen = 0,
                 .value = chunk.*,
@@ -270,7 +283,7 @@ pub const Store = struct {
     pub fn remove(store: *Store, key: []const u8) Error!void {
         try store.write(.{
             .id = row_id(store.ledger, store.generation, key, 0),
-            .table = table_rows,
+            .table = store.table,
             .kind = .delete,
             .op_seen = 0,
             .value = @splat(0),
@@ -286,6 +299,7 @@ pub const Store = struct {
 
     /// Starts a new generation: every key reads as absent (N15).
     pub fn reset(store: *Store) Error!void {
+        assert(store.table == table_rows);
         store.generation += 1;
         var root: [value_size]u8 = @splat(0);
         std.mem.writeInt(u64, root[0..8], store.generation, .little);
@@ -366,6 +380,43 @@ pub const Store = struct {
         try store.writes.put(store.arena, .{ .table = entry.table, .id = entry.id }, entry);
     }
 };
+
+/// A ledger key's value as it was at `op` (G6), or null if the key did not exist then. Reads
+/// each row as of `op`: the ledger's generation, then the key's chunks in that generation.
+pub fn get_as_of(
+    client: *Client,
+    arena: std.mem.Allocator,
+    ledger: u64,
+    key: []const u8,
+    op: u64,
+) Error!?[]const u8 {
+    assert(op != 0);
+    if (key.len > key_size_max) return error.TooLarge;
+
+    const generation: u64 = if (try client.row_as_of(table_roots, ledger, op)) |root|
+        std.mem.readInt(u64, root.value[0..8], .little)
+    else
+        0;
+    const chunk0 = try client.row_as_of(table_rows, chunk_id(ledger, generation, key, 0), op) orelse
+        return null;
+    const count = try chunk0_count(&chunk0.value);
+    const chunks = try arena.alloc([value_size]u8, count);
+    chunks[0] = chunk0.value;
+    for (chunks[1..], 1..) |*chunk, index| {
+        const tail = try client.row_as_of(
+            table_rows,
+            chunk_id(ledger, generation, key, @intCast(index)),
+            op,
+        ) orelse return error.Corrupt;
+        // A value's chunks are written together, in one op.
+        if (tail.op != chunk0.op) return error.Corrupt;
+        chunk.* = tail.value;
+    }
+    const decoded = try chunks_decode(arena, chunks);
+    if (!std.mem.eql(u8, decoded.key, key)) return error.Corrupt;
+    if (decoded.ledger != ledger or decoded.generation != generation) return error.Corrupt;
+    return decoded.value;
+}
 
 const testing = std.testing;
 

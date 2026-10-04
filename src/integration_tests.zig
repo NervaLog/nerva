@@ -194,6 +194,12 @@ fn lookup(client: *Client, table: u32, id: u64) !RowValue {
     return result[0];
 }
 
+fn expect_as_of(client: *Client, op: u64, byte: u8) !void {
+    const change = (try client.row_as_of(1, 1, op)).?;
+    try testing.expect(change.op <= op);
+    try testing.expectEqual(value(byte), change.value);
+}
+
 fn commit(client: *Client, entries: []const Entry) ![]const EntryResult {
     const results = try gpa.alloc(EntryResult, entries.len);
     try client.commit(entries, results);
@@ -266,6 +272,13 @@ fn scenario_cluster() !void {
     try testing.expectEqual(op_put, changes_all.items[0].op);
     try testing.expectEqual(workload.receipts_table, changes_all.items[2].table);
 
+    // As-of reads (G6): row 1 as it was at each op, from either client.
+    try expect_as_of(daemon_b, op_put, 0xaa);
+    try expect_as_of(daemon_a, fresh[0].op, 0xbb);
+    try expect_as_of(daemon_a, std.math.maxInt(u64), 0xbb);
+    try testing.expect(op_put > 1); // Client registration commits first.
+    try testing.expectEqual(null, try daemon_b.row_as_of(1, 1, op_put - 1));
+
     // Crash replica 2: the other two still form a quorum.
     cluster.stop(2);
     var expected: [16]u8 = undefined;
@@ -285,6 +298,8 @@ fn scenario_cluster() !void {
         try testing.expect(row_back.flags.exists);
         try testing.expectEqual(value(byte), row_back.value);
     }
+    // Replica 2's history index caught up too.
+    try expect_as_of(daemon_b, op_put, 0xaa);
     const after_failover = try commit(daemon_b, &.{put(200, 0xdd)});
     defer gpa.free(after_failover);
     try expect_statuses(after_failover, &.{.ok});

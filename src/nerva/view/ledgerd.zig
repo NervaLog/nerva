@@ -1,6 +1,7 @@
 //! Views over `nerva ledgerd` ledgers, maintained from the change feed (docs/DECISIONS.md N24).
 //!
-//! - `journal`: a ledger's journal lines in commit order (N19 left the order to the feed).
+//! - `journal`: a ledger's journal lines in commit order (N19 left the order to the feed), each
+//!   with the op that wrote it: the position to read the ledger as of (G6).
 //! - `spend`: Botpike's agent spend rollup (own and subtree settled spend, settled and denied
 //!   counts, depth), over the agent tree that the runtime's request ids encode (runtime D6:
 //!   `agent:sequence:step`, then `/child:step` per sub-agent).
@@ -24,7 +25,7 @@ pub const LedgerdViews = struct {
 
     pub const Ledger = struct {
         generation: u64 = 0,
-        journal: std.ArrayListUnmanaged([]const u8) = .{},
+        journal: std.ArrayListUnmanaged(JournalLine) = .{},
         /// Agent path (segments joined by '/') → spend.
         spend: std.StringHashMapUnmanaged(Spend) = .{},
         /// `done.`/`denied.` key → what it contributed, so a rewrite replaces, not adds.
@@ -39,6 +40,8 @@ pub const LedgerdViews = struct {
             ledger.generation = generation;
         }
     };
+
+    pub const JournalLine = struct { op: u64, line: []const u8 };
 
     pub const Spend = struct {
         own: u64 = 0,
@@ -64,7 +67,6 @@ pub const LedgerdViews = struct {
 
     /// Applies one complete op (called by the follower, in op order).
     pub fn apply(views: *LedgerdViews, op: u64, changes: []const Change) !void {
-        _ = op;
         // Rows first: a value's chunks may arrive in any order within the op.
         for (changes) |*change| {
             switch (change.table) {
@@ -87,7 +89,7 @@ pub const LedgerdViews = struct {
             var arena = std.heap.ArenaAllocator.init(views.allocator);
             defer arena.deinit();
             const decoded = views.chunk0_decode(arena.allocator(), change.id) orelse continue;
-            try views.value_apply(decoded);
+            try views.value_apply(op, decoded);
         }
     }
 
@@ -110,14 +112,17 @@ pub const LedgerdViews = struct {
         return decoded;
     }
 
-    fn value_apply(views: *LedgerdViews, decoded: store.Decoded) !void {
+    fn value_apply(views: *LedgerdViews, op: u64, decoded: store.Decoded) !void {
         const ledger = try views.ledger_get(decoded.ledger);
         if (decoded.generation > ledger.generation) ledger.reset(decoded.generation);
         if (decoded.generation < ledger.generation) return; // A write to a forgotten generation.
         const arena = ledger.arena.allocator();
 
         if (std.mem.startsWith(u8, decoded.key, "journal.")) {
-            try ledger.journal.append(arena, try arena.dupe(u8, decoded.value));
+            try ledger.journal.append(arena, .{
+                .op = op,
+                .line = try arena.dupe(u8, decoded.value),
+            });
             return;
         }
 
@@ -169,7 +174,7 @@ pub const LedgerdViews = struct {
         return entry.value_ptr.*;
     }
 
-    pub fn journal(views: *const LedgerdViews, ledger_id: u64) []const []const u8 {
+    pub fn journal(views: *const LedgerdViews, ledger_id: u64) []const JournalLine {
         const ledger = views.ledgers.get(ledger_id) orelse return &.{};
         return ledger.journal.items;
     }
@@ -310,8 +315,10 @@ test "ledgerd views: journal and spend rollup from chunked rows" {
 
     const journal = views.journal(1);
     try testing.expectEqual(@as(usize, 2), journal.len);
-    try testing.expectEqualStrings("RESERVE  3000  llm.complete  [planner-1:0:0]", journal[0]);
-    try testing.expectEqualStrings("x" ** 300, journal[1]);
+    try testing.expectEqualStrings("RESERVE  3000  llm.complete  [planner-1:0:0]", journal[0].line);
+    try testing.expectEqual(@as(u64, 1), journal[0].op);
+    try testing.expectEqualStrings("x" ** 300, journal[1].line);
+    try testing.expectEqual(@as(u64, 2), journal[1].op);
 
     const rollup = try views.rollup(arena, 1);
     try testing.expectEqual(@as(usize, 2), rollup.len);

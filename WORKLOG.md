@@ -122,3 +122,23 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
 - Verified: `test:unit` 287/288 (sandbox perf test); `test:integration`; `test:ledgerd`
   (conformance, race, views); views over seeds 1–4; VOPR seeds 1, 2, 5 replay with identical
   tick counts.
+
+## 2026-10-04 — 1.0 Milestone 4 (part): as-of reads and agent state
+
+- Core: `get_history` (operation 131), one row's changes newest first, with `op_max` (as of)
+  and a counting-down cursor. Served from a derived index on the change feed (`Change.row_key`,
+  tree id 4); `Client.get_history` and `Client.row_as_of` (N27).
+- VOPR: random histories checked against the model's change list; mutation-tested (an
+  off-by-one in the `op_max` filter is caught).
+- ledgerd: `store.get_as_of` reads a key as of an op (generation, chunk 0 and tails, each as of
+  that op). `nerva view` serves `GET /v1/ledgers/<ledger>/as_of?op=&key_hex=`, and journal
+  lines are now `line=<op>:<hex>` (N28).
+- ledgerd: `/v1/store/get` and `/v1/store/put` for the runtime's `Store` ability, in
+  `table_store` (1002), outside generations (N29).
+- Tests: `views.py` re-reads 65 snapshots of `ledgerd.py`'s files as of their ops (about 2,600
+  reads; mutation-tested: ignoring the op is caught). The new `store.py` covers a model,
+  `admin/init`, concurrent writers and a staged suspend (mutation-tested: storing in the ledger
+  table is caught). Integration test reads as of ops before and after a replica restart.
+- Not built, waiting on a decision: approval attribution and a claim lease (N30).
+- Verified: `test:unit` 289/290 (sandbox perf test); `test:fmt`; `test:integration`;
+  `test:ledgerd` (conformance, race, views, store); VOPR seeds 1, 2, 5, 11.
