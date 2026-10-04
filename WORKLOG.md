@@ -1,14 +1,14 @@
 # Worklog
 
 Chronological log of completed work items. The previous Kotlin/PostgreSQL implementation of Nerva
-is preserved at git tag `kotlin-archive`.
+is preserved on branch `kotlin-archive` (commit `641a882`).
 
 ---
 
 ## 2026-10-04
 
 - Reset the repository for the new Nerva: a log-centric database with declared derived state
-  (design in README.md). Previous code archived at tag `kotlin-archive`.
+  (design in README.md). Previous code archived on branch `kotlin-archive`.
 - Vendored TigerBeetle at `6f8e6b5` (consensus, LSM storage, IO, tracing, VOPR simulator); dropped
   the accounting state machine, clients, CDC, REPL, Vortex and release tooling. All local patches
   are listed in UPSTREAM.md.
