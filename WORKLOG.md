@@ -296,3 +296,16 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
 - Smoke reports the vendored `lsm_segmented_array` as slow in Debug (about 20 s against its
   10 s budget); it is a warning, not a failure, and smoke never reached it before this fix.
 
+
+## 2026-10-04 — Fly.io feasibility probe for nightly performance tests
+
+- `perf/fly/`: `run-probe.sh` creates one Machine and a volume in the `nerva-perf` Fly app,
+  builds `Dockerfile` (the `nerva` binary, `fio`, `perf`) with Fly's remote builder, runs
+  `probe.sh` at boot, prints its report, and destroys the Machine and volume on exit, failure
+  included. It answers the performance plan's Phase 0 questions about the hardware.
+- Probe results (performance-4x, 10 GB volume, `iad`, binary `0.0.1+3a01765`): production
+  config (Direct IO) formats and starts on the volume; three replicas and `nerva api` work on
+  Fly's private IPv6 addresses; `perf_event_open` works with hardware counters; the volume
+  delivers about 16,500 IOPS and 65 MiB/s, exactly Fly's documented cap for that size. Nightly
+  throughput runs will be IO-capped on Fly and are judged on write amplification instead.
+- Not part of the build or CI; it needs `flyctl` and `FLY_API_TOKEN`.
