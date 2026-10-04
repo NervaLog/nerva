@@ -301,3 +301,10 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
 
 - The repository moved from `topwombat/nerva` to `Botpike/nerva-ledger`; CLAUDE.md's issue rule
   names the new home. (GitHub redirects the old name for now.)
+
+## 2026-10-04 — CI on Botpike's own runners (N47)
+
+- `.github/workflows/ci.yml`, `release.yml`: every job `runs-on: [self-hosted, fly]`, the Fly
+  Machines of Botpike/ci-runners, instead of `ubuntu-latest`. Steps unchanged.
+- Verified on the pull request's own CI run: unit tests (the perf test skips), integration,
+  API, views, demos and the four VOPR seeds pass on the new runners.
