@@ -209,3 +209,10 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
 - Verified: `test:unit` (all but the sandbox perf test), `test:api`, `test:views`, `test:demo`
   (both demos under crashes).
 
+## 2026-10-04 — Releases by commit; v0.1.0
+
+- `.github/workflows/release.yml`: a commit to `main` that changes `VERSION` releases
+  `v<VERSION>` (semver check, refuses an existing tag, full CI, four targets, `SHA256SUMS`, tag
+  created on that commit). Tag pushes no longer release (N40).
+- `VERSION`: `0.1.0`, the first release.
+

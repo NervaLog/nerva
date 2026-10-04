@@ -96,8 +96,8 @@ application-only route. N39 removed the one application-specific gateway Nerva h
 **N32. CI on every push; releases are tags; the binary's release string stays `0.0.1`.**
 `ci.yml` runs on every push and pull request to `main`: typecheck, format, unit tests, the
 integration test, the gateway and demo suites, and the
-VOPR on seeds 1, 2 and 5, plus one random seed written to the job summary. `release.yml` runs on
-a `v*` tag: it calls the same CI on that commit, then cross-compiles Linux and macOS binaries
+VOPR on seeds 1, 2 and 5, plus one random seed written to the job summary. `release.yml` (as first
+written; N40 changed the trigger) ran on a `v*` tag: it calls the same CI on that commit, then cross-compiles Linux and macOS binaries
 (x86_64, aarch64) from one Linux runner and publishes them, with `SHA256SUMS`, as a GitHub
 release. A tag containing `-` is a prerelease.
 The tag names a release; the binary does not take its version from the tag. Its release string
@@ -238,4 +238,14 @@ N37, chunk ids N12/N13/N25). The application keeps its own rules on its side, on
 `nerva api`: transactions with reads at the version seen, chunking its larger values, and
 declared views where they fit. Decisions N6–N20, N24–N26 and N28–N29 are marked superseded and
 keep their numbers; GOALS-1.0 and the worklog describe the workload instead of naming it.
+
+**N40. Releases are cut by committing a new `VERSION`, not by pushing a tag.**
+The agents working on Nerva can push commits to `main` but not tags. `release.yml` now runs
+when a push to `main` changes `VERSION` (or by hand): it checks the version is semver and not
+already tagged (releasing twice fails), runs the full CI on that commit, builds the four
+targets, and creates tag `v<VERSION>` on exactly that commit while publishing the release with
+`SHA256SUMS`. A version with a suffix (`0.2.0-rc.1`) is a prerelease. Pushing a tag no longer
+releases: one way in is simpler to reason about, and a tag created by a workflow could not
+trigger another workflow anyway. `VERSION` names the release; the binary's release string stays
+`0.0.1+<commit>` (N32). First release: `0.1.0`.
 

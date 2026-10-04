@@ -89,8 +89,9 @@ Linux (io_uring) or macOS; x86_64 with AES or aarch64.
 
 CI (`.github/workflows/ci.yml`) runs on every push and pull request to `main`: typecheck, format,
 unit, integration, API, view and demo tests, and the VOPR on seeds 1, 2, 5 and one random seed (printed,
-so a failure replays). Pushing a tag `v*` runs CI on that commit, then publishes binaries for
-Linux and macOS (x86_64, aarch64) as a GitHub release (`release.yml`).
+so a failure replays). A commit to `main` that changes `VERSION` runs CI on that commit, then
+publishes binaries for Linux and macOS (x86_64, aarch64) as GitHub release `v<VERSION>`
+(`release.yml`); releasing a version twice fails.
 
 ## Running a cluster
 

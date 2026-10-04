@@ -46,7 +46,8 @@ the VOPR simulator are vendored from TigerBeetle; Nerva's own code is `src/nerva
 environmental, see UPSTREAM.md. Every other test must pass.
 
 CI (`.github/workflows/ci.yml`) runs the same steps on every push and pull request to `main`. A
-`v*` tag publishes a release (`release.yml`) after CI passes.
+commit that changes `VERSION` publishes release `v<VERSION>` (`release.yml`) after CI passes: to
+release, bump `VERSION` (and add a WORKLOG entry) in its own commit.
 
 ## Vendored code
 

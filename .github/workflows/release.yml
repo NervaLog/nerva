@@ -1,24 +1,64 @@
-# Push a tag `v*` (for example `v0.1.0`, or `v0.1.0-rc.1` for a prerelease) to publish binaries.
-# CI must pass on the tagged commit first.
+# A commit to main that changes VERSION publishes release v<VERSION> (docs/DECISIONS.md N40):
+# CI on that commit, then binaries for four targets, then the tag and the GitHub release.
+# A version with a suffix (0.2.0-rc.1) is a prerelease. Releasing a version twice fails.
 name: Release
 
 on:
   push:
-    tags: ['v*']
+    branches: [main]
+    paths: [VERSION]
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
+  version:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+
+      - name: Read VERSION
+        id: version
+        run: |
+          version=$(tr -d ' \n' < VERSION)
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "::error::VERSION is not a version: '$version'"
+            exit 1
+          fi
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+
+      - name: Refuse a version already released
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" > /dev/null 2>&1; then
+            echo "::error::$TAG already exists: bump VERSION to release again"
+            exit 1
+          fi
+
   ci:
+    needs: version
     uses: ./.github/workflows/ci.yml
 
   release:
-    needs: ci
+    needs: [version, ci]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
       contents: write
+    env:
+      TAG: ${{ needs.version.outputs.tag }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
@@ -28,13 +68,14 @@ jobs:
         run: ./zig/download.sh
 
       # Every target is cross-compiled from Linux. The binary reports `0.0.1+<commit>`: `0.0.1`
-      # is the data file and protocol release, changed deliberately (docs/DECISIONS.md N32).
+      # is the data file and protocol release, changed deliberately (N32); VERSION names the
+      # release.
       - name: Build
         run: |
           mkdir dist
           for target in x86_64-linux aarch64-linux x86_64-macos aarch64-macos; do
             ./zig/zig build -Drelease -Dtarget="$target"
-            name="nerva-$GITHUB_REF_NAME-$target"
+            name="nerva-$TAG-$target"
             mkdir "$name"
             cp zig-out/bin/nerva LICENSE NOTICE "$name/"
             tar -czf "dist/$name.tar.gz" "$name"
@@ -43,16 +84,17 @@ jobs:
 
       - name: Check the Linux x86_64 binary runs
         run: |
-          tar -xzf "dist/nerva-$GITHUB_REF_NAME-x86_64-linux.tar.gz"
-          "./nerva-$GITHUB_REF_NAME-x86_64-linux/nerva" version | tee version.txt
+          tar -xzf "dist/nerva-$TAG-x86_64-linux.tar.gz"
+          "./nerva-$TAG-x86_64-linux/nerva" version | tee version.txt
           grep -q "+$(git rev-parse --short=7 HEAD)" version.txt
 
+      # Creates the tag on exactly this commit, then the release.
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           prerelease=()
-          case "$GITHUB_REF_NAME" in *-*) prerelease=(--prerelease) ;; esac
-          gh release create "$GITHUB_REF_NAME" dist/* "${prerelease[@]}" --verify-tag \
-            --title "Nerva $GITHUB_REF_NAME" \
+          case "$TAG" in *-*) prerelease=(--prerelease) ;; esac
+          gh release create "$TAG" dist/* "${prerelease[@]}" --target "$GITHUB_SHA" \
+            --title "Nerva $TAG" \
             --notes "Nerva at commit $GITHUB_SHA. Binaries report \`0.0.1+${GITHUB_SHA:0:7}\`. Changes: WORKLOG.md. Check downloads against SHA256SUMS."
