@@ -296,3 +296,12 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
 - Smoke reports the vendored `lsm_segmented_array` as slow in Debug (about 20 s against its
   10 s budget); it is a warning, not a failure, and smoke never reached it before this fix.
 
+## 2026-10-04 — Consistent document reads in `documents.Transaction` (N47; #7)
+
+- `src/nerva/documents.zig`: `Transaction.get` reads every tail chunk at chunk 0's version,
+  from history when a rewrite landed between its two lookups, and records every chunk as read
+  at that version. `Transaction` is `TransactionType(Client)`, so tests can use a stub client.
+- Tests: a rewrite between the lookups (fails with the previous code: a value stitched from
+  two versions), a read with no race, and a tail older than chunk 0.
+- The repository moved to `Botpike/nerva-ledger`; issues moved with it.
+

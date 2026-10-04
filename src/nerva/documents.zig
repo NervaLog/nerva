@@ -188,140 +188,165 @@ pub const Error = Client.Error || error{
     TooLarge,
 };
 
-/// One optimistic transaction over the documents of one namespace in one table.
-pub const Transaction = struct {
-    client: *Client,
-    table: u32,
-    namespace: u64,
+/// One optimistic transaction over the documents of one namespace in one table, through a
+/// client of type `ClientType` (`Client`, or a stub in tests).
+pub fn TransactionType(comptime ClientType: type) type {
+    return struct {
+        const DocumentsTransaction = @This();
 
-    arena: std.mem.Allocator = undefined,
-    /// Row → the version this transaction saw.
-    reads: std.AutoArrayHashMapUnmanaged(u64, u64) = .{},
-    /// Row → the write to commit (a later write to the same row replaces an earlier one).
-    writes: std.AutoArrayHashMapUnmanaged(u64, Entry) = .{},
-    /// Key → value as this transaction sees it, including its own writes.
-    cache: std.StringHashMapUnmanaged(?[]const u8) = .{},
+        client: *ClientType,
+        table: u32,
+        namespace: u64,
 
-    pub const Outcome = enum { committed, conflict };
+        arena: std.mem.Allocator = undefined,
+        /// Row → the version this transaction saw.
+        reads: std.AutoArrayHashMapUnmanaged(u64, u64) = .{},
+        /// Row → the write to commit (a later write to the same row replaces an earlier one).
+        writes: std.AutoArrayHashMapUnmanaged(u64, Entry) = .{},
+        /// Key → value as this transaction sees it, including its own writes.
+        cache: std.StringHashMapUnmanaged(?[]const u8) = .{},
 
-    /// Starts a transaction whose memory comes from `arena` (reset by the caller per attempt).
-    pub fn begin(transaction: *Transaction, arena: std.mem.Allocator) void {
-        transaction.arena = arena;
-        transaction.reads = .{};
-        transaction.writes = .{};
-        transaction.cache = .{};
-    }
+        pub const Outcome = enum { committed, conflict };
 
-    pub fn get(transaction: *Transaction, key: []const u8) Error!?[]const u8 {
-        if (transaction.cache.get(key)) |cached| return cached;
-        if (key.len > key_size_max) return error.TooLarge;
-        const arena = transaction.arena;
-
-        const chunk0 = try transaction.lookup(row_id(transaction.namespace, key));
-        const value: ?[]const u8 = if (!chunk0.flags.exists) null else value: {
-            const count = try chunk0_count(&chunk0.value);
-            const chunks = try arena.alloc([value_size]u8, count);
-            chunks[0] = chunk0.value;
-            if (count > 1) {
-                const keys = try arena.alloc(RowKey, count - 1);
-                for (keys, 1..) |*row_key, chunk| {
-                    row_key.* = .{
-                        .id = chunk_id(transaction.namespace, key, @intCast(chunk)),
-                        .table = transaction.table,
-                    };
-                }
-                const rows = try arena.alloc(RowValue, keys.len);
-                try transaction.client.lookup_rows(keys, rows);
-                for (rows, chunks[1..]) |*row, *chunk| {
-                    if (!row.flags.exists) return error.Corrupt;
-                    try transaction.read_record(row);
-                    chunk.* = row.value;
-                }
-            }
-            const decoded = try chunks_decode(arena, chunks);
-            // A hash collision, or a row of another namespace.
-            if (!std.mem.eql(u8, decoded.key, key)) return error.Corrupt;
-            if (decoded.namespace != transaction.namespace) return error.Corrupt;
-            break :value decoded.value;
-        };
-        try transaction.cache.put(arena, try arena.dupe(u8, key), value);
-        return value;
-    }
-
-    pub fn put(transaction: *Transaction, key: []const u8, value: []const u8) Error!void {
-        if (key.len > key_size_max or value.len > value_size_max) return error.TooLarge;
-        const arena = transaction.arena;
-        const chunks = try chunks_encode(arena, transaction.namespace, key, value);
-        for (chunks, 0..) |*chunk, index| {
-            const id = chunk_id(transaction.namespace, key, @intCast(index));
-            try transaction.writes.put(arena, id, .{
-                .id = id,
-                .table = transaction.table,
-                .kind = .put,
-                .op_seen = 0,
-                .value = chunk.*,
-            });
+        /// Starts a transaction whose memory comes from `arena` (reset by the caller per attempt).
+        pub fn begin(transaction: *DocumentsTransaction, arena: std.mem.Allocator) void {
+            transaction.arena = arena;
+            transaction.reads = .{};
+            transaction.writes = .{};
+            transaction.cache = .{};
         }
-        try transaction.cache.put(arena, try arena.dupe(u8, key), try arena.dupe(u8, value));
-    }
 
-    /// Commits every read (at the version seen) and every write as one transaction.
-    pub fn commit(transaction: *Transaction) Error!Outcome {
-        const count = transaction.reads.count() + transaction.writes.count();
-        if (count == 0) return .committed;
-        const batch_size_limit = transaction.client.vsr_client.batch_size_limit.?;
-        if (count > nerva.Operation.commit.event_max(batch_size_limit)) return error.TooLarge;
+        pub fn get(transaction: *DocumentsTransaction, key: []const u8) Error!?[]const u8 {
+            if (transaction.cache.get(key)) |cached| return cached;
+            if (key.len > key_size_max) return error.TooLarge;
+            const arena = transaction.arena;
 
-        const entries = try transaction.arena.alloc(Entry, count);
-        var index: usize = 0;
-        for (transaction.reads.keys(), transaction.reads.values()) |id, op_seen| {
-            entries[index] = .{
-                .id = id,
-                .table = transaction.table,
-                .kind = .read,
-                .op_seen = op_seen,
-                .value = @splat(0),
+            const chunk0 = try transaction.lookup(row_id(transaction.namespace, key));
+            const value: ?[]const u8 = if (!chunk0.flags.exists) null else value: {
+                const count = try chunk0_count(&chunk0.value);
+                const chunks = try arena.alloc([value_size]u8, count);
+                chunks[0] = chunk0.value;
+                if (count > 1) {
+                    const keys = try arena.alloc(RowKey, count - 1);
+                    for (keys, 1..) |*row_key, chunk| {
+                        row_key.* = .{
+                            .id = chunk_id(transaction.namespace, key, @intCast(chunk)),
+                            .table = transaction.table,
+                        };
+                    }
+                    const rows = try arena.alloc(RowValue, keys.len);
+                    try transaction.client.lookup_rows(keys, rows);
+                    // The whole document as of chunk 0's version (N47): every write rewrites every
+                    // chunk in one transaction, so a tail at another op was rewritten since chunk 0
+                    // was read, and is read from its history at chunk 0's version.
+                    for (rows, chunks[1..]) |*row, *chunk| {
+                        if (row.flags.exists and row.op == chunk0.op) {
+                            chunk.* = row.value;
+                        } else {
+                            if (row.op < chunk0.op) return error.Corrupt;
+                            const change = try transaction.client.row_as_of(
+                                transaction.table,
+                                row.id,
+                                chunk0.op,
+                            ) orelse return error.Corrupt;
+                            if (change.op != chunk0.op or change.kind != .put) return error.Corrupt;
+                            chunk.* = change.value;
+                        }
+                        try transaction.read_record_at(row.id, chunk0.op);
+                    }
+                }
+                const decoded = try chunks_decode(arena, chunks);
+                // A hash collision, or a row of another namespace.
+                if (!std.mem.eql(u8, decoded.key, key)) return error.Corrupt;
+                if (decoded.namespace != transaction.namespace) return error.Corrupt;
+                break :value decoded.value;
             };
-            index += 1;
+            try transaction.cache.put(arena, try arena.dupe(u8, key), value);
+            return value;
         }
-        for (transaction.writes.values()) |entry| {
-            entries[index] = entry;
-            index += 1;
-        }
-        assert(index == count);
 
-        const results = try transaction.arena.alloc(EntryResult, count);
-        try transaction.client.commit(entries, results);
-        for (results) |result| {
-            switch (result.status) {
-                .ok, .aborted => {},
-                .conflict => return .conflict,
-                else => std.debug.panic("documents: commit rejected an entry: {s}", .{
-                    @tagName(result.status),
-                }),
+        pub fn put(transaction: *DocumentsTransaction, key: []const u8, value: []const u8) Error!void {
+            if (key.len > key_size_max or value.len > value_size_max) return error.TooLarge;
+            const arena = transaction.arena;
+            const chunks = try chunks_encode(arena, transaction.namespace, key, value);
+            for (chunks, 0..) |*chunk, index| {
+                const id = chunk_id(transaction.namespace, key, @intCast(index));
+                try transaction.writes.put(arena, id, .{
+                    .id = id,
+                    .table = transaction.table,
+                    .kind = .put,
+                    .op_seen = 0,
+                    .value = chunk.*,
+                });
             }
+            try transaction.cache.put(arena, try arena.dupe(u8, key), try arena.dupe(u8, value));
         }
-        assert(results[0].status == .ok);
-        return .committed;
-    }
 
-    fn lookup(transaction: *Transaction, id: u64) Error!RowValue {
-        var row: [1]RowValue = undefined;
-        try transaction.client.lookup_rows(&.{.{ .id = id, .table = transaction.table }}, &row);
-        try transaction.read_record(&row[0]);
-        return row[0];
-    }
+        /// Commits every read (at the version seen) and every write as one transaction.
+        pub fn commit(transaction: *DocumentsTransaction) Error!Outcome {
+            const count = transaction.reads.count() + transaction.writes.count();
+            if (count == 0) return .committed;
+            const batch_size_limit = transaction.client.vsr_client.batch_size_limit.?;
+            if (count > nerva.Operation.commit.event_max(batch_size_limit)) return error.TooLarge;
 
-    /// Records the version seen, unless this transaction already wrote the row.
-    fn read_record(transaction: *Transaction, row: *const RowValue) Error!void {
-        assert(row.table == transaction.table);
-        if (transaction.writes.contains(row.id)) return;
-        const entry = try transaction.reads.getOrPut(transaction.arena, row.id);
-        // Two lookups in one transaction may see different versions; keep the first: commit
-        // reports the conflict.
-        if (!entry.found_existing) entry.value_ptr.* = row.op;
-    }
-};
+            const entries = try transaction.arena.alloc(Entry, count);
+            var index: usize = 0;
+            for (transaction.reads.keys(), transaction.reads.values()) |id, op_seen| {
+                entries[index] = .{
+                    .id = id,
+                    .table = transaction.table,
+                    .kind = .read,
+                    .op_seen = op_seen,
+                    .value = @splat(0),
+                };
+                index += 1;
+            }
+            for (transaction.writes.values()) |entry| {
+                entries[index] = entry;
+                index += 1;
+            }
+            assert(index == count);
+
+            const results = try transaction.arena.alloc(EntryResult, count);
+            try transaction.client.commit(entries, results);
+            for (results) |result| {
+                switch (result.status) {
+                    .ok, .aborted => {},
+                    .conflict => return .conflict,
+                    else => std.debug.panic("documents: commit rejected an entry: {s}", .{
+                        @tagName(result.status),
+                    }),
+                }
+            }
+            assert(results[0].status == .ok);
+            return .committed;
+        }
+
+        fn lookup(transaction: *DocumentsTransaction, id: u64) Error!RowValue {
+            var row: [1]RowValue = undefined;
+            try transaction.client.lookup_rows(&.{.{ .id = id, .table = transaction.table }}, &row);
+            try transaction.read_record(&row[0]);
+            return row[0];
+        }
+
+        /// Records the version seen, unless this transaction already wrote the row.
+        fn read_record(transaction: *DocumentsTransaction, row: *const RowValue) Error!void {
+            assert(row.table == transaction.table);
+            try transaction.read_record_at(row.id, row.op);
+        }
+
+        /// Records that row `id` was read at version `op`, unless this transaction already wrote it.
+        fn read_record_at(transaction: *DocumentsTransaction, id: u64, op: u64) Error!void {
+            if (transaction.writes.contains(id)) return;
+            const entry = try transaction.reads.getOrPut(transaction.arena, id);
+            // Two lookups in one transaction may see different versions; keep the first: commit
+            // reports the conflict.
+            if (!entry.found_existing) entry.value_ptr.* = op;
+        }
+    };
+}
+
+pub const Transaction = TransactionType(Client);
 
 const testing = std.testing;
 
@@ -414,4 +439,161 @@ test "documents: row ids are stable and separate keys, chunks and namespaces" {
     try testing.expectEqual(row_id(0, "k"), chunk_id(0, "k", 0));
     try testing.expectEqual(tail_id(row_id(0, "k"), 3), chunk_id(0, "k", 3));
     try testing.expect(chunk_id(0, "k", 1) != chunk_id(0, "k", 2));
+}
+
+/// A client over rows held in memory, with their history, for `TransactionType`. A test can have
+/// writes land just before a given lookup, as a concurrent commit would.
+const TestClient = struct {
+    const Write = struct { id: u64, op: u64, value: [value_size]u8 };
+
+    /// Every write, in op order.
+    writes: std.ArrayListUnmanaged(Write) = .{},
+    /// Applied just before lookup number `lookup` (counting from zero) executes.
+    interleaved: ?struct { lookup: u32, writes: []const Write } = null,
+    lookups: u32 = 0,
+    history_reads: u32 = 0,
+
+    const table = 9;
+
+    fn document_writes(
+        arena: std.mem.Allocator,
+        namespace: u64,
+        key: []const u8,
+        value: []const u8,
+        op: u64,
+    ) ![]const Write {
+        const chunks = try chunks_encode(arena, namespace, key, value);
+        const writes = try arena.alloc(Write, chunks.len);
+        for (writes, chunks, 0..) |*write, *chunk, index| {
+            write.* = .{ .id = chunk_id(namespace, key, @intCast(index)), .op = op, .value = chunk.* };
+        }
+        return writes;
+    }
+
+    fn latest(client: *const TestClient, id: u64, op_max: u64) ?Write {
+        var found: ?Write = null;
+        for (client.writes.items) |write| {
+            if (write.id == id and write.op <= op_max) found = write;
+        }
+        return found;
+    }
+
+    pub fn lookup_rows(client: *TestClient, keys: []const RowKey, results: []RowValue) Error!void {
+        if (client.interleaved) |interleaved| {
+            if (interleaved.lookup == client.lookups) {
+                client.writes.appendSliceAssumeCapacity(interleaved.writes);
+                client.interleaved = null;
+            }
+        }
+        client.lookups += 1;
+        for (keys, results) |*key, *result| {
+            assert(key.table == table);
+            const write = client.latest(key.id, std.math.maxInt(u64));
+            result.* = .{
+                .id = key.id,
+                .table = table,
+                .flags = .{ .exists = write != null },
+                .op = if (write) |w| w.op else 0,
+                .op_read = 100,
+                .value = if (write) |w| w.value else @splat(0),
+            };
+        }
+    }
+
+    pub fn row_as_of(client: *TestClient, table_: u32, id: u64, op: u64) Error!?nerva.Change {
+        assert(table_ == table);
+        client.history_reads += 1;
+        const write = client.latest(id, op) orelse return null;
+        return .{
+            .id = id,
+            .table = table,
+            .kind = .put,
+            .flags = .{},
+            .op = write.op,
+            .timestamp = write.op,
+            .value = write.value,
+        };
+    }
+};
+
+test "documents: a document rewritten while it is read is read whole at chunk 0's version" {
+    var arena_instance = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_instance.deinit();
+    const arena = arena_instance.allocator();
+
+    const namespace = 3;
+    const key = "table.5";
+    const old: [150]u8 = @splat('o');
+    const new: [150]u8 = @splat('n');
+    var client: TestClient = .{};
+    try client.writes.ensureTotalCapacity(arena, 16);
+    const old_writes = try TestClient.document_writes(arena, namespace, key, &old, 5);
+    assert(old_writes.len == 3);
+    client.writes.appendSliceAssumeCapacity(old_writes);
+    // A rewrite commits between the lookup of chunk 0 and the lookup of the tails (issue #7).
+    client.interleaved = .{
+        .lookup = 1,
+        .writes = try TestClient.document_writes(arena, namespace, key, &new, 9),
+    };
+
+    var transaction: TransactionType(TestClient) = .{
+        .client = &client,
+        .table = TestClient.table,
+        .namespace = namespace,
+    };
+    transaction.begin(arena);
+    try testing.expectEqualSlices(u8, &old, (try transaction.get(key)).?);
+    try testing.expectEqual(2, client.lookups);
+    try testing.expectEqual(2, client.history_reads);
+    // Every chunk is recorded at the version read, so a commit after this read conflicts.
+    for (0..3) |chunk| {
+        const id = chunk_id(namespace, key, @intCast(chunk));
+        try testing.expectEqual(5, transaction.reads.get(id).?);
+    }
+}
+
+test "documents: a document read without a race needs no history" {
+    var arena_instance = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_instance.deinit();
+    const arena = arena_instance.allocator();
+
+    const value: [150]u8 = @splat('v');
+    var client: TestClient = .{};
+    try client.writes.ensureTotalCapacity(arena, 16);
+    client.writes.appendSliceAssumeCapacity(
+        try TestClient.document_writes(arena, 3, "key", &value, 5),
+    );
+    var transaction: TransactionType(TestClient) = .{
+        .client = &client,
+        .table = TestClient.table,
+        .namespace = 3,
+    };
+    transaction.begin(arena);
+    try testing.expectEqualSlices(u8, &value, (try transaction.get("key")).?);
+    try testing.expectEqual(2, client.lookups);
+    try testing.expectEqual(0, client.history_reads);
+}
+
+test "documents: a tail older than its chunk 0 is corrupt" {
+    var arena_instance = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_instance.deinit();
+    const arena = arena_instance.allocator();
+
+    const value: [150]u8 = @splat('v');
+    var client: TestClient = .{};
+    try client.writes.ensureTotalCapacity(arena, 16);
+    const writes = try TestClient.document_writes(arena, 3, "key", &value, 5);
+    client.writes.appendSliceAssumeCapacity(writes);
+    // Chunk 0 alone rewritten: no write of a document does that.
+    var chunk0 = writes[0];
+    chunk0.op = 7;
+    client.writes.appendAssumeCapacity(chunk0);
+
+    var transaction: TransactionType(TestClient) = .{
+        .client = &client,
+        .table = TestClient.table,
+        .namespace = 3,
+    };
+    transaction.begin(arena);
+    try testing.expectError(error.Corrupt, transaction.get("key"));
 }
