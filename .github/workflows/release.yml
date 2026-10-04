@@ -1,0 +1,58 @@
+# Push a tag `v*` (for example `v0.1.0`, or `v0.1.0-rc.1` for a prerelease) to publish binaries.
+# CI must pass on the tagged commit first.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  release:
+    needs: ci
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned Zig
+        run: ./zig/download.sh
+
+      # Every target is cross-compiled from Linux. The binary reports `0.0.1+<commit>`: `0.0.1`
+      # is the data file and protocol release, changed deliberately (docs/DECISIONS.md N32).
+      - name: Build
+        run: |
+          mkdir dist
+          for target in x86_64-linux aarch64-linux x86_64-macos aarch64-macos; do
+            ./zig/zig build -Drelease -Dtarget="$target"
+            name="nerva-$GITHUB_REF_NAME-$target"
+            mkdir "$name"
+            cp zig-out/bin/nerva LICENSE NOTICE "$name/"
+            tar -czf "dist/$name.tar.gz" "$name"
+          done
+          (cd dist && sha256sum -- *.tar.gz > SHA256SUMS)
+
+      - name: Check the Linux x86_64 binary runs
+        run: |
+          tar -xzf "dist/nerva-$GITHUB_REF_NAME-x86_64-linux.tar.gz"
+          "./nerva-$GITHUB_REF_NAME-x86_64-linux/nerva" version | tee version.txt
+          grep -q "+$(git rev-parse --short=7 HEAD)" version.txt
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          prerelease=()
+          case "$GITHUB_REF_NAME" in *-*) prerelease=(--prerelease) ;; esac
+          gh release create "$GITHUB_REF_NAME" dist/* "${prerelease[@]}" --verify-tag \
+            --title "Nerva $GITHUB_REF_NAME" \
+            --notes "Nerva at commit $GITHUB_SHA. Binaries report \`0.0.1+${GITHUB_SHA:0:7}\`. Changes: WORKLOG.md. Check downloads against SHA256SUMS."

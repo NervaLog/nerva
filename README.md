@@ -87,6 +87,11 @@ in-memory model replayed in op order.
 
 Linux (io_uring) or macOS; x86_64 with AES or aarch64.
 
+CI (`.github/workflows/ci.yml`) runs on every push and pull request to `main`: typecheck, format,
+unit, integration and ledgerd tests, and the VOPR on seeds 1, 2, 5 and one random seed (printed,
+so a failure replays). Pushing a tag `v*` runs CI on that commit, then publishes binaries for
+Linux and macOS (x86_64, aarch64) as a GitHub release (`release.yml`).
+
 ## Running a cluster
 
 ```bash

@@ -157,3 +157,14 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
   Nerva-backed `Store` must keep `daemon.key` in local files.
 - Decision N31: Botpike is dog-fooding, not a specification.
 
+## 2026-10-04 — CI and releases
+
+- `.github/workflows/ci.yml`: typecheck, format, unit, integration, ledgerd suites, and VOPR
+  seeds 1, 2, 5 and one random seed, on every push and pull request to `main`.
+- `.github/workflows/release.yml`: on a `v*` tag, CI on that commit, then binaries for four
+  targets, `SHA256SUMS`, and a GitHub release (prerelease if the tag contains `-`).
+- Decision N32. The integration guide now prefers a pinned release binary over building.
+- Checked locally: both workflows parse and pass `actionlint`; all four targets cross-compile
+  from Linux; the step commands are the ones run throughout this session. The first run on
+  GitHub is the real test.
+

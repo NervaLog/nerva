@@ -41,7 +41,7 @@ Restore an equivalent once Nerva's forest has real grooves.
 ## Derived files
 
 `src/nerva_main.zig` (the `nerva` binary) is derived from TigerBeetle's `src/tigerbeetle/main.zig`,
-trimmed to `format`, `start` and `version`; `src/nerva/cli.zig` follows the structure of
+trimmed to `format`, `start` and `version` (Nerva has since added `ledgerd` and `view`); `src/nerva/cli.zig` follows the structure of
 `src/tigerbeetle/cli.zig`. They are Nerva's own files, not patches, but upstream fixes to those
 originals should be checked for relevance.
 
@@ -49,7 +49,7 @@ originals should be checked for relevance.
 
 | File | Change |
 |---|---|
-| `build.zig` | Rewritten: the `nerva` executable, `run`, `check`, `test`, `test:unit`, `test:fmt`, `test:integration`, `vopr`, `fuzz`. No clients, multiversion, release fetching or CI matrix. Release is `0.0.1`. |
+| `build.zig` | Rewritten: the `nerva` executable, `run`, `check`, `test`, `test:unit`, `test:fmt`, `test:integration`, `test:ledgerd`, `vopr`, `fuzz`. No clients, multiversion or release fetching. Release is `0.0.1`. Nerva's own CI and release workflows are in `.github/workflows/` (not vendored). |
 | `src/vsr.zig` | Re-exports `nerva` and `state_machine` instead of `tigerbeetle`, `state_machine`, `cdc`, `tb_client`, `repl`. |
 | `src/vsr/replica.zig` | Request timing is enabled when `StateMachine.Operation == nerva.Operation` (was `tigerbeetle.Operation`). |
 | `src/trace/event.zig` | Operation and tree enums are derived from `nerva.zig` instead of `tigerbeetle.zig` / `state_machine.zig`. |

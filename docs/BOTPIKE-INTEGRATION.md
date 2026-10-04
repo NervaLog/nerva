@@ -36,11 +36,22 @@ in this document; read them when a behaviour surprises you.
 
 ## Getting the binary
 
-`topwombat/nerva` is private: CI that builds it needs a read token for that repository. Ask
-the owner for the token or for a prebuilt binary. Do not make the repository public, and do not
-copy its source into a Botpike repository.
+`topwombat/nerva` is private: CI that fetches it needs a read token for that repository. Ask
+the owner for the token. Do not make the repository public, and do not copy its source into a
+Botpike repository.
 
-Build at a pinned commit (use `main` at or after the commit that added this file, and record the
+**Prefer a release.** Each `v*` tag publishes binaries for Linux and macOS (x86_64, aarch64) on
+the repository's Releases page, once Nerva's CI has passed on that commit:
+`nerva-<tag>-<target>.tar.gz` plus `SHA256SUMS`. Pin a tag and check the checksum. With a token
+that can read the repository:
+
+```bash
+gh release download <tag> --repo topwombat/nerva --pattern 'nerva-<tag>-x86_64-linux.tar.gz' \
+    --pattern SHA256SUMS
+sha256sum --check --ignore-missing SHA256SUMS
+```
+
+If no release exists yet, build at a pinned commit (use `main` at or after the commit that added this file, and record the
 hash you used):
 
 ```bash

@@ -1,0 +1,71 @@
+# Every push and pull request to main, and every release (release.yml calls this first).
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned Zig
+        run: ./zig/download.sh
+
+      - name: Typecheck
+        run: ./zig/zig build check
+
+      - name: Format
+        run: ./zig/zig build test:fmt
+
+      # `benchmark.perf: usage example` skips itself where perf_event_open is denied, as on
+      # GitHub's runners; it fails only where it is allowed without hardware counters (UPSTREAM.md).
+      - name: Unit tests
+        run: ./zig/zig build test:unit
+
+      - name: Integration (three real replicas)
+        run: ./zig/zig build test:integration
+
+      # One suite at a time: each runs its own cluster, and together they would crowd the runner.
+      - name: ledgerd (against ledgerd.py, race, views and as-of, store)
+        run: ./zig/zig build test:ledgerd -j1
+
+  vopr:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        seed: ['1', '2', '5', 'random']
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned Zig
+        run: ./zig/download.sh
+
+      # A failure replays exactly with `./zig/zig build vopr -- <seed>`.
+      - name: VOPR
+        run: |
+          seed='${{ matrix.seed }}'
+          if [ "$seed" = random ]; then seed=$(od -An -N8 -tu8 /dev/urandom | tr -d ' '); fi
+          echo "VOPR seed: $seed"
+          echo "### VOPR seed \`$seed\`" >> "$GITHUB_STEP_SUMMARY"
+          ./zig/zig build vopr -- "$seed"
