@@ -15,6 +15,8 @@
 //!     GET  /v1/tables/<t>
 //!     PUT  /v1/views/<name>  {"table": 5, "where": […], "group_by": […], "aggregates": […]}
 //!     GET  /v1/views/<name>  (the declaration; `nerva view` serves the view itself)
+//!     POST /v1/documents/get, POST /v1/documents/commit, GET /v1/documents/changes
+//!                            (larger values, by key: `documents_routes.zig`)
 //!
 //! Conventions:
 //! - 64-bit numbers (`id`, `op`, `op_seen`, cursors) are decimal strings: JSON numbers lose
@@ -41,6 +43,7 @@ const assert = std.debug.assert;
 
 const nerva = @import("../../nerva.zig");
 const catalog = @import("../catalog.zig");
+const documents_routes = @import("documents_routes.zig");
 
 const Change = nerva.Change;
 const Entry = nerva.Entry;
@@ -60,7 +63,18 @@ pub const Reply = struct {
     body: []const u8,
 };
 
-const Route = enum { lookup, commit, changes, history, row, tables, views };
+const Route = enum {
+    lookup,
+    commit,
+    changes,
+    history,
+    row,
+    tables,
+    views,
+    documents_get,
+    documents_commit,
+    documents_changes,
+};
 
 const routes = [_]struct { path: []const u8, route: Route, method: Method }{
     .{ .path = "/v1/lookup", .route = .lookup, .method = .post },
@@ -68,6 +82,9 @@ const routes = [_]struct { path: []const u8, route: Route, method: Method }{
     .{ .path = "/v1/changes", .route = .changes, .method = .get },
     .{ .path = "/v1/history", .route = .history, .method = .get },
     .{ .path = "/v1/row", .route = .row, .method = .get },
+    .{ .path = "/v1/documents/get", .route = .documents_get, .method = .post },
+    .{ .path = "/v1/documents/commit", .route = .documents_commit, .method = .post },
+    .{ .path = "/v1/documents/changes", .route = .documents_changes, .method = .get },
 };
 
 const tables_prefix = "/v1/tables/";
@@ -123,6 +140,9 @@ pub fn handle(
         .row => row(arena, client, &cache, query),
         .tables => tables(arena, layouts, method, path[tables_prefix.len..], body),
         .views => views(arena, layouts, method, path[views_prefix.len..], body),
+        .documents_get => documents_routes.get(arena, client, body),
+        .documents_commit => documents_routes.commit(arena, client, body),
+        .documents_changes => documents_routes.changes(arena, client, query),
     } catch |err| switch (err) {
         error.BadRequest => error_reply(arena, 400, bad_request_reason),
         error.TooManyEvents => error_reply(arena, 400, "too many rows or entries for one request"),
@@ -154,7 +174,7 @@ fn Layouts(comptime Catalog: type) type {
 /// The reason for the last `error.BadRequest` (set just before it is returned; one thread).
 var bad_request_reason: []const u8 = "";
 
-fn bad(reason: []const u8) error{BadRequest} {
+pub fn bad(reason: []const u8) error{BadRequest} {
     bad_request_reason = reason;
     return error.BadRequest;
 }
@@ -489,26 +509,7 @@ fn row(arena: std.mem.Allocator, client: anytype, layouts: anytype, query: []con
     try client.lookup_rows(&.{.{ .table = table, .id = id }}, &current);
     if (as_of >= current[0].op_read) return bad("as_of is not yet committed");
 
-    var page: [65]Change = undefined;
-    var cursor: u64 = 0;
-    const found: ?Change = while (true) {
-        const count = try client.get_history(.{
-            .table = table,
-            .id = id,
-            .limit = page.len - 1,
-            .op_max = as_of,
-            .timestamp_max = cursor,
-        }, &page);
-        assert(count >= 1);
-        const end = page[count - 1];
-        assert(end.kind == .end);
-        if (count > 1) break page[0];
-        if (!end.flags.more) {
-            assert(as_of < end.op);
-            break null;
-        }
-        cursor = end.timestamp;
-    };
+    const found = try change_as_of(client, table, id, as_of);
 
     var out = Writer.init(arena);
     try out.print("{{\"table\":{},\"id\":", .{table});
@@ -528,6 +529,34 @@ fn row(arena: std.mem.Allocator, client: anytype, layouts: anytype, query: []con
     }
     try out.raw("}");
     return .{ .status = 200, .body = out.items() };
+}
+
+/// The row's last change (a put or a delete) at or before `op`, or null if it had none.
+pub fn change_as_of(client: anytype, table: u32, id: u64, op: u64) !?Change {
+    assert(op != 0);
+    var page: [65]Change = undefined;
+    var cursor: u64 = 0;
+    while (true) {
+        const count = try client.get_history(.{
+            .table = table,
+            .id = id,
+            .limit = page.len - 1,
+            .op_max = op,
+            .timestamp_max = cursor,
+        }, &page);
+        assert(count >= 1);
+        const end = page[count - 1];
+        assert(end.kind == .end);
+        if (count > 1) {
+            assert(page[0].op <= op);
+            return page[0];
+        }
+        if (!end.flags.more) {
+            assert(op < end.op);
+            return null;
+        }
+        cursor = end.timestamp;
+    }
 }
 
 fn page_reply(
@@ -657,7 +686,7 @@ fn views(
 
 // ---- Parsing ----
 
-fn json_parse(comptime T: type, arena: std.mem.Allocator, body: []const u8) !T {
+pub fn json_parse(comptime T: type, arena: std.mem.Allocator, body: []const u8) !T {
     return std.json.parseFromSliceLeaky(T, arena, body, .{}) catch |err| switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         error.UnknownField => bad("unknown field"),
@@ -666,7 +695,7 @@ fn json_parse(comptime T: type, arena: std.mem.Allocator, body: []const u8) !T {
     };
 }
 
-fn u64_parse(text: []const u8, comptime name: []const u8) error{BadRequest}!u64 {
+pub fn u64_parse(text: []const u8, comptime name: []const u8) error{BadRequest}!u64 {
     // Decimal digits only: no sign, no spaces, no leading `+`.
     if (text.len == 0 or text.len > 20) return bad(name ++ " must be a decimal string");
     for (text) |c| if (c < '0' or c > '9') return bad(name ++ " must be a decimal string");
@@ -685,7 +714,7 @@ fn table_check(table: u32) error{BadRequest}!void {
     if (table >= catalog.tables_reserved_min) return bad("table is reserved");
 }
 
-fn limit_parse(text: ?[]const u8) error{BadRequest}!u32 {
+pub fn limit_parse(text: ?[]const u8) error{BadRequest}!u32 {
     const value = try u64_parse(text orelse return bad("limit is required"), "limit");
     if (value == 0) return bad("limit must be positive");
     return @intCast(@min(value, page_limit_max));
@@ -701,7 +730,7 @@ fn value_parse(text: []const u8) error{BadRequest}![value_size]u8 {
 }
 
 /// Query parameters; each at most once, and only those listed.
-fn query_parse(
+pub fn query_parse(
     arena: std.mem.Allocator,
     query: []const u8,
     comptime allowed: []const []const u8,
@@ -732,27 +761,27 @@ pub fn error_reply(arena: std.mem.Allocator, status: u16, reason: []const u8) !R
     return .{ .status = status, .body = out.items() };
 }
 
-const Writer = struct {
+pub const Writer = struct {
     list: std.ArrayList(u8),
 
-    fn init(arena: std.mem.Allocator) Writer {
+    pub fn init(arena: std.mem.Allocator) Writer {
         return .{ .list = std.ArrayList(u8).init(arena) };
     }
 
-    fn items(writer: *const Writer) []const u8 {
+    pub fn items(writer: *const Writer) []const u8 {
         return writer.list.items;
     }
 
-    fn raw(writer: *Writer, text: []const u8) !void {
+    pub fn raw(writer: *Writer, text: []const u8) !void {
         try writer.list.appendSlice(text);
     }
 
-    fn print(writer: *Writer, comptime format: []const u8, args: anytype) !void {
+    pub fn print(writer: *Writer, comptime format: []const u8, args: anytype) !void {
         try writer.list.writer().print(format, args);
     }
 
     /// A 64-bit number, as a decimal string.
-    fn number(writer: *Writer, value: u64) !void {
+    pub fn number(writer: *Writer, value: u64) !void {
         try writer.print("\"{}\"", .{value});
     }
 
@@ -765,7 +794,7 @@ const Writer = struct {
         }
     }
 
-    fn hex(writer: *Writer, bytes: []const u8) !void {
+    pub fn hex(writer: *Writer, bytes: []const u8) !void {
         try writer.print("\"{s}\"", .{std.fmt.fmtSliceHexLower(bytes)});
     }
 
@@ -1062,4 +1091,112 @@ test "api: bad requests are refused before reaching the cluster" {
         try testing.expect(std.mem.startsWith(u8, reply.body, "{\"error\":"));
     }
     try testing.expectEqual(@as(u64, 0), fake.op); // Nothing reached the cluster.
+}
+
+test "api: documents are written, read, conflict and deleted by key" {
+    var arena_instance = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_instance.deinit();
+    const arena = arena_instance.allocator();
+    var fake: FakeClient = .{ .allocator = arena };
+
+    // 300 bytes: four chunks.
+    const value_hex = "ab" ** 300;
+    const put = try handle(arena, &fake, no_layouts, .post, "/v1/documents/commit",
+        \\{"namespace":"7","reads":[{"key":"cart/1","version":"0"}],
+        \\ "writes":[{"key":"cart/1","value_hex":"
+    ++ value_hex ++
+        \\"}]}
+    );
+    try testing.expectEqualStrings(
+        \\{"status":"committed","op":"1"}
+    , put.body);
+
+    const get_body =
+        \\{"namespace":"7","keys":["cart/1","cart/2"]}
+    ;
+    const found = try handle(arena, &fake, no_layouts, .post, "/v1/documents/get", get_body);
+    try testing.expectEqualStrings(
+        \\{"op":"2","documents":[{"key":"cart/1","exists":true,"version":"1","value_hex":"
+    ++ value_hex ++
+        \\"},{"key":"cart/2","exists":false,"version":"0","value_hex":""}]}
+    , found.body);
+
+    // Another namespace holds other documents.
+    const other = try handle(arena, &fake, no_layouts, .post, "/v1/documents/get",
+        \\{"namespace":"8","keys":["cart/1"]}
+    );
+    try testing.expect(std.mem.indexOf(u8, other.body, "\"exists\":false") != null);
+
+    // A read at an old version conflicts, naming the key and its version; nothing applies.
+    const stale = try handle(arena, &fake, no_layouts, .post, "/v1/documents/commit",
+        \\{"namespace":"7","reads":[{"key":"cart/2","version":"0"},
+        \\                          {"key":"cart/1","version":"0"}],
+        \\ "writes":[{"key":"cart/2","value_hex":"01"}]}
+    );
+    try testing.expectEqual(@as(u16, 409), stale.status);
+    try testing.expectEqualStrings(
+        \\{"status":"conflict","key":"cart/1","version":"1"}
+    , stale.body);
+
+    // A delete is a write: the version moves on, and a read at it can commit.
+    const deleted = try handle(arena, &fake, no_layouts, .post, "/v1/documents/commit",
+        \\{"namespace":"7","reads":[{"key":"cart/1","version":"1"}],
+        \\ "writes":[{"key":"cart/1","delete":true}]}
+    );
+    try testing.expectEqualStrings(
+        \\{"status":"committed","op":"6"}
+    , deleted.body);
+    const gone = try handle(arena, &fake, no_layouts, .post, "/v1/documents/get", get_body);
+    try testing.expectEqualStrings(
+        \\{"op":"7","documents":[{"key":"cart/1","exists":false,"version":"6","value_hex":""},
+    ++
+        \\{"key":"cart/2","exists":false,"version":"0","value_hex":""}]}
+    , gone.body);
+
+    const refused = [_][]const u8{
+        \\{"namespace":"7","keys":[]}
+        ,
+        \\{"namespace":"7","keys":["a","a"]}
+        ,
+        \\{"namespace":"7","keys":[""]}
+        ,
+        \\{"namespace":"-1","keys":["a"]}
+        ,
+        \\{"namespace":"7","keys":["a"],"as_of":"0"}
+        ,
+        \\{"namespace":"7","keys":["a"],"as_of":"99"}
+        ,
+        \\{"namespace":"7","keys":["
+        ++ "k" ** 1025 ++
+            \\"]}
+    };
+    for (refused) |body| {
+        const reply = try handle(arena, &fake, no_layouts, .post, "/v1/documents/get", body);
+        try testing.expectEqual(@as(u16, 400), reply.status);
+    }
+    const commit_refused = [_][]const u8{
+        \\{"namespace":"7"}
+        ,
+        \\{"namespace":"7","writes":[{"key":"a"}]}
+        ,
+        \\{"namespace":"7","writes":[{"key":"a","value_hex":"00","delete":true}]}
+        ,
+        \\{"namespace":"7","writes":[{"key":"a","value_hex":"0"}]}
+        ,
+        \\{"namespace":"7","writes":[{"key":"a","delete":true},{"key":"a","delete":true}]}
+        ,
+        \\{"namespace":"7","reads":[{"key":"a","version":"1"},{"key":"a","version":"1"}]}
+        ,
+        \\{"namespace":"7","writes":[{"key":"\ud800","delete":true}]}
+        ,
+        \\{"namespace":"7","writes":[{"key":"a","value_hex":"
+        ++ "00" ** (64 * 1024 + 1) ++
+            \\"}]}
+    };
+    for (commit_refused) |body| {
+        const reply = try handle(arena, &fake, no_layouts, .post, "/v1/documents/commit", body);
+        try testing.expectEqual(@as(u16, 400), reply.status);
+    }
+    // Nothing above was written; only the unanswerable `as_of` reached the cluster (a lookup).
+    try testing.expectEqual(@as(u64, 8), fake.op);
 }

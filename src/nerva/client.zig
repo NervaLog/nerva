@@ -242,11 +242,11 @@ pub const Client = struct {
         events: []const u8,
     ) Error![]const u8 {
         comptime assert(operation.is_multi_batch());
-        try client.ensure_idle();
-
+        // Refused before the client is marked busy, so that it can serve the next request.
         const batch_size_limit = client.vsr_client.batch_size_limit.?;
         const event_count = @divExact(events.len, operation.event_size());
         if (event_count > operation.event_max(batch_size_limit)) return error.TooManyEvents;
+        try client.ensure_idle();
 
         var encoder = MultiBatchEncoder.init(client.request[0..batch_size_limit], .{
             .element_size = operation.event_size(),

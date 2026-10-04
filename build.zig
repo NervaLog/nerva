@@ -80,7 +80,7 @@ pub fn build(b: *std.Build) !void {
         .test_unit_build = b.step("test:unit:build", "Build unit tests"),
         .test_fmt = b.step("test:fmt", "Check formatting"),
         .test_integration = b.step("test:integration", "Run integration tests (real processes)"),
-        .test_api = b.step("test:api", "Check nerva api against a model (python3)"),
+        .test_api = b.step("test:api", "Check nerva api against models (python3)"),
         .test_views = b.step("test:views", "Check declared views against a model (python3)"),
         .test_demo = b.step("test:demo", "Run the demos under crashes (python3)"),
         .vopr = b.step("vopr", "Run the VOPR"),
@@ -234,10 +234,10 @@ pub fn build(b: *std.Build) !void {
     run_integration_tests.has_side_effects = true; // Never cache: it runs real processes.
     steps.test_integration.dependOn(&run_integration_tests.step);
 
-    // zig build test:api: the JSON API against a model, then adds (one after the other: each
-    // runs a cluster).
+    // zig build test:api: the JSON API, its documents, then adds, against models (one after the
+    // other: each runs a cluster).
     var api_previous: ?*std.Build.Step = null;
-    for ([_][]const u8{ "api.py", "adds.py" }) |script| {
+    for ([_][]const u8{ "api.py", "documents.py", "adds.py" }) |script| {
         const run_api_test = b.addSystemCommand(&.{ "python3", b.fmt("tests/api/{s}", .{script}) });
         run_api_test.addFileArg(nerva.getEmittedBin());
         if (b.args) |args| run_api_test.addArgs(args);

@@ -140,8 +140,20 @@ curl -H 'X-Nerva-Key: secret' -d '{"entries":[{"kind":"put","table":1,"id":"5","
 
 64-bit numbers (ids, ops, cursors) are decimal strings; values are the 80 bytes as hex. Layouts
 live in the log, in a reserved catalog table; the core still stores bytes and never reads them.
-`zig build test:api` checks every route against a model, races eight writers on one row, and
-races fifty reservations on one budget with adds (none retried).
+
+**Documents** hold values larger than a row: up to 64 KiB under a string key (up to 1024 bytes
+of UTF-8) in a namespace (a `u64`, as a decimal string). Nerva chunks them over rows of a
+reserved table:
+
+| Route | Does |
+|---|---|
+| `POST /v1/documents/get` `{"namespace","keys":[…],"as_of"?}` | Up to 256 keys as of one op (the latest, or `as_of` a committed op): `exists`, `version` (the op of the last write, `"0"` if never written), `value_hex`. |
+| `POST /v1/documents/commit` `{"namespace","reads":[{"key","version"}],"writes":[{"key","value_hex"} or {"key","delete":true}]}` | One transaction. `200` committed with its `op`; `409` with the stale read's `key` and current `version`; `400` invalid. About 600 KB of keys and values per commit. |
+| `GET /v1/documents/changes?namespace=&cursor=&limit=` | The namespace's document writes in commit order (`key`, `op`, `kind` put or delete, `value_hex`), paged like `/v1/changes`. |
+
+`zig build test:api` checks every route against a model (documents included), races eight
+writers on one row and on one document, and races fifty reservations on one budget with adds
+(none retried).
 
 ## Declared views
 

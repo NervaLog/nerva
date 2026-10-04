@@ -92,9 +92,8 @@ holding facts, receipts and views. Nerva must support the second arrangement eit
 4. **As-of reads and workflow state** (G6, G7).
    - G6 ✅ `get_history` reads any row as of any op, through an index on the change feed
      (N27); `nerva api` serves `row?as_of=`, and declared views answer `as_of` any op.
-   - G7 open: durable workflow state needs larger values than 80-byte rows (applications chunk
-     them today, as `documents.zig` does for the catalog) and attributed approvals, which need
-     an identity model (N30).
+   - G7 open: larger values than 80-byte rows ✅ (documents of up to 64 KiB through
+     `nerva api`, N41); attributed approvals still need an identity model (N30).
 5. ✅ **Declared views** (G4): layouts and view declarations in the log, computed by `nerva view`
    latest or as of any op, with a hash per answer (N34, N35); demonstrated by the seat and
    canvas demos under crashes (N36, N38).

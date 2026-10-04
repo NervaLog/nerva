@@ -217,6 +217,22 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
 - `VERSION`: `0.1.0`, the first release.
 
 
+## 2026-10-04 — Documents in the generic API (N41)
+
+- `nerva api` serves documents (values up to 64 KiB under string keys, per namespace) in the
+  reserved table `0xFFFF0002`: `POST /v1/documents/get` (latest or `as_of`),
+  `POST /v1/documents/commit` (reads at a version, puts and deletes, `409` naming the key), and
+  `GET /v1/documents/changes` (decoded document writes, pages ending at op boundaries).
+  Code: `src/nerva/api/documents_routes.zig`.
+- `documents.zig`: deletes are tombstones (a `deleted` flag in chunk 0's header, which was
+  reserved), so the feed names deleted keys; headers are checked strictly.
+- Fixed in `client.zig`: an oversized request left the client marked busy, so the next request
+  panicked. The check now comes first.
+- `tests/api/documents.py`, run by `zig build test:api` after `api.py`: random transactions in
+  two namespaces against a model, reads latest and as of, feeds with small pages, limits, and
+  an eight-thread counter race on one document. Mutation-tested: reading tail chunks without
+  checking their version, and pages that split an op, both fail it.
+
 ## 2026-10-04 — Adds: conditional operations for hot rows (N42)
 
 - `src/nerva.zig`: `EntryKind.add`, `Add` (parameters in the entry's value), `add_amount` and
