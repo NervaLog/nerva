@@ -413,7 +413,17 @@ tree ids 1–15, and the trace's tree enum, derived from Nerva's four trees, pan
   redundant guard. The last mutation was caught only after adding header-count properties.)
 - `ci.yml` is unchanged while CI is re-wired; it should run `fuzz -- smoke`.
 
-**N47. Replicas export metrics with `--statsd` and spans with `--trace`.**
+**N47. CI runs on Botpike's own runners.**
+`ci.yml` and `release.yml` run every job on `[self-hosted, fly]`: Botpike/ci-runners starts a Fly
+Machine (performance-2x, 8 GB, its own 10 GB volume) for the job and stops it afterwards, so a
+job waits seconds for a runner and the Zig cache survives between jobs. They behave as GitHub's
+runners do where this repository depends on it: jobs run as a non-root user with
+`perf_event_paranoid` 2, so the perf test still skips itself (N32); the workspace is on the
+volume, which holds the integration test's 3.5 GiB; `xz` and `gh` are installed for Zig's
+download and the release. Nothing else changed: the steps, seeds and release are as N32 and N40
+set them.
+
+**N48. Replicas export metrics with `--statsd` and spans with `--trace`.**
 Nightly performance tests and anyone running Nerva need the replica's timings, and the vendored
 tracer already records them (request latency per operation, commit stages, compaction, lookups
 and scans per tree, storage IO, cache hits) and emits them every 10 s. `nerva start` simply
@@ -432,4 +442,3 @@ gave it no output. Now:
 - `test:integration` starts replica 0 with `--statsd` (to a UDP socket the test binds) and
   replica 1 with `--trace`, then waits up to 15 s for request, commit and cache metrics and
   checks the trace holds commit spans. Mutation-tested: dropping either wiring fails it.
-
