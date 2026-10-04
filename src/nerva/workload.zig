@@ -24,6 +24,7 @@ const vsr = @import("../vsr.zig");
 const nerva = @import("../nerva.zig");
 const MultiBatchDecoder = vsr.multi_batch.MultiBatchDecoder;
 const MultiBatchEncoder = vsr.multi_batch.MultiBatchEncoder;
+const TimestampRange = @import("../lsm/timestamp_range.zig").TimestampRange;
 
 const Entry = nerva.Entry;
 const EntryResult = nerva.EntryResult;
@@ -111,6 +112,69 @@ fn signed_range(prng: *stdx.PRNG, min: i64, max: i64) i64 {
     return @intCast(@as(i128, min) + prng.int_inclusive(u64, span));
 }
 
+/// A filter limit: usually `[0, small_max]` (zero is invalid, and returns nothing); sometimes at
+/// the largest a reply holds, just past it, or `maxInt(u32)`, which must be clamped (N48).
+fn limit_random(prng: *stdx.PRNG, small_max: u32, limit_max: u32) u32 {
+    return switch (prng.chances(.{ .small = 20, .max = 1, .past = 1, .huge = 1 })) {
+        .small => prng.int_inclusive(u32, small_max),
+        .max => limit_max,
+        .past => limit_max + 1,
+        .huge => std.math.maxInt(u32),
+    };
+}
+
+/// A timestamp past the largest valid one (`maxInt(u63)`): a filter holding it is invalid.
+fn timestamp_invalid(prng: *stdx.PRNG) u64 {
+    return prng.range_inclusive(u64, TimestampRange.timestamp_max + 1, std.math.maxInt(u64));
+}
+
+/// Checks `entry_validate`'s answer against the rules `EntryStatus` documents, written apart
+/// from it (N48): the entry is valid exactly when it breaks none of them, and otherwise the
+/// status names one it breaks. (Which one wins when several are broken is `entry_validate`'s
+/// choice.) An add's own parameters are `nerva_adds`'s to fuzz: when only they are wrong, any of
+/// the add statuses may be named.
+fn entry_status_check(entry: *const Entry, status: ?EntryStatus) void {
+    var broken = std.EnumSet(EntryStatus).initEmpty();
+    const kind_known = switch (entry.kind) {
+        .read, .put, .delete, .add => true,
+        _ => false,
+    };
+    if (!kind_known) broken.insert(.kind_invalid);
+    if (entry.table == 0) broken.insert(.table_invalid);
+    if (!stdx.zeroed(&entry.reserved_a) or entry.reserved_b != 0 or
+        !stdx.zeroed(&entry.reserved_c))
+    {
+        broken.insert(.reserved_not_zero);
+    }
+    if ((entry.kind == .read or entry.kind == .delete) and !stdx.zeroed(&entry.value)) {
+        broken.insert(.value_not_zero);
+    }
+    if ((entry.kind == .put or entry.kind == .delete or entry.kind == .add) and
+        entry.op_seen != 0)
+    {
+        broken.insert(.op_seen_not_zero);
+    }
+
+    if (status) |status_| {
+        const add_status = entry.kind == .add and switch (status_) {
+            .reserved_not_zero, .field_invalid, .delta_from_invalid => true,
+            else => false,
+        };
+        if (!broken.contains(status_) and !add_status) {
+            std.debug.panic("entry_validate: {s}, but the entry breaks {}: {}", .{
+                @tagName(status_),
+                broken,
+                entry.*,
+            });
+        }
+    } else if (broken.count() > 0) {
+        std.debug.panic("entry_validate: valid, but the entry breaks {}: {}", .{
+            broken,
+            entry.*,
+        });
+    }
+}
+
 fn budget_is(entries: []const Entry) bool {
     for (entries) |*entry| {
         if (entry.table != budgets_table) return false;
@@ -173,8 +237,22 @@ pub fn WorkloadType(comptime StateMachine: type) type {
         budget_transactions: u64 = 0,
         adds_applied: u64 = 0,
         adds_clamped: u64 = 0,
-        /// Scratch: the expected results of the transaction being checked.
-        expected: [transaction_entries_max]Expected = undefined,
+        /// Scratch: the expected results of the transaction being checked (any size, up to a full
+        /// batch).
+        expected: []Expected,
+
+        /// The cursor an incomplete `get_changes` reply returned, to continue from (N48).
+        changes_cursor: ?u64 = null,
+        /// The row and cursor an incomplete `get_history` reply returned, to continue from.
+        history_cursor: ?struct { table: u32, id: u64, timestamp_max: u64 } = null,
+
+        /// Coverage of the inputs and limits added in N48.
+        full_batches: u64 = 0,
+        invalid_entries: u64 = 0,
+        future_reads: u64 = 0,
+        invalid_filters: u64 = 0,
+        limits_clamped: u64 = 0,
+        cursors_continued: u64 = 0,
 
         pub const Options = struct {
             batch_size_limit: u32,
@@ -223,7 +301,14 @@ pub fn WorkloadType(comptime StateMachine: type) type {
             assert(options.budget_count > 0);
             assert(options.entries_per_transaction_max <= transaction_entries_max);
             assert(options.table_count < receipts_table);
-            return .{ .allocator = allocator, .prng = prng, .options = options };
+            const expected = try allocator.alloc(Expected, StateMachine.commit_entries_max);
+            errdefer allocator.free(expected);
+            return .{
+                .allocator = allocator,
+                .prng = prng,
+                .options = options,
+                .expected = expected,
+            };
         }
 
         pub fn deinit(workload: *Workload, allocator: std.mem.Allocator) void {
@@ -240,6 +325,16 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                 workload.adds_applied,
                 workload.adds_clamped,
             });
+            log.info("full batches={} invalid entries={} future reads={} invalid filters={} " ++
+                "limits clamped={} cursors continued={}", .{
+                workload.full_batches,
+                workload.invalid_entries,
+                workload.future_reads,
+                workload.invalid_filters,
+                workload.limits_clamped,
+                workload.cursors_continued,
+            });
+            allocator.free(workload.expected);
             workload.budgets.deinit(allocator);
             workload.receipt_seqs.deinit(allocator);
             workload.rows.deinit(allocator);
@@ -300,12 +395,17 @@ pub fn WorkloadType(comptime StateMachine: type) type {
             for (0..batch_count) |_| {
                 const writable = encoder.writable() orelse break;
                 const entries_free = stdx.bytes_as_slice(.inexact, Entry, writable);
-                const entries = entries_free[0..workload.prng.int_inclusive(
+                // Rarely, one transaction as large as the request allows (N48): prefetch and the
+                // state machine's scratch space at capacity.
+                const full = workload.prng.chance(stdx.PRNG.ratio(1, 100));
+                const entries = if (full) entries_free else entries_free[0..workload.prng.int_inclusive(
                     usize,
                     @min(entries_free.len, workload.options.entries_per_transaction_max),
                 )];
+                if (full) workload.full_batches += 1;
                 workload.build_transaction(entries);
                 encoder.add(@intCast(entries.len * @sizeOf(Entry)));
+                if (full) break;
             }
             return encoder.finish();
         }
@@ -415,11 +515,26 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                 }
 
                 if (prng.chance(workload.options.invalid_entry_probability)) {
-                    switch (prng.chances(.{ .table = 1, .reserved = 1, .value = 1, .kind = 1 })) {
+                    workload.invalid_entries += 1;
+                    switch (prng.chances(.{
+                        .table = 1,
+                        .reserved_a = 1,
+                        .reserved_b = 1,
+                        .reserved_c = 1,
+                        .value = 1,
+                        .kind = 1,
+                        .kind_zero = 1,
+                        .op_seen = 1,
+                    })) {
                         .table => entry.table = 0,
-                        .reserved => entry.reserved_b = 1,
+                        .reserved_a => entry.reserved_a[prng.index(&entry.reserved_a)] = 1,
+                        .reserved_b => entry.reserved_b = 1,
+                        .reserved_c => entry.reserved_c[prng.index(&entry.reserved_c)] = 1,
                         .value => entry.value[prng.index(&entry.value)] = 1,
                         .kind => entry.kind = @enumFromInt(prng.range_inclusive(u8, 5, 255)),
+                        .kind_zero => entry.kind = @enumFromInt(0),
+                        // Valid for a read (a version, maybe stale); invalid for any write.
+                        .op_seen => entry.op_seen = prng.range_inclusive(u64, 1, 1 << 40),
                     }
                 }
             }
@@ -428,7 +543,14 @@ pub fn WorkloadType(comptime StateMachine: type) type {
         fn entry_read(workload: *Workload, table: u32, id: u64) Entry {
             const version = workload.row_version(nerva.row_key(table, id));
             const op_seen = if (workload.prng.chance(workload.options.stale_read_probability))
-                workload.prng.int_inclusive(u64, workload.op_max)
+                switch (workload.prng.chances(.{ .stale = 4, .future = 1 })) {
+                    .stale => workload.prng.int_inclusive(u64, workload.op_max),
+                    // A version no row has yet (N48): it must conflict too.
+                    .future => future: {
+                        workload.future_reads += 1;
+                        break :future workload.op_max + workload.prng.range_inclusive(u64, 1, 100);
+                    },
+                }
             else
                 version.op;
             return .{
@@ -540,9 +662,11 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                     constants.message_body_size_max - reply_trailer_size,
                     @sizeOf(RowValue),
                 ) - keys_total;
+                // Usually a few keys; sometimes as many as the reply can hold (N48).
+                const keys_max = @min(keys_free.len, reply_keys_free);
                 const keys = keys_free[0..workload.prng.int_inclusive(
                     usize,
-                    @min(keys_free.len, reply_keys_free, 16),
+                    if (workload.prng.chance(stdx.PRNG.ratio(1, 20))) keys_max else @min(keys_max, 16),
                 )];
                 keys_total += keys.len;
                 for (keys) |*key| {
@@ -550,6 +674,11 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                         .id = workload.prng.int_inclusive(u64, workload.options.id_count - 1),
                         // Table zero is invalid, and must come back as not found.
                         .table = workload.prng.int_inclusive(u32, workload.options.table_count),
+                        // As must a key with reserved bits set.
+                        .reserved = if (workload.prng.chance(stdx.PRNG.ratio(1, 50)))
+                            workload.prng.range_inclusive(u32, 1, std.math.maxInt(u32))
+                        else
+                            0,
                     };
                 }
                 encoder.add(@intCast(keys.len * @sizeOf(RowKey)));
@@ -567,14 +696,33 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                 std.mem.bytesAsValue(ChangesFilter, body[0..@sizeOf(ChangesFilter)]),
             );
             filter.* = .{
-                .timestamp_min = switch (prng.chances(.{ .start = 1, .known = 3, .after = 1 })) {
+                .timestamp_min = switch (prng.chances(.{
+                    .start = 1,
+                    .known = 3,
+                    .after = 1,
+                    .cursor = 2,
+                    .invalid = 1,
+                })) {
                     .start => 0,
                     .known => if (changes.len == 0) 0 else changes[prng.index(changes)].timestamp,
                     .after => if (changes.len == 0) 0 else changes[changes.len - 1].timestamp + 1,
+                    // Where an incomplete reply said to continue (N48).
+                    .cursor => if (workload.changes_cursor) |cursor| cursor: {
+                        workload.cursors_continued += 1;
+                        break :cursor cursor;
+                    } else 0,
+                    // Past the largest timestamp: the filter is invalid, and returns nothing.
+                    .invalid => if (prng.chance(stdx.PRNG.ratio(1, 4)))
+                        timestamp_invalid(prng)
+                    else
+                        0,
                 },
-                // Zero is an invalid limit, and must return nothing.
-                .limit = prng.int_inclusive(u32, 64),
+                .limit = limit_random(prng, 64, StateMachine.changes_limit_max),
             };
+            // Reserved bytes set: the filter is invalid, and returns nothing.
+            if (prng.chance(stdx.PRNG.ratio(1, 50))) {
+                filter.reserved[prng.index(&filter.reserved)] = 1;
+            }
             return @sizeOf(ChangesFilter);
         }
 
@@ -600,22 +748,39 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                     workload.options.id_count,
                     workload.options.receipt_count,
                 ) - 1),
-                // Zero is an invalid limit, and must return nothing.
-                .limit = prng.int_inclusive(u32, 16),
+                .limit = limit_random(prng, 16, StateMachine.changes_limit_max),
                 .op_max = switch (prng.chances(.{ .latest = 2, .past = 4, .invalid = 1 })) {
                     .latest => std.math.maxInt(u64),
                     .past => prng.range_inclusive(u64, 1, @max(1, workload.op_max)),
                     .invalid => 0,
                 },
-                .timestamp_max = switch (prng.chances(.{ .newest = 3, .known = 2 })) {
+                .timestamp_max = switch (prng.chances(.{ .newest = 3, .known = 2, .invalid = 1 })) {
                     .newest => 0,
                     .known => if (known) |change| change.timestamp else 0,
+                    // Past the largest timestamp: the filter is invalid, and returns nothing.
+                    .invalid => if (prng.chance(stdx.PRNG.ratio(1, 4)))
+                        timestamp_invalid(prng)
+                    else
+                        0,
                 },
             };
             // Mostly ask about rows that have a history.
             if (known != null and prng.chance(stdx.PRNG.ratio(1, 2))) {
                 filter.table = known.?.table;
                 filter.id = known.?.id;
+            }
+            // Or continue where an incomplete reply said to (N48).
+            if (workload.history_cursor) |cursor| {
+                if (prng.chance(stdx.PRNG.ratio(1, 4))) {
+                    filter.table = cursor.table;
+                    filter.id = cursor.id;
+                    filter.timestamp_max = cursor.timestamp_max;
+                    workload.cursors_continued += 1;
+                }
+            }
+            // Reserved bytes set: the filter is invalid, and returns nothing.
+            if (prng.chance(stdx.PRNG.ratio(1, 50))) {
+                filter.reserved[prng.index(&filter.reserved)] = 1;
             }
             return @sizeOf(HistoryFilter);
         }
@@ -624,6 +789,7 @@ pub fn WorkloadType(comptime StateMachine: type) type {
             workload: *Workload,
             client_index: usize,
             operation: Operation,
+            op: u64,
             timestamp: u64,
             request_body: []align(constants.cache_line_size) const u8,
             reply_body: []align(constants.cache_line_size) const u8,
@@ -632,11 +798,13 @@ pub fn WorkloadType(comptime StateMachine: type) type {
             workload.requests_delivered += 1;
             assert(workload.requests_delivered <= workload.requests_sent);
 
+            // Every reply is checked against the op its request executed at, not only against
+            // the ops before it (N48).
             switch (operation) {
-                .commit => workload.check_commit(timestamp, request_body, reply_body),
-                .lookup_rows => workload.check_lookup_rows(request_body, reply_body),
-                .get_changes => workload.check_get_changes(request_body, reply_body),
-                .get_history => workload.check_get_history(request_body, reply_body),
+                .commit => workload.check_commit(op, timestamp, request_body, reply_body),
+                .lookup_rows => workload.check_lookup_rows(op, request_body, reply_body),
+                .get_changes => workload.check_get_changes(op, request_body, reply_body),
+                .get_history => workload.check_get_history(op, request_body, reply_body),
             }
         }
 
@@ -649,6 +817,7 @@ pub fn WorkloadType(comptime StateMachine: type) type {
 
         fn check_commit(
             workload: *Workload,
+            op_executed: u64,
             timestamp: u64,
             request_body: []align(constants.cache_line_size) const u8,
             reply_body: []align(constants.cache_line_size) const u8,
@@ -699,6 +868,7 @@ pub fn WorkloadType(comptime StateMachine: type) type {
 
                 workload.transactions_committed += 1;
                 const op = results[0].op;
+                assert(op == op_executed);
                 for (results, workload.expected[0..results.len]) |result, expected| {
                     assert(result.status == .ok);
                     assert(result.op == op);
@@ -765,10 +935,12 @@ pub fn WorkloadType(comptime StateMachine: type) type {
         /// The model's expectation, computed independently of the state machine. On success,
         /// fills `expected` with each entry's result.
         fn commit_failure(workload: *Workload, entries: []const Entry) ?Failure {
-            assert(entries.len <= transaction_entries_max);
+            assert(entries.len <= workload.expected.len);
             for (entries, 0..) |*entry, index| {
-                if (nerva.entry_validate(entry)) |status| {
-                    return .{ .index = index, .status = status, .op = 0 };
+                const status = nerva.entry_validate(entry);
+                entry_status_check(entry, status);
+                if (status) |status_| {
+                    return .{ .index = index, .status = status_, .op = 0 };
                 }
                 if (entry.kind == .add) {
                     const add = Add.from_entry(entry);
@@ -907,6 +1079,7 @@ pub fn WorkloadType(comptime StateMachine: type) type {
 
         fn check_lookup_rows(
             workload: *Workload,
+            op_executed: u64,
             request_body: []align(constants.cache_line_size) const u8,
             reply_body: []align(constants.cache_line_size) const u8,
         ) void {
@@ -929,6 +1102,7 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                     // checked so far (G2).
                     if (op_read) |op| assert(result.op_read == op);
                     assert(result.op_read > workload.op_max);
+                    assert(result.op_read == op_executed);
                     op_read = result.op_read;
                     assert(stdx.zeroed(&result.reserved_b));
                     const expected: Version = if (key.table == 0 or key.reserved != 0)
@@ -946,6 +1120,7 @@ pub fn WorkloadType(comptime StateMachine: type) type {
 
         fn check_get_changes(
             workload: *Workload,
+            op_executed: u64,
             request_body: []align(constants.cache_line_size) const u8,
             reply_body: []align(constants.cache_line_size) const u8,
         ) void {
@@ -953,11 +1128,16 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                 std.mem.bytesAsValue(ChangesFilter, request_body[0..@sizeOf(ChangesFilter)]),
             );
             const results = stdx.bytes_as_slice(.exact, Change, reply_body);
-            if (filter.limit == 0) {
+            // Invalid filters return nothing.
+            if (filter.limit == 0 or !stdx.zeroed(&filter.reserved) or
+                filter.timestamp_min > TimestampRange.timestamp_max)
+            {
+                if (filter.limit != 0) workload.invalid_filters += 1;
                 assert(results.len == 0);
                 return;
             }
             const limit = @min(filter.limit, StateMachine.changes_limit_max);
+            if (filter.limit > limit) workload.limits_clamped += 1;
 
             const changes = workload.changes.items;
             var start: usize = 0;
@@ -979,18 +1159,21 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                 assert(end.op == 0);
             } else {
                 assert(end.op > workload.op_max);
+                assert(end.op == op_executed);
                 workload.op_max = end.op;
             }
             assert(end.timestamp == if (count == 0)
                 filter.timestamp_min
             else
                 results[count - 1].timestamp + 1);
+            if (end.flags.more) workload.changes_cursor = end.timestamp;
         }
 
         /// The model's history of the row: its changes newest first, from `timestamp_max`, at most
         /// `limit` scanned; those after `op_max` are scanned but not returned (G6).
         fn check_get_history(
             workload: *Workload,
+            op_executed: u64,
             request_body: []align(constants.cache_line_size) const u8,
             reply_body: []align(constants.cache_line_size) const u8,
         ) void {
@@ -998,11 +1181,21 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                 std.mem.bytesAsValue(HistoryFilter, request_body[0..@sizeOf(HistoryFilter)]),
             );
             const results = stdx.bytes_as_slice(.exact, Change, reply_body);
-            if (filter.table == 0 or filter.limit == 0 or filter.op_max == 0) {
+            // Invalid filters return nothing.
+            if (filter.table == 0 or filter.limit == 0 or filter.op_max == 0 or
+                !stdx.zeroed(&filter.reserved) or
+                filter.timestamp_max > TimestampRange.timestamp_max)
+            {
+                if (!stdx.zeroed(&filter.reserved) or
+                    filter.timestamp_max > TimestampRange.timestamp_max)
+                {
+                    workload.invalid_filters += 1;
+                }
                 assert(results.len == 0);
                 return;
             }
             const limit = @min(filter.limit, StateMachine.changes_limit_max);
+            if (filter.limit > limit) workload.limits_clamped += 1;
             assert(results.len >= 1);
 
             var scanned: u32 = 0;
@@ -1037,8 +1230,14 @@ pub fn WorkloadType(comptime StateMachine: type) type {
             if (end.flags.more) {
                 assert(end.op == 0);
                 assert(end.timestamp == timestamp_last - 1);
+                workload.history_cursor = .{
+                    .table = filter.table,
+                    .id = filter.id,
+                    .timestamp_max = end.timestamp,
+                };
             } else {
                 assert(end.op > workload.op_max);
+                assert(end.op == op_executed);
                 assert(end.timestamp == 0);
                 workload.op_max = end.op;
             }

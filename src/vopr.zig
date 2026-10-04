@@ -1362,6 +1362,7 @@ pub const Simulator = struct {
                     simulator.workload.on_reply(
                         commit.client_index.?,
                         commit.reply.header.operation.cast(StateMachine.Operation),
+                        commit.prepare.header.op,
                         commit.reply.header.timestamp,
                         commit.prepare.body_used(),
                         commit.reply.body_used(),
@@ -1765,7 +1766,8 @@ fn log_override(
             if (log_performance_mode) {
                 if (scope != .simulator) return;
             } else {
-                if (scope != .simulator and scope != .cluster) return;
+                // Nerva: also the workload's summary of what it checked (N48).
+                if (scope != .simulator and scope != .cluster and scope != .workload) return;
             }
         }
     }
