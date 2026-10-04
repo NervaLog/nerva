@@ -282,3 +282,17 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
   `tests/api/api.py` sends malformed heads and a dripping client alongside normal ones;
   `tests/views/declared.py` checks the immediate 504, a dripping and a malformed client.
 
+## 2026-10-04 — Fuzzing runs again; Nerva's first fuzzers (N46; #6)
+
+- `src/trace/event.zig`: the tree enum names placeholders for unused ids up to 15, so the
+  vendored `lsm_scan` fuzzer no longer panics and `fuzz -- smoke` runs all its fuzzers (#6).
+- `src/nerva/adds_fuzz.zig`, `http_head_fuzz.zig`, `documents_fuzz.zig`, registered in
+  `src/fuzz_tests.zig` with smoke sizes: adds' arithmetic against an independent reference,
+  the gateways' head parser and key check, and document chunking.
+- Verified: `fuzz -- smoke` passes; each new fuzzer passes 20 random seeds; deliberate bugs
+  (an off-by-one clamp, a dropped last byte, control bytes or a repeated key accepted in a
+  head) each fail their fuzzer, then were reverted. A bare CR accepted is not caught, and is
+  harmless: the other checks refuse it (N46).
+- Smoke reports the vendored `lsm_segmented_array` as slow in Debug (about 20 s against its
+  10 s budget); it is a warning, not a failure, and smoke never reached it before this fix.
+

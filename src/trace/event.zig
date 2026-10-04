@@ -36,6 +36,12 @@ const Operation = operation_enum: {
     } });
 };
 
+/// The largest tree id a vendored test groove uses (`lsm/scan_fuzz.zig`'s `ThingsGroove`: 1–15).
+/// Nerva has fewer trees than TigerBeetle, whose ids covered these; every id up to this one that
+/// Nerva does not use gets a placeholder (`test_<id>`), so the enum stays exhaustive (Nerva
+/// patch, UPSTREAM.md; issue #6).
+const tree_id_test_max = 15;
+
 const TreeEnum = tree_enum: {
     const tree_ids = @import("../nerva.zig").tree_ids;
     var tree_fields: []const std.builtin.Type.EnumField = &[_]std.builtin.Type.EnumField{};
@@ -46,6 +52,18 @@ const TreeEnum = tree_enum: {
             tree_fields = tree_fields ++ &[_]std.builtin.Type.EnumField{.{
                 .name = groove_field.name ++ "." ++ field_name,
                 .value = @field(tree_ids_groove, field_name),
+            }};
+        }
+    }
+
+    for (1..tree_id_test_max + 1) |tree_id| {
+        const used = for (tree_fields) |tree_field| {
+            if (tree_field.value == tree_id) break true;
+        } else false;
+        if (!used) {
+            tree_fields = tree_fields ++ &[_]std.builtin.Type.EnumField{.{
+                .name = std.fmt.comptimePrint("test_{}", .{tree_id}),
+                .value = tree_id,
             }};
         }
     }
