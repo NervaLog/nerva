@@ -11,6 +11,8 @@ const vsr = @import("vsr.zig");
 const constants = @import("constants.zig");
 const config = constants.config;
 const cli = @import("nerva/cli.zig");
+const Client = @import("nerva/client.zig").Client;
+const ledgerd = @import("nerva/ledgerd/server.zig");
 
 const IO = @import("io.zig").IO;
 const Tracer = @import("trace.zig").Tracer;
@@ -62,6 +64,10 @@ pub fn main() !void {
             try std.io.getStdOut().writer().print("Nerva version {}\n", .{constants.semver});
             return;
         },
+        .ledgerd => |*args| {
+            log_level_runtime = if (args.log_debug) .debug else .info;
+            try command_ledgerd(gpa, args);
+        },
         inline .format, .start => |*args, tag| {
             log_level_runtime = if (args.log_debug) .debug else .info;
 
@@ -91,7 +97,7 @@ pub fn main() !void {
             switch (tag) {
                 .format => try command_format(gpa, &storage, args),
                 .start => try command_start(gpa, &io, time, &tracer, &storage, args),
-                .version => comptime unreachable,
+                .version, .ledgerd => comptime unreachable,
             }
         },
     }
@@ -207,4 +213,30 @@ fn command_start(
         replica.tick();
         try io.run_for_ns(constants.tick_ms * std.time.ns_per_ms);
     }
+}
+
+fn command_ledgerd(gpa: std.mem.Allocator, args: *const cli.Command.Ledgerd) !void {
+    const key = std.posix.getenv("LEDGER_KEY") orelse "";
+    if (key.len == 0) vsr.fatal(.cli, "ledgerd: set LEDGER_KEY", .{});
+
+    var client: Client = undefined;
+    try client.init(gpa, .{
+        .cluster = args.cluster,
+        .addresses = args.addresses.slice(),
+        .timeout = stdx.Duration.seconds(30),
+    });
+    defer client.deinit();
+
+    try ledgerd.serve(gpa, &client, .{
+        .listen = args.listen,
+        .key = key,
+        .ledger = args.ledger,
+        .on_listening = on_listening,
+    });
+}
+
+/// For `--listen=…:0`: print the bound port, alone, so a parent process can learn it.
+fn on_listening(address: std.net.Address) void {
+    const stdout = std.io.getStdOut().writer();
+    stdout.print("{}\n", .{address.getPort()}) catch {};
 }

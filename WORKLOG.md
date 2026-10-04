@@ -84,3 +84,23 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
 - Verified: `check`, `test:fmt` pass; `test:unit` 276/277 (only the sandbox-denied perf test
   fails); `test:integration` passes three times in a row with no leftover processes; VOPR
   seed 1 replays identically (91,649 ticks).
+
+## 2026-10-04 — 1.0 Milestone 2b: `nerva ledgerd`
+
+- Read Botpike/runtime and Botpike/app: the runtime already speaks a small ledger protocol to a
+  pluggable backend (`ledger/ledgerd.py`, Botpike's `/runtime-ledger`). Chose to serve that
+  protocol from Nerva instead of inventing a JSON API. Started `docs/DECISIONS.md` (N1–N20).
+- `src/nerva/ledgerd/routes.zig`: a port of `ledgerd.py`'s sixteen routes over a store interface,
+  including Python-compatible UTF-8 replacement and its write-before-error behaviour (N18).
+- `src/nerva/ledgerd/store.zig`: one Nerva transaction per route; values chunked over 80-byte
+  rows with SHA-256-derived ids (collision-checked); generations for `admin/init`; read set with
+  versions; conflict → retry.
+- `src/nerva/ledgerd/server.zig` + `nerva ledgerd`: sequential HTTP server (std.http), key from
+  `LEDGER_KEY`, jittered backoff on conflict (N20).
+- `tests/ledgerd/`: oracle copy of `ledgerd.py` (runtime commit 23010ba), `conformance.py`
+  (differential, byte-identical, scripted + seeded fuzz, ledger isolation) and `race.py` (two
+  gateways, money conservation, single claims, retries exercised). `zig build test:ledgerd`.
+- Found by the race test and fixed: a hot `journal.count` row (N19) and retry storms (N20).
+- Verified: conformance 5 seeds × 2,000 fuzzed requests byte-identical; race passes repeatedly
+  (8 and 16 threads); harness mutation-tested (a one-space journal change is caught);
+  `test:unit` 284/285 (sandbox perf test); `test:integration` passes.

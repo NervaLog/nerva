@@ -4,6 +4,7 @@ Guidance for Claude Code when working in this repository.
 
 **Read first, every session:** [README.md](./README.md) (design),
 [docs/GOALS-1.0.md](./docs/GOALS-1.0.md) (1.0 goals; Botpike is the first customer),
+[docs/DECISIONS.md](./docs/DECISIONS.md) (decision log: add to it when you decide something),
 [UPSTREAM.md](./UPSTREAM.md) (what is vendored), and [docs/TIGER_STYLE.md](./docs/TIGER_STYLE.md)
 (coding style, mandatory).
 
@@ -34,6 +35,7 @@ the VOPR simulator are vendored from TigerBeetle; Nerva's own code is `src/nerva
 ./zig/zig build vopr -- <seed>  # Simulator; a seed reproduces a run exactly (~5 min ReleaseSafe)
 ./zig/zig build fuzz -- smoke
 ./zig/zig build test:integration  # Real 3-replica cluster + client (~20 s, ~3.5 GiB disk)
+./zig/zig build test:ledgerd  # nerva ledgerd vs Botpike's ledgerd.py + a race (python3, ~2 min)
 ./zig/zig build               # zig-out/bin/nerva
 ./zig/zig fmt src build.zig
 ```

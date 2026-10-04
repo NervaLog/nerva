@@ -11,3 +11,6 @@ zig-out/
 *.vopr
 
 .DS_Store
+
+# Python bytecode from tests/.
+__pycache__/

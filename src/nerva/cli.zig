@@ -38,6 +38,14 @@ const CLIArgs = union(enum) {
         path: []const u8,
     },
 
+    ledgerd: struct {
+        cluster: u128,
+        addresses: vsr.ClusterAddress,
+        ledger: u64,
+        listen: []const u8,
+        log_debug: bool = false,
+    },
+
     version: struct {},
 
     pub const help =
@@ -51,6 +59,9 @@ const CLIArgs = union(enum) {
         \\  nerva start --addresses=<addresses> [--cache-grid=<size><KiB|MiB|GiB>]
         \\              [--development] [--log-debug] <path>
         \\
+        \\  nerva ledgerd --cluster=<integer> --addresses=<addresses> --ledger=<integer>
+        \\                --listen=<host:port> [--log-debug]
+        \\
         \\  nerva version
         \\
         \\Commands:
@@ -58,6 +69,9 @@ const CLIArgs = union(enum) {
         \\  format   Create a replica's data file at <path>.
         \\
         \\  start    Run a replica from the data file at <path>.
+        \\
+        \\  ledgerd  Serve the Botpike runtime's ledger protocol from the cluster at
+        \\           <addresses>. The key is read from the LEDGER_KEY environment variable.
         \\
         \\  version  Print the version.
         \\
@@ -80,6 +94,13 @@ const CLIArgs = union(enum) {
         \\  --cache-grid=<size><KiB|MiB|GiB>
         \\        Memory for caching data file blocks.
         \\
+        \\  --ledger=<integer>
+        \\        Which ledger of the cluster to serve; one cluster holds many.
+        \\
+        \\  --listen=<host:port>
+        \\        Where to serve HTTP. The bound port is printed to stdout (use port 0 for an
+        \\        ephemeral one).
+        \\
         \\  --development
         \\        Allow running without Direct IO, with small default caches.
         \\
@@ -92,7 +113,16 @@ const CLIArgs = union(enum) {
 pub const Command = union(enum) {
     format: Format,
     start: Start,
+    ledgerd: Ledgerd,
     version,
+
+    pub const Ledgerd = struct {
+        cluster: u128,
+        addresses: vsr.ClusterAddress,
+        ledger: u64,
+        listen: std.net.Address,
+        log_debug: bool,
+    };
 
     pub const Format = struct {
         cluster: u128,
@@ -134,8 +164,30 @@ pub fn parse_args(flags: *stdx.Flags) Command {
             .log_debug = start.log_debug,
             .path = start.path,
         }) catch |err| vsr.fatal(.cli, "start: {s}", .{error_message(err)}) },
+        .ledgerd => |ledgerd| .{ .ledgerd = .{
+            .cluster = ledgerd.cluster,
+            .addresses = ledgerd.addresses,
+            .ledger = ledgerd.ledger,
+            .listen = listen_parse(ledgerd.listen) orelse
+                vsr.fatal(.cli, "ledgerd: --listen must be <ipv4>:<port>", .{}),
+            .log_debug = ledgerd.log_debug,
+        } },
         .version => .version,
     };
+}
+
+fn listen_parse(text: []const u8) ?std.net.Address {
+    const colon = std.mem.lastIndexOfScalar(u8, text, ':') orelse return null;
+    const port = std.fmt.parseInt(u16, text[colon + 1 ..], 10) catch return null;
+    return std.net.Address.parseIp4(text[0..colon], port) catch null;
+}
+
+test listen_parse {
+    try std.testing.expectEqual(@as(u16, 8090), listen_parse("127.0.0.1:8090").?.getPort());
+    try std.testing.expectEqual(@as(u16, 0), listen_parse("0.0.0.0:0").?.getPort());
+    try std.testing.expect(listen_parse("8090") == null);
+    try std.testing.expect(listen_parse("localhost:8090") == null);
+    try std.testing.expect(listen_parse("127.0.0.1:99999") == null);
 }
 
 const Error = error{

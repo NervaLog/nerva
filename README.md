@@ -101,6 +101,22 @@ Linux (io_uring) or macOS; x86_64 with AES or aarch64.
 `--development` relaxes Direct IO and uses small caches. Clients use `src/nerva/client.zig`:
 `lookup_rows`, `commit` and `get_changes`, blocking, one request in flight per client.
 
+## The Botpike runtime's ledger
+
+`nerva ledgerd` serves the [Botpike runtime](https://github.com/Botpike/runtime)'s ledger
+protocol (`POST` `key=value` lines, `X-Ledger-Key`) from a Nerva cluster: a drop-in for the
+runtime's reference `ledgerd.py`, with every route one Nerva transaction.
+
+```bash
+LEDGER_KEY=secret ./zig-out/bin/nerva ledgerd --cluster=0 --addresses=3001,3002,3003 \
+    --ledger=1 --listen=127.0.0.1:8090
+./brt backend http://127.0.0.1:8090 secret   # in Botpike/runtime
+```
+
+`zig build test:ledgerd` checks it against `ledgerd.py` request by request (byte-identical
+replies, scripted scenarios plus a seeded fuzzer) and races two gateways on one ledger.
+Decisions and their reasons: [docs/DECISIONS.md](./docs/DECISIONS.md).
+
 ## Roadmap
 
 The 1.0 target, with Botpike as first customer, is in [docs/GOALS-1.0.md](./docs/GOALS-1.0.md).
@@ -108,8 +124,8 @@ The 1.0 target, with Botpike as first customer, is in [docs/GOALS-1.0.md](./docs
 1. **Foundation** — vendored consensus + storage + simulator, placeholder state machine. ✅
 2. **Commit core** — row model, optimistic read-set validation, versioned base rows; VOPR
    workload with a model checker. ✅
-3. **Server and client protocol** — `nerva format` / `nerva start` and a Zig client. ✅
-   An HTTP/JSON gateway for non-Zig callers (Botpike) is next.
+3. **Server and client protocol** — `nerva format` / `nerva start`, a Zig client, and
+   `nerva ledgerd` serving the Botpike runtime's ledger protocol. ✅
 4. **First derived view** — one incremental view, a watermark, and reads at a position.
 5. **Snapshots and subscriptions** — reads as of op `N`; change cursors.
 6. **Object storage tiering**, external operators, effect sinks.

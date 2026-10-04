@@ -84,8 +84,12 @@ arrangement either way.
    - 2a ✅ The `nerva` binary and a blocking Zig client (`src/nerva/client.zig`), proven by
      `zig build test:integration`: three real replicas, the receipt race between two clients,
      change-feed paging, and a replica crash and restart.
-   - 2b An HTTP/JSON gateway (`nerva gateway`) so Botpike (Kotlin, JDK 21) can call Nerva without
-     native code. Chosen over a C ABI + JNI client (more work) and Java FFM (preview on JDK 21).
+   - 2b ✅ `nerva ledgerd`: the Botpike runtime's own ledger protocol over HTTP, served from
+     Nerva (DECISIONS N6–N20). Chosen over a new JSON API because the protocol already exists,
+     has a consumer, a reference implementation and an acceptance bar. Proven by
+     `zig build test:ledgerd`: byte-identical to `ledgerd.py` over ~10k scripted and fuzzed
+     requests, and two gateways racing on one ledger conserve money and claim each sequence
+     number once. Not yet run against the runtime's Unison scenarios (no `ucm` in this sandbox).
 3. **Positioned reads and the first view** (G2, G4): Botpike's spend rollup maintained from the
    change feed, read at a position.
 4. **As-of reads and workflow state** (G6, G7).
