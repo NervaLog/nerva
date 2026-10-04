@@ -32,5 +32,27 @@ Stopping the server (Ctrl-C or SIGTERM) stops the cluster.
 twice, every confirmed sale is in the map, the views agree with each other and the map, and
 nothing is left running.
 
-`cluster.py` is the supervisor (three replicas, the API, two view processes, crash and restart);
-`nerva_http.py` a small client. The canvas demo will reuse both.
+## Shared canvas (`canvas/`)
+
+A 64 x 64 canvas from an 8-colour palette, painted by visitors and by simulated painters (one
+keeps a logo standing, others scribble over it, one draws a sunset, one a spiral). A visitor
+can paint, play the **timelapse** (the `canvas` view read at a series of ops since the last
+clear), crash processes and declare views. Each paint reads the pixel and writes it at the
+version read, counting repaints, so two painters on one pixel race.
+
+```bash
+python3 demo/canvas/server.py --nerva zig-out/bin/nerva --data /tmp/canvas --port 8001
+```
+
+Moderation defaults, not yet confirmed for a public deployment: 8 colours, one pixel a second
+per visitor, a clear every hour (`--reset-minutes`), no free text except view names.
+
+## Shared pieces
+
+`cluster.py` is the supervisor (three replicas, the API, two view processes, crash and
+restart); `common.py` the demo base (views, agreement between the two view processes, visitor
+views, rate limits per visitor, a request handler that answers 500 rather than drop a
+connection); `nerva_http.py` a small client that never retries a commit. `--behind-proxy`
+identifies visitors by `Fly-Client-IP` or `X-Forwarded-For`; `--no-limits` is for tests.
+
+`zig build test:demo` runs both demos under random crashes.

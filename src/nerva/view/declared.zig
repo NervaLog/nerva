@@ -284,7 +284,8 @@ fn aggregate(
             return false;
         }
     };
-    groups.sort(Context{ .view = view, .layout = layout, .groups = groups.values() });
+    // Unstable is fine (group keys are unique), and `sort` is insertion sort: O(n²).
+    groups.sortUnstable(Context{ .view = view, .layout = layout, .groups = groups.values() });
 
     var out = std.ArrayList(u8).init(arena);
     const writer = out.writer();

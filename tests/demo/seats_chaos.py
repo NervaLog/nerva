@@ -42,7 +42,7 @@ def main():
     port = 8700 + rng.randrange(200)
     server = subprocess.Popen([sys.executable, SERVER, "--nerva", nerva, "--data", data_dir,
                                "--port", str(port), "--nerva-port", str(4000 + rng.randrange(500) * 30),
-                               "--pace", "6"],
+                               "--pace", "6", "--no-limits"],
                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     try:
         line = server.stdout.readline()

@@ -38,7 +38,7 @@ the VOPR simulator are vendored from TigerBeetle; Nerva's own code is `src/nerva
 ./zig/zig build test:ledgerd  # ledgerd vs Botpike's ledgerd.py, race, views/as-of, store (~3 min)
 ./zig/zig build test:api      # nerva api (JSON) against a model, plus a counter race (~1 min)
 ./zig/zig build test:views    # declared views against a model, two view processes (~1 min)
-./zig/zig build test:demo     # the seat demo (3 replicas) under crashes (~2 min, ~3.5 GiB disk)
+./zig/zig build test:demo     # seat and canvas demos (3 replicas each) under crashes (~3 min)
 ./zig/zig build               # zig-out/bin/nerva
 ./zig/zig fmt src build.zig
 ```

@@ -216,3 +216,16 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
   crashes; no double sale, confirmed sales in the map, views agree, nothing left running.
   Mutation-tested with blind writes.
 
+## 2026-10-04 — Phase 2, step 5: the shared canvas
+
+- `demo/common.py`: the shared demo base (setup, views, agreement, visitor views, rate limits,
+  safe handler, `run`); the seat server now builds on it.
+- `demo/canvas/`: the canvas server (typed pixels, three views, simulated painters, timelapse
+  frames, hourly clear) and page (paint, play, rewind, crash, declare). Checked in a browser
+  with Playwright: painting, the timelapse playing, dark mode, phone width.
+- Found while profiling: `ArrayHashMap.sort` is insertion sort (O(n²)); declared views use
+  `sortUnstable` (4,096 groups: 145 ms to 10 ms). Gateways set `TCP_NODELAY`.
+- `tests/demo/canvas_chaos.py`, in `zig build test:demo` with the seat test: confirmed paints
+  are on the canvas as of their ops, under crashes. Mutation-tested.
+- Decision N38. Moderation defaults await the owner's policy (task 6).
+

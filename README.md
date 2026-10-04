@@ -178,9 +178,10 @@ of its groups, so two view processes can show they agree. v0 keeps tables and th
 
 ## Demos
 
-[demo/](./demo/README.md) holds public demos built only on the pieces above. The first is a
-seat race: 512 seats, simulated buyers, and a page to buy, rewind the show to any op, crash
-any process and declare views. `zig build test:demo` runs it under random crashes.
+[demo/](./demo/README.md) holds public demos built only on the pieces above: a seat race (512
+seats, simulated buyers; buy, rewind the show to any op, crash any process, declare views) and
+a shared canvas (paint, play the timelapse, crash, declare). `zig build test:demo` runs both
+under random crashes.
 
 ## Ledgerd views
 

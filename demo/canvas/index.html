@@ -1,0 +1,337 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Nerva canvas</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect x='2' y='2' width='6' height='6' fill='%23e03131'/%3E%3Crect x='8' y='8' width='6' height='6' fill='%231c7ed6'/%3E%3C/svg%3E">
+<style>
+:root {
+  --bg: #f7f7f5; --surface: #ffffff; --surface-2: #f0f0ed; --line: #e3e2de;
+  --text: #1c1b19; --text-2: #5d5b55; --text-3: #8f8c84;
+  --primary: #3b5bdb; --primary-soft: #dbe4ff;
+  --ok: #2b8a3e; --bad: #c92a2a; --bad-soft: #ffe3e3;
+  --radius: 8px; --shadow: 0 1px 2px rgba(0,0,0,.06), 0 2px 8px rgba(0,0,0,.04);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #141412; --surface: #1d1c1a; --surface-2: #262522; --line: #34322e;
+    --text: #f2f1ee; --text-2: #b4b1a9; --text-3: #7d7a72;
+    --primary: #748ffc; --primary-soft: #263266;
+    --ok: #51cf66; --bad: #ff6b6b; --bad-soft: #4a1c1c;
+    --shadow: 0 1px 2px rgba(0,0,0,.4);
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text);
+  font: 15px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
+.wrap { max-width: 1180px; margin: 0 auto; padding: 32px 16px 64px; }
+header { margin-bottom: 32px; max-width: 70ch; }
+.brand { font-weight: 700; letter-spacing: .02em; color: var(--text-3); font-size: 13px;
+  text-transform: uppercase; }
+h1 { font-size: 28px; line-height: 1.2; margin: 8px 0 12px; }
+header p { margin: 0; color: var(--text-2); }
+.grid { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); gap: 24px; }
+@media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+.card { background: var(--surface); border-radius: var(--radius); box-shadow: var(--shadow);
+  padding: 16px; }
+.stack > * + * { margin-top: 16px; }
+h2 { font-size: 13px; font-weight: 600; color: var(--text-2); margin: 0 0 12px;
+  text-transform: uppercase; letter-spacing: .04em; }
+.muted { color: var(--text-3); font-size: 13px; }
+canvas#board { width: 100%; max-width: 640px; aspect-ratio: 1; display: block; margin: 0 auto;
+  image-rendering: pixelated; border-radius: 4px; cursor: crosshair; background: #fff;
+  box-shadow: 0 0 0 1px var(--line); }
+.rewinding canvas#board { cursor: default; }
+.palette { display: flex; gap: 8px; justify-content: center; margin-top: 12px; flex-wrap: wrap; }
+.swatch { width: 32px; height: 32px; border-radius: 6px; border: 2px solid transparent;
+  box-shadow: 0 0 0 1px var(--line); cursor: pointer; padding: 0; }
+.swatch.on { border-color: var(--text); }
+.timeline { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+.timeline input { flex: 1; min-width: 160px; accent-color: var(--primary); }
+.op { font-variant-numeric: tabular-nums; }
+button { font: inherit; border-radius: 6px; border: 0; padding: 6px 12px; cursor: pointer; }
+.primary { background: var(--primary); color: #fff; }
+.quiet { background: var(--surface-2); color: var(--text); }
+.danger-quiet { background: transparent; color: var(--bad); padding: 4px 8px; }
+.danger-quiet:hover { background: var(--bad-soft); }
+.tiles { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.tile .value { font-size: 24px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.tile .label { font-size: 13px; color: var(--text-2); }
+.agree { display: flex; gap: 12px; align-items: flex-start; }
+.dot { width: 10px; height: 10px; border-radius: 50%; flex: none; margin-top: 6px; }
+.dot.ok { background: var(--ok); } .dot.wait { background: var(--text-3); } .dot.bad { background: var(--bad); }
+code, .mono { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px; }
+.procs { list-style: none; margin: 0; padding: 0; }
+.procs li { display: flex; align-items: center; gap: 8px; padding: 4px 0; }
+.procs .name { flex: 1; }
+.bars { display: grid; gap: 6px; }
+.bar { display: grid; grid-template-columns: 16px 1fr 56px; gap: 8px; align-items: center;
+  font-size: 13px; font-variant-numeric: tabular-nums; }
+.bar i { width: 14px; height: 14px; border-radius: 3px; box-shadow: 0 0 0 1px var(--line); }
+.bar b { display: block; height: 8px; border-radius: 4px; background: var(--surface-2); }
+.bar b span { display: block; height: 100%; border-radius: 4px; background: var(--primary); }
+.bar .n { text-align: right; color: var(--text-2); }
+table { width: 100%; border-collapse: collapse; font-size: 13px; font-variant-numeric: tabular-nums; }
+th { text-align: left; font-weight: 500; color: var(--text-3); padding: 4px 8px 4px 0; }
+td { padding: 4px 8px 4px 0; border-top: 1px solid var(--line); }
+textarea, input[type=text], select { width: 100%; font: 12px/1.4 ui-monospace, Menlo, monospace;
+  background: var(--surface-2); color: var(--text); border: 1px solid var(--line);
+  border-radius: 6px; padding: 8px; }
+textarea { min-height: 110px; resize: vertical; }
+.row-gap { display: flex; gap: 8px; align-items: center; margin-top: 8px; }
+.toast { position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
+  background: var(--text); color: var(--bg); padding: 8px 16px; border-radius: 6px;
+  box-shadow: var(--shadow); opacity: 0; transition: opacity .2s; pointer-events: none; }
+.toast.on { opacity: 1; }
+.banner { background: var(--primary-soft); border-radius: var(--radius); padding: 8px 12px;
+  font-size: 13px; display: none; margin-bottom: 12px; }
+.rewinding .banner { display: block; }
+.empty { color: var(--text-3); font-size: 13px; padding: 8px 0; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="brand">Nerva · live demo</div>
+    <h1>One canvas, many painters, one log.</h1>
+    <p>Pick a colour and paint a pixel. Bots fight over a logo while you watch. Every frame of
+    the timelapse is the same view read at an earlier op, and you can crash the database
+    while it plays.</p>
+  </header>
+
+  <div class="grid" id="app">
+    <div class="stack">
+      <div class="card">
+        <div class="banner" id="banner">Showing op <span class="op" id="banner-op"></span>,
+          exactly as the log had it then. <a href="#" id="banner-live">Back to live</a></div>
+        <canvas id="board" width="64" height="64" aria-label="The canvas"></canvas>
+        <div class="palette" id="palette"></div>
+      </div>
+      <div class="card">
+        <h2>Timelapse</h2>
+        <div class="timeline">
+          <button class="primary" id="play">Play</button>
+          <input type="range" id="slider" min="0" max="0" value="0" aria-label="Op">
+          <span class="op muted" id="slider-op"></span>
+          <button class="quiet" id="live">Live</button>
+        </div>
+        <p class="muted" style="margin:8px 0 0">Each frame is the <code>canvas</code> view
+          read <em>as of</em> an op since the canvas was last cleared.</p>
+      </div>
+      <div class="card">
+        <h2>Declare a view</h2>
+        <p class="muted" style="margin-top:0">Fields: <code>x</code>, <code>y</code>,
+          <code>color</code> (0 white … 7 blue), <code>paints</code> (times painted),
+          <code>painter</code>. It answers for every op, the timelapse included.</p>
+        <textarea id="spec">{
+  "where": [{"field": "paints", "op": "ge", "value": 3}],
+  "group_by": ["color"],
+  "aggregates": [{"fn": "count"}, {"fn": "max", "field": "paints"}]
+}</textarea>
+        <div class="row-gap">
+          <input type="text" id="view-name" placeholder="name, e.g. fought_over" style="flex:1">
+          <button class="primary" id="declare">Declare</button>
+        </div>
+        <div class="row-gap"><select id="view-pick" aria-label="View to show"></select></div>
+        <div id="view-out"></div>
+      </div>
+    </div>
+
+    <div class="stack">
+      <div class="card">
+        <div class="tiles">
+          <div class="tile"><div class="value" id="t-paints">–</div><div class="label">pixels painted</div></div>
+          <div class="tile"><div class="value" id="t-lost">–</div><div class="label">races lost</div></div>
+          <div class="tile"><div class="value" id="t-visitors">–</div><div class="label">pixels by visitors now</div></div>
+          <div class="tile"><div class="value" id="t-op">–</div><div class="label">log position</div></div>
+        </div>
+      </div>
+      <div class="card">
+        <h2>Pixels by colour</h2>
+        <div class="bars" id="colors"></div>
+        <div class="agree" style="margin-top:12px"><span class="dot wait" id="agree-dot"></span>
+          <div><div id="agree-text">Waiting for the views</div>
+          <div class="muted mono" id="agree-hashes"></div></div></div>
+      </div>
+      <div class="card">
+        <h2>Crash something</h2>
+        <ul class="procs" id="procs"></ul>
+        <p class="muted" style="margin:8px 0 0">A crash is a SIGKILL. One replica may be down
+          at a time. Crashed processes come back on their own after 20 s.</p>
+      </div>
+    </div>
+  </div>
+</div>
+<div class="toast" id="toast"></div>
+
+<script>
+const PALETTE = ["#ffffff", "#1c1b19", "#8f8c84", "#e03131", "#f08c00", "#fcc419", "#2f9e44", "#1c7ed6"];
+const NAMES = ["white", "black", "grey", "red", "orange", "yellow", "green", "blue"];
+const $ = (id) => document.getElementById(id);
+const fmt = (n) => Number(n).toLocaleString();
+let size = 64, color = 3, viewOp = null, playing = false, epochStart = 0, latestOp = 0;
+
+function toast(text) {
+  const t = $("toast"); t.textContent = text; t.classList.add("on");
+  clearTimeout(toast.timer); toast.timer = setTimeout(() => t.classList.remove("on"), 2200);
+}
+async function api(path, body) {
+  const r = await fetch(path, body ? { method: "POST", body: JSON.stringify(body) } : {});
+  return [r.status, await r.json().catch(() => ({}))];
+}
+
+$("palette").innerHTML = PALETTE.map((c, i) =>
+  `<button class="swatch${i === color ? " on" : ""}" data-c="${i}" style="background:${c}" aria-label="${NAMES[i]}"></button>`).join("");
+$("palette").onclick = (e) => {
+  const b = e.target.closest(".swatch"); if (!b) return;
+  color = Number(b.dataset.c);
+  document.querySelectorAll(".swatch").forEach((s) => s.classList.toggle("on", s === b));
+};
+
+const board = $("board"), ctx = board.getContext("2d");
+function draw(pixels) {
+  if (!pixels) return;
+  const image = ctx.createImageData(size, size);
+  for (let i = 0; i < pixels.length; i++) {
+    const hex = PALETTE[pixels.charCodeAt(i) - 48] || "#ffffff";
+    image.data[i * 4] = parseInt(hex.slice(1, 3), 16);
+    image.data[i * 4 + 1] = parseInt(hex.slice(3, 5), 16);
+    image.data[i * 4 + 2] = parseInt(hex.slice(5, 7), 16);
+    image.data[i * 4 + 3] = 255;
+  }
+  ctx.putImageData(image, 0, 0);
+}
+
+board.onclick = async (e) => {
+  if (viewOp !== null) return toast("Go back to live to paint");
+  const rect = board.getBoundingClientRect();
+  const x = Math.floor((e.clientX - rect.left) / rect.width * size);
+  const y = Math.floor((e.clientY - rect.top) / rect.height * size);
+  const [status, body] = await api("/api/paint", { x, y, color });
+  if (status === 200) { toast(`Painted at op ${fmt(body.op)}`); refresh(); }
+  else toast(body.error || "Nerva is unavailable; try again");
+};
+
+function render(state) {
+  size = state.size;
+  draw(state.pixels);
+  const total = size * size;
+  const colors = state.colors || [];
+  $("colors").innerHTML = colors.map((g) =>
+    `<div class="bar"><i style="background:${PALETTE[g.max_color ?? g.color]}"></i><b><span style="width:${(100 * g.count / total).toFixed(1)}%"></span></b><span class="n">${fmt(g.count)}</span></div>`).join("")
+    || `<p class="empty">Views unavailable</p>`;
+  const visitors = state.visitors && state.visitors[0];
+  $("t-visitors").textContent = visitors ? fmt(visitors.count) : "0";
+  $("t-op").textContent = state.op ? fmt(state.op) : "–";
+  if (viewOp === null) {
+    $("t-paints").textContent = fmt(state.stats.paints);
+    $("t-lost").textContent = fmt(state.stats.lost_race);
+    const [a, b] = state.hashes;
+    const dot = $("agree-dot");
+    if (a && b) {
+      const same = a.hash === b.hash && a.op === b.op;
+      dot.className = "dot " + (same ? "ok" : "bad");
+      $("agree-text").textContent = same ? `View a and view b agree at op ${fmt(a.op)}` : `Views disagree at op ${fmt(a.op)}`;
+    } else {
+      dot.className = "dot wait";
+      $("agree-text").textContent = `${a ? "View b" : "View a"} is down; the other is answering`;
+    }
+    $("agree-hashes").textContent = [a, b].map((h, i) => `${"ab"[i]} ${h ? h.hash.slice(0, 16) : "down"}`).join("  ");
+    renderProcs(state.cluster);
+    epochStart = Number(state.epoch_start_op); latestOp = Number(state.op || epochStart);
+    const slider = $("slider");
+    slider.min = epochStart; slider.max = latestOp; slider.value = latestOp;
+    $("slider-op").textContent = "op " + fmt(latestOp);
+    renderViewPicker(state.visitor_views);
+  }
+}
+
+function renderProcs(procs) {
+  $("procs").innerHTML = procs.map((p) => `<li><span class="dot ${p.alive ? "ok" : "bad"}"></span>
+    <span class="name">${p.name}${p.crashes ? ` <span class="muted">· crashed ${p.crashes}×</span>` : ""}</span>
+    <button class="${p.alive ? "danger-quiet" : "quiet"}" data-p="${p.name}" data-a="${p.alive ? "crash" : "restart"}">${p.alive ? "Crash" : "Restart"}</button></li>`).join("");
+}
+$("procs").onclick = async (e) => {
+  const b = e.target.closest("button"); if (!b) return;
+  const [status, body] = await api("/api/" + b.dataset.a, { process: b.dataset.p });
+  toast(status === 200 ? `${b.dataset.p}: ${b.dataset.a === "crash" ? "killed" : "restarting"}` : body.error);
+  refresh();
+};
+
+async function showOp(op) {
+  viewOp = op; $("app").classList.add("rewinding"); $("banner-op").textContent = fmt(op);
+  $("slider").value = op; $("slider-op").textContent = "op " + fmt(op);
+  const [status, state] = await api("/api/state?as_of=" + op);
+  if (status === 200 && viewOp === op) render(state);
+  showView();
+}
+function goLive() { playing = false; $("play").textContent = "Play"; viewOp = null;
+  $("app").classList.remove("rewinding"); refresh(); }
+
+let debounce = null;
+$("slider").oninput = () => { playing = false; $("play").textContent = "Play";
+  $("slider-op").textContent = "op " + fmt($("slider").value);
+  clearTimeout(debounce); debounce = setTimeout(() => showOp($("slider").value), 120); };
+$("live").onclick = goLive;
+$("banner-live").onclick = (e) => { e.preventDefault(); goLive(); };
+
+$("play").onclick = async () => {
+  if (playing) { playing = false; $("play").textContent = "Play"; return; }
+  playing = true; $("play").textContent = "Pause";
+  const from = epochStart, to = latestOp, frames = 90;
+  viewOp = from; $("app").classList.add("rewinding");
+  for (let i = 0; i <= frames && playing; i++) {
+    const op = Math.round(from + (to - from) * i / frames);
+    const started = performance.now();
+    const [status, frame] = await api("/api/frame?as_of=" + op);
+    if (!playing) break;
+    if (status === 200) {
+      draw(frame.pixels); viewOp = op;
+      $("banner-op").textContent = fmt(op); $("slider").value = op; $("slider-op").textContent = "op " + fmt(op);
+    }
+    await new Promise((r) => setTimeout(r, Math.max(0, 70 - (performance.now() - started))));
+  }
+  if (playing) { playing = false; $("play").textContent = "Play"; showOp(viewOp); }
+};
+
+function renderViewPicker(names) {
+  const pick = $("view-pick"), current = pick.value;
+  const options = ["pixels_by_color", "painted_by_visitors", ...names];
+  if (pick.options.length !== options.length) {
+    pick.innerHTML = options.map((n) => `<option>${n}</option>`).join("");
+    if (options.includes(current)) pick.value = current;
+  }
+}
+$("view-pick").onchange = showView;
+async function showView() {
+  const name = $("view-pick").value; if (!name) return;
+  const [status, view] = await api(`/api/views/${name}` + (viewOp !== null ? `?as_of=${viewOp}` : ""));
+  if (status !== 200) { $("view-out").innerHTML = `<p class="empty">${view.error || "unavailable"}</p>`; return; }
+  const groups = view.groups;
+  if (!groups.length) { $("view-out").innerHTML = `<p class="empty">No pixels match, as of op ${fmt(view.op)}</p>`; return; }
+  const cols = Object.keys(groups[0]);
+  $("view-out").innerHTML = `<p class="muted mono" style="margin:8px 0">op ${fmt(view.op)} · hash ${view.hash.slice(0, 16)}</p>
+    <div style="max-height:240px;overflow:auto"><table><thead><tr>${cols.map((c) => `<th>${c}</th>`).join("")}</tr></thead>
+    <tbody>${groups.map((g) => `<tr>${cols.map((c) => `<td>${g[c]}</td>`).join("")}</tr>`).join("")}</tbody></table></div>`;
+}
+$("declare").onclick = async () => {
+  let spec;
+  try { spec = JSON.parse($("spec").value); } catch (_) { return toast("The view is not valid JSON"); }
+  const [status, body] = await api("/api/views", { name: $("view-name").value.trim(), spec });
+  if (status !== 200) return toast(body.error || "Could not declare it");
+  toast(`Declared ${body.name}: it already knows the whole canvas`);
+  await refresh();
+  $("view-pick").value = body.name; showView();
+};
+
+async function refresh() {
+  if (viewOp !== null) return;
+  const [status, state] = await api("/api/state");
+  if (status === 200 && viewOp === null) { render(state); showView(); }
+}
+refresh();
+setInterval(refresh, 1000);
+</script>
+</body>
+</html>

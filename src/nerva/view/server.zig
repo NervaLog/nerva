@@ -103,8 +103,8 @@ pub fn serve(gpa: std.mem.Allocator, client: *Client, options: Options) !noretur
             continue;
         };
         defer connection.stream.close();
-        // One request per connection, sent within a deadline (N37).
-        http_connection.deadline(connection.stream);
+        // One request per connection, sent within a deadline, answered without delay (N37).
+        http_connection.prepare(connection.stream);
         var http = std.http.Server.init(connection, read_buffer);
         var request = http.receiveHead() catch continue;
         _ = arena_instance.reset(.retain_capacity);
