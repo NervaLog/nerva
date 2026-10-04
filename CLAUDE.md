@@ -47,7 +47,10 @@ environmental, see UPSTREAM.md. Every other test must pass.
 
 CI (`.github/workflows/ci.yml`) runs the same steps on every push and pull request to `main`. A
 commit that changes `VERSION` publishes release `v<VERSION>` (`release.yml`) after CI passes: to
-release, bump `VERSION` (and add a WORKLOG entry) in its own commit.
+release, add the version's "what's new" section to `CHANGELOG.md` (`## v<VERSION> — <date>`,
+written for people running Nerva: new capabilities with examples, fixes with their issues, and
+upgrade steps), then bump `VERSION` (and add a WORKLOG entry) in its own commit. The section
+becomes the GitHub release notes; a version without one is refused.
 
 ## Vendored code
 

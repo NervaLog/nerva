@@ -100,7 +100,8 @@ CI (`.github/workflows/ci.yml`) runs on every push and pull request to `main`: t
 unit, integration, API, view and demo tests, and the VOPR on seeds 1, 2, 5 and one random seed (printed,
 so a failure replays). A commit to `main` that changes `VERSION` runs CI on that commit, then
 publishes binaries for Linux and macOS (x86_64, aarch64) as GitHub release `v<VERSION>`
-(`release.yml`); releasing a version twice fails.
+(`release.yml`), with that version's section of [CHANGELOG.md](./CHANGELOG.md) as the release
+notes; releasing a version twice, or without notes, fails.
 
 Binaries report `<protocol>+<commit>`. The protocol release (`0.0.2` since adds, N43) is what
 replicas, clients and data files check: binaries of different protocol releases do not mix in

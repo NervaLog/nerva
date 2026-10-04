@@ -1,6 +1,8 @@
 # A commit to main that changes VERSION publishes release v<VERSION> (docs/DECISIONS.md N40):
 # CI on that commit, then binaries for four targets, then the tag and the GitHub release.
 # A version with a suffix (0.2.0-rc.1) is a prerelease. Releasing a version twice fails.
+# The release notes are the version's section of CHANGELOG.md (`## v<VERSION> — <date>`); a
+# version without one is refused before CI runs.
 name: Release
 
 on:
@@ -36,6 +38,13 @@ jobs:
             exit 1
           fi
           echo "tag=v$version" >> "$GITHUB_OUTPUT"
+
+      - name: Refuse a version without release notes
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          .github/scripts/release_notes.sh "$TAG" > notes.md
+          cat notes.md
 
       - name: Refuse a version already released
         env:
@@ -96,6 +105,13 @@ jobs:
         run: |
           prerelease=()
           case "$TAG" in *-*) prerelease=(--prerelease) ;; esac
+          {
+            .github/scripts/release_notes.sh "$TAG"
+            echo
+            echo "---"
+            echo
+            echo "Nerva at commit $GITHUB_SHA. Binaries report \`$BINARY_VERSION\`." \
+              "Check downloads against \`SHA256SUMS\`."
+          } > notes.md
           gh release create "$TAG" dist/* "${prerelease[@]}" --target "$GITHUB_SHA" \
-            --title "Nerva $TAG" \
-            --notes "Nerva at commit $GITHUB_SHA. Binaries report \`$BINARY_VERSION\`. Changes: WORKLOG.md. Check downloads against SHA256SUMS."
+            --title "Nerva $TAG" --notes-file notes.md

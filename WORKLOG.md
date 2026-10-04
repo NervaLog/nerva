@@ -255,3 +255,9 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
   reformatted. Golden format checksum updated for that reason only. Release notes take the
   binary's version from the binary.
 - CLAUDE.md: every pre-existing bug found gets a GitHub issue (#4, #5 filed).
+
+## 2026-10-04 — Release notes from CHANGELOG.md (N44)
+
+- `CHANGELOG.md`: a "what's new" section per release (v0.2.0, and v0.1.0 after the fact).
+- `release.yml` publishes the version's section as the release notes and refuses a version
+  without one (`.github/scripts/release_notes.sh`); CLAUDE.md and README describe the step.

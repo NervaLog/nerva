@@ -331,3 +331,11 @@ look for that release among those bundled in its binary; Nerva bundles only its 
 with the v0.1.0 binary: it formats a file and opens it; the new binary refuses it. The golden
 checksum of a formatted data file changes with the release string (UPSTREAM.md). The release
 workflow now writes the binary's own version string into the release notes.
+
+**N44. Release notes come from `CHANGELOG.md`.**
+The release notes said only "Changes: WORKLOG.md", a log of work rather than what a user needs.
+Each release now has a "what's new" section in `CHANGELOG.md` (`## v<VERSION> — <date>`):
+new capabilities with examples, fixes with their issues, and upgrade steps. `release.yml`
+publishes that section as the GitHub release notes (`.github/scripts/release_notes.sh`), and
+refuses, before CI runs, to release a version without one. v0.1.0's section was written after
+the fact, for completeness.
