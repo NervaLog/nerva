@@ -65,11 +65,10 @@ pub fn StateMachineType(comptime Storage: type) type {
         /// Timestamps a commit entry takes: its change, then one per view of its table, for a
         /// group the entry creates (N49).
         pub const entry_timestamps = 1 + nerva.views_per_table_max;
-        /// Groups one op can write (N49).
-        pub const groups_per_op_max: u32 = nerva.view_group_writes_max;
-        comptime {
-            assert(nerva.backfill_rows_per_op <= groups_per_op_max);
-        }
+        /// Group writes one op may make (N49): a write to a table costs 2 per view of the table
+        /// (its old and new group). Groups are twice the size of rows, so this bounds the
+        /// groups tree's tables to the rows tree's size.
+        pub const groups_per_op_max: u32 = @max(1, @divFloor(commit_entries_max, 2));
         /// -1 for the header record.
         pub const view_groups_limit_max =
             Operation.get_view.result_max(constants.message_body_size_max) - 1;
@@ -221,6 +220,9 @@ pub fn StateMachineType(comptime Storage: type) type {
         const Failure = struct { index: u32, status: EntryStatus, op: u64, value: u64 = 0 };
 
         batch_size_limit: u32,
+        /// `groups_per_op_max` for this `batch_size_limit`: the op's budget of group writes, and
+        /// the rows a pulse backfills (N49).
+        group_writes_limit: u32,
         forest: Forest,
 
         prefetch_timestamp: u64 = 0,
@@ -284,13 +286,15 @@ pub fn StateMachineType(comptime Storage: type) type {
             assert(options.batch_size_limit <= constants.message_body_size_max);
 
             const commit_entries_limit = Operation.commit.event_max(options.batch_size_limit);
-            const groups_limit: u32 = groups_per_op_max;
+            const groups_limit: u32 = @max(1, @divFloor(commit_entries_limit, 2));
+            assert(groups_limit <= groups_per_op_max);
             const lookup_rows_limit = Operation.lookup_rows.event_max(options.batch_size_limit);
             assert(commit_entries_limit <= commit_entries_max);
             assert(lookup_rows_limit <= lookup_rows_max);
 
             self.* = .{
                 .batch_size_limit = options.batch_size_limit,
+                .group_writes_limit = groups_limit,
                 .forest = undefined,
                 .changes_scan_buffer = undefined,
                 .write_keys = undefined,
@@ -359,7 +363,7 @@ pub fn StateMachineType(comptime Storage: type) type {
             try self.add_rows.ensureTotalCapacity(allocator, commit_entries_limit);
             errdefer self.add_rows.deinit(allocator);
 
-            self.backfill_rows = try allocator.alloc(Row, nerva.backfill_rows_per_op + 1);
+            self.backfill_rows = try allocator.alloc(Row, groups_limit + 1);
             errdefer allocator.free(self.backfill_rows);
 
             self.view_groups = try allocator.alloc(Group, view_groups_limit_max + 1);
@@ -379,6 +383,7 @@ pub fn StateMachineType(comptime Storage: type) type {
             self.forest.reset();
             self.* = .{
                 .batch_size_limit = self.batch_size_limit,
+                .group_writes_limit = self.group_writes_limit,
                 .forest = self.forest,
                 .changes_scan_buffer = self.changes_scan_buffer,
                 .write_keys = self.write_keys,
@@ -490,14 +495,14 @@ pub fn StateMachineType(comptime Storage: type) type {
                 },
                 .get_changes, .get_history, .get_view, .declare_view, .pulse => message_body_used,
             };
-            self.prepare_timestamp += prepare_delta(operation, payload);
+            self.prepare_timestamp += self.prepare_delta(operation, payload);
         }
 
-        fn prepare_delta(operation: Operation, events: []const u8) u64 {
+        fn prepare_delta(self: *const StateMachine, operation: Operation, events: []const u8) u64 {
             return switch (operation) {
                 .commit => @divExact(events.len, @sizeOf(Entry)) * entry_timestamps,
                 .declare_view => 1,
-                .pulse => nerva.backfill_rows_per_op,
+                .pulse => self.group_writes_limit,
                 .lookup_rows, .get_changes, .get_history, .get_view => 0,
             };
         }
@@ -768,9 +773,9 @@ pub fn StateMachineType(comptime Storage: type) type {
             });
 
             // Each batch's writes take the timestamps just below its share of the prepare's.
-            var batch_timestamp = timestamp - prepare_delta(operation, body_decoder.payload);
+            var batch_timestamp = timestamp - self.prepare_delta(operation, body_decoder.payload);
             while (body_decoder.pop()) |batch| {
-                batch_timestamp += prepare_delta(operation, batch);
+                batch_timestamp += self.prepare_delta(operation, batch);
                 const bytes_written: usize = switch (operation) {
                     .lookup_rows => self.execute_lookup_rows(
                         op,
@@ -792,7 +797,7 @@ pub fn StateMachineType(comptime Storage: type) type {
             assert(batch_timestamp == timestamp);
             assert(body_decoder.batch_count() == reply_encoder.batch_count);
             if (operation == .commit) {
-                assert(self.view_group_writes <= nerva.view_group_writes_max);
+                assert(self.view_group_writes <= self.group_writes_limit);
                 self.views_store();
             }
             return reply_encoder.finish();
@@ -1213,7 +1218,7 @@ pub fn StateMachineType(comptime Storage: type) type {
         fn view_writes_charge(self: *StateMachine, entries: []const Entry) bool {
             var cost: u32 = 0;
             for (entries) |*entry| cost += self.view_write_cost(entry);
-            if (self.view_group_writes + cost > nerva.view_group_writes_max) return false;
+            if (self.view_group_writes + cost > self.group_writes_limit) return false;
             self.view_group_writes += cost;
             return true;
         }
@@ -1455,7 +1460,7 @@ pub fn StateMachineType(comptime Storage: type) type {
             const view = &self.views_op[self.backfill_view.?];
             const groups = &self.forest.grooves.groups;
             groups.prefetch_setup(self.prefetch_snapshot.?);
-            const count = @min(results.len, nerva.backfill_rows_per_op);
+            const count = @min(results.len, self.group_writes_limit);
             for (results[0..count]) |*row| {
                 if (row.flags.deleted) continue;
                 if (!views.row_matches(&view.definition, &row.value)) continue;
@@ -1599,8 +1604,8 @@ pub fn StateMachineType(comptime Storage: type) type {
             const view = &self.views_op[index];
             assert(view.state == .building);
             const scanned = self.backfill_rows[0..self.backfill_count.?];
-            const count = @min(scanned.len, nerva.backfill_rows_per_op);
-            const timestamp_base = timestamp - nerva.backfill_rows_per_op;
+            const count = @min(scanned.len, self.group_writes_limit);
+            const timestamp_base = timestamp - self.group_writes_limit;
             for (scanned[0..count], 0..) |*row, k| {
                 const id: u64 = @truncate(row.key);
                 assert(row.key >> 64 == view.definition.table);
@@ -1610,8 +1615,8 @@ pub fn StateMachineType(comptime Storage: type) type {
                 self.group_change(view, &row.value, .add, timestamp_base + k + 1);
             }
             if (view.state == .building) {
-                if (scanned.len > nerva.backfill_rows_per_op) {
-                    view.backfill_cursor = @truncate(scanned[nerva.backfill_rows_per_op].key);
+                if (scanned.len > self.group_writes_limit) {
+                    view.backfill_cursor = @truncate(scanned[self.group_writes_limit].key);
                 } else {
                     view.state = .ready;
                 }

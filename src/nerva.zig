@@ -129,8 +129,8 @@ pub const EntryStatus = enum(u32) {
     /// An add to a field that a view on its table filters or groups by (N49): adds must not
     /// move a row between a view's groups.
     view_key_field = 13,
-    /// This op's budget of view group writes (`view_group_writes_max`) is spent: nothing applied,
-    /// retry in a later op (N49).
+    /// This op's budget of view group writes (`StateMachine.groups_per_op_max`) is spent:
+    /// nothing applied, retry in a later op (N49).
     views_busy = 14,
 };
 
@@ -253,11 +253,8 @@ pub const views_max = 64;
 pub const views_per_table_max = 4;
 /// The bytes of a view's group_by fields, concatenated.
 pub const group_key_size_max = 64;
-/// Rows a pulse adds to a building view.
-pub const backfill_rows_per_op = 1024;
-/// Group writes one op may make: a write to a table costs 2 per view of the table (its old and
-/// new group). Bounds the groups tree's tables, as `commit` entries bound the rows tree's.
-pub const view_group_writes_max = 4096;
+// The budget of group writes per op, and the rows a pulse backfills, depend on the message
+// size: `StateMachine.groups_per_op_max`.
 
 pub const view_where_max = 4;
 pub const view_group_by_max = 3;

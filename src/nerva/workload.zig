@@ -168,6 +168,7 @@ pub fn WorkloadType(comptime StateMachine: type) type {
         /// Changes returned by `get_history`, and those skipped for being after `op_max`.
         history_returned: u64 = 0,
         history_skipped: u64 = 0,
+        pulses: u64 = 0,
 
         budgets: std.AutoHashMapUnmanaged(u64, Budget) = .{},
         budget_transactions: u64 = 0,
@@ -637,14 +638,15 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                 .lookup_rows => workload.check_lookup_rows(request_body, reply_body),
                 .get_changes => workload.check_get_changes(request_body, reply_body),
                 .get_history => workload.check_get_history(request_body, reply_body),
+                .get_view, .declare_view, .pulse => unreachable, // Not sent yet.
             }
         }
 
+        /// Pulses backfill building views (N49); the model applies them when it reads a view.
         pub fn on_pulse(workload: *Workload, operation: Operation, timestamp: u64) void {
-            _ = workload;
-            _ = operation;
             _ = timestamp;
-            unreachable; // Nerva never pulses.
+            assert(operation == .pulse);
+            workload.pulses += 1;
         }
 
         fn check_commit(
@@ -662,12 +664,15 @@ pub fn WorkloadType(comptime StateMachine: type) type {
             assert(request.batch_count() == reply.batch_count());
 
             var op_request: ?u64 = null;
-            var batch_timestamp = timestamp - @divExact(request.payload.len, @sizeOf(Entry));
+            // Each entry takes a block of `entry_timestamps`: its change takes the first (N49).
+            const block = StateMachine.entry_timestamps;
+            var batch_timestamp =
+                timestamp - @divExact(request.payload.len, @sizeOf(Entry)) * block;
             while (request.pop()) |batch| {
                 const entries = stdx.bytes_as_slice(.exact, Entry, batch);
                 const results = stdx.bytes_as_slice(.exact, EntryResult, reply.pop().?);
                 assert(results.len == entries.len);
-                batch_timestamp += entries.len;
+                batch_timestamp += entries.len * block;
                 if (entries.len == 0) continue;
 
                 const claim = receipt_claim_is(entries);
@@ -713,7 +718,8 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                 if (budget) workload.check_budget(entries, results);
 
                 for (entries, results, 0..) |*entry, *result, index| {
-                    const entry_timestamp = batch_timestamp - entries.len + index + 1;
+                    const entry_timestamp =
+                        batch_timestamp - entries.len * block + index * block + 1;
                     workload.apply(op, entry_timestamp, entry, result);
                 }
             }
