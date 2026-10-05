@@ -24,9 +24,11 @@ env:
   # on the Machine's volume, under the cache directory, keyed by download.sh's hash (which holds
   # the version and checksums), and linked back in; Zig finds its lib next to the real binary.
   # A copy is used only if complete (written aside, then renamed) and it runs; otherwise it is
-  # replaced by a fresh download. download.sh then checks the version, as before.
+  # replaced by a fresh download. download.sh then checks the version, as before. First, a disk
+  # left too full by earlier jobs on the volume is freed (free_disk.sh, N65).
   INSTALL_ZIG: |
     set -eu
+    .github/scripts/free_disk.sh
     cache="${XDG_CACHE_HOME:-$HOME/.cache}/nerva-toolchain"
     toolchain="$cache/zig-$(sha256sum zig/download.sh | cut -c1-16)"
     if [ -x "$toolchain/zig" ] && [ -f "$toolchain/lib/std/std.zig" ]; then
@@ -66,6 +68,9 @@ jobs:
 
       - name: Format
         run: ./zig/zig build test:fmt
+
+      - name: Release scripts (the bill of materials, N63)
+        run: python3 .github/scripts/test_sbom.py
 
       - name: Integration (three real replicas)
         run: ./zig/zig build test:integration
