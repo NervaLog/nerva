@@ -401,6 +401,59 @@ pub fn field_integer(field: *const Field, value: *const [value_size]u8) ?i128 {
 
 const testing = std.testing;
 
+/// The view as the state machine maintains it (N52): its fields resolved to offsets through the
+/// table's layout. `view_check` must have passed.
+pub fn view_definition(
+    name: []const u8,
+    view: *const View,
+    layout: *const Layout,
+) nerva.ViewDefinition {
+    assert(name.len > 0 and name.len <= name_size_max);
+    var definition = std.mem.zeroes(nerva.ViewDefinition);
+    @memcpy(definition.name[0..name.len], name);
+    definition.table = view.table;
+    definition.where_count = @intCast(view.where.len);
+    for (view.where, 0..) |clause, index| {
+        definition.where[index] = .{
+            .field = field_ref(layout.field(clause.field).?),
+            .comparison = switch (clause.op) {
+                inline else => |comparison| @field(nerva.Comparison, @tagName(comparison)),
+            },
+            .value = std.mem.toBytes(std.mem.nativeToLittle(i128, clause.value)),
+        };
+    }
+    definition.group_by_count = @intCast(view.group_by.len);
+    for (view.group_by, 0..) |field_name, index| {
+        definition.group_by[index] = field_ref(layout.field(field_name).?);
+    }
+    definition.aggregate_count = @intCast(view.aggregates.len);
+    for (view.aggregates, 0..) |aggregate, index| {
+        definition.aggregates[index] = .{
+            .function = switch (aggregate.function) {
+                inline else => |function| @field(nerva.AggregateFunction, @tagName(function)),
+            },
+            .field = if (aggregate.field) |field_name|
+                field_ref(layout.field(field_name).?)
+            else
+                std.mem.zeroes(nerva.FieldRef),
+        };
+    }
+    return definition;
+}
+
+fn field_ref(field: *const Field) nerva.FieldRef {
+    return .{
+        .offset = field.offset,
+        .size = field.size,
+        .kind = switch (field.type) {
+            .u8, .u16, .u32, .u64 => .unsigned,
+            .i64 => .signed,
+            .bool => .boolean,
+            .bytes => .bytes,
+        },
+    };
+}
+
 test "catalog: layouts pack, align, extend and round-trip" {
     var arena_instance = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_instance.deinit();
@@ -513,4 +566,35 @@ test "catalog: invalid layouts and fields are refused" {
     , .{});
     const value = try fields_encode(&layout, negative);
     try testing.expectEqual(@as(?i128, -5), field_integer(layout.field("c").?, &value));
+}
+
+test "catalog: a view resolves to the state machine's definition through its layout" {
+    var arena_instance = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_instance.deinit();
+    const arena = arena_instance.allocator();
+
+    const layout = try layout_parse(arena,
+        \\{"name":"seats","fields":[{"name":"section","type":"u8"},{"name":"price","type":"u64"},
+        \\{"name":"sold","type":"bool"},{"name":"balance","type":"i64"}]}
+    );
+    const view = try view_parse(arena,
+        \\{"table":5,"where":[{"field":"sold","op":"eq","value":true},
+        \\{"field":"balance","op":"lt","value":-3}],"group_by":["section"],
+        \\"aggregates":[{"fn":"count"},{"fn":"sum","field":"price"}]}
+    );
+    try view_check(&view, &layout);
+    const definition = view_definition("revenue", &view, &layout);
+
+    try testing.expectEqualStrings("revenue", definition.name[0..7]);
+    try testing.expectEqual(@as(u32, 5), definition.table);
+    try testing.expectEqual(@as(u8, 2), definition.where_count);
+    try testing.expectEqual(nerva.FieldRef{ .offset = 16, .size = 1, .kind = .boolean }, definition.where[0].field);
+    try testing.expectEqual(nerva.Comparison.lt, definition.where[1].comparison);
+    try testing.expectEqual(nerva.FieldKind.signed, definition.where[1].field.kind);
+    try testing.expectEqual(@as(i128, -3), std.mem.readInt(i128, &definition.where[1].value, .little));
+    try testing.expectEqual(nerva.FieldRef{ .offset = 0, .size = 1, .kind = .unsigned }, definition.group_by[0]);
+    try testing.expectEqual(nerva.AggregateFunction.sum, definition.aggregates[1].function);
+    try testing.expectEqual(@as(u8, 8), definition.aggregates[1].field.offset);
+    // The state machine accepts what the catalog accepted.
+    try testing.expectEqual(null, @import("views.zig").definition_validate(&definition));
 }

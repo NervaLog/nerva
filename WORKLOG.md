@@ -373,7 +373,24 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
 - Tests: IO unit test for `run_once`; `test:integration` checks the median lookup is under one
   tick. Mutation-tested.
 
-## 2026-10-05 — Performance Phase 0: round trips, --cache-rows, bench, bench:load (N52)
+## 2026-10-05 — Views maintained by the state machine (N52)
+
+- `src/nerva.zig`: `declare_view`, `get_view` and `pulse` operations; `ViewDefinition`, `View`,
+  `Group`, `ViewQuery`, `ViewRecord`; statuses `view_key_field` and `views_busy`; tree ids 5–8.
+- `src/nerva/views.zig`: validation, row membership, group keys and hashes, the consensus hash.
+- `src/nerva/state_machine.zig`: `views` and `groups` grooves; three-stage commit prefetch;
+  groups and hash kept in every commit, coalesced per op; admission by distinct groups per op
+  (the canvas demo livelocked under a per-write budget); declare; paged reads by id or
+  name; backfill by pulse. Commit entries reserve 5 timestamps each.
+- `src/lsm/scan_builder.zig`: `scan_unique_key_range` (UPSTREAM.md).
+- `nerva api`: `PUT /v1/views/<name>` also declares into the state machine;
+  `GET /v1/views/<name>/groups`; `409 view_key_field`, `503 views_busy`. Client:
+  `declare_view`, `get_view`.
+- Tests: unit and state machine tests, the VOPR model of views, `tests/views/maintained.py` in
+  `test:views`. Mutation-tested (groups that never lose rows, the backfill cursor, admission off
+  by one).
+
+## 2026-10-05 — Performance Phase 0: round trips, --cache-rows, bench, bench:load (N53)
 
 - `src/nerva/client.zig`: `send` builds request messages and carries the previous round trip, so
   primaries record `client_request_round_trip`.
@@ -385,4 +402,3 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
 - Tests: `cache_rows_resolve` and `LatencyHistogram` unit tests; `test:integration` checks round
   trips arrive over statsd (every replica now sends) and starts replica 2 with `--cache-rows`.
   Mutation-tested: sending 0 as the round trip fails it. Every bench:load workload ran locally.
-

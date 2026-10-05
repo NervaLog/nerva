@@ -37,6 +37,7 @@ comptime {
     _ = @import("nerva/view/declared.zig");
     _ = @import("nerva/view/declared_benchmark.zig");
     _ = @import("nerva/view/server.zig");
+    _ = @import("nerva/views.zig");
     _ = @import("queue.zig");
     _ = @import("stack.zig");
     _ = @import("testing/exhaustigen.zig");

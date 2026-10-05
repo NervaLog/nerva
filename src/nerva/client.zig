@@ -28,6 +28,10 @@ const EntryResult = nerva.EntryResult;
 const ChangesFilter = nerva.ChangesFilter;
 const HistoryFilter = nerva.HistoryFilter;
 const Change = nerva.Change;
+const ViewDefinition = nerva.ViewDefinition;
+const DeclareResult = nerva.DeclareResult;
+const ViewQuery = nerva.ViewQuery;
+const ViewRecord = nerva.ViewRecord;
 
 const VSRClient = vsr.ClientType(Operation, MessageBus);
 
@@ -205,6 +209,42 @@ pub const Client = struct {
         const reply = stdx.bytes_as_slice(.exact, Change, client.reply[0..client.reply_size.?]);
         assert(reply.len <= changes.len);
         stdx.copy_disjoint(.exact, Change, changes[0..reply.len], reply);
+        return reply.len;
+    }
+
+    /// Declares a view, maintained from then on by every commit (N52).
+    pub fn declare_view(client: *Client, definition: *const ViewDefinition) Error!DeclareResult {
+        try client.ensure_idle();
+        const body = std.mem.asBytes(definition);
+        stdx.copy_disjoint(.exact, u8, client.request[0..body.len], body);
+        client.send(.declare_view, client.request[0..body.len]);
+        try client.run_until_reply();
+        const reply = stdx.bytes_as_slice(
+            .exact,
+            DeclareResult,
+            client.reply[0..client.reply_size.?],
+        );
+        assert(reply.len == 1);
+        return reply[0];
+    }
+
+    /// A view's latest state (the header record) and a page of its groups (N52). `records.len`
+    /// must hold `query.limit` groups plus the header. Returns the number of records written
+    /// (zero if the query is invalid).
+    pub fn get_view(client: *Client, query: ViewQuery, records: []ViewRecord) Error!usize {
+        assert(records.len >= @min(
+            query.limit +| 1,
+            Operation.get_view.result_max(constants.message_body_size_max),
+        ));
+        try client.ensure_idle();
+        const body = std.mem.asBytes(&query);
+        stdx.copy_disjoint(.exact, u8, client.request[0..body.len], body);
+        client.send(.get_view, client.request[0..body.len]);
+        try client.run_until_reply();
+
+        const reply = stdx.bytes_as_slice(.exact, ViewRecord, client.reply[0..client.reply_size.?]);
+        assert(reply.len <= records.len);
+        stdx.copy_disjoint(.exact, ViewRecord, records[0..reply.len], reply);
         return reply.len;
     }
 

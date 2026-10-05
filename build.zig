@@ -313,13 +313,22 @@ pub fn build(b: *std.Build) !void {
         steps.test_api.dependOn(&run_api_test.step);
     }
 
-    // zig build test:views: declared views against a model.
-    const run_views_test = b.addSystemCommand(&.{ "python3", "tests/views/declared.py" });
-    run_views_test.addFileArg(nerva.getEmittedBin());
-    if (b.args) |args| run_views_test.addArgs(args);
-    run_views_test.setCwd(b.path("."));
-    run_views_test.has_side_effects = true;
-    steps.test_views.dependOn(&run_views_test.step);
+    // zig build test:views: declared views against a model, then views maintained by the state
+    // machine against `nerva view` (one after the other: each runs a cluster).
+    var views_previous: ?*std.Build.Step = null;
+    for ([_][]const u8{ "declared.py", "maintained.py" }) |script| {
+        const run_views_test = b.addSystemCommand(&.{
+            "python3",
+            b.fmt("tests/views/{s}", .{script}),
+        });
+        run_views_test.addFileArg(nerva.getEmittedBin());
+        if (b.args) |args| run_views_test.addArgs(args);
+        run_views_test.setCwd(b.path("."));
+        run_views_test.has_side_effects = true;
+        if (views_previous) |previous| run_views_test.step.dependOn(previous);
+        views_previous = &run_views_test.step;
+        steps.test_views.dependOn(&run_views_test.step);
+    }
 
     // zig build test:demo: the demos under crashes, one after the other (each runs a cluster).
     var demo_previous: ?*std.Build.Step = null;
