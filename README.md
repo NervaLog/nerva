@@ -100,7 +100,7 @@ in-memory model replayed in op order.
 Linux (io_uring) or macOS; x86_64 with AES or aarch64.
 
 CI (`.github/workflows/ci.yml`) runs on every push and pull request to `main`: typecheck, format,
-unit, integration, API, view and demo tests, every fuzzer at its smoke size, and the VOPR on seeds 1,
+unit, integration, API, view, mixed-release and demo tests, every fuzzer at its smoke size, and the VOPR on seeds 1,
 2, 5 and one random seed (printed, so a failure replays), as parallel jobs (N57). A commit to `main` that changes `VERSION` runs CI on that commit, then
 publishes binaries for Linux and macOS (x86_64, aarch64) as GitHub release `v<VERSION>`
 (`release.yml`), with that version's section of [CHANGELOG.md](./CHANGELOG.md) as the release
@@ -108,9 +108,13 @@ notes; releasing a version twice, or without notes, fails. A separate workflow,
 `fuzz.yml`, runs every fuzzer and the VOPR on random seeds for a time budget; it is started by hand
 on runners brought up for it.
 
-Binaries report `<protocol>+<commit>`. The protocol release (`0.0.2` since adds, N43) is what
-replicas, clients and data files check: binaries of different protocol releases do not mix in
-one cluster, and data files formatted by v0.1.0 (protocol `0.0.1`) must be reformatted.
+Binaries report `<protocol>+<commit>`. The protocol release (`0.0.3` since maintained views,
+N60) is what data files and clients check: a replica refuses a data file of another release, so
+upgrading means reformatting, and accepts clients from `0.0.2` on. A replica ignores peers that
+run another release (N61): in a cluster mixing releases, only replicas of one release count
+toward each other's quorums, and each logs the others it ignores. Upgrade by stopping every
+replica, reformatting, and starting them all on the new release. `zig build test:release` runs a
+cluster of two releases.
 
 ## Running a cluster
 

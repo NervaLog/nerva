@@ -176,6 +176,8 @@ fn command_start(
         .release = config.process.release,
         .release_client_min = config.process.release_client_min,
         .multiversion = .single_release(config.process.release),
+        // Nerva bundles only its own release: peers of another release are ignored (N61, #34).
+        .release_peers_strict = true,
         .pipeline_requests_limit = args.pipeline_requests_limit,
         .storage_size_limit = args.storage_size_limit,
         .aof = null,
