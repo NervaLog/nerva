@@ -87,6 +87,8 @@ pub fn build(b: *std.Build) !void {
         .vopr_build = b.step("vopr:build", "Build the VOPR"),
         .fuzz = b.step("fuzz", "Run non-VOPR fuzzers"),
         .fuzz_build = b.step("fuzz:build", "Build non-VOPR fuzzers"),
+        .bench = b.step("bench", "Run every `benchmark:` test for real (ReleaseSafe)"),
+        .bench_load = b.step("bench:load", "Run the load generator (ReleaseSafe; pass flags after --)"),
     };
 
     const options = .{
@@ -206,6 +208,69 @@ pub fn build(b: *std.Build) !void {
     }
     steps.test_unit.dependOn(&run_stdx_unit_tests.step);
     steps.test_unit.dependOn(&run_unit_tests.step);
+
+    // zig build bench [-- <filter>]
+    // Every `benchmark:` test in benchmark mode, ReleaseSafe whatever -Drelease says. Machine
+    // results are `bench-json:` lines on stderr (`Bench.metric`).
+    const test_options_bench = b.addOptions();
+    test_options_bench.addOption(bool, "benchmark", true);
+    const stdx_module_bench = b.createModule(.{
+        .root_source_file = b.path("src/stdx/stdx.zig"),
+    });
+    stdx_module_bench.addOptions("test_options", test_options_bench);
+    const bench_filters: []const []const u8 = b.args orelse &.{"benchmark:"};
+    const stdx_benchmarks = b.addTest(.{
+        .name = "bench-stdx",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/stdx/stdx.zig"),
+            .target = target,
+            .optimize = .ReleaseSafe,
+        }),
+        .filters = bench_filters,
+    });
+    stdx_benchmarks.root_module.addOptions("test_options", test_options_bench);
+    const benchmarks = b.addTest(.{
+        .name = "bench",
+        .root_module = vsr_module(b, .{
+            .stdx_module = stdx_module_bench,
+            .vsr_options = vsr_options_test,
+            .test_options = test_options_bench,
+            .target = target,
+            .mode = .ReleaseSafe,
+        }),
+        .filters = bench_filters,
+    });
+    for ([_]*std.Build.Step.Compile{ stdx_benchmarks, benchmarks }) |compile| {
+        const run = b.addRunArtifact(compile);
+        run.setCwd(b.path("."));
+        run.has_side_effects = true; // Never cached: a benchmark is run to be measured.
+        steps.bench.dependOn(&run.step);
+    }
+
+    // zig build bench:load -- <flags>
+    // An executable, not a test: it must use the same (production) config as `nerva`.
+    const bench_load_options = b.addOptions();
+    bench_load_options.addOptionPath("nerva_exe", nerva.getEmittedBin());
+    const bench_load = b.addExecutable(.{
+        .name = "bench-load",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench_load.zig"),
+            .target = target,
+            .optimize = .ReleaseSafe,
+        }),
+    });
+    bench_load.root_module.addImport("stdx", stdx_module);
+    bench_load.root_module.addImport(
+        "abi",
+        b.createModule(.{ .root_source_file = b.path("src/abi.zig") }),
+    );
+    bench_load.root_module.addOptions("vsr_options", vsr_options_test);
+    bench_load.root_module.addOptions("bench_load_options", bench_load_options);
+    steps.check.dependOn(&bench_load.step);
+    const run_bench_load = b.addRunArtifact(bench_load);
+    if (b.args) |args| run_bench_load.addArgs(args);
+    run_bench_load.has_side_effects = true;
+    steps.bench_load.dependOn(&run_bench_load.step);
 
     // zig build test:integration
     const integration_tests_options = b.addOptions();

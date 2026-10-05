@@ -373,3 +373,16 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
 - Tests: IO unit test for `run_once`; `test:integration` checks the median lookup is under one
   tick. Mutation-tested.
 
+## 2026-10-05 — Performance Phase 0: round trips, --cache-rows, bench, bench:load (N52)
+
+- `src/nerva/client.zig`: `send` builds request messages and carries the previous round trip, so
+  primaries record `client_request_round_trip`.
+- `nerva start --cache-rows=<size>` (`cli.zig` `cache_rows_resolve`, `state_machine.zig`
+  `cache_entries_rows_multiple`).
+- `zig build bench` (`build.zig`), `Bench.metric` (vendored, UPSTREAM.md),
+  `src/nerva/documents_benchmark.zig`, `src/nerva/view/declared_benchmark.zig`.
+- `zig build bench:load` (`src/bench_load.zig`) and `src/nerva/latency_histogram.zig`.
+- Tests: `cache_rows_resolve` and `LatencyHistogram` unit tests; `test:integration` checks round
+  trips arrive over statsd (every replica now sends) and starts replica 2 with `--cache-rows`.
+  Mutation-tested: sending 0 as the round trip fails it. Every bench:load workload ran locally.
+

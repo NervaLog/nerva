@@ -1,0 +1,596 @@
+//! `zig build bench:load`: a load generator for a Nerva cluster, for the nightly performance
+//! job and for measuring a change by hand (docs/DECISIONS.md N52).
+//!
+//! One thread and one blocking `Client` per `--clients`. Closed loop (`--rate=0`) sends the next
+//! request as soon as the last one answers; open loop (`--rate=<n>`) sends at fixed times and
+//! measures each latency from the time the request was due, so a slow reply delays the samples
+//! behind it instead of hiding them. The result is one JSON object (`--output`, or stdout).
+//!
+//! An executable rather than a `zig test`: the client must use the production configuration of
+//! the `nerva` binary it talks to (as `integration_tests.zig`).
+
+const std = @import("std");
+const assert = std.debug.assert;
+
+const stdx = @import("stdx");
+const vsr = @import("vsr.zig");
+const nerva = @import("nerva.zig");
+const Client = @import("nerva/client.zig").Client;
+const LatencyHistogram = @import("nerva/latency_histogram.zig").LatencyHistogram;
+
+const Entry = nerva.Entry;
+const EntryResult = nerva.EntryResult;
+const RowKey = nerva.RowKey;
+const RowValue = nerva.RowValue;
+const Change = nerva.Change;
+
+const nerva_exe = @import("bench_load_options").nerva_exe;
+
+pub const tigerbeetle_config = @import("config.zig").configs.default_production;
+
+// Replicas refuse connections while they start; only errors are worth printing.
+pub const std_options: std.Options = .{ .log_level = .err };
+
+const table: u32 = 1;
+/// `--local` runs a `--development` cluster, which accepts this many client connections.
+const local_clients_max = 6;
+const batch_max = 1024;
+const history_limit = 64;
+const timeout = stdx.Duration.seconds(30);
+
+const Workload = enum {
+    /// Blind puts of `--batch` rows.
+    c1,
+    /// Read-modify-write of one row at the version read (two requests per transaction).
+    c2,
+    /// Read-modify-write of `--hot` rows, retried until it commits.
+    c3,
+    /// The same hot rows changed by `add` entries, which never conflict (N42).
+    c3_adds,
+    /// Lookups of `--batch` rows.
+    c4,
+    /// Change feed pages of `--batch` changes, from the start and round again.
+    c5,
+    /// 70% lookups, 20% read-modify-write, 5% feed pages, 5% history reads.
+    c7,
+};
+
+const CLIArgs = struct {
+    addresses: ?[]const u8 = null,
+    cluster: u128 = 0,
+    local: bool = false,
+    workload: Workload,
+    clients: u32 = 4,
+    batch: u32 = 1,
+    keys: u64 = 10_000,
+    hot: u32 = 4,
+    seconds: u32 = 10,
+    rate: u32 = 0,
+    seed: ?u64 = null,
+    output: ?[]const u8 = null,
+
+    pub const help =
+        \\Usage:
+        \\
+        \\  bench-load (--local | --addresses=<addresses> [--cluster=<id>]) --workload=<workload>
+        \\             [--clients=<n>] [--batch=<n>] [--keys=<n>] [--hot=<n>] [--seconds=<n>]
+        \\             [--rate=<requests per second>] [--seed=<n>] [--output=<file>]
+        \\
+        \\Workloads: c1 puts, c2 read-modify-write, c3 hot rows with retries, c3_adds hot rows
+        \\with add entries, c4 lookups, c5 change feed, c7 mixed. See src/bench_load.zig.
+        \\
+    ;
+};
+
+const Config = struct {
+    workload: Workload,
+    clients: u32,
+    batch: u32,
+    keys: u64,
+    hot: u32,
+    seconds: u32,
+    rate: u32,
+    seed: u64,
+};
+
+pub fn main() !void {
+    var gpa_instance: std.heap.GeneralPurposeAllocator(.{ .thread_safe = true }) = .init;
+    defer switch (gpa_instance.deinit()) {
+        .ok => {},
+        .leak => @panic("memory leaked"),
+    };
+    const gpa = gpa_instance.allocator();
+
+    var flags = stdx.Flags.init(gpa);
+    defer flags.deinit(gpa);
+    const args = flags.parse(CLIArgs);
+
+    if (args.local == (args.addresses != null)) {
+        stdx.Flags.fatal("exactly one of --local and --addresses is required", .{});
+    }
+    if (args.clients == 0) stdx.Flags.fatal("--clients must be at least 1", .{});
+    if (args.local and args.clients > local_clients_max) {
+        stdx.Flags.fatal("--local allows at most {} clients", .{local_clients_max});
+    }
+    if (args.batch == 0 or args.batch > batch_max) {
+        stdx.Flags.fatal("--batch must be from 1 to {}", .{batch_max});
+    }
+    if (args.keys < args.batch) stdx.Flags.fatal("--keys must be at least --batch", .{});
+    if (args.hot == 0 or args.hot > args.keys) {
+        stdx.Flags.fatal("--hot must be from 1 to --keys", .{});
+    }
+    if (args.seconds == 0) stdx.Flags.fatal("--seconds must be at least 1", .{});
+
+    const config: Config = .{
+        .workload = args.workload,
+        .clients = args.clients,
+        .batch = args.batch,
+        .keys = args.keys,
+        .hot = args.hot,
+        .seconds = args.seconds,
+        .rate = args.rate,
+        .seed = args.seed orelse std.crypto.random.int(u64),
+    };
+
+    var local: ?LocalCluster = null;
+    defer if (local) |*cluster| cluster.deinit(gpa);
+    var addresses_buffer: [vsr.constants.replicas_max]stdx.SocketAddress = undefined;
+    const addresses = if (args.local) addresses: {
+        local = try LocalCluster.init(gpa);
+        break :addresses try vsr.parse_addresses(local.?.addresses_flag, &addresses_buffer);
+    } else try vsr.parse_addresses(args.addresses.?, &addresses_buffer);
+
+    try preload(gpa, args.cluster, addresses, &config);
+
+    const result = try run(gpa, args.cluster, addresses, &config);
+    var json = std.ArrayList(u8).init(gpa);
+    defer json.deinit();
+    try result_write(json.writer(), &config, &result);
+    try json.append('\n');
+    if (args.output) |path| {
+        try std.fs.cwd().writeFile(.{ .sub_path = path, .data = json.items });
+    } else {
+        try std.io.getStdOut().writeAll(json.items);
+    }
+    if (result.failures > 0) std.process.exit(1);
+}
+
+/// Writes every key once (in batches), so that reads find rows and versions.
+fn preload(
+    gpa: std.mem.Allocator,
+    cluster: u128,
+    addresses: []const stdx.SocketAddress,
+    config: *const Config,
+) !void {
+    switch (config.workload) {
+        .c1, .c3_adds => return, // Blind writes and adds (with `create`) need no rows.
+        .c2, .c3, .c4, .c5, .c7 => {},
+    }
+    const client = try gpa.create(Client);
+    defer gpa.destroy(client);
+    try client.init(gpa, .{ .cluster = cluster, .addresses = addresses, .timeout = timeout });
+    defer client.deinit();
+
+    var entries: [batch_max]Entry = undefined;
+    var results: [batch_max]EntryResult = undefined;
+    var id: u64 = 1;
+    while (id <= config.keys) {
+        const count: usize = @intCast(@min(batch_max, config.keys - id + 1));
+        for (entries[0..count], 0..) |*entry, index| entry.* = put(id + index, 0);
+        try client.commit(entries[0..count], results[0..count]);
+        for (results[0..count]) |result| assert(result.status == .ok);
+        id += count;
+    }
+}
+
+const Result = struct {
+    histogram: LatencyHistogram = .{},
+    /// Latency samples: one per request, or per transaction for c2 and c3.
+    operations: u64 = 0,
+    requests: u64 = 0,
+    entries: u64 = 0,
+    conflicts: u64 = 0,
+    retries: u64 = 0,
+    /// Entries refused for a reason other than a conflict (a bug in this generator).
+    errors: u64 = 0,
+    /// Clients that stopped with an error (timeout, eviction).
+    failures: u64 = 0,
+    duration: stdx.Duration = .{ .ns = 0 },
+
+    fn merge(result: *Result, other: *const Result) void {
+        result.histogram.merge(&other.histogram);
+        result.operations += other.operations;
+        result.requests += other.requests;
+        result.entries += other.entries;
+        result.conflicts += other.conflicts;
+        result.retries += other.retries;
+        result.errors += other.errors;
+        result.failures += other.failures;
+    }
+};
+
+const Shared = struct {
+    config: *const Config,
+    cluster: u128,
+    addresses: []const stdx.SocketAddress,
+    gpa: std.mem.Allocator,
+    ready: std.atomic.Value(u32) = .init(0),
+    /// Monotonic ns at which every worker starts; zero until all are ready.
+    start_ns: std.atomic.Value(u64) = .init(0),
+};
+
+fn run(
+    gpa: std.mem.Allocator,
+    cluster: u128,
+    addresses: []const stdx.SocketAddress,
+    config: *const Config,
+) !Result {
+    var shared: Shared = .{ .config = config, .cluster = cluster, .addresses = addresses, .gpa = gpa };
+    const workers = try gpa.alloc(Worker, config.clients);
+    defer gpa.free(workers);
+    const threads = try gpa.alloc(std.Thread, config.clients);
+    defer gpa.free(threads);
+
+    for (workers, threads, 0..) |*worker, *thread, index| {
+        worker.* = .{
+            .shared = &shared,
+            .index = @intCast(index),
+            .prng = stdx.PRNG.from_seed(config.seed +% index),
+        };
+        thread.* = try std.Thread.spawn(.{}, Worker.main, .{worker});
+    }
+
+    var time_os: stdx.TimeOS = .{};
+    const time = time_os.interface();
+    while (shared.ready.load(.acquire) < config.clients) std.time.sleep(std.time.ns_per_ms);
+    // Workers whose client failed to connect are ready too; they report a failure.
+    const start = time.monotonic().add(.ms(100));
+    shared.start_ns.store(start.ns, .release);
+
+    var total: Result = .{};
+    for (workers, threads) |*worker, thread| {
+        thread.join();
+        total.merge(&worker.result);
+    }
+    total.duration = .{ .ns = @as(u64, config.seconds) * std.time.ns_per_s };
+    return total;
+}
+
+const Worker = struct {
+    shared: *Shared,
+    index: u32,
+    prng: stdx.PRNG,
+    result: Result = .{},
+    sequence: u64 = 0,
+    feed_cursor: u64 = 0,
+
+    entries: [batch_max]Entry = undefined,
+    results: [batch_max]EntryResult = undefined,
+    keys: [batch_max]RowKey = undefined,
+    rows: [batch_max]RowValue = undefined,
+    changes: [batch_max + 1]Change = undefined,
+
+    fn main(worker: *Worker) void {
+        worker.run() catch |err| {
+            std.log.err("client {}: {}", .{ worker.index, err });
+            worker.result.failures += 1;
+        };
+    }
+
+    fn run(worker: *Worker) !void {
+        const shared = worker.shared;
+        const config = shared.config;
+        const client = shared.gpa.create(Client) catch |err| {
+            _ = shared.ready.fetchAdd(1, .release);
+            return err;
+        };
+        defer shared.gpa.destroy(client);
+        client.init(shared.gpa, .{
+            .cluster = shared.cluster,
+            .addresses = shared.addresses,
+            .timeout = timeout,
+        }) catch |err| {
+            _ = shared.ready.fetchAdd(1, .release);
+            return err;
+        };
+        defer client.deinit();
+        _ = shared.ready.fetchAdd(1, .release);
+
+        var time_os: stdx.TimeOS = .{};
+        const time = time_os.interface();
+        while (shared.start_ns.load(.acquire) == 0) std.time.sleep(std.time.ns_per_ms / 10);
+        const start: stdx.Instant = .{ .ns = shared.start_ns.load(.acquire) };
+        const end = start.add(.{ .ns = @as(u64, config.seconds) * std.time.ns_per_s });
+
+        // Open loop: this client's share of the rate, staggered so clients do not send at once.
+        const interval_ns: u64 = if (config.rate == 0)
+            0
+        else
+            @as(u64, config.clients) * std.time.ns_per_s / config.rate;
+        var due = start.add(.{ .ns = interval_ns * worker.index / config.clients });
+
+        while (true) {
+            var now = time.monotonic();
+            if (now.ns >= end.ns) break;
+            if (interval_ns > 0) {
+                if (due.ns >= end.ns) break;
+                if (now.ns < due.ns) {
+                    std.time.sleep(due.ns - now.ns);
+                    now = time.monotonic();
+                }
+            } else {
+                due = now;
+            }
+            try worker.operation(client);
+            worker.result.histogram.record(due.elapsed(time.monotonic()).ns);
+            worker.result.operations += 1;
+            due = due.add(.{ .ns = interval_ns });
+        }
+    }
+
+    fn operation(worker: *Worker, client: *Client) !void {
+        const config = worker.shared.config;
+        switch (config.workload) {
+            .c1 => try worker.puts(client),
+            .c2 => try worker.read_modify_write(client, config.keys, false),
+            .c3 => try worker.read_modify_write(client, config.hot, true),
+            .c3_adds => try worker.add(client),
+            .c4 => try worker.lookups(client),
+            .c5 => try worker.feed_page(client),
+            .c7 => {
+                const roll = worker.prng.int_inclusive(u8, 99);
+                if (roll < 70) {
+                    try worker.lookups(client);
+                } else if (roll < 90) {
+                    try worker.read_modify_write(client, config.keys, false);
+                } else if (roll < 95) {
+                    try worker.feed_page(client);
+                } else {
+                    try worker.history(client);
+                }
+            },
+        }
+    }
+
+    fn key_random(worker: *Worker, keys: u64) u64 {
+        return 1 + worker.prng.int_inclusive(u64, keys - 1);
+    }
+
+    fn puts(worker: *Worker, client: *Client) !void {
+        const config = worker.shared.config;
+        // Distinct rows within a batch (a row written twice is `write_duplicate`).
+        const base = config.keys / config.clients * worker.index + worker.sequence * config.batch;
+        worker.sequence += 1;
+        const entries = worker.entries[0..config.batch];
+        for (entries, 0..) |*entry, index| {
+            entry.* = put(1 + (base + index) % config.keys, worker.sequence);
+        }
+        try worker.commit(client, entries);
+    }
+
+    fn lookups(worker: *Worker, client: *Client) !void {
+        const config = worker.shared.config;
+        const keys = worker.keys[0..config.batch];
+        for (keys) |*key| key.* = .{ .id = worker.key_random(config.keys), .table = table };
+        try client.lookup_rows(keys, worker.rows[0..config.batch]);
+        worker.result.requests += 1;
+        worker.result.entries += config.batch;
+    }
+
+    fn read_modify_write(worker: *Worker, client: *Client, keys: u64, retry: bool) !void {
+        const id = worker.key_random(keys);
+        while (true) {
+            var row: [1]RowValue = undefined;
+            try client.lookup_rows(&.{.{ .id = id, .table = table }}, &row);
+            worker.sequence += 1;
+            var entry_put = put(id, worker.sequence);
+            std.mem.writeInt(u64, entry_put.value[8..16], row[0].op, .little);
+            const entries = [2]Entry{
+                .{ .id = id, .table = table, .kind = .read, .op_seen = row[0].op, .value = @splat(0) },
+                entry_put,
+            };
+            var results: [2]EntryResult = undefined;
+            try client.commit(&entries, &results);
+            worker.result.requests += 2;
+            if (results[0].status == .ok) {
+                worker.result.entries += 2;
+                return;
+            }
+            if (results[0].status != .conflict) {
+                worker.result.errors += 1;
+                return;
+            }
+            worker.result.conflicts += 1;
+            if (!retry) return;
+            worker.result.retries += 1;
+        }
+    }
+
+    fn add(worker: *Worker, client: *Client) !void {
+        const config = worker.shared.config;
+        var entry: Entry = .{
+            .id = worker.key_random(config.hot),
+            .table = table,
+            .kind = .add,
+            .op_seen = 0,
+            .value = undefined,
+        };
+        const parameters: nerva.Add = .{
+            .delta = 1,
+            .min = 0,
+            .max = 0,
+            .delta_from = 0,
+            .offset = 0,
+            .field = .u64,
+            .flags = .{ .create = true },
+        };
+        entry.value = @bitCast(parameters);
+        try worker.commit(client, (&entry)[0..1]);
+    }
+
+    fn feed_page(worker: *Worker, client: *Client) !void {
+        const config = worker.shared.config;
+        const count = try client.get_changes(.{
+            .timestamp_min = worker.feed_cursor,
+            .limit = config.batch,
+        }, worker.changes[0 .. config.batch + 1]);
+        assert(count >= 1);
+        const end = worker.changes[count - 1];
+        assert(end.kind == .end);
+        worker.result.requests += 1;
+        worker.result.entries += count - 1;
+        worker.feed_cursor = if (end.flags.more) end.timestamp else 0;
+    }
+
+    fn history(worker: *Worker, client: *Client) !void {
+        const config = worker.shared.config;
+        const count = try client.get_history(.{
+            .table = table,
+            .id = worker.key_random(config.keys),
+            .limit = history_limit,
+            .op_max = std.math.maxInt(u64),
+            .timestamp_max = 0,
+        }, worker.changes[0 .. history_limit + 1]);
+        assert(count >= 1);
+        worker.result.requests += 1;
+        worker.result.entries += count - 1;
+    }
+
+    fn commit(worker: *Worker, client: *Client, entries: []const Entry) !void {
+        const results = worker.results[0..entries.len];
+        try client.commit(entries, results);
+        worker.result.requests += 1;
+        for (results) |result| switch (result.status) {
+            .ok => worker.result.entries += 1,
+            .conflict => worker.result.conflicts += 1,
+            .aborted => {},
+            else => worker.result.errors += 1,
+        };
+    }
+};
+
+fn put(id: u64, stamp: u64) Entry {
+    var value: [nerva.value_size]u8 = @splat(0);
+    std.mem.writeInt(u64, value[0..8], stamp, .little);
+    return .{ .id = id, .table = table, .kind = .put, .op_seen = 0, .value = value };
+}
+
+fn result_write(writer: anytype, config: *const Config, result: *const Result) !void {
+    const seconds: f64 = @as(f64, @floatFromInt(result.duration.ns)) / std.time.ns_per_s;
+    const histogram = &result.histogram;
+    try writer.print(
+        "{{\"workload\":\"{s}\",\"clients\":{},\"batch\":{},\"keys\":{},\"hot\":{}," ++
+            "\"seconds\":{},\"rate\":{},\"seed\":{},",
+        .{
+            @tagName(config.workload), config.clients, config.batch, config.keys, config.hot,
+            config.seconds,            config.rate,    config.seed,
+        },
+    );
+    try writer.print(
+        "\"operations\":{},\"requests\":{},\"entries\":{},\"conflicts\":{},\"retries\":{}," ++
+            "\"errors\":{},\"failures\":{},\"operations_per_s\":{d:.1},\"entries_per_s\":{d:.1},",
+        .{
+            result.operations,                                 result.requests,
+            result.entries,                                    result.conflicts,
+            result.retries,                                    result.errors,
+            result.failures,                                   @as(f64, @floatFromInt(result.operations)) / seconds,
+            @as(f64, @floatFromInt(result.entries)) / seconds,
+        },
+    );
+    try writer.print(
+        "\"latency_us\":{{\"p50\":{},\"p90\":{},\"p99\":{},\"p999\":{},\"max\":{}}}}}",
+        .{
+            histogram.percentile_us(0.5),  histogram.percentile_us(0.9),
+            histogram.percentile_us(0.99), histogram.percentile_us(0.999),
+            histogram.max_us,
+        },
+    );
+}
+
+/// A three-replica `--development` cluster of real `nerva` processes on free local ports.
+const LocalCluster = struct {
+    tmp_path: []const u8,
+    addresses_flag: []const u8,
+    processes: [3]std.process.Child,
+
+    fn init(gpa: std.mem.Allocator) !LocalCluster {
+        var name_buffer: [128]u8 = undefined;
+        const tmp_name = try std.fmt.bufPrint(
+            &name_buffer,
+            ".zig-cache/tmp/nerva-bench-{x}",
+            .{std.crypto.random.int(u64)},
+        );
+        try std.fs.cwd().makePath(tmp_name);
+        errdefer std.fs.cwd().deleteTree(tmp_name) catch {};
+        const tmp_path = try std.fs.cwd().realpathAlloc(gpa, tmp_name);
+        errdefer gpa.free(tmp_path);
+
+        var ports: [3]u16 = undefined;
+        for (&ports) |*port| port.* = try port_free();
+        const addresses_flag = try std.fmt.allocPrint(
+            gpa,
+            "127.0.0.1:{},127.0.0.1:{},127.0.0.1:{}",
+            .{ ports[0], ports[1], ports[2] },
+        );
+        errdefer gpa.free(addresses_flag);
+
+        var cluster: LocalCluster = .{
+            .tmp_path = tmp_path,
+            .addresses_flag = addresses_flag,
+            .processes = undefined,
+        };
+        var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+        var replica_buffer: [32]u8 = undefined;
+        var addresses_buffer: [256]u8 = undefined;
+        for (0..3) |replica| {
+            const path = try std.fmt.bufPrint(&path_buffer, "{s}/0_{}.nerva", .{ tmp_path, replica });
+            const format = try std.process.Child.run(.{ .allocator = gpa, .argv = &.{
+                nerva_exe,
+                "format",
+                "--cluster=0",
+                try std.fmt.bufPrint(&replica_buffer, "--replica={}", .{replica}),
+                "--replica-count=3",
+                "--development",
+                path,
+            } });
+            defer gpa.free(format.stdout);
+            defer gpa.free(format.stderr);
+            if (format.term != .Exited or format.term.Exited != 0) return error.FormatFailed;
+        }
+        var started: usize = 0;
+        errdefer for (cluster.processes[0..started]) |*process| {
+            _ = process.kill() catch {};
+        };
+        for (&cluster.processes, 0..) |*process, replica| {
+            const path = try std.fmt.bufPrint(&path_buffer, "{s}/0_{}.nerva", .{ tmp_path, replica });
+            process.* = std.process.Child.init(&.{
+                nerva_exe,
+                "start",
+                try std.fmt.bufPrint(&addresses_buffer, "--addresses={s}", .{addresses_flag}),
+                "--development",
+                path,
+            }, gpa);
+            process.stdin_behavior = .Ignore;
+            process.stdout_behavior = .Ignore;
+            process.stderr_behavior = .Ignore;
+            try process.spawn();
+            started += 1;
+        }
+        return cluster;
+    }
+
+    fn deinit(cluster: *LocalCluster, gpa: std.mem.Allocator) void {
+        for (&cluster.processes) |*process| _ = process.kill() catch {};
+        std.fs.deleteTreeAbsolute(cluster.tmp_path) catch {};
+        gpa.free(cluster.addresses_flag);
+        gpa.free(cluster.tmp_path);
+        cluster.* = undefined;
+    }
+};
+
+fn port_free() !u16 {
+    const address = try std.net.Address.parseIp4("127.0.0.1", 0);
+    var server = try address.listen(.{ .reuse_address = true });
+    defer server.deinit();
+    return server.listen_address.getPort();
+}
