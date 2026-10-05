@@ -1,4 +1,4 @@
-//! Views maintained in the state machine (docs/DECISIONS.md N49): the pure parts, shared by the
+//! Views maintained in the state machine (docs/DECISIONS.md N52): the pure parts, shared by the
 //! state machine, the VOPR model and the tests. A view's definition names fields by offset; a
 //! row belongs to at most one group of a view, the one its group_by fields' bytes name, if it
 //! passes the view's where clauses. Each group keeps a count and per-aggregate sums, and a view

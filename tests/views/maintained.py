@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Views maintained by the state machine (docs/DECISIONS.md N49), against `nerva view` (v0, N35)
+"""Views maintained by the state machine (docs/DECISIONS.md N52), against `nerva view` (v0, N35)
 as the oracle.
 
 One replica, `nerva api` and one `nerva view` process. Writes 5,000 seats, more than one pulse
@@ -69,7 +69,7 @@ def maintained(api, name):
 
 
 def view_hash(view_id, groups):
-    """The replicated hash, from the groups as served (`views.group_digest`, N49)."""
+    """The replicated hash, from the groups as served (`views.group_digest`, N52)."""
     total = 0
     for group in groups:
         key = bytes([group["section"]]) + bytes(63)

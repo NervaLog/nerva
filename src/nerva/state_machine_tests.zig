@@ -764,7 +764,7 @@ test "add: absent rows, mixed writes and invalid references are refused" {
     try testing.expectEqual(@as(u64, 1), field(try context.lookup(1, 2), 0));
 }
 
-// ---- Views maintained in the state machine (N49) ----
+// ---- Views maintained in the state machine (N52) ----
 
 const views = @import("views.zig");
 

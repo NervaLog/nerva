@@ -126,11 +126,11 @@ pub const EntryStatus = enum(u32) {
     field_invalid = 11,
     /// An add's `delta_from` does not name an earlier add of the same transaction.
     delta_from_invalid = 12,
-    /// An add to a field that a view on its table filters or groups by (N49): adds must not
+    /// An add to a field that a view on its table filters or groups by (N52): adds must not
     /// move a row between a view's groups.
     view_key_field = 13,
     /// This op's budget of view group writes (`StateMachine.groups_per_op_max`) is spent:
-    /// nothing applied, retry in a later op (N49).
+    /// nothing applied, retry in a later op (N52).
     views_busy = 14,
 };
 
@@ -245,7 +245,7 @@ pub const RowValue = extern struct {
     }
 };
 
-// ---- Views maintained in the state machine (docs/DECISIONS.md N49) ----
+// ---- Views maintained in the state machine (docs/DECISIONS.md N52) ----
 
 /// Views, cluster-wide. View ids are 1..views_max, in declaration order.
 pub const views_max = 64;
@@ -348,7 +348,7 @@ pub const DeclareStatus = enum(u32) {
     table_invalid = 5,
     views_full = 6,
     table_views_full = 7,
-    /// `min` or `max` (maintained from a later change, N49).
+    /// `min` or `max` (maintained from a later change, N52).
     unsupported = 8,
 };
 
@@ -374,7 +374,7 @@ pub const ViewState = enum(u8) {
     /// Rows written before the declaration are still being added (by pulses).
     building = 1,
     ready = 2,
-    /// Two group keys hashed alike; the view stops being maintained (N49).
+    /// Two group keys hashed alike; the view stops being maintained (N52).
     failed = 3,
 };
 
@@ -560,11 +560,11 @@ pub const Operation = enum(u8) {
     commit = constants.vsr_operations_reserved + 1,
     get_changes = constants.vsr_operations_reserved + 2,
     get_history = constants.vsr_operations_reserved + 3,
-    /// A view's latest state and a page of its groups (N49).
+    /// A view's latest state and a page of its groups (N52).
     get_view = constants.vsr_operations_reserved + 4,
-    /// Declares a view, maintained from then on in every commit (N49).
+    /// Declares a view, maintained from then on in every commit (N52).
     declare_view = constants.vsr_operations_reserved + 5,
-    /// `vsr.Operation.pulse`, mapped: backfills building views (N49).
+    /// `vsr.Operation.pulse`, mapped: backfills building views (N52).
     pulse = constants.vsr_operations_reserved + 6,
 
     pub fn EventType(comptime operation: Operation) type {

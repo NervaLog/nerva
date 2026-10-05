@@ -296,7 +296,6 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
 - Smoke reports the vendored `lsm_segmented_array` as slow in Debug (about 20 s against its
   10 s budget); it is a warning, not a failure, and smoke never reached it before this fix.
 
-
 ## 2026-10-04 — Repository renamed to `Botpike/nerva-ledger`
 
 - The repository moved from `topwombat/nerva` to `Botpike/nerva-ledger`; CLAUDE.md's issue rule
@@ -309,7 +308,72 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
 - Verified on the pull request's own CI run: unit tests (the perf test skips), integration,
   API, views, demos and the four VOPR seeds pass on the new runners.
 
-## 2026-10-05 — Views maintained by the state machine (N49)
+## 2026-10-04 — Consistent document reads in `documents.Transaction` (N48; #7)
+
+- `src/nerva/documents.zig`: `Transaction.get` reads every tail chunk at chunk 0's version,
+  from history when a rewrite landed between its two lookups, and records every chunk as read
+  at that version. `Transaction` is `TransactionType(Client)`, so tests can use a stub client.
+- Tests: a rewrite between the lookups (fails with the previous code: a value stitched from
+  two versions), a read with no race, and a tail older than chunk 0.
+
+## 2026-10-04 — VOPR workload: exact ops, unsent inputs, limits, cursors (N49)
+
+- `src/vopr.zig` passes the op each request committed at; `src/nerva/workload.zig` checks
+  replies against it exactly. The testing workload takes the argument, unused.
+- The workload generates `op_seen` on writes, kind zero, `reserved_a`/`reserved_c`, future
+  reads, `RowKey.reserved`, and invalid feed and history filters (reserved bytes, timestamps
+  past `maxInt(u63)`); checks `entry_validate` against the documented rules
+  (`entry_status_check`); reaches `changes_limit_max` and past it, full lookup batches and
+  full commit batches; and continues from cursors that incomplete replies returned.
+- Short-log VOPR runs print the workload's summary, with coverage counters.
+- Verified: seeds 1, 2, 5 and 20 random seeds pass; across them 38 full batches, 171 invalid
+  entries, 117 future reads, 26 invalid filters, 115 clamped limits, 48 cursors continued.
+- Planted bugs, each caught on seeds chosen for exercising it (then reverted): `op_read`
+  reported one op late (4/4 seeds; only the exact-op check catches it), `RowKey.reserved`
+  ignored (4/4), `ChangesFilter.reserved` unchecked (2/4), the limit clamp removed (4/4) or
+  off by one (4/4; the simulator's small messages make `changes_limit_max` a few dozen, within
+  any run's feed), and a put carrying `op_seen` accepted (3/4; only `entry_status_check`
+  catches it, as the model shares `entry_validate`).
+
+## 2026-10-04 — Fly.io feasibility probe for nightly performance tests
+
+- `perf/fly/`: `run-probe.sh` creates one Machine and a volume in the `nerva-perf` Fly app,
+  builds `Dockerfile` (the `nerva` binary, `fio`, `perf`) with Fly's remote builder, runs
+  `probe.sh` at boot, prints its report, and destroys the Machine and volume on exit, failure
+  included. It answers the performance plan's Phase 0 questions about the hardware.
+- Probe results (performance-4x, 10 GB volume, `iad`, binary `0.0.1+3a01765`): production
+  config (Direct IO) formats and starts on the volume; three replicas and `nerva api` work on
+  Fly's private IPv6 addresses; `perf_event_open` works with hardware counters; the volume
+  delivers about 16,500 IOPS and 65 MiB/s, exactly Fly's documented cap for that size. Nightly
+  throughput runs will be IO-capped on Fly and are judged on write amplification instead.
+- Not part of the build or CI; it needs `flyctl` and `FLY_API_TOKEN`.
+
+## 2026-10-04 — Metrics and traces from replicas (N50)
+
+- `nerva start --statsd=<host:port>` sends the replica's metrics (statsd over UDP, every 10 s)
+  and `--trace=<path>` writes its JSON span trace. `src/nerva/cli.zig` parses and validates
+  both (`statsd_parse`, `error.StatsdAddressInvalid`, `error.TracePathEmpty`);
+  `src/nerva_main.zig` hands them to the vendored tracer. No vendored file changed.
+- README: "Metrics and traces", with the metrics the performance plan reads.
+- Tests: `statsd_parse` and `start_resolve` unit tests; `test:integration` checks that replica 0's
+  statsd packets carry request, commit and cache metrics and that replica 1's trace holds commit
+  spans. Mutation-tested: without the statsd or the trace wiring, the integration test fails.
+- Verified: `check`, `test:fmt`, `test:integration`; `test:unit -Drelease` 305/306 (the
+  sandbox-denied perf test).
+
+## 2026-10-05 — The client no longer waits out a 10 ms tick per request (N51)
+
+- `src/io/linux.zig`: `IO.run_once(nanoseconds)`, which returns once callbacks have run;
+  `darwin.zig` and `windows.zig` alias it to `run_for_ns`. Vendored patch, listed in UPSTREAM.md.
+- `src/nerva/client.zig`: `run_io_once` ticks the VSR client every `tick_ms` and otherwise waits
+  with `run_once`, so `run_until_reply` and `deinit` return as soon as the reply (or shutdown)
+  arrives.
+- Through `nerva api` on a local three-replica cluster: lookup p50 10.60 ms to 1.05 ms, commit
+  p50 10.53 ms to 0.92 ms (N51 has the table).
+- Tests: IO unit test for `run_once`; `test:integration` checks the median lookup is under one
+  tick. Mutation-tested.
+
+## 2026-10-05 — Views maintained by the state machine (N52)
 
 - `src/nerva.zig`: `declare_view`, `get_view` and `pulse` operations; `ViewDefinition`, `View`,
   `Group`, `ViewQuery`, `ViewRecord`; statuses `view_key_field` and `views_busy`; tree ids 5–8.

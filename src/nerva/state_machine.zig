@@ -63,9 +63,9 @@ pub fn StateMachineType(comptime Storage: type) type {
             Operation.get_changes.result_max(constants.message_body_size_max) - 1;
 
         /// Timestamps a commit entry takes: its change, then one per view of its table, for a
-        /// group the entry creates (N49).
+        /// group the entry creates (N52).
         pub const entry_timestamps = 1 + nerva.views_per_table_max;
-        /// Distinct groups one op may write (N49), each once: admission refuses a transaction
+        /// Distinct groups one op may write (N52), each once: admission refuses a transaction
         /// that would take its op past this. Groups are twice the size of rows, so this bounds
         /// the groups tree's tables to the rows tree's size.
         pub const groups_per_op_max: u32 = @max(1, @divFloor(commit_entries_max, 2));
@@ -226,7 +226,7 @@ pub fn StateMachineType(comptime Storage: type) type {
 
         batch_size_limit: u32,
         /// `groups_per_op_max` for this `batch_size_limit`: the distinct groups an op may write,
-        /// and the rows a pulse backfills (N49).
+        /// and the rows a pulse backfills (N52).
         group_writes_limit: u32,
         forest: Forest,
 
@@ -255,7 +255,7 @@ pub fn StateMachineType(comptime Storage: type) type {
 
         forest_callback: ?*const fn (*StateMachine) void = null,
 
-        // ---- Views (N49) ----
+        // ---- Views (N52) ----
 
         /// The number of views declared, once known (null after a reset: every id is probed).
         view_count: ?u32 = null,
@@ -270,7 +270,7 @@ pub fn StateMachineType(comptime Storage: type) type {
         views_stored: [nerva.views_max]View = undefined,
         views_op_count: u32 = 0,
         /// Per request, the transactions the views budget refused: prefetch decides, commit
-        /// obeys (N49).
+        /// obeys (N52).
         view_txn_busy: std.DynamicBitSetUnmanaged = .{},
         /// The op's distinct groups, as admitted so far (prefetch); looked up only.
         view_op_keys: std.AutoHashMapUnmanaged(u128, void) = .{},
@@ -467,7 +467,7 @@ pub fn StateMachineType(comptime Storage: type) type {
             callback(self);
         }
 
-        /// Pulses backfill building views (N49). Unknown after a reset: one pulse finds out.
+        /// Pulses backfill building views (N52). Unknown after a reset: one pulse finds out.
         pub fn pulse_needed(self: *const StateMachine, timestamp: u64) bool {
             _ = timestamp;
             return self.view_building orelse true;
@@ -1175,7 +1175,7 @@ pub fn StateMachineType(comptime Storage: type) type {
             });
         }
 
-        // ---- Views (N49) ----
+        // ---- Views (N52) ----
 
         /// Prefetches every declared view (stage 0 of `commit`, `get_view`, `declare_view` and
         /// `pulse`), loads them, then runs the operation's own stage.
@@ -1203,7 +1203,7 @@ pub fn StateMachineType(comptime Storage: type) type {
 
         /// Prefetches the groups a commit may touch (stage 2, after the rows), and admits each
         /// transaction in order while the op's distinct groups fit in `group_writes_limit`
-        /// (N49): a transaction that would not fit is refused (`views_busy`) at commit. The
+        /// (N52): a transaction that would not fit is refused (`views_busy`) at commit. The
         /// groups counted are a superset of those the commit can touch, computed from the rows
         /// as they are before the op: for every write, in every view of its table, the old row's
         /// group and the put's (or a creating add's empty row's) group.

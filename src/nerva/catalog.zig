@@ -401,7 +401,7 @@ pub fn field_integer(field: *const Field, value: *const [value_size]u8) ?i128 {
 
 const testing = std.testing;
 
-/// The view as the state machine maintains it (N49): its fields resolved to offsets through the
+/// The view as the state machine maintains it (N52): its fields resolved to offsets through the
 /// table's layout. `view_check` must have passed.
 pub fn view_definition(
     name: []const u8,

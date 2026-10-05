@@ -121,6 +121,25 @@ pub const IO = struct {
         try self.flush_submissions(0);
     }
 
+    /// Pass all queued submissions to the kernel, wait up to `nanoseconds` for a completion,
+    /// run every callback that is ready, and return. Unlike `run_for_ns`, it does not wait out
+    /// the rest of `nanoseconds` once something has completed (Nerva patch, UPSTREAM.md).
+    pub fn run_once(self: *IO, nanoseconds: u63) !void {
+        assert(!self.run_for_ns_active);
+        assert(nanoseconds > 0);
+
+        // Callbacks already ready may queue more work: run them without waiting in the kernel.
+        try self.flush_submissions(if (self.completed.count() == 0) nanoseconds else 0);
+        try self.flush_completions(0);
+
+        while (self.completed.count() > 0) {
+            try self.run_callback();
+        }
+
+        // Ditto the optimization in `run()`.
+        try self.flush_submissions(0);
+    }
+
     fn flush_submissions(self: *IO, wait_duration_ns: u63) !void {
         // We guard against an io_uring_enter() syscall if we know we do not have any queued SQEs.
         // We cannot use `self.ring.sq_ready()` here since this counts flushed and unflushed SQEs.

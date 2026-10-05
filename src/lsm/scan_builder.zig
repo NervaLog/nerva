@@ -125,7 +125,7 @@ pub fn ScanBuilderType(
         }
 
         /// Initializes a Scan over a unique key, for values from `value_min` to `value_max`
-        /// inclusive (Nerva: backfill and view reads, N49).
+        /// inclusive (Nerva: backfill and view reads, N52).
         /// Produces the criteria equivalent to `WHERE key BETWEEN $min AND $max`.
         /// Results are ordered by key.
         pub fn scan_unique_key_range(

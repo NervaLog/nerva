@@ -333,12 +333,12 @@ fn commit(arena: std.mem.Allocator, client: anytype, layouts: anytype, body: []c
                 try out.print("{{\"status\":\"row_absent\",\"index\":{}}}", .{index});
                 return .{ .status = 409, .body = out.items() };
             },
-            // An add to a field a view filters or groups by (N49).
+            // An add to a field a view filters or groups by (N52).
             .view_key_field => {
                 try out.print("{{\"status\":\"view_key_field\",\"index\":{}}}", .{index});
                 return .{ .status = 409, .body = out.items() };
             },
-            // This op's views budget is spent; nothing applied, so retrying is safe (N49).
+            // This op's views budget is spent; nothing applied, so retrying is safe (N52).
             .views_busy => {
                 try out.print("{{\"status\":\"views_busy\",\"index\":{}}}", .{index});
                 return .{ .status = 503, .body = out.items() };
@@ -700,7 +700,7 @@ fn views(
                     "a view with this name is declared differently; views are immutable",
                 ),
                 inline else => |outcome| {
-                    // Then into the state machine, which maintains it from now on (N49).
+                    // Then into the state machine, which maintains it from now on (N52).
                     const definition = catalog.view_definition(name, &view, &layout);
                     const declared = try client.declare_view(&definition);
                     const reason: ?[]const u8 = switch (declared.status) {
@@ -729,7 +729,7 @@ fn views(
     }
 }
 
-/// Groups of a view maintained by the state machine (N49), in storage order, with the view's
+/// Groups of a view maintained by the state machine (N52), in storage order, with the view's
 /// state, hash and group count as of the read's op.
 ///
 ///     GET /v1/views/<name>/groups?cursor=<c>&limit=<n>

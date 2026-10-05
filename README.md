@@ -67,9 +67,9 @@ stay exact. The operations:
 | `commit` | `Entry` → `EntryResult` | One batch is one transaction of `read` (asserts `op_seen`), `put`, `delete` and `add` entries. If any read is stale (`conflict`), any add cannot apply, or any entry is invalid, nothing applies and the other entries report `aborted`; otherwise every entry reports `ok` with the commit op, and each add what it applied and the field's new value. |
 | `get_changes` | `ChangesFilter` → `Change[]` | Committed writes in op order from a timestamp cursor, ending with an `end` record that carries the next cursor and, when complete, the op the feed reflects. |
 | `get_history` | `HistoryFilter` → `Change[]` | One row's writes, newest first, through an index on the change feed. With `op_max = N`, the first change returned is the row as of op `N` (`Client.row_as_of`). |
-| `declare_view` | `ViewDefinition` → `DeclareResult` | Declares a view maintained from then on by every commit, with its fields resolved to offsets (N49). |
-| `get_view` | `ViewQuery` → `ViewRecord[]` | A maintained view's state, hash and group count, and a page of its groups (N49). |
-| `pulse` | — | Sent by the cluster to itself while a view is building: adds a bounded number of existing rows to it (N49). |
+| `declare_view` | `ViewDefinition` → `DeclareResult` | Declares a view maintained from then on by every commit, with its fields resolved to offsets (N52). |
+| `get_view` | `ViewQuery` → `ViewRecord[]` | A maintained view's state, hash and group count, and a page of its groups (N52). |
+| `pulse` | — | Sent by the cluster to itself while a view is building: adds a bounded number of existing rows to it (N52). |
 
 Commits execute serially in op order, so validating each read's version at commit time gives
 serializable transactions over point reads.
@@ -124,6 +124,29 @@ one cluster, and data files formatted by v0.1.0 (protocol `0.0.1`) must be refor
 
 `--development` relaxes Direct IO and uses small caches. Clients use `src/nerva/client.zig`:
 `lookup_rows`, `commit` and `get_changes`, blocking, one request in flight per client.
+
+### Metrics and traces
+
+`nerva start --statsd=<host:port>` sends the replica's metrics over UDP every 10 seconds, in
+statsd format with DogStatsD tags (`|#cluster:…,replica:N`). `--trace=<path>` writes a JSON span
+trace for [Perfetto](https://ui.perfetto.dev) or `chrome://tracing`; tracing slows the replica,
+so use it to diagnose, not to time. The metrics most useful for performance work:
+
+| Metric | What it measures |
+|---|---|
+| `tb.replica_request_us.*` (tag `operation:Operation.<op>`) | From the primary first seeing a request to this replica committing it (`min`, `max`, `avg`, `sum`, `count`) |
+| `tb.replica_request_local_us.*` (tag `operation`) | This replica's own commit of the request |
+| `tb.replica_request_execute_us.*` (tag `operation`) | Executing the request in the state machine |
+| `tb.replica_commit_us.*` (tag `stage`) | Each commit stage: `prefetch`, `stall`, `execute`, `compact`, `checkpoint_*` and others |
+| `tb.replica_prepare_ok_quorum_us.*` | From prepare to a replication quorum |
+| `tb.compact_beat_us.*`, `tb.compact_mutable_us.*` (tag `tree`) | Compaction work per LSM tree |
+| `tb.lookup_us.*`, `tb.scan_tree_us.*` (tag `tree`) | Point lookups and scans per tree |
+| `tb.storage_read_us.*`, `tb.storage_write_us.*` (tag `zone`) | Disk IO by data file zone |
+| `tb.grid_cache_hits`, `tb.grid_cache_misses` | Block cache effectiveness (gauges) |
+| `tb.replica_commit_min`, `tb.replica_commit_max`, `tb.replica_pipeline_queue_length` | Progress and backlog (gauges) |
+
+Timings are aggregated over each 10-second window. The `tb.` prefix and tag spellings come from
+TigerBeetle's tracer (UPSTREAM.md).
 
 ## JSON API
 
@@ -190,7 +213,7 @@ of its groups, so two view processes can show they agree. v0 keeps tables and th
 `min_op=<n>` answers once the view process has applied op `n` (read-your-writes), and `504` at
 once for an op not yet committed; views are rebuilt from the feed when the process restarts.
 
-**Maintained views** (N49). A view whose aggregates are `count` and `sum` is also declared into
+**Maintained views** (N52). A view whose aggregates are `count` and `sum` is also declared into
 the state machine, which keeps it inside every commit, like the rows: each write updates its
 row's groups, and every replica holds the same groups and the same hash at every op. Reading it
 reads the groups, not the rows, and nothing is lost when a process restarts:
