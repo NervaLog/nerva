@@ -46,7 +46,8 @@ the VOPR simulator are vendored from TigerBeetle; Nerva's own code is `src/nerva
 `benchmark.perf: usage example` fails where `perf_event_open` is denied (cloud sandboxes); this is
 environmental, see UPSTREAM.md. Every other test must pass.
 
-CI (`.github/workflows/ci.yml`) runs the same steps on every push and pull request to `main`. A
+CI (`.github/workflows/ci.yml`) runs the same steps on every push and pull request to `main`
+that changes more than Markdown (N68). A
 commit that changes `VERSION` publishes release `v<VERSION>` (`release.yml`) after CI passes: to
 release, add the version's "what's new" section to `CHANGELOG.md` (`## v<VERSION> — <date>`,
 written for people running Nerva: new capabilities with examples, fixes with their issues, and
