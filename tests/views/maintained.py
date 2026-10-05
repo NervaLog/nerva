@@ -15,7 +15,7 @@ that they build over existing rows. Then requires:
 - an add to a field the view groups or filters by to answer 409 `view_key_field`;
 - a commit of thousands of writes to one group to apply (admission counts distinct groups, not
   writes), and one touching more distinct groups than an op admits (a view grouped by price) to
-  answer 503 `views_busy`, applying nothing;
+  answer 413 `views_too_large`, applying nothing, and to commit once split in two (#32);
 - `min` and `max` to stay exact as the seats holding them are re-priced, deleted or moved;
 - every op compared earlier to read the same through `?as_of=<op>` at the end, as `nerva view`
   answers as of that op; and before a view's declaration, 404;
@@ -200,16 +200,21 @@ def main():
         assert status == 200, (status, body)
         check_both()
 
-        # More distinct groups than an op admits (4,095 in this configuration): refused whole.
+        # More distinct groups than an op admits (4,095 in this configuration): refused whole,
+        # as too large for any op (413), not as busy (#32). Split in two, it commits.
         status, body = request(api, "PUT", "/v1/views/by_price", BY_PRICE)
         assert status == 200 and body["maintained"] is True, body
         while maintained(api, "by_price")[1]["state"] != "ready":
             time.sleep(0.2)
         before = maintained(api, "revenue")[1]["hash"]
-        status, body = commit(api, [put(SEATS + 10_000 + i, seat_value(2, 10_000 + i, True))
-                                    for i in range(4200)])
-        assert status == 503 and body["status"] == "views_busy", (status, body)
+        large = [put(SEATS + 10_000 + i, seat_value(2, 10_000 + i, True)) for i in range(4200)]
+        status, body = commit(api, large)
+        assert status == 413 and body["status"] == "views_too_large", (status, body)
         assert maintained(api, "revenue")[1]["hash"] == before  # Nothing applied.
+        for half in (large[:2100], large[2100:]):
+            status, body = commit(api, half)
+            assert status == 200, (status, body)
+        check_both()
 
         # As of every op compared above: the same groups, read now (N62).
         for name, op, _ in list(checks):

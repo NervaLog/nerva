@@ -102,11 +102,12 @@ in-memory model replayed in op order.
 
 Linux (io_uring) or macOS; x86_64 with AES or aarch64.
 
-CI (`.github/workflows/ci.yml`) runs on every push and pull request to `main`: typecheck, format,
+CI (`.github/workflows/ci.yml`) runs on every push and pull request to `main` that changes more
+than Markdown (N68): typecheck, format,
 unit, integration, API, view, mixed-release and demo tests, every fuzzer at its smoke size, and the VOPR,
 as parallel jobs (N57). On a pull request the VOPR runs seeds 1, 2, 5 and one random seed in Debug
 (printed, so a failure replays); on `main` it runs in ReleaseSafe, seeds 1, 2 and 5 and then four
-lanes of random seeds for 6 minutes each, about 300 seeds a push (N67). A commit to `main` that changes `VERSION` runs CI on that commit, then
+lanes of random seeds for 6 minutes each, about 300 seeds a push (N73). A commit to `main` that changes `VERSION` runs CI on that commit, then
 publishes binaries for Linux and macOS (x86_64, aarch64) as GitHub release `v<VERSION>`
 (`release.yml`), with that version's section of [CHANGELOG.md](./CHANGELOG.md) as the release
 notes; releasing a version twice, or without notes, fails. Each release also carries its bill of
@@ -232,7 +233,10 @@ answers `503` and `/healthz` answers `503`, and it reconnects on its own, trying
 5 s whether or not requests arrive (N64); `nerva view` then reads the feed on from where it
 stopped. Heads are parsed
 strictly: lines end in CRLF, bodies have a `Content-Length` (no `Transfer-Encoding`), and
-anything malformed answers `400`.
+anything malformed answers `400`. A body is at most 4 MiB, and `nerva api` spends at most
+64 MiB on one request: a body that would take more once parsed (deeply nested or very long JSON
+arrays) answers `413 {"error":"request too complex"}`, and the gateway keeps at most 8 MiB
+between requests (N69).
 
 **Documents** hold values larger than a row: up to 64 KiB under a string key (up to 1024 bytes
 of UTF-8) in a namespace (a `u64`, as a decimal string). Nerva chunks them over rows of a
@@ -286,8 +290,9 @@ process restarts.
   summed fields are what views are for.
 - One op touches at most about 4,000 distinct groups and 8,000 `min` and `max` members (a write
   takes one in each such slot of its table), however many writes it has. A transaction that
-  would take an op past either is refused whole (`503 views_busy`), and can be retried; one that
-  exceeds them on its own never fits, so split it.
+  exceeds them on its own is refused whole (`413 views_too_large`): it never fits, so split it.
+  `503 views_busy` is only for a request that packs several transactions (Nerva's clients send
+  one each), when earlier ones filled the op: nothing applied, retry it.
 - `min` and `max` stay exact when the row holding them is deleted, moved or changed: the state
   machine keeps each group's values in order (N62). A table's views have at most four `min` and
   `max` aggregates between them (a fifth is refused: `"maintained": false`).

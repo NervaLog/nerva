@@ -5,10 +5,13 @@
 name: CI
 
 on:
+  # Markdown alone (docs, WORKLOG, CHANGELOG) starts nothing (N68); release.yml's call still runs.
   push:
     branches: [main]
+    paths-ignore: ['**.md']
   pull_request:
     branches: [main]
+    paths-ignore: ['**.md']
   workflow_dispatch:
   workflow_call:
 
@@ -152,7 +155,7 @@ jobs:
         run: python3 tests/demo/${{ matrix.demo }} zig-out/bin/nerva --seconds=75
 
   # Pull requests: the fixed seeds and one random seed, in Debug. Everything else (pushes to main,
-  # the release's run, a dispatch) runs `vopr_main` instead (N67).
+  # the release's run, a dispatch) runs `vopr_main` instead (N73).
   vopr:
     if: github.event_name == 'pull_request'
     runs-on: [self-hosted, fly]
@@ -177,7 +180,7 @@ jobs:
           echo "VOPR seed: $seed"
           echo "### VOPR seed \`$seed\`" >> "$GITHUB_STEP_SUMMARY"
           ./zig/zig build vopr -- "$seed"
-  # Main, in ReleaseSafe, which runs a seed 10 to 40 times faster than Debug (N67): the fixed seeds,
+  # Main, in ReleaseSafe, which runs a seed 10 to 40 times faster than Debug (N73): the fixed seeds,
   # then four lanes that each search fresh random seeds for 6 minutes (fuzz_loop.sh, as the long
   # fuzzing does, N59), about 300 seeds a push. A failing seed stops its lane and prints the
   # command that replays it, in the log and the job summary.
