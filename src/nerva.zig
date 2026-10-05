@@ -159,11 +159,11 @@ pub const EntryStatus = enum(u32) {
     /// The transaction alone touches more view groups (or `min`/`max` members) than one op
     /// allows: nothing applied, and no retry can succeed; split it (#32).
     views_too_large = 15,
-    /// A conserved add (N74) that is not one half of a pair: a `pair` add without its partner
+    /// A conserved add (N75) that is not one half of a pair: a `pair` add without its partner
     /// right after it, a partner that breaks the pair rules, or another add naming a pair's
     /// first half in `delta_from`.
     unpaired = 16,
-    /// A write that would change a conserved field (N74) other than by a pair: a put that
+    /// A write that would change a conserved field (N75) other than by a pair: a put that
     /// changes its bytes, a delete of a row where it is not zero, or an add that overlaps it
     /// without matching it.
     conserved_write = 17,
@@ -225,7 +225,7 @@ pub const Add = extern struct {
         create: bool = false,
         /// `delta` must be zero.
         delta_from: bool = false,
-        /// The first half of a pair (N74): the next entry is its partner.
+        /// The first half of a pair (N75): the next entry is its partner.
         pair: bool = false,
         padding: u2 = 0,
     };
@@ -394,7 +394,7 @@ pub const DeclareStatus = enum(u32) {
     /// The table's views would have more than `view_extremes_per_table_max` `min` and `max`
     /// aggregates.
     table_extremes_full = 9,
-    /// The view filters or groups by a field of a ledger (N74).
+    /// The view filters or groups by a field of a ledger (N75).
     ledger_field = 10,
 };
 
@@ -708,7 +708,7 @@ pub const Change = extern struct {
 };
 
 /// Operations exported by Nerva.
-// ---- Ledgers: conserved fields (docs/DECISIONS.md N74) ----
+// ---- Ledgers: conserved fields (docs/DECISIONS.md N75) ----
 
 /// Ledgers, cluster-wide.
 pub const ledgers_max = 64;
@@ -821,7 +821,7 @@ pub const Operation = enum(u8) {
     declare_view = constants.vsr_operations_reserved + 5,
     /// `vsr.Operation.pulse`, mapped: backfills building views (N52).
     pulse = constants.vsr_operations_reserved + 6,
-    /// Declares a ledger: a set of conserved fields (N74).
+    /// Declares a ledger: a set of conserved fields (N75).
     declare_ledger = constants.vsr_operations_reserved + 7,
     get_ledger = constants.vsr_operations_reserved + 8,
 
@@ -1040,7 +1040,7 @@ pub fn add_apply(add: *const Add, old: u64, applied: i64) u64 {
     };
 }
 
-/// The add as it applies to a conserved field with `floor` (N74): its `min` is raised to the
+/// The add as it applies to a conserved field with `floor` (N75): its `min` is raised to the
 /// floor, so that it never moves the field down past it. Pure, like `add_amount`, which takes
 /// the result; a field already below its floor can still move up.
 pub fn ledger_bounds(add: *const Add, floor: ?i64) Add {

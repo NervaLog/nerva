@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Ledgers through `nerva api` (docs/DECISIONS.md N74).
+"""Ledgers through `nerva api` (docs/DECISIONS.md N75).
 
 Runs one replica and two API gateways, then:
 

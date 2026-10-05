@@ -10,7 +10,7 @@
 //! budgets with adds only (no reads), never conflicting. The checker asserts, independently of
 //! the model, that each budget's available plus held equals what was funded, after every add.
 //!
-//! And a declared ledger (N74): pairs fund, reserve, post and void between accounts and a
+//! And a declared ledger (N75): pairs fund, reserve, post and void between accounts and a
 //! source, among unpaired halves, puts and deletes of balances and straddling adds, which must
 //! all fail. The checker asserts, independently of the row model, that the ledger's total stays
 //! what it was at its declaration (zero), and that no floored field goes below its floor.
@@ -115,7 +115,7 @@ fn budget_add(id: u64, offset: u8, delta: i64, delta_from: ?u32) Entry {
     };
 }
 
-/// Ledger 1 (N74): accounts in one table (`available` at 0 and `held` at 8, i64s floored at
+/// Ledger 1 (N75): accounts in one table (`available` at 0 and `held` at 8, i64s floored at
 /// 0) and one unfloored source in another, which funds them and so goes negative. Only ledger
 /// traffic touches these tables, and only once the ledger is declared: their total stays 0.
 pub const ledger_accounts_table: u32 = 102;
@@ -341,7 +341,7 @@ pub fn WorkloadType(comptime StateMachine: type) type {
         budgets: std.AutoHashMapUnmanaged(u64, Budget) = .{},
         budget_transactions: u64 = 0,
 
-        /// Ledgers declared (N74), in declaration order; whether ledger 1 is (ledger traffic
+        /// Ledgers declared (N75), in declaration order; whether ledger 1 is (ledger traffic
         /// starts once a reply says so, and so commits after it).
         model_ledgers: std.ArrayListUnmanaged(ModelLedger) = .{},
         ledger_declared: bool = false,
@@ -384,7 +384,7 @@ pub fn WorkloadType(comptime StateMachine: type) type {
             receipt_count: u64,
             /// Few budgets, so that adds contend.
             budget_count: u64,
-            /// Accounts of the ledger (N74).
+            /// Accounts of the ledger (N75).
             ledger_account_count: u64,
 
             pub fn generate(prng: *stdx.PRNG, options: struct {
@@ -1198,7 +1198,7 @@ pub fn WorkloadType(comptime StateMachine: type) type {
             assert(budget.available + budget.held == budget.funded);
         }
 
-        // ---- Ledgers (N74) ----
+        // ---- Ledgers (N75) ----
 
         /// Before ledger 1 is known declared: its declaration. Then mostly moves (each batch
         /// one transaction of pairs), some transactions that must fail, reads, and declarations
@@ -1712,7 +1712,7 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                     }
                 }
                 if (entry.kind != .add) continue;
-                // A conserved add stops at its field's floor (N74).
+                // A conserved add stops at its field's floor (N75).
                 const add_entry = Add.from_entry(entry);
                 const add = if (workload.model_conserved(entry.table, add_entry.offset)) |field|
                     nerva.ledger_bounds(&add_entry, field.floor)

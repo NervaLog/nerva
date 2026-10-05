@@ -640,6 +640,23 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
   `MessageBuffer.invalidate` after `evicted: no_session`. `check`, `test:fmt`, `test:unit`
   336/337 (the sandbox-denied perf test).
 
+## 2026-10-05 — `--trace` cannot stop the replica (N71; #30)
+
+- `src/nerva/trace_file.zig`: `TraceFile`, a buffered writer that stops (with a warning) on a
+  write error or at its size limit, and never fails; unit tests. `src/nerva_main.zig`: the
+  tracer writes through it. `src/nerva/cli.zig`: `--trace-size-max` (default 1 GiB).
+- `tests/api/api.py`: a traced replica with `--trace-size-max=64KiB` under load stops tracing at
+  the cap and keeps serving. README, TUTORIAL.
+- Verified: `check`, `test:fmt`, `test:unit` 341/342 (the sandbox-denied perf test), `test:api`
+  (stopped at 65,503 bytes).
+- With it, #60 (N69 amended): the largest valid `documents/get` (256 × 64 KiB) got 413. The
+  budget sat below the arena, which sizes each block from the last, so it counted 330 MiB for a
+  request asking for about 100 MB. It now sits above the arena (counting what a request asks
+  for), at 128 MiB, and the arena is reset as soon as the reply is written; the `get` reply is
+  sized up front. `tests/api/api.py` checks that `get` answers 200 and that RSS comes back. On a 1 MiB
+  tmpfs: `main`'s replica panics (`Tracer.start: error.NoSpaceLeft`, 283 lookups in); the fix
+  logs `tracing stopped: writing it failed: error.NoSpaceLeft` and serves 54,915 lookups.
+
 ## 2026-10-05 — `views_too_large` for a transaction no op can hold (N72; #32)
 
 - `src/nerva.zig`: `EntryStatus.views_too_large = 15`. `src/nerva/views.zig`: `Admission`.
@@ -652,7 +669,32 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
 - Verified: `check`, `test:fmt`, `test:unit` (the sandbox-denied perf test aside), `test:views`;
   VOPR seeds 1, 2, 5 (one `views_busy`, one `views_too_large`) and 2467272726192300042.
 
-## 2026-10-05 — Declared ledgers: conserved fields, floors, paired adds (N74)
+## 2026-10-05 — `extremes_scratch` holds two keys per member (N73; #62)
+
+- `src/nerva/state_machine.zig`: `extremes_scratch` sized for `2 * members_limit`.
+- `src/nerva/state_machine_tests.zig`: one op moving every `min`/`max` holder it admits to new
+  groups (panicked with `integer overflow` before; now commits, groups checked).
+- N62 corrected: with two `min`/`max` slots a transaction holds at most 4,094 writes to the
+  table, not any number; README gives the per-slot bounds.
+- Verified: `check`, `test:fmt`, `test:unit` 341/342 (the sandbox-denied perf test),
+  `test:views`; VOPR seeds 1, 2, 5, 2588955253890934414. At production limits (the pass's
+  probe): 2,047 rows moved in one transaction commit and the view holds each; on `8c206f2` it
+  panicked every replica, and again after a restart.
+- Found by the 0.0.4 hardening pass (a background agent), which otherwise held up: `min`/`max`
+  against a model with ties, deletes, moves and refills; about 8,100 `as_of` comparisons across
+  checkpoints and restarts, in agreement with `nerva view`; backfill under load; 13 VOPR seeds;
+  fuzzers at smoke size; v0.3.0 clients refused by 0.0.4, as N62 intends.
+
+## 2026-10-05 — The VOPR on `main` runs in ReleaseSafe on about 300 seeds (N74)
+
+- `.github/workflows/ci.yml`: `vopr` (seeds 1, 2, 5 and one random, Debug) runs on pull requests
+  only; `vopr_main` runs everywhere else: seeds 1, 2 and 5 in ReleaseSafe, and four lanes of
+  `fuzz_loop.sh vopr nerva 6`.
+- README's CI paragraph and DECISIONS N74.
+- Verified locally: the ReleaseSafe VOPR build (2m03), seeds 1, 2 and 5 pass (8 s, 1 s, 3 s),
+  `fuzz_loop.sh vopr nerva 2` ran 25 seeds without a failure; the workflow parses as YAML.
+
+## 2026-10-05 — Declared ledgers: conserved fields, floors, paired adds (N75)
 
 - `src/nerva.zig`: `LedgerField`, `LedgerDefinition`, `DeclareLedgerStatus`,
   `DeclareLedgerResult`, `LedgerQuery`, `Ledger`; operations `declare_ledger` and `get_ledger`;
@@ -670,7 +712,7 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
 - Tests: `state_machine_tests.zig` (pairs, refusals, floors, declarations, views, reload);
   `workload.zig` (ledger traffic, the model's rules, `check_ledger`); `adds_fuzz.zig` (floors,
   partners, conservation); `tests/api/ledgers.py`, in `test:api`; format guards.
-- Docs: README "Ledgers" and routes; DECISIONS N74; GOALS G8 decided and the non-goal's note;
+- Docs: README "Ledgers" and routes; DECISIONS N75; GOALS G8 decided and the non-goal's note;
   CHANGELOG v0.4.0.
 - Verified: `check`, `test:fmt`, `test:unit` (the sandbox-denied perf test aside), `test:api`,
   `test:views`, `test:integration`, `test:release`, `fuzz -- smoke`, VOPR seeds; four planted

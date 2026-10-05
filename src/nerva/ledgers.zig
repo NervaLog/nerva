@@ -1,4 +1,4 @@
-//! Ledgers (docs/DECISIONS.md N74): sets of conserved `i64` fields that only pairs of adds may
+//! Ledgers (docs/DECISIONS.md N75): sets of conserved `i64` fields that only pairs of adds may
 //! change. A definition's static checks, and the index the state machine finds conserved
 //! fields with, from the ledger declarations alone: no layouts, no rows.
 

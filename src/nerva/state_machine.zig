@@ -481,7 +481,7 @@ pub fn StateMachineType(comptime Storage: type) type {
         /// The building view a pulse backfills (an index into `views_op`), if any.
         backfill_view: ?u32 = null,
 
-        // ---- Ledgers (N74) ----
+        // ---- Ledgers (N75) ----
 
         /// The number of ledgers declared, once known (null after a reset: every slot is
         /// probed).
@@ -691,7 +691,9 @@ pub fn StateMachineType(comptime Storage: type) type {
             errdefer self.members_touched.deinit(allocator);
             try self.members_scratch.ensureTotalCapacity(allocator, members_limit);
             errdefer self.members_scratch.deinit(allocator);
-            try self.extremes_scratch.ensureTotalCapacity(allocator, members_limit);
+            // A member may touch two (group, slot) keys: the group it leaves, when it held that
+            // group's value, and the group it enters (`extremes_gather`, #62).
+            try self.extremes_scratch.ensureTotalCapacity(allocator, 2 * members_limit);
             errdefer self.extremes_scratch.deinit(allocator);
             try self.extreme_scans.ensureTotalCapacity(allocator, members_limit);
             errdefer self.extreme_scans.deinit(allocator);
@@ -1327,7 +1329,7 @@ pub fn StateMachineType(comptime Storage: type) type {
 
         /// The first reason the transaction cannot commit, or null.
         /// The views budget comes first (prefetch decided it: `views_busy`, `views_too_large`),
-        /// then static checks (per entry, then pairs: N74), then duplicate writes, then read
+        /// then static checks (per entry, then pairs: N75), then duplicate writes, then read
         /// conflicts.
         fn commit_failure(
             self: *StateMachine,
@@ -1372,7 +1374,7 @@ pub fn StateMachineType(comptime Storage: type) type {
                             .op = 0,
                         };
                     }
-                    // A conserved field is an `i64`, changed only as a whole (N74).
+                    // A conserved field is an `i64`, changed only as a whole (N75).
                     const index_ = &self.ledger_index;
                     const conserved_write = if (index_.find(entry.table, add.offset) != null)
                         add.field != .i64
@@ -1403,7 +1405,7 @@ pub fn StateMachineType(comptime Storage: type) type {
             return null;
         }
 
-        /// The index of the first conserved add that is not one half of a pair (N74), or null.
+        /// The index of the first conserved add that is not one half of a pair (N75), or null.
         /// A pair is a first half (`pair`) at `i` and its partner at `i + 1`: an add to another
         /// field of the same ledger whose `delta_from` names `i`, without bounds or `clamp`. No
         /// other add may name a first half. Needs only the entries and the ledgers: every add
@@ -1586,7 +1588,7 @@ pub fn StateMachineType(comptime Storage: type) type {
                 }
                 if (entry.kind != .add) continue;
                 const conserved = self.ledger_index.find(entry.table, Add.from_entry(entry).offset);
-                // A conserved add never moves its field down past the floor (N74).
+                // A conserved add never moves its field down past the floor (N75).
                 const add = if (conserved) |field|
                     nerva.ledger_bounds(&Add.from_entry(entry), field.floor)
                 else
@@ -1626,7 +1628,7 @@ pub fn StateMachineType(comptime Storage: type) type {
             return null;
         }
 
-        /// Whether a put or delete leaves the row's conserved fields as they are (N74): a put
+        /// Whether a put or delete leaves the row's conserved fields as they are (N75): a put
         /// must not change their bytes, and a delete needs them all zero. A row that does not
         /// exist holds zeros. A put or delete is the only write to its row in its transaction
         /// (`write_duplicate`), so the stored row is the one it changes.
@@ -1691,7 +1693,7 @@ pub fn StateMachineType(comptime Storage: type) type {
             });
         }
 
-        // ---- Ledgers (N74) ----
+        // ---- Ledgers (N75) ----
 
         /// Prefetches every declared ledger (stage 0 of `commit`, `declare_view`,
         /// `declare_ledger` and `get_ledger`), loads them, then the views where the operation
@@ -2972,7 +2974,7 @@ pub fn StateMachineType(comptime Storage: type) type {
                     table_extremes += views.extreme_count(&view.definition);
                 }
             }
-            // Adds move conserved fields, and must not move rows between groups (N74).
+            // Adds move conserved fields, and must not move rows between groups (N75).
             const ledger_index = &self.ledger_index;
             for (definition.where[0..definition.where_count]) |*clause| {
                 const field = clause.field;

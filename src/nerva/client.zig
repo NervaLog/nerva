@@ -241,7 +241,7 @@ pub const Client = struct {
         return reply[0];
     }
 
-    /// Declares a ledger: a set of conserved fields that only pairs of adds change (N74).
+    /// Declares a ledger: a set of conserved fields that only pairs of adds change (N75).
     pub fn declare_ledger(
         client: *Client,
         definition: *const nerva.LedgerDefinition,

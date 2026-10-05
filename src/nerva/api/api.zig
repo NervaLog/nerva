@@ -21,7 +21,7 @@
 //!     GET  /v1/views/<name>/groups?cursor=<c>&limit=<n>&as_of=<op>
 //!                            (the view, maintained by the state machine: N52, N62)
 //!     PUT  /v1/ledgers/<id>  {"fields": [{"table": 7, "field": "available", "floor": "0"}, …]}
-//!     GET  /v1/ledgers/<id>  (conserved fields: N74)
+//!     GET  /v1/ledgers/<id>  (conserved fields: N75)
 //!     POST /v1/documents/get, POST /v1/documents/commit, GET /v1/documents/changes
 //!                            (larger values, by key: `documents_routes.zig`)
 //!
@@ -39,7 +39,7 @@
 //!   and `create`. A committed reply lists `adds`: each add's `index`, `applied` and new
 //!   `value`. An add that would cross a bound answers `409 {"status": "out_of_bounds", "index",
 //!   "value"}`; one to an absent row without `create`, `409 {"status": "row_absent", "index"}`.
-//! - A field of a ledger (N74) changes only by a pair: an add with `"pair": true` (which may
+//! - A field of a ledger (N75) changes only by a pair: an add with `"pair": true` (which may
 //!   clamp), then an add naming it in `delta_from` (which may not). Otherwise `409 {"status":
 //!   "unpaired", "index"}`; a put, delete or overlapping add that would change it, `409
 //!   {"status": "conserved_write", "index"}`.
@@ -402,7 +402,7 @@ fn commit(arena: std.mem.Allocator, client: anytype, layouts: anytype, body: []c
                 try out.print("{{\"status\":\"views_too_large\",\"index\":{}}}", .{index});
                 return .{ .status = 413, .body = out.items() };
             },
-            // A conserved field changed other than by a pair (N74).
+            // A conserved field changed other than by a pair (N75).
             .unpaired, .conserved_write => {
                 try out.print("{{\"status\":\"{s}\",\"index\":{}}}", .{
                     @tagName(result.status),
@@ -539,7 +539,7 @@ const LedgerRequest = struct {
     },
 };
 
-/// A ledger (N74): a set of conserved i64 fields that only pairs of adds change.
+/// A ledger (N75): a set of conserved i64 fields that only pairs of adds change.
 ///
 ///     PUT /v1/ledgers/<id>  {"fields": [{"table": 7, "field": "available", "floor": "0"},
 ///                                       {"table": 7, "offset": 8, "floor": null}, …]}
@@ -894,7 +894,7 @@ fn views(
                 return bad("a view needs a layout for its table (PUT /v1/tables/<t>)");
             try catalog.view_check(&view, &layout);
             // A view declared differently is refused before the state machine sees it; one the
-            // state machine refuses over a ledger's field is not written to the catalog (N74).
+            // state machine refuses over a ledger's field is not written to the catalog (N75).
             if (try layouts.view(arena, name)) |existing| {
                 const same = std.mem.eql(
                     u8,

@@ -1,10 +1,12 @@
 //! The memory `nerva api` may hold for one request (#31).
 //!
 //! A request's JSON is parsed into the request's arena, and `std.json.Value` costs many times the
-//! body's size for nested or long arrays: a 4 MiB body could take about 0.8 GB. The arena
-//! allocates through this budget, which refuses (as out of memory) any allocation that would take
-//! what it holds past `limit`, and remembers that it did, so the gateway answers 413 rather than
-//! growing. The arena keeps at most `retain_max` between requests.
+//! body's size for nested or long arrays: a 4 MiB body could take about 0.8 GB. A request
+//! allocates through this budget, over its arena: it counts the bytes the request asks for,
+//! refuses (as out of memory) any allocation past `limit`, and remembers that it did, so the
+//! gateway answers 413 rather than growing. It sits above the arena, not below: the arena sizes
+//! each new block from the last one, so below it the budget would count several times what the
+//! request asked for (#60). The arena keeps at most `retain_max` between requests.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -14,15 +16,16 @@ const MemoryBudget = @This();
 
 parent_allocator: std.mem.Allocator,
 limit: usize,
-/// Bytes allocated through the budget and not yet freed.
+/// Bytes the request has allocated through the budget and not freed.
 used: usize = 0,
 /// Whether an allocation was refused since the last `request_start`.
 exceeded: bool = false,
 
 /// What the request arena keeps between requests.
 pub const retain_max = 8 * 1024 * 1024;
-/// The most a request's arena may hold: well above a valid 4 MiB request's needs.
-pub const limit_default = 64 * 1024 * 1024;
+/// The most a request may allocate: the largest valid request, a `documents/get` of 256
+/// documents of 64 KiB, asks for about 100 MB (its rows, chunks, values and hex reply; #60).
+pub const limit_default = 128 * 1024 * 1024;
 
 pub fn init(parent_allocator: std.mem.Allocator, limit: usize) MemoryBudget {
     assert(limit > 0);
@@ -41,8 +44,9 @@ pub fn allocator(self: *MemoryBudget) std.mem.Allocator {
     };
 }
 
-/// Forgets a refusal from an earlier request.
+/// Starts a request: the arena was reset, so everything allocated before is gone.
 pub fn request_start(self: *MemoryBudget) void {
+    self.used = 0;
     self.exceeded = false;
 }
 
@@ -94,19 +98,19 @@ test "MemoryBudget: refuses past its limit, says so, and counts frees" {
     try std.testing.expect(budget.exceeded);
     try std.testing.expectEqual(@as(usize, 600), budget.used);
 
-    budget.request_start();
-    try std.testing.expect(!budget.exceeded);
     gpa.free(a);
     try std.testing.expectEqual(@as(usize, 0), budget.used);
+    budget.request_start();
+    try std.testing.expect(!budget.exceeded);
     const b = try gpa.alloc(u8, 1024);
     gpa.free(b);
     try std.testing.expect(!budget.exceeded);
 }
 
-test "MemoryBudget: a request arena past its budget fails, and keeps at most retain_max" {
-    var budget = MemoryBudget.init(std.testing.allocator, 4 * 1024 * 1024);
-    var arena = std.heap.ArenaAllocator.init(budget.allocator());
+test "MemoryBudget: a request over an arena past its budget fails, and the next fits" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
+    var budget = MemoryBudget.init(arena.allocator(), 4 * 1024 * 1024);
 
     // Deeply nested JSON costs far more than its bytes once parsed.
     const depth = 200_000;
@@ -116,15 +120,16 @@ test "MemoryBudget: a request arena past its budget fails, and keeps at most ret
     @memset(body[depth..], ']');
     try std.testing.expectError(
         error.OutOfMemory,
-        std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), body, .{}),
+        std.json.parseFromSliceLeaky(std.json.Value, budget.allocator(), body, .{}),
     );
     try std.testing.expect(budget.exceeded);
 
     // The arena keeps one buffer of the limit, plus its node's header.
     _ = arena.reset(.{ .retain_with_limit = 64 * 1024 });
-    try std.testing.expect(budget.used <= 64 * 1024 + 64);
+    try std.testing.expect(arena.queryCapacity() <= 64 * 1024);
     budget.request_start();
-    const small = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), "[1]", .{});
+    try std.testing.expectEqual(@as(usize, 0), budget.used);
+    const small = try std.json.parseFromSliceLeaky(std.json.Value, budget.allocator(), "[1]", .{});
     try std.testing.expectEqual(@as(usize, 1), small.array.items.len);
     try std.testing.expect(!budget.exceeded);
 }

@@ -67,12 +67,15 @@ Each release has a CycloneDX 1.5 software bill of materials next to its binaries
   retrying never helped. It now gets `413 views_too_large`: split it. (#32)
 - A large JSON body kept up to 0.8 GB allocated in `nerva api`. A request may use at most
   64 MiB (`413 request too complex` past that), and the gateway keeps at most 8 MiB between
-  requests. (#31)
+  requests. (#31, #60)
+- With `--trace`, a full or failing trace disk panicked the replica, and the trace grew
+  without bound. Trace writes are buffered and bounded now, and a write error stops tracing,
+  not the replica. (#30)
+- One transaction moving the holders of many groups' `min` or `max` to new groups (about 1,600
+  rows) panicked every replica, again on restart. (#62)
 
 ### Known issues
 
-- With `--trace`, a trace write error panics the replica, and the trace grows without bound.
-  (#30)
 - A document holds at most 64 KiB. (#25)
 
 ### Upgrading from v0.3.0

@@ -1,7 +1,7 @@
 //! Fuzzes adds' arithmetic (docs/DECISIONS.md N42, N46): `nerva.add_amount` and `nerva.add_apply`
 //! against a reference written independently from N42's text, plus properties any applied amount
 //! must have, and `entry_validate` on arbitrary add parameters. And pairs on conserved fields
-//! (N74): `nerva.ledger_bounds` with floors, the partner's arithmetic, and conservation.
+//! (N75): `nerva.ledger_bounds` with floors, the partner's arithmetic, and conservation.
 //!
 //! The VOPR model resolves adds with the same `add_amount` as the state machine, so it cannot
 //! catch a mistake in it; this fuzzer is the arithmetic's independent check.
@@ -88,7 +88,7 @@ const PairCounts = struct {
     floor_clamped: u64 = 0,
 };
 
-/// A pair on two conserved i64 fields with random floors (N74): the first half, with its own
+/// A pair on two conserved i64 fields with random floors (N75): the first half, with its own
 /// bounds and maybe `clamp`, then the partner, which moves the negated amount without bounds
 /// or `clamp`. Checks both against the reference with the floors as bounds, and that a pair
 /// either moves one amount (the sum unchanged, no field moved below its floor) or fails whole.
@@ -222,7 +222,7 @@ fn type_max(add: *const Add) i128 {
 /// Whether moving the field from `old` by `magnitude` in `delta`'s direction stays within the
 /// type and does not pass the bound in that direction (N42: "an add never moves the field past
 /// `min` (delta negative) or `max` (positive), nor out of the type's range").
-/// With a `floor` (N74), a move down must not pass it either.
+/// With a `floor` (N75), a move down must not pass it either.
 fn fits(add: *const Add, old: u64, delta: i64, magnitude: u64, floor: ?i64) bool {
     if (magnitude == 0) return true;
     const new = if (delta > 0)

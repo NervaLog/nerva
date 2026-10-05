@@ -105,6 +105,13 @@ pub fn get(arena: std.mem.Allocator, client: anytype, body: []const u8) !Reply {
     try documents_read(arena, client, namespace, request.keys, chunk0s, found);
 
     var out = Writer.init(arena);
+    // Sized up front: grown step by step, the arena would keep every smaller copy (#60).
+    var reply_size: usize = 64;
+    for (found) |*document| {
+        // A key's JSON is at most 6 bytes per byte (`\u00XX`); a value is hex.
+        reply_size += 96 + 6 * document.key.len + 2 * (if (document.value) |v| v.len else 0);
+    }
+    try out.list.ensureTotalCapacity(reply_size);
     try out.raw("{\"op\":");
     try out.number(as_of orelse op_read);
     try out.raw(",\"documents\":[");

@@ -113,7 +113,7 @@ test "format: wire and storage layouts" {
         nerva.Member.Flags,
         nerva.GroupVersion,
         nerva.ViewVersion,
-        // Ledgers (N74): declared over the wire and stored in the ledgers tree.
+        // Ledgers (N75): declared over the wire and stored in the ledgers tree.
         nerva.LedgerField,
         nerva.LedgerField.Flags,
         nerva.LedgerDefinition,
