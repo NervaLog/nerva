@@ -5,6 +5,97 @@ publishes a version's section as its GitHub release notes, and refuses to releas
 without one. Design reasons are in [docs/DECISIONS.md](./docs/DECISIONS.md); the full log of
 work is [WORKLOG.md](./WORKLOG.md).
 
+## v0.3.0 — 2026-10-05
+
+Views that the cluster keeps itself, metrics and traces from replicas, a faster client, and a
+round of gateway fixes. **This release is not compatible with v0.2.0's data files, and its
+replicas must never run in one cluster with v0.2.0 replicas:** see "Upgrading" below.
+
+### New: maintained views
+
+A view whose aggregates are `count` and `sum` is now kept by the state machine inside every
+commit, like the rows. Every replica holds the same groups and the same hash at every op, and
+nothing is rebuilt when a process restarts. Declare it as before; read its groups from
+`nerva api`:
+
+```bash
+curl -X PUT -H 'X-Nerva-Key: secret' http://127.0.0.1:8080/v1/views/revenue -d '{
+  "table": 5, "where": [{"field": "sold", "op": "eq", "value": true}],
+  "group_by": ["section"], "aggregates": [{"fn": "count"}, {"fn": "sum", "field": "price"}]}'
+curl -H 'X-Nerva-Key: secret' 'http://127.0.0.1:8080/v1/views/revenue/groups?limit=100'
+# {"view":"revenue","id":1,"state":"ready","op":"1240","hash":"…","group_count":"8",
+#  "groups":[{"section":4,"count":"369","sum_price":"184590"},…],"more":false,"cursor":null}
+```
+
+- A view declared over existing rows says `"state":"building"` until the cluster has added
+  them, a bounded number per op; then `"ready"`.
+- Groups come a page at a time (`cursor`, `limit`), in storage order.
+- An `add` to a field a maintained view filters or groups by answers `409 view_key_field`.
+- One op touches at most about 4,000 distinct groups; a transaction past that answers
+  `503 views_busy`.
+- `min`, `max` and as-of answers are still served by `nerva view`.
+
+### New: metrics and traces
+
+- `nerva start --statsd=<host:port>` sends the replica's metrics (requests, commits, caches,
+  client round trips) over UDP every 10 seconds, in statsd format with DogStatsD tags.
+- `nerva start --trace=<path>` writes a JSON span trace. The path must be a new file: an
+  existing one is refused (#29).
+- `nerva start --cache-rows=<size>` sizes the row cache.
+- `zig build bench` and `zig build bench:load` measure Nerva's parts and a running cluster.
+
+### Faster
+
+The Zig client, and so `nerva api`, returns as soon as its reply arrives instead of at the end
+of a 10 ms tick. Through `nerva api` on a local three-replica cluster, lookup p50 went from
+10.60 ms to 1.05 ms and commit p50 from 10.53 ms to 0.92 ms.
+
+### Fixed
+
+- A request head ending in a bare LF crashed `nerva api` and `nerva view` before the key was
+  checked. (#8)
+- A slow client stalled a gateway: the timeout was per read, not per request. Gateways now read
+  up to 16 connections at once, with a 10 s deadline per request. (#9)
+- The `X-Nerva-Key` check took time that depended on the key. It is constant-time now. (#10)
+- When all 16 slots were taken by idle connections, a gateway shut everyone else out for
+  minutes, with no key needed. A new connection now displaces the oldest one that is still
+  sending its request. (#28)
+- `GET /v1/views/groups` crashed `nerva api`. It is now `404`, and a view named `groups` reads
+  at `/v1/views/groups/groups`. (#26)
+- After one cluster timeout, `nerva api` answered `503` to every later request, while
+  `/healthz` still said `200`. It now reconnects, and `/healthz` answers `503` until the
+  cluster is reachable again. (#27)
+- `nerva start --trace=<path>` truncated whatever file it named, a data file included. (#29)
+- `documents.Transaction` (Zig) could read a value stitched from two versions when a rewrite
+  landed between its reads. (#7)
+
+### Known issues
+
+- With `--trace`, a trace write error panics the replica, and the trace grows without bound.
+  (#30)
+- A 4 MiB JSON body keeps about 0.8 GB allocated in `nerva api` for the rest of its life. (#31)
+- A transaction touching more view groups than one op allows gets `503 views_busy`, and
+  retrying will never make it succeed. (#32)
+- Any client can send `pulse`, the cluster's internal backfill operation. (#33)
+- Replicas of different releases are not refused at the wire. One formatted by another release
+  joins the cluster and takes part in quorums until the first checkpoint (about 960 ops), then
+  panics with `checkpoint diverged`. Follow the upgrade steps below exactly. (#34)
+
+### Upgrading from v0.2.0
+
+- **Stop every replica before starting any v0.3.0 replica.** v0.3.0 replicas apply commits
+  differently (views), so a cluster mixing the two releases diverges. Nothing refuses a mix
+  yet (#34).
+- **Reformat data files.** Binaries now report `0.0.3+<commit>`. A v0.3.0 replica stops on a
+  v0.2.0 data file with `panic: multiversion unsupported`. Format new files and load your data
+  again.
+- **Clients and gateways can follow.** v0.3.0 replicas still accept v0.2.0 clients, so a v0.2.0
+  `nerva api` keeps committing and reading against a v0.3.0 cluster. It does not have the new
+  routes (`/v1/views/<name>/groups`).
+- Zig client users: new operations `declare_view`, `get_view` (`pulse` is internal), new
+  statuses `view_key_field` and `views_busy`, and `Client.reconnect`. Existing values keep their
+  numbers.
+
 ## v0.2.0 — 2026-10-04
 
 Two new capabilities for applications on `nerva api`, values larger than a row and counters

@@ -107,9 +107,10 @@ publishes binaries for Linux and macOS (x86_64, aarch64) as GitHub release `v<VE
 (`release.yml`), with that version's section of [CHANGELOG.md](./CHANGELOG.md) as the release
 notes; releasing a version twice, or without notes, fails.
 
-Binaries report `<protocol>+<commit>`. The protocol release (`0.0.2` since adds, N43) is what
-replicas, clients and data files check: binaries of different protocol releases do not mix in
-one cluster, and data files formatted by v0.1.0 (protocol `0.0.1`) must be reformatted.
+Binaries report `<protocol>+<commit>`. The protocol release (`0.0.3` since maintained views,
+N58) is what data files and clients check: a replica refuses a data file of another release, so
+upgrading means reformatting, and accepts clients from `0.0.2` on. Replicas do not yet refuse
+peers of another release (#34): stop every replica before starting the new release.
 
 ## Running a cluster
 

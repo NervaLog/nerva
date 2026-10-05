@@ -9,7 +9,7 @@ const VoprStateMachine = enum { nerva, testing };
 const VoprLog = enum { short, full };
 
 // Nerva has no client releases yet; every build is "the" release.
-const release = "0.0.2";
+const release = "0.0.3";
 const release_client_min = "0.0.2";
 
 const zig_version = std.SemanticVersion{
