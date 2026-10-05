@@ -64,8 +64,10 @@ of a 10 ms tick. Through `nerva api` on a local three-replica cluster, lookup p5
   at `/v1/views/groups/groups`. (#26)
 - After one cluster timeout, `nerva api` answered `503` to every later request, while
   `/healthz` still said `200`. It now reconnects, and `/healthz` answers `503` until the
-  cluster is reachable again. (#27)
+  cluster is reachable again. (#27, #37)
 - `nerva start --trace=<path>` truncated whatever file it named, a data file included. (#29)
+- A JSON body with newlines (`curl -d` with a multi-line body, as in the examples above) was
+  refused with `400 malformed request` when it arrived in the same read as its head. (#36)
 - `documents.Transaction` (Zig) could read a value stitched from two versions when a rewrite
   landed between its reads. (#7)
 

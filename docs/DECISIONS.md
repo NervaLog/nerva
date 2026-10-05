@@ -683,4 +683,4 @@ cluster. Measured on what the bump does and does not do:
   every replica before upgrading.
 - The golden checksum of a formatted data file did not change: only the development release
   `0.0.1` writes a different superblock (N43).
-v0.3.0's notes list #30–#34 as known issues; #38's fixes (#26–#29) ship in it.
+v0.3.0's notes list #30–#34 as known issues; #38's fixes (#26–#29, #36) ship in it.

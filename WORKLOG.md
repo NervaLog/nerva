@@ -424,8 +424,8 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
 ## 2026-10-05 — Release v0.3.0 (N58)
 
 - `build.zig`: release `0.0.3`, clients from `0.0.2`. `CHANGELOG.md`: the v0.3.0 section
-  (maintained views, metrics and traces, the faster client, #7–#10 and #26–#29 fixed, #30–#34
-  known, upgrade steps). `VERSION` 0.3.0.
+  (maintained views, metrics and traces, the faster client; #7–#10, #26–#29 and #36 fixed;
+  #30–#34 known; upgrade steps). `VERSION` 0.3.0.
 - Measured, with the v0.2.0 binary and a `0.0.3` build: a v0.2.0 `nerva api` commits and reads
   against a `0.0.3` cluster; a `0.0.3` replica refuses a `0.0.2` data file
   (`multiversion unsupported`); a mixed cluster runs until the `0.0.3` replica panics with
