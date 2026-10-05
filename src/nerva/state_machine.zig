@@ -640,7 +640,9 @@ pub fn StateMachineType(comptime Storage: type) type {
             errdefer self.members_touched.deinit(allocator);
             try self.members_scratch.ensureTotalCapacity(allocator, members_limit);
             errdefer self.members_scratch.deinit(allocator);
-            try self.extremes_scratch.ensureTotalCapacity(allocator, members_limit);
+            // A member may touch two (group, slot) keys: the group it leaves, when it held that
+            // group's value, and the group it enters (`extremes_gather`, #62).
+            try self.extremes_scratch.ensureTotalCapacity(allocator, 2 * members_limit);
             errdefer self.extremes_scratch.deinit(allocator);
             try self.extreme_scans.ensureTotalCapacity(allocator, members_limit);
             errdefer self.extreme_scans.deinit(allocator);

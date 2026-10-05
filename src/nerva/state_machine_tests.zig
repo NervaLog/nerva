@@ -1517,3 +1517,79 @@ test "views: min and max stay exact as the rows holding them leave, and read as 
     // While it was building, it was.
     try testing.expectEqual(nerva.ViewState.building, (try view_groups_read(context, 1, op_before)).state);
 }
+
+test "views: one op moving every min and max holder it admits to new groups (#62)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const context = try context_init(&arena);
+
+    // Grouped by a u64 key, with four `min`/`max` slots (the most a table takes).
+    const a: nerva.FieldRef = .{ .offset = 8, .size = 8, .kind = .unsigned };
+    const b: nerva.FieldRef = .{ .offset = 16, .size = 8, .kind = .unsigned };
+    var definition = std.mem.zeroes(nerva.ViewDefinition);
+    @memcpy(definition.name[0..5], "moves");
+    definition.table = 8;
+    definition.group_by_count = 1;
+    definition.group_by[0] = .{ .offset = 0, .size = 8, .kind = .unsigned };
+    definition.aggregate_count = 5;
+    definition.aggregates[0] = .{ .function = .count, .field = std.mem.zeroes(nerva.FieldRef) };
+    definition.aggregates[1] = .{ .function = .min, .field = a };
+    definition.aggregates[2] = .{ .function = .max, .field = a };
+    definition.aggregates[3] = .{ .function = .min, .field = b };
+    definition.aggregates[4] = .{ .function = .max, .field = b };
+    const declared = try context.declare(definition);
+    try testing.expectEqual(nerva.DeclareStatus.created, declared.status);
+    _ = context.pulse_until_ready();
+
+    // Each row alone in its group, so it holds all four slots. Moving them all in one
+    // transaction admits 4 members per row (the op's member limit), and touches each slot of
+    // the group it leaves and of the group it enters: twice as many as members.
+    const rows = context.state_machine.member_writes_limit / 4;
+    try testing.expect(2 * rows <= context.state_machine.group_writes_limit);
+    const entries = try allocator.alloc(Entry, rows);
+    for ([_]u64{ 0, rows }, 0..) |group_base, round| {
+        for (entries, 0..) |*entry, index| {
+            entry.* = put(8, index + 1, 0);
+            std.mem.writeInt(u64, entry.value[0..8], group_base + index, .little);
+            std.mem.writeInt(u64, entry.value[8..16], 1000 * round + index, .little);
+            std.mem.writeInt(u64, entry.value[16..24], 7 * index, .little);
+        }
+        for ((try context.commit(&.{entries}))[0]) |result| {
+            try testing.expectEqual(nerva.EntryStatus.ok, result.status);
+        }
+    }
+
+    // Every row is in its new group, holding its slots; the old groups are gone.
+    var seen: u64 = 0;
+    var cursor: u64 = 0;
+    while (true) {
+        const records = try context.view(.{
+            .view_id = declared.view_id,
+            .group_hash_min = cursor,
+            .as_of = 0,
+            .limit = 256,
+        });
+        const header = records[0];
+        try testing.expectEqual(nerva.ViewState.ready, header.state);
+        for (records[1..]) |*record| {
+            const group = std.mem.readInt(u64, record.group_key[0..8], .little);
+            try testing.expect(group >= rows and group < 2 * rows);
+            const index = group - rows;
+            try testing.expectEqual(@as(u64, 1), record.count);
+            const sum = struct {
+                fn at(r: *const nerva.ViewRecord, slot: usize) i128 {
+                    return std.mem.readInt(i128, &r.sums[slot], .little);
+                }
+            }.at;
+            try testing.expectEqual(@as(i128, 1000 + index), sum(record, 1));
+            try testing.expectEqual(@as(i128, 1000 + index), sum(record, 2));
+            try testing.expectEqual(@as(i128, 7 * index), sum(record, 3));
+            try testing.expectEqual(@as(i128, 7 * index), sum(record, 4));
+            seen += 1;
+        }
+        if (!header.flags.more) break;
+        cursor = header.cursor;
+    }
+    try testing.expectEqual(rows, seen);
+}
