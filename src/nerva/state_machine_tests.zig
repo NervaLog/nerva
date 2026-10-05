@@ -175,6 +175,48 @@ const Context = struct {
         return results[0];
     }
 
+    fn declare(context: *Context, definition: nerva.ViewDefinition) !nerva.DeclareResult {
+        const results = try context.execute(.declare_view, &.{&.{definition}});
+        assert(results[0].len == 1);
+        return results[0][0];
+    }
+
+    /// The header, then the page's groups.
+    fn view(context: *Context, query: nerva.ViewQuery) ![]const nerva.ViewRecord {
+        const results = try context.execute(.get_view, &.{&.{query}});
+        return results[0];
+    }
+
+    /// A `pulse`, as the replica sends it to itself: no body, no reply.
+    fn pulse(context: *Context) void {
+        const state_machine = &context.state_machine;
+        const body = context.request[0..0];
+        assert(state_machine.input_valid(.pulse, body));
+        state_machine.prepare(.pulse, body);
+        if (state_machine.prepare_timestamp == state_machine.commit_timestamp) {
+            state_machine.prepare_timestamp += 1;
+        }
+        const timestamp = state_machine.prepare_timestamp;
+        context.prefetching = true;
+        state_machine.prefetch_timestamp = timestamp;
+        state_machine.prefetch(prefetch_callback, context.op, context.op, .pulse, body);
+        while (context.prefetching) context.storage.run();
+        const reply_size = state_machine.commit(1, context.op, timestamp, .pulse, body, context.reply);
+        assert(reply_size == 0);
+        state_machine.commit_timestamp = timestamp;
+        context.op += 1;
+    }
+
+    /// Pulses until no view is building; returns the number of pulses.
+    fn pulse_until_ready(context: *Context) u32 {
+        var pulses: u32 = 0;
+        while (context.state_machine.pulse_needed(0)) : (pulses += 1) {
+            assert(pulses < 10_000);
+            context.pulse();
+        }
+        return pulses;
+    }
+
     fn history(context: *Context, filter: nerva.HistoryFilter) ![]const Change {
         const results = try context.execute(.get_history, &.{&.{filter}});
         return results[0];
@@ -722,8 +764,264 @@ test "add: absent rows, mixed writes and invalid references are refused" {
     try testing.expectEqual(@as(u64, 1), field(try context.lookup(1, 2), 0));
 }
 
+// ---- Views maintained in the state machine (N52) ----
+
+const views = @import("views.zig");
+
+/// Seats in table 5: `section` u8 at 0, `price` u64 at 8, `sold` bool at 16. The view: sold seats
+/// by section, counted, with the sum of their prices.
+fn revenue_view(name: []const u8) nerva.ViewDefinition {
+    var definition = std.mem.zeroes(nerva.ViewDefinition);
+    @memcpy(definition.name[0..name.len], name);
+    definition.table = 5;
+    definition.where_count = 1;
+    definition.where[0] = .{
+        .field = .{ .offset = 16, .size = 1, .kind = .boolean },
+        .comparison = .eq,
+        .value = std.mem.toBytes(std.mem.nativeToLittle(i128, 1)),
+    };
+    definition.group_by_count = 1;
+    definition.group_by[0] = .{ .offset = 0, .size = 1, .kind = .unsigned };
+    definition.aggregate_count = 2;
+    definition.aggregates[0] = .{ .function = .count, .field = std.mem.zeroes(nerva.FieldRef) };
+    definition.aggregates[1] = .{
+        .function = .sum,
+        .field = .{ .offset = 8, .size = 8, .kind = .unsigned },
+    };
+    return definition;
+}
+
+fn seat(id: u64, section: u8, price: u64, sold: bool) Entry {
+    var entry = put(5, id, 0);
+    entry.value = @splat(0);
+    entry.value[0] = section;
+    std.mem.writeInt(u64, entry.value[8..16], price, .little);
+    entry.value[16] = @intFromBool(sold);
+    return entry;
+}
+
+/// Every page of a view's groups, by section: count and price sum. Checks the header against
+/// the groups it lists (the hash and the group count).
+fn view_sections(context: *Context, view_id: u64) !struct {
+    state: nerva.ViewState,
+    count: [8]u64,
+    sum: [8]i128,
+} {
+    var count: [8]u64 = @splat(0);
+    var sum: [8]i128 = @splat(0);
+    var hash: [32]u8 = @splat(0);
+    var groups: u64 = 0;
+    var cursor: u64 = 0;
+    var header_last: nerva.ViewRecord = undefined;
+    while (true) {
+        const records = try context.view(.{ .view_id = view_id, .group_hash_min = cursor, .limit = 2 });
+        const header = records[0];
+        try testing.expectEqual(nerva.ViewRecord.Kind.header, header.kind);
+        header_last = header;
+        for (records[1..]) |*record| {
+            try testing.expectEqual(nerva.ViewRecord.Kind.group, record.kind);
+            try testing.expect(record.count > 0);
+            const section = record.group_key[0];
+            count[section] += record.count;
+            sum[section] += std.mem.readInt(i128, &record.sums[1], .little);
+            var group = std.mem.zeroes(nerva.Group);
+            group.count = record.count;
+            group.group_key = record.group_key;
+            group.sums = record.sums;
+            views.hash_update(&hash, &views.group_digest(view_id, &group), .add);
+            groups += 1;
+        }
+        if (!header.flags.more) break;
+        cursor = header.cursor;
+    }
+    // The replicated hash and group count agree with the groups listed.
+    try testing.expectEqual(header_last.hash, hash);
+    try testing.expectEqual(header_last.group_count, groups);
+    return .{ .state = header_last.state, .count = count, .sum = sum };
+}
+
+test "views: declared on an empty table, then kept exact by every commit" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const context = try context_init(&arena);
+
+    const declared = try context.declare(revenue_view("revenue"));
+    try testing.expectEqual(nerva.DeclareStatus.created, declared.status);
+    try testing.expectEqual(@as(u64, 1), declared.view_id);
+    try testing.expectEqual(@as(u32, 1), context.pulse_until_ready());
+    try testing.expectEqual(nerva.ViewState.ready, (try view_sections(context, 1)).state);
+
+    // Two transactions in one request, then a move between sections, an unsold seat, a delete.
+    _ = try context.commit(&.{
+        &.{ seat(1, 1, 100, true), seat(2, 1, 50, true) },
+        &.{ seat(3, 2, 70, true), seat(4, 2, 10, false) },
+    });
+    var sections = try view_sections(context, 1);
+    try testing.expectEqual(@as(u64, 2), sections.count[1]);
+    try testing.expectEqual(@as(i128, 150), sections.sum[1]);
+    try testing.expectEqual(@as(u64, 1), sections.count[2]);
+
+    _ = try context.commit(&.{&.{ seat(2, 2, 55, true), seat(4, 2, 10, true), delete(5, 3) }});
+    sections = try view_sections(context, 1);
+    try testing.expectEqual(@as(u64, 1), sections.count[1]);
+    try testing.expectEqual(@as(i128, 100), sections.sum[1]);
+    try testing.expectEqual(@as(u64, 2), sections.count[2]);
+    try testing.expectEqual(@as(i128, 65), sections.sum[2]);
+
+    // A stale transaction applies nothing to the view either.
+    _ = try context.commit(&.{&.{ read(5, 1, 1), seat(1, 3, 999, true) }});
+    try testing.expectEqual(sections, try view_sections(context, 1));
+
+    // Emptying a group removes it from the listing, and from the hash.
+    _ = try context.commit(&.{&.{delete(5, 1)}});
+    sections = try view_sections(context, 1);
+    try testing.expectEqual(@as(u64, 0), sections.count[1]);
+}
+
+test "views: a view over existing rows backfills in pulses, writes on both sides of the cursor" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const context = try context_init(&arena);
+    const limit = context.state_machine.group_writes_limit;
+
+    // More rows than one pulse adds, so that the build takes several pulses.
+    const rows_count = 3 * limit + 1;
+    var expected_count: [8]u64 = @splat(0);
+    var expected_sum: [8]i128 = @splat(0);
+    for (0..rows_count) |id| {
+        const section: u8 = @intCast(id % 3);
+        _ = try context.commit(&.{&.{seat(id, section, id, true)}});
+        expected_count[section] += 1;
+        expected_sum[section] += id;
+    }
+
+    try testing.expectEqual(nerva.DeclareStatus.created, (try context.declare(revenue_view("v"))).status);
+    try testing.expectEqual(nerva.ViewState.building, (try view_sections(context, 1)).state);
+    context.pulse();
+    // One pulse in: rewrite a row behind the cursor and one ahead of it, and add a new one.
+    _ = try context.commit(&.{&.{ seat(0, 4, 1000, true), seat(rows_count - 1, 5, 7, true) }});
+    expected_count[0] -= 1;
+    expected_sum[0] -= 0;
+    expected_count[4] += 1;
+    expected_sum[4] += 1000;
+    const last_section: u8 = @intCast((rows_count - 1) % 3);
+    expected_count[last_section] -= 1;
+    expected_sum[last_section] -= rows_count - 1;
+    expected_count[5] += 1;
+    expected_sum[5] += 7;
+
+    try testing.expect(context.pulse_until_ready() >= 2);
+    const sections = try view_sections(context, 1);
+    try testing.expectEqual(nerva.ViewState.ready, sections.state);
+    try testing.expectEqual(expected_count, sections.count);
+    try testing.expectEqual(expected_sum, sections.sum);
+}
+
+test "views: declarations, adds and transactions over the op's groups are refused" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const context = try context_init(&arena);
+
+    try testing.expectEqual(nerva.DeclareStatus.created, (try context.declare(revenue_view("a"))).status);
+    const again = try context.declare(revenue_view("a"));
+    try testing.expectEqual(nerva.DeclareStatus.exists, again.status);
+    try testing.expectEqual(@as(u64, 1), again.view_id);
+    var different = revenue_view("a");
+    different.where_count = 0;
+    different.where[0] = std.mem.zeroes(nerva.Where);
+    try testing.expectEqual(nerva.DeclareStatus.different, (try context.declare(different)).status);
+    var with_max = revenue_view("b");
+    with_max.aggregates[1].function = .max;
+    try testing.expectEqual(nerva.DeclareStatus.unsupported, (try context.declare(with_max)).status);
+    var reserved = revenue_view("c");
+    reserved.table = 0xFFFF_0001;
+    try testing.expectEqual(nerva.DeclareStatus.table_invalid, (try context.declare(reserved)).status);
+    for ([_][]const u8{ "b", "c", "d" }) |name| {
+        try testing.expectEqual(nerva.DeclareStatus.created, (try context.declare(revenue_view(name))).status);
+    }
+    try testing.expectEqual(nerva.DeclareStatus.table_views_full, (try context.declare(revenue_view("e"))).status);
+    _ = context.pulse_until_ready();
+
+    // Adds may change a summed field, not a filtered or grouped one.
+    _ = try context.commit(&.{&.{seat(1, 1, 100, true)}});
+    const price_add = add(5, 1, 8, 5, .{});
+    try expect_statuses((try context.commit(&.{&.{price_add}}))[0], &.{.ok});
+    try testing.expectEqual(@as(i128, 105), (try view_sections(context, 1)).sum[1]);
+    try expect_statuses((try context.commit(&.{&.{add(5, 1, 0, 1, .{})}}))[0], &.{.view_key_field});
+    try expect_statuses((try context.commit(&.{&.{add(5, 1, 12, 1, .{})}}))[0], &.{.view_key_field});
+
+    // Admission counts the op's distinct groups, not its writes: writes to groups already
+    // counted are free, so any number of them fit.
+    const limit = context.state_machine.group_writes_limit;
+    const same_group = try arena.allocator().alloc(Entry, limit + 1);
+    for (same_group, 0..) |*entry, index| entry.* = seat(100 + index, 2, 1, true);
+    for ((try context.commit(&.{same_group}))[0]) |result| {
+        try testing.expectEqual(nerva.EntryStatus.ok, result.status);
+    }
+    try testing.expectEqual(@as(u64, limit + 1), (try view_sections(context, 1)).count[2]);
+
+    // A view on table 6 grouped by price: every price is a group of its own. A transaction
+    // that does not fit is refused whole, while others in the same op are admitted in order:
+    // one that fits exactly, one whose groups are all counted already, and a small one.
+    var by_price = revenue_view("p");
+    by_price.table = 6;
+    by_price.group_by[0] = .{ .offset = 8, .size = 8, .kind = .unsigned };
+    try testing.expectEqual(nerva.DeclareStatus.created, (try context.declare(by_price)).status);
+    _ = context.pulse_until_ready();
+    const priced = struct {
+        fn entries(allocator: std.mem.Allocator, count: usize, price_base: u64) ![]Entry {
+            const result = try allocator.alloc(Entry, count);
+            for (result, 0..) |*entry, index| {
+                entry.* = seat(price_base + index, 1, price_base + index, true);
+                entry.table = 6;
+            }
+            return result;
+        }
+    }.entries;
+    const allocator = arena.allocator();
+    const too_many = try priced(allocator, limit + 1, 1_000_000);
+    const small = try priced(allocator, 1, 4_000_000);
+    const refused = try context.commit(&.{ too_many, small });
+    try testing.expectEqual(nerva.EntryStatus.views_busy, refused[0][0].status);
+    for (refused[0][1..]) |result| try testing.expectEqual(nerva.EntryStatus.aborted, result.status);
+    try testing.expectEqual(nerva.EntryStatus.ok, refused[1][0].status);
+
+    const fits = try priced(allocator, limit, 2_000_000);
+    const counted = try priced(allocator, 1, 2_000_000 + limit - 1);
+    counted[0].id = 3_000_000; // Another row, in a group the op counted already.
+    const over = try priced(allocator, 1, 5_000_000);
+    const results = try context.commit(&.{ fits, counted, over });
+    for (results[0]) |result| try testing.expectEqual(nerva.EntryStatus.ok, result.status);
+    try testing.expectEqual(nerva.EntryStatus.ok, results[1][0].status);
+    try testing.expectEqual(nerva.EntryStatus.views_busy, results[2][0].status);
+}
+
+test "views: reads page through the groups, and say when a view is missing" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const context = try context_init(&arena);
+
+    _ = try context.declare(revenue_view("v"));
+    _ = context.pulse_until_ready();
+    for (0..6) |section| _ = try context.commit(&.{&.{seat(section, @intCast(section), 1, true)}});
+
+    const first = try context.view(.{ .view_id = 1, .group_hash_min = 0, .limit = 4 });
+    try testing.expect(first[0].flags.more);
+    try testing.expectEqual(@as(usize, 5), first.len);
+    try testing.expectEqual(@as(u64, 6), first[0].group_count);
+    const rest = try context.view(.{ .view_id = 1, .group_hash_min = first[0].cursor, .limit = 4 });
+    try testing.expect(!rest[0].flags.more);
+    try testing.expectEqual(@as(usize, 3), rest.len);
+    // Pages follow storage order, without overlap.
+    try testing.expect(first[4].group_hash < rest[1].group_hash);
+
+    const missing = try context.view(.{ .view_id = 2, .group_hash_min = 0, .limit = 4 });
+    try testing.expectEqual(@as(usize, 1), missing.len);
+    try testing.expectEqual(nerva.ViewState.missing, missing[0].state);
+}
+
 test "format: what a fixed script commits" {
-    // A format guard (N51): every result, row and change a fixed script produces, summarized and
+    // A format guard (N54): every result, row and change a fixed script produces, summarized and
     // checksummed. A change to what the state machine stores (ops, timestamps, tombstones, add
     // results, change values) fails here; a meant one updates the snapshot and says why.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -836,20 +1134,20 @@ test "format: what a fixed script commits" {
         \\row 1/3: exists=true op=3 op_read=7 value[0..24]=0000000000000000fbffffffffffffff6400000000000000
         \\row 1/4: exists=false op=0 op_read=8 value[0..24]=000000000000000000000000000000000000000000000000
         \\change: put 1/1 op=1 timestamp=1 more=false
-        \\change: put 1/2 op=1 timestamp=2 more=false
-        \\change: put 1/3 op=1 timestamp=3 more=false
-        \\change: put 1/3 op=1 timestamp=4 more=false
-        \\change: delete 1/2 op=2 timestamp=5 more=false
-        \\change: put 1/1 op=2 timestamp=7 more=false
-        \\change: put 1/2 op=3 timestamp=8 more=false
-        \\change: put 1/3 op=3 timestamp=9 more=false
-        \\change: put 1/3 op=3 timestamp=10 more=false
-        \\change: end 0/0 op=9 timestamp=11 more=false
-        \\history 1/2: put op=3 timestamp=8
-        \\history 1/2: delete op=2 timestamp=5
-        \\history 1/2: put op=1 timestamp=2
+        \\change: put 1/2 op=1 timestamp=6 more=false
+        \\change: put 1/3 op=1 timestamp=11 more=false
+        \\change: put 1/3 op=1 timestamp=16 more=false
+        \\change: delete 1/2 op=2 timestamp=21 more=false
+        \\change: put 1/1 op=2 timestamp=31 more=false
+        \\change: put 1/2 op=3 timestamp=36 more=false
+        \\change: put 1/3 op=3 timestamp=41 more=false
+        \\change: put 1/3 op=3 timestamp=46 more=false
+        \\change: end 0/0 op=9 timestamp=47 more=false
+        \\history 1/2: put op=3 timestamp=36
+        \\history 1/2: delete op=2 timestamp=21
+        \\history 1/2: put op=1 timestamp=6
         \\history 1/2: end op=10 timestamp=0
-        \\checksum: fe42e6a1c001fed7e514f8c26ad02bef
+        \\checksum: 1da1fb8303b359f4e064856cfe0b241f
         \\
     ).diff(summary.items);
 }

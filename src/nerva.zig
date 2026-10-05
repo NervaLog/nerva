@@ -31,6 +31,16 @@ pub const tree_ids = struct {
         // `row_key(table, id)`: a row's history, in timestamp order (`get_history`).
         .row_key = 4,
     };
+
+    pub const View = .{
+        .timestamp = 5,
+        .id = 6,
+    };
+
+    pub const Group = .{
+        .timestamp = 7,
+        .key = 8,
+    };
 };
 
 /// The LSM key of a row: `table` in the high 64 bits, `id` in the low 64 bits.
@@ -116,6 +126,12 @@ pub const EntryStatus = enum(u32) {
     field_invalid = 11,
     /// An add's `delta_from` does not name an earlier add of the same transaction.
     delta_from_invalid = 12,
+    /// An add to a field that a view on its table filters or groups by (N52): adds must not
+    /// move a row between a view's groups.
+    view_key_field = 13,
+    /// This op's budget of view group writes (`StateMachine.groups_per_op_max`) is spent:
+    /// nothing applied, retry in a later op (N52).
+    views_busy = 14,
 };
 
 /// The `commit` result, one per entry.
@@ -229,6 +245,241 @@ pub const RowValue = extern struct {
     }
 };
 
+// ---- Views maintained in the state machine (docs/DECISIONS.md N52) ----
+
+/// Views, cluster-wide. View ids are 1..views_max, in declaration order.
+pub const views_max = 64;
+/// Views over one table.
+pub const views_per_table_max = 4;
+/// The bytes of a view's group_by fields, concatenated.
+pub const group_key_size_max = 64;
+// The budget of group writes per op, and the rows a pulse backfills, depend on the message
+// size: `StateMachine.groups_per_op_max`.
+
+pub const view_where_max = 4;
+pub const view_group_by_max = 3;
+pub const view_aggregates_max = 6;
+
+pub const FieldKind = enum(u8) {
+    /// Little-endian, 1, 2, 4 or 8 bytes.
+    unsigned = 1,
+    /// Little-endian two's complement, 8 bytes.
+    signed = 2,
+    /// One byte, 0 or 1.
+    boolean = 3,
+    /// Raw bytes, 1..80; may be grouped by, not compared or aggregated.
+    bytes = 4,
+    _,
+};
+
+/// A field of a row's value, resolved from the table's layout by the gateway.
+pub const FieldRef = extern struct {
+    offset: u8,
+    size: u8,
+    kind: FieldKind,
+    reserved: u8 = 0,
+
+    comptime {
+        assert(@sizeOf(FieldRef) == 4);
+        assert(stdx.no_padding(FieldRef));
+    }
+};
+
+pub const Comparison = enum(u8) { eq = 1, ne = 2, lt = 3, le = 4, gt = 5, ge = 6, _ };
+
+pub const AggregateFunction = enum(u8) { count = 1, sum = 2, min = 3, max = 4, _ };
+
+pub const Where = extern struct {
+    field: FieldRef,
+    comparison: Comparison,
+    reserved: [11]u8 = @splat(0),
+    /// i128, little-endian.
+    value: [16]u8,
+
+    comptime {
+        assert(@sizeOf(Where) == 32);
+        assert(stdx.no_padding(Where));
+    }
+};
+
+pub const AggregateRef = extern struct {
+    function: AggregateFunction,
+    reserved: [3]u8 = @splat(0),
+    /// All zero for `count`.
+    field: FieldRef,
+
+    comptime {
+        assert(@sizeOf(AggregateRef) == 8);
+        assert(stdx.no_padding(AggregateRef));
+    }
+};
+
+/// The `declare_view` event. A view is immutable once declared.
+pub const ViewDefinition = extern struct {
+    /// The catalog name rules (`catalog.zig`), zero-padded.
+    name: [32]u8,
+    table: u32,
+    where_count: u8,
+    group_by_count: u8,
+    aggregate_count: u8,
+    reserved_a: u8 = 0,
+    /// Unused slots are all zero.
+    where: [view_where_max]Where,
+    group_by: [view_group_by_max]FieldRef,
+    aggregates: [view_aggregates_max]AggregateRef,
+    reserved_b: [28]u8 = @splat(0),
+
+    comptime {
+        assert(@sizeOf(ViewDefinition) == 256);
+        assert(stdx.no_padding(ViewDefinition));
+    }
+};
+
+pub const DeclareStatus = enum(u32) {
+    /// Declared now; `View.state` says whether it is still building.
+    created = 1,
+    /// Already declared with this definition (the result names it).
+    exists = 2,
+    /// The name is declared with another definition.
+    different = 3,
+    /// The definition breaks a static rule (`views.definition_validate`).
+    invalid = 4,
+    /// The table is zero or reserved.
+    table_invalid = 5,
+    views_full = 6,
+    table_views_full = 7,
+    /// `min` or `max` (maintained from a later change, N52).
+    unsupported = 8,
+};
+
+/// The `declare_view` result.
+pub const DeclareResult = extern struct {
+    status: DeclareStatus,
+    reserved_a: u32 = 0,
+    /// `created` and `exists`: the view's id. Otherwise zero.
+    view_id: u64,
+    /// `created`: this op. `exists`: the op it was declared at. Otherwise zero.
+    op: u64,
+    reserved_b: u64 = 0,
+
+    comptime {
+        assert(@sizeOf(DeclareResult) == 32);
+        assert(stdx.no_padding(DeclareResult));
+    }
+};
+
+pub const ViewState = enum(u8) {
+    /// Answers for `get_view` of an id never declared.
+    missing = 0,
+    /// Rows written before the declaration are still being added (by pulses).
+    building = 1,
+    ready = 2,
+    /// Two group keys hashed alike; the view stops being maintained (N52).
+    failed = 3,
+};
+
+/// A view as the forest stores it.
+pub const View = extern struct {
+    id: u64,
+    timestamp: u64,
+    declared_op: u64,
+    /// While building: rows with a smaller id are already in the groups.
+    backfill_cursor: u64,
+    /// Groups with a count above zero.
+    group_count: u64,
+    state: ViewState,
+    reserved_a: [7]u8 = @splat(0),
+    /// The sum, modulo 2^256 (little-endian), of the digests of the non-empty groups.
+    hash: [32]u8,
+    definition: ViewDefinition,
+    reserved_b: [176]u8 = @splat(0),
+
+    comptime {
+        assert(@sizeOf(View) == 512);
+        assert(stdx.no_padding(View));
+    }
+};
+
+/// A group of a view as the forest stores it. Never removed: a group whose count falls to zero
+/// is kept, empty, so that its history stays readable.
+pub const Group = extern struct {
+    /// `view_id << 64 | group_hash`.
+    key: u128,
+    timestamp: u64,
+    count: u64,
+    /// The group_by fields' bytes, then zeros; compared on every update (a hash collision fails
+    /// the view).
+    group_key: [group_key_size_max]u8,
+    /// Per aggregate slot: an i128 sum, little-endian (zero for `count`).
+    sums: [view_aggregates_max][16]u8,
+    reserved: [64]u8 = @splat(0),
+
+    comptime {
+        assert(@sizeOf(Group) == 256);
+        assert(stdx.no_padding(Group));
+    }
+};
+
+/// The `get_view` event: the latest state of one view, and a page of its groups in storage
+/// order (by group hash).
+pub const ViewQuery = extern struct {
+    /// The view, by id; or zero, and the view by `name`.
+    view_id: u64,
+    /// Groups with `group_hash >= group_hash_min`. Zero: from the first.
+    group_hash_min: u64,
+    /// Groups per page, at most; zero is invalid.
+    limit: u32,
+    /// With `view_id` zero: the view's name, zero-padded. Otherwise all zero.
+    name: [32]u8 = @splat(0),
+    reserved: [12]u8 = @splat(0),
+
+    comptime {
+        assert(@sizeOf(ViewQuery) == 64);
+        assert(stdx.no_padding(ViewQuery));
+    }
+};
+
+/// The `get_view` result: a header record, then the page's groups.
+pub const ViewRecord = extern struct {
+    kind: Kind,
+    /// Header only.
+    state: ViewState,
+    flags: Flags,
+    reserved_a: [5]u8 = @splat(0),
+    view_id: u64,
+    /// Header: the op the read executed at.
+    op: u64,
+    /// Header: the op the view was declared at.
+    declared_op: u64,
+    /// Header: groups with a count above zero.
+    group_count: u64,
+    /// Header, with `flags.more`: the next page's `group_hash_min`.
+    cursor: u64,
+    /// Group only.
+    group_hash: u64,
+    /// Group only.
+    count: u64,
+    /// Header: the view's hash.
+    hash: [32]u8,
+    /// Group only.
+    group_key: [group_key_size_max]u8,
+    /// Group only.
+    sums: [view_aggregates_max][16]u8,
+
+    pub const Kind = enum(u8) { header = 1, group = 2 };
+
+    pub const Flags = packed struct(u8) {
+        /// Header: groups remain after this page.
+        more: bool = false,
+        padding: u7 = 0,
+    };
+
+    comptime {
+        assert(@sizeOf(ViewRecord) == 256);
+        assert(stdx.no_padding(ViewRecord));
+    }
+};
+
 /// The `get_changes` event.
 pub const ChangesFilter = extern struct {
     /// Return changes with `timestamp >= timestamp_min`. Zero means from the beginning.
@@ -309,6 +560,12 @@ pub const Operation = enum(u8) {
     commit = constants.vsr_operations_reserved + 1,
     get_changes = constants.vsr_operations_reserved + 2,
     get_history = constants.vsr_operations_reserved + 3,
+    /// A view's latest state and a page of its groups (N52).
+    get_view = constants.vsr_operations_reserved + 4,
+    /// Declares a view, maintained from then on in every commit (N52).
+    declare_view = constants.vsr_operations_reserved + 5,
+    /// `vsr.Operation.pulse`, mapped: backfills building views (N52).
+    pulse = constants.vsr_operations_reserved + 6,
 
     pub fn EventType(comptime operation: Operation) type {
         return switch (operation) {
@@ -316,6 +573,9 @@ pub const Operation = enum(u8) {
             .commit => Entry,
             .get_changes => ChangesFilter,
             .get_history => HistoryFilter,
+            .get_view => ViewQuery,
+            .declare_view => ViewDefinition,
+            .pulse => void,
         };
     }
 
@@ -324,6 +584,9 @@ pub const Operation = enum(u8) {
             .lookup_rows => RowValue,
             .commit => EntryResult,
             .get_changes, .get_history => Change,
+            .get_view => ViewRecord,
+            .declare_view => DeclareResult,
+            .pulse => void,
         };
     }
 
@@ -343,7 +606,7 @@ pub const Operation = enum(u8) {
     pub inline fn is_batchable(operation: Operation) bool {
         return switch (operation) {
             .lookup_rows, .commit => true,
-            .get_changes, .get_history => false,
+            .get_changes, .get_history, .get_view, .declare_view, .pulse => false,
         };
     }
 
@@ -351,7 +614,7 @@ pub const Operation = enum(u8) {
     pub inline fn is_multi_batch(operation: Operation) bool {
         return switch (operation) {
             .lookup_rows, .commit => true,
-            .get_changes, .get_history => false,
+            .get_changes, .get_history, .get_view, .declare_view, .pulse => false,
         };
     }
 
@@ -382,15 +645,27 @@ pub const Operation = enum(u8) {
                     operation.result_max(constants.message_body_size_max),
                 );
             },
+            .get_view => count: {
+                const query = std.mem.bytesAsValue(ViewQuery, batch[0..@sizeOf(ViewQuery)]);
+                // +1 for the header.
+                break :count @min(
+                    query.limit +| 1,
+                    operation.result_max(constants.message_body_size_max),
+                );
+            },
+            .declare_view => 1,
+            .pulse => 0,
         };
     }
 
     pub fn from_vsr(operation: vsr.Operation) ?Operation {
+        if (operation == .pulse) return .pulse;
         if (operation.vsr_reserved()) return null;
         return vsr.Operation.to(Operation, operation);
     }
 
     pub fn to_vsr(operation: Operation) vsr.Operation {
+        if (operation == .pulse) return .pulse;
         return vsr.Operation.from(Operation, operation);
     }
 };

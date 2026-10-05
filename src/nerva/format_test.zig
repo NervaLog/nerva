@@ -1,4 +1,4 @@
-//! Format guards (docs/DECISIONS.md N51): tests that fail on any change to what Nerva puts on the
+//! Format guards (docs/DECISIONS.md N54): tests that fail on any change to what Nerva puts on the
 //! wire or on disk, so that no such change is made by accident.
 //!
 //! - Every wire and storage type's layout (size, field offsets and types, flag bits) and every
@@ -89,6 +89,24 @@ test "format: wire and storage layouts" {
         nerva.Operation,
         documents.Header,
         documents.Header.Flags,
+        // Views maintained by the state machine (N52): stored in the views and groups trees, and
+        // declared and read over the wire.
+        nerva.FieldKind,
+        nerva.FieldRef,
+        nerva.Comparison,
+        nerva.AggregateFunction,
+        nerva.Where,
+        nerva.AggregateRef,
+        nerva.ViewDefinition,
+        nerva.DeclareStatus,
+        nerva.DeclareResult,
+        nerva.ViewState,
+        nerva.View,
+        nerva.Group,
+        nerva.ViewQuery,
+        nerva.ViewRecord,
+        nerva.ViewRecord.Kind,
+        nerva.ViewRecord.Flags,
     }) |T| try layout_render(writer, T);
 
     // Tree ids name the LSM trees in the data file: never renumber them (CLAUDE.md).
@@ -145,6 +163,8 @@ test "format: wire and storage layouts" {
         \\  row_absent = 10
         \\  field_invalid = 11
         \\  delta_from_invalid = 12
+        \\  view_key_field = 13
+        \\  views_busy = 14
         \\nerva.Add: extern struct, size 80
         \\  delta: offset 0, size 8, i64
         \\  min: offset 8, size 8, u64
@@ -213,6 +233,9 @@ test "format: wire and storage layouts" {
         \\  commit = 129
         \\  get_changes = 130
         \\  get_history = 131
+        \\  get_view = 132
+        \\  declare_view = 133
+        \\  pulse = 134
         \\nerva.documents.Header: extern struct, size 24
         \\  namespace: offset 0, size 8, u64
         \\  reserved_a: offset 8, size 8, u64
@@ -222,11 +245,122 @@ test "format: wire and storage layouts" {
         \\nerva.documents.Header.Flags: packed struct, size 2
         \\  deleted: bit 0, 1 bits, bool
         \\  padding: bit 1, 15 bits, u15
+        \\nerva.FieldKind: enum(u8), non-exhaustive
+        \\  unsigned = 1
+        \\  signed = 2
+        \\  boolean = 3
+        \\  bytes = 4
+        \\nerva.FieldRef: extern struct, size 4
+        \\  offset: offset 0, size 1, u8
+        \\  size: offset 1, size 1, u8
+        \\  kind: offset 2, size 1, nerva.FieldKind
+        \\  reserved: offset 3, size 1, u8
+        \\nerva.Comparison: enum(u8), non-exhaustive
+        \\  eq = 1
+        \\  ne = 2
+        \\  lt = 3
+        \\  le = 4
+        \\  gt = 5
+        \\  ge = 6
+        \\nerva.AggregateFunction: enum(u8), non-exhaustive
+        \\  count = 1
+        \\  sum = 2
+        \\  min = 3
+        \\  max = 4
+        \\nerva.Where: extern struct, size 32
+        \\  field: offset 0, size 4, nerva.FieldRef
+        \\  comparison: offset 4, size 1, nerva.Comparison
+        \\  reserved: offset 5, size 11, [11]u8
+        \\  value: offset 16, size 16, [16]u8
+        \\nerva.AggregateRef: extern struct, size 8
+        \\  function: offset 0, size 1, nerva.AggregateFunction
+        \\  reserved: offset 1, size 3, [3]u8
+        \\  field: offset 4, size 4, nerva.FieldRef
+        \\nerva.ViewDefinition: extern struct, size 256
+        \\  name: offset 0, size 32, [32]u8
+        \\  table: offset 32, size 4, u32
+        \\  where_count: offset 36, size 1, u8
+        \\  group_by_count: offset 37, size 1, u8
+        \\  aggregate_count: offset 38, size 1, u8
+        \\  reserved_a: offset 39, size 1, u8
+        \\  where: offset 40, size 128, [4]nerva.Where
+        \\  group_by: offset 168, size 12, [3]nerva.FieldRef
+        \\  aggregates: offset 180, size 48, [6]nerva.AggregateRef
+        \\  reserved_b: offset 228, size 28, [28]u8
+        \\nerva.DeclareStatus: enum(u32)
+        \\  created = 1
+        \\  exists = 2
+        \\  different = 3
+        \\  invalid = 4
+        \\  table_invalid = 5
+        \\  views_full = 6
+        \\  table_views_full = 7
+        \\  unsupported = 8
+        \\nerva.DeclareResult: extern struct, size 32
+        \\  status: offset 0, size 4, nerva.DeclareStatus
+        \\  reserved_a: offset 4, size 4, u32
+        \\  view_id: offset 8, size 8, u64
+        \\  op: offset 16, size 8, u64
+        \\  reserved_b: offset 24, size 8, u64
+        \\nerva.ViewState: enum(u8)
+        \\  missing = 0
+        \\  building = 1
+        \\  ready = 2
+        \\  failed = 3
+        \\nerva.View: extern struct, size 512
+        \\  id: offset 0, size 8, u64
+        \\  timestamp: offset 8, size 8, u64
+        \\  declared_op: offset 16, size 8, u64
+        \\  backfill_cursor: offset 24, size 8, u64
+        \\  group_count: offset 32, size 8, u64
+        \\  state: offset 40, size 1, nerva.ViewState
+        \\  reserved_a: offset 41, size 7, [7]u8
+        \\  hash: offset 48, size 32, [32]u8
+        \\  definition: offset 80, size 256, nerva.ViewDefinition
+        \\  reserved_b: offset 336, size 176, [176]u8
+        \\nerva.Group: extern struct, size 256
+        \\  key: offset 0, size 16, u128
+        \\  timestamp: offset 16, size 8, u64
+        \\  count: offset 24, size 8, u64
+        \\  group_key: offset 32, size 64, [64]u8
+        \\  sums: offset 96, size 96, [6][16]u8
+        \\  reserved: offset 192, size 64, [64]u8
+        \\nerva.ViewQuery: extern struct, size 64
+        \\  view_id: offset 0, size 8, u64
+        \\  group_hash_min: offset 8, size 8, u64
+        \\  limit: offset 16, size 4, u32
+        \\  name: offset 20, size 32, [32]u8
+        \\  reserved: offset 52, size 12, [12]u8
+        \\nerva.ViewRecord: extern struct, size 256
+        \\  kind: offset 0, size 1, nerva.ViewRecord.Kind
+        \\  state: offset 1, size 1, nerva.ViewState
+        \\  flags: offset 2, size 1, nerva.ViewRecord.Flags
+        \\  reserved_a: offset 3, size 5, [5]u8
+        \\  view_id: offset 8, size 8, u64
+        \\  op: offset 16, size 8, u64
+        \\  declared_op: offset 24, size 8, u64
+        \\  group_count: offset 32, size 8, u64
+        \\  cursor: offset 40, size 8, u64
+        \\  group_hash: offset 48, size 8, u64
+        \\  count: offset 56, size 8, u64
+        \\  hash: offset 64, size 32, [32]u8
+        \\  group_key: offset 96, size 64, [64]u8
+        \\  sums: offset 160, size 96, [6][16]u8
+        \\nerva.ViewRecord.Kind: enum(u8)
+        \\  header = 1
+        \\  group = 2
+        \\nerva.ViewRecord.Flags: packed struct, size 1
+        \\  more: bit 0, 1 bits, bool
+        \\  padding: bit 1, 7 bits, u7
         \\tree_ids:
         \\  Row.timestamp = 1
         \\  Row.key = 2
         \\  Change.timestamp = 3
         \\  Change.row_key = 4
+        \\  View.timestamp = 5
+        \\  View.id = 6
+        \\  Group.timestamp = 7
+        \\  Group.key = 8
         \\
     ).diff(out.items);
 }

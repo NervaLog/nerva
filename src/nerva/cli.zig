@@ -31,6 +31,8 @@ const CLIArgs = union(enum) {
     start: struct {
         addresses: vsr.ClusterAddress,
         cache_grid: ?ByteSize = null,
+        statsd: ?[]const u8 = null,
+        trace: ?[]const u8 = null,
         development: bool = false,
         log_debug: bool = false,
 
@@ -63,6 +65,7 @@ const CLIArgs = union(enum) {
         \\               [--development] [--log-debug] <path>
         \\
         \\  nerva start --addresses=<addresses> [--cache-grid=<size><KiB|MiB|GiB>]
+        \\              [--statsd=<host:port>] [--trace=<path>]
         \\              [--development] [--log-debug] <path>
         \\
         \\  nerva view --cluster=<integer> --addresses=<addresses> --listen=<host:port>
@@ -105,6 +108,14 @@ const CLIArgs = union(enum) {
         \\
         \\  --cache-grid=<size><KiB|MiB|GiB>
         \\        Memory for caching data file blocks.
+        \\
+        \\  --statsd=<host:port>
+        \\        Send the replica's metrics as statsd over UDP every 10 seconds. The port
+        \\        defaults to 8125; a bare port means 127.0.0.1. IPv6 goes in brackets.
+        \\
+        \\  --trace=<path>
+        \\        Write a JSON trace of the replica's spans to <path> (Perfetto,
+        \\        chrome://tracing). For diagnosis: tracing slows the replica down.
         \\
         \\  --listen=<host:port>
         \\        Where to serve HTTP. The bound port is printed to stdout (use port 0 for an
@@ -157,6 +168,8 @@ pub const Command = union(enum) {
         request_size_limit: u32,
         lsm_forest_compaction_block_count: u32,
         lsm_forest_node_count: u32,
+        statsd: ?stdx.SocketAddress,
+        trace: ?[]const u8,
         development: bool,
         log_debug: bool,
         path: []const u8,
@@ -176,6 +189,8 @@ pub fn parse_args(flags: *stdx.Flags) Command {
         .start => |start| .{ .start = start_resolve(.{
             .addresses = start.addresses,
             .cache_grid = start.cache_grid,
+            .statsd = start.statsd,
+            .trace = start.trace,
             .development = start.development,
             .log_debug = start.log_debug,
             .path = start.path,
@@ -218,6 +233,8 @@ const Error = error{
     ReplicaIndexOutOfRange,
     CacheGridTooSmall,
     CacheGridNotBlockMultiple,
+    StatsdAddressInvalid,
+    TracePathEmpty,
 };
 
 fn error_message(err: Error) []const u8 {
@@ -236,6 +253,9 @@ fn error_message(err: Error) []const u8 {
             "--cache-grid must be a multiple of the block size ({} bytes)",
             .{constants.block_size},
         ),
+        error.StatsdAddressInvalid => "--statsd must be <host:port> with a non-zero port " ++
+            "(IPv6 in brackets)",
+        error.TracePathEmpty => "--trace must name a file",
     };
 }
 
@@ -251,10 +271,24 @@ const cache_grid_size_min = constants.block_size * Grid.Cache.value_count_max_mu
 const StartArgs = struct {
     addresses: vsr.ClusterAddress,
     cache_grid: ?ByteSize,
+    statsd: ?[]const u8,
+    trace: ?[]const u8,
     development: bool,
     log_debug: bool,
     path: []const u8,
 };
+
+const statsd_port_default = 8125;
+
+fn statsd_parse(text: []const u8) Error!stdx.SocketAddress {
+    if (text.len == 0) return error.StatsdAddressInvalid;
+    const address = vsr.parse_address_and_port(.{
+        .string = text,
+        .port_default = statsd_port_default,
+    }) catch return error.StatsdAddressInvalid;
+    if (address.port == 0) return error.StatsdAddressInvalid;
+    return address;
+}
 
 fn start_resolve(start: StartArgs) Error!Command.Start {
     const cache_grid_size: u64 = if (start.cache_grid) |size|
@@ -265,6 +299,11 @@ fn start_resolve(start: StartArgs) Error!Command.Start {
         constants.grid_cache_size_default;
     if (cache_grid_size < cache_grid_size_min) return error.CacheGridTooSmall;
     if (cache_grid_size % constants.block_size != 0) return error.CacheGridNotBlockMultiple;
+
+    const statsd: ?stdx.SocketAddress = if (start.statsd) |text| try statsd_parse(text) else null;
+    if (start.trace) |path| {
+        if (path.len == 0) return error.TracePathEmpty;
+    }
 
     const compaction_block_count_min = StateMachine.Forest.Options.compaction_block_count_min;
     return .{
@@ -284,6 +323,8 @@ fn start_resolve(start: StartArgs) Error!Command.Start {
             constants.lsm_manifest_memory_size_default,
             constants.lsm_manifest_node_size,
         )),
+        .statsd = statsd,
+        .trace = start.trace,
         .development = start.development,
         .log_debug = start.log_debug,
         .path = start.path,
@@ -314,12 +355,39 @@ test format_validate {
     try std.testing.expectError(error.ReplicaIndexOutOfRange, format_validate(format));
 }
 
+test statsd_parse {
+    const ipv4 = try statsd_parse("10.0.0.7:9125");
+    try std.testing.expectEqual(@as(u16, 9125), ipv4.port);
+    try std.testing.expectEqual(stdx.IPAddress.Family.IPv4, ipv4.ip.family());
+
+    const ipv6 = try statsd_parse("[fdaa::2]:9125");
+    try std.testing.expectEqual(@as(u16, 9125), ipv6.port);
+    try std.testing.expectEqual(stdx.IPAddress.Family.IPv6, ipv6.ip.family());
+
+    try std.testing.expectEqual(@as(u16, statsd_port_default), (try statsd_parse("10.0.0.7")).port);
+    try std.testing.expectEqual(@as(u16, 9125), (try statsd_parse("9125")).port);
+
+    for ([_][]const u8{
+        "",
+        "10.0.0.7:",
+        "10.0.0.7:0",
+        "10.0.0.7:65536",
+        "[fdaa::2",
+        "fdaa::2:9125",
+        "localhost:9125",
+    }) |text| {
+        try std.testing.expectError(error.StatsdAddressInvalid, statsd_parse(text));
+    }
+}
+
 test start_resolve {
     var diagnostic: ?[]const u8 = null;
     const addresses = try vsr.ClusterAddress.parse_flag_value("3001,3002,3003", &diagnostic);
     const start: StartArgs = .{
         .addresses = addresses,
         .cache_grid = null,
+        .statsd = null,
+        .trace = null,
         .development = true,
         .log_debug = false,
         .path = "0_0.nerva",
@@ -333,6 +401,23 @@ test start_resolve {
     );
     try std.testing.expectEqual(@as(u32, 0), development.pipeline_requests_limit);
     try std.testing.expectEqual(constants.message_size_max, development.request_size_limit);
+    try std.testing.expect(development.statsd == null);
+    try std.testing.expect(development.trace == null);
+
+    var observed = start;
+    observed.statsd = "10.0.0.7:9125";
+    observed.trace = "trace.json";
+    const observed_start = try start_resolve(observed);
+    try std.testing.expectEqual(@as(u16, 9125), observed_start.statsd.?.port);
+    try std.testing.expectEqualStrings("trace.json", observed_start.trace.?);
+
+    var trace_empty = start;
+    trace_empty.trace = "";
+    try std.testing.expectError(error.TracePathEmpty, start_resolve(trace_empty));
+
+    var statsd_invalid = start;
+    statsd_invalid.statsd = "10.0.0.7:";
+    try std.testing.expectError(error.StatsdAddressInvalid, start_resolve(statsd_invalid));
 
     var production_args = start;
     production_args.development = false;
