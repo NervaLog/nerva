@@ -315,11 +315,13 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
   `Group`, `ViewQuery`, `ViewRecord`; statuses `view_key_field` and `views_busy`; tree ids 5–8.
 - `src/nerva/views.zig`: validation, row membership, group keys and hashes, the consensus hash.
 - `src/nerva/state_machine.zig`: `views` and `groups` grooves; three-stage commit prefetch;
-  groups and hash kept in every commit; the per-op group budget; declare; paged reads by id or
+  groups and hash kept in every commit, coalesced per op; admission by distinct groups per op
+  (the canvas demo livelocked under a per-write budget); declare; paged reads by id or
   name; backfill by pulse. Commit entries reserve 5 timestamps each.
 - `src/lsm/scan_builder.zig`: `scan_unique_key_range` (UPSTREAM.md).
 - `nerva api`: `PUT /v1/views/<name>` also declares into the state machine;
   `GET /v1/views/<name>/groups`; `409 view_key_field`, `503 views_busy`. Client:
   `declare_view`, `get_view`.
 - Tests: unit and state machine tests, the VOPR model of views, `tests/views/maintained.py` in
-  `test:views`. Mutation-tested.
+  `test:views`. Mutation-tested (groups that never lose rows, the backfill cursor, admission off
+  by one).

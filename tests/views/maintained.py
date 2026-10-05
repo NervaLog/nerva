@@ -12,9 +12,10 @@ Then requires:
   deletes, and adds to the summed price);
 - the replicated hash to be the sum, modulo 2^256, of the groups' digests, recomputed here from
   the groups as served, and the group count to match;
-- an add to a field the view groups or filters by to answer 409 `view_key_field`, and a commit
-  writing more than one op's budget to the view's table to answer 503 `views_busy`, applying
-  nothing;
+- an add to a field the view groups or filters by to answer 409 `view_key_field`;
+- a commit of thousands of writes to one group to apply (admission counts distinct groups, not
+  writes), and one touching more distinct groups than an op admits (a view grouped by price) to
+  answer 503 `views_busy`, applying nothing;
 - a view with `min` to be declared but reported as not maintained (404 on its groups).
 
 Usage: maintained.py <path to nerva> [--seed=N]
@@ -31,6 +32,7 @@ LAYOUT = {"name": "seats", "fields": [{"name": "section", "type": "u8"},
 REVENUE = {"table": TABLE, "where": [{"field": "sold", "op": "eq", "value": True}],
            "group_by": ["section"],
            "aggregates": [{"fn": "count"}, {"fn": "sum", "field": "price"}]}
+BY_PRICE = {"table": TABLE, "group_by": ["price"], "aggregates": [{"fn": "count"}]}
 CHEAPEST = {"table": TABLE, "group_by": ["section"],
             "aggregates": [{"fn": "count"}, {"fn": "min", "field": "price"}]}
 SEATS = 5000
@@ -155,14 +157,25 @@ def main():
                 assert status == 200, body
             checks.append(check_against_oracle(api, view_port))
 
-        # Refusals: an add to a grouped field, and more than one op's budget of group writes.
+        # Refusals: an add to a grouped field.
         # `section` is a u8 at offset 0: a u64 add there overlaps it.
         status, body = commit(api, [{"kind": "add", "table": TABLE, "id": "0",
                                      "offset": 0, "type": "u64", "delta": "1"}])
         assert status == 409 and body["status"] == "view_key_field", (status, body)
-        before = maintained(api, "revenue")[1]["hash"]
+        # Many writes to one group fit in an op: the revenue view gains one group's worth.
         status, body = commit(api, [put(SEATS + 1000 + i, seat_value(1, 1, True))
-                                    for i in range(2100)])
+                                    for i in range(3000)])
+        assert status == 200, (status, body)
+        checks.append(check_against_oracle(api, view_port))
+
+        # More distinct groups than an op admits (4,095 in this configuration): refused whole.
+        status, body = request(api, "PUT", "/v1/views/by_price", BY_PRICE)
+        assert status == 200 and body["maintained"] is True, body
+        while maintained(api, "by_price")[1]["state"] != "ready":
+            time.sleep(0.2)
+        before = maintained(api, "revenue")[1]["hash"]
+        status, body = commit(api, [put(SEATS + 10_000 + i, seat_value(2, 10_000 + i, True))
+                                    for i in range(4200)])
         assert status == 503 and body["status"] == "views_busy", (status, body)
         assert maintained(api, "revenue")[1]["hash"] == before  # Nothing applied.
 

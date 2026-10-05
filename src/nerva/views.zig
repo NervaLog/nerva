@@ -216,6 +216,24 @@ pub fn hash_update(hash: *[32]u8, digest: *const [32]u8, sign: enum { add, remov
     }, .little);
 }
 
+/// The row values a write may leave behind or start from, for the groups it may touch: the old
+/// row's value, and a put's new value or a creating add's empty row (a superset: an add keeps
+/// its row in its group, `view_key_field`).
+pub fn entry_values(
+    entry: *const nerva.Entry,
+    value_old: ?[value_size]u8,
+) [2]?[value_size]u8 {
+    var values: [2]?[value_size]u8 = .{ value_old, null };
+    switch (entry.kind) {
+        .put => values[1] = entry.value,
+        .add => if (nerva.Add.from_entry(entry).flags.create) {
+            values[1] = @as([value_size]u8, @splat(0));
+        },
+        else => {},
+    }
+    return values;
+}
+
 /// Whether an add to the 8 bytes at `offset` would change a field the view filters or groups
 /// by (refused: `view_key_field`).
 pub fn add_touches_key(definition: *const ViewDefinition, offset: u8) bool {

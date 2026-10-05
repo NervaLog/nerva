@@ -208,8 +208,8 @@ curl -H 'X-Nerva-Key: secret' 'http://127.0.0.1:8080/v1/views/revenue/groups?lim
   replicated state.
 - An `add` to a field a maintained view filters or groups by is refused (`409 view_key_field`);
   adds to summed fields are what views are for.
-- One op makes at most about 4,000 group writes; a write costs 2 per maintained view of its
-  table. A transaction past that is refused whole (`503 views_busy`), and can be retried.
+- One op touches at most about 4,000 distinct groups, however many writes it has. A transaction
+  that would take an op past that is refused whole (`503 views_busy`), and can be retried.
 - `min` and `max`, and answers as of an op, are still `nerva view`'s (the declaration reply
   says `"maintained": false`).
 

@@ -917,7 +917,7 @@ test "views: a view over existing rows backfills in pulses, writes on both sides
     try testing.expectEqual(expected_sum, sections.sum);
 }
 
-test "views: declarations, adds and the budget are refused where they must be" {
+test "views: declarations, adds and transactions over the op's groups are refused" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const context = try context_init(&arena);
@@ -950,15 +950,50 @@ test "views: declarations, adds and the budget are refused where they must be" {
     try expect_statuses((try context.commit(&.{&.{add(5, 1, 0, 1, .{})}}))[0], &.{.view_key_field});
     try expect_statuses((try context.commit(&.{&.{add(5, 1, 12, 1, .{})}}))[0], &.{.view_key_field});
 
-    // The op's budget: four views on table 5 cost 8 per write. A transaction that does not fit
-    // is refused whole; a smaller one after it in the same op still fits.
+    // Admission counts the op's distinct groups, not its writes: writes to groups already
+    // counted are free, so any number of them fit.
     const limit = context.state_machine.group_writes_limit;
-    const too_many = try arena.allocator().alloc(Entry, limit / 8 + 1);
-    for (too_many, 0..) |*entry, index| entry.* = seat(100 + index, 1, 1, true);
-    const results = try context.commit(&.{ too_many, &.{seat(99, 2, 1, true)} });
-    try testing.expectEqual(nerva.EntryStatus.views_busy, results[0][0].status);
+    const same_group = try arena.allocator().alloc(Entry, limit + 1);
+    for (same_group, 0..) |*entry, index| entry.* = seat(100 + index, 2, 1, true);
+    for ((try context.commit(&.{same_group}))[0]) |result| {
+        try testing.expectEqual(nerva.EntryStatus.ok, result.status);
+    }
+    try testing.expectEqual(@as(u64, limit + 1), (try view_sections(context, 1)).count[2]);
+
+    // A view on table 6 grouped by price: every price is a group of its own. A transaction
+    // that does not fit is refused whole, while others in the same op are admitted in order:
+    // one that fits exactly, one whose groups are all counted already, and a small one.
+    var by_price = revenue_view("p");
+    by_price.table = 6;
+    by_price.group_by[0] = .{ .offset = 8, .size = 8, .kind = .unsigned };
+    try testing.expectEqual(nerva.DeclareStatus.created, (try context.declare(by_price)).status);
+    _ = context.pulse_until_ready();
+    const priced = struct {
+        fn entries(allocator: std.mem.Allocator, count: usize, price_base: u64) ![]Entry {
+            const result = try allocator.alloc(Entry, count);
+            for (result, 0..) |*entry, index| {
+                entry.* = seat(price_base + index, 1, price_base + index, true);
+                entry.table = 6;
+            }
+            return result;
+        }
+    }.entries;
+    const allocator = arena.allocator();
+    const too_many = try priced(allocator, limit + 1, 1_000_000);
+    const small = try priced(allocator, 1, 4_000_000);
+    const refused = try context.commit(&.{ too_many, small });
+    try testing.expectEqual(nerva.EntryStatus.views_busy, refused[0][0].status);
+    for (refused[0][1..]) |result| try testing.expectEqual(nerva.EntryStatus.aborted, result.status);
+    try testing.expectEqual(nerva.EntryStatus.ok, refused[1][0].status);
+
+    const fits = try priced(allocator, limit, 2_000_000);
+    const counted = try priced(allocator, 1, 2_000_000 + limit - 1);
+    counted[0].id = 3_000_000; // Another row, in a group the op counted already.
+    const over = try priced(allocator, 1, 5_000_000);
+    const results = try context.commit(&.{ fits, counted, over });
+    for (results[0]) |result| try testing.expectEqual(nerva.EntryStatus.ok, result.status);
     try testing.expectEqual(nerva.EntryStatus.ok, results[1][0].status);
-    try testing.expectEqual(@as(u64, 1), (try view_sections(context, 1)).count[2]);
+    try testing.expectEqual(nerva.EntryStatus.views_busy, results[2][0].status);
 }
 
 test "views: reads page through the groups, and say when a view is missing" {

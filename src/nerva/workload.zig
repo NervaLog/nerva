@@ -176,8 +176,11 @@ pub fn WorkloadType(comptime StateMachine: type) type {
 
         /// Views declared (N49), in id order, and whether each was seen ready (never undone).
         model_views: std.ArrayListUnmanaged(ModelView) = .{},
-        /// This request's view group writes, charged per transaction as the state machine does.
-        view_group_writes: u32 = 0,
+        /// Scratch for admission (N49): the request's distinct groups, the transaction's, and
+        /// which transactions were refused (`views_busy`).
+        view_op_keys: std.AutoHashMapUnmanaged(u128, void) = .{},
+        view_txn_keys: std.ArrayListUnmanaged(u128) = .{},
+        view_txn_busy: std.ArrayListUnmanaged(bool) = .{},
         view_reads_ready: u64 = 0,
         view_reads_building: u64 = 0,
         views_busy: u64 = 0,
@@ -268,6 +271,9 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                 workload.views_busy,
             });
             workload.model_views.deinit(allocator);
+            workload.view_op_keys.deinit(allocator);
+            workload.view_txn_keys.deinit(allocator);
+            workload.view_txn_busy.deinit(allocator);
             workload.budgets.deinit(allocator);
             workload.receipt_seqs.deinit(allocator);
             workload.rows.deinit(allocator);
@@ -750,12 +756,13 @@ pub fn WorkloadType(comptime StateMachine: type) type {
             assert(request.batch_count() == reply.batch_count());
 
             var op_request: ?u64 = null;
-            workload.view_group_writes = 0;
+            workload.views_admit(request_body);
+            var batch_index: usize = 0;
             // Each entry takes a block of `entry_timestamps`: its change takes the first (N49).
             const block = StateMachine.entry_timestamps;
             var batch_timestamp =
                 timestamp - @divExact(request.payload.len, @sizeOf(Entry)) * block;
-            while (request.pop()) |batch| {
+            while (request.pop()) |batch| : (batch_index += 1) {
                 const entries = stdx.bytes_as_slice(.exact, Entry, batch);
                 const results = stdx.bytes_as_slice(.exact, EntryResult, reply.pop().?);
                 assert(results.len == entries.len);
@@ -764,7 +771,8 @@ pub fn WorkloadType(comptime StateMachine: type) type {
 
                 const claim = receipt_claim_is(entries);
                 const budget = budget_is(entries);
-                if (workload.commit_failure(entries)) |failure| {
+                const views_busy = workload.view_txn_busy.items[batch_index];
+                if (workload.commit_failure(entries, views_busy)) |failure| {
                     // Adds alone, clamped and creating, never fail (G8).
                     assert(!budget);
                     workload.transactions_failed += 1;
@@ -857,19 +865,16 @@ pub fn WorkloadType(comptime StateMachine: type) type {
 
         /// The model's expectation, computed independently of the state machine. On success,
         /// fills `expected` with each entry's result.
-        fn commit_failure(workload: *Workload, entries: []const Entry) ?Failure {
+        fn commit_failure(workload: *Workload, entries: []const Entry, views_busy: bool) ?Failure {
             assert(entries.len <= transaction_entries_max);
-            // The views budget: charged per transaction in request order, before anything else.
-            var cost: u32 = 0;
-            for (entries) |*entry| cost += workload.view_write_cost(entry);
-            if (workload.view_group_writes + cost > workload.group_writes_limit()) {
+            // Admission comes first (`views_admit`).
+            if (views_busy) {
                 workload.views_busy += 1;
                 const index = for (entries, 0..) |*entry, index| {
-                    if (workload.view_write_cost(entry) > 0) break index;
+                    if (workload.entry_viewed(entry)) break index;
                 } else unreachable;
                 return .{ .index = index, .status = .views_busy, .op = 0 };
             }
-            workload.view_group_writes += cost;
             for (entries, 0..) |*entry, index| {
                 if (nerva.entry_validate(entry)) |status| {
                     return .{ .index = index, .status = status, .op = 0 };
@@ -1014,17 +1019,64 @@ pub fn WorkloadType(comptime StateMachine: type) type {
             }) catch @panic("OOM");
         }
 
-        fn view_write_cost(workload: *const Workload, entry: *const Entry) u32 {
-            if (entry.table == 0) return 0;
+        /// Admission (N49), for every transaction of the request before any applies: in order,
+        /// a transaction is admitted while the request's distinct groups fit in
+        /// `group_writes_limit`. Its groups are, for every write to a table with views, in each
+        /// of those views, the group of the row as it was before the request and that of the
+        /// put's value (or a creating add's empty row), where they match the view's filter.
+        fn views_admit(
+            workload: *Workload,
+            request_body: []align(constants.cache_line_size) const u8,
+        ) void {
+            var request = MultiBatchDecoder.init(request_body, .{
+                .element_size = @sizeOf(Entry),
+            }) catch unreachable;
+            const allocator = workload.allocator;
+            workload.view_op_keys.clearRetainingCapacity();
+            workload.view_txn_busy.clearRetainingCapacity();
+            while (request.pop()) |batch| {
+                const entries = stdx.bytes_as_slice(.exact, Entry, batch);
+                workload.view_txn_keys.clearRetainingCapacity();
+                const admitted = admit: for (entries) |*entry| {
+                    if (!workload.entry_viewed(entry)) continue;
+                    const version = workload.row_version(nerva.row_key(entry.table, entry.id));
+                    const value_old: ?[value_size]u8 = if (version.exists) version.value else null;
+                    for (workload.model_views.items) |*view| {
+                        if (view.definition.table != entry.table) continue;
+                        for (views.entry_values(entry, value_old)) |candidate| {
+                            const value = candidate orelse continue;
+                            if (!views.row_matches(&view.definition, &value)) continue;
+                            const group_key = views.group_key(&view.definition, &value);
+                            const key = views.group_tree_key(view.id, &group_key);
+                            if (workload.view_op_keys.contains(key)) continue;
+                            if (workload.view_op_keys.count() == workload.group_writes_limit()) {
+                                break :admit false;
+                            }
+                            workload.view_op_keys.put(allocator, key, {}) catch @panic("OOM");
+                            workload.view_txn_keys.append(allocator, key) catch @panic("OOM");
+                        }
+                    }
+                } else true;
+                if (!admitted) {
+                    for (workload.view_txn_keys.items) |key| {
+                        assert(workload.view_op_keys.remove(key));
+                    }
+                }
+                workload.view_txn_busy.append(allocator, !admitted) catch @panic("OOM");
+            }
+        }
+
+        /// Whether the entry writes a table with a view (in any state).
+        fn entry_viewed(workload: *const Workload, entry: *const Entry) bool {
+            if (entry.table == 0) return false;
             switch (entry.kind) {
                 .put, .delete, .add => {},
-                else => return 0,
+                else => return false,
             }
-            var cost: u32 = 0;
             for (workload.model_views.items) |*view| {
-                if (view.definition.table == entry.table) cost += 2;
+                if (view.definition.table == entry.table) return true;
             }
-            return cost;
+            return false;
         }
 
         fn check_declare_view(

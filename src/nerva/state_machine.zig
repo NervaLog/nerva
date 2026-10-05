@@ -65,9 +65,9 @@ pub fn StateMachineType(comptime Storage: type) type {
         /// Timestamps a commit entry takes: its change, then one per view of its table, for a
         /// group the entry creates (N49).
         pub const entry_timestamps = 1 + nerva.views_per_table_max;
-        /// Group writes one op may make (N49): a write to a table costs 2 per view of the table
-        /// (its old and new group). Groups are twice the size of rows, so this bounds the
-        /// groups tree's tables to the rows tree's size.
+        /// Distinct groups one op may write (N49), each once: admission refuses a transaction
+        /// that would take its op past this. Groups are twice the size of rows, so this bounds
+        /// the groups tree's tables to the rows tree's size.
         pub const groups_per_op_max: u32 = @max(1, @divFloor(commit_entries_max, 2));
         /// -1 for the header record.
         pub const view_groups_limit_max =
@@ -219,9 +219,14 @@ pub fn StateMachineType(comptime Storage: type) type {
 
         const Failure = struct { index: u32, status: EntryStatus, op: u64, value: u64 = 0 };
 
+        const GroupScratch = struct { group: Group, stored: ?Group };
+
+        /// Batches one multi-batch request may carry.
+        const request_batches_max = std.math.maxInt(u16);
+
         batch_size_limit: u32,
-        /// `groups_per_op_max` for this `batch_size_limit`: the op's budget of group writes, and
-        /// the rows a pulse backfills (N49).
+        /// `groups_per_op_max` for this `batch_size_limit`: the distinct groups an op may write,
+        /// and the rows a pulse backfills (N49).
         group_writes_limit: u32,
         forest: Forest,
 
@@ -264,8 +269,17 @@ pub fn StateMachineType(comptime Storage: type) type {
         views_op: [nerva.views_max]View = undefined,
         views_stored: [nerva.views_max]View = undefined,
         views_op_count: u32 = 0,
-        /// This op's group writes charged so far (`view_group_writes_max`).
-        view_group_writes: u32 = 0,
+        /// Per request, the transactions the views budget refused: prefetch decides, commit
+        /// obeys (N49).
+        view_txn_busy: std.DynamicBitSetUnmanaged = .{},
+        /// The op's distinct groups, as admitted so far (prefetch); looked up only.
+        view_op_keys: std.AutoHashMapUnmanaged(u128, void) = .{},
+        /// The keys the transaction being admitted added, to take back if it does not fit.
+        view_txn_keys: std.ArrayListUnmanaged(u128) = .{},
+        /// The groups this op changed, in the order first touched, and their state now and as
+        /// stored: written back once each at the end of the op.
+        groups_touched: std.ArrayListUnmanaged(u128) = .{},
+        groups_scratch: std.AutoHashMapUnmanaged(u128, GroupScratch) = .{},
         /// Rows a pulse scanned (one more than it adds, to know whether the table has more).
         backfill_rows: []Row,
         backfill_count: ?u32 = null,
@@ -368,9 +382,28 @@ pub fn StateMachineType(comptime Storage: type) type {
 
             self.view_groups = try allocator.alloc(Group, view_groups_limit_max + 1);
             errdefer allocator.free(self.view_groups);
+
+            self.view_txn_busy = try std.DynamicBitSetUnmanaged.initEmpty(
+                allocator,
+                request_batches_max,
+            );
+            errdefer self.view_txn_busy.deinit(allocator);
+            try self.view_op_keys.ensureTotalCapacity(allocator, groups_limit);
+            errdefer self.view_op_keys.deinit(allocator);
+            try self.view_txn_keys.ensureTotalCapacity(allocator, groups_limit);
+            errdefer self.view_txn_keys.deinit(allocator);
+            try self.groups_touched.ensureTotalCapacity(allocator, groups_limit);
+            errdefer self.groups_touched.deinit(allocator);
+            try self.groups_scratch.ensureTotalCapacity(allocator, groups_limit);
+            errdefer self.groups_scratch.deinit(allocator);
         }
 
         pub fn deinit(self: *StateMachine, allocator: std.mem.Allocator) void {
+            self.groups_scratch.deinit(allocator);
+            self.groups_touched.deinit(allocator);
+            self.view_txn_keys.deinit(allocator);
+            self.view_op_keys.deinit(allocator);
+            self.view_txn_busy.deinit(allocator);
             allocator.free(self.view_groups);
             allocator.free(self.backfill_rows);
             self.add_rows.deinit(allocator);
@@ -390,7 +423,17 @@ pub fn StateMachineType(comptime Storage: type) type {
                 .add_rows = self.add_rows,
                 .backfill_rows = self.backfill_rows,
                 .view_groups = self.view_groups,
+                .view_txn_busy = self.view_txn_busy,
+                .view_op_keys = self.view_op_keys,
+                .view_txn_keys = self.view_txn_keys,
+                .groups_touched = self.groups_touched,
+                .groups_scratch = self.groups_scratch,
             };
+            self.view_txn_busy.unsetAll();
+            self.view_op_keys.clearRetainingCapacity();
+            self.view_txn_keys.clearRetainingCapacity();
+            self.groups_touched.clearRetainingCapacity();
+            self.groups_scratch.clearRetainingCapacity();
             self.add_rows.clearRetainingCapacity();
         }
 
@@ -774,7 +817,8 @@ pub fn StateMachineType(comptime Storage: type) type {
 
             // Each batch's writes take the timestamps just below its share of the prepare's.
             var batch_timestamp = timestamp - self.prepare_delta(operation, body_decoder.payload);
-            while (body_decoder.pop()) |batch| {
+            var batch_index: u32 = 0;
+            while (body_decoder.pop()) |batch| : (batch_index += 1) {
                 batch_timestamp += self.prepare_delta(operation, batch);
                 const bytes_written: usize = switch (operation) {
                     .lookup_rows => self.execute_lookup_rows(
@@ -786,6 +830,7 @@ pub fn StateMachineType(comptime Storage: type) type {
                         op,
                         batch_timestamp,
                         batch,
+                        self.view_txn_busy.isSet(batch_index),
                         reply_encoder.writable().?,
                     ),
                     .get_changes, .get_history, .get_view, .declare_view, .pulse => {
@@ -797,7 +842,7 @@ pub fn StateMachineType(comptime Storage: type) type {
             assert(batch_timestamp == timestamp);
             assert(body_decoder.batch_count() == reply_encoder.batch_count);
             if (operation == .commit) {
-                assert(self.view_group_writes <= self.group_writes_limit);
+                self.groups_store();
                 self.views_store();
             }
             return reply_encoder.finish();
@@ -843,6 +888,7 @@ pub fn StateMachineType(comptime Storage: type) type {
             op: u64,
             timestamp: u64,
             batch: []const u8,
+            views_busy: bool,
             output: []u8,
         ) usize {
             const entries = stdx.bytes_as_slice(.exact, Entry, batch);
@@ -850,7 +896,8 @@ pub fn StateMachineType(comptime Storage: type) type {
             assert(entries.len <= self.write_keys.len);
 
             // Resolving the adds fills in each add's result (`applied`, `value`).
-            const failure = self.commit_failure(entries) orelse self.adds_resolve(entries, results);
+            const failure = self.commit_failure(entries, views_busy) orelse
+                self.adds_resolve(entries, results);
             if (failure) |f| {
                 for (results, 0..) |*result, index| {
                     result.* = if (index == f.index)
@@ -878,14 +925,13 @@ pub fn StateMachineType(comptime Storage: type) type {
         }
 
         /// The first reason the transaction cannot commit, or null.
-        /// The views budget comes first (it is charged in transaction order whatever happens
-        /// next, so that prefetch and commit agree on it), then static checks, then duplicate
-        /// writes, then read conflicts.
-        fn commit_failure(self: *StateMachine, entries: []const Entry) ?Failure {
-            if (!self.view_writes_charge(entries)) {
+        /// The views budget comes first (prefetch decided it, `views_busy`), then static checks,
+        /// then duplicate writes, then read conflicts.
+        fn commit_failure(self: *StateMachine, entries: []const Entry, views_busy: bool) ?Failure {
+            if (views_busy) {
                 const index = for (entries, 0..) |*entry, index| {
-                    if (self.view_write_cost(entry) > 0) break index;
-                } else unreachable;
+                    if (self.entry_viewed(entry)) break index;
+                } else unreachable; // A transaction without groups always fits.
                 return .{ .index = @intCast(index), .status = .views_busy, .op = 0 };
             }
             for (entries, 0..) |*entry, index| {
@@ -1155,56 +1201,80 @@ pub fn StateMachineType(comptime Storage: type) type {
             }
         }
 
-        /// Prefetches the groups a commit may touch (stage 2, after the rows): for every write
-        /// of a transaction that the views budget admits, in each view of its table, the old
-        /// row's group and the put's (or a creating add's empty row's) group.
+        /// Prefetches the groups a commit may touch (stage 2, after the rows), and admits each
+        /// transaction in order while the op's distinct groups fit in `group_writes_limit`
+        /// (N49): a transaction that would not fit is refused (`views_busy`) at commit. The
+        /// groups counted are a superset of those the commit can touch, computed from the rows
+        /// as they are before the op: for every write, in every view of its table, the old row's
+        /// group and the put's (or a creating add's empty row's) group.
         fn prefetch_commit_groups(self: *StateMachine) void {
-            const body_decoder = MultiBatchDecoder.init(self.prefetch_input.?, .{
+            var decoder = MultiBatchDecoder.init(self.prefetch_input.?, .{
                 .element_size = @sizeOf(Entry),
             }) catch unreachable; // Already validated by `input_valid()`.
-            var decoder = body_decoder;
 
             const groups = &self.forest.grooves.groups;
             groups.prefetch_setup(self.prefetch_snapshot.?);
-            const charged = self.view_group_writes;
-            defer self.view_group_writes = charged; // Commit charges again, the same way.
-            while (decoder.pop()) |batch| {
+            self.view_txn_busy.unsetAll();
+            self.view_op_keys.clearRetainingCapacity();
+            var batch_index: u32 = 0;
+            while (decoder.pop()) |batch| : (batch_index += 1) {
                 const entries = stdx.bytes_as_slice(.exact, Entry, batch);
-                if (!self.view_writes_charge(entries)) continue;
-                for (entries) |*entry| {
-                    if (self.view_write_cost(entry) == 0) continue;
-                    self.prefetch_entry_groups(entry);
+                if (!self.view_txn_admit(entries)) {
+                    self.view_txn_busy.set(batch_index);
+                    continue;
                 }
+                for (self.view_txn_keys.items) |key| groups.prefetch_enqueue(.{ .key = key });
             }
+            self.view_txn_keys.clearRetainingCapacity();
             groups.prefetch(prefetch_groups_callback, &self.groups_prefetch_context);
         }
 
-        fn prefetch_entry_groups(self: *StateMachine, entry: *const Entry) void {
-            const groups = &self.forest.grooves.groups;
-            const value_old: ?[nerva.value_size]u8 =
-                switch (self.forest.grooves.rows.get(nerva.row_key(entry.table, entry.id))) {
-                    .found_object => |row| if (row.flags.deleted) null else row.value,
-                    .not_found => null,
-                };
-            for (self.views_op[0..self.views_op_count]) |*view| {
-                if (!view_maintained(view, entry.table)) continue;
-                if (view.state == .building and entry.id >= view.backfill_cursor) continue;
-                const definition = &view.definition;
-                var candidates: [2]?[nerva.value_size]u8 = .{ value_old, null };
-                switch (entry.kind) {
-                    .put => candidates[1] = entry.value,
-                    .add => if (Add.from_entry(entry).flags.create) {
-                        candidates[1] = @as([nerva.value_size]u8, @splat(0));
-                    },
-                    else => {},
-                }
-                for (&candidates) |*candidate| {
-                    const value = candidate.* orelse continue;
-                    if (!views.row_matches(definition, &value)) continue;
-                    const key = views.group_key(definition, &value);
-                    groups.prefetch_enqueue(.{ .key = views.group_tree_key(view.id, &key) });
+        /// Adds the transaction's groups to the op's, if they fit (`view_txn_keys` holds those
+        /// it added). Otherwise leaves the op's groups as they were.
+        fn view_txn_admit(self: *StateMachine, entries: []const Entry) bool {
+            self.view_txn_keys.clearRetainingCapacity();
+            for (entries) |*entry| {
+                if (!self.entry_viewed(entry)) continue;
+                const rows = &self.forest.grooves.rows;
+                const value_old: ?[nerva.value_size]u8 =
+                    switch (rows.get(nerva.row_key(entry.table, entry.id))) {
+                        .found_object => |row| if (row.flags.deleted) null else row.value,
+                        .not_found => null,
+                    };
+                for (self.views_op[0..self.views_op_count]) |*view| {
+                    if (view.definition.table != entry.table) continue;
+                    for (views.entry_values(entry, value_old)) |candidate| {
+                        const value = candidate orelse continue;
+                        if (!views.row_matches(&view.definition, &value)) continue;
+                        const group_key = views.group_key(&view.definition, &value);
+                        const key = views.group_tree_key(view.id, &group_key);
+                        if (self.view_op_keys.contains(key)) continue;
+                        if (self.view_op_keys.count() == self.group_writes_limit) {
+                            for (self.view_txn_keys.items) |added| {
+                                assert(self.view_op_keys.remove(added));
+                            }
+                            self.view_txn_keys.clearRetainingCapacity();
+                            return false;
+                        }
+                        self.view_op_keys.putAssumeCapacity(key, {});
+                        self.view_txn_keys.appendAssumeCapacity(key);
+                    }
                 }
             }
+            return true;
+        }
+
+        /// Whether the entry writes a table with a view (in any state).
+        fn entry_viewed(self: *const StateMachine, entry: *const Entry) bool {
+            if (entry.table == 0) return false;
+            switch (entry.kind) {
+                .put, .delete, .add => {},
+                else => return false,
+            }
+            for (self.views_op[0..self.views_op_count]) |*view| {
+                if (view.definition.table == entry.table) return true;
+            }
+            return false;
         }
 
         fn prefetch_groups_callback(context: *GroupsGroove.PrefetchContext) void {
@@ -1214,38 +1284,13 @@ pub fn StateMachineType(comptime Storage: type) type {
             self.prefetch_finish();
         }
 
-        /// Charges the transaction's view group writes to this op's budget, if they fit.
-        fn view_writes_charge(self: *StateMachine, entries: []const Entry) bool {
-            var cost: u32 = 0;
-            for (entries) |*entry| cost += self.view_write_cost(entry);
-            if (self.view_group_writes + cost > self.group_writes_limit) return false;
-            self.view_group_writes += cost;
-            return true;
-        }
-
-        /// An entry's view group writes, at most: its old and new group in each view of its
-        /// table, whatever the view's state (so that the cost cannot change during the op).
-        fn view_write_cost(self: *const StateMachine, entry: *const Entry) u32 {
-            if (entry.table == 0) return 0;
-            switch (entry.kind) {
-                .put, .delete, .add => {},
-                else => return 0,
-            }
-            var cost: u32 = 0;
-            for (self.views_op[0..self.views_op_count]) |*view| {
-                if (view.definition.table == entry.table) cost += 2;
-            }
-            return cost;
-        }
-
         /// Whether `view` is kept up to date with writes to `table`.
         fn view_maintained(view: *const View, table: u32) bool {
             return view.definition.table == table and
                 (view.state == .building or view.state == .ready);
         }
 
-        /// Loads the views prefetched for this op into `views_op` and `views_stored`, and resets
-        /// the op's budget.
+        /// Loads the views prefetched for this op into `views_op` and `views_stored`.
         fn views_load(self: *StateMachine) void {
             const groove = &self.forest.grooves.views;
             const count = self.view_count orelse nerva.views_max;
@@ -1268,7 +1313,8 @@ pub fn StateMachineType(comptime Storage: type) type {
             self.view_count = loaded;
             self.view_building = building;
             self.views_op_count = loaded;
-            self.view_group_writes = 0;
+            assert(self.groups_touched.items.len == 0);
+            assert(self.groups_scratch.count() == 0);
         }
 
         /// Writes back the views this op changed.
@@ -1321,7 +1367,8 @@ pub fn StateMachineType(comptime Storage: type) type {
         }
 
         /// Adds the row to, or removes it from, its group of `view`, keeping the view's hash and
-        /// group count. `timestamp` is for a group created now.
+        /// group count, in the op's scratch groups (written back by `groups_store`). `timestamp`
+        /// is for a group created now.
         fn group_change(
             self: *StateMachine,
             view: *View,
@@ -1329,49 +1376,78 @@ pub fn StateMachineType(comptime Storage: type) type {
             sign: enum { add, remove },
             timestamp: u64,
         ) void {
-            if (view.state == .failed) return; // An earlier collision in this op.
-            const groups = &self.forest.grooves.groups;
+            if (view.state == .failed) return; // An earlier collision.
             const key = views.group_key(&view.definition, value);
             const tree_key = views.group_tree_key(view.id, &key);
-            const found: ?Group = switch (groups.get(tree_key)) {
-                .found_object => |group| group,
-                .not_found => null,
-            };
-            if (found) |group| {
-                if (!std.mem.eql(u8, &group.group_key, &key)) {
-                    // Two group keys hashed alike: every replica fails the view at this op.
-                    log.warn("view {}: group hash collision; the view fails", .{view.id});
-                    view.state = .failed;
-                    return;
-                }
-            } else {
-                // A row leaves only a group it is counted in.
+            const scratch = self.group_scratch(tree_key, &key);
+            const group = &scratch.group;
+            if (!std.mem.eql(u8, &group.group_key, &key)) {
+                // Two group keys hashed alike: every replica fails the view at this op.
+                log.warn("view {}: group hash collision; the view fails", .{view.id});
+                view.state = .failed;
+                return;
+            }
+            if (group.timestamp == 0) {
+                // Created now: a row leaves only a group it is counted in.
+                assert(scratch.stored == null);
                 assert(sign == .add);
                 assert(TimestampRange.valid(timestamp));
+                group.timestamp = timestamp;
             }
 
-            var group: Group = found orelse .{
-                .key = tree_key,
-                .timestamp = timestamp,
-                .count = 0,
-                .group_key = key,
-                .sums = @splat(@splat(0)),
-            };
-            const group_old = group;
-            views.hash_update(&view.hash, &views.group_digest(view.id, &group), .remove);
-            views.group_apply(&view.definition, &group, value, switch (sign) {
+            const count_old = group.count;
+            views.hash_update(&view.hash, &views.group_digest(view.id, group), .remove);
+            views.group_apply(&view.definition, group, value, switch (sign) {
                 .add => .add,
                 .remove => .remove,
             });
-            views.hash_update(&view.hash, &views.group_digest(view.id, &group), .add);
-            if (group_old.count == 0 and group.count > 0) view.group_count += 1;
-            if (group_old.count > 0 and group.count == 0) view.group_count -= 1;
+            views.hash_update(&view.hash, &views.group_digest(view.id, group), .add);
+            if (count_old == 0 and group.count > 0) view.group_count += 1;
+            if (count_old > 0 and group.count == 0) view.group_count -= 1;
+        }
 
-            if (found == null) {
-                groups.insert(&group);
-            } else {
-                groups.update(.{ .old = &group_old, .new = &group });
+        /// The group's state in this op, from the groove the first time.
+        fn group_scratch(
+            self: *StateMachine,
+            tree_key: u128,
+            key: *const [nerva.group_key_size_max]u8,
+        ) *GroupScratch {
+            const entry = self.groups_scratch.getOrPutAssumeCapacity(tree_key);
+            if (!entry.found_existing) {
+                const stored: ?Group = switch (self.forest.grooves.groups.get(tree_key)) {
+                    .found_object => |group| group,
+                    .not_found => null,
+                };
+                entry.value_ptr.* = .{
+                    .group = stored orelse .{
+                        .key = tree_key,
+                        .timestamp = 0, // Assigned when a row first joins it.
+                        .count = 0,
+                        .group_key = key.*,
+                        .sums = @splat(@splat(0)),
+                    },
+                    .stored = stored,
+                };
+                self.groups_touched.appendAssumeCapacity(tree_key);
             }
+            return entry.value_ptr;
+        }
+
+        /// Writes back each group this op changed, once, in the order first touched.
+        fn groups_store(self: *StateMachine) void {
+            const groups = &self.forest.grooves.groups;
+            for (self.groups_touched.items) |tree_key| {
+                const scratch = self.groups_scratch.getPtr(tree_key).?;
+                if (scratch.stored) |*stored| {
+                    if (!stdx.equal_bytes(Group, stored, &scratch.group)) {
+                        groups.update(.{ .old = stored, .new = &scratch.group });
+                    }
+                } else if (scratch.group.timestamp != 0) {
+                    groups.insert(&scratch.group);
+                }
+            }
+            self.groups_touched.clearRetainingCapacity();
+            self.groups_scratch.clearRetainingCapacity();
         }
 
         /// Stage 1 of `get_view`: scans the view's groups from the query's cursor.
@@ -1629,6 +1705,7 @@ pub fn StateMachineType(comptime Storage: type) type {
                 if (!views.row_matches(&view.definition, &row.value)) continue;
                 self.group_change(view, &row.value, .add, timestamp_base + k + 1);
             }
+            self.groups_store();
             if (view.state == .building) {
                 if (scanned.len > self.group_writes_limit) {
                     view.backfill_cursor = @truncate(scanned[self.group_writes_limit].key);
