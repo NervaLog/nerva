@@ -125,9 +125,10 @@ pub const Client = struct {
             // Close connections gracefully, bounded by the timeout.
             client.vsr_client.shutdown();
             const start = client.time_os.monotonic();
+            var tick_next = start;
             while (!client.vsr_client.shutdown_complete()) {
                 if (start.elapsed(client.time_os.monotonic()).ns > client.options.timeout.ns) break;
-                client.io.run_for_ns(constants.tick_ms * std.time.ns_per_ms) catch break;
+                client.run_io_once(start, &tick_next) catch break;
             }
             client.vsr_client.deinit(allocator);
         }
@@ -287,6 +288,7 @@ pub const Client = struct {
     fn run_until_reply(client: *Client) Error!void {
         assert(client.state == .registering or client.state == .waiting);
         const start = client.time_os.monotonic();
+        var tick_next = start;
         while (true) {
             switch (client.state) {
                 .idle => return,
@@ -298,13 +300,29 @@ pub const Client = struct {
                 client.state = .timed_out;
                 return error.Timeout;
             }
-            client.vsr_client.tick();
-            client.io.run_for_ns(constants.tick_ms * std.time.ns_per_ms) catch |err| {
+            client.run_io_once(start, &tick_next) catch |err| {
                 log.err("io: {}", .{err});
                 client.state = .timed_out;
                 return error.Timeout;
             };
         }
+    }
+
+    /// Ticks the VSR client every `tick_ms` (its timeouts count ticks), then waits for IO until
+    /// the next tick or the call's deadline, and returns as soon as any callback has run. The
+    /// reply callback therefore ends a wait at once, rather than at the end of a 10 ms tick.
+    fn run_io_once(client: *Client, start: stdx.Instant, tick_next: *stdx.Instant) !void {
+        const tick: stdx.Duration = .{ .ns = constants.tick_ms * std.time.ns_per_ms };
+        const now = client.time_os.monotonic();
+        if (now.ns >= tick_next.ns) {
+            client.vsr_client.tick();
+            tick_next.* = now.add(tick);
+        }
+        const deadline = start.add(client.options.timeout);
+        const wait_until = if (deadline.ns < tick_next.ns) deadline else tick_next.*;
+        // At least 1 ns: `run_once` always waits (a zero wait is `IO.run`'s job).
+        const wait_ns: u63 = @intCast(@max(wait_until.ns -| now.ns, 1));
+        try client.io.run_once(wait_ns);
     }
 
     fn on_register(user_data: u128, result: *const vsr.RegisterResult) void {

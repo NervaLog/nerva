@@ -360,3 +360,16 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
   spans. Mutation-tested: without the statsd or the trace wiring, the integration test fails.
 - Verified: `check`, `test:fmt`, `test:integration`; `test:unit -Drelease` 305/306 (the
   sandbox-denied perf test).
+
+## 2026-10-05 — The client no longer waits out a 10 ms tick per request (N51)
+
+- `src/io/linux.zig`: `IO.run_once(nanoseconds)`, which returns once callbacks have run;
+  `darwin.zig` and `windows.zig` alias it to `run_for_ns`. Vendored patch, listed in UPSTREAM.md.
+- `src/nerva/client.zig`: `run_io_once` ticks the VSR client every `tick_ms` and otherwise waits
+  with `run_once`, so `run_until_reply` and `deinit` return as soon as the reply (or shutdown)
+  arrives.
+- Through `nerva api` on a local three-replica cluster: lookup p50 10.60 ms to 1.05 ms, commit
+  p50 10.53 ms to 0.92 ms (N51 has the table).
+- Tests: IO unit test for `run_once`; `test:integration` checks the median lookup is under one
+  tick. Mutation-tested.
+

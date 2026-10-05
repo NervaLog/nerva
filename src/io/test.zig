@@ -886,3 +886,46 @@ test "chained zero-delay callbacks complete in a single flush" {
         }
     }.run_test();
 }
+
+// Nerva patch (UPSTREAM.md): `run_once` returns once a callback has run, rather than waiting out
+// its whole duration as `run_for_ns` does; with nothing to complete, it waits the duration.
+test "run_once returns after the first completion" {
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest; // Elsewhere it is run_for_ns.
+
+    try struct {
+        fired: bool = false,
+
+        const Context = @This();
+
+        fn run_test() !void {
+            var time_os: TimeOS = .{};
+            const time = time_os.interface();
+            var io = try IO.init(32, 0);
+            defer io.deinit();
+            var context: Context = .{};
+
+            // A 1 ms timeout ends a wait of up to 10 s as soon as it fires.
+            var completion: IO.Completion = undefined;
+            io.timeout(*Context, &context, callback, &completion, @intCast(Duration.ms(1).ns));
+            const start = time.monotonic();
+            while (!context.fired) try io.run_once(@intCast(Duration.seconds(10).ns));
+            // Generous for loaded CI machines, yet far below the 10 s the wait allowed.
+            try testing.expect(start.elapsed(time.monotonic()).ns < Duration.seconds(1).ns);
+
+            // With nothing in flight, the wait lasts its whole duration (less timer slack).
+            const idle_start = time.monotonic();
+            try io.run_once(@intCast(Duration.ms(20).ns));
+            try testing.expect(idle_start.elapsed(time.monotonic()).ns >= Duration.ms(15).ns);
+        }
+
+        fn callback(
+            context: *Context,
+            completion: *IO.Completion,
+            result: IO.TimeoutError!void,
+        ) void {
+            _ = completion;
+            result catch unreachable;
+            context.fired = true;
+        }
+    }.run_test();
+}
