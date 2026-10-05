@@ -107,7 +107,7 @@ than Markdown (N68): typecheck, format,
 unit, integration, API, view, mixed-release and demo tests, every fuzzer at its smoke size, and the VOPR,
 as parallel jobs (N57). On a pull request the VOPR runs seeds 1, 2, 5 and one random seed in Debug
 (printed, so a failure replays); on `main` it runs in ReleaseSafe, seeds 1, 2 and 5 and then four
-lanes of random seeds for 6 minutes each, about 300 seeds a push (N73). A commit to `main` that changes `VERSION` runs CI on that commit, then
+lanes of random seeds for 6 minutes each, about 300 seeds a push (N74). A commit to `main` that changes `VERSION` runs CI on that commit, then
 publishes binaries for Linux and macOS (x86_64, aarch64) as GitHub release `v<VERSION>`
 (`release.yml`), with that version's section of [CHANGELOG.md](./CHANGELOG.md) as the release
 notes; releasing a version twice, or without notes, fails. Each release also carries its bill of
@@ -146,7 +146,9 @@ cluster of two releases.
 `nerva start --statsd=<host:port>` sends the replica's metrics over UDP every 10 seconds, in
 statsd format with DogStatsD tags (`|#cluster:…,replica:N`). `--trace=<path>` writes a JSON span
 trace for [Perfetto](https://ui.perfetto.dev) or `chrome://tracing` to a new file (it refuses
-an existing one); tracing slows the replica, so use it to diagnose, not to time. The metrics most useful for performance work:
+an existing one); tracing slows the replica, so use it to diagnose, not to time. The trace is
+written 64 KiB at a time and stops at `--trace-size-max` (default 1 GiB), or if writing it fails,
+with a warning in the log; the replica runs on (N71). The metrics most useful for performance work:
 
 | Metric | What it measures |
 |---|---|
@@ -233,10 +235,10 @@ answers `503` and `/healthz` answers `503`, and it reconnects on its own, trying
 5 s whether or not requests arrive (N64); `nerva view` then reads the feed on from where it
 stopped. Heads are parsed
 strictly: lines end in CRLF, bodies have a `Content-Length` (no `Transfer-Encoding`), and
-anything malformed answers `400`. A body is at most 4 MiB, and `nerva api` spends at most
-64 MiB on one request: a body that would take more once parsed (deeply nested or very long JSON
-arrays) answers `413 {"error":"request too complex"}`, and the gateway keeps at most 8 MiB
-between requests (N69).
+anything malformed answers `400`. A body is at most 4 MiB, and a `nerva api` request may
+allocate at most 128 MiB: a body that would take more once parsed (deeply nested or very long
+JSON arrays) answers `413 {"error":"request too complex"}`. What a request took is given back as
+soon as its reply is written; the gateway keeps at most 8 MiB between requests (N69).
 
 **Documents** hold values larger than a row: up to 64 KiB under a string key (up to 1024 bytes
 of UTF-8) in a namespace (a `u64`, as a decimal string). Nerva chunks them over rows of a
@@ -289,7 +291,8 @@ process restarts.
 - An `add` to a field a view filters or groups by is refused (`409 view_key_field`); adds to
   summed fields are what views are for.
 - One op touches at most about 4,000 distinct groups and 8,000 `min` and `max` members (a write
-  takes one in each such slot of its table), however many writes it has. A transaction that
+  takes one in each such slot of its table), however many writes it has: a transaction writes
+  at most about 4,000 rows of a table with two such slots, 2,000 with four. A transaction that
   exceeds them on its own is refused whole (`413 views_too_large`): it never fits, so split it.
   `503 views_busy` is only for a request that packs several transactions (Nerva's clients send
   one each), when earlier ones filled the op: nothing applied, retry it.

@@ -25,7 +25,9 @@ Runs one replica and two API gateways, then:
 - malformed request heads (a bare LF, folded lines, `Transfer-Encoding`, ...) answer 400 or are
   dropped, and the gateway serves the next request (N45);
 - a 4 MiB body of nested or long arrays to answer 413 and leave the gateway's memory near
-  where it was (#31);
+  where it was (#31), and the largest valid `documents/get` (256 keys of 64 KiB) to answer 200
+  (#60);
+- `--trace` to stop at `--trace-size-max` with the replica still serving (#30);
 - 401 without the key, 404 and 405.
 
 Usage: api.py <path to nerva> [--seed=N] [--steps=N]
@@ -404,10 +406,28 @@ def check_request_memory(cluster):
         text = response.read().decode()
         connection.close()
         assert response.status == 413 and "too complex" in text, (name, response.status, text)
-        after = rss_mib(pid)
+        # Given back just after the reply is written (#60).
+        deadline = time.monotonic() + 5
+        while (after := rss_mib(pid)) >= baseline + 100 and time.monotonic() < deadline:
+            time.sleep(0.1)
         assert after < baseline + 100, f"{name}: RSS {baseline} MiB before, {after} MiB after"
     assert request(port, "GET", "/healthz", key=None)[0] == 200
     return baseline, rss_mib(pid)
+
+
+def check_documents_get_max(port):
+    # The largest valid `documents/get` (`keys_max` keys of 64 KiB) is answered (#60: the
+    # request budget refused it).
+    value = "ab" * (64 * 1024)
+    keys = [f"max-{i:03}" for i in range(256)]
+    for start in range(0, len(keys), 8):
+        writes = [{"key": key, "value_hex": value} for key in keys[start:start + 8]]
+        status, body = request(port, "POST", "/v1/documents/commit",
+                               {"namespace": "60", "reads": [], "writes": writes})
+        assert status == 200, (status, body)
+    status, body = request(port, "POST", "/v1/documents/get", {"namespace": "60", "keys": keys})
+    assert status == 200, (status, body)
+    assert all(d["value_hex"] == value for d in body["documents"]), "a document differs"
 
 
 def check_malformed(port):
@@ -471,6 +491,49 @@ def check_trace_refuses_existing(nerva, tmp):
     assert result.returncode != 0, "start --trace=<existing file> did not refuse"
     with open(victim, "rb") as f:
         assert f.read() == b"x" * 100_000, "start --trace=<existing file> changed the file"
+
+
+def check_trace_bounded(nerva, tmp):
+    # `--trace` stops at `--trace-size-max` and the replica runs on (#30; it used to grow
+    # without bound, and to panic when a write failed).
+    data_file = os.path.join(tmp, "traced.nerva")
+    trace = os.path.join(tmp, "traced.json")
+    subprocess.run([nerva, "format", "--cluster=0", "--replica=0", "--replica-count=1",
+                    "--development", data_file], check=True, capture_output=True)
+    log = open(os.path.join(tmp, "traced.log"), "w+")
+    replica = subprocess.Popen([nerva, "start", "--addresses=0", "--development",
+                                f"--trace={trace}", "--trace-size-max=64KiB", data_file],
+                               stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log,
+                               text=True)
+    gateway = None
+    try:
+        address = replica.stdout.readline().strip()
+        gateway = subprocess.Popen([nerva, "api", "--cluster=0", f"--addresses={address}",
+                                    "--listen=127.0.0.1:0"], stdin=subprocess.PIPE,
+                                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                   env={**os.environ, "NERVA_KEY": KEY}, text=True)
+        port = int(gateway.stdout.readline())
+        deadline = time.monotonic() + 60
+        while "tracing stopped" not in open(log.name).read():
+            assert time.monotonic() < deadline, "the trace never reached --trace-size-max"
+            status, body = request(port, "POST", "/v1/lookup",
+                                   {"rows": [{"table": 1, "id": "0"}]})
+            assert status == 200, (status, body)
+        assert "reached --trace-size-max" in open(log.name).read()
+        for _ in range(20):  # Still serving, with tracing stopped.
+            assert request(port, "POST", "/v1/lookup",
+                           {"rows": [{"table": 1, "id": "0"}]})[0] == 200
+        assert replica.poll() is None, "the replica exited"
+        size = os.path.getsize(trace)
+        assert 0 < size <= 64 * 1024, size
+        return size
+    finally:
+        for process in (gateway, replica):
+            if process is not None:
+                process.kill()
+                process.wait()
+        log.close()
+        os.remove(data_file)
 
 
 def check_stall_recovery(cluster, port):
@@ -544,9 +607,11 @@ def main():
         check_connections(ports[0])
         check_malformed(ports[0])
         rss = check_request_memory(cluster)
+        check_documents_get_max(ports[0])
         check_multiline_body(ports[0])
         check_idle_flood(ports[0])
         check_trace_refuses_existing(nerva, cluster.tmp)
+        trace_size = check_trace_bounded(nerva, cluster.tmp)
         check_stall_recovery(cluster, ports[1])
         check_layouts(ports)
 
@@ -558,7 +623,7 @@ def main():
         print(f"api: PASSED ({steps} steps: {counts}; feed of {len(feed)} changes; "
               f"{len(keys)} histories; {as_of_reads} as-of reads; counter race with "
               f"{conflicts} conflicts retried; gateway RSS {rss[0]} MiB, {rss[1]} MiB after "
-              f"4 MiB nested bodies; seed {seed})")
+              f"4 MiB nested bodies; trace stopped at {trace_size} bytes; seed {seed})")
     finally:
         cluster.close()
 

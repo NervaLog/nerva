@@ -863,8 +863,10 @@ committed op since its declaration.
   distinct members (`members_per_op_max`, 8,190 in production), and admission counts them as it
   counts groups (N52): a write counts its member in each `min` or `max` slot of each view whose
   filter its old or new value passes, and a transaction that would take the op past the limit
-  is refused whole (`views_busy`). With one or two such slots on a table any request fits; with
-  four, a transaction of more than about 2,000 writes to that table never does. The owner chose
+  is refused whole (`views_busy`). With one such slot on a table any request fits; with k, a
+  transaction of more than 8,190 / k writes to that table never does: 4,094 with two, 2,047 with
+  four (measured; this said two slots fit any request, corrected after the 0.0.4 hardening pass,
+  and such a transaction is refused `views_too_large` since N72). The owner chose
   this over sizing the members trees so that nothing is ever refused: measured on one replica
   (`--development`, RSS after start), `main` takes 1,014 MiB, this change 1,295 MiB, and with
   members sized for 4 × a request's entries 1,953 MiB. The 281 MiB are mostly the two version
@@ -1051,19 +1053,28 @@ protection), so a run that never starts blocks no merge. A release still runs CI
 `release.yml` calls `ci.yml`, and a call is not filtered by paths. If a test ever reads a
 Markdown file, it must be added back to the filter.
 
-**N69. `nerva api` spends at most 64 MiB on one request, and keeps at most 8 MiB.**
+**N69. A `nerva api` request may allocate at most 128 MiB, and is given back when it answers.**
 Request bodies are parsed into `std.json.Value` in a per-request arena, which costs many times
 the body for nested or long arrays, and the arena was reset with `.retain_capacity`, so one
 4 MiB body pinned its peak for the gateway's life (#31; measured at `825355c`: 91 to 788 MiB for
-nested arrays, 527 MiB for a long one). The arena now allocates through `MemoryBudget`
-(`src/nerva/api/memory_budget.zig`), which refuses an allocation past 64 MiB held and records
-it; the gateway answers `413 {"error":"request too complex"}` instead of 500 and serves on. The
-arena is reset with `.retain_with_limit = 8 MiB`. A budget, rather than limits on JSON depth or
-array length, bounds every shape of body at once, including ones parsed into typed structs. 64 MiB
-is well above what any valid request needs (a full 4 MiB commit parses in a few MiB). Tests:
-unit tests of the budget (refusal, frees, an arena over nested JSON); `test:api` sends both
-bodies (413) and checks the gateway's RSS stays within 100 MiB of where it was (measured: 92 MiB
-before, 133 MiB after).
+nested arrays, 527 MiB for a long one). A request now allocates through `MemoryBudget`
+(`src/nerva/api/memory_budget.zig`), over the arena: it counts the bytes the request asks for,
+refuses an allocation past 128 MiB, and records it, so the gateway answers
+`413 {"error":"request too complex"}` instead of 500 and serves on. The arena is reset as soon as
+the reply is written (`respond` writes it before returning), keeping at most 8 MiB. A budget,
+rather than limits on JSON depth or array length, bounds every shape of body at once.
+- **Above the arena, not below** (#60). #57 first put the budget below the arena, at 64 MiB.
+  But `ArenaAllocator` sizes each new block from the last one plus the request, so below it the
+  budget counted several times what the request asked for: the largest valid request, a
+  `documents/get` of 256 documents of 64 KiB, asks for about 100 MB (rows, chunks, values, hex
+  reply) yet counted 330 MiB, and was refused. Above the arena the budget counts requests, and
+  128 MiB holds that `get`. The cost is that the memory the arena touches can reach two to three
+  times the budget for a moment (about 290 MiB for the nested-array body, from 788 MiB), and it
+  is given back at once. The `get` reply is also sized up front, so it is not copied as it grows.
+Tests: unit tests of the budget (refusal, frees, a request over an arena failing on nested JSON,
+then the next fitting); `test:api` sends both bodies (413) and checks the gateway's RSS returns
+within 100 MiB of where it was (93 MiB, then 101 MiB), and that the largest valid
+`documents/get` answers 200.
 
 **N70. An evicted client is deinit'ed by `Client.deinit`, not by its eviction callback.**
 The vendored VSR client asks its eviction callback to deinit it, but calls the callback from
@@ -1077,6 +1088,20 @@ client processes no message. No vendored file changes. Test: `test:integration` 
 restarting replica 0 (down since the failover step, which makes registrations slow) and pushing
 a client's session out with `clients_max` newer ones; its next two requests get
 `error.Evicted` (before: the process aborted on an assertion in `MessageBuffer.invalidate`).
+
+**N71. `--trace` writes through a buffered, bounded writer that never fails.**
+The vendored tracer writes each span with one `write(2)` on the replica's thread and panics if
+it fails, and nothing bounded the file: with `--trace` (N50), a full trace disk killed the
+replica, and the trace grew with the request rate (#30; measured at `03b3c93` with the trace on a
+1 MiB tmpfs: `panic: Tracer.start: error.NoSpaceLeft` after 283 lookups). Rather than patch the
+vendored tracer, Nerva hands it a writer that cannot fail (`src/nerva/trace_file.zig`): it
+buffers spans and writes them 64 KiB at a time; on a write error, or once the file would pass
+`--trace-size-max` (new, default 1 GiB, refused without `--trace`), it logs once
+(`warning(trace_file): tracing stopped: …`) and drops what follows. `nerva start` flushes it on
+exit. Up to 64 KiB of spans are lost if the replica crashes, an acceptable cost for a diagnostic
+flag. Tests: unit (buffering, a failing writer, the size limit); `test:api` runs a replica with
+`--trace-size-max=64KiB` under load (stopped at 65,503 bytes, still serving). Measured once on a
+1 MiB tmpfs: the replica logs the stop and served 54,915 lookups in the time `main`'s panicked.
 
 **N72. A transaction too large for any op gets `views_too_large` (413), not `views_busy`.**
 `views_busy` (N52) said "retry in a later op", but a transaction whose own distinct view groups
@@ -1094,7 +1119,20 @@ and the request whose third transaction overflows only with the first two expect
 and then commits alone; `test:views` sends 4,200 new groups (413) and the same rows split in two
 (200 each).
 
-**N73. On `main`, the VOPR runs in ReleaseSafe on about 300 seeds; pull requests keep Debug.**
+**N73. The op's `min`/`max` scratch holds two keys per member.**
+`extremes_gather` gives each touched member up to two (group, slot) keys: the group it left, when
+it held that group's value as stored, and the group it entered. `extremes_scratch` was sized for
+one per member, so one admitted transaction moving the holders of many groups' values to new
+groups (about 1,640 rows, each alone in its group, under four slots) overflowed it: every replica
+panicked (`integer overflow` in `getOrPutAssumeCapacity`), and again replaying the op after a
+restart (#62; reproduced at `8c206f2`, found by the 0.0.4 hardening pass). It is now sized for
+`2 * members_limit`, the most admission lets an op reach. Other scratch structures were checked
+against admission and are sized right. Tests: a state-machine test moves every holder the op's
+member limit admits to new groups in one transaction (it panicked; it now commits and every new
+group holds its row's values); at production limits, 2,047 rows moved in one transaction commit
+and the replica serves on.
+
+**N74. On `main`, the VOPR runs in ReleaseSafe on about 300 seeds; pull requests keep Debug.**
 CI ran the VOPR on seeds 1, 2, 5 and one random seed in Debug on every push and pull request
 (N32): 40 s to 2m01 a seed (N57). ReleaseSafe runs the same seed 10 to 40 times faster (measured
 locally, one core: seed 1 in 8 s, 2 in 1 s, 5 in 3 s; `fuzz_loop.sh` searched 25 random seeds
