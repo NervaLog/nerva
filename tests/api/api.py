@@ -24,6 +24,7 @@ Runs one replica and two API gateways, then:
   unhealthy, then recovers on its own (#27);
 - malformed request heads (a bare LF, folded lines, `Transfer-Encoding`, ...) answer 400 or are
   dropped, and the gateway serves the next request (N45);
+- `--trace` to stop at `--trace-size-max` with the replica still serving (#30);
 - 401 without the key, 404 and 405.
 
 Usage: api.py <path to nerva> [--seed=N] [--steps=N]
@@ -437,6 +438,49 @@ def check_trace_refuses_existing(nerva, tmp):
         assert f.read() == b"x" * 100_000, "start --trace=<existing file> changed the file"
 
 
+def check_trace_bounded(nerva, tmp):
+    # `--trace` stops at `--trace-size-max` and the replica runs on (#30; it used to grow
+    # without bound, and to panic when a write failed).
+    data_file = os.path.join(tmp, "traced.nerva")
+    trace = os.path.join(tmp, "traced.json")
+    subprocess.run([nerva, "format", "--cluster=0", "--replica=0", "--replica-count=1",
+                    "--development", data_file], check=True, capture_output=True)
+    log = open(os.path.join(tmp, "traced.log"), "w+")
+    replica = subprocess.Popen([nerva, "start", "--addresses=0", "--development",
+                                f"--trace={trace}", "--trace-size-max=64KiB", data_file],
+                               stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log,
+                               text=True)
+    gateway = None
+    try:
+        address = replica.stdout.readline().strip()
+        gateway = subprocess.Popen([nerva, "api", "--cluster=0", f"--addresses={address}",
+                                    "--listen=127.0.0.1:0"], stdin=subprocess.PIPE,
+                                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                   env={**os.environ, "NERVA_KEY": KEY}, text=True)
+        port = int(gateway.stdout.readline())
+        deadline = time.monotonic() + 60
+        while "tracing stopped" not in open(log.name).read():
+            assert time.monotonic() < deadline, "the trace never reached --trace-size-max"
+            status, body = request(port, "POST", "/v1/lookup",
+                                   {"rows": [{"table": 1, "id": "0"}]})
+            assert status == 200, (status, body)
+        assert "reached --trace-size-max" in open(log.name).read()
+        for _ in range(20):  # Still serving, with tracing stopped.
+            assert request(port, "POST", "/v1/lookup",
+                           {"rows": [{"table": 1, "id": "0"}]})[0] == 200
+        assert replica.poll() is None, "the replica exited"
+        size = os.path.getsize(trace)
+        assert 0 < size <= 64 * 1024, size
+        return size
+    finally:
+        for process in (gateway, replica):
+            if process is not None:
+                process.kill()
+                process.wait()
+        log.close()
+        os.remove(data_file)
+
+
 def check_stall_recovery(cluster, port):
     # A cluster stall past the client's timeout (30 s) breaks the gateway's client; the gateway
     # replaces it once the cluster is back, and /healthz says so meanwhile (#27). It recovers
@@ -510,6 +554,7 @@ def main():
         check_multiline_body(ports[0])
         check_idle_flood(ports[0])
         check_trace_refuses_existing(nerva, cluster.tmp)
+        trace_size = check_trace_bounded(nerva, cluster.tmp)
         check_stall_recovery(cluster, ports[1])
         check_layouts(ports)
 
@@ -520,7 +565,8 @@ def main():
 
         print(f"api: PASSED ({steps} steps: {counts}; feed of {len(feed)} changes; "
               f"{len(keys)} histories; {as_of_reads} as-of reads; counter race with "
-              f"{conflicts} conflicts retried; seed {seed})")
+              f"{conflicts} conflicts retried; trace stopped at {trace_size} bytes; "
+              f"seed {seed})")
     finally:
         cluster.close()
 

@@ -635,3 +635,16 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
 - Demos read views from `nerva api` and compare its hash with a `nerva view` process's.
 - Tests: `tests/views/maintained.py` (byte-for-byte equality, the new routes and refusals), the
   randomized test with pages ending early, format guard for `Group.op`. Mutation-tested.
+
+## 2026-10-05 — `--trace` cannot stop the replica (N71; #30)
+
+- `src/nerva/trace_file.zig`: `TraceFile`, a buffered writer that stops (with a warning) on a
+  write error or at its size limit, and never fails; unit tests. `src/nerva_main.zig`: the
+  tracer writes through it. `src/nerva/cli.zig`: `--trace-size-max` (default 1 GiB).
+- `tests/api/api.py`: a traced replica with `--trace-size-max=64KiB` under load stops tracing at
+  the cap and keeps serving. README, TUTORIAL.
+- Verified: `check`, `test:fmt`, `test:unit` 341/342 (the sandbox-denied perf test), `test:api`
+  (stopped at 65,503 bytes). On a 1 MiB
+  tmpfs: `main`'s replica panics (`Tracer.start: error.NoSpaceLeft`, 283 lookups in); the fix
+  logs `tracing stopped: writing it failed: error.NoSpaceLeft` and serves 54,915 lookups.
+

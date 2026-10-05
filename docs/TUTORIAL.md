@@ -811,8 +811,9 @@ Three `nerva start` flags help when you run Nerva for real:
 - `--trace=<path>` writes a span trace you can open in [Perfetto](https://ui.perfetto.dev). It
   slows the replica, so use it to diagnose, not to measure, and give it a **new** file: an
   existing one is refused (`--trace: existing.json exists; give a new file`), so a typo cannot
-  overwrite your data file. Do not leave it on: the trace grows without bound, and a write error
-  to it stops the replica ([#30](https://github.com/Botpike/nerva-ledger/issues/30)).
+  overwrite your data file. Tracing stops, with `warning(trace_file): tracing stopped: …` in the
+  log, at `--trace-size-max` (default `1GiB`) or if writing fails (a full disk, say); the
+  replica runs on.
 - `--cache-grid=<size>` and `--cache-rows=<size>` size the block cache and the row cache (128
   bytes a row). The row cache defaults to its minimum, a few hundred rows.
 

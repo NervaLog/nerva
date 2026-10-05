@@ -466,6 +466,7 @@ test start_resolve {
         .cache_rows = null,
         .statsd = null,
         .trace = null,
+        .trace_size_max = null,
         .development = true,
         .log_debug = false,
         .path = "0_0.nerva",
@@ -488,6 +489,19 @@ test start_resolve {
     const observed_start = try start_resolve(observed);
     try std.testing.expectEqual(@as(u16, 9125), observed_start.statsd.?.port);
     try std.testing.expectEqualStrings("trace.json", observed_start.trace.?);
+    try std.testing.expectEqual(trace_size_default, observed_start.trace_size_max);
+
+    var trace_bounded = observed;
+    trace_bounded.trace_size_max = .{ .value = 64, .unit = .kib };
+    try std.testing.expectEqual(64 * 1024, (try start_resolve(trace_bounded)).trace_size_max);
+
+    var trace_size_alone = start;
+    trace_size_alone.trace_size_max = .{ .value = 64, .unit = .kib };
+    try std.testing.expectError(error.TraceSizeMaxWithoutTrace, start_resolve(trace_size_alone));
+
+    var trace_size_zero = observed;
+    trace_size_zero.trace_size_max = .{ .value = 0 };
+    try std.testing.expectError(error.TraceSizeMaxZero, start_resolve(trace_size_zero));
 
     var trace_empty = start;
     trace_empty.trace = "";
