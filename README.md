@@ -104,7 +104,9 @@ unit, integration, API, view, mixed-release and demo tests, every fuzzer at its 
 2, 5 and one random seed (printed, so a failure replays), as parallel jobs (N57). A commit to `main` that changes `VERSION` runs CI on that commit, then
 publishes binaries for Linux and macOS (x86_64, aarch64) as GitHub release `v<VERSION>`
 (`release.yml`), with that version's section of [CHANGELOG.md](./CHANGELOG.md) as the release
-notes; releasing a version twice, or without notes, fails.
+notes; releasing a version twice, or without notes, fails. A separate workflow,
+`fuzz.yml`, runs every fuzzer and the VOPR on random seeds for a time budget; it is started by hand
+on runners brought up for it.
 
 Binaries report `<protocol>+<commit>`. The protocol release (`0.0.3` since maintained views,
 N60) is what data files and clients check: a replica refuses a data file of another release, so

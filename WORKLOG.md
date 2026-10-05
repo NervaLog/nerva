@@ -447,6 +447,14 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
   9 s), and recovers from a damaged copy; `zig build check` passes through the links;
   actionlint is clean apart from the custom `fly` label.
 
+## 2026-10-05 — Long fuzzing workflow (N59)
+
+- `.github/workflows/fuzz.yml` (dispatch only) and `.github/scripts/fuzz_loop.sh`: every fuzzer
+  and seven VOPR lanes on random seeds for a time budget, on Fly runners started for the run.
+- Verified locally: `nerva_adds` for a minute (319 runs, passing); the `canary` fuzzer's planted
+  failure is reported with its seed and replay command, and fails the job; the VOPR path (testing
+  state machine, 9 runs); the workflow parses, 16 fuzz and 7 VOPR jobs.
+
 ## 2026-10-05 — Release v0.3.0 (N60)
 
 - `build.zig`: release `0.0.3`, clients from `0.0.2`. `CHANGELOG.md`: the v0.3.0 section
