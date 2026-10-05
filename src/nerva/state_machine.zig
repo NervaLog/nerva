@@ -1379,17 +1379,15 @@ pub fn StateMachineType(comptime Storage: type) type {
             assert(self.view_groups_count == null);
             const query = view_query(self.prefetch_input.?);
             const limit = view_query_limit(query) orelse return self.prefetch_finish();
-            if (query.view_id == 0 or query.view_id > self.views_op_count) {
-                return self.prefetch_finish();
-            }
+            const view_id = self.view_query_id(query) orelse return self.prefetch_finish();
 
             const groups = &self.forest.grooves.groups;
             const scan = groups.scan_builder.scan_unique_key_range(
                 .key,
                 self.forest.scan_buffer_pool.acquire_assume_capacity(),
                 self.prefetch_snapshot.?,
-                @as(u128, query.view_id) << 64 | query.group_hash_min,
-                @as(u128, query.view_id) << 64 | std.math.maxInt(u64),
+                @as(u128, view_id) << 64 | query.group_hash_min,
+                @as(u128, view_id) << 64 | std.math.maxInt(u64),
                 .ascending,
             );
             self.groups_scan_lookup = GroupsScanLookup.init(groups, scan);
@@ -1418,7 +1416,23 @@ pub fn StateMachineType(comptime Storage: type) type {
         fn view_query_limit(query: *const ViewQuery) ?u32 {
             if (query.limit == 0) return null;
             if (!stdx.zeroed(&query.reserved)) return null;
+            // By id or by name, not both.
+            if (query.view_id != 0 and !stdx.zeroed(&query.name)) return null;
             return @min(query.limit, view_groups_limit_max);
+        }
+
+        /// The id of the view a valid query names, or null if no such view is declared.
+        fn view_query_id(self: *const StateMachine, query: *const ViewQuery) ?u64 {
+            if (query.view_id != 0) {
+                return if (query.view_id <= self.views_op_count) query.view_id else null;
+            }
+            const name_size = std.mem.indexOfScalar(u8, &query.name, 0) orelse query.name.len;
+            const name = query.name[0..name_size];
+            if (name.len == 0 or !stdx.zeroed(query.name[name_size..])) return null;
+            for (self.views_op[0..self.views_op_count]) |*view| {
+                if (std.mem.eql(u8, views.definition_name(&view.definition), name)) return view.id;
+            }
+            return null;
         }
 
         /// Stage 1 of `pulse`: scans the rows of the oldest building view's table from its
@@ -1488,14 +1502,15 @@ pub fn StateMachineType(comptime Storage: type) type {
             header.kind = .header;
             header.view_id = query.view_id;
             header.op = op;
-            if (query.view_id == 0 or query.view_id > self.views_op_count) {
+            const view_id = self.view_query_id(query) orelse {
                 assert(self.view_groups_count == null);
                 header.state = .missing;
                 return @sizeOf(ViewRecord);
-            }
+            };
+            header.view_id = view_id;
 
-            const view = &self.views_op[query.view_id - 1];
-            assert(view.id == query.view_id);
+            const view = &self.views_op[view_id - 1];
+            assert(view.id == view_id);
             header.state = view.state;
             header.declared_op = view.declared_op;
             header.group_count = view.group_count;

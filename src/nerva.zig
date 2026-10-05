@@ -423,12 +423,15 @@ pub const Group = extern struct {
 /// The `get_view` event: the latest state of one view, and a page of its groups in storage
 /// order (by group hash).
 pub const ViewQuery = extern struct {
+    /// The view, by id; or zero, and the view by `name`.
     view_id: u64,
     /// Groups with `group_hash >= group_hash_min`. Zero: from the first.
     group_hash_min: u64,
     /// Groups per page, at most; zero is invalid.
     limit: u32,
-    reserved: [44]u8 = @splat(0),
+    /// With `view_id` zero: the view's name, zero-padded. Otherwise all zero.
+    name: [32]u8 = @splat(0),
+    reserved: [12]u8 = @splat(0),
 
     comptime {
         assert(@sizeOf(ViewQuery) == 64);
