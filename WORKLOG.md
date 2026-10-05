@@ -550,6 +550,23 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
   `as_of`; format guards updated. Mutation-tested: three planted bugs fail the unit test; the
   VOPR catches a blunt one but not those three (N62 says why).
 
+## 2026-10-05 — A software bill of materials with every release (N63)
+
+- `.github/scripts/sbom.py`: CycloneDX 1.5 JSON for a tag and commit, from `build.zig`,
+  UPSTREAM.md and `zig/download.sh`; refuses disagreeing or missing pins.
+- `.github/workflows/release.yml`: the `version` job checks it can be written; the release adds
+  `nerva-v<VERSION>.cdx.json` to the assets and to `SHA256SUMS`, and the notes name it.
+- `.github/scripts/test_sbom.py`, run in CI's `system` job. README: the release paragraph.
+- Verified: the tests (6), mutation-tested; strict validation of v0.3.0's SBOM against the
+  CycloneDX 1.5 schema; a dry run of the release step's `dist/` and `SHA256SUMS`.
+
+## 2026-10-05 — CI frees a nearly full runner volume (N65; #50)
+
+- `.github/scripts/free_disk.sh`: logs free space; below 6 GiB empties the Zig build cache and
+  older toolchains. Run by `INSTALL_ZIG` in `ci.yml` and before the release build.
+- Verified locally: with room it changes nothing; with the threshold forced above the free space
+  it removes the build cache and the older toolchain, keeps the pinned one, and warns.
+
 ## 2026-10-05 — Nightly: build the image on the host network
 
 - The first nightly run failed building its image: `fly machine run .` used the runner's local
