@@ -96,7 +96,9 @@ holding facts, receipts and views. Nerva must support the second arrangement eit
      `nerva api`, N41); attributed approvals still need an identity model (N30).
 5. ✅ **Declared views** (G4): layouts and view declarations in the log, computed by `nerva view`
    latest or as of any op, with a hash per answer (N34, N35); demonstrated by the seat and
-   canvas demos under crashes (N36, N38).
+   canvas demos under crashes (N36, N38). Views with `count` and `sum` are also maintained by
+   the state machine itself, with a hash every replica agrees on (N49); `min`, `max` and `as_of`
+   there are next.
 6. **Effect sinks** (G5) and **conditional operations for hot balances** (G8).
    - G8 ✅ adds: bounded, clampable changes to a 64-bit field inside the commit, which never
      conflict; `delta_from` moves exactly what an earlier add took (N42). The VOPR checks that

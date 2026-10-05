@@ -308,3 +308,18 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
   Machines of Botpike/ci-runners, instead of `ubuntu-latest`. Steps unchanged.
 - Verified on the pull request's own CI run: unit tests (the perf test skips), integration,
   API, views, demos and the four VOPR seeds pass on the new runners.
+
+## 2026-10-05 — Views maintained by the state machine (N49)
+
+- `src/nerva.zig`: `declare_view`, `get_view` and `pulse` operations; `ViewDefinition`, `View`,
+  `Group`, `ViewQuery`, `ViewRecord`; statuses `view_key_field` and `views_busy`; tree ids 5–8.
+- `src/nerva/views.zig`: validation, row membership, group keys and hashes, the consensus hash.
+- `src/nerva/state_machine.zig`: `views` and `groups` grooves; three-stage commit prefetch;
+  groups and hash kept in every commit; the per-op group budget; declare; paged reads by id or
+  name; backfill by pulse. Commit entries reserve 5 timestamps each.
+- `src/lsm/scan_builder.zig`: `scan_unique_key_range` (UPSTREAM.md).
+- `nerva api`: `PUT /v1/views/<name>` also declares into the state machine;
+  `GET /v1/views/<name>/groups`; `409 view_key_field`, `503 views_busy`. Client:
+  `declare_view`, `get_view`.
+- Tests: unit and state machine tests, the VOPR model of views, `tests/views/maintained.py` in
+  `test:views`. Mutation-tested.
