@@ -651,3 +651,27 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
   new groups answer 413; split in two, they commit). Format snapshot: the new status line.
 - Verified: `check`, `test:fmt`, `test:unit` (the sandbox-denied perf test aside), `test:views`;
   VOPR seeds 1, 2, 5 (one `views_busy`, one `views_too_large`) and 2467272726192300042.
+
+## 2026-10-05 — Declared ledgers: conserved fields, floors, paired adds (N74)
+
+- `src/nerva.zig`: `LedgerField`, `LedgerDefinition`, `DeclareLedgerStatus`,
+  `DeclareLedgerResult`, `LedgerQuery`, `Ledger`; operations `declare_ledger` and `get_ledger`;
+  `AddFlags.pair`; `EntryStatus.unpaired = 16`, `conserved_write = 17`;
+  `DeclareStatus.ledger_field`; tree ids 16 and 17; `ledger_bounds`.
+- `src/nerva/ledgers.zig`: `definition_validate`, and `Index`, the conserved fields sorted for
+  bisection.
+- `src/nerva/state_machine.zig`: the `ledgers` groove, prefetched and loaded every op that needs
+  it; `declare_ledger` and `get_ledger`; in `commit_failure`, overlapping adds and the pair
+  rules; in `adds_resolve`, floors and conserved puts and deletes; views refused over conserved
+  fields.
+- `src/nerva/client.zig`: `declare_ledger`, `get_ledger`. `src/nerva/api/api.zig`:
+  `PUT`/`GET /v1/ledgers/<id>`, `"pair"` on adds, 409 `unpaired` and `conserved_write`;
+  `PUT /v1/views` declares into the state machine before writing the catalog.
+- Tests: `state_machine_tests.zig` (pairs, refusals, floors, declarations, views, reload);
+  `workload.zig` (ledger traffic, the model's rules, `check_ledger`); `adds_fuzz.zig` (floors,
+  partners, conservation); `tests/api/ledgers.py`, in `test:api`; format guards.
+- Docs: README "Ledgers" and routes; DECISIONS N74; GOALS G8 decided and the non-goal's note;
+  CHANGELOG v0.4.0.
+- Verified: `check`, `test:fmt`, `test:unit` (the sandbox-denied perf test aside), `test:api`,
+  `test:views`, `test:integration`, `test:release`, `fuzz -- smoke`, VOPR seeds; four planted
+  bugs, each caught.

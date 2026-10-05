@@ -10,6 +10,11 @@
 //! budgets with adds only (no reads), never conflicting. The checker asserts, independently of
 //! the model, that each budget's available plus held equals what was funded, after every add.
 //!
+//! And a declared ledger (N74): pairs fund, reserve, post and void between accounts and a
+//! source, among unpaired halves, puts and deletes of balances and straddling adds, which must
+//! all fail. The checker asserts, independently of the row model, that the ledger's total stays
+//! what it was at its declaration (zero), and that no floored field goes below its floor.
+//!
 //! The simulator delivers replies in op order, so the workload checks each reply against an
 //! in-memory model of the committed state at that op: every status, version, value and change
 //! must match exactly. This checks strict serializability of commits and the change feed.
@@ -40,6 +45,7 @@ const ViewDefinition = nerva.ViewDefinition;
 const ViewRecord = nerva.ViewRecord;
 const DeclareResult = nerva.DeclareResult;
 const views = @import("views.zig");
+const ledgers = @import("ledgers.zig");
 
 /// The table holding receipts. Random transactions never touch it.
 pub const receipts_table: u32 = 100;
@@ -107,6 +113,71 @@ fn budget_add(id: u64, offset: u8, delta: i64, delta_from: ?u32) Entry {
         .op_seen = 0,
         .value = parameters.value(),
     };
+}
+
+/// Ledger 1 (N74): accounts in one table (`available` at 0 and `held` at 8, i64s floored at
+/// 0) and one unfloored source in another, which funds them and so goes negative. Only ledger
+/// traffic touches these tables, and only once the ledger is declared: their total stays 0.
+pub const ledger_accounts_table: u32 = 102;
+pub const ledger_sources_table: u32 = 103;
+/// Ledger probes name a field of this table, which no ledger holds.
+const ledger_probe_table: u32 = 104;
+
+fn ledger_main() nerva.LedgerDefinition {
+    var definition = std.mem.zeroes(nerva.LedgerDefinition);
+    definition.id = 1;
+    definition.field_count = 3;
+    definition.fields[0] = .{
+        .table = ledger_accounts_table,
+        .offset = 0,
+        .flags = .{ .floor = true },
+        .floor = 0,
+    };
+    definition.fields[1] = .{
+        .table = ledger_accounts_table,
+        .offset = 8,
+        .flags = .{ .floor = true },
+        .floor = 0,
+    };
+    definition.fields[2] = .{
+        .table = ledger_sources_table,
+        .offset = 0,
+        .flags = .{},
+        .floor = 0,
+    };
+    return definition;
+}
+
+/// An add to the i64 at `offset`: a pair's first half (`pair`), or its partner (`partner_of`).
+fn ledger_add(table: u32, id: u64, offset: u8, delta: i64, options: struct {
+    pair: bool = false,
+    clamp: bool = false,
+    partner_of: ?u32 = null,
+}) Entry {
+    const parameters: Add = .{
+        .delta = delta,
+        .min = 0,
+        .max = 0,
+        .delta_from = options.partner_of orelse 0,
+        .offset = offset,
+        .field = .i64,
+        .flags = .{
+            .clamp = options.clamp,
+            .create = true,
+            .delta_from = options.partner_of != null,
+            .pair = options.pair,
+        },
+    };
+    return .{ .id = id, .table = table, .kind = .add, .op_seen = 0, .value = parameters.value() };
+}
+
+fn ledger_is(entries: []const Entry) bool {
+    for (entries) |*entry| {
+        if (entry.table != ledger_accounts_table and entry.table != ledger_sources_table) {
+            return false;
+        }
+    }
+    return entries.len > 0;
 }
 
 /// A signed integer in `[min, max]` (the PRNG draws unsigned ones).
@@ -205,6 +276,7 @@ pub fn WorkloadType(comptime StateMachine: type) type {
             value: [value_size]u8,
         };
 
+        const Request = struct { operation: Operation, size: usize };
         const Failure = struct { index: usize, status: EntryStatus, op: u64, value: u64 = 0 };
         /// An add's expected result.
         const Expected = struct { applied: i64 = 0, value: u64 = 0 };
@@ -212,6 +284,12 @@ pub fn WorkloadType(comptime StateMachine: type) type {
 
         /// Per hot budget, from the adds' results alone: what was funded, and where it is.
         const Budget = struct { funded: u64 = 0, available: u64 = 0, held: u64 = 0 };
+
+        const ModelLedger = struct { op: u64, definition: nerva.LedgerDefinition };
+        /// A conserved field, as the model's ledgers declare it.
+        const ModelConserved = struct { ledger: usize, floor: ?i64 };
+        /// A conserved field of one row.
+        const LedgerFieldKey = struct { row: u128, offset: u8 };
 
         allocator: std.mem.Allocator,
         prng: *stdx.PRNG,
@@ -262,6 +340,17 @@ pub fn WorkloadType(comptime StateMachine: type) type {
 
         budgets: std.AutoHashMapUnmanaged(u64, Budget) = .{},
         budget_transactions: u64 = 0,
+
+        /// Ledgers declared (N74), in declaration order; whether ledger 1 is (ledger traffic
+        /// starts once a reply says so, and so commits after it).
+        model_ledgers: std.ArrayListUnmanaged(ModelLedger) = .{},
+        ledger_declared: bool = false,
+        /// Every conserved field written since, from the adds' results alone (not the row
+        /// model): the checker's view of the ledger.
+        ledger_values: std.AutoHashMapUnmanaged(LedgerFieldKey, i64) = .{},
+        ledger_moves: u64 = 0,
+        ledger_refused: std.EnumArray(EntryStatus, u64) = .initFill(0),
+        ledger_reads: u64 = 0,
         adds_applied: u64 = 0,
         adds_clamped: u64 = 0,
         /// Scratch: the expected results of the transaction being checked (any size, up to a full
@@ -295,6 +384,8 @@ pub fn WorkloadType(comptime StateMachine: type) type {
             receipt_count: u64,
             /// Few budgets, so that adds contend.
             budget_count: u64,
+            /// Accounts of the ledger (N74).
+            ledger_account_count: u64,
 
             pub fn generate(prng: *stdx.PRNG, options: struct {
                 batch_size_limit: u32,
@@ -312,6 +403,7 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                     .invalid_entry_probability = stdx.PRNG.ratio(prng.int_inclusive(u64, 3), 100),
                     .receipt_count = prng.range_inclusive(u64, 1, 4),
                     .budget_count = prng.range_inclusive(u64, 1, 3),
+                    .ledger_account_count = prng.range_inclusive(u64, 2, 5),
                 };
             }
         };
@@ -344,6 +436,7 @@ pub fn WorkloadType(comptime StateMachine: type) type {
             assert(options.entries_per_transaction_max > 0);
             assert(options.receipt_count > 0);
             assert(options.budget_count > 0);
+            assert(options.ledger_account_count >= 2);
             assert(options.entries_per_transaction_max <= transaction_entries_max);
             assert(options.table_count < receipts_table);
             const expected = try allocator.alloc(Expected, StateMachine.commit_entries_max);
@@ -401,6 +494,17 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                 workload.limits_clamped,
                 workload.cursors_continued,
             });
+            log.info("ledger moves={} unpaired={} conserved_write={} out_of_bounds={} " ++
+                "row_absent={} reads={}", .{
+                workload.ledger_moves,
+                workload.ledger_refused.get(.unpaired),
+                workload.ledger_refused.get(.conserved_write),
+                workload.ledger_refused.get(.out_of_bounds),
+                workload.ledger_refused.get(.row_absent),
+                workload.ledger_reads,
+            });
+            workload.model_ledgers.deinit(allocator);
+            workload.ledger_values.deinit(allocator);
             allocator.free(workload.expected);
             workload.budgets.deinit(allocator);
             workload.receipt_seqs.deinit(allocator);
@@ -416,7 +520,7 @@ pub fn WorkloadType(comptime StateMachine: type) type {
             workload: *Workload,
             client_index: usize,
             body: []align(constants.cache_line_size) u8,
-        ) struct { operation: Operation, size: usize } {
+        ) Request {
             workload.requests_sent += 1;
 
             const body_limited = body[0..workload.options.batch_size_limit];
@@ -429,6 +533,7 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                 .get_history = 2,
                 .declare_view = 1,
                 .get_view = 6,
+                .ledger = 4,
             })) {
                 .commit => .{ .operation = .commit, .size = workload.build_commit(body_limited) },
                 .claim => .{
@@ -459,6 +564,7 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                     .operation = .get_view,
                     .size = workload.build_get_view(body),
                 },
+                .ledger => workload.build_ledger(body_limited),
             };
         }
 
@@ -953,6 +1059,8 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                 .declare_view => workload.check_declare_view(request_body, reply_body),
                 .get_view => workload.check_get_view(op, request_body, reply_body),
                 .pulse => unreachable, // Sent by the replica, reported to `on_pulse`.
+                .declare_ledger => workload.check_declare_ledger(op, request_body, reply_body),
+                .get_ledger => workload.check_get_ledger(request_body, reply_body),
             }
         }
 
@@ -994,11 +1102,13 @@ pub fn WorkloadType(comptime StateMachine: type) type {
 
                 const claim = receipt_claim_is(entries);
                 const budget = budget_is(entries);
+                const ledger = ledger_is(entries);
                 const admission = workload.view_txn_admission.items[batch_index];
                 if (workload.commit_failure(entries, admission)) |failure| {
                     // Adds alone, clamped and creating, never fail (G8).
                     assert(!budget);
                     workload.transactions_failed += 1;
+                    if (ledger) workload.ledger_refused.getPtr(failure.status).* += 1;
                     if (claim) {
                         // Claims are always well-formed: they lose only to another claim.
                         assert(failure.status == .conflict);
@@ -1035,6 +1145,7 @@ pub fn WorkloadType(comptime StateMachine: type) type {
 
                 if (claim) workload.check_claim_won(&entries[1]);
                 if (budget) workload.check_budget(entries, results);
+                if (ledger) workload.check_ledger(entries, results);
 
                 for (entries, results, 0..) |*entry, *result, index| {
                     const entry_timestamp =
@@ -1087,6 +1198,440 @@ pub fn WorkloadType(comptime StateMachine: type) type {
             assert(budget.available + budget.held == budget.funded);
         }
 
+        // ---- Ledgers (N74) ----
+
+        /// Before ledger 1 is known declared: its declaration. Then mostly moves (each batch
+        /// one transaction of pairs), some transactions that must fail, reads, and declarations
+        /// that must be refused.
+        fn build_ledger(
+            workload: *Workload,
+            body: []align(constants.cache_line_size) u8,
+        ) Request {
+            const prng = workload.prng;
+            if (!workload.ledger_declared) {
+                return .{
+                    .operation = .declare_ledger,
+                    .size = ledger_declare_body(body, ledger_main()),
+                };
+            }
+            switch (prng.chances(.{ .moves = 12, .refused = 4, .read = 1, .probe = 1 })) {
+                .moves, .refused => |kind| {
+                    var encoder = MultiBatchEncoder.init(body, .{ .element_size = @sizeOf(Entry) });
+                    const batch_count = prng.range_inclusive(
+                        u32,
+                        1,
+                        workload.options.multi_batch_per_request_limit,
+                    );
+                    for (0..batch_count) |_| {
+                        const writable = encoder.writable() orelse break;
+                        const entries_free = stdx.bytes_as_slice(.inexact, Entry, writable);
+                        const count = if (kind == .moves)
+                            workload.build_ledger_moves(entries_free)
+                        else
+                            workload.build_ledger_refused(entries_free);
+                        encoder.add(@intCast(count * @sizeOf(Entry)));
+                        if (count == 0) break;
+                    }
+                    return .{ .operation = .commit, .size = encoder.finish() };
+                },
+                .read => {
+                    const query: *nerva.LedgerQuery = @alignCast(std.mem.bytesAsValue(
+                        nerva.LedgerQuery,
+                        body[0..@sizeOf(nerva.LedgerQuery)],
+                    ));
+                    query.* = .{ .id = prng.range_inclusive(u32, 1, 2) };
+                    return .{ .operation = .get_ledger, .size = @sizeOf(nerva.LedgerQuery) };
+                },
+                .probe => {
+                    // Ledger 1 again, identically or not; or a field of it in another ledger.
+                    var definition = ledger_main();
+                    switch (prng.chances(.{ .again = 1, .different = 1, .taken = 1 })) {
+                        .again => {},
+                        .different => definition.fields[2].flags.floor = true,
+                        .taken => {
+                            definition.id = 2;
+                            definition.field_count = 2;
+                            definition.fields[0] = definition.fields[prng.int_inclusive(usize, 2)];
+                            definition.fields[1] = .{
+                                .table = ledger_probe_table,
+                                .offset = 0,
+                                .flags = .{},
+                                .floor = 0,
+                            };
+                            definition.fields[2] = std.mem.zeroes(nerva.LedgerField);
+                        },
+                    }
+                    return .{
+                        .operation = .declare_ledger,
+                        .size = ledger_declare_body(body, definition),
+                    };
+                },
+            }
+        }
+
+        fn ledger_declare_body(
+            body: []align(constants.cache_line_size) u8,
+            definition: nerva.LedgerDefinition,
+        ) usize {
+            const target: *nerva.LedgerDefinition = @alignCast(std.mem.bytesAsValue(
+                nerva.LedgerDefinition,
+                body[0..@sizeOf(nerva.LedgerDefinition)],
+            ));
+            target.* = definition;
+            return @sizeOf(nerva.LedgerDefinition);
+        }
+
+        /// One transaction of one to three pairs: fund (source to an account's `available`),
+        /// reserve (`available` to `held`), post (`held` to another account's `available`) or
+        /// void (`held` back to `available`). Returns the entries written.
+        fn build_ledger_moves(workload: *Workload, entries: []Entry) usize {
+            const prng = workload.prng;
+            const pairs = @min(prng.range_inclusive(usize, 1, 3), entries.len / 2);
+            const accounts = workload.options.ledger_account_count;
+            for (0..pairs) |pair| {
+                const first: u32 = @intCast(2 * pair);
+                const account = prng.int_inclusive(u64, accounts - 1);
+                const other = (account + prng.range_inclusive(u64, 1, accounts - 1)) % accounts;
+                const amount: i64 = @intCast(prng.range_inclusive(u64, 1, 500));
+                // A first half that does not clamp may fail the transaction: out_of_bounds.
+                const clamp = prng.chance(stdx.PRNG.ratio(4, 5));
+                const accounts_table = ledger_accounts_table;
+                const halves: [2]Entry = switch (prng.chances(.{
+                    .fund = 2,
+                    .reserve = 4,
+                    .post = 3,
+                    .void = 2,
+                })) {
+                    .fund => .{
+                        ledger_add(ledger_sources_table, 0, 0, -amount, .{ .pair = true }),
+                        ledger_add(ledger_accounts_table, account, 0, 0, .{ .partner_of = first }),
+                    },
+                    .reserve => .{
+                        ledger_add(accounts_table, account, 0, -amount, .{
+                            .pair = true,
+                            .clamp = clamp,
+                        }),
+                        ledger_add(accounts_table, account, 8, 0, .{ .partner_of = first }),
+                    },
+                    .post => .{
+                        ledger_add(accounts_table, account, 8, -amount, .{
+                            .pair = true,
+                            .clamp = clamp,
+                        }),
+                        ledger_add(accounts_table, other, 0, 0, .{ .partner_of = first }),
+                    },
+                    .void => .{
+                        ledger_add(accounts_table, account, 8, -amount, .{
+                            .pair = true,
+                            .clamp = clamp,
+                        }),
+                        ledger_add(accounts_table, account, 0, 0, .{ .partner_of = first }),
+                    },
+                };
+                entries[first] = halves[0];
+                entries[first + 1] = halves[1];
+            }
+            return 2 * pairs;
+        }
+
+        /// A transaction that must not change the ledger: an unpaired half, a partner that
+        /// clamps, a put or delete of an account, an add straddling `available` and `held`. A
+        /// put that changes no balance, or a delete of an empty account, may commit.
+        fn build_ledger_refused(workload: *Workload, entries: []Entry) usize {
+            const prng = workload.prng;
+            if (entries.len < 2) return 0;
+            const account = prng.int_inclusive(u64, workload.options.ledger_account_count - 1);
+            const amount: i64 = @intCast(prng.range_inclusive(u64, 1, 500));
+            switch (prng.chances(.{
+                .half = 2,
+                .partner_alone = 1,
+                .partner_clamps = 1,
+                .put = 2,
+                .delete = 1,
+                .straddle = 1,
+            })) {
+                .half => {
+                    entries[0] = ledger_add(ledger_sources_table, 0, 0, -amount, .{ .pair = true });
+                    return 1;
+                },
+                .partner_alone => {
+                    entries[0] = ledger_add(ledger_accounts_table, account, 0, amount, .{});
+                    return 1;
+                },
+                .partner_clamps => {
+                    entries[0] = ledger_add(ledger_sources_table, 0, 0, -amount, .{ .pair = true });
+                    entries[1] = ledger_add(ledger_accounts_table, account, 0, 0, .{
+                        .partner_of = 0,
+                        .clamp = true,
+                    });
+                    return 2;
+                },
+                .put => {
+                    // Zero balances, so it commits only if the account holds none.
+                    var value: [value_size]u8 = @splat(0);
+                    @memset(value[16..], prng.int(u8));
+                    entries[0] = .{
+                        .id = account,
+                        .table = ledger_accounts_table,
+                        .kind = .put,
+                        .op_seen = 0,
+                        .value = value,
+                    };
+                    return 1;
+                },
+                .delete => {
+                    entries[0] = .{
+                        .id = account,
+                        .table = ledger_accounts_table,
+                        .kind = .delete,
+                        .op_seen = 0,
+                        .value = @splat(0),
+                    };
+                    return 1;
+                },
+                .straddle => {
+                    entries[0] = ledger_add(ledger_accounts_table, account, 0, amount, .{});
+                    var add = Add.from_entry(&entries[0]);
+                    add.offset = prng.range_inclusive(u8, 1, 7);
+                    entries[0].value = add.value();
+                    return 1;
+                },
+            }
+        }
+
+        fn check_declare_ledger(
+            workload: *Workload,
+            op: u64,
+            request_body: []align(constants.cache_line_size) const u8,
+            reply_body: []align(constants.cache_line_size) const u8,
+        ) void {
+            const definition: *const nerva.LedgerDefinition = @alignCast(std.mem.bytesAsValue(
+                nerva.LedgerDefinition,
+                request_body[0..@sizeOf(nerva.LedgerDefinition)],
+            ));
+            const results = stdx.bytes_as_slice(.exact, nerva.DeclareLedgerResult, reply_body);
+            assert(results.len == 1);
+            const result = results[0];
+
+            const expected: nerva.DeclareLedgerStatus = expected: {
+                if (ledgers.definition_validate(definition)) |status| break :expected status;
+                for (workload.model_ledgers.items) |*ledger| {
+                    if (ledger.definition.id != definition.id) continue;
+                    if (stdx.equal_bytes(nerva.LedgerDefinition, &ledger.definition, definition)) {
+                        assert(result.op == ledger.op);
+                        break :expected .exists;
+                    }
+                    break :expected .ledger_immutable;
+                }
+                if (workload.model_ledgers.items.len == nerva.ledgers_max) {
+                    break :expected .ledgers_full;
+                }
+                for (definition.fields[0..definition.field_count]) |*field| {
+                    if (workload.model_conserved(field.table, field.offset) != null) {
+                        break :expected .ledger_field_taken;
+                    }
+                    for (workload.model_views.items) |*view| {
+                        if (view.definition.table != field.table) continue;
+                        if (views.add_touches_key(&view.definition, field.offset)) {
+                            break :expected .field_viewed;
+                        }
+                    }
+                }
+                break :expected .created;
+            };
+            assert(result.status == expected);
+            if (expected == .created) {
+                assert(result.op == op);
+                assert(op > workload.op_max);
+                workload.op_max = op;
+                workload.model_ledgers.append(workload.allocator, .{
+                    .op = op,
+                    .definition = definition.*,
+                }) catch @panic("OOM");
+            } else if (expected != .exists) {
+                assert(result.op == 0);
+            }
+            if (expected == .created or expected == .exists) {
+                if (definition.id == 1) workload.ledger_declared = true;
+            }
+        }
+
+        fn check_get_ledger(
+            workload: *Workload,
+            request_body: []align(constants.cache_line_size) const u8,
+            reply_body: []align(constants.cache_line_size) const u8,
+        ) void {
+            const query: *const nerva.LedgerQuery = @alignCast(std.mem.bytesAsValue(
+                nerva.LedgerQuery,
+                request_body[0..@sizeOf(nerva.LedgerQuery)],
+            ));
+            const results = stdx.bytes_as_slice(.exact, nerva.Ledger, reply_body);
+            assert(results.len == 1);
+            const result = &results[0];
+            workload.ledger_reads += 1;
+            for (workload.model_ledgers.items, 1..) |*ledger, slot| {
+                if (ledger.definition.id != query.id) continue;
+                assert(result.slot == slot);
+                assert(result.op == ledger.op);
+                assert(result.timestamp > 0);
+                assert(stdx.equal_bytes(
+                    nerva.LedgerDefinition,
+                    &result.definition,
+                    &ledger.definition,
+                ));
+                return;
+            }
+            assert(stdx.zeroed(std.mem.asBytes(result)));
+        }
+
+        /// The ledger's invariant after a committed ledger transaction, from the adds' results
+        /// alone (independent of the row model): every conserved add moved its field from what
+        /// it was to what the result says, a transaction's conserved adds sum to zero, puts and
+        /// deletes left balances as they were, the ledger's total is still zero, and no floored
+        /// field is below its floor.
+        fn check_ledger(
+            workload: *Workload,
+            entries: []const Entry,
+            results: []const EntryResult,
+        ) void {
+            var moved: i128 = 0;
+            for (entries, results) |*entry, result| {
+                const row = nerva.row_key(entry.table, entry.id);
+                switch (entry.kind) {
+                    .add => {
+                        const add = Add.from_entry(entry);
+                        const field = workload.model_conserved(entry.table, add.offset).?;
+                        const value = workload.ledger_values.getOrPut(
+                            workload.allocator,
+                            .{ .row = row, .offset = add.offset },
+                        ) catch @panic("OOM");
+                        if (!value.found_existing) value.value_ptr.* = 0;
+                        const after: i64 = @bitCast(result.value);
+                        assert(@as(i128, value.value_ptr.*) + result.applied == after);
+                        value.value_ptr.* = after;
+                        if (field.floor) |floor| assert(after >= floor);
+                        moved += result.applied;
+                        workload.ledger_moves += 1;
+                    },
+                    .put, .delete => {
+                        for (workload.model_ledgers.items) |*ledger| {
+                            const definition = &ledger.definition;
+                            for (definition.fields[0..definition.field_count]) |*field| {
+                                if (field.table != entry.table) continue;
+                                const held = workload.ledger_values.get(
+                                    .{ .row = row, .offset = field.offset },
+                                ) orelse 0;
+                                const written: i64 = if (entry.kind == .put)
+                                    std.mem.readInt(i64, entry.value[field.offset..][0..8], .little)
+                                else
+                                    0;
+                                assert(written == held);
+                            }
+                        }
+                    },
+                    else => unreachable,
+                }
+            }
+            assert(moved == 0);
+            var total: i128 = 0;
+            var values = workload.ledger_values.valueIterator();
+            while (values.next()) |value| total += value.*;
+            assert(total == 0);
+        }
+
+        /// The conserved field at exactly `(table, offset)` in the model's ledgers, if any.
+        fn model_conserved(workload: *const Workload, table: u32, offset: u8) ?ModelConserved {
+            for (workload.model_ledgers.items, 0..) |*ledger, index| {
+                for (ledger.definition.fields[0..ledger.definition.field_count]) |*field| {
+                    if (field.table == table and field.offset == offset) {
+                        return .{
+                            .ledger = index,
+                            .floor = if (field.flags.floor) field.floor else null,
+                        };
+                    }
+                }
+            }
+            return null;
+        }
+
+        /// Whether an add writes a conserved field other than whole, as an i64: its 8 bytes
+        /// overlap one that it does not match exactly, or it matches one as a u64.
+        fn model_conserved_write(workload: *const Workload, table: u32, add: *const Add) bool {
+            for (workload.model_ledgers.items) |*ledger| {
+                for (ledger.definition.fields[0..ledger.definition.field_count]) |*field| {
+                    if (field.table != table) continue;
+                    if (field.offset == add.offset) return add.field != .i64;
+                    const overlaps = add.offset < @as(u16, field.offset) + 8 and
+                        field.offset < @as(u16, add.offset) + 8;
+                    if (overlaps) return true;
+                }
+            }
+            return false;
+        }
+
+        /// The lowest index of an entry that breaks a pair rule (written apart from the state
+        /// machine's scan): a `pair` add outside every ledger, or without the next entry naming
+        /// it; a partner (an add naming the `pair` add just before it) outside the first half's
+        /// ledger, on its field, or with bounds, `clamp` or `pair`; any other add naming a
+        /// `pair` add; a conserved add that is neither half of a pair.
+        fn model_unpaired(workload: *const Workload, entries: []const Entry) ?usize {
+            for (entries, 0..) |*entry, index| {
+                if (entry.kind != .add) continue;
+                const add = Add.from_entry(entry);
+                const conserved = workload.model_conserved(entry.table, add.offset);
+                const names_pair = add.flags.delta_from and
+                    Add.from_entry(&entries[add.delta_from]).flags.pair;
+                const partner = names_pair and add.delta_from + 1 == index;
+                if (names_pair and !partner) return index;
+                if (partner) {
+                    const first_entry = &entries[index - 1];
+                    // A first half outside every ledger was refused at its own index.
+                    const first = workload.model_conserved(
+                        first_entry.table,
+                        Add.from_entry(first_entry).offset,
+                    ).?;
+                    const field = conserved orelse return index;
+                    if (field.ledger != first.ledger) return index;
+                    if (add.flags.pair or add.flags.clamp or add.flags.min or add.flags.max) {
+                        return index;
+                    }
+                    if (first_entry.table == entry.table and first_entry.id == entry.id and
+                        Add.from_entry(first_entry).offset == add.offset)
+                    {
+                        return index;
+                    }
+                    continue;
+                }
+                if (add.flags.pair) {
+                    if (conserved == null) return index;
+                    if (index + 1 == entries.len) return index;
+                    const next = &entries[index + 1];
+                    if (next.kind != .add) return index;
+                    const next_add = Add.from_entry(next);
+                    if (!next_add.flags.delta_from or next_add.delta_from != index) return index;
+                    continue;
+                }
+                if (conserved != null) return index;
+            }
+            return null;
+        }
+
+        /// Whether a put or delete leaves its row's conserved fields as the model holds them
+        /// (zeros for a row that does not exist).
+        fn model_conserved_unchanged(workload: *const Workload, entry: *const Entry) bool {
+            const version = workload.row_version(nerva.row_key(entry.table, entry.id));
+            const current: [value_size]u8 = if (version.exists) version.value else @splat(0);
+            const new: [value_size]u8 = if (entry.kind == .put) entry.value else @splat(0);
+            for (workload.model_ledgers.items) |*ledger| {
+                for (ledger.definition.fields[0..ledger.definition.field_count]) |*field| {
+                    if (field.table != entry.table) continue;
+                    const at = field.offset;
+                    if (!std.mem.eql(u8, current[at..][0..8], new[at..][0..8])) return false;
+                }
+            }
+            return true;
+        }
+
         /// The model's expectation, computed independently of the state machine. On success,
         /// fills `expected` with each entry's result.
         fn commit_failure(
@@ -1130,7 +1675,13 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                     {
                         return .{ .index = index, .status = .delta_from_invalid, .op = 0 };
                     }
+                    if (workload.model_conserved_write(entry.table, &add)) {
+                        return .{ .index = index, .status = .conserved_write, .op = 0 };
+                    }
                 }
+            }
+            if (workload.model_unpaired(entries)) |index| {
+                return .{ .index = index, .status = .unpaired, .op = 0 };
             }
             // The earliest write whose row an earlier write already wrote (adds may share one).
             for (entries, 0..) |*entry, index| {
@@ -1155,8 +1706,18 @@ pub fn WorkloadType(comptime StateMachine: type) type {
             const expected = workload.expected[0..entries.len];
             @memset(expected, .{});
             for (entries, 0..) |*entry, index| {
+                if (entry.kind == .put or entry.kind == .delete) {
+                    if (!workload.model_conserved_unchanged(entry)) {
+                        return .{ .index = index, .status = .conserved_write, .op = 0 };
+                    }
+                }
                 if (entry.kind != .add) continue;
-                const add = Add.from_entry(entry);
+                // A conserved add stops at its field's floor (N74).
+                const add_entry = Add.from_entry(entry);
+                const add = if (workload.model_conserved(entry.table, add_entry.offset)) |field|
+                    nerva.ledger_bounds(&add_entry, field.floor)
+                else
+                    add_entry;
                 // The row before this add: the last earlier add to it, else the model.
                 const earlier: ?usize = for (0..index) |i| {
                     const j = index - 1 - i;

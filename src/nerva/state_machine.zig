@@ -41,7 +41,12 @@ const ViewDefinition = nerva.ViewDefinition;
 const ViewQuery = nerva.ViewQuery;
 const ViewRecord = nerva.ViewRecord;
 const DeclareResult = nerva.DeclareResult;
+const DeclareLedgerResult = nerva.DeclareLedgerResult;
+const Ledger = nerva.Ledger;
+const LedgerDefinition = nerva.LedgerDefinition;
+const LedgerQuery = nerva.LedgerQuery;
 const views = @import("views.zig");
+const ledgers = @import("ledgers.zig");
 const RowKey = nerva.RowKey;
 const RowValue = nerva.RowValue;
 const Change = nerva.Change;
@@ -298,6 +303,30 @@ pub fn StateMachineType(comptime Storage: type) type {
             },
         );
 
+        const LedgersGroove = GrooveType(
+            Storage,
+            Ledger,
+            .{
+                .ids = tree_ids.Ledger,
+                .batch_value_count_max = .{
+                    .timestamp = 1,
+                    .slot = 1,
+                },
+                .primary_key = "slot",
+                .primary_key_orphaned = false,
+                .unique_keys = &[_][:0]const u8{"slot"},
+                .ignored = &[_][:0]const u8{
+                    "op",
+                    "reserved_a",
+                    "definition",
+                    "reserved_b",
+                },
+                .optional = &[_][:0]const u8{},
+                .derived = .{},
+                .objects_cache = true,
+            },
+        );
+
         pub const Forest = ForestType(Storage, .{
             .rows = RowsGroove,
             .changes = ChangesGroove,
@@ -306,6 +335,7 @@ pub fn StateMachineType(comptime Storage: type) type {
             .members = MembersGroove,
             .group_versions = GroupVersionsGroove,
             .view_versions = ViewVersionsGroove,
+            .ledgers = LedgersGroove,
         });
 
         const RowsScanLookup = ScanLookupType(
@@ -450,6 +480,16 @@ pub fn StateMachineType(comptime Storage: type) type {
         view_groups_count: ?u32 = null,
         /// The building view a pulse backfills (an index into `views_op`), if any.
         backfill_view: ?u32 = null,
+
+        // ---- Ledgers (N74) ----
+
+        /// The number of ledgers declared, once known (null after a reset: every slot is
+        /// probed).
+        ledger_count: ?u32 = null,
+        ledgers_prefetch_context: LedgersGroove.PrefetchContext = undefined,
+        /// The ledgers, in declaration order (slot minus one), and their conserved fields.
+        ledgers_op: [nerva.ledgers_max]Ledger = undefined,
+        ledger_index: ledgers.Index = .{},
 
         // ---- min, max and as_of (N62) ----
 
@@ -596,6 +636,17 @@ pub fn StateMachineType(comptime Storage: type) type {
                         .tree_options_object = .{ .batch_value_count_limit = nerva.views_max },
                         .tree_options_index = .{
                             .version = .{ .batch_value_count_limit = nerva.views_max },
+                        },
+                    },
+                    .ledgers = .{
+                        .cache_entries_max = LedgersGroove.ObjectsCache.Cache
+                            .value_count_max_multiple,
+                        .prefetch_entries_for_read_max = nerva.ledgers_max,
+                        .prefetch_entries_for_update_max = nerva.ledgers_max,
+                        // One declaration per op.
+                        .tree_options_object = .{ .batch_value_count_limit = 1 },
+                        .tree_options_index = .{
+                            .slot = .{ .batch_value_count_limit = 1 },
                         },
                     },
                 },
@@ -828,7 +879,14 @@ pub fn StateMachineType(comptime Storage: type) type {
                     }) catch unreachable; // Already validated by `input_valid()`.
                     break :payload body_decoder.payload;
                 },
-                .get_changes, .get_history, .get_view, .declare_view, .pulse => message_body_used,
+                .get_changes,
+                .get_history,
+                .get_view,
+                .declare_view,
+                .pulse,
+                .declare_ledger,
+                .get_ledger,
+                => message_body_used,
             };
             self.prepare_timestamp +=
                 self.prepare_delta(operation, payload) + self.versions_reserve(operation);
@@ -837,10 +895,10 @@ pub fn StateMachineType(comptime Storage: type) type {
         fn prepare_delta(self: *const StateMachine, operation: Operation, events: []const u8) u64 {
             return switch (operation) {
                 .commit => @divExact(events.len, @sizeOf(Entry)) * entry_timestamps,
-                .declare_view => 1,
+                .declare_view, .declare_ledger => 1,
                 // Each row a pulse may add takes an entry's block.
                 .pulse => self.group_writes_limit * entry_timestamps,
-                .lookup_rows, .get_changes, .get_history, .get_view => 0,
+                .lookup_rows, .get_changes, .get_history, .get_view, .get_ledger => 0,
             };
         }
 
@@ -850,7 +908,13 @@ pub fn StateMachineType(comptime Storage: type) type {
             return switch (operation) {
                 .commit, .pulse => self.group_writes_limit + nerva.views_max,
                 .declare_view => 1,
-                .lookup_rows, .get_changes, .get_history, .get_view => 0,
+                .lookup_rows,
+                .get_changes,
+                .get_history,
+                .get_view,
+                .declare_ledger,
+                .get_ledger,
+                => 0,
             };
         }
 
@@ -894,10 +958,10 @@ pub fn StateMachineType(comptime Storage: type) type {
 
             switch (operation) {
                 .lookup_rows => self.prefetch_rows(RowKey, message_body_used),
-                .commit => self.prefetch_views(),
+                .commit, .declare_view, .declare_ledger, .get_ledger => self.prefetch_ledgers(),
                 .get_changes => self.prefetch_changes(message_body_used),
                 .get_history => self.prefetch_history(message_body_used),
-                .get_view, .declare_view, .pulse => self.prefetch_views(),
+                .get_view, .pulse => self.prefetch_views(),
             }
         }
 
@@ -1117,6 +1181,13 @@ pub fn StateMachineType(comptime Storage: type) type {
                     output_buffer,
                 ),
                 .pulse => self.execute_pulse(op, timestamp),
+                .declare_ledger => self.execute_declare_ledger(
+                    op,
+                    timestamp,
+                    message_body_used,
+                    output_buffer,
+                ),
+                .get_ledger => self.execute_get_ledger(message_body_used, output_buffer),
             };
         }
 
@@ -1161,9 +1232,14 @@ pub fn StateMachineType(comptime Storage: type) type {
                             .fits,
                         reply_encoder.writable().?,
                     ),
-                    .get_changes, .get_history, .get_view, .declare_view, .pulse => {
-                        comptime unreachable;
-                    },
+                    .get_changes,
+                    .get_history,
+                    .get_view,
+                    .declare_view,
+                    .pulse,
+                    .declare_ledger,
+                    .get_ledger,
+                    => comptime unreachable,
                 };
                 reply_encoder.add(@intCast(bytes_written));
             }
@@ -1251,7 +1327,8 @@ pub fn StateMachineType(comptime Storage: type) type {
 
         /// The first reason the transaction cannot commit, or null.
         /// The views budget comes first (prefetch decided it: `views_busy`, `views_too_large`),
-        /// then static checks, then duplicate writes, then read conflicts.
+        /// then static checks (per entry, then pairs: N74), then duplicate writes, then read
+        /// conflicts.
         fn commit_failure(
             self: *StateMachine,
             entries: []const Entry,
@@ -1295,7 +1372,23 @@ pub fn StateMachineType(comptime Storage: type) type {
                             .op = 0,
                         };
                     }
+                    // A conserved field is an `i64`, changed only as a whole (N74).
+                    const index_ = &self.ledger_index;
+                    const conserved_write = if (index_.find(entry.table, add.offset) != null)
+                        add.field != .i64
+                    else
+                        index_.touches(entry.table, add.offset, 8);
+                    if (conserved_write) {
+                        return .{
+                            .index = @intCast(index),
+                            .status = .conserved_write,
+                            .op = 0,
+                        };
+                    }
                 }
+            }
+            if (self.unpaired(entries)) |index| {
+                return .{ .index = index, .status = .unpaired, .op = 0 };
             }
             if (self.write_duplicate(entries)) |index| {
                 return .{ .index = index, .status = .write_duplicate, .op = 0 };
@@ -1306,6 +1399,60 @@ pub fn StateMachineType(comptime Storage: type) type {
                 if (version != entry.op_seen) {
                     return .{ .index = @intCast(index), .status = .conflict, .op = version };
                 }
+            }
+            return null;
+        }
+
+        /// The index of the first conserved add that is not one half of a pair (N74), or null.
+        /// A pair is a first half (`pair`) at `i` and its partner at `i + 1`: an add to another
+        /// field of the same ledger whose `delta_from` names `i`, without bounds or `clamp`. No
+        /// other add may name a first half. Needs only the entries and the ledgers: every add
+        /// has passed `entry_validate`, its `delta_from` names an earlier add, and a conserved
+        /// add is an `i64`.
+        fn unpaired(self: *const StateMachine, entries: []const Entry) ?u32 {
+            var index: u32 = 0;
+            while (index < entries.len) {
+                const entry = &entries[index];
+                if (entry.kind != .add) {
+                    index += 1;
+                    continue;
+                }
+                const add = Add.from_entry(entry);
+                if (add.flags.delta_from) {
+                    assert(add.delta_from < index);
+                    // Earlier first halves were checked with their partners, which are skipped.
+                    if (Add.from_entry(&entries[add.delta_from]).flags.pair) return index;
+                }
+                const conserved = self.ledger_index.find(entry.table, add.offset);
+                if (!add.flags.pair) {
+                    if (conserved != null) return index;
+                    index += 1;
+                    continue;
+                }
+                const first = conserved orelse return index;
+                assert(add.field == .i64);
+                if (index + 1 == entries.len) return index;
+                const partner_entry = &entries[index + 1];
+                if (partner_entry.kind != .add) return index;
+                const partner = Add.from_entry(partner_entry);
+                if (!partner.flags.delta_from or partner.delta_from != index) return index;
+
+                const partner_field =
+                    self.ledger_index.find(partner_entry.table, partner.offset) orelse
+                    return index + 1;
+                assert(partner.field == .i64);
+                if (partner_field.ledger != first.ledger) return index + 1;
+                if (partner.flags.pair or partner.flags.clamp or
+                    partner.flags.min or partner.flags.max)
+                {
+                    return index + 1;
+                }
+                if (partner_entry.table == entry.table and partner_entry.id == entry.id and
+                    partner.offset == add.offset)
+                {
+                    return index + 1;
+                }
+                index += 2;
             }
             return null;
         }
@@ -1430,8 +1577,20 @@ pub fn StateMachineType(comptime Storage: type) type {
             self.add_rows.clearRetainingCapacity();
             for (entries, results, 0..) |*entry, *result, index| {
                 result.* = .{ .status = .ok, .op = 0 };
+                if (entry.kind == .put or entry.kind == .delete) {
+                    if (!self.conserved_unchanged(entry)) return .{
+                        .index = @intCast(index),
+                        .status = .conserved_write,
+                        .op = 0,
+                    };
+                }
                 if (entry.kind != .add) continue;
-                const add = Add.from_entry(entry);
+                const conserved = self.ledger_index.find(entry.table, Add.from_entry(entry).offset);
+                // A conserved add never moves its field down past the floor (N74).
+                const add = if (conserved) |field|
+                    nerva.ledger_bounds(&Add.from_entry(entry), field.floor)
+                else
+                    Add.from_entry(entry);
 
                 const key = nerva.row_key(entry.table, entry.id);
                 const row = self.add_rows.getOrPutAssumeCapacity(key);
@@ -1465,6 +1624,30 @@ pub fn StateMachineType(comptime Storage: type) type {
                 std.mem.writeInt(u64, field, result.value, .little);
             }
             return null;
+        }
+
+        /// Whether a put or delete leaves the row's conserved fields as they are (N74): a put
+        /// must not change their bytes, and a delete needs them all zero. A row that does not
+        /// exist holds zeros. A put or delete is the only write to its row in its transaction
+        /// (`write_duplicate`), so the stored row is the one it changes.
+        fn conserved_unchanged(self: *StateMachine, entry: *const Entry) bool {
+            assert(entry.kind == .put or entry.kind == .delete);
+            const fields = self.ledger_index.table_fields(entry.table);
+            if (fields.len == 0) return true;
+            const current: [nerva.value_size]u8 =
+                switch (self.forest.grooves.rows.get(nerva.row_key(entry.table, entry.id))) {
+                    .found_object => |row| if (row.flags.deleted) @splat(0) else row.value,
+                    .not_found => @splat(0),
+                };
+            const new: [nerva.value_size]u8 = if (entry.kind == .put) entry.value else @splat(0);
+            for (fields) |*field| {
+                if (!std.mem.eql(
+                    u8,
+                    current[field.offset..][0..8],
+                    new[field.offset..][0..8],
+                )) return false;
+            }
+            return true;
         }
 
         /// Deleting a row that does not exist (or is already deleted) is a no-op.
@@ -1508,6 +1691,141 @@ pub fn StateMachineType(comptime Storage: type) type {
             });
         }
 
+        // ---- Ledgers (N74) ----
+
+        /// Prefetches every declared ledger (stage 0 of `commit`, `declare_view`,
+        /// `declare_ledger` and `get_ledger`), loads them, then the views where the operation
+        /// needs them.
+        fn prefetch_ledgers(self: *StateMachine) void {
+            const groove = &self.forest.grooves.ledgers;
+            groove.prefetch_setup(self.prefetch_snapshot.?);
+            const count = self.ledger_count orelse nerva.ledgers_max;
+            for (1..count + 1) |slot| groove.prefetch_enqueue(.{ .slot = slot });
+            groove.prefetch(prefetch_ledgers_callback, &self.ledgers_prefetch_context);
+        }
+
+        fn prefetch_ledgers_callback(context: *LedgersGroove.PrefetchContext) void {
+            const self: *StateMachine = @alignCast(
+                @fieldParentPtr("ledgers_prefetch_context", context),
+            );
+            self.ledgers_load();
+            switch (self.prefetch_operation.?) {
+                .commit, .declare_view, .declare_ledger => self.prefetch_views(),
+                .get_ledger => self.prefetch_finish(),
+                else => unreachable,
+            }
+        }
+
+        /// Loads the ledgers prefetched for this op into `ledgers_op`, and indexes those not
+        /// indexed yet (ledgers are immutable: the index only grows).
+        fn ledgers_load(self: *StateMachine) void {
+            const groove = &self.forest.grooves.ledgers;
+            const count = self.ledger_count orelse nerva.ledgers_max;
+            var loaded: u32 = 0;
+            for (1..count + 1) |slot| {
+                switch (groove.get(slot)) {
+                    .found_object => |ledger| {
+                        // Slots are dense: 1, 2, … in declaration order.
+                        assert(ledger.slot == loaded + 1);
+                        self.ledgers_op[loaded] = ledger;
+                        loaded += 1;
+                    },
+                    .not_found => break,
+                }
+            }
+            if (self.ledger_count) |known| assert(known == loaded);
+            self.ledger_count = loaded;
+            assert(self.ledger_index.ledger_count <= loaded);
+            for (self.ledgers_op[self.ledger_index.ledger_count..loaded]) |*ledger| {
+                self.ledger_index.insert(&ledger.definition);
+            }
+            assert(self.ledger_index.ledger_count == loaded);
+        }
+
+        fn execute_declare_ledger(
+            self: *StateMachine,
+            op: u64,
+            timestamp: u64,
+            message_body_used: []align(constants.cache_line_size) const u8,
+            output_buffer: *align(constants.cache_line_size) [constants.message_body_size_max]u8,
+        ) usize {
+            assert(message_body_used.len == @sizeOf(LedgerDefinition));
+            const definition: *const LedgerDefinition = @alignCast(std.mem.bytesAsValue(
+                LedgerDefinition,
+                message_body_used[0..@sizeOf(LedgerDefinition)],
+            ));
+            const result: *DeclareLedgerResult = @alignCast(std.mem.bytesAsValue(
+                DeclareLedgerResult,
+                output_buffer[0..@sizeOf(DeclareLedgerResult)],
+            ));
+            result.* = self.ledger_declare(op, timestamp, definition);
+            return @sizeOf(DeclareLedgerResult);
+        }
+
+        fn ledger_declare(
+            self: *StateMachine,
+            op: u64,
+            timestamp: u64,
+            definition: *const LedgerDefinition,
+        ) DeclareLedgerResult {
+            if (ledgers.definition_validate(definition)) |status| {
+                return .{ .status = status, .op = 0 };
+            }
+            const count = self.ledger_count.?;
+            for (self.ledgers_op[0..count]) |*ledger| {
+                if (ledger.definition.id != definition.id) continue;
+                if (stdx.equal_bytes(LedgerDefinition, &ledger.definition, definition)) {
+                    return .{ .status = .exists, .op = ledger.op };
+                }
+                return .{ .status = .ledger_immutable, .op = 0 };
+            }
+            if (count == nerva.ledgers_max) return .{ .status = .ledgers_full, .op = 0 };
+            for (definition.fields[0..definition.field_count]) |*field| {
+                if (self.ledger_index.find(field.table, field.offset) != null) {
+                    return .{ .status = .ledger_field_taken, .op = 0 };
+                }
+                for (self.views_op[0..self.views_op_count]) |*view| {
+                    if (!view_maintained(view, field.table)) continue;
+                    if (views.add_touches_key(&view.definition, field.offset)) {
+                        return .{ .status = .field_viewed, .op = 0 };
+                    }
+                }
+            }
+
+            const ledger: Ledger = .{
+                .slot = count + 1,
+                .timestamp = timestamp,
+                .op = op,
+                .definition = definition.*,
+            };
+            self.forest.grooves.ledgers.insert(&ledger);
+            self.ledgers_op[count] = ledger;
+            self.ledger_count = count + 1;
+            self.ledger_index.insert(&ledger.definition);
+            return .{ .status = .created, .op = op };
+        }
+
+        fn execute_get_ledger(
+            self: *StateMachine,
+            message_body_used: []align(constants.cache_line_size) const u8,
+            output_buffer: *align(constants.cache_line_size) [constants.message_body_size_max]u8,
+        ) usize {
+            assert(message_body_used.len == @sizeOf(LedgerQuery));
+            const query: *const LedgerQuery = @alignCast(
+                std.mem.bytesAsValue(LedgerQuery, message_body_used[0..@sizeOf(LedgerQuery)]),
+            );
+            const result: *Ledger = @alignCast(
+                std.mem.bytesAsValue(Ledger, output_buffer[0..@sizeOf(Ledger)]),
+            );
+            result.* = std.mem.zeroes(Ledger);
+            if (query.id != 0 and stdx.zeroed(&query.reserved)) {
+                for (self.ledgers_op[0..self.ledger_count.?]) |*ledger| {
+                    if (ledger.definition.id == query.id) result.* = ledger.*;
+                }
+            }
+            return @sizeOf(Ledger);
+        }
+
         // ---- Views (N52) ----
 
         /// Prefetches every declared view (stage 0 of `commit`, `get_view`, `declare_view` and
@@ -1527,7 +1845,7 @@ pub fn StateMachineType(comptime Storage: type) type {
             self.views_load();
             switch (self.prefetch_operation.?) {
                 .commit => self.prefetch_rows(Entry, self.prefetch_input.?),
-                .declare_view => self.prefetch_finish(),
+                .declare_view, .declare_ledger => self.prefetch_finish(),
                 .get_view => self.prefetch_view_groups(),
                 .pulse => self.prefetch_backfill_rows(),
                 else => unreachable,
@@ -2652,6 +2970,19 @@ pub fn StateMachineType(comptime Storage: type) type {
                 if (view.definition.table == definition.table) {
                     table_views += 1;
                     table_extremes += views.extreme_count(&view.definition);
+                }
+            }
+            // Adds move conserved fields, and must not move rows between groups (N74).
+            const ledger_index = &self.ledger_index;
+            for (definition.where[0..definition.where_count]) |*clause| {
+                const field = clause.field;
+                if (ledger_index.touches(definition.table, field.offset, field.size)) {
+                    return .{ .status = .ledger_field, .view_id = 0, .op = 0 };
+                }
+            }
+            for (definition.group_by[0..definition.group_by_count]) |field| {
+                if (ledger_index.touches(definition.table, field.offset, field.size)) {
+                    return .{ .status = .ledger_field, .view_id = 0, .op = 0 };
                 }
             }
             if (self.views_op_count == nerva.views_max) {

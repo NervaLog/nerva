@@ -212,12 +212,14 @@ curl -H 'X-Nerva-Key: secret' -d '{"entries":[{"kind":"put","table":1,"id":"5","
 | Route | Does |
 |---|---|
 | `POST /v1/lookup` `{"rows":[{"table","id"}]}` | Point reads: `exists`, version `op`, `value_hex`, and the `op` read at. |
-| `POST /v1/commit` `{"entries":[…]}` | One transaction of `read` (with `op_seen`), `put` (with `value_hex`), `delete` and `add` (`field`, or `offset` and `type`; `delta` or `delta_from`; optional `min`, `max`, `clamp`, `create`). `200` committed with its `op` and each add's `applied` and `value`; `409` conflict with the stale entry's `index` and the row's current `op`, or `out_of_bounds` (with the field's `value`) or `row_absent` for an add; `400` invalid. |
+| `POST /v1/commit` `{"entries":[…]}` | One transaction of `read` (with `op_seen`), `put` (with `value_hex`), `delete` and `add` (`field`, or `offset` and `type`; `delta` or `delta_from`; optional `min`, `max`, `clamp`, `create`, `pair`). `200` committed with its `op` and each add's `applied` and `value`; `409` conflict with the stale entry's `index` and the row's current `op`, or `out_of_bounds` (with the field's `value`) or `row_absent` for an add, or `unpaired` or `conserved_write` for a ledger's field (below); `400` invalid. |
 | `GET /v1/changes?cursor=&limit=` | The change feed, paged. |
 | `GET /v1/history?table=&id=&op_max=&cursor=&limit=` | One row's writes, newest first, up to `op_max`. |
 | `GET /v1/row?table=&id=&as_of=` | One row as it was at an op (refused for an op not yet committed). |
 | `PUT /v1/tables/<t>` `{"name","fields":[{"name","type"}]}` | Declare a table's layout (u8, u16, u32, u64, i64, bool, bytes), or extend it by appending fields. Then puts may send `fields` instead of `value_hex`, and reads return `fields`. |
 | `GET /v1/tables/<t>` | The table's layout. |
+| `PUT /v1/ledgers/<id>` `{"fields":[{"table","field" or "offset","floor"}]}` | Declare a ledger: 2 to 16 conserved `i64` fields (below). `200` created or exists, with its `op`; `409` `ledger_immutable`, `ledger_field_taken`, `field_viewed` or `ledgers_full`; `400` invalid. |
+| `GET /v1/ledgers/<id>` | The ledger's fields, floors and the op it was declared at. |
 
 64-bit numbers (ids, ops, cursors) are decimal strings; values are the 80 bytes as hex. Layouts
 live in the log, in a reserved catalog table; the core still stores bytes and never reads them.
@@ -247,8 +249,60 @@ reserved table:
 | `GET /v1/documents/changes?namespace=&cursor=&limit=` | The namespace's document writes in commit order (`key`, `op`, `kind` put or delete, `value_hex`), paged like `/v1/changes`. |
 
 `zig build test:api` checks every route against a model (documents included), races eight
-writers on one row and on one document, and races fifty reservations on one budget with adds
-(none retried).
+writers on one row and on one document, races fifty reservations on one budget with adds
+(none retried), and races fifty clamped reservations on one ledger account (below).
+
+## Ledgers
+
+A **ledger** is a declared set of conserved `i64` fields, each with an optional floor (N74). Once
+a field is in a ledger, the state machine changes it in one way only: a **pair** of adds that
+moves one amount from one field of the ledger to another, never below either field's floor. A
+client cannot create or destroy value, overdraw a floored field, or overwrite a balance, however
+it builds its requests: the cluster refuses the transaction.
+
+```bash
+curl -X PUT -H 'X-Nerva-Key: secret' http://127.0.0.1:8080/v1/tables/7 -d '{"name": "accounts",
+  "fields": [{"name": "available", "type": "i64"}, {"name": "held", "type": "i64"}]}'
+curl -X PUT -H 'X-Nerva-Key: secret' http://127.0.0.1:8080/v1/tables/8 -d '{"name": "sources",
+  "fields": [{"name": "balance", "type": "i64"}]}'
+curl -X PUT -H 'X-Nerva-Key: secret' http://127.0.0.1:8080/v1/ledgers/1 -d '{"fields": [
+  {"table": 7, "field": "available", "floor": "0"}, {"table": 7, "field": "held", "floor": "0"},
+  {"table": 8, "field": "balance", "floor": null}]}'
+# {"ledger":1,"declared":"created","op":"57"}
+
+# Reserve up to 30: the first half (pair) may clamp at its floor; its partner, the next entry,
+# names it in delta_from and moves exactly what it took.
+curl -H 'X-Nerva-Key: secret' http://127.0.0.1:8080/v1/commit -d '{"entries": [
+  {"kind": "add", "table": 7, "id": "1", "field": "available", "delta": "-30", "pair": true,
+   "clamp": true},
+  {"kind": "add", "table": 7, "id": "1", "field": "held", "delta_from": 0}]}'
+```
+
+- **Pairs.** A pair is an add with `"pair": true` at index `i` and its partner at `i + 1`: an add
+  to another field of the same ledger (another row, or another field of the same row) whose
+  `delta_from` is `i`, without `min`, `max`, `clamp` or `pair`. Each move of the example is one
+  pair: fund (`balance` to `available`), reserve (`available` to `held`), post (`held` to
+  another account's `available`), void (`held` back to `available`). A transaction may hold
+  several pairs, and other entries. Any other add to a conserved field, a partner breaking a
+  rule, or a third add naming a first half is `409 {"status": "unpaired", "index"}`.
+- **Floors.** A conserved add never moves its field down past its floor: the first half
+  clamps there with `clamp`, or the transaction is `409 out_of_bounds`; the partner never
+  clamps, so if its floor (or the `i64` range) stops it, the whole transaction is
+  `out_of_bounds`. A field with no floor may go negative: a source of funds. A field below its
+  floor (declared over existing rows) may still move back up.
+- **No other writes.** A put that would change a conserved field's bytes, a delete of a row
+  whose conserved fields are not all zero, and an add that overlaps a conserved field without
+  matching it as an `i64` are `409 {"status": "conserved_write", "index"}`. A put that leaves
+  them alone, or creates a row with them zero, commits; so does an add with `create`.
+- **Declarations** are immutable: the same one again is a no-op (`exists`, with its op); another
+  under the same id is `409 ledger_immutable`. A field belongs to one ledger at most
+  (`ledger_field_taken`). A view may sum a conserved field, or take its `min` or `max`, but not
+  filter or group by it, whichever is declared first (`field_viewed`, or `409` for the view).
+  At most 64 ledgers, of 2 to 16 fields. A ledger may be declared over rows that already
+  exist: its total is then whatever it was at the declaration's op.
+- **The invariant:** for every ledger, the sum of its fields over all rows is what it was at its
+  declaration, at every op, and no field moves down past its floor. The VOPR checks it after
+  every commit under crashes and faults, independently of its model of the rows.
 
 ## Declared views
 

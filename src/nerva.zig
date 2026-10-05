@@ -60,6 +60,11 @@ pub const tree_ids = struct {
         // `view_version_key`: a view's versions, by op (N62).
         .version = 15,
     };
+
+    pub const Ledger = .{
+        .timestamp = 16,
+        .slot = 17,
+    };
 };
 
 /// The LSM key of a row: `table` in the high 64 bits, `id` in the low 64 bits.
@@ -154,6 +159,14 @@ pub const EntryStatus = enum(u32) {
     /// The transaction alone touches more view groups (or `min`/`max` members) than one op
     /// allows: nothing applied, and no retry can succeed; split it (#32).
     views_too_large = 15,
+    /// A conserved add (N74) that is not one half of a pair: a `pair` add without its partner
+    /// right after it, a partner that breaks the pair rules, or another add naming a pair's
+    /// first half in `delta_from`.
+    unpaired = 16,
+    /// A write that would change a conserved field (N74) other than by a pair: a put that
+    /// changes its bytes, a delete of a row where it is not zero, or an add that overlaps it
+    /// without matching it.
+    conserved_write = 17,
 };
 
 /// The `commit` result, one per entry.
@@ -212,7 +225,9 @@ pub const Add = extern struct {
         create: bool = false,
         /// `delta` must be zero.
         delta_from: bool = false,
-        padding: u3 = 0,
+        /// The first half of a pair (N74): the next entry is its partner.
+        pair: bool = false,
+        padding: u2 = 0,
     };
 
     comptime {
@@ -379,6 +394,8 @@ pub const DeclareStatus = enum(u32) {
     /// The table's views would have more than `view_extremes_per_table_max` `min` and `max`
     /// aggregates.
     table_extremes_full = 9,
+    /// The view filters or groups by a field of a ledger (N74).
+    ledger_field = 10,
 };
 
 /// The `declare_view` result.
@@ -691,6 +708,108 @@ pub const Change = extern struct {
 };
 
 /// Operations exported by Nerva.
+// ---- Ledgers: conserved fields (docs/DECISIONS.md N74) ----
+
+/// Ledgers, cluster-wide.
+pub const ledgers_max = 64;
+pub const ledger_fields_max = 16;
+
+/// A conserved field: an `i64` at `offset` in every row of `table`.
+pub const LedgerField = extern struct {
+    table: u32,
+    /// 8-aligned, at most `value_size - 8`.
+    offset: u8,
+    flags: Flags,
+    reserved: [2]u8 = @splat(0),
+    /// No conserved add moves the field down past it, when `flags.floor`. Zero otherwise.
+    floor: i64,
+
+    pub const Flags = packed struct(u8) {
+        floor: bool = false,
+        padding: u7 = 0,
+    };
+
+    comptime {
+        assert(@sizeOf(LedgerField) == 16);
+        assert(stdx.no_padding(LedgerField));
+    }
+};
+
+/// The `declare_ledger` event. A ledger is immutable once declared: its fields change only by
+/// pairs of adds that move one amount from one of them to another.
+pub const LedgerDefinition = extern struct {
+    /// At least 1, chosen by the client.
+    id: u32,
+    field_count: u8,
+    reserved: [3]u8 = @splat(0),
+    /// Strictly ascending by `(table, offset)`; unused slots are all zero.
+    fields: [ledger_fields_max]LedgerField,
+
+    comptime {
+        assert(@sizeOf(LedgerDefinition) == 264);
+        assert(stdx.no_padding(LedgerDefinition));
+    }
+};
+
+pub const DeclareLedgerStatus = enum(u32) {
+    created = 1,
+    /// Already declared with this definition.
+    exists = 2,
+    /// The id is declared with another definition.
+    ledger_immutable = 3,
+    /// A field is already in another ledger.
+    ledger_field_taken = 4,
+    /// The definition breaks a static rule (`ledgers.definition_validate`).
+    invalid = 5,
+    /// A field's table is zero or reserved.
+    table_invalid = 6,
+    ledgers_full = 7,
+    /// A maintained view filters or groups by one of the fields.
+    field_viewed = 8,
+};
+
+/// The `declare_ledger` result.
+pub const DeclareLedgerResult = extern struct {
+    status: DeclareLedgerStatus,
+    reserved: u32 = 0,
+    /// `created`: this op. `exists`: the op it was declared at. Otherwise zero.
+    op: u64,
+
+    comptime {
+        assert(@sizeOf(DeclareLedgerResult) == 16);
+        assert(stdx.no_padding(DeclareLedgerResult));
+    }
+};
+
+/// The `get_ledger` event.
+pub const LedgerQuery = extern struct {
+    id: u32,
+    reserved: [12]u8 = @splat(0),
+
+    comptime {
+        assert(@sizeOf(LedgerQuery) == 16);
+        assert(stdx.no_padding(LedgerQuery));
+    }
+};
+
+/// A ledger as the forest stores it, and the `get_ledger` result (all zero if not declared).
+pub const Ledger = extern struct {
+    /// 1..ledgers_max, in declaration order: the groove's key, so that every ledger can be
+    /// prefetched by slot.
+    slot: u64,
+    timestamp: u64,
+    /// The op the ledger was declared at.
+    op: u64,
+    reserved_a: u64 = 0,
+    definition: LedgerDefinition,
+    reserved_b: [216]u8 = @splat(0),
+
+    comptime {
+        assert(@sizeOf(Ledger) == 512);
+        assert(stdx.no_padding(Ledger));
+    }
+};
+
 pub const Operation = enum(u8) {
     lookup_rows = constants.vsr_operations_reserved + 0,
     commit = constants.vsr_operations_reserved + 1,
@@ -702,6 +821,9 @@ pub const Operation = enum(u8) {
     declare_view = constants.vsr_operations_reserved + 5,
     /// `vsr.Operation.pulse`, mapped: backfills building views (N52).
     pulse = constants.vsr_operations_reserved + 6,
+    /// Declares a ledger: a set of conserved fields (N74).
+    declare_ledger = constants.vsr_operations_reserved + 7,
+    get_ledger = constants.vsr_operations_reserved + 8,
 
     pub fn EventType(comptime operation: Operation) type {
         return switch (operation) {
@@ -712,6 +834,8 @@ pub const Operation = enum(u8) {
             .get_view => ViewQuery,
             .declare_view => ViewDefinition,
             .pulse => void,
+            .declare_ledger => LedgerDefinition,
+            .get_ledger => LedgerQuery,
         };
     }
 
@@ -723,6 +847,8 @@ pub const Operation = enum(u8) {
             .get_view => ViewRecord,
             .declare_view => DeclareResult,
             .pulse => void,
+            .declare_ledger => DeclareLedgerResult,
+            .get_ledger => Ledger,
         };
     }
 
@@ -742,7 +868,14 @@ pub const Operation = enum(u8) {
     pub inline fn is_batchable(operation: Operation) bool {
         return switch (operation) {
             .lookup_rows, .commit => true,
-            .get_changes, .get_history, .get_view, .declare_view, .pulse => false,
+            .get_changes,
+            .get_history,
+            .get_view,
+            .declare_view,
+            .pulse,
+            .declare_ledger,
+            .get_ledger,
+            => false,
         };
     }
 
@@ -750,7 +883,14 @@ pub const Operation = enum(u8) {
     pub inline fn is_multi_batch(operation: Operation) bool {
         return switch (operation) {
             .lookup_rows, .commit => true,
-            .get_changes, .get_history, .get_view, .declare_view, .pulse => false,
+            .get_changes,
+            .get_history,
+            .get_view,
+            .declare_view,
+            .pulse,
+            .declare_ledger,
+            .get_ledger,
+            => false,
         };
     }
 
@@ -789,7 +929,7 @@ pub const Operation = enum(u8) {
                     operation.result_max(constants.message_body_size_max),
                 );
             },
-            .declare_view => 1,
+            .declare_view, .declare_ledger, .get_ledger => 1,
             .pulse => 0,
         };
     }
@@ -898,6 +1038,20 @@ pub fn add_apply(add: *const Add, old: u64, applied: i64) u64 {
         .i64 => @bitCast(@as(i64, @intCast(@as(i128, @as(i64, @bitCast(old))) + applied))),
         _ => unreachable,
     };
+}
+
+/// The add as it applies to a conserved field with `floor` (N74): its `min` is raised to the
+/// floor, so that it never moves the field down past it. Pure, like `add_amount`, which takes
+/// the result; a field already below its floor can still move up.
+pub fn ledger_bounds(add: *const Add, floor: ?i64) Add {
+    assert(add.field == .i64);
+    var bounded = add.*;
+    if (floor) |value| {
+        const min: i64 = if (add.flags.min) @max(@as(i64, @bitCast(add.min)), value) else value;
+        bounded.flags.min = true;
+        bounded.min = @bitCast(min);
+    }
+    return bounded;
 }
 
 test entry_validate {
