@@ -408,7 +408,20 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
 - Merged after views (N52): the layouts guard covers views' types, operations and tree ids; the
   script guard caught N52's 5 timestamps per entry, and its snapshot was updated for it.
 
-## 2026-10-05 — Long fuzzing workflow (N55)
+## 2026-10-05 — Performance Phase 0: round trips, --cache-rows, bench, bench:load (N55)
+
+- `src/nerva/client.zig`: `send` builds request messages and carries the previous round trip, so
+  primaries record `client_request_round_trip`.
+- `nerva start --cache-rows=<size>` (`cli.zig` `cache_rows_resolve`, `state_machine.zig`
+  `cache_entries_rows_multiple`).
+- `zig build bench` (`build.zig`), `Bench.metric` (vendored, UPSTREAM.md),
+  `src/nerva/documents_benchmark.zig`, `src/nerva/view/declared_benchmark.zig`.
+- `zig build bench:load` (`src/bench_load.zig`) and `src/nerva/latency_histogram.zig`.
+- Tests: `cache_rows_resolve` and `LatencyHistogram` unit tests; `test:integration` checks round
+  trips arrive over statsd (every replica now sends) and starts replica 2 with `--cache-rows`.
+  Mutation-tested: sending 0 as the round trip fails it. Every bench:load workload ran locally.
+
+## 2026-10-05 — Long fuzzing workflow (N57)
 
 - `.github/workflows/fuzz.yml` (dispatch only) and `.github/scripts/fuzz_loop.sh`: every fuzzer
   and seven VOPR lanes on random seeds for a time budget, on Fly runners started for the run.

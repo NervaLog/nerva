@@ -151,6 +151,31 @@ so use it to diagnose, not to time. The metrics most useful for performance work
 Timings are aggregated over each 10-second window. The `tb.` prefix and tag spellings come from
 TigerBeetle's tracer (UPSTREAM.md).
 
+### Caches
+
+`--cache-grid` sizes the block cache. `--cache-rows=<size>` sizes the row cache (128 bytes a row,
+rounded down to whole cache sets); it defaults to its minimum, one set of a few hundred rows.
+
+### Benchmarks
+
+```bash
+./zig/zig build bench                         # every `benchmark:` test, ReleaseSafe
+./zig/zig build bench -- "benchmark: documents"
+./zig/zig build -Drelease bench:load -- --local --workload=c7 --clients=4 --seconds=30
+./zig/zig build -Drelease bench:load -- --addresses=<addresses> --workload=c4 --batch=64 \
+    --rate=2000 --output=c4.json
+```
+
+`zig build bench` prints each result for people and, from `Bench.metric`, one
+`bench-json: {"name":…,"value":…,"unit":…}` line for machines. `bench:load` drives a cluster
+with one thread and one client per `--clients` (`--local` starts a three-replica `--development`
+cluster, at most 6 clients) and prints one JSON object: operations and entries per second,
+conflicts and retries, and latency percentiles in µs. Workloads: `c1` puts, `c2`
+read-modify-write, `c3` hot rows with retries, `c3_adds` hot rows with adds, `c4` lookups, `c5`
+change feed, `c7` mixed. `--rate=0` (default) is a closed loop; `--rate=<n>` an open loop whose
+latencies count from each request's due time. Use `-Drelease` so the `nerva` it starts is a
+release build.
+
 ## JSON API
 
 `nerva api` serves the core operations as JSON over HTTP, for any language:

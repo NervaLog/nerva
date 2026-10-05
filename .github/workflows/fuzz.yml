@@ -1,4 +1,4 @@
-# Long fuzzing (N55): every fuzzer and the VOPR on random seeds for a time budget, by hand only.
+# Long fuzzing (N57): every fuzzer and the VOPR on random seeds for a time budget, by hand only.
 # Smoke (ci.yml) runs each fuzzer once at a fixed seed: a regression check. This searches. Start
 # Fly runners (Botpike/ci-runners) for the run, dispatch it, and stop them afterwards: every job
 # below runs at once if there are enough runners, else they queue.
