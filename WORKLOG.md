@@ -447,6 +447,20 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
   9 s), and recovers from a damaged copy; `zig build check` passes through the links;
   actionlint is clean apart from the custom `fly` label.
 
+## 2026-10-05 — Gateway fixes: routes, recovery, slots, trace files (N58; #26–#29, #36)
+
+- `api.zig`: `/v1/views/groups` is the view named `groups`, not a groups route with no name
+  (#26).
+- `client.zig`, `api/server.zig`: `Client.reconnect`; the gateway replaces a client that timed
+  out or was evicted, at most every 5 s, answering 503 meanwhile, and `/healthz` reports it (#27).
+- `http_connection.zig`: with every slot busy, a new connection displaces the oldest one still
+  sending its request (#28).
+- `nerva_main.zig`: `--trace` creates its file exclusively (#29).
+- `http_connection.zig`: the early bare-LF refusal scans only the head, so a body may hold
+  newlines when it arrives with its head (#36, found writing the tutorial).
+- Tests in `tests/api/api.py`, `tests/views/maintained.py` and a `Receiver` unit test, each
+  failing on the binary before the fix.
+
 ## 2026-10-05 — Long fuzzing workflow (N59)
 
 - `.github/workflows/fuzz.yml` (dispatch only) and `.github/scripts/fuzz_loop.sh`: every fuzzer
@@ -455,6 +469,86 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
   failure is reported with its seed and replay command, and fails the job; the VOPR path (testing
   state machine, 9 runs); the workflow parses, 16 fuzz and 7 VOPR jobs.
 
+## 2026-10-05 — Release v0.3.0 (N60)
+
+- `build.zig`: release `0.0.3`, clients from `0.0.2`. `CHANGELOG.md`: the v0.3.0 section
+  (maintained views, metrics and traces, the faster client; #7–#10, #26–#29, #34 and #36
+  fixed; #30–#33 known; upgrade steps). `VERSION` 0.3.0.
+- Measured, with the v0.2.0 binary and a `0.0.3` build: a v0.2.0 `nerva api` commits and reads
+  against a `0.0.3` cluster; a `0.0.3` replica refuses a `0.0.2` data file
+  (`multiversion unsupported`); a mixed cluster runs until the `0.0.3` replica panics with
+  `checkpoint diverged` at op 960 (#34, commented). The replica_format golden checksum is
+  unchanged.
+- Verified: `check`, `test:fmt`, `test:unit` 328/329 (the sandbox-denied perf test).
+
+## 2026-10-05 — Replicas ignore peers that run another release (N61; #34)
+
+- `src/nerva/release_peers.zig`: `admits` (whether to handle a message, by its sender's announced
+  release, or a prepare's or block's own) and `announced` (the release a ping or pong carries).
+- `src/vsr/replica.zig`: option `release_peers_strict`; `on_message` records announcements and
+  drops what `admits` refuses, logging a peer of another release once; `tick_peer_connections`
+  forgets a disconnected peer's release and pings a newly connected peer; `send_ping(peer)`.
+  `src/message_bus.zig` and the simulated bus: `replica_connected`. `src/testing/cluster.zig`:
+  the option. `nerva start` sets it. UPSTREAM.md lists the patches.
+- `src/vopr.zig`: the `nerva` lane runs one release with the option on (no simulated upgrades,
+  which Nerva never performs); the `testing` lane is unchanged.
+- `zig build test:release` (`tests/release/mixed.py`, a second `nerva` with release `0.0.200`),
+  in CI's `system` job, CLAUDE.md and README.
+- Verified: unit tests (`release_peers`, 332/333 overall, the sandbox-denied perf test);
+  `test:release`; `test:integration`; VOPR `nerva` seeds 1, 2, 5, 16638486064026786667,
+  3787786164975552336 and `testing` seeds 1, 2; `check`, `test:fmt`. With the v0.2.0 binary: one
+  v0.3.0 replica among two v0.2.0 ones is ignored and ignores them; two v0.3.0 replicas commit
+  past a checkpoint while the v0.2.0 one panics at the first operation it does not know.
+- Mutation-tested: the gate off (a commit succeeds without replica 1), unannounced peers
+  admitted, and prepares of another release admitted each fail a test.
+
+## 2026-10-05 — Tutorial
+
+- `docs/TUTORIAL.md`: a step-by-step tutorial for people new to Nerva. It covers a
+  one-replica cluster and `nerva api`, rows and versions, transactions (compare-and-set,
+  claims, atomicity, deletes), the change feed, history and as-of reads, layouts, adds,
+  maintained views and `nerva view`, documents, crashes and safe retries, operating a replica,
+  the Zig client, a contributor's tour of the code, and a cheat sheet. Linked from README.md.
+- Written at `eaa7520`, then updated for v0.3.0: releases and upgrades (N60, N61), multi-line
+  bodies (#36 fixed), the gateway's reconnect and `/healthz` (#27), `views_busy` that a retry
+  cannot fix (#32), `--statsd`, `--trace` and `--cache-rows`, `Client.reconnect`,
+  `test:release`.
+- Verified: every command and reply in it comes from one scripted run against a fresh
+  one-replica `--development` cluster at v0.3.0. The crash, outage and reconnect, retry,
+  layout and declaration claims were each checked separately.
+- Found while writing it: #36 (fixed in N58) and #37 (a duplicate of #27, fixed in N58).
+
+## 2026-10-05 — Views: min, max and as_of in the state machine (N62)
+
+- `src/nerva.zig`: `Member`, `GroupVersion`, `ViewVersion`; `member_key`, `member_order`,
+  `group_version_key`, `view_version_key`; tree ids 9–15; `ViewQuery.as_of`;
+  `view_extremes_per_table_max`; status `table_extremes_full`.
+- `src/nerva/views.zig`: `min` and `max` accepted; ordered values, the members' order prefix,
+  `extreme_count`.
+- `src/nerva/state_machine.zig`: `members`, `group_versions` and `view_versions` grooves; commit
+  prefetch stages 3 (members) and 4 (scans of the order where a group's holder may leave);
+  `views_finish` settles `min` and `max`, keeps hashes and group counts, writes groups, members,
+  views and their versions once each; a timestamp reserve per op for versions; entry blocks of 9;
+  `get_view` as of an op (view version, then one scan per listed group).
+- `src/lsm/scan_builder.zig`: `scan_prefix_range` (UPSTREAM.md).
+- `nerva api`: `GET /v1/views/<name>/groups?as_of=`, `declared_op`, every aggregate rendered as
+  `<fn>_<field>`; `min` and `max` maintained.
+- Admission counts members as well as groups (`member_writes_limit`, a request's entries);
+  pulses add at most what both limits allow. Replica RSS: 1,014 MiB on `main`, 1,295 MiB here.
+- `build.zig`: release `0.0.4`, clients from `0.0.4` (owner's decisions; README, UPSTREAM.md).
+  `ViewQuery.as_of` in v0.3.0's reserved bytes, so its layout is otherwise unchanged. Found and
+  filed while checking: #42 (`nerva view` exits on a timeout; the canvas test flakes under
+  load) and #48 (an evicted client segfaults).
+- `docs/TUTORIAL.md` matches v0.3.0 and is left so: its maintained views (`count` and `sum`,
+  latest only) and its release notes (`0.0.3`, clients from `0.0.2`) change with the release
+  that ships this.
+- `demo/canvas/server.py`: the reset is two transactions (its per-pixel `canvas` view, now
+  maintained, needs 4,096 groups for one).
+- Tests: the state machine tests' harness compacts and checkpoints; a randomized `min`, `max`
+  and `as_of` test against a model (with member refusals); the VOPR model of both, reading
+  declared views more often; `tests/views/maintained.py` with a `min` and `max` view and
+  `as_of`; format guards updated. Mutation-tested: three planted bugs fail the unit test; the
+  VOPR catches a blunt one but not those three (N62 says why).
 
 ## 2026-10-05 — Nightly: build the image on the host network
 

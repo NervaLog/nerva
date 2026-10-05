@@ -3,6 +3,8 @@
 //!
 //! A gateway executes one request at a time, but reads requests from up to `connections_max`
 //! connections at once, so a client that sends its request slowly, or never, holds up nobody.
+//! With every slot busy, a new connection displaces the oldest one still sending its request
+//! (N58): holding slots open with idle connections cannot lock others out (#28).
 //! Each connection carries one request (replies say `connection: close`), which must arrive
 //! whole within `deadline_ns` of the connection being accepted; the reply is written within the
 //! same budget, counted afresh. Request heads are parsed strictly (`head_parse`): anything
@@ -135,7 +137,8 @@ pub fn key_matches(key_header: ?[]const u8, key: []const u8) bool {
 }
 
 pub const Options = struct {
-    /// Connections read at once; further connections wait in the listen backlog.
+    /// Connections read at once. A further connection displaces the oldest one still sending its
+    /// request (or, with every slot's request complete, waits until one is served).
     connections_max: u32,
     head_size_max: u32 = 16 * 1024,
     body_size_max: u32,
@@ -247,10 +250,9 @@ pub const Receiver = struct {
                 wait_ns = timeout_ns - (now - start);
             }
             var fds_count: usize = 0;
-            var accepting = false;
             for (receiver.slots) |*slot| {
                 switch (slot.state) {
-                    .free => accepting = true,
+                    .free => {},
                     .reading => {
                         const left = slot.deadline -| now;
                         wait_ns = if (wait_ns) |wait| @min(wait, left) else left;
@@ -264,21 +266,27 @@ pub const Receiver = struct {
                     .complete, .serving => unreachable,
                 }
             }
-            if (accepting) {
-                receiver.poll_fds[fds_count] = .{
-                    .fd = receiver.server.stream.handle,
-                    .events = posix.POLL.IN,
-                    .revents = 0,
-                };
-                fds_count += 1;
-            }
-            assert(fds_count > 0);
+            // The listening socket always, and last: with every slot busy, a waiting connection
+            // displaces the oldest one still sending its request (#28). Last, so that a slot
+            // closed for it has had its own events handled before its fd can be reused.
+            receiver.poll_fds[fds_count] = .{
+                .fd = receiver.server.stream.handle,
+                .events = posix.POLL.IN,
+                .revents = 0,
+            };
+            fds_count += 1;
             const ready = try posix.poll(receiver.poll_fds[0..fds_count], milliseconds(wait_ns));
             if (ready == 0) continue;
 
             for (receiver.poll_fds[0..fds_count]) |poll_fd| {
                 if (poll_fd.revents == 0) continue;
                 if (poll_fd.fd == receiver.server.stream.handle) {
+                    if (!receiver.slot_free()) {
+                        // Every slot complete: serve them first, then accept.
+                        const oldest = receiver.oldest_reading() orelse continue;
+                        log.debug("every slot busy: closing the oldest unfinished request", .{});
+                        receiver.close(&receiver.slots[oldest]);
+                    }
                     receiver.accept();
                 } else {
                     receiver.read(receiver.slot_reading(poll_fd.fd));
@@ -298,7 +306,7 @@ pub const Receiver = struct {
     fn accept(receiver: *Receiver) void {
         const slot = for (receiver.slots) |*slot| {
             if (slot.state == .free) break slot;
-        } else unreachable; // Polled only with a free slot.
+        } else unreachable; // `next` frees one first.
         const fd = posix.accept(
             receiver.server.stream.handle,
             null,
@@ -344,13 +352,17 @@ pub const Receiver = struct {
 
         if (slot.head == null) {
             const bytes = slot.buffer[0..slot.size];
-            // Refuse a bare LF at once, rather than wait for a CRLF CRLF that never comes.
-            for (bytes[size_before..], size_before..) |byte, index| {
+            const head_end = std.mem.indexOfPos(u8, bytes, size_before -| 3, "\r\n\r\n");
+            // Refuse a bare LF in the head at once, rather than wait for a CRLF CRLF that never
+            // comes. Bytes past the head are the body's, where an LF is just a byte (#36).
+            const head_read = if (head_end) |index| index + "\r\n\r\n".len else slot.size;
+            assert(head_read > size_before);
+            for (bytes[size_before..head_read], size_before..) |byte, index| {
                 if (byte == '\n' and (index == 0 or bytes[index - 1] != '\r')) {
                     return receiver.refuse(slot, "malformed request");
                 }
             }
-            const end = std.mem.indexOfPos(u8, bytes, size_before -| 3, "\r\n\r\n") orelse {
+            const end = head_end orelse {
                 if (slot.size == receiver.options.head_size_max) {
                     return receiver.refuse(slot, "request head too large");
                 }
@@ -444,6 +456,25 @@ pub const Receiver = struct {
                 receiver.close(slot);
             }
         }
+    }
+
+    fn slot_free(receiver: *const Receiver) bool {
+        for (receiver.slots) |*slot| {
+            if (slot.state == .free) return true;
+        }
+        return false;
+    }
+
+    /// The connection accepted first among those still sending their request.
+    fn oldest_reading(receiver: *const Receiver) ?u32 {
+        var oldest: ?u32 = null;
+        for (receiver.slots, 0..) |*slot, index| {
+            if (slot.state != .reading) continue;
+            if (oldest == null or slot.accepted < receiver.slots[oldest.?].accepted) {
+                oldest = @intCast(index);
+            }
+        }
+        return oldest;
     }
 
     fn oldest_complete(receiver: *const Receiver) ?u32 {
@@ -578,6 +609,33 @@ test "Receiver: a slow client holds up nobody, and is closed at its deadline" {
     try testing.expectEqual(0, try slow.read(&reply));
 }
 
+test "Receiver: a body may hold LFs, though the head may not, when both arrive in one read" {
+    var receiver = try Receiver.init(
+        testing.allocator,
+        try std.net.Address.parseIp("127.0.0.1", 0),
+        .{ .connections_max = 2, .body_size_max = 64 },
+    );
+    defer receiver.deinit(testing.allocator);
+
+    // Head and a pretty-printed body in one write, as `curl -d` sends them (#36).
+    const client = try test_connect(&receiver);
+    defer client.close();
+    try client.writeAll("POST /v1/lookup HTTP/1.1\r\nContent-Length: 13\r\n\r\n{\"rows\":[\n]}\n");
+    const received = (try receiver.next(1000)).?;
+    try testing.expectEqualStrings("{\"rows\":[\n]}\n", received.request.body);
+    receiver.respond(received, 200, "{}");
+
+    // A bare LF in the head is still refused, with a body behind it in the same read.
+    const bare = try test_connect(&receiver);
+    defer bare.close();
+    try bare.writeAll("POST / HTTP/1.1\nContent-Length: 2\r\n\r\n{}");
+    try testing.expectEqual(null, try receiver.next(100));
+    var reply: [256]u8 = undefined;
+    const reply_size = try bare.readAll(&reply);
+    try testing.expect(std.mem.startsWith(u8, reply[0..reply_size], "HTTP/1.1 400 "));
+    try testing.expect(std.mem.indexOf(u8, reply[0..reply_size], "malformed request") != null);
+}
+
 test "Receiver: malformed and oversized requests are refused with 400" {
     var receiver = try Receiver.init(
         testing.allocator,
@@ -608,29 +666,36 @@ test "Receiver: malformed and oversized requests are refused with 400" {
     }
 }
 
-test "Receiver: with every slot busy, a connection waits until one frees" {
+test "Receiver: with every slot busy, a new connection displaces the oldest unfinished one" {
     var receiver = try Receiver.init(
         testing.allocator,
         try std.net.Address.parseIp("127.0.0.1", 0),
-        .{ .connections_max = 1, .body_size_max = 0 },
+        .{ .connections_max = 2, .body_size_max = 0 },
     );
     defer receiver.deinit(testing.allocator);
 
-    const first = try test_connect(&receiver);
-    defer first.close();
-    try first.writeAll("GET /first HTTP/1.1\r\n");
-    try testing.expectEqual(null, try receiver.next(50)); // Accepts `first`.
-
-    const second = try test_connect(&receiver);
-    defer second.close();
-    try second.writeAll("GET /second HTTP/1.1\r\n\r\n");
+    // Two connections that send nothing hold both slots (#28).
+    const idle_old = try test_connect(&receiver);
+    defer idle_old.close();
+    try testing.expectEqual(null, try receiver.next(50));
+    const idle_new = try test_connect(&receiver);
+    defer idle_new.close();
     try testing.expectEqual(null, try receiver.next(50));
 
-    try first.writeAll("\r\n");
-    const received_first = (try receiver.next(1000)).?;
-    try testing.expectEqualStrings("/first", received_first.request.target);
-    receiver.respond(received_first, 200, "{}");
-    const received_second = (try receiver.next(1000)).?;
-    try testing.expectEqualStrings("/second", received_second.request.target);
-    receiver.respond(received_second, 200, "{}");
+    // A full request arrives: it is served at once, displacing the oldest idle connection.
+    const client = try test_connect(&receiver);
+    defer client.close();
+    try client.writeAll("GET /served HTTP/1.1\r\n\r\n");
+    const received = (try receiver.next(1000)).?;
+    try testing.expectEqualStrings("/served", received.request.target);
+    receiver.respond(received, 200, "{}");
+
+    var buffer: [16]u8 = undefined;
+    try testing.expectEqual(0, try idle_old.read(&buffer)); // Closed.
+
+    // The newer idle connection kept its slot, and can still send its request.
+    try idle_new.writeAll("GET /later HTTP/1.1\r\n\r\n");
+    const later = (try receiver.next(1000)).?;
+    try testing.expectEqualStrings("/later", later.request.target);
+    receiver.respond(later, 200, "{}");
 }

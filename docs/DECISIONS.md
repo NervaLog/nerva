@@ -723,6 +723,41 @@ it runs and has its standard library, and otherwise replaced by a fresh download
 then checks the version as before. `release.yml` still downloads (one job per release).
 A run now takes 10 Machines instead of 6, of the org's pool of 30.
 
+**N58. Gateway fixes from the second hardening pass: routes, recovery, slots, trace files.**
+Five bugs found by the second pass, each reproduced before it was fixed:
+- **`GET /v1/views/groups` crashed `nerva api` (#26).** The path matched both the views prefix and
+  the groups suffix, and the name between them was sliced from 10 to 9. A path is a groups route
+  only with a name between the two: `/v1/views/groups` is the view named `groups`, which can now
+  be read and declared, and `/v1/views/groups/groups` reads its groups.
+- **One timeout disabled `nerva api` for good (#27).** A client that timed out or was evicted
+  stays unusable, and the gateway never replaced it, while `/healthz` said 200. The gateway now
+  keeps the client's health: after a timeout or eviction it answers 503 at once, and the next
+  request for the cluster at least 5 s later replaces the client (`Client.reconnect`, or `init`
+  alone if a replacement failed partway, never `deinit` twice). `/healthz` answers 503 until it
+  is ready again, so a load balancer stops sending to it. The 5 s bound keeps an outage from
+  tying up the gateway's thread with a registration per request. `nerva view` still exits when
+  it cannot follow the feed, leaving recovery to its supervisor.
+- **Idle connections locked clients out (#28).** N45's 16 slots each held an idle connection for
+  its whole 10 s deadline, while new connections queued behind them: 200 idle connections held
+  `/healthz` up for 85 s, with no key. With every slot busy, the `Receiver` now still polls the
+  listening socket, and a waiting connection displaces the oldest one still sending its request
+  (closed without a reply). A client that sends its request promptly is served; an attacker must
+  open connections faster than a request arrives, not merely hold sixteen. Not a per-peer limit:
+  behind a proxy every client has one address. Amends N45, whose further connections waited in
+  the backlog.
+- **`--trace=<path>` truncated whatever it named (#29)**, a data file included. It is now
+  created exclusively, and an existing file is refused with a message.
+- **A body with a newline was refused when it arrived with its head (#36).** N45's early
+  refusal of a bare LF scanned every byte read so far, body included, so `curl -d` with
+  pretty-printed JSON (the README's own examples) got `400 malformed request` whenever head and
+  body shared a read. The scan now stops at the end of the head; the body is bytes.
+Tests that fail on the binary before these fixes: a view named `groups` read and declared
+(`tests/views/maintained.py`); 200 idle connections and `/healthz` within 3 s, `start --trace`
+of an existing file leaving it intact, and a replica stalled past the client's timeout, then
+resumed, with the gateway reporting itself unhealthy and recovering (`tests/api/api.py`); and a
+`Receiver` unit test of displacement; and a multi-line body sent in one write with its head
+(`tests/api/api.py`, and a `Receiver` unit test that also keeps a bare LF in the head refused).
+
 **N59. Long fuzzing, by hand, on runners started for it.**
 Smoke (N53) runs each fuzzer once at a fixed seed: it keeps fuzzers working, but finds little.
 Finding bugs takes many seeds. `.github/workflows/fuzz.yml` runs, on `workflow_dispatch` only,
@@ -734,3 +769,160 @@ once (ReleaseSafe), then gives each run a fresh seed and a 30-minute cap. A fail
 exactly, so the job prints the seed and the command that replays it, in its log and summary, and
 stops: one failing seed is the finding. A run past the cap is a warning, not a failure (some
 fuzzers' default sizes are long). Not scheduled: a schedule would need runners standing by.
+
+**N60. Release v0.3.0: the release string moves to `0.0.3`; clients from `0.0.2` are still
+accepted.**
+Maintained views (N52) changed what a commit does on every replica (5 timestamps per entry,
+operations 132–134, trees 5–8) without moving the release string, so v0.2.0 and later binaries
+both said `0.0.2` (#34). Owner's decision (N32, option (a) of #34): bump `release` to `0.0.3`
+and reformat, as for N43. `release_client_min` stays `0.0.2`: the client protocol only gained
+operations, and a v0.2.0 `nerva api` was measured committing and reading against a `0.0.3`
+cluster. Measured on what the bump does and does not do:
+- A `0.0.3` replica opening a `0.0.2` data file stops with `multiversion unsupported`: it looks
+  for `0.0.2` among the releases bundled in its binary, and Nerva bundles only its own (N43).
+- It does **not** keep releases apart on the wire. In a three-replica cluster with two v0.2.0
+  replicas and one freshly formatted `0.0.3` replica, the `0.0.3` replica joined as a backup,
+  was needed for quorum (and committed) once a v0.2.0 replica stopped, and panicked with
+  `checkpoint diverged` at op 960, the first checkpoint. TigerBeetle expects a newer binary to
+  run older releases' prepares with the older code it bundles; Nerva has no older code to run.
+  N61 makes replicas ignore peers of another release, so a mixed cluster cannot diverge.
+- The golden checksum of a formatted data file did not change: only the development release
+  `0.0.1` writes a different superblock (N43).
+v0.3.0's notes list #30–#33 as known issues; #38's fixes (#26–#29, #36) and N61 (#34) ship in
+it.
+
+**N61. Replicas ignore peers that run another release.**
+N60 measured that a release string only guards data files: a replica of another release joins
+the cluster, counts toward quorums while it executes the log with other code, and is caught only
+at the first checkpoint (#34). TigerBeetle lets releases mix because a newer binary bundles the
+older releases and runs their prepares with the older code; Nerva bundles one (N43). Owner's
+decision: fix it in v0.3.0.
+- **By peer, not by message.** Only pings and pongs carry their sender's running release; most
+  replica messages carry release 0. A replica records each peer's release from its pings and
+  pongs and handles a peer's messages only once that peer has announced the release it runs
+  itself (`nerva/release_peers.zig`, `admits`). A peer that has not announced yet counts for
+  nothing, about a second at startup. Prepares and blocks do not name their sender (any replica
+  relays or repairs them) but carry the release they were made in, so they are checked by that:
+  root and reserved prepares carry 0. Requests, client pings and replies pass:
+  `release_client_min` governs clients.
+- **Restarts.** A restart always drops the restarting replica's connections, so a replica
+  forgets a peer's release when the message bus no longer holds a connection to it, and pings a
+  peer as soon as a connection appears, so each side learns the other's release within a tick
+  rather than at the next ping timeout. (Pinging first on open, the first design, does not
+  work: the bus drops messages to replicas it is not yet connected to.)
+- **Opt-in, for Nerva.** `Replica.Options.release_peers_strict`, set by `nerva start`. Vendored
+  `replica_test.zig` and the VOPR's `testing` lane simulate TigerBeetle's in-place upgrades, in
+  which replicas of different releases cooperate, and keep upstream behaviour. The VOPR's `nerva`
+  lane simulated them too, a path Nerva never runs (N43: a new release is a reformat). It now runs
+  one release with the option on, as production does.
+- **With a v0.2.0 peer**, which ignores no one (measured with the v0.2.0 binary). One v0.3.0
+  replica and two v0.2.0: the v0.3.0 replica logs that it ignores both, drops their prepares,
+  and never counts; the v0.2.0 pair cannot commit without each other. Two v0.3.0 and one v0.2.0:
+  the v0.3.0 pair ignores the v0.2.0 replica and commits past a checkpoint; the v0.2.0 replica
+  takes the v0.3.0 primary's view, commits its prepares, and panics on the first operation it
+  does not know (`Operation.cast`, a views operation). Either way only one release's replicas
+  count toward quorums. Between v0.3.0 and later releases neither side executes the other's
+  prepares.
+Tests: unit tests of `admits`; `zig build test:release` (`tests/release/mixed.py`) builds a
+second `nerva` with release `0.0.200` and runs replicas 0 and 1 on one release and replica 2 on
+the other: both sides log the mismatch, nothing commits without replica 1, and with it back
+1,000 commits pass the first checkpoint with no panic (before: `checkpoint diverged`). VOPR
+seeds 1, 2, 5 and two random seeds on the `nerva` lane, 1 and 2 on `testing`. Mutation-tested:
+without the gate a commit succeeds with replica 1 stopped (`test:release`); admitting unannounced
+peers or prepares of another release fails the unit tests. Forgetting a release on disconnect is
+not covered by a failing test: a restart onto another release would need two binaries swapped on
+one replica index within a ping interval.
+
+**N62. Views' `min` and `max` from each group's members in order; views read as of any op.**
+The second step of N52 (design approved by the owner before implementation). After it, every
+aggregate `nerva view` offers is maintained by the state machine, and a view reads as of any
+committed op since its declaration.
+- **Members.** `count` and `sum` change by adding and subtracting; `min` and `max` cannot: when
+  the row holding a group's minimum leaves, the new minimum is another row's. So every `min` or
+  `max` slot keeps, for each row in the view, a `Member` (tree ids 9 to 11; 128 bytes): keyed by
+  view, slot and row, and, while the row is in a group, indexed by `order`, the group's 64-bit
+  prefix (SHA-256 of the view id, the slot and the group key) then the value, encoded so that it
+  sorts as the field does (signed fields with the sign bit flipped; every comparable field is at
+  most 64 bits). A group's slot is the first member of its range in `order` (`min`) or the last
+  (`max`), and the group stores it, so reads cost nothing more. Members are never removed: a row
+  that leaves the view keeps its member, out of the order. The member stores its group key: a
+  prefix shared by two groups is found when the order is read, and fails the view at that op on
+  every replica, as a group hash collision does (N52).
+- **Exact at every op, with no IO in commit.** Commit prefetch gains two stages. Stage 3
+  prefetches the member of every admitted write in every `min` or `max` slot of its table.
+  Stage 4 counts, per group and slot, the writes that may take a member out (from the rows as
+  they are before the op, a superset, as admission's count is), `r`; and where one of them may
+  take away the member holding the group's value, reads the first `r + 1` members of the order,
+  one scan each: at least one of them is untouched by the op, unless the slot has no more. At
+  the end of the op each touched group's slot is the best of the members the op brought into it
+  and either its stored value (if the op did not take away its holder) or the first untouched
+  member read. The view's hash and group count are now kept there too, once per group per op,
+  from the group as stored and as left.
+- **Bounds.** At most 4 `min` and `max` slots per table, across its views (`declare_view`
+  answers `table_extremes_full`, status 9). One op writes at most a request's entries' worth of
+  distinct members (`members_per_op_max`, 8,190 in production), and admission counts them as it
+  counts groups (N52): a write counts its member in each `min` or `max` slot of each view whose
+  filter its old or new value passes, and a transaction that would take the op past the limit
+  is refused whole (`views_busy`). With one or two such slots on a table any request fits; with
+  four, a transaction of more than about 2,000 writes to that table never does. The owner chose
+  this over sizing the members trees so that nothing is ever refused: measured on one replica
+  (`--development`, RSS after start), `main` takes 1,014 MiB, this change 1,295 MiB, and with
+  members sized for 4 × a request's entries 1,953 MiB. The 281 MiB are mostly the two version
+  trees. A pulse adds at most as many rows as both limits allow (`backfill_rows_max`). The scans
+  of stage 4 count each member once, so they read at most twice as many members as the op may
+  touch. Each entry's block of timestamps grows from 5 to 9 (its change, a group in each of 4
+  views, a member in each of 4 slots); a pulse's rows take the same blocks.
+- **As of an op.** Two append-only trees, like the changes: `group_versions` (tree ids 12, 13;
+  256 bytes), the group as each op that changed it left it, and `view_versions` (14, 15; 128
+  bytes), the view's state, hash and group count likewise, written once per op at the end of
+  the op. Each op reserves timestamps for them, below its writes' (`group_writes_limit` plus
+  `views_max`), so entries keep the top of the op's range as before. A version key orders a
+  group's versions by op (`view_id`, the group hash, then the op in 57 bits: ops below 2^57).
+  `ViewQuery.as_of` (zero: the latest; the last 8 of v0.3.0's 12 reserved bytes, which its
+  clients send as zeros, so their queries still read the latest) reads the view's last version at or before `as_of`, then walks the
+  current groups in storage order (groups are never removed) and reads each one's last version,
+  one scan per group: so an `as_of` page holds at most 128 groups (`view_as_of_limit_max`). A
+  group with no version then did not exist yet; a view with none, `missing`. `as_of` past the
+  read's op reads the latest. History is kept forever, as rows' is.
+- **API.** `GET /v1/views/<name>/groups?as_of=<op>` (refused for an op not yet committed, as
+  `GET /v1/row` is; `404` before the declaration), and every group renders each aggregate as
+  `<fn>_<field>`, as `nerva view` does. The reply now carries `declared_op`. `PUT /v1/views`
+  says `"maintained": true` for `min` and `max`; `unsupported` (status 8) is no longer returned.
+- **Tests.** Unit tests for the ordered encoding, member keys and order prefixes and version
+  keys; golden values for all four (computed in Python) in the derivations guard. The state
+  machine tests' harness now compacts and checkpoints as the replica does, so a test may run
+  for hundreds of ops: a randomized test (ids few and prices fewer, so that ties are common;
+  puts, deletes and adds; several transactions per op) compares two views, with four `min` and
+  `max` slots over unsigned and signed fields, to a brute-force model after each of 300 ops,
+  after a backfill with commits between the pulses; then reads every one of those ops back as of
+  it, and as of before and at the declaration. The VOPR declares views with random `min`, `max`
+  and `sum` slots, predicts `table_extremes_full`, checks ready views' slots against the model
+  (computed apart from the members), reads as of random past and future ops against the rows
+  replayed from the model's change feed, and checks that a view read ready as of an op is never
+  building as of a later one. `tests/views/maintained.py` adds a view with `min` and `max`, and
+  compares both views with `nerva view` latest and then as of every op compared before.
+- **The canvas demo** declares a view with a group per pixel and `max`, maintained since this
+  change: its reset, one transaction of 4,096 pixels, needed one group more than an op takes and
+  was refused forever, and `commit_retrying` retried it forever (found by `test:demo`). The
+  owner chose to reset in two transactions of 2,048 pixels; an epoch starts at the second.
+- **Mutation-tested.** In the state machine: reading one member instead of `r + 1`, ignoring that
+  an op took away a group's holder, and reading versions as of `as_of - 1` each fail the
+  randomized unit test. The VOPR's comparison is live (every `min` and `max` set to zero fails
+  seeds 1 and 13), but the two subtler of those bugs pass seeds 1, 2, 3 and 13: its few reads of
+  ready views rarely meet a group whose holder left, or a group changed at exactly `as_of`.
+  The unit test is what guards them.
+- **Release `0.0.4`, clients from `0.0.4`** (owner's decisions, on N32 and N60). What a commit
+  does on every replica changed (9 timestamps per entry, a reserve per op, trees 9 to 15), so a
+  `0.0.3` and a `0.0.4` replica would diverge: the release string moves, data files must be
+  reformatted, and N61 keeps replicas of the two releases apart. Clients of v0.3.0 are refused:
+  a v0.3.0 `nerva api` asserts that a maintained view's aggregates are sums, and does not know
+  status 9, so against this cluster it would crash on a `min` or `max` view. Measured: a `0.0.2`
+  `nerva api` is evicted at registration with `client_release_too_low`, and then segfaults, an
+  older bug in the client's eviction (#48). `ViewQuery` keeps v0.3.0's layout regardless:
+  `as_of` takes the last 8 of its 12 reserved bytes, so had old clients been kept, their
+  queries would still read the latest. The formatted data file's golden checksum is unchanged,
+  as for `0.0.3` (N60).
+- **Format guards** (N54) updated, as they should fail on all of this: the layouts snapshot
+  gains the three new types, tree ids 9 to 15, `table_extremes_full` and `ViewQuery.as_of` in
+  its reserved bytes; the script snapshot's change timestamps step by 9 per entry, plus each op's reserve
+  for versions.

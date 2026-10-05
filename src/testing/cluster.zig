@@ -91,6 +91,8 @@ pub fn ClusterType(comptime StateMachineType: anytype) type {
             releases: []const Release,
             client_release: vsr.Release,
             state_machine: StateMachine.Options,
+            /// Nerva: replicas ignore peers of another release (N61). Needs one release.
+            release_peers_strict: bool = false,
         };
 
         pub const Callbacks = struct {
@@ -735,6 +737,7 @@ pub fn ClusterType(comptime StateMachineType: anytype) type {
                     .release = options.release,
                     .release_client_min = release_client_min,
                     .multiversion = replica_multiversion(replica),
+                    .release_peers_strict = cluster.options.release_peers_strict,
                     .test_context = cluster,
                     .tracer = &cluster.replica_tracers[replica_index],
                 },
