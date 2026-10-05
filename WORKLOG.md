@@ -389,3 +389,10 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
 - Tests: unit and state machine tests, the VOPR model of views, `tests/views/maintained.py` in
   `test:views`. Mutation-tested (groups that never lose rows, the backfill cursor, admission off
   by one).
+
+## 2026-10-04 — CI runs the fuzzers' smoke pass (N53)
+
+- `.github/workflows/ci.yml`: the `test` job runs `zig build fuzz -- smoke` after the unit tests.
+  README lists it among CI's steps.
+- Verified locally: the smoke pass passes on `main`.
+
