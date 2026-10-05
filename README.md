@@ -174,6 +174,17 @@ change feed, `c7` mixed. `--rate=0` (default) is a closed loop; `--rate=<n>` an 
 latencies count from each request's due time. Use `-Drelease` so the `nerva` it starts is a
 release build.
 
+### Nightly performance
+
+`.github/workflows/perf-nightly.yml` runs every night at 06:47 UTC (and by hand, with any
+candidate and baseline). It builds the candidate (`main`) and the baseline (the last night that
+passed), then `perf/nightly/fly-run.sh` creates one Fly Machine for the night, runs both builds
+there in alternating rounds (`perf/nightly/run.sh`: every benchmark, then the `bench:load`
+workloads against three production-config replicas), and destroys it. `perf/nightly/compare.py`
+compares the rounds pairwise: a metric that is worse than its threshold in every round fails the
+night and files a `perf-regression` issue; it never blocks a release. Results go to the
+`perf-results` branch. The job needs the repository secret `FLY_API_TOKEN_PERF`.
+
 ## JSON API
 
 `nerva api` serves the core operations as JSON over HTTP, for any language:

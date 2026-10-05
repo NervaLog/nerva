@@ -4,7 +4,7 @@
 //! A gateway executes one request at a time, but reads requests from up to `connections_max`
 //! connections at once, so a client that sends its request slowly, or never, holds up nobody.
 //! With every slot busy, a new connection displaces the oldest one still sending its request
-//! (N56): holding slots open with idle connections cannot lock others out (#28).
+//! (N57): holding slots open with idle connections cannot lock others out (#28).
 //! Each connection carries one request (replies say `connection: close`), which must arrive
 //! whole within `deadline_ns` of the connection being accepted; the reply is written within the
 //! same budget, counted afresh. Request heads are parsed strictly (`head_parse`): anything
