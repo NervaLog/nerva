@@ -233,10 +233,10 @@ answers `503` and `/healthz` answers `503`, and it reconnects on its own, trying
 5 s whether or not requests arrive (N64); `nerva view` then reads the feed on from where it
 stopped. Heads are parsed
 strictly: lines end in CRLF, bodies have a `Content-Length` (no `Transfer-Encoding`), and
-anything malformed answers `400`. A body is at most 4 MiB, and a `nerva api` request may allocate at most
-128 MiB on one request: a body that would take more once parsed (deeply nested or very long JSON
-arrays) answers `413 {"error":"request too complex"}`. What a request took is given back as soon
-as its reply is written; the gateway keeps at most 8 MiB between requests (N69).
+anything malformed answers `400`. A body is at most 4 MiB, and a `nerva api` request may
+allocate at most 128 MiB: a body that would take more once parsed (deeply nested or very long
+JSON arrays) answers `413 {"error":"request too complex"}`. What a request took is given back as
+soon as its reply is written; the gateway keeps at most 8 MiB between requests (N69).
 
 **Documents** hold values larger than a row: up to 64 KiB under a string key (up to 1024 bytes
 of UTF-8) in a namespace (a `u64`, as a decimal string). Nerva chunks them over rows of a
