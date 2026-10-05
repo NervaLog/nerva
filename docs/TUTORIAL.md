@@ -8,8 +8,8 @@ tour of the code for people who want to change Nerva itself.
 It assumes you are comfortable with a shell, `curl` and JSON, and know roughly what a database
 transaction is. You do not need to know Zig until the last two parts.
 
-Every reply shown below is real output from a run of these exact commands. **Your op numbers
-will differ**: see "Ops move on their own" in Part 1.
+Every reply shown below is real output from a run of these exact commands against v0.3.0.
+**Your op numbers will differ**: see "Ops move on their own" in Part 2.
 
 > Nerva is a research database (see the [README](../README.md)). Do not put data in it that you
 > cannot lose.
@@ -98,15 +98,16 @@ cd nerva-ledger
 ./zig/download.sh      # installs Zig 0.14.1 into ./zig
 ./zig/zig build        # builds zig-out/bin/nerva (a few minutes the first time)
 ./zig-out/bin/nerva version
-# Nerva version 0.0.2+eaa7520
+# Nerva version 0.0.3+4033927
 ```
 
-The version is `<protocol release>+<commit>`. Replicas, clients and data files of different
-protocol releases refuse each other.
+The version is `<protocol release>+<commit>`: `0.0.3` is the protocol release of v0.3.0. It
+decides which replicas, data files and clients work together (see "One release per cluster"
+below).
 
-Release binaries are on the [releases page](https://github.com/Botpike/nerva-ledger/releases),
-but this tutorial follows `main`: maintained views (Part 7) came after v0.2.0, so build from
-source.
+Or skip the build: v0.3.0 binaries for Linux and macOS (x86_64, aarch64) are on the
+[releases page](https://github.com/Botpike/nerva-ledger/releases). This tutorial matches
+v0.3.0; [CHANGELOG.md](../CHANGELOG.md) lists what each release changed.
 
 ### Start one replica
 
@@ -152,9 +153,8 @@ n() { curl -s -H 'X-Nerva-Key: secret' "$@"; echo; }
 A=http://127.0.0.1:8080
 ```
 
-> **Write JSON bodies on one line.** On current `main`, the gateways can refuse a body that
-> contains a newline with `400 malformed request` ([#36](https://github.com/Botpike/nerva-ledger/issues/36)).
-> All examples here are single-line.
+Bodies may span several lines, as the longer examples below do. (Before v0.3.0, a body with
+a newline could be refused with `400 malformed request`: if you see that, upgrade.)
 
 ### A three-replica cluster
 
@@ -173,6 +173,22 @@ $NERVA api --cluster=1 --addresses=3001,3002,3003 --listen=127.0.0.1:8080 &
 
 Everything below works identically against it. With three replicas, any one can crash and the
 cluster keeps committing.
+
+### One release per cluster
+
+Every replica of a cluster must run the same release (the part of `nerva version` before the
+`+`). A replica ignores peers that run another release, and says so in its log:
+
+```
+error(replica): … replica 2 runs release 0.0.2, this replica runs 0.0.3: ignoring it (a cluster must run one release)
+```
+
+Ignored peers count toward nobody's quorum, so a cluster with mixed releases may stop
+committing. Data files are tied to a release too: a replica refuses a file formatted by
+another one. Upgrading therefore means: stop every replica, format new data files with the
+new binary, start them all on it, and load your data again. Clients and gateways are more
+lenient: replicas accept clients from release `0.0.2` (v0.2.0) on, so `nerva api` can be
+upgraded after the cluster.
 
 ---
 
@@ -257,7 +273,9 @@ The row above is at version 5. "Change it, but only if nobody else did since I r
 `read` at that version plus a `put`:
 
 ```bash
-n -d '{"entries":[{"kind":"read","table":1,"id":"42","op_seen":"5"},{"kind":"put","table":1,"id":"42","value_hex":"776f726c64"}]}' $A/v1/commit
+n -d '{"entries":[
+  {"kind":"read","table":1,"id":"42","op_seen":"5"},
+  {"kind":"put","table":1,"id":"42","value_hex":"776f726c64"}]}' $A/v1/commit
 ```
 ```json
 {"status":"committed","op":"10"}
@@ -431,7 +449,11 @@ Types are `u8`, `u16`, `u32`, `u64`, `i64`, `bool` and `bytes` (with a size). No
 `fields` instead of `value_hex`, and reads return both:
 
 ```bash
-n -d '{"entries":[{"kind":"put","table":5,"id":"1","fields":{"section":1,"price":"100","sold":true}},{"kind":"put","table":5,"id":"2","fields":{"section":1,"price":"100","sold":false}},{"kind":"put","table":5,"id":"3","fields":{"section":2,"price":"250","sold":true}},{"kind":"put","table":5,"id":"4","fields":{"section":2,"price":"250","sold":true}}]}' $A/v1/commit
+n -d '{"entries":[
+  {"kind":"put","table":5,"id":"1","fields":{"section":1,"price":"100","sold":true}},
+  {"kind":"put","table":5,"id":"2","fields":{"section":1,"price":"100","sold":false}},
+  {"kind":"put","table":5,"id":"3","fields":{"section":2,"price":"250","sold":true}},
+  {"kind":"put","table":5,"id":"4","fields":{"section":2,"price":"250","sold":true}}]}' $A/v1/commit
 # {"status":"committed","op":"38"}
 
 n -d '{"rows":[{"table":5,"id":"3"}]}' $A/v1/lookup
@@ -487,7 +509,9 @@ Each add reports what it `applied` and the field's new `value`.
 one transaction:
 
 ```bash
-n -d '{"entries":[{"kind":"add","table":6,"id":"1","field":"available","delta":"-30","min":"0","clamp":true},{"kind":"add","table":6,"id":"1","field":"held","delta_from":0}]}' $A/v1/commit
+n -d '{"entries":[
+  {"kind":"add","table":6,"id":"1","field":"available","delta":"-30","min":"0","clamp":true},
+  {"kind":"add","table":6,"id":"1","field":"held","delta_from":0}]}' $A/v1/commit
 ```
 
 Run it three times:
@@ -531,7 +555,11 @@ A **view** is a declaration stored in the log, not code you run. Declare "count 
 price of sold seats, by section":
 
 ```bash
-n -X PUT $A/v1/views/revenue -d '{"table":5,"where":[{"field":"sold","op":"eq","value":true}],"group_by":["section"],"aggregates":[{"fn":"count"},{"fn":"sum","field":"price"}]}'
+n -X PUT $A/v1/views/revenue -d '{
+  "table": 5,
+  "where": [{"field": "sold", "op": "eq", "value": true}],
+  "group_by": ["section"],
+  "aggregates": [{"fn": "count"}, {"fn": "sum", "field": "price"}]}'
 # {"view":"revenue","declared":"created","maintained":true}
 ```
 
@@ -611,8 +639,9 @@ n "$V/v1/views/revenue?as_of=89"
 
 Op 89 has the same groups as op 87, so it has the same hash. **A hash is a function of the
 groups only**: two `nerva view` processes, or two clusters fed the same writes, agree on it
-exactly. You can check that two copies of a report agree by comparing 64 hex digits. (In two
-separate runs of this tutorial, the groups above hashed to `2560a945…` both times.)
+exactly. You can check that two copies of a report agree by comparing 64 hex digits. (Every
+run of this tutorial so far, on fresh clusters of two different releases, hashed the groups
+above to `2560a945…`.)
 
 The two kinds of hash are computed differently: `nerva view` hashes its whole answer, while the
 replicas sum per-group digests so that one write updates the hash cheaply. Compare maintained
@@ -624,7 +653,7 @@ hashes with maintained hashes, and `nerva view` hashes with `nerva view` hashes.
 | Reads | latest | latest, `min_op=<n>`, `as_of=<op>` |
 | Where the state lives | replicated, durable, in every replica | in the process's memory, rebuilt from the feed on restart |
 | Cost of a read | reads the groups | computes from rows held in memory (v0) |
-| Limit | about 4,000 distinct groups touched per op (`503 views_busy`, retry) | two million changes in memory |
+| Limit | about 4,000 distinct groups touched per op (`503 views_busy`, below) | two million changes in memory |
 
 ### Adds and views
 
@@ -646,6 +675,23 @@ n -d '{"entries":[{"kind":"add","table":5,"id":"3","offset":0,"type":"u64","delt
 
 Change such fields with a `put`.
 
+### Large transactions: `views_busy`
+
+Maintaining views costs work inside the commit, so one op may touch at most about 4,000
+distinct view groups, counted across all of a table's views. A row that moves between groups
+touches both. A transaction past that answers `503 {"status":"views_busy","index":…}` and
+applies nothing.
+
+**Do not retry `views_busy` unchanged: split the transaction.** The status suggests trying
+again later, but `nerva api` and the Zig client send one transaction per request, and each
+request is its own op. So `views_busy` always means that this transaction by itself touches too
+many groups, and every retry of it gets the same answer
+([#32](https://github.com/Botpike/nerva-ledger/issues/32)). It happens with bulk loads into a
+view grouped by a high-cardinality field. Send such loads in transactions of a few hundred rows.
+
+Groups are counted once however many writes land in them: a transaction of thousands of puts
+into the same few sections is fine.
+
 ---
 
 ## Part 8: Documents: larger values by key
@@ -658,17 +704,17 @@ means "must not exist".
 ```bash
 # {"items":[]} as hex
 n -d '{"namespace":"7","reads":[{"key":"cart/alice","version":"0"}],"writes":[{"key":"cart/alice","value_hex":"7b226974656d73223a5b5d7d"}]}' $A/v1/documents/commit
-# {"status":"committed","op":"102"}
+# {"status":"committed","op":"101"}
 
 n -d '{"namespace":"7","keys":["cart/alice","cart/bob"]}' $A/v1/documents/get
-# {"op":"103","documents":[{"key":"cart/alice","exists":true,"version":"102","value_hex":"7b226974656d73223a5b5d7d"},{"key":"cart/bob","exists":false,"version":"0","value_hex":""}]}
+# {"op":"103","documents":[{"key":"cart/alice","exists":true,"version":"101","value_hex":"7b226974656d73223a5b5d7d"},{"key":"cart/bob","exists":false,"version":"0","value_hex":""}]}
 ```
 
 A stale read conflicts and names the key:
 
 ```bash
 n -d '{"namespace":"7","reads":[{"key":"cart/alice","version":"0"}],"writes":[{"key":"cart/alice","delete":true}]}' $A/v1/documents/commit
-# {"status":"conflict","key":"cart/alice","version":"102"}     (409)
+# {"status":"conflict","key":"cart/alice","version":"101"}     (409)
 ```
 
 `documents/get` takes up to 256 keys and an optional `"as_of"`. A commit carries up to about
@@ -676,7 +722,7 @@ n -d '{"namespace":"7","reads":[{"key":"cart/alice","version":"0"}],"writes":[{"
 
 ```bash
 n "$A/v1/documents/changes?namespace=7&limit=1000"
-# {"documents":[{"key":"cart/alice","op":"102","kind":"put","value_hex":"7b2269…"}],"more":false,"cursor":"…","op":"105"}
+# {"documents":[{"key":"cart/alice","op":"101","kind":"put","value_hex":"7b2269…"}],"more":false,"cursor":"…","op":"105"}
 ```
 
 This feed is filtered from the shared change feed, `limit` records at a time, so a page can come
@@ -693,24 +739,41 @@ Kill the replica the hard way, as in a power cut:
 kill -9 %1        # or: kill -9 <pid of nerva start>
 ```
 
-While it is down, the gateway holds requests and waits for the cluster (up to 30 seconds, then
-`503 {"error":"cluster unavailable"}`). Restart it from the same data file:
+While the cluster is unreachable, `nerva api` holds each request for up to 30 seconds, then
+answers `503 {"error":"cluster unavailable"}`. If the cluster comes back within those 30
+seconds, held requests simply complete. Leave it down longer and watch the gateway notice:
+
+```bash
+n -d '{"rows":[{"table":6,"id":"1"}]}' $A/v1/lookup     # waits, then:
+# {"error":"cluster unavailable"}                        (503)
+curl -s $A/healthz
+# {"ok":false,"error":"cluster unavailable"}             (503)
+```
+
+From then on, requests answer `503` at once instead of each waiting 30 seconds, and
+`/healthz` reports the gateway as unhealthy. Restart the replica from the same data file:
 
 ```bash
 $NERVA start --addresses=3001 --development 1_0.nerva >> replica.log 2>&1 &
 # …about ten seconds later:
 n -d '{"rows":[{"table":6,"id":"1"}]}' $A/v1/lookup
-# {"op":"128","rows":[{"table":6,"id":"1","exists":true,"op":"55",…,"fields":{"available":"0","held":"50"}}]}
+# {"op":"110","rows":[{"table":6,"id":"1","exists":true,"op":"55",…,"fields":{"available":"0","held":"50"}}]}
+curl -s $A/healthz
+# {"ok":true}
 ```
 
-Everything committed is there. A commit is acknowledged only once it is durable on a quorum
-of replicas. With three replicas you can kill any one and the other two keep committing (if it
-was the primary, after a short election); the restarted one catches up by itself.
+`api.log` says `reconnected to the cluster`. The gateway replaces its broken connection on
+the next request for the cluster, at most once every 5 seconds, so a request or two may still
+see `503` while the replica opens. Then everything committed is there: a commit is acknowledged
+only once it is durable on a quorum of replicas. With three replicas you can kill any one and
+the other two keep committing (if it was the primary, after a short election); the restarted
+one catches up by itself.
 
-> **After an outage longer than 30 seconds, restart `nerva api`.** Once one request has timed
-> out, the gateway keeps answering `503` even after the cluster is back, while `/healthz` still
-> says ok ([#37](https://github.com/Botpike/nerva-ledger/issues/37)). Short outages, like the
-> one above, are fine.
+> **Behind a load balancer**, the reconnect needs a request to trigger it. `/healthz` alone
+> does not: it stays `503` after the cluster recovers until a request for the cluster arrives
+> ([#44](https://github.com/Botpike/nerva-ledger/issues/44)). If your balancer stops routing
+> to a gateway whose health check fails, also send it a keyed request now and then (a lookup
+> of any row will do), or it never comes back by itself.
 
 ### The one rule about retries
 
@@ -724,17 +787,37 @@ writes safe to retry:
 - **Claims** with `op_seen: "0"` behave the same way.
 - **Adds** are *not* idempotent: a retried `-30` takes 30 again. Pair an add with a claim on
   a request-id row in the same transaction, so a retry conflicts instead of applying twice.
-  Here request 9001 claims row `(7, 9001)` and spends 30, and is sent twice:
+  Here request 9001 claims row `(7, 9001)` and settles 10 of what is held, and is sent twice:
 
   ```bash
-  n -d '{"entries":[{"kind":"read","table":7,"id":"9001","op_seen":"0"},{"kind":"put","table":7,"id":"9001","value_hex":"01"},{"kind":"add","table":6,"id":"1","field":"available","delta":"-30","min":"0"}]}' $A/v1/commit
-  # first:  {"status":"committed","op":"11","adds":[{"index":2,"applied":"-30","value":"20"}]}
-  # again:  {"status":"conflict","index":0,"op":"11"}     ← already applied, at op 11
+  n -d '{"entries":[
+    {"kind":"read","table":7,"id":"9001","op_seen":"0"},
+    {"kind":"put","table":7,"id":"9001","value_hex":"01"},
+    {"kind":"add","table":6,"id":"1","field":"held","delta":"-10","min":"0"}]}' $A/v1/commit
+  # first:  {"status":"committed","op":"115","adds":[{"index":2,"applied":"-10","value":"40"}]}
+  # again:  {"status":"conflict","index":0,"op":"115"}     ← already applied, at op 115
   ```
 
   The conflict's `op` even tells you which op the first attempt committed at.
 
 The demos' client (`demo/nerva_http.py`) never retries a commit for this reason.
+
+### Watching a replica
+
+Three `nerva start` flags help when you run Nerva for real:
+
+- `--statsd=<host:port>` sends the replica's metrics over UDP every 10 seconds, in statsd
+  format with DogStatsD tags (`cluster`, `replica`, and per-metric tags such as `operation`).
+  Useful ones: `tb.replica_request_us` (time from the primary seeing a request to this replica
+  committing it), `tb.replica_commit_us` by stage, and the grid cache's hits and misses. The
+  `tb.` prefix comes from TigerBeetle. The README's "Metrics and traces" section lists more.
+- `--trace=<path>` writes a span trace you can open in [Perfetto](https://ui.perfetto.dev). It
+  slows the replica, so use it to diagnose, not to measure, and give it a **new** file: an
+  existing one is refused (`--trace: existing.json exists; give a new file`), so a typo cannot
+  overwrite your data file. Do not leave it on: the trace grows without bound, and a write error
+  to it stops the replica ([#30](https://github.com/Botpike/nerva-ledger/issues/30)).
+- `--cache-grid=<size>` and `--cache-rows=<size>` size the block cache and the row cache (128
+  bytes a row). The row cache defaults to its minimum, a few hundred rows.
 
 ### Cleaning up
 
@@ -797,9 +880,11 @@ try client.lookup_rows(&.{.{ .id = 42, .table = 1 }}, &rows);
 const change: ?nerva.Change = try client.row_as_of(1, 42, op);
 ```
 
-Also available: `get_changes`, `get_history`, `declare_view` and `get_view`. Two rules from the
-client's doc comment: after `error.Timeout` the request may still commit and the client must
-not be reused (only `deinit`); after `error.Evicted`, create a new client.
+Also available: `get_changes`, `get_history`, `declare_view` and `get_view`. When a call
+returns `error.Timeout` (the request may still have committed) or `error.Evicted`, the client
+cannot make further calls. `client.reconnect()` replaces its session in place, which is what
+`nerva api` does. If `reconnect` itself fails, the client is uninitialized: call `init` again,
+never `deinit`.
 
 ---
 
@@ -808,7 +893,7 @@ not be reused (only `deinit`); after `error.Evicted`, create a new client.
 Read this part before changing Nerva itself. Then read, in order: [CLAUDE.md](../CLAUDE.md)
 (the working protocol, which applies to people too), [docs/TIGER_STYLE.md](./TIGER_STYLE.md)
 (the coding style, which is mandatory), [docs/DECISIONS.md](./DECISIONS.md) (why things are
-the way they are, numbered N1…N55) and [UPSTREAM.md](../UPSTREAM.md) (what is vendored and
+the way they are, numbered N1…N61) and [UPSTREAM.md](../UPSTREAM.md) (what is vendored and
 patched).
 
 ### Where things are
@@ -825,6 +910,7 @@ patched).
 | `src/nerva/view/` | `nerva view`: the feed follower and declared views computed in memory. |
 | `src/nerva/http_connection.zig` | The gateways' strict, bounded HTTP/1.1 receiver. |
 | `src/nerva/cli.zig`, `src/nerva_main.zig` | The `nerva` binary's commands and flags. |
+| `src/nerva/release_peers.zig` | Which peers a replica listens to: only those running its own release (N61). |
 | `src/nerva/workload.zig` | The VOPR workload: random traffic checked against a model. |
 | `src/nerva/*_tests.zig`, `*_fuzz.zig`, `format_test.zig` | Deterministic tests, fuzzers, format guards. |
 | `src/vsr/`, `src/lsm/`, `src/io/`, `src/testing/`, … | Vendored from TigerBeetle. Prefer not to touch. |
@@ -894,11 +980,15 @@ check it.
 | `./zig/zig build test:integration` | Three real replicas and the Zig client | ~20 s, 3.5 GiB disk |
 | `./zig/zig build test:api` | Every JSON route against a model; write races | ~3 min |
 | `./zig/zig build test:views` | Declared and maintained views against models | ~2 min |
+| `./zig/zig build test:release` | A cluster of two releases: the odd replica is ignored | ~1 min |
 | `./zig/zig build test:demo` | Both demos under random crashes | ~3 min |
 
 `benchmark.perf: usage example` fails in sandboxes that deny `perf_event_open`; that is the
 environment, not your change. Everything else must pass. CI runs all of it on every pull
-request.
+request, as parallel jobs. Two more workflows run outside pull requests: `fuzz.yml` (every
+fuzzer and the VOPR on random seeds for a time budget, started by hand) and
+`perf-nightly.yml` (benchmarks of `main` against the last good night, which file an issue on a
+regression).
 
 ### How changes are made here
 
@@ -943,11 +1033,11 @@ NERVA_KEY=… nerva view --cluster=<id> --addresses=<…> --listen=<host:port>
 | `GET /v1/row` | `?table=&id=&as_of=` |
 | `PUT`, `GET /v1/tables/<t>` | `{"name","fields":[{"name","type"}]}` |
 | `PUT`, `GET /v1/views/<name>` | `{"table","where","group_by","aggregates"}` |
-| `GET /v1/views/<name>/groups` | `?limit=&cursor=` |
+| `GET /v1/views/<name>/groups` | `?limit=&cursor=` (a view named `groups`: `/v1/views/groups/groups`) |
 | `POST /v1/documents/get` | `{"namespace","keys":[…],"as_of"?}` |
 | `POST /v1/documents/commit` | `{"namespace","reads":[{"key","version"}],"writes":[…]}` |
 | `GET /v1/documents/changes` | `?namespace=&cursor=&limit=` |
-| `GET /healthz` | no key needed |
+| `GET /healthz` | no key needed; `503` while the gateway cannot reach the cluster |
 
 **`nerva view` routes**: `GET /v1/views`, `GET /v1/views/<name>?min_op=<n|latest>` or `?as_of=<op>`.
 
@@ -959,7 +1049,7 @@ NERVA_KEY=… nerva view --cluster=<id> --addresses=<…> --listen=<host:port>
 | 400 | Invalid request; nothing applied. |
 | 401 | Missing or wrong `X-Nerva-Key`. |
 | 409 | `conflict` (stale read: `index`, current `op`), `out_of_bounds`, `row_absent`, `view_key_field`; or a layout or view declaration that contradicts an earlier one. Nothing applied. |
-| 503 | `cluster unavailable` (a commit **may** have applied; see #37) or `views_busy` (nothing applied, retry). |
+| 503 | `cluster unavailable` (a commit **may** have applied) or `views_busy` (nothing applied; split the transaction, Part 7). |
 | 504 | `nerva view`: `min_op` not committed yet. |
 
 **Remember**
@@ -969,3 +1059,4 @@ NERVA_KEY=… nerva view --cluster=<id> --addresses=<…> --listen=<host:port>
 - 64-bit numbers are strings.
 - Follow cursors until `more` is false.
 - Never blindly retry a commit.
+- Every replica of a cluster runs the same release; upgrading means reformatting.
