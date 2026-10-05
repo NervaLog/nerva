@@ -5,6 +5,90 @@ publishes a version's section as its GitHub release notes, and refuses to releas
 without one. Design reasons are in [docs/DECISIONS.md](./docs/DECISIONS.md); the full log of
 work is [WORKLOG.md](./WORKLOG.md).
 
+## v0.4.0 — 2026-10-05
+
+Declared ledgers, so that the cluster itself conserves balances; views with `min` and `max`,
+read as of any op and served whole by `nerva api`; and a round of fixes that keep replicas and
+gateways up. **This release is not compatible with v0.3.0's data files, its replicas must never
+run in one cluster with v0.3.0 replicas, and it refuses v0.3.0 clients:** see "Upgrading" below.
+
+### New: declared ledgers
+
+A ledger is a declared set of conserved `i64` fields, each with an optional floor. Its fields
+then change only by a **pair** of adds that moves one amount from one field to another, never
+below a floor, whoever sends the request. Value is neither created nor destroyed, a floored
+field is never overdrawn, and puts and deletes cannot overwrite a balance.
+
+```bash
+curl -X PUT -H 'X-Nerva-Key: secret' http://127.0.0.1:8080/v1/ledgers/1 -d '{"fields": [
+  {"table": 7, "field": "available", "floor": "0"}, {"table": 7, "field": "held", "floor": "0"},
+  {"table": 8, "field": "balance", "floor": null}]}'
+# Reserve up to 30: the first half may clamp at its floor; the partner moves what it took.
+curl -H 'X-Nerva-Key: secret' http://127.0.0.1:8080/v1/commit -d '{"entries": [
+  {"kind": "add", "table": 7, "id": "1", "field": "available", "delta": "-30", "pair": true,
+   "clamp": true},
+  {"kind": "add", "table": 7, "id": "1", "field": "held", "delta_from": 0}]}'
+```
+
+- An add to a conserved field outside a pair answers `409 {"status": "unpaired", "index"}`; a
+  put, delete or overlapping add that would change one, `409 {"status": "conserved_write"}`.
+- A partner stopped by its floor fails the whole transaction `out_of_bounds`.
+- `GET /v1/ledgers/<id>` reads a declaration back. Declarations are immutable
+  (`409 ledger_immutable`), a field is in one ledger at most (`409 ledger_field_taken`), and a
+  view may sum a conserved field but not filter or group by it.
+- At most 64 ledgers of 2 to 16 fields. See README, "Ledgers".
+
+### New: views, complete in the cluster
+
+- `min` and `max` are maintained by the state machine too, and stay exact when the row holding
+  them is deleted, moved or changed. A table's views have at most four of them.
+- A view reads as of any op since its declaration: `?as_of=<op>`.
+- `GET /v1/views/<name>` on `nerva api` is now the whole view, groups sorted by key, read at
+  one op, byte for byte what `nerva view` answers, with `hash`, the replicated `view_hash` and
+  `declared_op`. **It used to return the declaration, which moved to
+  `GET /v1/views/<name>/definition`.** `GET /v1/views` lists the views. A view of more than
+  10,000 groups is read in pages from `/groups`.
+- A view declared over a ledger's field is refused with `409`, and nothing is written.
+
+### New: releases carry a bill of materials
+
+Each release has a CycloneDX 1.5 software bill of materials next to its binaries.
+
+### Fixed
+
+- One request with the raw operation value 134 (`pulse`) from any client crashed every replica,
+  for good. Clients can no longer send it. (#33)
+- Any eviction (more than 64 client sessions over a cluster's life, a client release too old)
+  aborted `nerva api`, `nerva view` and Zig clients. They now report `error.Evicted` and
+  reconnect. (#48, #52)
+- A reply arriving after its request timed out could abort a gateway, and `nerva view` exited
+  on one timeout. Both recover on their own now. (#42, #44)
+- A transaction that touched more view groups than any op allows got `503 views_busy`, and
+  retrying never helped. It now gets `413 views_too_large`: split it. (#32)
+- A large JSON body kept up to 0.8 GB allocated in `nerva api`. A request may use at most
+  64 MiB (`413 request too complex` past that), and the gateway keeps at most 8 MiB between
+  requests. (#31, #60)
+- With `--trace`, a full or failing trace disk panicked the replica, and the trace grew
+  without bound. Trace writes are buffered and bounded now, and a write error stops tracing,
+  not the replica. (#30)
+- One transaction moving the holders of many groups' `min` or `max` to new groups (about 1,600
+  rows) panicked every replica, again on restart. (#62)
+
+### Known issues
+
+- A document holds at most 64 KiB. (#25)
+
+### Upgrading from v0.3.0
+
+- **Stop every replica, then start them all on v0.4.0, on newly formatted data files.**
+  Binaries report `0.0.4+<commit>`. A cluster cannot run two releases, and a v0.4.0 replica
+  stops on a v0.3.0 data file. Load your data again.
+- **Upgrade clients and gateways too.** v0.4.0 replicas refuse clients older than v0.4.0.
+- `GET /v1/views/<name>` now answers the view; read the declaration at `/definition`.
+- Zig client users: new operations `declare_ledger` and `get_ledger`, `AddFlags.pair`, new
+  statuses `views_too_large` (15), `unpaired` (16) and `conserved_write` (17), and
+  `DeclareStatus.ledger_field`. Existing values keep their numbers.
+
 ## v0.3.0 — 2026-10-05
 
 Views that the cluster keeps itself, metrics and traces from replicas, a faster client, and a

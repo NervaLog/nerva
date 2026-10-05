@@ -113,6 +113,14 @@ test "format: wire and storage layouts" {
         nerva.Member.Flags,
         nerva.GroupVersion,
         nerva.ViewVersion,
+        // Ledgers (N75): declared over the wire and stored in the ledgers tree.
+        nerva.LedgerField,
+        nerva.LedgerField.Flags,
+        nerva.LedgerDefinition,
+        nerva.DeclareLedgerStatus,
+        nerva.DeclareLedgerResult,
+        nerva.LedgerQuery,
+        nerva.Ledger,
     }) |T| try layout_render(writer, T);
 
     // Tree ids name the LSM trees in the data file: never renumber them (CLAUDE.md).
@@ -172,6 +180,8 @@ test "format: wire and storage layouts" {
         \\  view_key_field = 13
         \\  views_busy = 14
         \\  views_too_large = 15
+        \\  unpaired = 16
+        \\  conserved_write = 17
         \\nerva.Add: extern struct, size 80
         \\  delta: offset 0, size 8, i64
         \\  min: offset 8, size 8, u64
@@ -188,7 +198,8 @@ test "format: wire and storage layouts" {
         \\  clamp: bit 2, 1 bits, bool
         \\  create: bit 3, 1 bits, bool
         \\  delta_from: bit 4, 1 bits, bool
-        \\  padding: bit 5, 3 bits, u3
+        \\  pair: bit 5, 1 bits, bool
+        \\  padding: bit 6, 2 bits, u2
         \\nerva.Add.AddField: enum(u8), non-exhaustive
         \\  u64 = 1
         \\  i64 = 2
@@ -243,6 +254,8 @@ test "format: wire and storage layouts" {
         \\  get_view = 132
         \\  declare_view = 133
         \\  pulse = 134
+        \\  declare_ledger = 135
+        \\  get_ledger = 136
         \\nerva.documents.Header: extern struct, size 24
         \\  namespace: offset 0, size 8, u64
         \\  reserved_a: offset 8, size 8, u64
@@ -304,6 +317,7 @@ test "format: wire and storage layouts" {
         \\  table_views_full = 7
         \\  unsupported = 8
         \\  table_extremes_full = 9
+        \\  ledger_field = 10
         \\nerva.DeclareResult: extern struct, size 32
         \\  status: offset 0, size 4, nerva.DeclareStatus
         \\  reserved_a: offset 4, size 4, u32
@@ -393,6 +407,43 @@ test "format: wire and storage layouts" {
         \\  reserved_a: offset 41, size 7, [7]u8
         \\  hash: offset 48, size 32, [32]u8
         \\  reserved_b: offset 80, size 48, [48]u8
+        \\nerva.LedgerField: extern struct, size 16
+        \\  table: offset 0, size 4, u32
+        \\  offset: offset 4, size 1, u8
+        \\  flags: offset 5, size 1, nerva.LedgerField.Flags
+        \\  reserved: offset 6, size 2, [2]u8
+        \\  floor: offset 8, size 8, i64
+        \\nerva.LedgerField.Flags: packed struct, size 1
+        \\  floor: bit 0, 1 bits, bool
+        \\  padding: bit 1, 7 bits, u7
+        \\nerva.LedgerDefinition: extern struct, size 264
+        \\  id: offset 0, size 4, u32
+        \\  field_count: offset 4, size 1, u8
+        \\  reserved: offset 5, size 3, [3]u8
+        \\  fields: offset 8, size 256, [16]nerva.LedgerField
+        \\nerva.DeclareLedgerStatus: enum(u32)
+        \\  created = 1
+        \\  exists = 2
+        \\  ledger_immutable = 3
+        \\  ledger_field_taken = 4
+        \\  invalid = 5
+        \\  table_invalid = 6
+        \\  ledgers_full = 7
+        \\  field_viewed = 8
+        \\nerva.DeclareLedgerResult: extern struct, size 16
+        \\  status: offset 0, size 4, nerva.DeclareLedgerStatus
+        \\  reserved: offset 4, size 4, u32
+        \\  op: offset 8, size 8, u64
+        \\nerva.LedgerQuery: extern struct, size 16
+        \\  id: offset 0, size 4, u32
+        \\  reserved: offset 4, size 12, [12]u8
+        \\nerva.Ledger: extern struct, size 512
+        \\  slot: offset 0, size 8, u64
+        \\  timestamp: offset 8, size 8, u64
+        \\  op: offset 16, size 8, u64
+        \\  reserved_a: offset 24, size 8, u64
+        \\  definition: offset 32, size 264, nerva.LedgerDefinition
+        \\  reserved_b: offset 296, size 216, [216]u8
         \\tree_ids:
         \\  Row.timestamp = 1
         \\  Row.key = 2
@@ -409,6 +460,8 @@ test "format: wire and storage layouts" {
         \\  GroupVersion.version = 13
         \\  ViewVersion.timestamp = 14
         \\  ViewVersion.version = 15
+        \\  Ledger.timestamp = 16
+        \\  Ledger.slot = 17
         \\
     ).diff(out.items);
 }

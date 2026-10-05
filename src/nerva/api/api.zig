@@ -20,6 +20,8 @@
 //!     GET  /v1/views/<name>/definition
 //!     GET  /v1/views/<name>/groups?cursor=<c>&limit=<n>&as_of=<op>
 //!                            (the view, maintained by the state machine: N52, N62)
+//!     PUT  /v1/ledgers/<id>  {"fields": [{"table": 7, "field": "available", "floor": "0"}, …]}
+//!     GET  /v1/ledgers/<id>  (conserved fields: N75)
 //!     POST /v1/documents/get, POST /v1/documents/commit, GET /v1/documents/changes
 //!                            (larger values, by key: `documents_routes.zig`)
 //!
@@ -37,6 +39,10 @@
 //!   and `create`. A committed reply lists `adds`: each add's `index`, `applied` and new
 //!   `value`. An add that would cross a bound answers `409 {"status": "out_of_bounds", "index",
 //!   "value"}`; one to an absent row without `create`, `409 {"status": "row_absent", "index"}`.
+//! - A field of a ledger (N75) changes only by a pair: an add with `"pair": true` (which may
+//!   clamp), then an add naming it in `delta_from` (which may not). Otherwise `409 {"status":
+//!   "unpaired", "index"}`; a put, delete or overlapping add that would change it, `409
+//!   {"status": "conserved_write", "index"}`.
 //! - A table may have a layout (`catalog.zig`, N34): then puts may give `fields` instead of
 //!   `value_hex`, and every row or change of that table also comes back with `fields`.
 //! - Tables from `catalog.tables_reserved_min` up are Nerva's own: refused here, and left out of
@@ -51,6 +57,7 @@ const catalog = @import("../catalog.zig");
 const declared_views = @import("../view/declared.zig");
 const documents = @import("../documents.zig");
 const documents_routes = @import("documents_routes.zig");
+const ledgers_static = @import("../ledgers.zig");
 
 const Change = nerva.Change;
 const Entry = nerva.Entry;
@@ -84,6 +91,7 @@ const Route = enum {
     view_groups,
     view_definition,
     view_list,
+    ledgers,
 };
 
 const routes = [_]struct { path: []const u8, route: Route, method: Method }{
@@ -99,6 +107,7 @@ const routes = [_]struct { path: []const u8, route: Route, method: Method }{
 
 const tables_prefix = "/v1/tables/";
 const views_prefix = "/v1/views/";
+const ledgers_prefix = "/v1/ledgers/";
 const views_groups_suffix = "/groups";
 const views_definition_suffix = "/definition";
 /// The most groups `GET /v1/views/<name>` answers with at once (N66); larger views are read in
@@ -129,7 +138,13 @@ pub fn handle(
     const path = target[0..question];
     const query = if (question < target.len) target[question + 1 ..] else "";
 
-    const route: Route = if (std.mem.eql(u8, path, "/v1/views")) route: {
+    const route: Route = if (std.mem.startsWith(u8, path, ledgers_prefix)) route: {
+        if (method != .get and method != .put) {
+            return error_reply(arena, 405, "method not allowed");
+        }
+        if (query.len > 0) return error_reply(arena, 400, "unexpected query");
+        break :route .ledgers;
+    } else if (std.mem.eql(u8, path, "/v1/views")) route: {
         if (method != .get) return error_reply(arena, 405, "method not allowed");
         if (query.len > 0) return error_reply(arena, 400, "unexpected query");
         break :route .view_list;
@@ -189,6 +204,7 @@ pub fn handle(
             path[views_prefix.len .. path.len - views_definition_suffix.len],
         ),
         .view_list => view_list(arena, client),
+        .ledgers => ledgers(arena, client, layouts, method, path[ledgers_prefix.len..], body),
         .view_groups => view_groups(
             arena,
             client,
@@ -288,8 +304,8 @@ fn commit(arena: std.mem.Allocator, client: anytype, layouts: anytype, body: []c
             return bad("only a put has fields");
         }
         if (entry_request.kind != .add and entry_request.add_fields_present()) {
-            return bad("only an add has field, offset, type, delta, min, max, clamp, create " ++
-                "or delta_from");
+            return bad("only an add has field, offset, type, delta, min, max, clamp, create, " ++
+                "delta_from or pair");
         }
         add_field.* = null;
         entry.* = .{
@@ -387,6 +403,14 @@ fn commit(arena: std.mem.Allocator, client: anytype, layouts: anytype, body: []c
                 try out.print("{{\"status\":\"views_too_large\",\"index\":{}}}", .{index});
                 return .{ .status = 413, .body = out.items() };
             },
+            // A conserved field changed other than by a pair (N75).
+            .unpaired, .conserved_write => {
+                try out.print("{{\"status\":\"{s}\",\"index\":{}}}", .{
+                    @tagName(result.status),
+                    index,
+                });
+                return .{ .status = 409, .body = out.items() };
+            },
             // Validated above: the server would be at fault.
             else => std.debug.panic("api: commit rejected entry {}: {s}", .{
                 index,
@@ -428,11 +452,12 @@ const EntryRequest = struct {
     max: ?[]const u8 = null,
     clamp: bool = false,
     create: bool = false,
+    pair: bool = false,
 
     fn add_fields_present(request: *const EntryRequest) bool {
         return request.field != null or request.offset != null or request.type != null or
             request.delta != null or request.delta_from != null or request.min != null or
-            request.max != null or request.clamp or request.create;
+            request.max != null or request.clamp or request.create or request.pair;
     }
 };
 
@@ -446,7 +471,7 @@ fn add_parse(layouts: anytype, request: *const EntryRequest, previous: []const E
         .delta_from = 0,
         .offset = 0,
         .field = .u64,
-        .flags = .{ .clamp = request.clamp, .create = request.create },
+        .flags = .{ .clamp = request.clamp, .create = request.create, .pair = request.pair },
     };
     if (request.field) |name| {
         if (request.offset != null or request.type != null) {
@@ -504,6 +529,142 @@ fn add_parse(layouts: anytype, request: *const EntryRequest, previous: []const E
         else => unreachable,
     };
     return add;
+}
+
+const LedgerRequest = struct {
+    fields: []const struct {
+        table: u32,
+        offset: ?u8 = null,
+        field: ?[]const u8 = null,
+        floor: ?[]const u8 = null,
+    },
+};
+
+/// A ledger (N75): a set of conserved i64 fields that only pairs of adds change.
+///
+///     PUT /v1/ledgers/<id>  {"fields": [{"table": 7, "field": "available", "floor": "0"},
+///                                       {"table": 7, "offset": 8, "floor": null}, …]}
+///     GET /v1/ledgers/<id>
+///
+/// A field is named by layout (`field`) or by `offset`; `floor` (an i64 as a string, or null)
+/// stops conserved adds that move it down. The fields are sent sorted, so their order in the
+/// request does not matter.
+fn ledgers(
+    arena: std.mem.Allocator,
+    client: anytype,
+    layouts: anytype,
+    method: Method,
+    id_text: []const u8,
+    body: []const u8,
+) !Reply {
+    const id_wide = std.fmt.parseInt(u64, id_text, 10) catch return bad("invalid ledger id");
+    if (id_wide == 0 or id_wide > std.math.maxInt(u32)) return bad("invalid ledger id");
+    const id: u32 = @intCast(id_wide);
+    var out = Writer.init(arena);
+    switch (method) {
+        .get => {
+            const ledger = try client.get_ledger(id);
+            if (ledger.slot == 0) return error_reply(arena, 404, "no such ledger");
+            assert(ledger.definition.id == id);
+            try out.print("{{\"ledger\":{},\"op\":", .{id});
+            try out.number(ledger.op);
+            try out.raw(",\"fields\":[");
+            const definition = &ledger.definition;
+            for (definition.fields[0..definition.field_count], 0..) |*field, index| {
+                if (index > 0) try out.raw(",");
+                try out.print("{{\"table\":{},\"offset\":{}", .{ field.table, field.offset });
+                if (try layouts.layout(arena, field.table)) |layout| {
+                    for (layout.fields) |*named| {
+                        if (named.offset != field.offset or named.type != .i64) continue;
+                        try out.raw(",\"field\":");
+                        try std.json.stringify(named.name, .{}, out.list.writer());
+                    }
+                }
+                try out.raw(",\"floor\":");
+                if (field.flags.floor) {
+                    try out.print("\"{}\"", .{field.floor});
+                } else {
+                    try out.raw("null");
+                }
+                try out.raw("}");
+            }
+            try out.raw("]}");
+            return .{ .status = 200, .body = out.items() };
+        },
+        .put => {
+            const definition = try ledger_parse(arena, layouts, id, body);
+            const declared = try client.declare_ledger(&definition);
+            const conflict: ?[]const u8 = switch (declared.status) {
+                .created, .exists => null,
+                .ledger_immutable => "ledger_immutable",
+                .ledger_field_taken => "ledger_field_taken",
+                .field_viewed => "field_viewed",
+                .ledgers_full => "ledgers_full",
+                // Checked here first: the state machine would agree.
+                .invalid, .table_invalid => unreachable,
+            };
+            if (conflict) |status| {
+                try out.print("{{\"status\":\"{s}\",\"ledger\":{}}}", .{ status, id });
+                return .{ .status = 409, .body = out.items() };
+            }
+            try out.print("{{\"ledger\":{},\"declared\":\"{s}\",\"op\":", .{
+                id,
+                @tagName(declared.status),
+            });
+            try out.number(declared.op);
+            try out.raw("}");
+            return .{ .status = 200, .body = out.items() };
+        },
+        .post => unreachable,
+    }
+}
+
+fn ledger_parse(
+    arena: std.mem.Allocator,
+    layouts: anytype,
+    id: u32,
+    body: []const u8,
+) !nerva.LedgerDefinition {
+    const request = try json_parse(LedgerRequest, arena, body);
+    if (request.fields.len < 2 or request.fields.len > nerva.ledger_fields_max) {
+        return bad("a ledger has 2 to 16 fields");
+    }
+    var definition = std.mem.zeroes(nerva.LedgerDefinition);
+    definition.id = id;
+    definition.field_count = @intCast(request.fields.len);
+    for (request.fields, definition.fields[0..request.fields.len]) |field, *target| {
+        try table_check(field.table);
+        const offset: u8 = if (field.field) |name| offset: {
+            if (field.offset != null) return bad("a ledger field has field or offset, not both");
+            const layout = try layouts.layout(arena, field.table) orelse
+                return bad("field needs a layout for the table (PUT /v1/tables/<t>)");
+            const named = layout.field(name) orelse return bad("no such field");
+            if (named.type != .i64) return bad("a ledger's fields must be i64");
+            break :offset named.offset;
+        } else field.offset orelse return bad("a ledger field needs field or offset");
+        if (offset % 8 != 0 or offset > value_size - 8) {
+            return bad("a ledger field's offset must be a multiple of 8, at most 72");
+        }
+        target.* = .{ .table = field.table, .offset = offset, .flags = .{}, .floor = 0 };
+        if (field.floor) |text| {
+            target.flags.floor = true;
+            target.floor = try i64_parse(text, "floor");
+        }
+    }
+    const fields = definition.fields[0..definition.field_count];
+    std.mem.sortUnstable(nerva.LedgerField, fields, {}, struct {
+        fn less_than(_: void, a: nerva.LedgerField, b: nerva.LedgerField) bool {
+            if (a.table != b.table) return a.table < b.table;
+            return a.offset < b.offset;
+        }
+    }.less_than);
+    for (fields[1..], fields[0 .. fields.len - 1]) |field, previous| {
+        if (field.table == previous.table and field.offset == previous.offset) {
+            return bad("a ledger names each field once");
+        }
+    }
+    assert(ledgers_static.definition_validate(&definition) == null);
+    return definition;
 }
 
 fn bound_parse(field: nerva.Add.AddField, text: []const u8, comptime name: []const u8) !u64 {
@@ -733,6 +894,27 @@ fn views(
             const layout = try layouts.layout(arena, view.table) orelse
                 return bad("a view needs a layout for its table (PUT /v1/tables/<t>)");
             try catalog.view_check(&view, &layout);
+            // A view declared differently is refused before the state machine sees it; one the
+            // state machine refuses over a ledger's field is not written to the catalog (N75).
+            if (try layouts.view(arena, name)) |existing| {
+                const same = std.mem.eql(
+                    u8,
+                    try catalog.view_render(arena, &existing),
+                    try catalog.view_render(arena, &view),
+                );
+                if (!same) return error_reply(
+                    arena,
+                    409,
+                    "a view with this name is declared differently; views are immutable",
+                );
+            }
+            const definition = catalog.view_definition(name, &view, &layout);
+            const declared = try client.declare_view(&definition);
+            if (declared.status == .ledger_field) return error_reply(
+                arena,
+                409,
+                "the view filters or groups by a field of a ledger",
+            );
             switch (try layouts.view_put(arena, name, &view)) {
                 .different => return error_reply(
                     arena,
@@ -740,9 +922,7 @@ fn views(
                     "a view with this name is declared differently; views are immutable",
                 ),
                 inline else => |outcome| {
-                    // Then into the state machine, which maintains it from now on (N52).
-                    const definition = catalog.view_definition(name, &view, &layout);
-                    const declared = try client.declare_view(&definition);
+                    // The state machine maintains it from now on (N52), unless it refused it.
                     const reason: ?[]const u8 = switch (declared.status) {
                         .created, .exists => null,
                         .unsupported => unreachable, // No longer returned (N62).
@@ -752,6 +932,7 @@ fn views(
                         .table_views_full => "the table's views are full",
                         .different => "declared differently in the state machine",
                         .invalid, .table_invalid => "refused by the state machine",
+                        .ledger_field => unreachable, // Answered above.
                     };
                     try out.print("{{\"view\":\"{s}\",\"declared\":\"{s}\",\"maintained\":{}", .{
                         name,
@@ -1220,6 +1401,17 @@ const FakeClient = struct {
 
     pub fn get_view(_: *FakeClient, _: nerva.ViewQuery, _: []nerva.ViewRecord) Error!usize {
         unreachable; // Covered by `tests/views/maintained.py`.
+    }
+
+    pub fn declare_ledger(
+        _: *FakeClient,
+        _: *const nerva.LedgerDefinition,
+    ) Error!nerva.DeclareLedgerResult {
+        unreachable; // Covered by `tests/api/ledgers.py`.
+    }
+
+    pub fn get_ledger(_: *FakeClient, _: u32) Error!nerva.Ledger {
+        unreachable; // Covered by `tests/api/ledgers.py`.
     }
 };
 

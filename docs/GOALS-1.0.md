@@ -62,13 +62,18 @@ on one budget at once — exactly the contended pattern TigerBeetle was built fo
 offers conditional, commutative operations applied inside the commit (for example "reserve up to
 X if the balance allows"), the way TigerBeetle applies transfers, so a hot budget does not
 serialize clients through retries.
-*Open decision:* whether balances move to Nerva at 1.0, or stay in a dedicated ledger with Nerva
-holding facts, receipts and views. Nerva must support the second arrangement either way.
+*Decided* (N75, closing what was this goal's open decision): balances move to Nerva. Declared
+ledgers make conservation the cluster's job: their fields change only by pairs of adds that move
+one amount between them, never below a floor, whoever sends the request. Nerva still supports
+balances kept in a dedicated ledger, with Nerva holding facts, receipts and views.
 
 ## Non-goals for 1.0
 
 - Holding real money before Nerva has an external correctness review comparable to
-  TigerBeetle's Jepsen analysis.
+  TigerBeetle's Jepsen analysis. (The owner accepted this risk on 2026-10-05, for the first
+  application; the VOPR's ledger invariant under faults, that application's contract tests on
+  both ledgers, a week of staging with a restore drill and a verified cutover stand in for the
+  review.)
 - SQL and general-purpose queries; full PostgreSQL compatibility.
 - Object-storage tiering, external operators (embeddings) and other north-star features the
   workload does not need.
@@ -102,7 +107,7 @@ holding facts, receipts and views. Nerva must support the second arrangement eit
 6. **Effect sinks** (G5) and **conditional operations for hot balances** (G8).
    - G8 ✅ adds: bounded, clampable changes to a 64-bit field inside the commit, which never
      conflict; `delta_from` moves exactly what an earlier add took (N42). The VOPR checks that
-     hot budgets conserve what was funded under crashes and faults. The decision whether
-     balances move to Nerva stays open.
+     hot budgets conserve what was funded under crashes and faults. Balances move to Nerva:
+     declared ledgers (N75) refuse any move that is not a balanced pair within floors.
 7. **First production use**: the dog-fooding service's facts, receipts and views on Nerva
-   through the generic API, balances per the G8 decision.
+   through the generic API, balances in declared ledgers (G8, N75).
