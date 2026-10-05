@@ -63,8 +63,9 @@ class Demo:
         for name, spec in self.views.items():
             status, body = self.api.request("PUT", f"/v1/views/{name}", spec)
             assert status == 200, (name, body)
-        status, body = self.view_clients[0].request("GET", "/v1/views")
-        self.visitor_views = [v for v in body.get("views", []) if v.startswith("v_")]
+        status, body = self.api.request("GET", "/v1/views")
+        self.visitor_views = [v["name"] for v in body.get("views", [])
+                              if v["name"].startswith("v_")]
 
     @staticmethod
     def wait_for(process, timeout=120):
@@ -110,25 +111,38 @@ class Demo:
 
     # ---- Reading ----
 
-    def view_from(self, index, name, as_of=None):
-        """A view from view process `index` only, or None if it is down."""
+    @staticmethod
+    def view_at(process, name, as_of=None):
+        """A view from one process (`nerva api` or a `nerva view`), or None if it cannot answer:
+        down, or (`nerva api`) the view is still building."""
         query = f"as_of={as_of}" if as_of else "min_op=latest"
         try:
-            status, body = self.view_clients[index].request("GET", f"/v1/views/{name}?{query}")
+            status, body = process.request("GET", f"/v1/views/{name}?{query}")
         except Unavailable:
             return None
         return body if status == 200 else None
 
-    def view(self, name, as_of=None, prefer=0):
-        """A view from view process `prefer`, or the other if it is down."""
-        return self.view_from(prefer, name, as_of) or self.view_from(1 - prefer, name, as_of)
+    def view(self, name, as_of=None):
+        """A view as the cluster maintains it, from `nerva api` (N66); from a `nerva view`
+        process if the gateway cannot answer."""
+        for process in [self.api] + self.view_clients:
+            answer = self.view_at(process, name, as_of)
+            if answer:
+                return answer
+        return None
 
     def agreement(self, name, as_of=None):
-        """The view from both processes at exactly the same op: b as of the op a answered at."""
-        a = self.view_from(0, name, as_of)
-        b = self.view_from(1, name, a["op"] if a else as_of)
-        return a, b, [{"process": f"view {'ab'[i]}", "op": v["op"], "hash": v["hash"]}
-                      if v else None for i, v in enumerate((a, b))]
+        """The view as the cluster maintains it (`nerva api`), and as a `nerva view` process
+        recomputes it from the log at exactly the same op: their hashes must match (N66)."""
+        a = self.view_at(self.api, name, as_of)
+        b, label = None, "view a"
+        for index, process in enumerate(self.view_clients):
+            b, label = self.view_at(process, name, a["op"] if a else as_of), f"view {'ab'[index]}"
+            if b:
+                break
+        labels = ("maintained", f"recomputed ({label})")
+        return a, b, [{"process": labels[i], "op": v["op"], "hash": v["hash"]} if v else None
+                      for i, v in enumerate((a, b))]
 
     def common_state(self):
         return {"cluster": self.cluster.status(), "visitor_views": list(self.visitor_views)}

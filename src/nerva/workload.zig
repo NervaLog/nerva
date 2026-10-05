@@ -244,7 +244,7 @@ pub fn WorkloadType(comptime StateMachine: type) type {
         /// which transactions were refused (`views_busy`).
         view_op_keys: std.AutoHashMapUnmanaged(u128, void) = .{},
         view_txn_keys: std.ArrayListUnmanaged(u128) = .{},
-        view_txn_busy: std.ArrayListUnmanaged(bool) = .{},
+        view_txn_admission: std.ArrayListUnmanaged(views.Admission) = .{},
         /// The same for members (N62).
         view_op_members: std.AutoHashMapUnmanaged(u128, void) = .{},
         view_txn_members: std.ArrayListUnmanaged(u128) = .{},
@@ -252,6 +252,8 @@ pub fn WorkloadType(comptime StateMachine: type) type {
         view_reads_ready: u64 = 0,
         view_reads_building: u64 = 0,
         views_busy: u64 = 0,
+        /// Of those, transactions too large for any op (#32).
+        views_too_large: u64 = 0,
         /// Coverage of N62: reads as of a past op, groups with a min or max checked, and
         /// declarations refused for too many of them.
         view_reads_as_of: u64 = 0,
@@ -368,12 +370,14 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                 workload.adds_applied,
                 workload.adds_clamped,
             });
-            log.info("views declared={} reads ready={} building={} pulses={} views_busy={}", .{
+            log.info("views declared={} reads ready={} building={} pulses={} views_busy={} " ++
+                "of which too large={}", .{
                 workload.model_views.items.len,
                 workload.view_reads_ready,
                 workload.view_reads_building,
                 workload.pulses,
                 workload.views_busy,
+                workload.views_too_large,
             });
             log.info("views as_of reads={} extremes checked={} table_extremes_full={} " ++
                 "views_busy for members={}", .{
@@ -385,7 +389,7 @@ pub fn WorkloadType(comptime StateMachine: type) type {
             workload.model_views.deinit(allocator);
             workload.view_op_keys.deinit(allocator);
             workload.view_txn_keys.deinit(allocator);
-            workload.view_txn_busy.deinit(allocator);
+            workload.view_txn_admission.deinit(allocator);
             workload.view_op_members.deinit(allocator);
             workload.view_txn_members.deinit(allocator);
             log.info("full batches={} invalid entries={} future reads={} invalid filters={} " ++
@@ -990,8 +994,8 @@ pub fn WorkloadType(comptime StateMachine: type) type {
 
                 const claim = receipt_claim_is(entries);
                 const budget = budget_is(entries);
-                const views_busy = workload.view_txn_busy.items[batch_index];
-                if (workload.commit_failure(entries, views_busy)) |failure| {
+                const admission = workload.view_txn_admission.items[batch_index];
+                if (workload.commit_failure(entries, admission)) |failure| {
                     // Adds alone, clamped and creating, never fail (G8).
                     assert(!budget);
                     workload.transactions_failed += 1;
@@ -1085,15 +1089,24 @@ pub fn WorkloadType(comptime StateMachine: type) type {
 
         /// The model's expectation, computed independently of the state machine. On success,
         /// fills `expected` with each entry's result.
-        fn commit_failure(workload: *Workload, entries: []const Entry, views_busy: bool) ?Failure {
+        fn commit_failure(
+            workload: *Workload,
+            entries: []const Entry,
+            admission: views.Admission,
+        ) ?Failure {
             assert(entries.len <= workload.expected.len);
             // Admission comes first (`views_admit`).
-            if (views_busy) {
+            if (admission != .fits) {
+                if (admission == .too_large) workload.views_too_large += 1;
                 workload.views_busy += 1;
                 const index = for (entries, 0..) |*entry, index| {
                     if (workload.entry_viewed(entry)) break index;
                 } else unreachable;
-                return .{ .index = index, .status = .views_busy, .op = 0 };
+                return .{
+                    .index = index,
+                    .status = if (admission == .too_large) .views_too_large else .views_busy,
+                    .op = 0,
+                };
             }
             for (entries, 0..) |*entry, index| {
                 const status = nerva.entry_validate(entry);
@@ -1256,12 +1269,12 @@ pub fn WorkloadType(comptime StateMachine: type) type {
             const allocator = workload.allocator;
             workload.view_op_keys.clearRetainingCapacity();
             workload.view_op_members.clearRetainingCapacity();
-            workload.view_txn_busy.clearRetainingCapacity();
+            workload.view_txn_admission.clearRetainingCapacity();
             while (request.pop()) |batch| {
                 const entries = stdx.bytes_as_slice(.exact, Entry, batch);
                 workload.view_txn_keys.clearRetainingCapacity();
                 workload.view_txn_members.clearRetainingCapacity();
-                const admitted = admit: for (entries) |*entry| {
+                const admission: views.Admission = admit: for (entries) |*entry| {
                     if (!workload.entry_viewed(entry)) continue;
                     const version = workload.row_version(nerva.row_key(entry.table, entry.id));
                     const value_old: ?[value_size]u8 = if (version.exists) version.value else null;
@@ -1276,7 +1289,9 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                             const key = views.group_tree_key(view.id, &group_key);
                             if (workload.view_op_keys.contains(key)) continue;
                             if (workload.view_op_keys.count() == workload.group_writes_limit()) {
-                                break :admit false;
+                                const own = workload.view_txn_keys.items.len ==
+                                    workload.view_op_keys.count();
+                                break :admit if (own) .too_large else .busy;
                             }
                             workload.view_op_keys.put(allocator, key, {}) catch @panic("OOM");
                             workload.view_txn_keys.append(allocator, key) catch @panic("OOM");
@@ -1292,14 +1307,16 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                             if (workload.view_op_members.contains(key)) continue;
                             if (workload.view_op_members.count() == workload.member_writes_limit()) {
                                 workload.views_busy_members += 1;
-                                break :admit false;
+                                const own = workload.view_txn_members.items.len ==
+                                    workload.view_op_members.count();
+                                break :admit if (own) .too_large else .busy;
                             }
                             workload.view_op_members.put(allocator, key, {}) catch @panic("OOM");
                             workload.view_txn_members.append(allocator, key) catch @panic("OOM");
                         }
                     }
-                } else true;
-                if (!admitted) {
+                } else .fits;
+                if (admission != .fits) {
                     for (workload.view_txn_keys.items) |key| {
                         assert(workload.view_op_keys.remove(key));
                     }
@@ -1307,7 +1324,7 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                         assert(workload.view_op_members.remove(key));
                     }
                 }
-                workload.view_txn_busy.append(allocator, !admitted) catch @panic("OOM");
+                workload.view_txn_admission.append(allocator, admission) catch @panic("OOM");
             }
         }
 
@@ -1417,10 +1434,8 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                 assert(records.len == 1);
                 return;
             }
-            const limit_max = if (query.as_of == 0)
-                StateMachine.view_groups_limit_max
-            else
-                StateMachine.view_as_of_limit_max;
+            // As of an op, a page may end early, when its scans ran out (N66).
+            const limit_max = StateMachine.view_groups_limit_max;
             assert(records.len - 1 <= @min(query.limit, limit_max));
             for (records[1..]) |*record| {
                 assert(record.kind == .group);

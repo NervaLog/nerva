@@ -75,7 +75,10 @@ pub fn StateMachineType(comptime Storage: type) type {
         /// each `min` or `max` slot of its table: with one or two such slots, any request fits.
         pub const members_per_op_max: u32 = commit_entries_max;
         /// Groups per `get_view` page read as of a past op: each takes a scan (N62).
-        pub const view_as_of_limit_max = @min(128, view_groups_limit_max);
+        /// Scans a `get_view` page read as of a past op may take (N66): one per listed group
+        /// changed since `as_of`. The page ends at the group that would take one more.
+        /// 128 in production; few with the small messages of tests, so that pages end early.
+        pub const view_as_of_scans_max = @max(1, @min(128, @divFloor(view_groups_limit_max, 8)));
         /// Distinct groups one op may write (N52), each once: admission refuses a transaction
         /// that would take its op past this. Groups are twice the size of rows, so this bounds
         /// the groups tree's tables to the rows tree's size.
@@ -89,7 +92,7 @@ pub fn StateMachineType(comptime Storage: type) type {
             assert(lookup_rows_max > 0);
             assert(changes_limit_max > 0);
             assert(view_groups_limit_max > 0);
-            assert(view_as_of_limit_max > 0);
+            assert(view_as_of_scans_max > 0);
         }
 
         pub const Options = struct {
@@ -200,7 +203,7 @@ pub fn StateMachineType(comptime Storage: type) type {
                 .primary_key = "key",
                 .primary_key_orphaned = false,
                 .unique_keys = &[_][:0]const u8{"key"},
-                .ignored = &[_][:0]const u8{ "count", "group_key", "sums", "reserved" },
+                .ignored = &[_][:0]const u8{ "count", "group_key", "sums", "op", "reserved" },
                 .optional = &[_][:0]const u8{},
                 .derived = .{},
                 .objects_cache = true,
@@ -424,8 +427,9 @@ pub fn StateMachineType(comptime Storage: type) type {
         views_stored: [nerva.views_max]View = undefined,
         views_op_count: u32 = 0,
         /// Per request, the transactions the views budget refused: prefetch decides, commit
-        /// obeys (N52).
+        /// obeys (N52). Of those, the ones too large for any op (#32).
         view_txn_busy: std.DynamicBitSetUnmanaged = .{},
+        view_txn_too_large: std.DynamicBitSetUnmanaged = .{},
         /// The op's distinct groups, as admitted so far (prefetch); looked up only.
         view_op_keys: std.AutoHashMapUnmanaged(u128, void) = .{},
         /// The keys the transaction being admitted added, to take back if it does not fit.
@@ -475,6 +479,9 @@ pub fn StateMachineType(comptime Storage: type) type {
         view_version: ?ViewVersion = null,
         group_versions: []?GroupVersion,
         group_versions_done: u32 = 0,
+        group_version_scans: u32 = 0,
+        /// The groups the page lists: fewer than requested when the scans ran out.
+        view_groups_listed: u32 = 0,
         view_version_buffer: [1]ViewVersion = undefined,
         group_version_buffer: [1]GroupVersion = undefined,
         /// The op being prefetched (`get_view` as of a past op clamps to it).
@@ -615,6 +622,11 @@ pub fn StateMachineType(comptime Storage: type) type {
                 request_batches_max,
             );
             errdefer self.view_txn_busy.deinit(allocator);
+            self.view_txn_too_large = try std.DynamicBitSetUnmanaged.initEmpty(
+                allocator,
+                request_batches_max,
+            );
+            errdefer self.view_txn_too_large.deinit(allocator);
             try self.view_op_keys.ensureTotalCapacity(allocator, groups_limit);
             errdefer self.view_op_keys.deinit(allocator);
             try self.view_txn_keys.ensureTotalCapacity(allocator, groups_limit);
@@ -643,7 +655,7 @@ pub fn StateMachineType(comptime Storage: type) type {
             // Each scan reads one more member than the op may take from its slot.
             self.extreme_members = try allocator.alloc(Member, 2 * members_limit);
             errdefer allocator.free(self.extreme_members);
-            self.group_versions = try allocator.alloc(?GroupVersion, view_as_of_limit_max);
+            self.group_versions = try allocator.alloc(?GroupVersion, view_groups_limit_max);
             errdefer allocator.free(self.group_versions);
         }
 
@@ -663,6 +675,7 @@ pub fn StateMachineType(comptime Storage: type) type {
             self.view_txn_keys.deinit(allocator);
             self.view_op_keys.deinit(allocator);
             self.view_txn_busy.deinit(allocator);
+            self.view_txn_too_large.deinit(allocator);
             allocator.free(self.view_groups);
             allocator.free(self.backfill_rows);
             self.add_rows.deinit(allocator);
@@ -683,6 +696,7 @@ pub fn StateMachineType(comptime Storage: type) type {
                 .backfill_rows = self.backfill_rows,
                 .view_groups = self.view_groups,
                 .view_txn_busy = self.view_txn_busy,
+                .view_txn_too_large = self.view_txn_too_large,
                 .view_op_keys = self.view_op_keys,
                 .view_txn_keys = self.view_txn_keys,
                 .groups_touched = self.groups_touched,
@@ -1139,7 +1153,12 @@ pub fn StateMachineType(comptime Storage: type) type {
                         op,
                         batch_timestamp,
                         batch,
-                        self.view_txn_busy.isSet(batch_index),
+                        if (self.view_txn_too_large.isSet(batch_index))
+                            .too_large
+                        else if (self.view_txn_busy.isSet(batch_index))
+                            .busy
+                        else
+                            .fits,
                         reply_encoder.writable().?,
                     ),
                     .get_changes, .get_history, .get_view, .declare_view, .pulse => {
@@ -1194,7 +1213,7 @@ pub fn StateMachineType(comptime Storage: type) type {
             op: u64,
             timestamp: u64,
             batch: []const u8,
-            views_busy: bool,
+            admission: views.Admission,
             output: []u8,
         ) usize {
             const entries = stdx.bytes_as_slice(.exact, Entry, batch);
@@ -1202,7 +1221,7 @@ pub fn StateMachineType(comptime Storage: type) type {
             assert(entries.len <= self.write_keys.len);
 
             // Resolving the adds fills in each add's result (`applied`, `value`).
-            const failure = self.commit_failure(entries, views_busy) orelse
+            const failure = self.commit_failure(entries, admission) orelse
                 self.adds_resolve(entries, results);
             if (failure) |f| {
                 for (results, 0..) |*result, index| {
@@ -1231,14 +1250,22 @@ pub fn StateMachineType(comptime Storage: type) type {
         }
 
         /// The first reason the transaction cannot commit, or null.
-        /// The views budget comes first (prefetch decided it, `views_busy`), then static checks,
-        /// then duplicate writes, then read conflicts.
-        fn commit_failure(self: *StateMachine, entries: []const Entry, views_busy: bool) ?Failure {
-            if (views_busy) {
+        /// The views budget comes first (prefetch decided it: `views_busy`, `views_too_large`),
+        /// then static checks, then duplicate writes, then read conflicts.
+        fn commit_failure(
+            self: *StateMachine,
+            entries: []const Entry,
+            admission: views.Admission,
+        ) ?Failure {
+            if (admission != .fits) {
                 const index = for (entries, 0..) |*entry, index| {
                     if (self.entry_viewed(entry)) break index;
                 } else unreachable; // A transaction without groups always fits.
-                return .{ .index = @intCast(index), .status = .views_busy, .op = 0 };
+                return .{
+                    .index = @intCast(index),
+                    .status = if (admission == .too_large) .views_too_large else .views_busy,
+                    .op = 0,
+                };
             }
             for (entries, 0..) |*entry, index| {
                 if (nerva.entry_validate(entry)) |status| {
@@ -1524,14 +1551,23 @@ pub fn StateMachineType(comptime Storage: type) type {
             const members = &self.forest.grooves.members;
             members.prefetch_setup(self.prefetch_snapshot.?);
             self.view_txn_busy.unsetAll();
+            self.view_txn_too_large.unsetAll();
             self.view_op_keys.clearRetainingCapacity();
             self.view_op_members.clearRetainingCapacity();
             var batch_index: u32 = 0;
             while (decoder.pop()) |batch| : (batch_index += 1) {
                 const entries = stdx.bytes_as_slice(.exact, Entry, batch);
-                if (!self.view_txn_admit(entries)) {
-                    self.view_txn_busy.set(batch_index);
-                    continue;
+                switch (self.view_txn_admit(entries)) {
+                    .fits => {},
+                    .busy => {
+                        self.view_txn_busy.set(batch_index);
+                        continue;
+                    },
+                    .too_large => {
+                        self.view_txn_busy.set(batch_index);
+                        self.view_txn_too_large.set(batch_index);
+                        continue;
+                    },
                 }
                 for (self.view_txn_keys.items) |key| groups.prefetch_enqueue(.{ .key = key });
                 for (self.view_txn_members.items) |key| members.prefetch_enqueue(.{ .key = key });
@@ -1545,10 +1581,10 @@ pub fn StateMachineType(comptime Storage: type) type {
         /// and `view_txn_members` hold those it added). Otherwise leaves the op's as they were.
         /// A write counts, in each view of its table, the groups of its old and new values that
         /// pass the view's filter, and if either does, its member in each `min` or `max` slot.
-        fn view_txn_admit(self: *StateMachine, entries: []const Entry) bool {
+        fn view_txn_admit(self: *StateMachine, entries: []const Entry) views.Admission {
             self.view_txn_keys.clearRetainingCapacity();
             self.view_txn_members.clearRetainingCapacity();
-            const fits = fits: {
+            const admission: views.Admission = admission: {
                 for (entries) |*entry| {
                     if (!self.entry_viewed(entry)) continue;
                     const rows = &self.forest.grooves.rows;
@@ -1569,7 +1605,9 @@ pub fn StateMachineType(comptime Storage: type) type {
                             const op_keys = &self.view_op_keys;
                             const txn_keys = &self.view_txn_keys;
                             if (!admit(op_keys, txn_keys, key, self.group_writes_limit)) {
-                                break :fits false;
+                                // Too large if the op's budget holds only this transaction's.
+                                const own = txn_keys.items.len == op_keys.count();
+                                break :admission if (own) .too_large else .busy;
                             }
                         }
                         if (!matched) continue;
@@ -1581,14 +1619,15 @@ pub fn StateMachineType(comptime Storage: type) type {
                             const op_keys = &self.view_op_members;
                             const txn_keys = &self.view_txn_members;
                             if (!admit(op_keys, txn_keys, key, self.member_writes_limit)) {
-                                break :fits false;
+                                const own = txn_keys.items.len == op_keys.count();
+                                break :admission if (own) .too_large else .busy;
                             }
                         }
                     }
                 }
-                break :fits true;
+                break :admission .fits;
             };
-            if (!fits) {
+            if (admission != .fits) {
                 for (self.view_txn_keys.items) |added| assert(self.view_op_keys.remove(added));
                 for (self.view_txn_members.items) |added| {
                     assert(self.view_op_members.remove(added));
@@ -1596,7 +1635,7 @@ pub fn StateMachineType(comptime Storage: type) type {
                 self.view_txn_keys.clearRetainingCapacity();
                 self.view_txn_members.clearRetainingCapacity();
             }
-            return fits;
+            return admission;
         }
 
         /// Counts `key` in the op's set, and the transaction's list, unless already counted; false
@@ -2219,10 +2258,12 @@ pub fn StateMachineType(comptime Storage: type) type {
 
                 if (scratch.stored) |*group_stored| {
                     if (stdx.equal_bytes(Group, group_stored, group)) continue;
+                    group.op = op;
                     groups.update(.{ .old = group_stored, .new = group });
                 } else {
                     // Touched and left empty, never written.
                     if (group.timestamp == 0) continue;
+                    group.op = op;
                     groups.insert(group);
                 }
                 self.forest.grooves.group_versions.insert(&.{
@@ -2329,20 +2370,39 @@ pub fn StateMachineType(comptime Storage: type) type {
             self.forest.scan_buffer_pool.reset();
             self.forest.grooves.view_versions.scan_builder.reset();
             self.group_versions_done = 0;
+            self.group_version_scans = 0;
             self.prefetch_group_version_next();
         }
 
-        /// Stage 3 of `get_view` as of a past op: each listed group's version then, one scan
-        /// each.
+        /// Stage 3 of `get_view` as of a past op: each listed group's version then. A group no
+        /// op has changed since is as it was (N66); any other takes a scan, and the page ends
+        /// before the group that would take more than `view_as_of_scans_max`.
         fn prefetch_group_version_next(self: *StateMachine) void {
             const query = view_query(self.prefetch_input.?);
             const limit = view_query_limit(query).?;
             const listed = @min(self.view_groups_count.?, limit);
-            if (self.view_version == null or self.group_versions_done == listed) {
-                return self.prefetch_finish();
-            }
-            const group = &self.view_groups[self.group_versions_done];
             const as_of = view_query_as_of(query, self.prefetch_op);
+            self.view_groups_listed = listed;
+            if (self.view_version == null) return self.prefetch_finish();
+            while (self.group_versions_done < listed) : (self.group_versions_done += 1) {
+                const group = &self.view_groups[self.group_versions_done];
+                assert(group.op > 0);
+                if (group.op > as_of) {
+                    if (self.group_version_scans < view_as_of_scans_max) break;
+                    self.view_groups_listed = self.group_versions_done;
+                    return self.prefetch_finish();
+                }
+                self.group_versions[self.group_versions_done] = .{
+                    .version = nerva.group_version_key(group.key, group.op),
+                    .timestamp = group.timestamp,
+                    .op = group.op,
+                    .key = group.key,
+                    .count = group.count,
+                    .group_key = group.group_key,
+                    .sums = group.sums,
+                };
+            } else return self.prefetch_finish();
+            const group = &self.view_groups[self.group_versions_done];
             const group_versions = &self.forest.grooves.group_versions;
             const scan = group_versions.scan_builder.scan_prefix_range(
                 .version,
@@ -2371,6 +2431,7 @@ pub fn StateMachineType(comptime Storage: type) type {
             self.group_versions[self.group_versions_done] =
                 if (results.len == 1) results[0] else null;
             self.group_versions_done += 1;
+            self.group_version_scans += 1;
             self.forest.scan_buffer_pool.reset();
             self.forest.grooves.group_versions.scan_builder.reset();
             self.prefetch_group_version_next();
@@ -2387,7 +2448,6 @@ pub fn StateMachineType(comptime Storage: type) type {
             if (!stdx.zeroed(&query.reserved)) return null;
             // By id or by name, not both.
             if (query.view_id != 0 and !stdx.zeroed(&query.name)) return null;
-            if (query.as_of != 0) return @min(query.limit, view_as_of_limit_max);
             return @min(query.limit, view_groups_limit_max);
         }
 
@@ -2464,6 +2524,8 @@ pub fn StateMachineType(comptime Storage: type) type {
                 self.view_groups_count = null;
                 self.view_version = null;
                 self.group_versions_done = 0;
+                self.group_version_scans = 0;
+                self.view_groups_listed = 0;
             }
             const query = view_query(message_body_used);
             const limit = view_query_limit(query) orelse {
@@ -2486,6 +2548,8 @@ pub fn StateMachineType(comptime Storage: type) type {
             const view = &self.views_op[view_id - 1];
             assert(view.id == view_id);
             header.declared_op = view.declared_op;
+            const name = views.definition_name(&view.definition);
+            @memcpy(header.group_key[0..name.len], name);
             const as_of = query.as_of != 0;
             if (as_of) {
                 // As the op `as_of` left it (N62); missing if it was declared later.
@@ -2505,9 +2569,12 @@ pub fn StateMachineType(comptime Storage: type) type {
 
             const scanned = self.view_groups[0..self.view_groups_count.?];
             assert(scanned.len <= limit + 1);
-            if (as_of) assert(self.group_versions_done == @min(scanned.len, limit));
+            // As of an op, the scans may have ended the page early.
+            const listed = if (as_of) self.view_groups_listed else @min(scanned.len, limit);
+            assert(listed <= @min(scanned.len, limit));
+            if (as_of) assert(self.group_versions_done == listed);
             var count: usize = 0;
-            for (scanned[0..@min(scanned.len, limit)], 0..) |*group_now, index| {
+            for (scanned[0..listed], 0..) |*group_now, index| {
                 assert(group_now.key >> 64 == view.id);
                 const group: Group = if (as_of) group: {
                     // Not yet created at `as_of`.
@@ -2533,9 +2600,9 @@ pub fn StateMachineType(comptime Storage: type) type {
                 record.sums = group.sums;
                 count += 1;
             }
-            if (scanned.len > limit) {
+            if (scanned.len > listed) {
                 header.flags.more = true;
-                header.cursor = @truncate(scanned[limit].key);
+                header.cursor = @truncate(scanned[listed].key);
             }
             return (1 + count) * @sizeOf(ViewRecord);
         }
