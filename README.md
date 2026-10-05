@@ -9,6 +9,9 @@ deterministic functions of it, and every read says which log position it reflect
 
 > Status: **toy / research.** The foundation and the commit core exist — see [Roadmap](#roadmap).
 
+New here? [docs/TUTORIAL.md](./docs/TUTORIAL.md) walks through a running cluster, every API
+and the code, step by step.
+
 ## Design in one picture
 
 ```

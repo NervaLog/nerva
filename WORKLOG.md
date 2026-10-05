@@ -420,3 +420,17 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
 - Tests: `cache_rows_resolve` and `LatencyHistogram` unit tests; `test:integration` checks round
   trips arrive over statsd (every replica now sends) and starts replica 2 with `--cache-rows`.
   Mutation-tested: sending 0 as the round trip fails it. Every bench:load workload ran locally.
+
+## 2026-10-05 — Tutorial
+
+- `docs/TUTORIAL.md`: a step-by-step tutorial for people new to Nerva. It covers a
+  one-replica cluster and `nerva api`, rows and versions, transactions (compare-and-set,
+  claims, atomicity, deletes), the change feed, history and as-of reads, layouts, adds,
+  maintained views and `nerva view`, documents, crashes and safe retries, the Zig client, a
+  contributor's tour of the code, and a cheat sheet. Linked from README.md.
+- Verified: every command and reply in it comes from one scripted run against a fresh
+  one-replica `--development` cluster at `eaa7520`. The crash, retry, layout and declaration
+  claims were each checked separately.
+- Found while writing it, filed, not fixed here: #36 (the gateways refuse a body containing a
+  newline when head and body arrive in one read; examples are single-line until it is fixed)
+  and #37 (`nerva api` answers 503 forever after one request times out).
