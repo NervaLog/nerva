@@ -517,3 +517,35 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
   one-replica `--development` cluster at v0.3.0. The crash, outage and reconnect, retry,
   layout and declaration claims were each checked separately.
 - Found while writing it: #36 (fixed in N58) and #37 (a duplicate of #27, fixed in N58).
+
+## 2026-10-05 — Views: min, max and as_of in the state machine (N62)
+
+- `src/nerva.zig`: `Member`, `GroupVersion`, `ViewVersion`; `member_key`, `member_order`,
+  `group_version_key`, `view_version_key`; tree ids 9–15; `ViewQuery.as_of`;
+  `view_extremes_per_table_max`; status `table_extremes_full`.
+- `src/nerva/views.zig`: `min` and `max` accepted; ordered values, the members' order prefix,
+  `extreme_count`.
+- `src/nerva/state_machine.zig`: `members`, `group_versions` and `view_versions` grooves; commit
+  prefetch stages 3 (members) and 4 (scans of the order where a group's holder may leave);
+  `views_finish` settles `min` and `max`, keeps hashes and group counts, writes groups, members,
+  views and their versions once each; a timestamp reserve per op for versions; entry blocks of 9;
+  `get_view` as of an op (view version, then one scan per listed group).
+- `src/lsm/scan_builder.zig`: `scan_prefix_range` (UPSTREAM.md).
+- `nerva api`: `GET /v1/views/<name>/groups?as_of=`, `declared_op`, every aggregate rendered as
+  `<fn>_<field>`; `min` and `max` maintained.
+- Admission counts members as well as groups (`member_writes_limit`, a request's entries);
+  pulses add at most what both limits allow. Replica RSS: 1,014 MiB on `main`, 1,295 MiB here.
+- `build.zig`: release `0.0.4`, clients from `0.0.4` (owner's decisions; README, UPSTREAM.md).
+  `ViewQuery.as_of` in v0.3.0's reserved bytes, so its layout is otherwise unchanged. Found and
+  filed while checking: #42 (`nerva view` exits on a timeout; the canvas test flakes under
+  load) and #48 (an evicted client segfaults).
+- `docs/TUTORIAL.md` matches v0.3.0 and is left so: its maintained views (`count` and `sum`,
+  latest only) and its release notes (`0.0.3`, clients from `0.0.2`) change with the release
+  that ships this.
+- `demo/canvas/server.py`: the reset is two transactions (its per-pixel `canvas` view, now
+  maintained, needs 4,096 groups for one).
+- Tests: the state machine tests' harness compacts and checkpoints; a randomized `min`, `max`
+  and `as_of` test against a model (with member refusals); the VOPR model of both, reading
+  declared views more often; `tests/views/maintained.py` with a `min` and `max` view and
+  `as_of`; format guards updated. Mutation-tested: three planted bugs fail the unit test; the
+  VOPR catches a blunt one but not those three (N62 says why).

@@ -34,6 +34,9 @@ const EntryStatus = nerva.EntryStatus;
 const Add = nerva.Add;
 const View = nerva.View;
 const Group = nerva.Group;
+const Member = nerva.Member;
+const GroupVersion = nerva.GroupVersion;
+const ViewVersion = nerva.ViewVersion;
 const ViewDefinition = nerva.ViewDefinition;
 const ViewQuery = nerva.ViewQuery;
 const ViewRecord = nerva.ViewRecord;
@@ -63,8 +66,16 @@ pub fn StateMachineType(comptime Storage: type) type {
             Operation.get_changes.result_max(constants.message_body_size_max) - 1;
 
         /// Timestamps a commit entry takes: its change, then one per view of its table, for a
-        /// group the entry creates (N52).
-        pub const entry_timestamps = 1 + nerva.views_per_table_max;
+        /// group the entry creates (N52), then one per `min` or `max` slot of its table, for a
+        /// member the entry creates (N62).
+        pub const entry_timestamps =
+            1 + nerva.views_per_table_max + nerva.view_extremes_per_table_max;
+        /// Distinct members one op may write, each once (N62): admission refuses a transaction
+        /// that would take its op past this, as it does for groups. A write takes a member in
+        /// each `min` or `max` slot of its table: with one or two such slots, any request fits.
+        pub const members_per_op_max: u32 = commit_entries_max;
+        /// Groups per `get_view` page read as of a past op: each takes a scan (N62).
+        pub const view_as_of_limit_max = @min(128, view_groups_limit_max);
         /// Distinct groups one op may write (N52), each once: admission refuses a transaction
         /// that would take its op past this. Groups are twice the size of rows, so this bounds
         /// the groups tree's tables to the rows tree's size.
@@ -78,6 +89,7 @@ pub fn StateMachineType(comptime Storage: type) type {
             assert(lookup_rows_max > 0);
             assert(changes_limit_max > 0);
             assert(view_groups_limit_max > 0);
+            assert(view_as_of_limit_max > 0);
         }
 
         pub const Options = struct {
@@ -86,6 +98,8 @@ pub fn StateMachineType(comptime Storage: type) type {
             lsm_forest_node_count: u32,
             cache_entries_rows: u32 = cache_entries_rows_multiple,
             cache_entries_groups: u32 = GroupsGroove.ObjectsCache.Cache.value_count_max_multiple,
+            cache_entries_members: u32 =
+                MembersGroove.ObjectsCache.Cache.value_count_max_multiple,
         };
 
         /// The row cache holds a multiple of this many rows (its set size), and at least one.
@@ -193,11 +207,102 @@ pub fn StateMachineType(comptime Storage: type) type {
             },
         );
 
+        const MembersGroove = GrooveType(
+            Storage,
+            Member,
+            .{
+                .ids = tree_ids.Member,
+                .batch_value_count_max = .{
+                    .timestamp = members_per_op_max,
+                    .key = members_per_op_max,
+                    // An update moves a member: out of its old position, into its new one.
+                    .order = 2 * members_per_op_max,
+                },
+                .primary_key = "key",
+                .primary_key_orphaned = false,
+                .unique_keys = &[_][:0]const u8{"key"},
+                .ignored = &[_][:0]const u8{
+                    "position",
+                    "view_id",
+                    "slot",
+                    "flags",
+                    "reserved",
+                    "group_key",
+                    "value",
+                },
+                .optional = &[_][:0]const u8{},
+                .derived = .{
+                    .order = struct {
+                        fn order(member: *const Member) ?u128 {
+                            return if (member.flags.present) member.position else null;
+                        }
+                    }.order,
+                },
+                .objects_cache = true,
+            },
+        );
+
+        const GroupVersionsGroove = GrooveType(
+            Storage,
+            GroupVersion,
+            .{
+                .ids = tree_ids.GroupVersion,
+                .batch_value_count_max = .{
+                    .timestamp = groups_per_op_max,
+                    .version = groups_per_op_max,
+                },
+                .primary_key = "timestamp",
+                .primary_key_orphaned = false,
+                .unique_keys = &[_][:0]const u8{},
+                .ignored = &[_][:0]const u8{
+                    "op",
+                    "key",
+                    "count",
+                    "group_key",
+                    "sums",
+                    "reserved",
+                },
+                .optional = &[_][:0]const u8{},
+                .derived = .{},
+                // Append only, like changes.
+                .objects_cache = false,
+            },
+        );
+
+        const ViewVersionsGroove = GrooveType(
+            Storage,
+            ViewVersion,
+            .{
+                .ids = tree_ids.ViewVersion,
+                .batch_value_count_max = .{
+                    .timestamp = nerva.views_max,
+                    .version = nerva.views_max,
+                },
+                .primary_key = "timestamp",
+                .primary_key_orphaned = false,
+                .unique_keys = &[_][:0]const u8{},
+                .ignored = &[_][:0]const u8{
+                    "op",
+                    "group_count",
+                    "state",
+                    "reserved_a",
+                    "hash",
+                    "reserved_b",
+                },
+                .optional = &[_][:0]const u8{},
+                .derived = .{},
+                .objects_cache = false,
+            },
+        );
+
         pub const Forest = ForestType(Storage, .{
             .rows = RowsGroove,
             .changes = ChangesGroove,
             .views = ViewsGroove,
             .groups = GroupsGroove,
+            .members = MembersGroove,
+            .group_versions = GroupVersionsGroove,
+            .view_versions = ViewVersionsGroove,
         });
 
         const RowsScanLookup = ScanLookupType(
@@ -208,6 +313,21 @@ pub fn StateMachineType(comptime Storage: type) type {
         const GroupsScanLookup = ScanLookupType(
             GroupsGroove,
             GroupsGroove.ScanBuilder.Scan,
+            Storage,
+        );
+        const MembersScanLookup = ScanLookupType(
+            MembersGroove,
+            MembersGroove.ScanBuilder.Scan,
+            Storage,
+        );
+        const GroupVersionsScanLookup = ScanLookupType(
+            GroupVersionsGroove,
+            GroupVersionsGroove.ScanBuilder.Scan,
+            Storage,
+        );
+        const ViewVersionsScanLookup = ScanLookupType(
+            ViewVersionsGroove,
+            ViewVersionsGroove.ScanBuilder.Scan,
             Storage,
         );
 
@@ -224,6 +344,36 @@ pub fn StateMachineType(comptime Storage: type) type {
         const Failure = struct { index: u32, status: EntryStatus, op: u64, value: u64 = 0 };
 
         const GroupScratch = struct { group: Group, stored: ?Group };
+        const MemberScratch = struct { member: Member, stored: ?Member };
+
+        /// One `min` or `max` slot of one group.
+        const ExtremeKey = struct { group: u128, slot: u8 };
+
+        /// What an op did to one `min` or `max` slot of a group (N62), gathered from the
+        /// members it touched before the slot's new value is computed.
+        const ExtremeScratch = struct {
+            /// The best value among the touched members now in the group.
+            best: ?i128 = null,
+            /// Whether a touched member held the group's value before the op: the slot must
+            /// then be read from the members' order, as prefetched.
+            stored_left: bool = false,
+        };
+
+        /// The start of a group's members' order of one slot, as prefetched (N62): the first
+        /// `removals_max + 1` members, or all of them.
+        const ExtremeScan = struct {
+            key: ExtremeKey,
+            prefix: u64,
+            function: nerva.AggregateFunction,
+            /// An upper bound on the members of the slot the op may move or remove.
+            removals_max: u32,
+            /// Whether the op may take away the member holding the group's value: only then is
+            /// the order read.
+            read: bool = false,
+            /// Where its members are in `extreme_members`, once read.
+            start: u32 = 0,
+            count: u32 = 0,
+        };
 
         /// Batches one multi-batch request may carry.
         const request_batches_max = std.math.maxInt(u16);
@@ -280,6 +430,10 @@ pub fn StateMachineType(comptime Storage: type) type {
         view_op_keys: std.AutoHashMapUnmanaged(u128, void) = .{},
         /// The keys the transaction being admitted added, to take back if it does not fit.
         view_txn_keys: std.ArrayListUnmanaged(u128) = .{},
+        /// The same for members (N62): the op's distinct members as admitted so far, and those
+        /// the transaction being admitted added.
+        view_op_members: std.AutoHashMapUnmanaged(u128, void) = .{},
+        view_txn_members: std.ArrayListUnmanaged(u128) = .{},
         /// The groups this op changed, in the order first touched, and their state now and as
         /// stored: written back once each at the end of the op.
         groups_touched: std.ArrayListUnmanaged(u128) = .{},
@@ -292,6 +446,42 @@ pub fn StateMachineType(comptime Storage: type) type {
         view_groups_count: ?u32 = null,
         /// The building view a pulse backfills (an index into `views_op`), if any.
         backfill_view: ?u32 = null,
+
+        // ---- min, max and as_of (N62) ----
+
+        /// `members_per_op_max` for this `batch_size_limit`.
+        member_writes_limit: u32,
+        members_prefetch_context: MembersGroove.PrefetchContext = undefined,
+        members_scan_lookup: MembersScanLookup = undefined,
+        group_versions_scan_lookup: GroupVersionsScanLookup = undefined,
+        view_versions_scan_lookup: ViewVersionsScanLookup = undefined,
+        /// The members this op changed, in the order first touched, and their state now and as
+        /// stored: written back once each at the end of the op.
+        members_touched: std.ArrayListUnmanaged(u128) = .{},
+        members_scratch: std.AutoHashMapUnmanaged(u128, MemberScratch) = .{},
+        /// Per `min` or `max` slot of a group the op touched; looked up only.
+        extremes_scratch: std.AutoHashMapUnmanaged(ExtremeKey, ExtremeScratch) = .{},
+        /// The slots whose members' order the op prefetched, in the order prefetched, and an
+        /// index by key; their members are in `extreme_members`.
+        extreme_scans: std.ArrayListUnmanaged(ExtremeScan) = .{},
+        extreme_scan_index: std.AutoHashMapUnmanaged(ExtremeKey, u32) = .{},
+        extreme_scans_done: u32 = 0,
+        /// The members stage 4 counted, so that each is counted once.
+        extreme_counted: std.AutoHashMapUnmanaged(u128, void) = .{},
+        extreme_members: []Member,
+        extreme_members_count: u32 = 0,
+        /// `get_view` as of a past op: the view's version, then each listed group's version
+        /// (null: the group did not exist yet).
+        view_version: ?ViewVersion = null,
+        group_versions: []?GroupVersion,
+        group_versions_done: u32 = 0,
+        view_version_buffer: [1]ViewVersion = undefined,
+        group_version_buffer: [1]GroupVersion = undefined,
+        /// The op being prefetched (`get_view` as of a past op clamps to it).
+        prefetch_op: u64 = 0,
+        /// The next timestamp a version takes, and the last it may (the op's reserve).
+        version_timestamp: u64 = 0,
+        version_timestamp_max: u64 = 0,
 
         pub fn init(
             self: *StateMachine,
@@ -309,15 +499,20 @@ pub fn StateMachineType(comptime Storage: type) type {
             const lookup_rows_limit = Operation.lookup_rows.event_max(options.batch_size_limit);
             assert(commit_entries_limit <= commit_entries_max);
             assert(lookup_rows_limit <= lookup_rows_max);
+            const members_limit = commit_entries_limit;
+            assert(members_limit <= members_per_op_max);
 
             self.* = .{
                 .batch_size_limit = options.batch_size_limit,
                 .group_writes_limit = groups_limit,
+                .member_writes_limit = members_limit,
                 .forest = undefined,
                 .changes_scan_buffer = undefined,
                 .write_keys = undefined,
                 .backfill_rows = undefined,
                 .view_groups = undefined,
+                .extreme_members = undefined,
+                .group_versions = undefined,
             };
 
             try self.forest.init(
@@ -368,6 +563,34 @@ pub fn StateMachineType(comptime Storage: type) type {
                             .key = .{ .batch_value_count_limit = groups_limit },
                         },
                     },
+                    .members = .{
+                        .cache_entries_max = options.cache_entries_members,
+                        .prefetch_entries_for_read_max = 0,
+                        .prefetch_entries_for_update_max = members_limit,
+                        .tree_options_object = .{ .batch_value_count_limit = members_limit },
+                        .tree_options_index = .{
+                            .key = .{ .batch_value_count_limit = members_limit },
+                            .order = .{ .batch_value_count_limit = 2 * members_limit },
+                        },
+                    },
+                    .group_versions = .{
+                        .cache_entries_max = 0,
+                        .prefetch_entries_for_read_max = 0,
+                        .prefetch_entries_for_update_max = 0,
+                        .tree_options_object = .{ .batch_value_count_limit = groups_limit },
+                        .tree_options_index = .{
+                            .version = .{ .batch_value_count_limit = groups_limit },
+                        },
+                    },
+                    .view_versions = .{
+                        .cache_entries_max = 0,
+                        .prefetch_entries_for_read_max = 0,
+                        .prefetch_entries_for_update_max = 0,
+                        .tree_options_object = .{ .batch_value_count_limit = nerva.views_max },
+                        .tree_options_index = .{
+                            .version = .{ .batch_value_count_limit = nerva.views_max },
+                        },
+                    },
                 },
             );
             errdefer self.forest.deinit(allocator);
@@ -400,9 +623,41 @@ pub fn StateMachineType(comptime Storage: type) type {
             errdefer self.groups_touched.deinit(allocator);
             try self.groups_scratch.ensureTotalCapacity(allocator, groups_limit);
             errdefer self.groups_scratch.deinit(allocator);
+
+            try self.members_touched.ensureTotalCapacity(allocator, members_limit);
+            errdefer self.members_touched.deinit(allocator);
+            try self.members_scratch.ensureTotalCapacity(allocator, members_limit);
+            errdefer self.members_scratch.deinit(allocator);
+            try self.extremes_scratch.ensureTotalCapacity(allocator, members_limit);
+            errdefer self.extremes_scratch.deinit(allocator);
+            try self.extreme_scans.ensureTotalCapacity(allocator, members_limit);
+            errdefer self.extreme_scans.deinit(allocator);
+            try self.extreme_scan_index.ensureTotalCapacity(allocator, members_limit);
+            errdefer self.extreme_scan_index.deinit(allocator);
+            try self.extreme_counted.ensureTotalCapacity(allocator, members_limit);
+            errdefer self.extreme_counted.deinit(allocator);
+            try self.view_op_members.ensureTotalCapacity(allocator, members_limit);
+            errdefer self.view_op_members.deinit(allocator);
+            try self.view_txn_members.ensureTotalCapacity(allocator, members_limit);
+            errdefer self.view_txn_members.deinit(allocator);
+            // Each scan reads one more member than the op may take from its slot.
+            self.extreme_members = try allocator.alloc(Member, 2 * members_limit);
+            errdefer allocator.free(self.extreme_members);
+            self.group_versions = try allocator.alloc(?GroupVersion, view_as_of_limit_max);
+            errdefer allocator.free(self.group_versions);
         }
 
         pub fn deinit(self: *StateMachine, allocator: std.mem.Allocator) void {
+            allocator.free(self.group_versions);
+            allocator.free(self.extreme_members);
+            self.view_txn_members.deinit(allocator);
+            self.view_op_members.deinit(allocator);
+            self.extreme_counted.deinit(allocator);
+            self.extreme_scan_index.deinit(allocator);
+            self.extreme_scans.deinit(allocator);
+            self.extremes_scratch.deinit(allocator);
+            self.members_scratch.deinit(allocator);
+            self.members_touched.deinit(allocator);
             self.groups_scratch.deinit(allocator);
             self.groups_touched.deinit(allocator);
             self.view_txn_keys.deinit(allocator);
@@ -432,7 +687,26 @@ pub fn StateMachineType(comptime Storage: type) type {
                 .view_txn_keys = self.view_txn_keys,
                 .groups_touched = self.groups_touched,
                 .groups_scratch = self.groups_scratch,
+                .member_writes_limit = self.member_writes_limit,
+                .members_touched = self.members_touched,
+                .members_scratch = self.members_scratch,
+                .extremes_scratch = self.extremes_scratch,
+                .extreme_scans = self.extreme_scans,
+                .extreme_scan_index = self.extreme_scan_index,
+                .extreme_counted = self.extreme_counted,
+                .view_op_members = self.view_op_members,
+                .view_txn_members = self.view_txn_members,
+                .extreme_members = self.extreme_members,
+                .group_versions = self.group_versions,
             };
+            self.members_touched.clearRetainingCapacity();
+            self.members_scratch.clearRetainingCapacity();
+            self.extremes_scratch.clearRetainingCapacity();
+            self.extreme_scans.clearRetainingCapacity();
+            self.extreme_scan_index.clearRetainingCapacity();
+            self.extreme_counted.clearRetainingCapacity();
+            self.view_op_members.clearRetainingCapacity();
+            self.view_txn_members.clearRetainingCapacity();
             self.view_txn_busy.unsetAll();
             self.view_op_keys.clearRetainingCapacity();
             self.view_txn_keys.clearRetainingCapacity();
@@ -542,16 +816,45 @@ pub fn StateMachineType(comptime Storage: type) type {
                 },
                 .get_changes, .get_history, .get_view, .declare_view, .pulse => message_body_used,
             };
-            self.prepare_timestamp += self.prepare_delta(operation, payload);
+            self.prepare_timestamp +=
+                self.prepare_delta(operation, payload) + self.versions_reserve(operation);
         }
 
         fn prepare_delta(self: *const StateMachine, operation: Operation, events: []const u8) u64 {
             return switch (operation) {
                 .commit => @divExact(events.len, @sizeOf(Entry)) * entry_timestamps,
                 .declare_view => 1,
-                .pulse => self.group_writes_limit,
+                // Each row a pulse may add takes an entry's block.
+                .pulse => self.group_writes_limit * entry_timestamps,
                 .lookup_rows, .get_changes, .get_history, .get_view => 0,
             };
+        }
+
+        /// Timestamps an op takes, below those of its writes, for the versions of the groups and
+        /// views it changes (N62).
+        fn versions_reserve(self: *const StateMachine, operation: Operation) u64 {
+            return switch (operation) {
+                .commit, .pulse => self.group_writes_limit + nerva.views_max,
+                .declare_view => 1,
+                .lookup_rows, .get_changes, .get_history, .get_view => 0,
+            };
+        }
+
+        /// Starts the op's versions at the bottom of its reserve: `writes_min` is the timestamp
+        /// just below its writes'.
+        fn versions_begin(self: *StateMachine, operation: Operation, writes_min: u64) void {
+            const reserve = self.versions_reserve(operation);
+            assert(reserve > 0);
+            assert(writes_min >= reserve);
+            self.version_timestamp = writes_min - reserve + 1;
+            self.version_timestamp_max = writes_min;
+            assert(TimestampRange.valid(self.version_timestamp));
+        }
+
+        fn version_timestamp_next(self: *StateMachine) u64 {
+            assert(self.version_timestamp <= self.version_timestamp_max);
+            defer self.version_timestamp += 1;
+            return self.version_timestamp;
         }
 
         pub fn prefetch(
@@ -570,6 +873,7 @@ pub fn StateMachineType(comptime Storage: type) type {
             assert(message_body_used.len <= self.batch_size_limit);
 
             self.prefetch_operation = operation;
+            self.prefetch_op = op;
             self.prefetch_input = message_body_used;
             self.prefetch_snapshot = snapshot;
             self.prefetch_callback = callback;
@@ -798,7 +1102,7 @@ pub fn StateMachineType(comptime Storage: type) type {
                     message_body_used,
                     output_buffer,
                 ),
-                .pulse => self.execute_pulse(timestamp),
+                .pulse => self.execute_pulse(op, timestamp),
             };
         }
 
@@ -821,6 +1125,7 @@ pub fn StateMachineType(comptime Storage: type) type {
 
             // Each batch's writes take the timestamps just below its share of the prepare's.
             var batch_timestamp = timestamp - self.prepare_delta(operation, body_decoder.payload);
+            if (operation == .commit) self.versions_begin(.commit, batch_timestamp);
             var batch_index: u32 = 0;
             while (body_decoder.pop()) |batch| : (batch_index += 1) {
                 batch_timestamp += self.prepare_delta(operation, batch);
@@ -845,10 +1150,7 @@ pub fn StateMachineType(comptime Storage: type) type {
             }
             assert(batch_timestamp == timestamp);
             assert(body_decoder.batch_count() == reply_encoder.batch_count);
-            if (operation == .commit) {
-                self.groups_store();
-                self.views_store();
-            }
+            if (operation == .commit) self.views_finish(op);
             return reply_encoder.finish();
         }
 
@@ -1218,8 +1520,12 @@ pub fn StateMachineType(comptime Storage: type) type {
 
             const groups = &self.forest.grooves.groups;
             groups.prefetch_setup(self.prefetch_snapshot.?);
+            // Stage 3 prefetches the members admitted here.
+            const members = &self.forest.grooves.members;
+            members.prefetch_setup(self.prefetch_snapshot.?);
             self.view_txn_busy.unsetAll();
             self.view_op_keys.clearRetainingCapacity();
+            self.view_op_members.clearRetainingCapacity();
             var batch_index: u32 = 0;
             while (decoder.pop()) |batch| : (batch_index += 1) {
                 const entries = stdx.bytes_as_slice(.exact, Entry, batch);
@@ -1228,43 +1534,83 @@ pub fn StateMachineType(comptime Storage: type) type {
                     continue;
                 }
                 for (self.view_txn_keys.items) |key| groups.prefetch_enqueue(.{ .key = key });
+                for (self.view_txn_members.items) |key| members.prefetch_enqueue(.{ .key = key });
             }
             self.view_txn_keys.clearRetainingCapacity();
+            self.view_txn_members.clearRetainingCapacity();
             groups.prefetch(prefetch_groups_callback, &self.groups_prefetch_context);
         }
 
-        /// Adds the transaction's groups to the op's, if they fit (`view_txn_keys` holds those
-        /// it added). Otherwise leaves the op's groups as they were.
+        /// Adds the transaction's groups and members to the op's, if they fit (`view_txn_keys`
+        /// and `view_txn_members` hold those it added). Otherwise leaves the op's as they were.
+        /// A write counts, in each view of its table, the groups of its old and new values that
+        /// pass the view's filter, and if either does, its member in each `min` or `max` slot.
         fn view_txn_admit(self: *StateMachine, entries: []const Entry) bool {
             self.view_txn_keys.clearRetainingCapacity();
-            for (entries) |*entry| {
-                if (!self.entry_viewed(entry)) continue;
-                const rows = &self.forest.grooves.rows;
-                const value_old: ?[nerva.value_size]u8 =
-                    switch (rows.get(nerva.row_key(entry.table, entry.id))) {
-                        .found_object => |row| if (row.flags.deleted) null else row.value,
-                        .not_found => null,
-                    };
-                for (self.views_op[0..self.views_op_count]) |*view| {
-                    if (view.definition.table != entry.table) continue;
-                    for (views.entry_values(entry, value_old)) |candidate| {
-                        const value = candidate orelse continue;
-                        if (!views.row_matches(&view.definition, &value)) continue;
-                        const group_key = views.group_key(&view.definition, &value);
-                        const key = views.group_tree_key(view.id, &group_key);
-                        if (self.view_op_keys.contains(key)) continue;
-                        if (self.view_op_keys.count() == self.group_writes_limit) {
-                            for (self.view_txn_keys.items) |added| {
-                                assert(self.view_op_keys.remove(added));
+            self.view_txn_members.clearRetainingCapacity();
+            const fits = fits: {
+                for (entries) |*entry| {
+                    if (!self.entry_viewed(entry)) continue;
+                    const rows = &self.forest.grooves.rows;
+                    const value_old: ?[nerva.value_size]u8 =
+                        switch (rows.get(nerva.row_key(entry.table, entry.id))) {
+                            .found_object => |row| if (row.flags.deleted) null else row.value,
+                            .not_found => null,
+                        };
+                    for (self.views_op[0..self.views_op_count]) |*view| {
+                        if (view.definition.table != entry.table) continue;
+                        var matched = false;
+                        for (views.entry_values(entry, value_old)) |candidate| {
+                            const value = candidate orelse continue;
+                            if (!views.row_matches(&view.definition, &value)) continue;
+                            matched = true;
+                            const group_key = views.group_key(&view.definition, &value);
+                            const key = views.group_tree_key(view.id, &group_key);
+                            const op_keys = &self.view_op_keys;
+                            const txn_keys = &self.view_txn_keys;
+                            if (!admit(op_keys, txn_keys, key, self.group_writes_limit)) {
+                                break :fits false;
                             }
-                            self.view_txn_keys.clearRetainingCapacity();
-                            return false;
                         }
-                        self.view_op_keys.putAssumeCapacity(key, {});
-                        self.view_txn_keys.appendAssumeCapacity(key);
+                        if (!matched) continue;
+                        const definition = &view.definition;
+                        const aggregates = definition.aggregates[0..definition.aggregate_count];
+                        for (aggregates, 0..) |*aggregate, slot| {
+                            if (!views.extreme(aggregate.function)) continue;
+                            const key = nerva.member_key(view.id, @intCast(slot), entry.id);
+                            const op_keys = &self.view_op_members;
+                            const txn_keys = &self.view_txn_members;
+                            if (!admit(op_keys, txn_keys, key, self.member_writes_limit)) {
+                                break :fits false;
+                            }
+                        }
                     }
                 }
+                break :fits true;
+            };
+            if (!fits) {
+                for (self.view_txn_keys.items) |added| assert(self.view_op_keys.remove(added));
+                for (self.view_txn_members.items) |added| {
+                    assert(self.view_op_members.remove(added));
+                }
+                self.view_txn_keys.clearRetainingCapacity();
+                self.view_txn_members.clearRetainingCapacity();
             }
+            return fits;
+        }
+
+        /// Counts `key` in the op's set, and the transaction's list, unless already counted; false
+        /// if the set is full.
+        fn admit(
+            op_keys: *std.AutoHashMapUnmanaged(u128, void),
+            txn_keys: *std.ArrayListUnmanaged(u128),
+            key: u128,
+            limit: u32,
+        ) bool {
+            if (op_keys.contains(key)) return true;
+            if (op_keys.count() == limit) return false;
+            op_keys.putAssumeCapacity(key, {});
+            txn_keys.appendAssumeCapacity(key);
             return true;
         }
 
@@ -1285,7 +1631,175 @@ pub fn StateMachineType(comptime Storage: type) type {
             const self: *StateMachine = @alignCast(
                 @fieldParentPtr("groups_prefetch_context", context),
             );
-            self.prefetch_finish();
+            switch (self.prefetch_operation.?) {
+                .commit => self.prefetch_commit_members(),
+                .pulse => self.prefetch_backfill_members(),
+                else => unreachable,
+            }
+        }
+
+        /// Stage 3 of `commit` (N62): the members admission counted, in every `min` or `max`
+        /// slot of every admitted write's table (enqueued by `prefetch_commit_groups`).
+        fn prefetch_commit_members(self: *StateMachine) void {
+            const members = &self.forest.grooves.members;
+            members.prefetch(prefetch_members_callback, &self.members_prefetch_context);
+        }
+
+        fn members_enqueue(self: *StateMachine, view: *const View, id: u64) void {
+            const definition = &view.definition;
+            for (definition.aggregates[0..definition.aggregate_count], 0..) |*aggregate, slot| {
+                if (!views.extreme(aggregate.function)) continue;
+                self.forest.grooves.members.prefetch_enqueue(.{
+                    .key = nerva.member_key(view.id, @intCast(slot), id),
+                });
+            }
+        }
+
+        /// Stage 3 of `pulse`: the members of the rows it adds (none exist yet; prefetched so
+        /// that the commit can tell).
+        fn prefetch_backfill_members(self: *StateMachine) void {
+            const members = &self.forest.grooves.members;
+            members.prefetch_setup(self.prefetch_snapshot.?);
+            if (self.backfill_view) |index| {
+                const view = &self.views_op[index];
+                const count = @min(self.backfill_count.?, self.backfill_rows_max(view));
+                for (self.backfill_rows[0..count]) |*row| {
+                    self.members_enqueue(view, @truncate(row.key));
+                }
+            }
+            members.prefetch(prefetch_members_callback, &self.members_prefetch_context);
+        }
+
+        fn prefetch_members_callback(context: *MembersGroove.PrefetchContext) void {
+            const self: *StateMachine = @alignCast(
+                @fieldParentPtr("members_prefetch_context", context),
+            );
+            switch (self.prefetch_operation.?) {
+                .commit => self.prefetch_extreme_scans(),
+                .pulse => self.prefetch_finish(),
+                else => unreachable,
+            }
+        }
+
+        /// Stage 4 of `commit` (N62). For every slot a write may take a member out of (from
+        /// the rows as they are before the op, as admission counts), counts the writes that
+        /// may; and where one of them may take away the member holding the group's value,
+        /// prefetches the first `removals_max + 1` members of the slot's order, one scan each.
+        fn prefetch_extreme_scans(self: *StateMachine) void {
+            assert(self.extreme_scans.items.len == 0);
+            assert(self.extreme_scan_index.count() == 0);
+            var decoder = MultiBatchDecoder.init(self.prefetch_input.?, .{
+                .element_size = @sizeOf(Entry),
+            }) catch unreachable; // Already validated by `input_valid()`.
+            var batch_index: u32 = 0;
+            while (decoder.pop()) |batch| : (batch_index += 1) {
+                if (self.view_txn_busy.isSet(batch_index)) continue;
+                for (stdx.bytes_as_slice(.exact, Entry, batch)) |*entry| {
+                    if (!self.entry_viewed(entry)) continue;
+                    const old = switch (self.forest.grooves.rows.get(
+                        nerva.row_key(entry.table, entry.id),
+                    )) {
+                        .found_object => |row| if (row.flags.deleted) continue else row.value,
+                        .not_found => continue,
+                    };
+                    for (self.views_op[0..self.views_op_count]) |*view| {
+                        if (!view_maintained(view, entry.table)) continue;
+                        if (view.state == .building and entry.id >= view.backfill_cursor) continue;
+                        if (!views.row_matches(&view.definition, &old)) continue;
+                        self.extreme_scans_count(view, entry.id, &old);
+                    }
+                }
+            }
+            var count: u32 = 0;
+            for (self.extreme_scans.items) |*scan| {
+                if (!scan.read) continue;
+                scan.start = count;
+                count += scan.removals_max + 1;
+            }
+            assert(count <= self.extreme_members.len);
+            self.extreme_members_count = count;
+            self.extreme_scans_done = 0;
+            self.extreme_scan_next();
+        }
+
+        /// Counts one write that may take row `id`'s members, as `old`, out of its group's
+        /// slots (each member once, however many writes the op has to its row), and marks a slot
+        /// to read if `old` holds the group's value there.
+        fn extreme_scans_count(
+            self: *StateMachine,
+            view: *const View,
+            id: u64,
+            old: *const [nerva.value_size]u8,
+        ) void {
+            const definition = &view.definition;
+            const group_key = views.group_key(definition, old);
+            const tree_key = views.group_tree_key(view.id, &group_key);
+            const group: ?Group = switch (self.forest.grooves.groups.get(tree_key)) {
+                .found_object => |group| group,
+                .not_found => null,
+            };
+            for (definition.aggregates[0..definition.aggregate_count], 0..) |*aggregate, index| {
+                if (!views.extreme(aggregate.function)) continue;
+                const slot: u8 = @intCast(index);
+                const key: ExtremeKey = .{ .group = tree_key, .slot = slot };
+                const entry = self.extreme_scan_index.getOrPutAssumeCapacity(key);
+                if (!entry.found_existing) {
+                    entry.value_ptr.* = @intCast(self.extreme_scans.items.len);
+                    self.extreme_scans.appendAssumeCapacity(.{
+                        .key = key,
+                        .prefix = views.member_order_prefix(view.id, slot, &group_key),
+                        .function = aggregate.function,
+                        .removals_max = 0,
+                    });
+                }
+                const scan = &self.extreme_scans.items[entry.value_ptr.*];
+                const member = nerva.member_key(view.id, slot, id);
+                if (self.extreme_counted.getOrPutAssumeCapacity(member).found_existing) continue;
+                scan.removals_max += 1;
+                const stored = group orelse continue;
+                if (stored.count == 0) continue;
+                const value = views.field_integer(aggregate.field, old);
+                if (value == std.mem.readInt(i128, &stored.sums[slot], .little)) scan.read = true;
+            }
+        }
+
+        fn extreme_scan_next(self: *StateMachine) void {
+            while (self.extreme_scans_done < self.extreme_scans.items.len) {
+                if (self.extreme_scans.items[self.extreme_scans_done].read) break;
+                self.extreme_scans_done += 1;
+            } else return self.prefetch_finish();
+
+            const scan = &self.extreme_scans.items[self.extreme_scans_done];
+            const members = &self.forest.grooves.members;
+            const range = members.scan_builder.scan_prefix_range(
+                .order,
+                self.forest.scan_buffer_pool.acquire_assume_capacity(),
+                self.prefetch_snapshot.?,
+                nerva.member_order(scan.prefix, 0),
+                nerva.member_order(scan.prefix, std.math.maxInt(u64)),
+                switch (scan.function) {
+                    .min => .ascending,
+                    .max => .descending,
+                    else => unreachable,
+                },
+            );
+            self.members_scan_lookup = MembersScanLookup.init(members, range);
+            self.members_scan_lookup.read(
+                self.extreme_members[scan.start..][0 .. scan.removals_max + 1],
+                extreme_scan_callback,
+            );
+        }
+
+        fn extreme_scan_callback(scan_lookup: *MembersScanLookup, results: []const Member) void {
+            const self: *StateMachine =
+                @alignCast(@fieldParentPtr("members_scan_lookup", scan_lookup));
+            const scan = &self.extreme_scans.items[self.extreme_scans_done];
+            assert(results.len <= scan.removals_max + 1);
+            scan.count = @intCast(results.len);
+            self.extreme_scans_done += 1;
+            self.forest.scan_buffer_pool.reset();
+            self.forest.grooves.members.scan_builder.reset();
+            self.extreme_scan_next();
         }
 
         /// Whether `view` is kept up to date with writes to `table`.
@@ -1321,8 +1835,8 @@ pub fn StateMachineType(comptime Storage: type) type {
             assert(self.groups_scratch.count() == 0);
         }
 
-        /// Writes back the views this op changed.
-        fn views_store(self: *StateMachine) void {
+        /// Writes back the views this op changed, with their versions at `op`.
+        fn views_store(self: *StateMachine, op: u64) void {
             const groove = &self.forest.grooves.views;
             var building = false;
             for (
@@ -1333,13 +1847,26 @@ pub fn StateMachineType(comptime Storage: type) type {
                 if (stdx.equal_bytes(View, view, stored)) continue;
                 groove.update(.{ .old = stored, .new = view });
                 stored.* = view.*;
+                self.view_version_insert(view, op);
             }
             self.view_building = building;
         }
 
+        fn view_version_insert(self: *StateMachine, view: *const View, op: u64) void {
+            self.forest.grooves.view_versions.insert(&.{
+                .version = nerva.view_version_key(view.id, op),
+                .timestamp = self.version_timestamp_next(),
+                .op = op,
+                .group_count = view.group_count,
+                .state = view.state,
+                .hash = view.hash,
+            });
+        }
+
         /// Keeps the views over `table` exact after one row changed from `old` to `new` (null:
-        /// absent). `timestamp` is the entry's: a group it creates in the table's `n`th view
-        /// takes `timestamp + 1 + n`.
+        /// absent). `timestamp` is the entry's (`entry_timestamps`): a group it creates in the
+        /// table's `n`th view takes `timestamp + 1 + n`, and a member it creates in the table's
+        /// `m`th `min` or `max` slot takes `timestamp + 1 + views_per_table_max + m`.
         fn views_row_changed(
             self: *StateMachine,
             table: u32,
@@ -1349,30 +1876,119 @@ pub fn StateMachineType(comptime Storage: type) type {
             timestamp: u64,
         ) void {
             var slot: u64 = 0;
+            var extreme_slot: u64 = 0;
             for (self.views_op[0..self.views_op_count]) |*view| {
                 if (view.definition.table != table) continue;
                 defer slot += 1;
+                defer extreme_slot += views.extreme_count(&view.definition);
                 assert(slot < nerva.views_per_table_max);
                 if (!view_maintained(view, table)) continue;
                 // A building view adds rows from its cursor on when the pulse reaches them.
                 if (view.state == .building and id >= view.backfill_cursor) continue;
+                self.view_row_changed(
+                    view,
+                    id,
+                    old,
+                    new,
+                    timestamp + 1 + slot,
+                    timestamp + 1 + nerva.views_per_table_max + extreme_slot,
+                );
+            }
+            assert(extreme_slot <= nerva.view_extremes_per_table_max);
+        }
 
-                if (old) |value| {
-                    if (views.row_matches(&view.definition, value)) {
-                        self.group_change(view, value, .remove, 0);
+        /// One view's part of `views_row_changed`, and a pulse's (with `old` null).
+        fn view_row_changed(
+            self: *StateMachine,
+            view: *View,
+            id: u64,
+            old: ?*const [nerva.value_size]u8,
+            new: ?*const [nerva.value_size]u8,
+            group_timestamp: u64,
+            member_timestamp: u64,
+        ) void {
+            const old_in = if (old) |value| views.row_matches(&view.definition, value) else false;
+            const new_in = if (new) |value| views.row_matches(&view.definition, value) else false;
+            if (old_in) self.group_change(view, old.?, .remove, 0);
+            if (new_in) self.group_change(view, new.?, .add, group_timestamp);
+            if (old_in or new_in) {
+                self.members_change(view, id, if (new_in) new.? else null, member_timestamp);
+            }
+        }
+
+        /// Moves the row's member of each `min` or `max` slot of `view` to its place in `value`'s
+        /// group, or takes it out of the order (`value` null), in the op's scratch members. A
+        /// member created now takes `timestamp + m` in the view's `m`th such slot.
+        fn members_change(
+            self: *StateMachine,
+            view: *const View,
+            id: u64,
+            value: ?*const [nerva.value_size]u8,
+            timestamp: u64,
+        ) void {
+            if (view.state == .failed) return; // An earlier collision.
+            const definition = &view.definition;
+            var m: u64 = 0;
+            for (definition.aggregates[0..definition.aggregate_count], 0..) |*aggregate, index| {
+                if (!views.extreme(aggregate.function)) continue;
+                defer m += 1;
+                const slot: u8 = @intCast(index);
+                const member = &self.member_scratch(view.id, slot, id).member;
+                if (value) |row| {
+                    if (member.timestamp == 0) {
+                        assert(TimestampRange.valid(timestamp + m));
+                        member.timestamp = timestamp + m;
                     }
-                }
-                if (new) |value| {
-                    if (views.row_matches(&view.definition, value)) {
-                        self.group_change(view, value, .add, timestamp + 1 + slot);
-                    }
+                    const group_key = views.group_key(definition, row);
+                    member.flags.present = true;
+                    member.group_key = group_key;
+                    member.value = std.mem.toBytes(std.mem.nativeToLittle(
+                        i128,
+                        views.field_integer(aggregate.field, row),
+                    ));
+                    member.position = nerva.member_order(
+                        views.member_order_prefix(view.id, slot, &group_key),
+                        views.field_ordered(aggregate.field, row),
+                    );
+                } else {
+                    member.flags.present = false;
+                    member.group_key = @splat(0);
+                    member.value = @splat(0);
+                    member.position = 0;
                 }
             }
         }
 
-        /// Adds the row to, or removes it from, its group of `view`, keeping the view's hash and
-        /// group count, in the op's scratch groups (written back by `groups_store`). `timestamp`
-        /// is for a group created now.
+        /// The member's state in this op, from the groove the first time.
+        fn member_scratch(self: *StateMachine, view_id: u64, slot: u8, id: u64) *MemberScratch {
+            const key = nerva.member_key(view_id, slot, id);
+            const entry = self.members_scratch.getOrPutAssumeCapacity(key);
+            if (!entry.found_existing) {
+                const stored: ?Member = switch (self.forest.grooves.members.get(key)) {
+                    .found_object => |member| member,
+                    .not_found => null,
+                };
+                entry.value_ptr.* = .{
+                    .member = stored orelse .{
+                        .key = key,
+                        .position = 0,
+                        .timestamp = 0, // Assigned when it first joins a group.
+                        .view_id = @intCast(view_id),
+                        .slot = slot,
+                        .flags = .{},
+                        .group_key = @splat(0),
+                        .value = @splat(0),
+                    },
+                    .stored = stored,
+                };
+                self.members_touched.appendAssumeCapacity(key);
+            }
+            return entry.value_ptr;
+        }
+
+        /// Adds the row to, or removes it from, its group of `view` (count and sums), in the op's
+        /// scratch groups. `views_finish` then settles `min` and `max`, the view's hash and group
+        /// count, and writes the groups back. `timestamp` is for a group created now.
         fn group_change(
             self: *StateMachine,
             view: *View,
@@ -1399,15 +2015,10 @@ pub fn StateMachineType(comptime Storage: type) type {
                 group.timestamp = timestamp;
             }
 
-            const count_old = group.count;
-            views.hash_update(&view.hash, &views.group_digest(view.id, group), .remove);
             views.group_apply(&view.definition, group, value, switch (sign) {
                 .add => .add,
                 .remove => .remove,
             });
-            views.hash_update(&view.hash, &views.group_digest(view.id, group), .add);
-            if (count_old == 0 and group.count > 0) view.group_count += 1;
-            if (count_old > 0 and group.count == 0) view.group_count -= 1;
         }
 
         /// The group's state in this op, from the groove the first time.
@@ -1437,21 +2048,212 @@ pub fn StateMachineType(comptime Storage: type) type {
             return entry.value_ptr;
         }
 
-        /// Writes back each group this op changed, once, in the order first touched.
-        fn groups_store(self: *StateMachine) void {
+        /// Ends an op that may have changed views (commit, pulse): settles the `min` and `max`
+        /// of every group it touched, then writes back its groups, members and views, each
+        /// once, with their versions (N62).
+        fn views_finish(self: *StateMachine, op: u64) void {
+            self.views_finish_groups(op);
+            self.views_finish_views(op);
+        }
+
+        fn views_finish_groups(self: *StateMachine, op: u64) void {
+            assert(op < 1 << nerva.version_op_bits);
+            self.extremes_gather();
+            self.extremes_settle();
+            self.groups_store(op);
+            self.members_store();
+            self.extreme_counted.clearRetainingCapacity();
+            self.extremes_scratch.clearRetainingCapacity();
+            self.extreme_scans.clearRetainingCapacity();
+            self.extreme_scan_index.clearRetainingCapacity();
+            self.extreme_scans_done = 0;
+            self.extreme_members_count = 0;
+        }
+
+        fn views_finish_views(self: *StateMachine, op: u64) void {
+            self.views_store(op);
+            assert(self.version_timestamp <= self.version_timestamp_max + 1);
+        }
+
+        /// From the members the op touched: per group and slot, the best value it brought in,
+        /// and whether it took away the member holding the group's value as stored.
+        fn extremes_gather(self: *StateMachine) void {
+            assert(self.extremes_scratch.count() == 0);
+            for (self.members_touched.items) |key| {
+                const scratch = self.members_scratch.getPtr(key).?;
+                const view = &self.views_op[scratch.member.view_id - 1];
+                if (view.state == .failed) continue;
+                const slot = scratch.member.slot;
+                const function = view.definition.aggregates[slot].function;
+                assert(views.extreme(function));
+
+                if (scratch.stored) |*stored| {
+                    if (stored.flags.present) {
+                        const group_key = views.group_tree_key(view.id, &stored.group_key);
+                        // The row left its group as stored, so the op touched the group.
+                        const group = self.groups_scratch.getPtr(group_key).?;
+                        const group_stored = group.stored.?;
+                        assert(group_stored.count > 0);
+                        if (stdx.equal_bytes([16]u8, &stored.value, &group_stored.sums[slot])) {
+                            self.extreme_scratch(group_key, slot).stored_left = true;
+                        }
+                    }
+                }
+                if (scratch.member.flags.present) {
+                    const group_key = views.group_tree_key(view.id, &scratch.member.group_key);
+                    const extreme = self.extreme_scratch(group_key, slot);
+                    extreme.best = extreme_better(
+                        function,
+                        extreme.best,
+                        std.mem.readInt(i128, &scratch.member.value, .little),
+                    );
+                }
+            }
+        }
+
+        fn extreme_scratch(self: *StateMachine, group: u128, slot: u8) *ExtremeScratch {
+            const entry = self.extremes_scratch.getOrPutAssumeCapacity(.{
+                .group = group,
+                .slot = slot,
+            });
+            if (!entry.found_existing) entry.value_ptr.* = .{};
+            return entry.value_ptr;
+        }
+
+        fn extreme_better(function: nerva.AggregateFunction, best: ?i128, value: i128) i128 {
+            const current = best orelse return value;
+            return switch (function) {
+                .min => @min(current, value),
+                .max => @max(current, value),
+                else => unreachable,
+            };
+        }
+
+        /// Sets every `min` and `max` slot of the groups the op touched: the best of the members
+        /// it brought in and the members it did not touch. Those are represented by the value as
+        /// stored, unless the op took away the member holding it: then by the first untouched
+        /// member of the order, as prefetched (`prefetch_extreme_scans`).
+        fn extremes_settle(self: *StateMachine) void {
+            for (self.groups_touched.items) |group_key| {
+                const scratch = self.groups_scratch.getPtr(group_key).?;
+                const view = &self.views_op[@as(usize, @intCast(group_key >> 64)) - 1];
+                const definition = &view.definition;
+                for (definition.aggregates[0..definition.aggregate_count], 0..) |*aggregate, i| {
+                    if (view.state == .failed) break;
+                    if (!views.extreme(aggregate.function)) continue;
+                    const slot: u8 = @intCast(i);
+                    const group = &scratch.group;
+                    if (group.count == 0) {
+                        group.sums[slot] = @splat(0);
+                        continue;
+                    }
+                    const extreme_key: ExtremeKey = .{ .group = group_key, .slot = slot };
+                    const extreme = self.extremes_scratch.get(extreme_key);
+                    var best: ?i128 = if (extreme) |e| e.best else null;
+                    const stored_count = if (scratch.stored) |*stored| stored.count else 0;
+                    if (stored_count > 0) {
+                        const stored = &scratch.stored.?;
+                        if (extreme == null or !extreme.?.stored_left) {
+                            best = extreme_better(
+                                aggregate.function,
+                                best,
+                                std.mem.readInt(i128, &stored.sums[slot], .little),
+                            );
+                        } else if (self.extreme_untouched(view, slot, group)) |value| {
+                            best = extreme_better(aggregate.function, best, value);
+                        }
+                    }
+                    if (view.state == .failed) break;
+                    // The group is not empty: some member is in it.
+                    group.sums[slot] = std.mem.toBytes(std.mem.nativeToLittle(i128, best.?));
+                }
+            }
+        }
+
+        /// The first member of the group's order of `slot`, as prefetched, that the op did not
+        /// touch, or null if it touched them all. Fails the view on an order prefix collision.
+        fn extreme_untouched(
+            self: *StateMachine,
+            view: *View,
+            slot: u8,
+            group: *const Group,
+        ) ?i128 {
+            const index = self.extreme_scan_index.get(.{ .group = group.key, .slot = slot }).?;
+            const scan = &self.extreme_scans.items[index];
+            assert(scan.read);
+            // The member holding the group's value was in the order.
+            assert(scan.count > 0);
+            for (self.extreme_members[scan.start..][0..scan.count]) |*member| {
+                assert(member.flags.present);
+                if (member.view_id != view.id or member.slot != slot or
+                    !std.mem.eql(u8, &member.group_key, &group.group_key))
+                {
+                    // Two groups' orders share a prefix: every replica fails the view here.
+                    log.warn("view {}: member order collision; the view fails", .{view.id});
+                    view.state = .failed;
+                    return null;
+                }
+                if (self.members_scratch.contains(member.key)) continue;
+                return std.mem.readInt(i128, &member.value, .little);
+            }
+            // Every member prefetched was touched: then they were all the slot had.
+            assert(scan.count <= scan.removals_max);
+            return null;
+        }
+
+        /// Writes back each group this op changed, once, in the order first touched, with its
+        /// version at `op`, and keeps each view's hash and group count.
+        fn groups_store(self: *StateMachine, op: u64) void {
             const groups = &self.forest.grooves.groups;
             for (self.groups_touched.items) |tree_key| {
                 const scratch = self.groups_scratch.getPtr(tree_key).?;
-                if (scratch.stored) |*stored| {
-                    if (!stdx.equal_bytes(Group, stored, &scratch.group)) {
-                        groups.update(.{ .old = stored, .new = &scratch.group });
-                    }
-                } else if (scratch.group.timestamp != 0) {
-                    groups.insert(&scratch.group);
+                const group = &scratch.group;
+                const view = &self.views_op[@as(usize, @intCast(tree_key >> 64)) - 1];
+                const empty = std.mem.zeroes(Group);
+                const stored = if (scratch.stored) |*stored| stored else &empty;
+
+                views.hash_update(&view.hash, &views.group_digest(view.id, stored), .remove);
+                views.hash_update(&view.hash, &views.group_digest(view.id, group), .add);
+                if (stored.count == 0 and group.count > 0) view.group_count += 1;
+                if (stored.count > 0 and group.count == 0) view.group_count -= 1;
+
+                if (scratch.stored) |*group_stored| {
+                    if (stdx.equal_bytes(Group, group_stored, group)) continue;
+                    groups.update(.{ .old = group_stored, .new = group });
+                } else {
+                    // Touched and left empty, never written.
+                    if (group.timestamp == 0) continue;
+                    groups.insert(group);
                 }
+                self.forest.grooves.group_versions.insert(&.{
+                    .version = nerva.group_version_key(tree_key, op),
+                    .timestamp = self.version_timestamp_next(),
+                    .op = op,
+                    .key = tree_key,
+                    .count = group.count,
+                    .group_key = group.group_key,
+                    .sums = group.sums,
+                });
             }
             self.groups_touched.clearRetainingCapacity();
             self.groups_scratch.clearRetainingCapacity();
+        }
+
+        /// Writes back each member this op changed, once, in the order first touched.
+        fn members_store(self: *StateMachine) void {
+            const members = &self.forest.grooves.members;
+            for (self.members_touched.items) |key| {
+                const scratch = self.members_scratch.getPtr(key).?;
+                if (scratch.stored) |*stored| {
+                    if (!stdx.equal_bytes(Member, stored, &scratch.member)) {
+                        members.update(.{ .old = stored, .new = &scratch.member });
+                    }
+                } else if (scratch.member.timestamp != 0) {
+                    members.insert(&scratch.member);
+                }
+            }
+            self.members_touched.clearRetainingCapacity();
+            self.members_scratch.clearRetainingCapacity();
         }
 
         /// Stage 1 of `get_view`: scans the view's groups from the query's cursor.
@@ -1484,7 +2286,94 @@ pub fn StateMachineType(comptime Storage: type) type {
             self.view_groups_count = @intCast(results.len);
             self.forest.scan_buffer_pool.reset();
             self.forest.grooves.groups.scan_builder.reset();
-            self.prefetch_finish();
+            const query = view_query(self.prefetch_input.?);
+            if (query.as_of == 0) return self.prefetch_finish();
+            self.prefetch_view_version();
+        }
+
+        /// The last version at or before `as_of` (clamped: no version is newer than the read).
+        fn view_query_as_of(query: *const ViewQuery, op: u64) u64 {
+            assert(query.as_of != 0);
+            return @min(query.as_of, op);
+        }
+
+        /// Stage 2 of `get_view` as of a past op (N62): the view's version then.
+        fn prefetch_view_version(self: *StateMachine) void {
+            const query = view_query(self.prefetch_input.?);
+            const view_id = self.view_query_id(query).?;
+            const as_of = view_query_as_of(query, self.prefetch_op);
+            const view_versions = &self.forest.grooves.view_versions;
+            const scan = view_versions.scan_builder.scan_prefix_range(
+                .version,
+                self.forest.scan_buffer_pool.acquire_assume_capacity(),
+                self.prefetch_snapshot.?,
+                nerva.view_version_key(view_id, 0),
+                nerva.view_version_key(view_id, as_of),
+                .descending,
+            );
+            self.view_versions_scan_lookup = ViewVersionsScanLookup.init(view_versions, scan);
+            self.view_versions_scan_lookup.read(
+                (&self.view_version_buffer)[0..1],
+                prefetch_view_version_callback,
+            );
+        }
+
+        fn prefetch_view_version_callback(
+            scan_lookup: *ViewVersionsScanLookup,
+            results: []const ViewVersion,
+        ) void {
+            const self: *StateMachine =
+                @alignCast(@fieldParentPtr("view_versions_scan_lookup", scan_lookup));
+            assert(results.len <= 1);
+            self.view_version = if (results.len == 1) results[0] else null;
+            self.forest.scan_buffer_pool.reset();
+            self.forest.grooves.view_versions.scan_builder.reset();
+            self.group_versions_done = 0;
+            self.prefetch_group_version_next();
+        }
+
+        /// Stage 3 of `get_view` as of a past op: each listed group's version then, one scan
+        /// each.
+        fn prefetch_group_version_next(self: *StateMachine) void {
+            const query = view_query(self.prefetch_input.?);
+            const limit = view_query_limit(query).?;
+            const listed = @min(self.view_groups_count.?, limit);
+            if (self.view_version == null or self.group_versions_done == listed) {
+                return self.prefetch_finish();
+            }
+            const group = &self.view_groups[self.group_versions_done];
+            const as_of = view_query_as_of(query, self.prefetch_op);
+            const group_versions = &self.forest.grooves.group_versions;
+            const scan = group_versions.scan_builder.scan_prefix_range(
+                .version,
+                self.forest.scan_buffer_pool.acquire_assume_capacity(),
+                self.prefetch_snapshot.?,
+                nerva.group_version_key(group.key, 0),
+                nerva.group_version_key(group.key, as_of),
+                .descending,
+            );
+            self.group_versions_scan_lookup = GroupVersionsScanLookup.init(group_versions, scan);
+            self.group_versions_scan_lookup.read(
+                (&self.group_version_buffer)[0..1],
+                prefetch_group_version_callback,
+            );
+        }
+
+        fn prefetch_group_version_callback(
+            scan_lookup: *GroupVersionsScanLookup,
+            results: []const GroupVersion,
+        ) void {
+            const self: *StateMachine =
+                @alignCast(@fieldParentPtr("group_versions_scan_lookup", scan_lookup));
+            assert(results.len <= 1);
+            const group = &self.view_groups[self.group_versions_done];
+            if (results.len == 1) assert(results[0].key == group.key);
+            self.group_versions[self.group_versions_done] =
+                if (results.len == 1) results[0] else null;
+            self.group_versions_done += 1;
+            self.forest.scan_buffer_pool.reset();
+            self.forest.grooves.group_versions.scan_builder.reset();
+            self.prefetch_group_version_next();
         }
 
         fn view_query(body: []align(constants.cache_line_size) const u8) *const ViewQuery {
@@ -1498,6 +2387,7 @@ pub fn StateMachineType(comptime Storage: type) type {
             if (!stdx.zeroed(&query.reserved)) return null;
             // By id or by name, not both.
             if (query.view_id != 0 and !stdx.zeroed(&query.name)) return null;
+            if (query.as_of != 0) return @min(query.limit, view_as_of_limit_max);
             return @min(query.limit, view_groups_limit_max);
         }
 
@@ -1554,7 +2444,7 @@ pub fn StateMachineType(comptime Storage: type) type {
             const view = &self.views_op[self.backfill_view.?];
             const groups = &self.forest.grooves.groups;
             groups.prefetch_setup(self.prefetch_snapshot.?);
-            const count = @min(results.len, self.group_writes_limit);
+            const count = @min(results.len, self.backfill_rows_max(view));
             for (results[0..count]) |*row| {
                 if (row.flags.deleted) continue;
                 if (!views.row_matches(&view.definition, &row.value)) continue;
@@ -1570,7 +2460,11 @@ pub fn StateMachineType(comptime Storage: type) type {
             message_body_used: []align(constants.cache_line_size) const u8,
             output_buffer: *align(constants.cache_line_size) [constants.message_body_size_max]u8,
         ) usize {
-            defer self.view_groups_count = null;
+            defer {
+                self.view_groups_count = null;
+                self.view_version = null;
+                self.group_versions_done = 0;
+            }
             const query = view_query(message_body_used);
             const limit = view_query_limit(query) orelse {
                 assert(self.view_groups_count == null);
@@ -1591,16 +2485,42 @@ pub fn StateMachineType(comptime Storage: type) type {
 
             const view = &self.views_op[view_id - 1];
             assert(view.id == view_id);
-            header.state = view.state;
             header.declared_op = view.declared_op;
-            header.group_count = view.group_count;
-            header.hash = view.hash;
+            const as_of = query.as_of != 0;
+            if (as_of) {
+                // As the op `as_of` left it (N62); missing if it was declared later.
+                const version = self.view_version orelse {
+                    header.state = .missing;
+                    return @sizeOf(ViewRecord);
+                };
+                assert(version.op <= view_query_as_of(query, op));
+                header.state = version.state;
+                header.group_count = version.group_count;
+                header.hash = version.hash;
+            } else {
+                header.state = view.state;
+                header.group_count = view.group_count;
+                header.hash = view.hash;
+            }
 
             const scanned = self.view_groups[0..self.view_groups_count.?];
             assert(scanned.len <= limit + 1);
+            if (as_of) assert(self.group_versions_done == @min(scanned.len, limit));
             var count: usize = 0;
-            for (scanned[0..@min(scanned.len, limit)]) |*group| {
-                assert(group.key >> 64 == view.id);
+            for (scanned[0..@min(scanned.len, limit)], 0..) |*group_now, index| {
+                assert(group_now.key >> 64 == view.id);
+                const group: Group = if (as_of) group: {
+                    // Not yet created at `as_of`.
+                    const version = self.group_versions[index] orelse continue;
+                    assert(version.key == group_now.key);
+                    break :group .{
+                        .key = version.key,
+                        .timestamp = group_now.timestamp,
+                        .count = version.count,
+                        .group_key = version.group_key,
+                        .sums = version.sums,
+                    };
+                } else group_now.*;
                 // Empty groups are kept (their history stays readable), but not listed.
                 if (group.count == 0) continue;
                 const record = &records[1 + count];
@@ -1634,8 +2554,12 @@ pub fn StateMachineType(comptime Storage: type) type {
             const result: *DeclareResult = @alignCast(
                 std.mem.bytesAsValue(DeclareResult, output_buffer[0..@sizeOf(DeclareResult)]),
             );
+            self.versions_begin(.declare_view, timestamp - self.prepare_delta(.declare_view, &.{}));
             result.* = self.view_declare(op, timestamp, definition);
-            self.views_store();
+            if (result.status == .created) {
+                self.view_version_insert(&self.views_op[result.view_id - 1], op);
+            }
+            self.views_store(op);
             return @sizeOf(DeclareResult);
         }
 
@@ -1650,6 +2574,7 @@ pub fn StateMachineType(comptime Storage: type) type {
             }
             const name = views.definition_name(definition);
             var table_views: u32 = 0;
+            var table_extremes: u32 = views.extreme_count(definition);
             for (self.views_op[0..self.views_op_count]) |*view| {
                 if (std.mem.eql(u8, views.definition_name(&view.definition), name)) {
                     if (stdx.equal_bytes(ViewDefinition, &view.definition, definition)) {
@@ -1657,13 +2582,19 @@ pub fn StateMachineType(comptime Storage: type) type {
                     }
                     return .{ .status = .different, .view_id = 0, .op = 0 };
                 }
-                if (view.definition.table == definition.table) table_views += 1;
+                if (view.definition.table == definition.table) {
+                    table_views += 1;
+                    table_extremes += views.extreme_count(&view.definition);
+                }
             }
             if (self.views_op_count == nerva.views_max) {
                 return .{ .status = .views_full, .view_id = 0, .op = 0 };
             }
             if (table_views == nerva.views_per_table_max) {
                 return .{ .status = .table_views_full, .view_id = 0, .op = 0 };
+            }
+            if (table_extremes > nerva.view_extremes_per_table_max) {
+                return .{ .status = .table_extremes_full, .view_id = 0, .op = 0 };
             }
 
             const index = self.views_op_count;
@@ -1686,8 +2617,17 @@ pub fn StateMachineType(comptime Storage: type) type {
             return .{ .status = .created, .view_id = view.id, .op = op };
         }
 
+        /// The rows one pulse adds to `view`: each may write a group and a member in each of the
+        /// view's `min` and `max` slots, within the op's limits for both.
+        fn backfill_rows_max(self: *const StateMachine, view: *const View) u32 {
+            const extremes = @max(1, views.extreme_count(&view.definition));
+            const rows = @min(self.group_writes_limit, @divFloor(self.member_writes_limit, extremes));
+            assert(rows > 0);
+            return rows;
+        }
+
         /// Adds the rows the pulse scanned to the building view's groups. Replies nothing.
-        fn execute_pulse(self: *StateMachine, timestamp: u64) usize {
+        fn execute_pulse(self: *StateMachine, op: u64, timestamp: u64) usize {
             defer {
                 self.backfill_view = null;
                 self.backfill_count = null;
@@ -1699,25 +2639,34 @@ pub fn StateMachineType(comptime Storage: type) type {
             const view = &self.views_op[index];
             assert(view.state == .building);
             const scanned = self.backfill_rows[0..self.backfill_count.?];
-            const count = @min(scanned.len, self.group_writes_limit);
-            const timestamp_base = timestamp - self.group_writes_limit;
+            const count = @min(scanned.len, self.backfill_rows_max(view));
+            // Each row takes an entry's block of timestamps (`entry_timestamps`).
+            const timestamp_base = timestamp - self.prepare_delta(.pulse, &.{});
+            self.versions_begin(.pulse, timestamp_base);
             for (scanned[0..count], 0..) |*row, k| {
                 const id: u64 = @truncate(row.key);
                 assert(row.key >> 64 == view.definition.table);
                 assert(id >= view.backfill_cursor);
                 if (row.flags.deleted) continue;
-                if (!views.row_matches(&view.definition, &row.value)) continue;
-                self.group_change(view, &row.value, .add, timestamp_base + k + 1);
+                const block = timestamp_base + k * entry_timestamps;
+                self.view_row_changed(
+                    view,
+                    id,
+                    null,
+                    &row.value,
+                    block + 1,
+                    block + 1 + nerva.views_per_table_max,
+                );
             }
-            self.groups_store();
+            self.views_finish_groups(op);
             if (view.state == .building) {
-                if (scanned.len > self.group_writes_limit) {
-                    view.backfill_cursor = @truncate(scanned[self.group_writes_limit].key);
+                if (scanned.len > count) {
+                    view.backfill_cursor = @truncate(scanned[count].key);
                 } else {
                     view.state = .ready;
                 }
             }
-            self.views_store();
+            self.views_finish_views(op);
             return 0;
         }
 
