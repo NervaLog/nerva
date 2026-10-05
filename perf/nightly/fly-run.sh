@@ -14,12 +14,13 @@ memory=${FLY_MEMORY_MB:-16384}; volume_gb=${FLY_VOLUME_GB:-50}; fly=${FLY:-flyct
 here=$(cd "$(dirname "$0")" && pwd)
 run_id="nightly-$(date -u +%Y%m%d%H%M%S)"
 volume_name="perf_$(date -u +%Y%m%d%H%M%S)"
-mid=""; vol=""
+mid=""; vol=""; image=""
 
 cleanup() {
   set +e
   [ -n "$mid" ] && $fly machine destroy "$mid" -a "$app" --force
   [ -n "$vol" ] && $fly volumes destroy "$vol" -a "$app" --yes
+  [ -n "$image" ] && docker rmi "$image" >/dev/null
   echo "cleanup done for $run_id"
 }
 trap cleanup EXIT
@@ -51,7 +52,18 @@ vol=$($fly volumes create "$volume_name" -a "$app" -r "$region" -s "$volume_gb" 
   python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
 echo "volume $vol"
 cd "$context"
-mid=$($fly machine run . -a "$app" -r "$region" --vm-size "$size" --vm-memory "$memory" \
+# `machine run .` builds with a local Docker when there is one, and on the CI runners that build
+# has no DNS; so build here on the host network and push to the app's registry. Without a local
+# Docker, `machine run .` uses Fly's remote builder.
+source="."
+if command -v docker >/dev/null && docker info >/dev/null 2>&1; then
+  image="registry.fly.io/$app:$run_id"
+  $fly auth docker
+  docker build --network host -t "$image" .
+  docker push "$image"
+  source=$image
+fi
+mid=$($fly machine run "$source" -a "$app" -r "$region" --vm-size "$size" --vm-memory "$memory" \
   -v "$vol:/data" --name "$run_id" --metadata nerva_perf_run="$run_id" --restart no \
   --autostop=off --detach \
   -e PERF_ROUNDS="${PERF_ROUNDS:-3}" -e PERF_SECONDS="${PERF_SECONDS:-20}" \

@@ -567,3 +567,9 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
 - Verified locally: with room it changes nothing; with the threshold forced above the free space
   it removes the build cache and the older toolchain, keeps the pinned one, and warns.
 
+## 2026-10-05 — Nightly: build the image on the host network
+
+- The first nightly run failed building its image: `fly machine run .` used the runner's local
+  Docker, whose build containers cannot resolve DNS. `perf/nightly/fly-run.sh` now builds with
+  `docker build --network host`, pushes to `registry.fly.io/nerva-perf`, and runs that image;
+  without a local Docker it still uses Fly's remote builder.
