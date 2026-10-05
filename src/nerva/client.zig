@@ -241,6 +241,42 @@ pub const Client = struct {
         return reply[0];
     }
 
+    /// Declares a ledger: a set of conserved fields that only pairs of adds change (N75).
+    pub fn declare_ledger(
+        client: *Client,
+        definition: *const nerva.LedgerDefinition,
+    ) Error!nerva.DeclareLedgerResult {
+        try client.ensure_idle();
+        const body = std.mem.asBytes(definition);
+        stdx.copy_disjoint(.exact, u8, client.request[0..body.len], body);
+        client.send(.declare_ledger, client.request[0..body.len]);
+        try client.run_until_reply();
+        const reply = stdx.bytes_as_slice(
+            .exact,
+            nerva.DeclareLedgerResult,
+            client.reply[0..client.reply_size.?],
+        );
+        assert(reply.len == 1);
+        return reply[0];
+    }
+
+    /// A ledger's declaration and the op it was declared at; all zero if `id` is not declared.
+    pub fn get_ledger(client: *Client, id: u32) Error!nerva.Ledger {
+        try client.ensure_idle();
+        const query: nerva.LedgerQuery = .{ .id = id };
+        const body = std.mem.asBytes(&query);
+        stdx.copy_disjoint(.exact, u8, client.request[0..body.len], body);
+        client.send(.get_ledger, client.request[0..body.len]);
+        try client.run_until_reply();
+        const reply = stdx.bytes_as_slice(
+            .exact,
+            nerva.Ledger,
+            client.reply[0..client.reply_size.?],
+        );
+        assert(reply.len == 1);
+        return reply[0];
+    }
+
     /// A view's latest state (the header record) and a page of its groups (N52). `records.len`
     /// must hold `query.limit` groups plus the header. Returns the number of records written
     /// (zero if the query is invalid).

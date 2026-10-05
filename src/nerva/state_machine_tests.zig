@@ -274,6 +274,21 @@ const Context = struct {
         return results[0][0];
     }
 
+    fn declare_ledger(
+        context: *Context,
+        definition: nerva.LedgerDefinition,
+    ) !nerva.DeclareLedgerResult {
+        const results = try context.execute(.declare_ledger, &.{&.{definition}});
+        assert(results[0].len == 1);
+        return results[0][0];
+    }
+
+    fn get_ledger(context: *Context, id: u32) !nerva.Ledger {
+        const results = try context.execute(.get_ledger, &.{&.{.{ .id = id }}});
+        assert(results[0].len == 1);
+        return results[0][0];
+    }
+
     /// The header, then the page's groups.
     fn view(context: *Context, query: nerva.ViewQuery) ![]const nerva.ViewRecord {
         const results = try context.execute(.get_view, &.{&.{query}});
@@ -857,6 +872,525 @@ test "add: absent rows, mixed writes and invalid references are refused" {
     try testing.expectEqual(@as(u64, 1), field(try context.lookup(1, 2), 0));
 }
 
+// ---- Ledgers: conserved fields (N75) ----
+
+/// Accounts in table 7 (`available` at 0 and `held` at 8, both floored at 0), and a source in
+/// table 9 (`balance` at 0, no floor): ledger 1.
+const accounts = 7;
+const sources = 9;
+
+fn conserved(table: u32, offset: u8, floor: ?i64) nerva.LedgerField {
+    return .{
+        .table = table,
+        .offset = offset,
+        .flags = .{ .floor = floor != null },
+        .floor = floor orelse 0,
+    };
+}
+
+fn ledger_definition(id: u32, fields: []const nerva.LedgerField) nerva.LedgerDefinition {
+    var definition = std.mem.zeroes(nerva.LedgerDefinition);
+    definition.id = id;
+    definition.field_count = @intCast(fields.len);
+    @memcpy(definition.fields[0..fields.len], fields);
+    return definition;
+}
+
+fn accounts_ledger() nerva.LedgerDefinition {
+    return ledger_definition(1, &.{
+        conserved(accounts, 0, 0),
+        conserved(accounts, 8, 0),
+        conserved(sources, 0, null),
+    });
+}
+
+/// An add to the i64 field at `offset`.
+fn move(table: u32, id: u64, offset: u8, delta: i64, options: struct {
+    min: ?i64 = null,
+    max: ?i64 = null,
+    clamp: bool = false,
+    create: bool = false,
+    delta_from: ?u32 = null,
+    pair: bool = false,
+}) Entry {
+    const parameters: nerva.Add = .{
+        .delta = delta,
+        .min = @bitCast(options.min orelse 0),
+        .max = @bitCast(options.max orelse 0),
+        .delta_from = options.delta_from orelse 0,
+        .offset = offset,
+        .field = .i64,
+        .flags = .{
+            .min = options.min != null,
+            .max = options.max != null,
+            .clamp = options.clamp,
+            .create = options.create,
+            .delta_from = options.delta_from != null,
+            .pair = options.pair,
+        },
+    };
+    return .{ .id = id, .table = table, .kind = .add, .op_seen = 0, .value = parameters.value() };
+}
+
+/// The partner of the pair whose first half is at `first`.
+fn partner(table: u32, id: u64, offset: u8, first: u32) Entry {
+    return move(table, id, offset, 0, .{ .delta_from = first, .create = true });
+}
+
+fn signed(row: RowValue, offset: u8) i64 {
+    return std.mem.readInt(i64, row.value[offset..][0..8], .little);
+}
+
+/// Declares the accounts ledger and funds account 1 with `amount` from source 1.
+fn ledger_funded(context: *Context, amount: i64) !void {
+    const declared = try context.declare_ledger(accounts_ledger());
+    try testing.expectEqual(nerva.DeclareLedgerStatus.created, declared.status);
+    const funded = try context.commit(&.{&.{
+        move(sources, 1, 0, -amount, .{ .pair = true, .create = true }),
+        partner(accounts, 1, 0, 0),
+    }});
+    try expect_statuses(funded[0], &.{ .ok, .ok });
+}
+
+/// The ledger's total over the rows the tests use: it must never change.
+fn ledger_total(context: *Context) !i64 {
+    var total: i64 = 0;
+    for (1..4) |id| {
+        const account = try context.lookup(accounts, id);
+        total += signed(account, 0) + signed(account, 8);
+        total += signed(try context.lookup(sources, id), 0);
+    }
+    return total;
+}
+
+test "ledger: a pair moves one amount between conserved fields, and the total stays" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const context = try context_init(&arena);
+    try ledger_funded(context, 50);
+    try testing.expectEqual(0, try ledger_total(context));
+
+    // available -5 -> held, in one row.
+    const reserved = try context.commit(&.{&.{
+        move(accounts, 1, 0, -5, .{ .pair = true }),
+        partner(accounts, 1, 8, 0),
+    }});
+    try expect_statuses(reserved[0], &.{ .ok, .ok });
+    try testing.expectEqual(5, reserved[0][1].applied);
+    const account = try context.lookup(accounts, 1);
+    try testing.expectEqual(45, signed(account, 0));
+    try testing.expectEqual(5, signed(account, 8));
+    // A field without a floor goes negative: the source the funds came from.
+    try testing.expectEqual(-50, signed(try context.lookup(sources, 1), 0));
+    try testing.expectEqual(0, try ledger_total(context));
+
+    // Several pairs in one transaction, and on one row, stack.
+    const posted = try context.commit(&.{&.{
+        move(accounts, 1, 8, -3, .{ .pair = true }),
+        partner(accounts, 2, 0, 0),
+        move(accounts, 1, 8, -2, .{ .pair = true }),
+        partner(accounts, 1, 0, 2),
+    }});
+    try expect_statuses(posted[0], &.{ .ok, .ok, .ok, .ok });
+    try testing.expectEqual(47, signed(try context.lookup(accounts, 1), 0));
+    try testing.expectEqual(3, signed(try context.lookup(accounts, 2), 0));
+    try testing.expectEqual(0, try ledger_total(context));
+
+    // Adds outside the ledger, on its tables or others, need no partner (N42 as before).
+    const other = try context.commit(&.{&.{
+        move(accounts, 1, 16, 9, .{}),
+        add(1, 1, 0, 4, .{ .create = true }),
+    }});
+    try expect_statuses(other[0], &.{ .ok, .ok });
+    try testing.expectEqual(9, signed(try context.lookup(accounts, 1), 16));
+}
+
+test "ledger: conserved adds outside a pair are unpaired, and nothing applies" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const context = try context_init(&arena);
+    try ledger_funded(context, 50);
+    _ = try context.declare_ledger(ledger_definition(2, &.{
+        conserved(accounts, 24, null),
+        conserved(accounts, 32, null),
+    }));
+    const op_before = (try context.lookup(accounts, 1)).op;
+
+    const Case = struct { entries: []const Entry, statuses: []const nerva.EntryStatus };
+    const cases = [_]Case{
+        // A first half without its partner; at the end of the transaction.
+        .{
+            .entries = &.{ move(accounts, 1, 0, -5, .{ .pair = true }), put(1, 1, 3) },
+            .statuses = &.{ .unpaired, .aborted },
+        },
+        .{
+            .entries = &.{ put(1, 1, 3), move(accounts, 1, 0, -5, .{ .pair = true }) },
+            .statuses = &.{ .aborted, .unpaired },
+        },
+        // A conserved add without `pair`, alone or naming a non-conserved add.
+        .{
+            .entries = &.{move(accounts, 1, 0, -5, .{})},
+            .statuses = &.{.unpaired},
+        },
+        .{
+            .entries = &.{ add(1, 1, 0, 5, .{ .create = true }), partner(accounts, 1, 8, 0) },
+            .statuses = &.{ .aborted, .unpaired },
+        },
+        // `pair` on an add outside every ledger.
+        .{
+            .entries = &.{
+                move(accounts, 1, 16, -5, .{ .pair = true }),
+                partner(accounts, 1, 8, 0),
+            },
+            .statuses = &.{ .unpaired, .aborted },
+        },
+        // The next entry does not name the first half, or is not an add.
+        .{
+            .entries = &.{
+                move(accounts, 1, 0, -5, .{ .pair = true }),
+                move(accounts, 1, 8, 5, .{}),
+            },
+            .statuses = &.{ .unpaired, .aborted },
+        },
+        .{
+            .entries = &.{ move(accounts, 1, 0, -5, .{ .pair = true }), put(1, 1, 3) },
+            .statuses = &.{ .unpaired, .aborted },
+        },
+        // A partner in another ledger, outside every ledger, or on the first half's own field.
+        .{
+            .entries = &.{
+                move(accounts, 1, 0, -5, .{ .pair = true }),
+                partner(accounts, 1, 24, 0),
+            },
+            .statuses = &.{ .aborted, .unpaired },
+        },
+        .{
+            .entries = &.{
+                move(accounts, 1, 0, -5, .{ .pair = true }),
+                partner(accounts, 1, 16, 0),
+            },
+            .statuses = &.{ .aborted, .unpaired },
+        },
+        .{
+            .entries = &.{
+                move(accounts, 1, 0, -5, .{ .pair = true }),
+                partner(accounts, 1, 0, 0),
+            },
+            .statuses = &.{ .aborted, .unpaired },
+        },
+        // A partner with bounds, `clamp` or `pair` of its own.
+        .{
+            .entries = &.{
+                move(accounts, 1, 0, -5, .{ .pair = true }),
+                move(accounts, 1, 8, 0, .{ .delta_from = 0, .max = 100 }),
+            },
+            .statuses = &.{ .aborted, .unpaired },
+        },
+        .{
+            .entries = &.{
+                move(accounts, 1, 0, -5, .{ .pair = true }),
+                move(accounts, 1, 8, 0, .{ .delta_from = 0, .clamp = true }),
+            },
+            .statuses = &.{ .aborted, .unpaired },
+        },
+        .{
+            .entries = &.{
+                move(accounts, 1, 0, -5, .{ .pair = true }),
+                move(accounts, 1, 8, 0, .{ .delta_from = 0, .pair = true }),
+                partner(accounts, 2, 0, 1),
+            },
+            .statuses = &.{ .aborted, .unpaired, .aborted },
+        },
+        // A third add naming a first half: conserved, or not.
+        .{
+            .entries = &.{
+                move(accounts, 1, 0, -5, .{ .pair = true }),
+                partner(accounts, 1, 8, 0),
+                partner(accounts, 2, 0, 0),
+            },
+            .statuses = &.{ .aborted, .aborted, .unpaired },
+        },
+        .{
+            .entries = &.{
+                move(accounts, 1, 0, -5, .{ .pair = true }),
+                partner(accounts, 1, 8, 0),
+                move(accounts, 1, 16, 0, .{ .delta_from = 0 }),
+            },
+            .statuses = &.{ .aborted, .aborted, .unpaired },
+        },
+    };
+    for (cases) |case| {
+        const results = try context.commit(&.{case.entries});
+        try expect_statuses(results[0], case.statuses);
+    }
+    // Nothing applied.
+    try testing.expectEqual(op_before, (try context.lookup(accounts, 1)).op);
+    try testing.expect(!(try context.lookup(1, 1)).flags.exists);
+    try testing.expectEqual(0, try ledger_total(context));
+}
+
+test "ledger: floors stop the first half, or clamp it; a partner never clamps" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const context = try context_init(&arena);
+    try ledger_funded(context, 7);
+
+    // Floor 0, no `min`, no clamp: out_of_bounds, with the current value.
+    const refused = try context.commit(&.{&.{
+        move(accounts, 1, 0, -10, .{ .pair = true }),
+        partner(accounts, 1, 8, 0),
+    }});
+    try expect_statuses(refused[0], &.{ .out_of_bounds, .aborted });
+    try testing.expectEqual(7, refused[0][0].value);
+
+    // An entry's own `min` below the floor does not lower it.
+    const below = try context.commit(&.{&.{
+        move(accounts, 1, 0, -10, .{ .pair = true, .min = -100 }),
+        partner(accounts, 1, 8, 0),
+    }});
+    try expect_statuses(below[0], &.{ .out_of_bounds, .aborted });
+
+    // With clamp: "reserve up to 10" takes the 7 there is, and the partner gains exactly 7.
+    const clamped = try context.commit(&.{&.{
+        move(accounts, 1, 0, -10, .{ .pair = true, .clamp = true }),
+        partner(accounts, 1, 8, 0),
+    }});
+    try expect_statuses(clamped[0], &.{ .ok, .ok });
+    try testing.expectEqual(-7, clamped[0][0].applied);
+    try testing.expectEqual(7, clamped[0][1].applied);
+
+    // An entry's own `min` above the floor binds first.
+    const bounded = try context.commit(&.{&.{
+        move(accounts, 1, 8, -10, .{ .pair = true, .clamp = true, .min = 4 }),
+        partner(accounts, 1, 0, 0),
+    }});
+    try expect_statuses(bounded[0], &.{ .ok, .ok });
+    try testing.expectEqual(-3, bounded[0][0].applied);
+
+    // The partner stopped by its own floor fails the whole transaction: here it would take
+    // 5 from an `available` of 3.
+    const stopped = try context.commit(&.{&.{
+        move(accounts, 1, 8, 5, .{ .pair = true }),
+        partner(accounts, 1, 0, 0),
+    }});
+    try expect_statuses(stopped[0], &.{ .aborted, .out_of_bounds });
+    try testing.expectEqual(3, stopped[0][1].value);
+    // Or by the i64 range.
+    const overflow = try context.commit(&.{&.{
+        move(sources, 2, 0, std.math.minInt(i64) + 1, .{ .pair = true, .create = true }),
+        partner(sources, 3, 0, 0),
+        move(sources, 4, 0, -10, .{ .pair = true, .create = true }),
+        partner(sources, 3, 0, 2),
+    }});
+    try expect_statuses(overflow[0], &.{ .aborted, .aborted, .aborted, .out_of_bounds });
+
+    const account = try context.lookup(accounts, 1);
+    try testing.expectEqual(3, signed(account, 0));
+    try testing.expectEqual(4, signed(account, 8));
+    try testing.expectEqual(0, try ledger_total(context));
+}
+
+test "ledger: a field below its floor moves back up, never further down" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const context = try context_init(&arena);
+
+    // Rows written before the ledger: account 1's `available` is -4.
+    _ = try context.commit(&.{&.{move(accounts, 1, 0, -4, .{ .create = true })}});
+    _ = try context.declare_ledger(accounts_ledger());
+
+    const down = try context.commit(&.{&.{
+        move(accounts, 1, 0, -1, .{ .pair = true, .clamp = true }),
+        partner(accounts, 1, 8, 0),
+    }});
+    try expect_statuses(down[0], &.{ .ok, .ok });
+    try testing.expectEqual(0, down[0][0].applied);
+
+    const up = try context.commit(&.{&.{
+        move(sources, 1, 0, -6, .{ .pair = true, .create = true }),
+        partner(accounts, 1, 0, 0),
+    }});
+    try expect_statuses(up[0], &.{ .ok, .ok });
+    try testing.expectEqual(2, signed(try context.lookup(accounts, 1), 0));
+}
+
+test "ledger: puts, deletes and overlapping adds cannot change conserved fields" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const context = try context_init(&arena);
+    try ledger_funded(context, 50);
+
+    var account = try context.lookup(accounts, 1);
+    // A put that changes a conserved field, or creates a row with one not zero.
+    var changed = put(accounts, 1, 0);
+    changed.value = account.value;
+    changed.value[3] ^= 1;
+    try expect_statuses((try context.commit(&.{&.{changed}}))[0], &.{.conserved_write});
+    try expect_statuses(
+        (try context.commit(&.{&.{ put(5, 1, 1), put(accounts, 2, 1) }}))[0],
+        &.{ .aborted, .conserved_write },
+    );
+    // One that changes only other fields of the row commits; so does one creating a row whose
+    // conserved fields are zero.
+    var other = put(accounts, 1, 0);
+    other.value = account.value;
+    other.value[16] = 0xaa;
+    var created = put(accounts, 2, 0);
+    @memset(created.value[16..], 0xbb);
+    try expect_statuses((try context.commit(&.{&.{ other, created }}))[0], &.{ .ok, .ok });
+    account = try context.lookup(accounts, 1);
+    try testing.expectEqual(50, signed(account, 0));
+    try testing.expectEqual(0xaa, account.value[16]);
+
+    // A delete of a row holding a balance; then one whose conserved fields are all zero, and
+    // one of a row that does not exist.
+    try expect_statuses((try context.commit(&.{&.{delete(accounts, 1)}}))[0], &.{.conserved_write});
+    try expect_statuses(
+        (try context.commit(&.{&.{ delete(accounts, 2), delete(accounts, 3) }}))[0],
+        &.{ .ok, .ok },
+    );
+    try testing.expect(!(try context.lookup(accounts, 2)).flags.exists);
+
+    // An add straddling `available@0` and `held@8`, or matching a field as a u64.
+    try expect_statuses(
+        (try context.commit(&.{&.{move(accounts, 1, 4, 1, .{})}}))[0],
+        &.{.conserved_write},
+    );
+    try expect_statuses(
+        (try context.commit(&.{&.{add(accounts, 1, 8, 1, .{})}}))[0],
+        &.{.conserved_write},
+    );
+    try expect_statuses(
+        (try context.commit(&.{&.{
+            move(accounts, 1, 0, -1, .{ .pair = true }),
+            add(accounts, 1, 8, 0, .{ .delta_from = 0 }),
+        }}))[0],
+        &.{ .aborted, .conserved_write },
+    );
+    try testing.expectEqual(0, try ledger_total(context));
+}
+
+test "ledger: declarations are immutable, one ledger per field, and survive a reload" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const context = try context_init(&arena);
+
+    const created = try context.declare_ledger(accounts_ledger());
+    try testing.expectEqual(nerva.DeclareLedgerStatus.created, created.status);
+    // Again, identically: a no-op that names the op it was declared at.
+    const again = try context.declare_ledger(accounts_ledger());
+    try testing.expectEqual(nerva.DeclareLedgerStatus.exists, again.status);
+    try testing.expectEqual(created.op, again.op);
+
+    var different = accounts_ledger();
+    different.fields[2].flags.floor = true;
+    try testing.expectEqual(
+        nerva.DeclareLedgerStatus.ledger_immutable,
+        (try context.declare_ledger(different)).status,
+    );
+    const taken = try context.declare_ledger(
+        ledger_definition(2, &.{ conserved(accounts, 8, null), conserved(accounts, 16, null) }),
+    );
+    try testing.expectEqual(nerva.DeclareLedgerStatus.ledger_field_taken, taken.status);
+    try testing.expectEqual(nerva.DeclareLedgerStatus.invalid, (try context.declare_ledger(
+        ledger_definition(2, &.{conserved(accounts, 16, null)}),
+    )).status);
+    try testing.expectEqual(nerva.DeclareLedgerStatus.table_invalid, (try context.declare_ledger(
+        ledger_definition(2, &.{ conserved(1, 0, null), conserved(0xFFFF_0001, 0, null) }),
+    )).status);
+
+    const stored = try context.get_ledger(1);
+    try testing.expectEqual(1, stored.slot);
+    try testing.expectEqual(created.op, stored.op);
+    const definition = accounts_ledger();
+    try testing.expect(stdx.equal_bytes(nerva.LedgerDefinition, &stored.definition, &definition));
+    try testing.expect(stdx.zeroed(std.mem.asBytes(&try context.get_ledger(2))));
+
+    // Writes on every kind of table id, the reserved ones included, leave the declaration.
+    _ = try context.commit(&.{
+        &.{ put(1, 1, 1), delete(1, 1) },
+        &.{ put(0xFFFF_0001, 1, 1), delete(0xFFFF_0001, 1) },
+        &.{ put(0xFFFF_FFFF, 1, 1), delete(0xFFFF_FFFF, 1) },
+    });
+    // What a reset (state sync) forgets: the state machine finds the ledger again.
+    context.state_machine.ledger_count = null;
+    context.state_machine.ledger_index = .{};
+    try testing.expectEqual(created.op, (try context.get_ledger(1)).op);
+    try testing.expectEqual(1, context.state_machine.ledger_index.ledger_count);
+    try expect_statuses(
+        (try context.commit(&.{&.{move(accounts, 1, 0, 5, .{ .create = true })}}))[0],
+        &.{.unpaired},
+    );
+
+    // Up to `ledgers_max`, each over its own table.
+    for (2..nerva.ledgers_max + 1) |id| {
+        const table: u32 = @intCast(100 + id);
+        const result = try context.declare_ledger(ledger_definition(
+            @intCast(id),
+            &.{ conserved(table, 0, null), conserved(table, 8, null) },
+        ));
+        try testing.expectEqual(nerva.DeclareLedgerStatus.created, result.status);
+    }
+    try testing.expectEqual(nerva.DeclareLedgerStatus.ledgers_full, (try context.declare_ledger(
+        ledger_definition(1000, &.{ conserved(1, 0, null), conserved(1, 8, null) }),
+    )).status);
+    try testing.expectEqual(created.op, (try context.get_ledger(1)).op);
+    try testing.expectEqual(nerva.ledgers_max, (try context.get_ledger(nerva.ledgers_max)).slot);
+}
+
+test "ledger: views cannot filter or group by a conserved field, in either order" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const context = try context_init(&arena);
+
+    // The revenue view (table 5) groups by `section@0` (1 byte) and filters on `sold@16`; it
+    // sums `price@8`.
+    const revenue = try context.declare(revenue_view("revenue"));
+    try testing.expectEqual(nerva.DeclareStatus.created, revenue.status);
+    try testing.expectEqual(nerva.DeclareLedgerStatus.field_viewed, (try context.declare_ledger(
+        ledger_definition(1, &.{ conserved(5, 0, null), conserved(sources, 0, null) }),
+    )).status);
+    try testing.expectEqual(nerva.DeclareLedgerStatus.field_viewed, (try context.declare_ledger(
+        ledger_definition(1, &.{ conserved(5, 16, null), conserved(sources, 0, null) }),
+    )).status);
+    // Summing a conserved field is what views are for.
+    try testing.expectEqual(nerva.DeclareLedgerStatus.created, (try context.declare_ledger(
+        ledger_definition(1, &.{ conserved(5, 8, null), conserved(sources, 0, null) }),
+    )).status);
+
+    // The other order: a ledger on table 6, then views over it.
+    try testing.expectEqual(nerva.DeclareLedgerStatus.created, (try context.declare_ledger(
+        ledger_definition(2, &.{ conserved(6, 0, null), conserved(6, 16, null) }),
+    )).status);
+    var grouped = revenue_view("grouped");
+    grouped.table = 6;
+    const grouped_result = try context.declare(grouped);
+    try testing.expectEqual(nerva.DeclareStatus.ledger_field, grouped_result.status);
+    var filtered = revenue_view("filtered");
+    filtered.table = 6;
+    filtered.group_by[0] = .{ .offset = 24, .size = 1, .kind = .unsigned };
+    const filtered_result = try context.declare(filtered);
+    try testing.expectEqual(nerva.DeclareStatus.ledger_field, filtered_result.status);
+    var summed = revenue_view("summed");
+    summed.table = 6;
+    summed.where_count = 0;
+    summed.where[0] = std.mem.zeroes(nerva.Where);
+    summed.group_by_count = 0;
+    summed.group_by[0] = std.mem.zeroes(nerva.FieldRef);
+    summed.aggregates[1].field = .{ .offset = 16, .size = 8, .kind = .signed };
+    try testing.expectEqual(nerva.DeclareStatus.created, (try context.declare(summed)).status);
+
+    // The sum view follows pairs exactly.
+    _ = try context.commit(&.{&.{
+        move(6, 1, 0, -40, .{ .pair = true, .create = true }),
+        partner(6, 2, 16, 0),
+    }});
+    _ = context.pulse_until_ready();
+    const records = try context.view(.{ .view_id = 2, .group_hash_min = 0, .limit = 10 });
+    try testing.expectEqual(2, records.len);
+    try testing.expectEqual(40, std.mem.readInt(i128, &records[1].sums[1], .little));
+}
+
 // ---- Views maintained in the state machine (N52) ----
 
 const views = @import("views.zig");
@@ -1226,6 +1760,52 @@ test "format: what a fixed script commits" {
         });
         try checksum_input.appendSlice(std.mem.asBytes(&change));
     }
+    // A ledger over table 2 (N75), a pair with a floor that clamps it, and a refused put.
+    const declared = try context.declare_ledger(ledger_definition(1, &.{
+        conserved(2, 0, 0),
+        conserved(2, 8, null),
+    }));
+    try writer.print("declare_ledger: {s} op={}\n", .{ @tagName(declared.status), declared.op });
+    try checksum_input.appendSlice(std.mem.asBytes(&declared));
+    const ledger_requests = [_][]const []const Entry{
+        &.{&.{ move(2, 1, 8, -30, .{ .pair = true, .create = true }), partner(2, 1, 0, 0) }},
+        &.{
+            &.{ move(2, 1, 0, -50, .{ .pair = true, .clamp = true }), partner(2, 2, 8, 0) },
+            &.{put(2, 1, 0xE1)},
+        },
+    };
+    for (ledger_requests, 0..) |request, request_index| {
+        const results = try context.commit(request);
+        for (results, 0..) |transaction, transaction_index| {
+            for (transaction) |result| {
+                try writer.print("ledger commit {}.{}: {s} op={} applied={} value={}\n", .{
+                    request_index,
+                    transaction_index,
+                    @tagName(result.status),
+                    result.op,
+                    result.applied,
+                    result.value,
+                });
+                try checksum_input.appendSlice(std.mem.asBytes(&result));
+            }
+        }
+    }
+    for (1..3) |id| {
+        const row = try context.lookup(2, id);
+        try writer.print("row 2/{}: op={} value[0..16]={}\n", .{
+            id,
+            row.op,
+            std.fmt.fmtSliceHexLower(row.value[0..16]),
+        });
+        try checksum_input.appendSlice(std.mem.asBytes(&row));
+    }
+    const stored = try context.get_ledger(1);
+    try writer.print("ledger 1: slot={} op={} timestamp={}\n", .{
+        stored.slot,
+        stored.op,
+        stored.timestamp,
+    });
+    try checksum_input.appendSlice(std.mem.asBytes(&stored));
     try writer.print("checksum: {x:0>32}\n", .{vsr.checksum(checksum_input.items)});
 
     const snap = stdx.Snap.snap_fn("src");
@@ -1260,7 +1840,16 @@ test "format: what a fixed script commits" {
         \\history 1/2: delete op=2 timestamp=193
         \\history 1/2: put op=1 timestamp=88
         \\history 1/2: end op=10 timestamp=0
-        \\checksum: d34675c73c5d0555e0d2e0fda1cbc312
+        \\declare_ledger: created op=11
+        \\ledger commit 0.0: ok op=12 applied=-30 value=18446744073709551586
+        \\ledger commit 0.0: ok op=12 applied=30 value=30
+        \\ledger commit 1.0: ok op=13 applied=-30 value=0
+        \\ledger commit 1.0: ok op=13 applied=30 value=30
+        \\ledger commit 1.1: conserved_write op=0 applied=0 value=0
+        \\row 2/1: op=13 value[0..16]=0000000000000000e2ffffffffffffff
+        \\row 2/2: op=13 value[0..16]=00000000000000001e00000000000000
+        \\ledger 1: slot=1 op=11 timestamp=427
+        \\checksum: 143ac07b47dc8c858b8723796b4011a9
         \\
     ).diff(summary.items);
 }

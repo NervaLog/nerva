@@ -693,3 +693,27 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
 - README's CI paragraph and DECISIONS N74.
 - Verified locally: the ReleaseSafe VOPR build (2m03), seeds 1, 2 and 5 pass (8 s, 1 s, 3 s),
   `fuzz_loop.sh vopr nerva 2` ran 25 seeds without a failure; the workflow parses as YAML.
+
+## 2026-10-05 — Declared ledgers: conserved fields, floors, paired adds (N75)
+
+- `src/nerva.zig`: `LedgerField`, `LedgerDefinition`, `DeclareLedgerStatus`,
+  `DeclareLedgerResult`, `LedgerQuery`, `Ledger`; operations `declare_ledger` and `get_ledger`;
+  `AddFlags.pair`; `EntryStatus.unpaired = 16`, `conserved_write = 17`;
+  `DeclareStatus.ledger_field`; tree ids 16 and 17; `ledger_bounds`.
+- `src/nerva/ledgers.zig`: `definition_validate`, and `Index`, the conserved fields sorted for
+  bisection.
+- `src/nerva/state_machine.zig`: the `ledgers` groove, prefetched and loaded every op that needs
+  it; `declare_ledger` and `get_ledger`; in `commit_failure`, overlapping adds and the pair
+  rules; in `adds_resolve`, floors and conserved puts and deletes; views refused over conserved
+  fields.
+- `src/nerva/client.zig`: `declare_ledger`, `get_ledger`. `src/nerva/api/api.zig`:
+  `PUT`/`GET /v1/ledgers/<id>`, `"pair"` on adds, 409 `unpaired` and `conserved_write`;
+  `PUT /v1/views` declares into the state machine before writing the catalog.
+- Tests: `state_machine_tests.zig` (pairs, refusals, floors, declarations, views, reload);
+  `workload.zig` (ledger traffic, the model's rules, `check_ledger`); `adds_fuzz.zig` (floors,
+  partners, conservation); `tests/api/ledgers.py`, in `test:api`; format guards.
+- Docs: README "Ledgers" and routes; DECISIONS N75; GOALS G8 decided and the non-goal's note;
+  CHANGELOG v0.4.0.
+- Verified: `check`, `test:fmt`, `test:unit` (the sandbox-denied perf test aside), `test:api`,
+  `test:views`, `test:integration`, `test:release`, `fuzz -- smoke`, VOPR seeds; four planted
+  bugs, each caught.
