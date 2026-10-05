@@ -148,9 +148,12 @@ pub const EntryStatus = enum(u32) {
     /// An add to a field that a view on its table filters or groups by (N52): adds must not
     /// move a row between a view's groups.
     view_key_field = 13,
-    /// This op's budget of view group writes (`StateMachine.groups_per_op_max`) is spent:
-    /// nothing applied, retry in a later op (N52).
+    /// This op's budget of view group writes (`StateMachine.groups_per_op_max`) is spent by
+    /// other transactions of the same request: nothing applied, retry in a later op (N52).
     views_busy = 14,
+    /// The transaction alone touches more view groups (or `min`/`max` members) than one op
+    /// allows: nothing applied, and no retry can succeed; split it (#32).
+    views_too_large = 15,
 };
 
 /// The `commit` result, one per entry.

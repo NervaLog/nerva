@@ -289,8 +289,9 @@ curl -H 'X-Nerva-Key: secret' 'http://127.0.0.1:8080/v1/views/revenue/groups?as_
   adds to summed fields are what views are for.
 - One op touches at most about 4,000 distinct groups and 8,000 `min` and `max` members (a write
   takes one in each such slot of its table), however many writes it has. A transaction that
-  would take an op past either is refused whole (`503 views_busy`), and can be retried; one that
-  exceeds them on its own never fits, so split it.
+  exceeds them on its own is refused whole (`413 views_too_large`): it never fits, so split it.
+  `503 views_busy` is only for a request that packs several transactions (Nerva's clients send
+  one each), when earlier ones filled the op: nothing applied, retry it.
 - `min` and `max` stay exact when the row holding them is deleted, moved or changed: the state
   machine keeps each group's values in order (N62). A table's views have at most four `min` and
   `max` aggregates between them (a fifth is refused: `"maintained": false`).

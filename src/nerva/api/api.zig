@@ -347,6 +347,11 @@ fn commit(arena: std.mem.Allocator, client: anytype, layouts: anytype, body: []c
                 try out.print("{{\"status\":\"views_busy\",\"index\":{}}}", .{index});
                 return .{ .status = 503, .body = out.items() };
             },
+            // The transaction alone is too large for any op: nothing applied; split it (#32).
+            .views_too_large => {
+                try out.print("{{\"status\":\"views_too_large\",\"index\":{}}}", .{index});
+                return .{ .status = 413, .body = out.items() };
+            },
             // Validated above: the server would be at fault.
             else => std.debug.panic("api: commit rejected entry {}: {s}", .{
                 index,

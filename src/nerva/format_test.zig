@@ -171,6 +171,7 @@ test "format: wire and storage layouts" {
         \\  delta_from_invalid = 12
         \\  view_key_field = 13
         \\  views_busy = 14
+        \\  views_too_large = 15
         \\nerva.Add: extern struct, size 80
         \\  delta: offset 0, size 8, i64
         \\  min: offset 8, size 8, u64
