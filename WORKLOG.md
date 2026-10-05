@@ -502,6 +502,22 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
 - Mutation-tested: the gate off (a commit succeeds without replica 1), unannounced peers
   admitted, and prepares of another release admitted each fail a test.
 
+## 2026-10-05 — Tutorial
+
+- `docs/TUTORIAL.md`: a step-by-step tutorial for people new to Nerva. It covers a
+  one-replica cluster and `nerva api`, rows and versions, transactions (compare-and-set,
+  claims, atomicity, deletes), the change feed, history and as-of reads, layouts, adds,
+  maintained views and `nerva view`, documents, crashes and safe retries, operating a replica,
+  the Zig client, a contributor's tour of the code, and a cheat sheet. Linked from README.md.
+- Written at `eaa7520`, then updated for v0.3.0: releases and upgrades (N60, N61), multi-line
+  bodies (#36 fixed), the gateway's reconnect and `/healthz` (#27), `views_busy` that a retry
+  cannot fix (#32), `--statsd`, `--trace` and `--cache-rows`, `Client.reconnect`,
+  `test:release`.
+- Verified: every command and reply in it comes from one scripted run against a fresh
+  one-replica `--development` cluster at v0.3.0. The crash, outage and reconnect, retry,
+  layout and declaration claims were each checked separately.
+- Found while writing it: #36 (fixed in N58) and #37 (a duplicate of #27, fixed in N58).
+
 ## 2026-10-05 — Views: min, max and as_of in the state machine (N62)
 
 - `src/nerva.zig`: `Member`, `GroupVersion`, `ViewVersion`; `member_key`, `member_order`,
@@ -523,6 +539,9 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
   `ViewQuery.as_of` in v0.3.0's reserved bytes, so its layout is otherwise unchanged. Found and
   filed while checking: #42 (`nerva view` exits on a timeout; the canvas test flakes under
   load) and #48 (an evicted client segfaults).
+- `docs/TUTORIAL.md` matches v0.3.0 and is left so: its maintained views (`count` and `sum`,
+  latest only) and its release notes (`0.0.3`, clients from `0.0.2`) change with the release
+  that ships this.
 - `demo/canvas/server.py`: the reset is two transactions (its per-pixel `canvas` view, now
   maintained, needs 4,096 groups for one).
 - Tests: the state machine tests' harness compacts and checkpoints; a randomized `min`, `max`
