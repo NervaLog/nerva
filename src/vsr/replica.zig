@@ -6,6 +6,7 @@ const SourceLocation = std.builtin.SourceLocation;
 
 const constants = @import("../constants.zig");
 const nerva = @import("../nerva.zig");
+const release_peers = @import("../nerva/release_peers.zig");
 
 const stdx = @import("stdx");
 const RingBufferType = stdx.RingBufferType;
@@ -279,6 +280,18 @@ pub fn ReplicaType(
         release_client_min: vsr.Release,
 
         multiversion: Multiversion,
+
+        /// Nerva: whether to ignore peers that run another release than this replica's (#34).
+        /// Nerva bundles only its own release (N43), so it cannot run a peer's other release, and
+        /// a cluster mixing releases would diverge. Off for TigerBeetle's multiversion upgrade
+        /// tests, where replicas of different releases cooperate.
+        release_peers_strict: bool,
+
+        /// Nerva: each peer's running release, from its latest ping or pong; null until one
+        /// arrives. Only consulted when release_peers_strict.
+        peer_releases: [constants.members_max]?vsr.Release = @splat(null),
+        /// Nerva: whether the message bus held a connection to each peer at the last tick.
+        peer_connected: [constants.members_max]bool = @splat(false),
 
         /// Probability with which the primary unconditionally injects stalls.
         commit_stall_probability: Ratio,
@@ -642,6 +655,7 @@ pub fn ReplicaType(
             release: vsr.Release,
             release_client_min: vsr.Release,
             multiversion: Multiversion,
+            release_peers_strict: bool = false,
             test_context: ?*anyopaque = null,
             timeout_prepare_ticks: ?u64 = null,
             timeout_grid_repair_message_ticks: ?u64 = null,
@@ -733,6 +747,7 @@ pub fn ReplicaType(
                     .release = options.release,
                     .release_client_min = options.release_client_min,
                     .multiversion = options.multiversion,
+                    .release_peers_strict = options.release_peers_strict,
                     .timeout_prepare_ticks = options.timeout_prepare_ticks,
                     .timeout_grid_repair_message_ticks = options.timeout_grid_repair_message_ticks,
                     .commit_stall_probability = options.commit_stall_probability,
@@ -1081,6 +1096,7 @@ pub fn ReplicaType(
             release: vsr.Release,
             release_client_min: vsr.Release,
             multiversion: Multiversion,
+            release_peers_strict: bool,
             timeout_prepare_ticks: ?u64,
             timeout_grid_repair_message_ticks: ?u64,
             commit_stall_probability: ?Ratio,
@@ -1323,6 +1339,7 @@ pub fn ReplicaType(
                 .release = options.release,
                 .release_client_min = options.release_client_min,
                 .multiversion = options.multiversion,
+                .release_peers_strict = options.release_peers_strict,
                 .commit_stall_probability = options.commit_stall_probability orelse
                     stdx.PRNG.ratio(2, 5),
                 .commit_stall_lag_min = commit_stall_lag_min,
@@ -1556,6 +1573,7 @@ pub fn ReplicaType(
             self.clock.tick();
             self.message_bus.tick();
             self.multiversion.tick();
+            if (self.release_peers_strict) self.tick_peer_connections();
 
             const timeouts = .{
                 .{ &self.ping_timeout, on_ping_timeout },
@@ -1763,6 +1781,23 @@ pub fn ReplicaType(
                     message.header.cluster,
                 });
                 return;
+            }
+
+            if (self.release_peers_strict) {
+                if (release_peers.announced(message.header)) |announcement| {
+                    self.on_release_announced(announcement.replica, announcement.release);
+                }
+                if (!release_peers.admits(
+                    self.release,
+                    self.replica,
+                    &self.peer_releases,
+                    message.header,
+                )) {
+                    log.debug("{}: on_message: ignoring (peer release unknown or other)", .{
+                        self.log_prefix(),
+                    });
+                    return;
+                }
             }
 
             switch (self.syncing) {
@@ -3595,7 +3630,46 @@ pub fn ReplicaType(
 
         fn on_ping_timeout(self: *Replica) void {
             self.ping_timeout.reset();
+            self.send_ping(null);
+        }
 
+        /// Nerva: forgets the release of a peer whose connection was lost (it may come back on
+        /// another release), and pings a newly connected peer, so it learns this replica's release
+        /// without waiting for the ping timeout (N61).
+        fn tick_peer_connections(self: *Replica) void {
+            assert(self.release_peers_strict);
+            for (0..self.node_count) |peer_usize| {
+                const peer: u8 = @intCast(peer_usize);
+                if (peer == self.replica) continue;
+                const connected = self.message_bus.replica_connected(peer);
+                if (!connected) self.peer_releases[peer] = null;
+                if (connected and !self.peer_connected[peer]) self.send_ping(peer);
+                self.peer_connected[peer] = connected;
+            }
+        }
+
+        /// Nerva: records the release a peer announced in a ping or pong, and says once when it
+        /// is not this replica's (N61).
+        fn on_release_announced(self: *Replica, peer: u8, release: vsr.Release) void {
+            assert(self.release_peers_strict);
+            if (peer == self.replica or peer >= self.node_count) return;
+            const known = self.peer_releases[peer];
+            if (release.value != self.release.value and
+                (known == null or known.?.value != release.value))
+            {
+                log.err("{}: replica {} runs release {}, this replica runs {}: ignoring it " ++
+                    "(a cluster must run one release)", .{
+                    self.log_prefix(),
+                    peer,
+                    release,
+                    self.release,
+                });
+            }
+            self.peer_releases[peer] = release;
+        }
+
+        /// Sends a ping to one peer, or to every other replica and standby (`peer` null).
+        fn send_ping(self: *Replica, peer: ?u8) void {
             const message = self.message_bus.pool.get_message(.ping);
             defer self.message_bus.unref(message);
 
@@ -3631,7 +3705,12 @@ pub fn ReplicaType(
             message.header.set_checksum();
 
             assert(message.header.view <= self.view);
-            self.send_message_to_other_replicas_and_standbys(message.base());
+            if (peer) |replica| {
+                assert(replica != self.replica);
+                self.send_message_to_replica(replica, message);
+            } else {
+                self.send_message_to_other_replicas_and_standbys(message.base());
+            }
         }
 
         fn on_prepare_timeout(self: *Replica) void {

@@ -11,6 +11,8 @@ const VoprLog = enum { short, full };
 // Nerva has no client releases yet; every build is "the" release.
 const release = "0.0.3";
 const release_client_min = "0.0.2";
+// Only `zig build test:release` builds this release, to run a cluster of two releases (N61).
+const release_test_other = "0.0.200";
 
 const zig_version = std.SemanticVersion{
     .major = 0,
@@ -82,6 +84,10 @@ pub fn build(b: *std.Build) !void {
         .test_integration = b.step("test:integration", "Run integration tests (real processes)"),
         .test_api = b.step("test:api", "Check nerva api against models (python3)"),
         .test_views = b.step("test:views", "Check declared views against a model (python3)"),
+        .test_release = b.step(
+            "test:release",
+            "Check that replicas of two releases do not form one cluster (python3)",
+        ),
         .test_demo = b.step("test:demo", "Run the demos under crashes (python3)"),
         .vopr = b.step("vopr", "Run the VOPR"),
         .vopr_build = b.step("vopr:build", "Build the VOPR"),
@@ -335,6 +341,27 @@ pub fn build(b: *std.Build) !void {
         views_previous = &run_views_test.step;
         steps.test_views.dependOn(&run_views_test.step);
     }
+
+    // zig build test:release: a cluster of two releases (N61). The second `nerva` differs only in
+    // its release string, which no real release uses; it is built for this test, never installed.
+    const vsr_options_other = b.addOptions();
+    vsr_options_other.addOption(?[40]u8, "git_commit", options.git_commit[0..40].*);
+    vsr_options_other.addOption(bool, "config_verify", options.config_verify);
+    vsr_options_other.addOption([]const u8, "release", release_test_other);
+    vsr_options_other.addOption([]const u8, "release_client_min", release_client_min);
+    const nerva_other = nerva_executable(b, .{
+        .stdx_module = stdx_module,
+        .vsr_options = vsr_options_other,
+        .target = target,
+        .mode = mode,
+    });
+    const run_release_test = b.addSystemCommand(&.{ "python3", "tests/release/mixed.py" });
+    run_release_test.addFileArg(nerva.getEmittedBin());
+    run_release_test.addFileArg(nerva_other.getEmittedBin());
+    if (b.args) |args| run_release_test.addArgs(args);
+    run_release_test.setCwd(b.path("."));
+    run_release_test.has_side_effects = true;
+    steps.test_release.dependOn(&run_release_test.step);
 
     // zig build test:demo: the demos under crashes, one after the other (each runs a cluster).
     var demo_previous: ?*std.Build.Step = null;

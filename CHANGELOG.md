@@ -66,6 +66,10 @@ of a 10 ms tick. Through `nerva api` on a local three-replica cluster, lookup p5
   `/healthz` still said `200`. It now reconnects, and `/healthz` answers `503` until the
   cluster is reachable again. (#27, #37)
 - `nerva start --trace=<path>` truncated whatever file it named, a data file included. (#29)
+- A replica of another release could join a cluster: it counted toward quorums while running
+  the log with different code, and panicked with `checkpoint diverged` at the first checkpoint
+  (about 960 ops). Replicas now ignore peers that run another release, and log it:
+  `replica 2 runs release 0.0.2, this replica runs 0.0.3: ignoring it`. (#34)
 - A JSON body with newlines (`curl -d` with a multi-line body, as in the examples above) was
   refused with `400 malformed request` when it arrived in the same read as its head. (#36)
 - `documents.Transaction` (Zig) could read a value stitched from two versions when a rewrite
@@ -79,15 +83,13 @@ of a 10 ms tick. Through `nerva api` on a local three-replica cluster, lookup p5
 - A transaction touching more view groups than one op allows gets `503 views_busy`, and
   retrying will never make it succeed. (#32)
 - Any client can send `pulse`, the cluster's internal backfill operation. (#33)
-- Replicas of different releases are not refused at the wire. One formatted by another release
-  joins the cluster and takes part in quorums until the first checkpoint (about 960 ops), then
-  panics with `checkpoint diverged`. Follow the upgrade steps below exactly. (#34)
 
 ### Upgrading from v0.2.0
 
-- **Stop every replica before starting any v0.3.0 replica.** v0.3.0 replicas apply commits
-  differently (views), so a cluster mixing the two releases diverges. Nothing refuses a mix
-  yet (#34).
+- **Stop every replica, then start them all on v0.3.0.** A cluster cannot run two releases. A
+  v0.3.0 replica ignores v0.2.0 peers, so during a one-at-a-time upgrade it never counts toward
+  their quorums, nor they toward its own. A v0.2.0 replica facing a v0.3.0 majority stops with
+  `panic: attempt to use null value` at the first operation it does not know.
 - **Reformat data files.** Binaries now report `0.0.3+<commit>`. A v0.3.0 replica stops on a
   v0.2.0 data file with `panic: multiversion unsupported`. Format new files and load your data
   again.

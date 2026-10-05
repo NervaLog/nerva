@@ -76,6 +76,9 @@ jobs:
       - name: Declared views (against a model)
         run: ./zig/zig build test:views
 
+      - name: Mixed releases (a second nerva, another release string)
+        run: ./zig/zig build test:release
+
   unit:
     runs-on: [self-hosted, fly]
     timeout-minutes: 60
