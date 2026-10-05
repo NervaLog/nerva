@@ -408,7 +408,32 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
 - Merged after views (N52): the layouts guard covers views' types, operations and tree ids; the
   script guard caught N52's 5 timestamps per entry, and its snapshot was updated for it.
 
-## 2026-10-05 — Faster CI: parallel test jobs, demos split, Zig kept on the volume (N55)
+## 2026-10-05 — Performance Phase 0: round trips, --cache-rows, bench, bench:load (N55)
+
+- `src/nerva/client.zig`: `send` builds request messages and carries the previous round trip, so
+  primaries record `client_request_round_trip`.
+- `nerva start --cache-rows=<size>` (`cli.zig` `cache_rows_resolve`, `state_machine.zig`
+  `cache_entries_rows_multiple`).
+- `zig build bench` (`build.zig`), `Bench.metric` (vendored, UPSTREAM.md),
+  `src/nerva/documents_benchmark.zig`, `src/nerva/view/declared_benchmark.zig`.
+- `zig build bench:load` (`src/bench_load.zig`) and `src/nerva/latency_histogram.zig`.
+- Tests: `cache_rows_resolve` and `LatencyHistogram` unit tests; `test:integration` checks round
+  trips arrive over statsd (every replica now sends) and starts replica 2 with `--cache-rows`.
+  Mutation-tested: sending 0 as the round trip fails it. Every bench:load workload ran locally.
+
+## 2026-10-05 — Nightly performance run (N56)
+
+- `.github/workflows/perf-nightly.yml`: nightly at 06:47 UTC and by hand; builds candidate and
+  baseline, runs them on a Fly Machine, compares, records on `perf-results`, files
+  `perf-regression` issues.
+- `perf/nightly/`: `run.sh` (on the Machine), `Dockerfile`, `fly-run.sh` (create, poll, collect,
+  destroy, sweep), `compare.py` and `test_compare.py` (7 tests).
+- `build.zig`: `bench:build` installs `bench`, `bench-stdx` and `bench-load` without running them.
+- Verified: `test_compare.py`; a local dry run of `run.sh` (two rounds, `--development`); a full
+  trial on Fly (one performance-8x Machine, created and destroyed), which passed and found the
+  Fly volume dominating production-config latency (N56).
+
+## 2026-10-05 — Faster CI: parallel test jobs, demos split, Zig kept on the volume (N57)
 
 - `.github/workflows/ci.yml`: `test` split into `unit` (unit tests) and `system` (typecheck,
   format, integration, API, views); `demo` split into one job per demo, each building with

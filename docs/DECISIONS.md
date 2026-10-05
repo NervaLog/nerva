@@ -630,7 +630,73 @@ Proven by planted changes, each failing exactly its guard: two `HistoryFilter` f
 `EntryStatus.conflict` renumbered, a tree id renumbered (layouts); `row_key`'s halves swapped,
 one character of `layout_render`'s output (derivations); change timestamps shifted (script).
 
-**N55. CI runs its tests as parallel jobs, and keeps the Zig toolchain on the runner's volume.**
+**N55. Phase 0 of performance testing: client round trips, a row cache flag, `zig build bench`
+and a load generator.**
+The rest of what the nightly performance job needs before it can measure anything:
+- **Client round trips.** A primary records `client_request_round_trip` from each request's
+  `previous_request_latency`, which the vendored `vsr.Client.request` always sent as 0.
+  `src/nerva/client.zig` now builds its request messages itself (`send`, with the public
+  `get_message` and `raw_request`), carrying the previous call's round trip in nanoseconds: a
+  replica reads the field as nanoseconds before release 0.17.0, as microseconds after, and a
+  comptime assertion fails if Nerva's release string ever crosses that line. No vendored change.
+  Found on the way: only the primary records round trips (at prepare), while every replica
+  records request timings (at commit); `test:integration` now has every replica send statsd.
+- **`--cache-rows=<size>`** sizes the row object cache, which was fixed at its minimum (one set,
+  a few hundred rows). Bytes are divided by the row size (128) and rounded down to whole sets;
+  less than one set is refused. The default is unchanged: changing it is a measured decision for
+  later.
+- **`zig build bench`** runs every `benchmark:` test in benchmark mode, ReleaseSafe, from a
+  separate test binary (the existing route, `-Drelease test -- "benchmark: …"`, still works).
+  `Bench.metric` (a vendored addition) prints `bench-json:` lines for machines. Nerva's first
+  benchmarks: `documents` (chunk encode with ids, and decode) and `declared views` (latest and
+  as of a middle op). First numbers (ReleaseSafe, this sandbox): a 64 KiB document takes about
+  0.69 ms to encode, nearly all of it the SHA-256 of each of its ~820 chunk ids.
+- **`zig build bench:load`** (`src/bench_load.zig`): one thread and one blocking client per
+  `--clients`, closed or open loop, workloads c1–c5, c3_adds and c7 of the plan, a log-linear
+  `LatencyHistogram` (`src/nerva/latency_histogram.zig`, at most 1/16 relative error), one JSON
+  object out. `--local` starts a three-replica `--development` cluster (at most 6 clients there).
+  Built by `zig build check`, so it cannot rot. Not done: C6 (history of deep rows) and C8 (a
+  replica crash), which belong to the harness that owns the processes.
+- First local readings (4-CPU sandbox, `--development`, 5 s each): adds on four hot rows commit
+  691 a second against 223 for read-modify-write with retries (541 conflicts). Lookups: one or
+  two clients reach about 1,550 a second with p99 1.4–10 ms; four clients fall to 710 a second
+  with p90 20 ms and p99 32 ms, in steps of the replicas' 10 ms tick. Either CPU contention (3
+  replicas and 4 clients on 4 CPUs) or requests waiting on a replica tick: the first thing for
+  the nightly job, on dedicated machines, to settle.
+
+**N56. A nightly A/B performance run on one Fly Machine.**
+`perf-nightly.yml` (06:47 UTC, and by hand) measures `main` against the last night that passed:
+- **Where.** The job runs on Botpike's CI runners (N47) and creates one dedicated Machine for the
+  night (performance-8x, 16 GB, a 50 GB volume) in the `nerva-perf` app, with both builds baked
+  into its image, and destroys it on exit, failure included; each night first sweeps anything
+  older than four hours. One Machine (three replicas and the load on localhost) keeps noise low
+  and the orchestration simple; replicas on separate Machines are a later step (v2).
+- **What.** `perf/nightly/run.sh` runs each build in each of three rounds, in alternating order
+  (A B, B A, A B) so drift over the night falls on both: every `benchmark:` test, then nine
+  `bench:load` workloads (c1, c1 batch 64, c2, c3, c3_adds, c4, c4 batch 64, c5 batch 1024, c7;
+  8 clients, 20 s each) against three replicas in production config. One JSON line per result.
+- **Verdict.** `perf/nightly/compare.py` pairs the builds within each round. A metric fails when
+  the candidate is worse than its threshold in every round (at least two), warns when the median
+  is worse, and improves when the median is better. Thresholds, fixed until calibrated: 10% for
+  throughput and microbenchmarks, 15% for p50, 25% for p99. A failed night files a
+  `perf-regression` issue and does not move the baseline; it never blocks a release (owner's
+  decision).
+- **Records.** Each night's results, log, verdict and summary go to `results/<date>-<commit>/` on
+  the `perf-results` branch, whose `baseline` file names the commit to beat.
+- **The baseline must build `bench:build`** (added here). A baseline from before it is replaced
+  by the candidate itself, which makes that night a measure of noise.
+- **Credentials.** The secret `FLY_API_TOKEN_PERF`; meant to be a deploy token scoped to
+  `nerva-perf` rather than an organization token.
+- **Trial** (2026-10-05, from a session, the same commit as both builds, 2 rounds of 5 s):
+  every metric passed, within 9% at the median. The Machine and volume were destroyed.
+- **Found by the trial, the first thing to investigate:** in production config on the Fly
+  volume, 8 clients reach only about 245 operations a second with a 31 ms median (c1, c4), against
+  about 1 ms locally with `--development`. The microbenchmarks match local numbers, so the CPU is
+  not the difference: most likely Direct IO writes, from three replicas sharing one volume capped
+  at 16,000 IOPS and 64 to 128 MiB/s. Until that is understood, the nightly's load numbers mostly
+  measure the volume; they still detect regressions, which is what they are for.
+
+**N57. CI runs its tests as parallel jobs, and keeps the Zig toolchain on the runner's volume.**
 Measured on run 37240753012, the single `test` job was the critical path at 7m05 (typecheck 48 s,
 format 0 s, unit 3m06, integration 29 s, API 2m10, views 21 s), then `demo` at 6m03 (a release
 build, the seat demo, then the canvas demo); the VOPR seeds take 40 s to 2m01. `ci.yml` now runs:

@@ -101,7 +101,7 @@ Linux (io_uring) or macOS; x86_64 with AES or aarch64.
 
 CI (`.github/workflows/ci.yml`) runs on every push and pull request to `main`: typecheck, format,
 unit, integration, API, view and demo tests, every fuzzer at its smoke size, and the VOPR on seeds 1,
-2, 5 and one random seed (printed, so a failure replays), as parallel jobs (N55). A commit to `main` that changes `VERSION` runs CI on that commit, then
+2, 5 and one random seed (printed, so a failure replays), as parallel jobs (N57). A commit to `main` that changes `VERSION` runs CI on that commit, then
 publishes binaries for Linux and macOS (x86_64, aarch64) as GitHub release `v<VERSION>`
 (`release.yml`), with that version's section of [CHANGELOG.md](./CHANGELOG.md) as the release
 notes; releasing a version twice, or without notes, fails.
@@ -147,6 +147,42 @@ so use it to diagnose, not to time. The metrics most useful for performance work
 
 Timings are aggregated over each 10-second window. The `tb.` prefix and tag spellings come from
 TigerBeetle's tracer (UPSTREAM.md).
+
+### Caches
+
+`--cache-grid` sizes the block cache. `--cache-rows=<size>` sizes the row cache (128 bytes a row,
+rounded down to whole cache sets); it defaults to its minimum, one set of a few hundred rows.
+
+### Benchmarks
+
+```bash
+./zig/zig build bench                         # every `benchmark:` test, ReleaseSafe
+./zig/zig build bench -- "benchmark: documents"
+./zig/zig build -Drelease bench:load -- --local --workload=c7 --clients=4 --seconds=30
+./zig/zig build -Drelease bench:load -- --addresses=<addresses> --workload=c4 --batch=64 \
+    --rate=2000 --output=c4.json
+```
+
+`zig build bench` prints each result for people and, from `Bench.metric`, one
+`bench-json: {"name":…,"value":…,"unit":…}` line for machines. `bench:load` drives a cluster
+with one thread and one client per `--clients` (`--local` starts a three-replica `--development`
+cluster, at most 6 clients) and prints one JSON object: operations and entries per second,
+conflicts and retries, and latency percentiles in µs. Workloads: `c1` puts, `c2`
+read-modify-write, `c3` hot rows with retries, `c3_adds` hot rows with adds, `c4` lookups, `c5`
+change feed, `c7` mixed. `--rate=0` (default) is a closed loop; `--rate=<n>` an open loop whose
+latencies count from each request's due time. Use `-Drelease` so the `nerva` it starts is a
+release build.
+
+### Nightly performance
+
+`.github/workflows/perf-nightly.yml` runs every night at 06:47 UTC (and by hand, with any
+candidate and baseline). It builds the candidate (`main`) and the baseline (the last night that
+passed), then `perf/nightly/fly-run.sh` creates one Fly Machine for the night, runs both builds
+there in alternating rounds (`perf/nightly/run.sh`: every benchmark, then the `bench:load`
+workloads against three production-config replicas), and destroys it. `perf/nightly/compare.py`
+compares the rounds pairwise: a metric that is worse than its threshold in every round fails the
+night and files a `perf-regression` issue; it never blocks a release. Results go to the
+`perf-results` branch. The job needs the repository secret `FLY_API_TOKEN_PERF`.
 
 ## JSON API
 
