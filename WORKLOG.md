@@ -529,4 +529,8 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
   is replaced (#42).
 - `tests/api/api.py`: recovery with only `/healthz` polled. `tests/views/declared.py`: a view
   process survives a stall and recovers on its own. README and TUTORIAL updated.
+- Verified: `check`, `test:fmt`, `test:unit` 334/335 (the sandbox-denied perf test),
+  `test:views` and `test:api`. Against `main`'s binary the new checks fail: a stalled view
+  process answers 500 instead of 503, and `/healthz` stays 503 for 120 s after the cluster
+  recovers. Without the `on_reply` change the new unit test panics.
 
