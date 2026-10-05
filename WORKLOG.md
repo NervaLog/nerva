@@ -420,3 +420,15 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
 - Tests: `cache_rows_resolve` and `LatencyHistogram` unit tests; `test:integration` checks round
   trips arrive over statsd (every replica now sends) and starts replica 2 with `--cache-rows`.
   Mutation-tested: sending 0 as the round trip fails it. Every bench:load workload ran locally.
+
+## 2026-10-05 — Release v0.3.0 (N58)
+
+- `build.zig`: release `0.0.3`, clients from `0.0.2`. `CHANGELOG.md`: the v0.3.0 section
+  (maintained views, metrics and traces, the faster client, #7–#10 and #26–#29 fixed, #30–#34
+  known, upgrade steps). `VERSION` 0.3.0.
+- Measured, with the v0.2.0 binary and a `0.0.3` build: a v0.2.0 `nerva api` commits and reads
+  against a `0.0.3` cluster; a `0.0.3` replica refuses a `0.0.2` data file
+  (`multiversion unsupported`); a mixed cluster runs until the `0.0.3` replica panics with
+  `checkpoint diverged` at op 960 (#34, commented). The replica_format golden checksum is
+  unchanged.
+- Verified: `check`, `test:fmt`, `test:unit` 328/329 (the sandbox-denied perf test).
