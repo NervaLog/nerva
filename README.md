@@ -102,7 +102,8 @@ in-memory model replayed in op order.
 
 Linux (io_uring) or macOS; x86_64 with AES or aarch64.
 
-CI (`.github/workflows/ci.yml`) runs on every push and pull request to `main`: typecheck, format,
+CI (`.github/workflows/ci.yml`) runs on every push and pull request to `main` that changes more
+than Markdown (N68): typecheck, format,
 unit, integration, API, view, mixed-release and demo tests, every fuzzer at its smoke size, and the VOPR on seeds 1,
 2, 5 and one random seed (printed, so a failure replays), as parallel jobs (N57). A commit to `main` that changes `VERSION` runs CI on that commit, then
 publishes binaries for Linux and macOS (x86_64, aarch64) as GitHub release `v<VERSION>`

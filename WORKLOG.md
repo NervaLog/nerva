@@ -635,3 +635,9 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
 - Demos read views from `nerva api` and compare its hash with a `nerva view` process's.
 - Tests: `tests/views/maintained.py` (byte-for-byte equality, the new routes and refusals), the
   randomized test with pages ending early, format guard for `Group.op`. Mutation-tested.
+
+## 2026-10-05 — No CI for Markdown-only changes (N68)
+
+- `.github/workflows/ci.yml`: `paths-ignore: ['**.md']` on push and pull request; release.yml's
+  call to it is unaffected.
+- README's CI paragraph and DECISIONS N68 say so.
