@@ -1,4 +1,4 @@
-//! Documents: keys with values of up to 64 KiB, chunked over a table's 80-byte rows, read and
+//! Documents: keys with values of up to 512 KiB, chunked over a table's 80-byte rows, read and
 //! written in optimistic transactions through the client (docs/DECISIONS.md N39).
 //!
 //! The catalog keeps layouts and view declarations this way. Chunk 0 of a document holds a
@@ -24,7 +24,9 @@ const RowKey = nerva.RowKey;
 const RowValue = nerva.RowValue;
 const value_size = nerva.value_size;
 
-pub const value_size_max = 64 * 1024;
+/// The largest value one commit request can carry, with room for other writes (#25): a
+/// larger value would no longer be written atomically.
+pub const value_size_max = 512 * 1024;
 pub const key_size_max = 1024;
 
 /// Chunk 0's header.
