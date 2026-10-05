@@ -605,3 +605,12 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
 - Demos read views from `nerva api` and compare its hash with a `nerva view` process's.
 - Tests: `tests/views/maintained.py` (byte-for-byte equality, the new routes and refusals), the
   randomized test with pages ending early, format guard for `Group.op`. Mutation-tested.
+
+## 2026-10-05 — The VOPR on `main` runs in ReleaseSafe on about 300 seeds (N67)
+
+- `.github/workflows/ci.yml`: `vopr` (seeds 1, 2, 5 and one random, Debug) runs on pull requests
+  only; `vopr_main` runs everywhere else: seeds 1, 2 and 5 in ReleaseSafe, and four lanes of
+  `fuzz_loop.sh vopr nerva 6`.
+- README's CI paragraph and DECISIONS N67.
+- Verified locally: the ReleaseSafe VOPR build (2m03), seeds 1, 2 and 5 pass (8 s, 1 s, 3 s),
+  `fuzz_loop.sh vopr nerva 2` ran 25 seeds without a failure; the workflow parses as YAML.

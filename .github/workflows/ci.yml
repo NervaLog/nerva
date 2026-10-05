@@ -151,7 +151,10 @@ jobs:
       - name: ${{ matrix.demo }} under crashes
         run: python3 tests/demo/${{ matrix.demo }} zig-out/bin/nerva --seconds=75
 
+  # Pull requests: the fixed seeds and one random seed, in Debug. Everything else (pushes to main,
+  # the release's run, a dispatch) runs `vopr_main` instead (N67).
   vopr:
+    if: github.event_name == 'pull_request'
     runs-on: [self-hosted, fly]
     timeout-minutes: 60
     strategy:
@@ -174,3 +177,37 @@ jobs:
           echo "VOPR seed: $seed"
           echo "### VOPR seed \`$seed\`" >> "$GITHUB_STEP_SUMMARY"
           ./zig/zig build vopr -- "$seed"
+  # Main, in ReleaseSafe, which runs a seed 10 to 40 times faster than Debug (N67): the fixed seeds,
+  # then four lanes that each search fresh random seeds for 6 minutes (fuzz_loop.sh, as the long
+  # fuzzing does, N59), about 300 seeds a push. A failing seed stops its lane and prints the
+  # command that replays it, in the log and the job summary.
+  vopr_main:
+    name: vopr (main, ${{ matrix.lane }})
+    if: github.event_name != 'pull_request'
+    runs-on: [self-hosted, fly]
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: [fixed, random-1, random-2, random-3, random-4]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned Zig
+        run: eval "$INSTALL_ZIG"
+
+      # A failure replays exactly with `./zig/zig build -Drelease vopr -- <seed>`.
+      - name: VOPR seeds 1, 2 and 5 (ReleaseSafe)
+        if: matrix.lane == 'fixed'
+        run: |
+          for seed in 1 2 5; do
+            echo "VOPR seed: $seed"
+            echo "### VOPR seed \`$seed\` (ReleaseSafe)" >> "$GITHUB_STEP_SUMMARY"
+            ./zig/zig build -Drelease vopr -- "$seed"
+          done
+
+      - name: VOPR on random seeds (ReleaseSafe, 6 minutes)
+        if: matrix.lane != 'fixed'
+        run: .github/scripts/fuzz_loop.sh vopr nerva 6
