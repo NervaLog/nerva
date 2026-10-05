@@ -84,9 +84,13 @@ pub fn StateMachineType(comptime Storage: type) type {
             batch_size_limit: u32,
             lsm_forest_compaction_block_count: u32 = Forest.Options.compaction_block_count_min,
             lsm_forest_node_count: u32,
-            cache_entries_rows: u32 = RowsGroove.ObjectsCache.Cache.value_count_max_multiple,
+            cache_entries_rows: u32 = cache_entries_rows_multiple,
             cache_entries_groups: u32 = GroupsGroove.ObjectsCache.Cache.value_count_max_multiple,
         };
+
+        /// The row cache holds a multiple of this many rows (its set size), and at least one.
+        pub const cache_entries_rows_multiple: u32 =
+            RowsGroove.ObjectsCache.Cache.value_count_max_multiple;
 
         const RowsGroove = GrooveType(
             Storage,

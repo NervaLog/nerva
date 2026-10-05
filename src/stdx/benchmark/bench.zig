@@ -138,6 +138,25 @@ pub fn estimate(bench: *const Bench, durations: []Duration) Duration {
     return durations[2];
 }
 
+/// A result for machines (Nerva patch, UPSTREAM.md): in benchmark mode, one line on stderr,
+/// `bench-json: {"name":…,"value":…,"unit":…}`, which the nightly performance job collects.
+pub fn metric(
+    _: *const Bench,
+    comptime name: []const u8,
+    value: u64,
+    comptime unit: []const u8,
+) void {
+    comptime assert(name.len > 0 and unit.len > 0);
+    comptime for (name ++ unit) |char| assert(std.mem.indexOfScalar(u8, "\\\"{}", char) == null);
+    switch (mode) {
+        .smoke => {},
+        .benchmark => std.debug.print(
+            "bench-json: {{\"name\":\"" ++ name ++ "\",\"value\":{},\"unit\":\"" ++ unit ++ "\"}}\n",
+            .{value},
+        ),
+    }
+}
+
 pub fn report(_: *const Bench, comptime fmt: []const u8, args: anytype) void {
     switch (mode) {
         .smoke => {},

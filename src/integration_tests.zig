@@ -51,7 +51,7 @@ const Cluster = struct {
     addresses_flag: []const u8,
     addresses: [replica_count]stdx.SocketAddress,
     processes: [replica_count]?std.process.Child,
-    /// Replica 0 sends its metrics here (`--statsd`).
+    /// Every replica sends its metrics here (`--statsd`).
     statsd: StatsdListener,
 
     fn init() !*Cluster {
@@ -147,7 +147,8 @@ const Cluster = struct {
         var addresses_buffer: [256]u8 = undefined;
         var trace_buffer: [std.fs.max_path_bytes]u8 = undefined;
         var observe_buffer: [std.fs.max_path_bytes + 16]u8 = undefined;
-        var argv: stdx.BoundedArrayType([]const u8, 6) = .{};
+        var statsd_buffer: [64]u8 = undefined;
+        var argv: stdx.BoundedArrayType([]const u8, 7) = .{};
         argv.push(nerva_exe);
         argv.push("start");
         argv.push(try std.fmt.bufPrint(
@@ -156,15 +157,18 @@ const Cluster = struct {
             .{cluster.addresses_flag},
         ));
         argv.push("--development");
-        // Replica 0 sends metrics and replica 1 writes a trace; replica 2 does neither.
+        // Every replica sends metrics (round trips are recorded by whichever is primary);
+        // replica 1 also writes a trace, and replica 2 has a larger row cache.
+        argv.push(try std.fmt.bufPrint(&statsd_buffer, "--statsd=127.0.0.1:{}", .{
+            cluster.statsd.port,
+        }));
         switch (replica) {
-            0 => argv.push(try std.fmt.bufPrint(&observe_buffer, "--statsd=127.0.0.1:{}", .{
-                cluster.statsd.port,
-            })),
+            0 => {},
             1 => argv.push(try std.fmt.bufPrint(&observe_buffer, "--trace={s}", .{
                 cluster.trace_file(&trace_buffer),
             })),
-            else => {},
+            2 => argv.push("--cache-rows=64MiB"),
+            else => unreachable,
         }
         argv.push(cluster.data_file(&path_buffer, replica));
         var process = std.process.Child.init(argv.const_slice(), cluster.gpa);
@@ -381,13 +385,15 @@ fn scenario_cluster() !void {
         try testing.expect(median_ns < constants.tick_ms * std.time.ns_per_ms);
     }
 
-    // Observability: replica 0 (the primary) sends request timings and gauges over statsd, and
+    // Observability: the replicas send request timings and gauges over statsd, and
     // replica 1 has written commit spans to its trace file.
     try cluster.statsd.expect_metrics(&.{
         "tb.replica_request_us.count:",
         "operation:Operation.commit",
         "tb.replica_commit_us.avg:",
         "tb.grid_cache_hits:",
+        // Clients send each request's previous round trip; the primary records it.
+        "tb.client_request_round_trip_us.count:",
     });
     {
         var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
