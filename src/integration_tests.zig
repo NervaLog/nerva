@@ -431,4 +431,16 @@ fn scenario_cluster() !void {
     const after_failover = try commit(daemon_b, &.{put(200, 0xdd)});
     defer gpa.free(after_failover);
     try expect_statuses(after_failover, &.{.ok});
+
+    // Eviction: a client whose session the replicas dropped is evicted on its next request,
+    // and gets `error.Evicted` (it used to abort the process, #52). Sessions outlive their
+    // clients, so registering `clients_max` more pushes the oldest one out. Last: it pushes out
+    // every earlier session too.
+    {
+        const evictee = try cluster.client();
+        defer cluster.client_deinit(evictee);
+        for (0..constants.clients_max) |_| cluster.client_deinit(try cluster.client());
+        try testing.expectError(error.Evicted, lookup(evictee, 1, 1));
+        try testing.expectError(error.Evicted, lookup(evictee, 1, 1));
+    }
 }

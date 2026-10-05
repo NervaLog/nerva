@@ -156,8 +156,10 @@ pub const Client = struct {
                 if (start.elapsed(client.time_os.monotonic()).ns > client.options.timeout.ns) break;
                 client.run_io_once(start, &tick_next) catch break;
             }
-            client.vsr_client.deinit(allocator);
         }
+        // An evicted VSR client must process no more messages, so its IO is not driven again
+        // (#52): every call returned `error.Evicted` since.
+        client.vsr_client.deinit(allocator);
         allocator.free(client.request[0..]);
         allocator.free(client.reply[0..]);
         client.message_pool.deinit(allocator);
@@ -424,8 +426,10 @@ pub const Client = struct {
     fn on_eviction(vsr_client: *VSRClient, eviction: *const Message.Eviction) void {
         const client: *Client = @fieldParentPtr("vsr_client", vsr_client);
         log.warn("evicted: {s}", .{@tagName(eviction.header.reason)});
-        // The eviction callback must deinit the VSR client.
-        vsr_client.deinit(client.allocator);
+        // The VSR client's contract asks the callback to deinit it, but the callback runs inside
+        // the message bus's receive path, which goes on to use the buffer `deinit` would free
+        // (#52). `Client.deinit` deinits it instead; the evicted VSR client processes no more
+        // messages because nothing drives its IO until then.
         client.state = .evicted;
     }
 
