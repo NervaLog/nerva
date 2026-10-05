@@ -101,7 +101,7 @@ Linux (io_uring) or macOS; x86_64 with AES or aarch64.
 
 CI (`.github/workflows/ci.yml`) runs on every push and pull request to `main`: typecheck, format,
 unit, integration, API, view and demo tests, every fuzzer at its smoke size, and the VOPR on seeds 1,
-2, 5 and one random seed (printed, so a failure replays), as parallel jobs (N54). A commit to `main` that changes `VERSION` runs CI on that commit, then
+2, 5 and one random seed (printed, so a failure replays), as parallel jobs (N55). A commit to `main` that changes `VERSION` runs CI on that commit, then
 publishes binaries for Linux and macOS (x86_64, aarch64) as GitHub release `v<VERSION>`
 (`release.yml`), with that version's section of [CHANGELOG.md](./CHANGELOG.md) as the release
 notes; releasing a version twice, or without notes, fails.

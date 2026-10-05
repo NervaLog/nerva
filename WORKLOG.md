@@ -396,7 +396,19 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
   README lists it among CI's steps.
 - Verified locally: the smoke pass passes on `main`.
 
-## 2026-10-05 — Faster CI: parallel test jobs, demos split, Zig kept on the volume (N54)
+## 2026-10-04 — Format guards (N54)
+
+- `src/nerva/format_test.zig`: a snapshot of every wire and storage type's layout, enum values
+  and tree ids, by reflection; golden values for `row_key`, `tail_id` and the catalog's stored
+  JSON and field packing.
+- `src/nerva/state_machine_tests.zig`: "format: what a fixed script commits", a summary and
+  checksum of every result, row, change and history record a fixed script produces.
+- Verified: each of six planted changes (field order, an enum value, a tree id, `row_key`, the
+  layout JSON, change timestamps) fails exactly its guard; then reverted.
+- Merged after views (N52): the layouts guard covers views' types, operations and tree ids; the
+  script guard caught N52's 5 timestamps per entry, and its snapshot was updated for it.
+
+## 2026-10-05 — Faster CI: parallel test jobs, demos split, Zig kept on the volume (N55)
 
 - `.github/workflows/ci.yml`: `test` split into `unit` (unit tests) and `system` (typecheck,
   format, integration, API, views); `demo` split into one job per demo, each building with

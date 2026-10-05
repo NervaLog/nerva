@@ -1,7 +1,7 @@
 # Every push and pull request to main, and every release (release.yml calls this first).
 # Every job runs on Botpike's own runners (Botpike/ci-runners): a Fly Machine started for the
 # job, performance-2x with 8 GB and a 10 GB volume that keeps the Zig cache between jobs.
-# The jobs run in parallel, balanced so none is much longer than the others (N54).
+# The jobs run in parallel, balanced so none is much longer than the others (N55).
 name: CI
 
 on:
