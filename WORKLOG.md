@@ -461,3 +461,11 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
 - Tests in `tests/api/api.py`, `tests/views/maintained.py` and a `Receiver` unit test, each
   failing on the binary before the fix.
 
+## 2026-10-05 — Long fuzzing workflow (N59)
+
+- `.github/workflows/fuzz.yml` (dispatch only) and `.github/scripts/fuzz_loop.sh`: every fuzzer
+  and seven VOPR lanes on random seeds for a time budget, on Fly runners started for the run.
+- Verified locally: `nerva_adds` for a minute (319 runs, passing); the `canary` fuzzer's planted
+  failure is reported with its seed and replay command, and fails the job; the VOPR path (testing
+  state machine, 9 runs); the workflow parses, 16 fuzz and 7 VOPR jobs.
+

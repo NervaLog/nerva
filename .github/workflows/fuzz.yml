@@ -1,0 +1,86 @@
+# Long fuzzing (N59): every fuzzer and the VOPR on random seeds for a time budget, by hand only.
+# Smoke (ci.yml) runs each fuzzer once at a fixed seed: a regression check. This searches. Start
+# Fly runners (Botpike/ci-runners) for the run, dispatch it, and stop them afterwards: every job
+# below runs at once if there are enough runners, else they queue.
+# A failure prints its seed and the command that replays it exactly, in the job log and summary.
+name: Fuzz (long)
+
+on:
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: "Minutes each job searches (at most 300; jobs time out at 330)"
+        required: true
+        default: "120"
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    runs-on: [self-hosted, fly]
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      matrix:
+        # Every fuzzer in src/fuzz_tests.zig except `canary` (fails on purpose) and `smoke`.
+        fuzzer:
+          - ewah
+          - lsm_scan
+          - lsm_cache_map
+          - lsm_manifest_log
+          - lsm_manifest_level
+          - lsm_segmented_array
+          - lsm_tree
+          - message_bus
+          - storage
+          - vsr_free_set
+          - vsr_superblock
+          - vsr_superblock_quorums
+          - vsr_multi_batch
+          - nerva_adds
+          - nerva_http_head
+          - nerva_documents
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned Zig
+        run: ./zig/download.sh
+
+      - name: Fuzz ${{ matrix.fuzzer }} on random seeds
+        env:
+          MINUTES: ${{ inputs.minutes }}
+        run: |
+          .github/scripts/fuzz_loop.sh fuzz '${{ matrix.fuzzer }}' "$(( MINUTES > 300 ? 300 : MINUTES ))"
+
+  vopr:
+    runs-on: [self-hosted, fly]
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      matrix:
+        # Six lanes of Nerva's state machine (views, adds, receipts, budgets: N49, N52) and one of
+        # the testing state machine, which exercises consensus and storage alone.
+        include:
+          - { state_machine: nerva, lane: 1 }
+          - { state_machine: nerva, lane: 2 }
+          - { state_machine: nerva, lane: 3 }
+          - { state_machine: nerva, lane: 4 }
+          - { state_machine: nerva, lane: 5 }
+          - { state_machine: nerva, lane: 6 }
+          - { state_machine: testing, lane: 1 }
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned Zig
+        run: ./zig/download.sh
+
+      - name: VOPR (${{ matrix.state_machine }}, lane ${{ matrix.lane }}) on random seeds
+        env:
+          MINUTES: ${{ inputs.minutes }}
+        run: |
+          .github/scripts/fuzz_loop.sh vopr '${{ matrix.state_machine }}' "$(( MINUTES > 300 ? 300 : MINUTES ))"
