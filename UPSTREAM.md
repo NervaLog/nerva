@@ -49,7 +49,7 @@ originals should be checked for relevance.
 
 | File | Change |
 |---|---|
-| `build.zig` | Rewritten: the `nerva` executable, `run`, `check`, `test`, `test:unit`, `test:fmt`, `test:integration`, `test:api`, `test:views`, `test:demo`, `vopr`, `fuzz`, `bench` and `bench:load` (N53). No clients, multiversion or release fetching. Release is `0.0.2` (N43; `0.0.1` until then). Nerva's own CI and release workflows are in `.github/workflows/` (not vendored). |
+| `build.zig` | Rewritten: the `nerva` executable, `run`, `check`, `test`, `test:unit`, `test:fmt`, `test:integration`, `test:api`, `test:views`, `test:demo`, `vopr`, `fuzz`, `bench` and `bench:load` (N54). No clients, multiversion or release fetching. Release is `0.0.2` (N43; `0.0.1` until then). Nerva's own CI and release workflows are in `.github/workflows/` (not vendored). |
 | `src/vsr.zig` | Re-exports `nerva` and `state_machine` instead of `tigerbeetle`, `state_machine`, `cdc`, `tb_client`, `repl`. |
 | `src/vsr/replica.zig` | Request timing is enabled when `StateMachine.Operation == nerva.Operation` (was `tigerbeetle.Operation`). |
 | `src/trace/event.zig` | Operation and tree enums are derived from `nerva.zig` instead of `tigerbeetle.zig` / `state_machine.zig`. The tree enum also names every id up to `tree_id_test_max` (15) that Nerva does not use (`test_<id>`), because vendored test grooves (`lsm/scan_fuzz.zig`) use ids 1–15, which TigerBeetle's trees covered (#6, N46). |
@@ -65,7 +65,7 @@ originals should be checked for relevance.
 | `src/io/linux.zig` | Added `IO.run_once(nanoseconds)`: submit, wait up to `nanoseconds` for a completion, run the ready callbacks and return, built from the existing private helpers (N51). |
 | `src/io/darwin.zig`, `src/io/windows.zig` | Added `IO.run_once`, which calls `run_for_ns` (correct, without the early return; production is Linux) (N51). |
 | `src/io/test.zig` | Added the test "run_once returns after the first completion" (Linux only) (N51). |
-| `src/stdx/benchmark/bench.zig` | Added `Bench.metric(name, value, unit)`: in benchmark mode, one `bench-json:` line per result for the nightly job (N53). |
+| `src/stdx/benchmark/bench.zig` | Added `Bench.metric(name, value, unit)`: in benchmark mode, one `bench-json:` line per result for the nightly job (N54). |
 
 ## Known differences in behaviour
 

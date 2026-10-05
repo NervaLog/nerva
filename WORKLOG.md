@@ -390,7 +390,13 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
   `test:views`. Mutation-tested (groups that never lose rows, the backfill cursor, admission off
   by one).
 
-## 2026-10-05 — Performance Phase 0: round trips, --cache-rows, bench, bench:load (N53)
+## 2026-10-04 — CI runs the fuzzers' smoke pass (N53)
+
+- `.github/workflows/ci.yml`: the `test` job runs `zig build fuzz -- smoke` after the unit tests.
+  README lists it among CI's steps.
+- Verified locally: the smoke pass passes on `main`.
+
+## 2026-10-05 — Performance Phase 0: round trips, --cache-rows, bench, bench:load (N54)
 
 - `src/nerva/client.zig`: `send` builds request messages and carries the previous round trip, so
   primaries record `client_request_round_trip`.
