@@ -685,3 +685,11 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
   checkpoints and restarts, in agreement with `nerva view`; backfill under load; 13 VOPR seeds;
   fuzzers at smoke size; v0.3.0 clients refused by 0.0.4, as N62 intends.
 
+## 2026-10-05 — The VOPR on `main` runs in ReleaseSafe on about 300 seeds (N74)
+
+- `.github/workflows/ci.yml`: `vopr` (seeds 1, 2, 5 and one random, Debug) runs on pull requests
+  only; `vopr_main` runs everywhere else: seeds 1, 2 and 5 in ReleaseSafe, and four lanes of
+  `fuzz_loop.sh vopr nerva 6`.
+- README's CI paragraph and DECISIONS N74.
+- Verified locally: the ReleaseSafe VOPR build (2m03), seeds 1, 2 and 5 pass (8 s, 1 s, 3 s),
+  `fuzz_loop.sh vopr nerva 2` ran 25 seeds without a failure; the workflow parses as YAML.

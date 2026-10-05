@@ -104,8 +104,10 @@ Linux (io_uring) or macOS; x86_64 with AES or aarch64.
 
 CI (`.github/workflows/ci.yml`) runs on every push and pull request to `main` that changes more
 than Markdown (N68): typecheck, format,
-unit, integration, API, view, mixed-release and demo tests, every fuzzer at its smoke size, and the VOPR on seeds 1,
-2, 5 and one random seed (printed, so a failure replays), as parallel jobs (N57). A commit to `main` that changes `VERSION` runs CI on that commit, then
+unit, integration, API, view, mixed-release and demo tests, every fuzzer at its smoke size, and the VOPR,
+as parallel jobs (N57). On a pull request the VOPR runs seeds 1, 2, 5 and one random seed in Debug
+(printed, so a failure replays); on `main` it runs in ReleaseSafe, seeds 1, 2 and 5 and then four
+lanes of random seeds for 6 minutes each, about 300 seeds a push (N74). A commit to `main` that changes `VERSION` runs CI on that commit, then
 publishes binaries for Linux and macOS (x86_64, aarch64) as GitHub release `v<VERSION>`
 (`release.yml`), with that version's section of [CHANGELOG.md](./CHANGELOG.md) as the release
 notes; releasing a version twice, or without notes, fails. Each release also carries its bill of
