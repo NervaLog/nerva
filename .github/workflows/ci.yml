@@ -42,7 +42,7 @@ jobs:
       - name: Unit tests
         run: ./zig/zig build test:unit
 
-      # Every fuzzer, vendored and Nerva's own, at its smoke size and seed (N46, N50), so a
+      # Every fuzzer, vendored and Nerva's own, at its smoke size and seed (N46, N53), so a
       # fuzzer that stops working fails here. `lsm_segmented_array` logs "too slow for the
       # smoke mode" in Debug; that is a warning, not a failure.
       - name: Fuzzers (smoke)

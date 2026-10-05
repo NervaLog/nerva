@@ -83,7 +83,22 @@ pub fn main() !void {
             var time_os: stdx.TimeOS = .{};
             const time = time_os.interface();
 
-            var tracer = try Tracer.init(gpa, time, .unknown, .{});
+            // `start --trace` writes spans to a file; `start --statsd` sends metrics over UDP.
+            const trace_file: ?std.fs.File = if (tag == .start and args.trace != null)
+                try std.fs.cwd().createFile(args.trace.?, .{})
+            else
+                null;
+            defer if (trace_file) |file| file.close();
+            var trace_writer: ?std.fs.File.Writer =
+                if (trace_file) |file| file.writer() else null;
+
+            var tracer = try Tracer.init(gpa, time, .unknown, if (tag == .start) .{
+                .writer = if (trace_writer) |*writer| writer.any() else null,
+                .statsd_options = if (args.statsd) |address|
+                    .{ .udp = .{ .io = &io, .address = address } }
+                else
+                    .log,
+            } else .{});
             defer tracer.deinit(gpa);
 
             var storage = try Storage.init(&io, &tracer, .{

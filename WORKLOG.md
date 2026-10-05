@@ -335,7 +335,62 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
   any run's feed), and a put carrying `op_seen` accepted (3/4; only `entry_status_check`
   catches it, as the model shares `entry_validate`).
 
-## 2026-10-04 — CI runs the fuzzers' smoke pass (N50)
+## 2026-10-04 — Fly.io feasibility probe for nightly performance tests
+
+- `perf/fly/`: `run-probe.sh` creates one Machine and a volume in the `nerva-perf` Fly app,
+  builds `Dockerfile` (the `nerva` binary, `fio`, `perf`) with Fly's remote builder, runs
+  `probe.sh` at boot, prints its report, and destroys the Machine and volume on exit, failure
+  included. It answers the performance plan's Phase 0 questions about the hardware.
+- Probe results (performance-4x, 10 GB volume, `iad`, binary `0.0.1+3a01765`): production
+  config (Direct IO) formats and starts on the volume; three replicas and `nerva api` work on
+  Fly's private IPv6 addresses; `perf_event_open` works with hardware counters; the volume
+  delivers about 16,500 IOPS and 65 MiB/s, exactly Fly's documented cap for that size. Nightly
+  throughput runs will be IO-capped on Fly and are judged on write amplification instead.
+- Not part of the build or CI; it needs `flyctl` and `FLY_API_TOKEN`.
+
+## 2026-10-04 — Metrics and traces from replicas (N50)
+
+- `nerva start --statsd=<host:port>` sends the replica's metrics (statsd over UDP, every 10 s)
+  and `--trace=<path>` writes its JSON span trace. `src/nerva/cli.zig` parses and validates
+  both (`statsd_parse`, `error.StatsdAddressInvalid`, `error.TracePathEmpty`);
+  `src/nerva_main.zig` hands them to the vendored tracer. No vendored file changed.
+- README: "Metrics and traces", with the metrics the performance plan reads.
+- Tests: `statsd_parse` and `start_resolve` unit tests; `test:integration` checks that replica 0's
+  statsd packets carry request, commit and cache metrics and that replica 1's trace holds commit
+  spans. Mutation-tested: without the statsd or the trace wiring, the integration test fails.
+- Verified: `check`, `test:fmt`, `test:integration`; `test:unit -Drelease` 305/306 (the
+  sandbox-denied perf test).
+
+## 2026-10-05 — The client no longer waits out a 10 ms tick per request (N51)
+
+- `src/io/linux.zig`: `IO.run_once(nanoseconds)`, which returns once callbacks have run;
+  `darwin.zig` and `windows.zig` alias it to `run_for_ns`. Vendored patch, listed in UPSTREAM.md.
+- `src/nerva/client.zig`: `run_io_once` ticks the VSR client every `tick_ms` and otherwise waits
+  with `run_once`, so `run_until_reply` and `deinit` return as soon as the reply (or shutdown)
+  arrives.
+- Through `nerva api` on a local three-replica cluster: lookup p50 10.60 ms to 1.05 ms, commit
+  p50 10.53 ms to 0.92 ms (N51 has the table).
+- Tests: IO unit test for `run_once`; `test:integration` checks the median lookup is under one
+  tick. Mutation-tested.
+
+## 2026-10-05 — Views maintained by the state machine (N52)
+
+- `src/nerva.zig`: `declare_view`, `get_view` and `pulse` operations; `ViewDefinition`, `View`,
+  `Group`, `ViewQuery`, `ViewRecord`; statuses `view_key_field` and `views_busy`; tree ids 5–8.
+- `src/nerva/views.zig`: validation, row membership, group keys and hashes, the consensus hash.
+- `src/nerva/state_machine.zig`: `views` and `groups` grooves; three-stage commit prefetch;
+  groups and hash kept in every commit, coalesced per op; admission by distinct groups per op
+  (the canvas demo livelocked under a per-write budget); declare; paged reads by id or
+  name; backfill by pulse. Commit entries reserve 5 timestamps each.
+- `src/lsm/scan_builder.zig`: `scan_unique_key_range` (UPSTREAM.md).
+- `nerva api`: `PUT /v1/views/<name>` also declares into the state machine;
+  `GET /v1/views/<name>/groups`; `409 view_key_field`, `503 views_busy`. Client:
+  `declare_view`, `get_view`.
+- Tests: unit and state machine tests, the VOPR model of views, `tests/views/maintained.py` in
+  `test:views`. Mutation-tested (groups that never lose rows, the backfill cursor, admission off
+  by one).
+
+## 2026-10-04 — CI runs the fuzzers' smoke pass (N53)
 
 - `.github/workflows/ci.yml`: the `test` job runs `zig build fuzz -- smoke` after the unit tests.
   README lists it among CI's steps.
