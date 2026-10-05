@@ -17,6 +17,7 @@ const api_server = @import("nerva/api/server.zig");
 
 const IO = @import("io.zig").IO;
 const Tracer = @import("trace.zig").Tracer;
+const TraceFile = @import("nerva/trace_file.zig").TraceFile;
 const Storage = @import("storage.zig").StorageType(IO);
 const AOF = @import("aof.zig").AOFType(IO);
 const MessageBus = @import("message_bus.zig").MessageBusType(IO);
@@ -99,11 +100,18 @@ pub fn main() !void {
             else
                 null;
             defer if (trace_file) |file| file.close();
-            var trace_writer: ?std.fs.File.Writer =
+            var trace_file_writer: ?std.fs.File.Writer =
                 if (trace_file) |file| file.writer() else null;
+            // Buffered, bounded, and never failing: a trace write error must not panic the
+            // replica (#30).
+            var trace_writer: ?TraceFile = if (trace_file_writer) |*writer|
+                .init(writer.any(), if (tag == .start) args.trace_size_max else unreachable)
+            else
+                null;
+            defer if (trace_writer) |*writer| writer.flush();
 
             var tracer = try Tracer.init(gpa, time, .unknown, if (tag == .start) .{
-                .writer = if (trace_writer) |*writer| writer.any() else null,
+                .writer = if (trace_writer) |*writer| writer.writer() else null,
                 .statsd_options = if (args.statsd) |address|
                     .{ .udp = .{ .io = &io, .address = address } }
                 else

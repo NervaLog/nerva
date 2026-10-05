@@ -13,6 +13,7 @@ const constants = @import("../constants.zig");
 const IO = @import("../io.zig").IO;
 const Storage = @import("../storage.zig").StorageType(IO);
 const ByteSize = stdx.ByteSize;
+const trace_size_default = @import("trace_file.zig").size_max_default;
 
 const StateMachine = @import("state_machine.zig").StateMachineType(Storage);
 const Grid = vsr.GridType(Storage);
@@ -35,6 +36,7 @@ const CLIArgs = union(enum) {
         cache_rows: ?ByteSize = null,
         statsd: ?[]const u8 = null,
         trace: ?[]const u8 = null,
+        trace_size_max: ?ByteSize = null,
         development: bool = false,
         log_debug: bool = false,
 
@@ -122,7 +124,12 @@ const CLIArgs = union(enum) {
         \\
         \\  --trace=<path>
         \\        Write a JSON trace of the replica's spans to <path> (Perfetto,
-        \\        chrome://tracing). For diagnosis: tracing slows the replica down.
+        \\        chrome://tracing). For short diagnostic runs: tracing slows the replica
+        \\        down. Tracing stops, and the replica runs on, if writing fails or the file
+        \\        reaches --trace-size-max.
+        \\
+        \\  --trace-size-max=<size><KiB|MiB|GiB>
+        \\        The largest trace file (default 1GiB).
         \\
         \\  --listen=<host:port>
         \\        Where to serve HTTP. The bound port is printed to stdout (use port 0 for an
@@ -178,6 +185,7 @@ pub const Command = union(enum) {
         lsm_forest_node_count: u32,
         statsd: ?stdx.SocketAddress,
         trace: ?[]const u8,
+        trace_size_max: u64,
         development: bool,
         log_debug: bool,
         path: []const u8,
@@ -200,6 +208,7 @@ pub fn parse_args(flags: *stdx.Flags) Command {
             .cache_rows = start.cache_rows,
             .statsd = start.statsd,
             .trace = start.trace,
+            .trace_size_max = start.trace_size_max,
             .development = start.development,
             .log_debug = start.log_debug,
             .path = start.path,
@@ -246,6 +255,8 @@ const Error = error{
     CacheRowsTooLarge,
     StatsdAddressInvalid,
     TracePathEmpty,
+    TraceSizeMaxWithoutTrace,
+    TraceSizeMaxZero,
 };
 
 fn error_message(err: Error) []const u8 {
@@ -272,6 +283,8 @@ fn error_message(err: Error) []const u8 {
         error.StatsdAddressInvalid => "--statsd must be <host:port> with a non-zero port " ++
             "(IPv6 in brackets)",
         error.TracePathEmpty => "--trace must name a file",
+        error.TraceSizeMaxWithoutTrace => "--trace-size-max needs --trace",
+        error.TraceSizeMaxZero => "--trace-size-max must be positive",
     };
 }
 
@@ -290,6 +303,7 @@ const StartArgs = struct {
     cache_rows: ?ByteSize,
     statsd: ?[]const u8,
     trace: ?[]const u8,
+    trace_size_max: ?ByteSize,
     development: bool,
     log_debug: bool,
     path: []const u8,
@@ -335,6 +349,11 @@ fn start_resolve(start: StartArgs) Error!Command.Start {
     if (start.trace) |path| {
         if (path.len == 0) return error.TracePathEmpty;
     }
+    if (start.trace_size_max != null and start.trace == null) {
+        return error.TraceSizeMaxWithoutTrace;
+    }
+    const trace_size_max: u64 = if (start.trace_size_max) |size| size.bytes() else trace_size_default;
+    if (trace_size_max == 0) return error.TraceSizeMaxZero;
 
     const compaction_block_count_min = StateMachine.Forest.Options.compaction_block_count_min;
     return .{
@@ -357,6 +376,7 @@ fn start_resolve(start: StartArgs) Error!Command.Start {
         )),
         .statsd = statsd,
         .trace = start.trace,
+        .trace_size_max = trace_size_max,
         .development = start.development,
         .log_debug = start.log_debug,
         .path = start.path,
