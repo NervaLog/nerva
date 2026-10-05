@@ -420,3 +420,16 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
 - Tests: `cache_rows_resolve` and `LatencyHistogram` unit tests; `test:integration` checks round
   trips arrive over statsd (every replica now sends) and starts replica 2 with `--cache-rows`.
   Mutation-tested: sending 0 as the round trip fails it. Every bench:load workload ran locally.
+
+## 2026-10-05 — Gateway fixes: routes, recovery, slots, trace files (N56; #26–#29)
+
+- `api.zig`: `/v1/views/groups` is the view named `groups`, not a groups route with no name
+  (#26).
+- `client.zig`, `api/server.zig`: `Client.reconnect`; the gateway replaces a client that timed
+  out or was evicted, at most every 5 s, answering 503 meanwhile, and `/healthz` reports it (#27).
+- `http_connection.zig`: with every slot busy, a new connection displaces the oldest one still
+  sending its request (#28).
+- `nerva_main.zig`: `--trace` creates its file exclusively (#29).
+- Tests in `tests/api/api.py`, `tests/views/maintained.py` and a `Receiver` unit test, each
+  failing on the binary before the fix.
+

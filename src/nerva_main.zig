@@ -84,8 +84,18 @@ pub fn main() !void {
             const time = time_os.interface();
 
             // `start --trace` writes spans to a file; `start --statsd` sends metrics over UDP.
+            // Never an existing file: a path given by mistake (the data file's, say) would be
+            // truncated (#29).
             const trace_file: ?std.fs.File = if (tag == .start and args.trace != null)
-                try std.fs.cwd().createFile(args.trace.?, .{})
+                std.fs.cwd().createFile(args.trace.?, .{ .exclusive = true }) catch |err|
+                    switch (err) {
+                        error.PathAlreadyExists => vsr.fatal(
+                            .cli,
+                            "--trace: {s} exists; give a new file",
+                            .{args.trace.?},
+                        ),
+                        else => return err,
+                    }
             else
                 null;
             defer if (trace_file) |file| file.close();

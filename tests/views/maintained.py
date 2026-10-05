@@ -16,7 +16,8 @@ Then requires:
 - a commit of thousands of writes to one group to apply (admission counts distinct groups, not
   writes), and one touching more distinct groups than an op admits (a view grouped by price) to
   answer 503 `views_busy`, applying nothing;
-- a view with `min` to be declared but reported as not maintained (404 on its groups).
+- a view with `min` to be declared but reported as not maintained (404 on its groups);
+- a view named `groups` to be read (404 before it exists, not a crash: #26) and declared.
 
 Usage: maintained.py <path to nerva> [--seed=N]
 """
@@ -183,6 +184,15 @@ def main():
         status, body = request(api, "PUT", "/v1/views/cheapest", CHEAPEST)
         assert status == 200 and body["maintained"] is False, body
         assert request(api, "GET", "/v1/views/cheapest/groups")[0] == 404
+
+        # A view named `groups` (#26): reading it before it exists answers 404 (it crashed the
+        # gateway), then it can be declared and its groups read at `/v1/views/groups/groups`.
+        assert request(api, "GET", "/v1/views/groups")[0] == 404
+        status, body = request(api, "PUT", "/v1/views/groups", REVENUE)
+        assert status == 200, (status, body)
+        assert request(api, "GET", "/v1/views/groups")[0] == 200
+        status, body = request(api, "GET", "/v1/views/groups/groups")
+        assert status == 200 and "groups" in body, (status, body)
 
         print(f"maintained views: PASSED ({SEATS} seats backfilled; {len(checks)} comparisons "
               f"with nerva view, up to {max(checks)} groups each; seed {seed})")
