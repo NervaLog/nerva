@@ -566,3 +566,10 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
   process answers 500 instead of 503, and `/healthz` stays 503 for 120 s after the cluster
   recovers. Without the `on_reply` change the new unit test panics.
 
+## 2026-10-05 — CI frees a nearly full runner volume (N65; #50)
+
+- `.github/scripts/free_disk.sh`: logs free space; below 6 GiB empties the Zig build cache and
+  older toolchains. Run by `INSTALL_ZIG` in `ci.yml` and before the release build.
+- Verified locally: with room it changes nothing; with the threshold forced above the free space
+  it removes the build cache and the older toolchain, keeps the pinned one, and warns.
+
