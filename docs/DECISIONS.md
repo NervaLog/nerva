@@ -581,8 +581,8 @@ are maintained inside the commit, like rows. This first step covers `count` and 
   moves, deletes and stale reads; backfill in several pulses with writes on both sides of the
   cursor; refusals; paging); the VOPR declares random views and checks every ready view's
   groups, hash and group count against groups computed from the model's rows, reproduces
-  `view_key_field` and admission (`views_busy`) exactly, and checks a ready view never builds again;
-  `tests/views/maintained.py` backfills 5,000 seats and compares each answer with `nerva view`
+  `view_key_field` and admission (`views_busy`) exactly, and checks a ready view never builds
+  again; `tests/views/maintained.py` backfills 5,000 seats and compares each answer with `nerva view`
   at the same op, recomputing the hash in Python. Mutation-tested: groups that never lose rows
   fail the unit tests and the VOPR (seeds 1 and 13); rows past the cursor counted twice fail
   the backfill test; admission refusing one group early fails the VOPR (seed 3).
