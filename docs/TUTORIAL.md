@@ -587,7 +587,7 @@ n "$A/v1/views/revenue/groups?limit=100"
 ```
 ```json
 {"view":"revenue","id":1,"state":"ready","op":"77",
- "view_hash":"0c8ceeee30d22fcca2f2a5b97e80be1cf94912ed80cfc7218ff1225874c29739",
+ "hash":"0c8ceeee30d22fcca2f2a5b97e80be1cf94912ed80cfc7218ff1225874c29739",
  "group_count":"2",
  "groups":[{"section":1,"count":"1","sum_price":"100"},
            {"section":2,"count":"2","sum_price":"500"}],
