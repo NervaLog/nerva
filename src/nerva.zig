@@ -41,6 +41,25 @@ pub const tree_ids = struct {
         .timestamp = 7,
         .key = 8,
     };
+
+    pub const Member = .{
+        .timestamp = 9,
+        .key = 10,
+        // `Member.position` while present: a group's members of one min or max slot, by value.
+        .order = 11,
+    };
+
+    pub const GroupVersion = .{
+        .timestamp = 12,
+        // `group_version_key`: a group's versions, by op (N62).
+        .version = 13,
+    };
+
+    pub const ViewVersion = .{
+        .timestamp = 14,
+        // `view_version_key`: a view's versions, by op (N62).
+        .version = 15,
+    };
 };
 
 /// The LSM key of a row: `table` in the high 64 bits, `id` in the low 64 bits.
@@ -256,6 +275,10 @@ pub const group_key_size_max = 64;
 // The budget of group writes per op, and the rows a pulse backfills, depend on the message
 // size: `StateMachine.groups_per_op_max`.
 
+/// `min` and `max` aggregates over one table, counted across its views (N62): each is a member
+/// of its group's order for every row in the view.
+pub const view_extremes_per_table_max = 4;
+
 pub const view_where_max = 4;
 pub const view_group_by_max = 3;
 pub const view_aggregates_max = 6;
@@ -348,8 +371,11 @@ pub const DeclareStatus = enum(u32) {
     table_invalid = 5,
     views_full = 6,
     table_views_full = 7,
-    /// `min` or `max` (maintained from a later change, N52).
+    /// No longer returned: `min` and `max` are maintained since N62.
     unsupported = 8,
+    /// The table's views would have more than `view_extremes_per_table_max` `min` and `max`
+    /// aggregates.
+    table_extremes_full = 9,
 };
 
 /// The `declare_view` result.
@@ -410,7 +436,8 @@ pub const Group = extern struct {
     /// The group_by fields' bytes, then zeros; compared on every update (a hash collision fails
     /// the view).
     group_key: [group_key_size_max]u8,
-    /// Per aggregate slot: an i128 sum, little-endian (zero for `count`).
+    /// Per aggregate slot, an i128, little-endian: the sum (`sum`), the smallest or largest
+    /// value (`min`, `max`; zero while the group is empty), or zero (`count`).
     sums: [view_aggregates_max][16]u8,
     reserved: [64]u8 = @splat(0),
 
@@ -420,8 +447,107 @@ pub const Group = extern struct {
     }
 };
 
-/// The `get_view` event: the latest state of one view, and a page of its groups in storage
-/// order (by group hash).
+/// A row's place in one `min` or `max` slot of a view (N62): one per view, slot and row the
+/// view has seen. Never removed: a row that leaves the view is kept, absent (out of `order`).
+pub const Member = extern struct {
+    /// `member_key(view_id, slot, row id)`.
+    key: u128,
+    /// While present, `member_order(order prefix, value)`, indexed as `order`: the members of a
+    /// group's slot, by value. Zero while absent.
+    position: u128,
+    timestamp: u64,
+    view_id: u32,
+    slot: u8,
+    flags: Flags,
+    reserved: [2]u8 = @splat(0),
+    /// While present, the group's key (compared when the order is read: a prefix collision
+    /// fails the view). Zero while absent.
+    group_key: [group_key_size_max]u8,
+    /// While present, the row's value of the slot's field, an i128, little-endian.
+    value: [16]u8,
+
+    pub const Flags = packed struct(u8) {
+        present: bool = false,
+        padding: u7 = 0,
+    };
+
+    comptime {
+        assert(@sizeOf(Member) == 128);
+        assert(stdx.no_padding(Member));
+    }
+};
+
+/// A group as one op left it (N62): written once for every group an op changes, so a view can
+/// be read as of a past op.
+pub const GroupVersion = extern struct {
+    /// `group_version_key(group key, op)`.
+    version: u128,
+    timestamp: u64,
+    op: u64,
+    /// The group's `Group.key`.
+    key: u128,
+    count: u64,
+    group_key: [group_key_size_max]u8,
+    sums: [view_aggregates_max][16]u8,
+    reserved: [40]u8 = @splat(0),
+
+    comptime {
+        assert(@sizeOf(GroupVersion) == 256);
+        assert(stdx.no_padding(GroupVersion));
+    }
+};
+
+/// A view's header as one op left it (N62): written once for every view an op changes.
+pub const ViewVersion = extern struct {
+    /// `view_version_key(view_id, op)`.
+    version: u128,
+    timestamp: u64,
+    op: u64,
+    group_count: u64,
+    state: ViewState,
+    reserved_a: [7]u8 = @splat(0),
+    hash: [32]u8,
+    reserved_b: [48]u8 = @splat(0),
+
+    comptime {
+        assert(@sizeOf(ViewVersion) == 128);
+        assert(stdx.no_padding(ViewVersion));
+    }
+};
+
+/// Ops are below 2^57 (`group_version_key`), about 4,500 years at a million ops a second.
+pub const version_op_bits = 57;
+
+/// A member's place in the members tree: unique per view, slot and row.
+pub fn member_key(view_id: u64, slot: u8, id: u64) u128 {
+    assert(view_id >= 1 and view_id <= views_max);
+    assert(slot < view_aggregates_max);
+    return @as(u128, view_id) << 72 | @as(u128, slot) << 64 | id;
+}
+
+/// A member's place in its group's order: the group's prefix, then the value, ordered.
+pub fn member_order(prefix: u64, value_ordered: u64) u128 {
+    return @as(u128, prefix) << 64 | value_ordered;
+}
+
+/// A group's version at `op`: `view_id`, then the group hash, then the op, so that a group's
+/// versions are adjacent and ordered by op.
+pub fn group_version_key(group_key: u128, op: u64) u128 {
+    const view_id: u64 = @intCast(group_key >> 64);
+    const group_hash: u64 = @truncate(group_key);
+    assert(view_id >= 1 and view_id <= views_max);
+    assert(op < 1 << version_op_bits);
+    return @as(u128, view_id) << (64 + version_op_bits) |
+        @as(u128, group_hash) << version_op_bits | op;
+}
+
+pub fn view_version_key(view_id: u64, op: u64) u128 {
+    assert(view_id >= 1 and view_id <= views_max);
+    return @as(u128, view_id) << 64 | op;
+}
+
+/// The `get_view` event: the state of one view, latest or as of a past op, and a page of its
+/// groups in storage order (by group hash).
 pub const ViewQuery = extern struct {
     /// The view, by id; or zero, and the view by `name`.
     view_id: u64,
@@ -431,7 +557,11 @@ pub const ViewQuery = extern struct {
     limit: u32,
     /// With `view_id` zero: the view's name, zero-padded. Otherwise all zero.
     name: [32]u8 = @splat(0),
-    reserved: [12]u8 = @splat(0),
+    reserved: [4]u8 = @splat(0),
+    /// Zero: the latest. Otherwise the view as the op `as_of` left it (N62), with at most
+    /// `StateMachine.view_as_of_limit_max` groups per page. Taken from v0.3.0's reserved
+    /// bytes, which its clients send as zeros: their queries read the latest, as they did.
+    as_of: u64 = 0,
 
     comptime {
         assert(@sizeOf(ViewQuery) == 64);
