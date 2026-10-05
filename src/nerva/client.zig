@@ -30,6 +30,13 @@ const HistoryFilter = nerva.HistoryFilter;
 const Change = nerva.Change;
 
 const VSRClient = vsr.ClientType(Operation, MessageBus);
+
+comptime {
+    // Replicas read `previous_request_latency` as nanoseconds from releases before 0.17.0, and
+    // as microseconds from 0.17.0 on (`replica.zig`); `Client.send` sends nanoseconds.
+    assert(constants.config.process.release.value <
+        vsr.Release.from(.{ .major = 0, .minor = 17, .patch = 0 }).value);
+}
 const Body = [constants.message_body_size_max]u8;
 
 /// Changes per `get_history` call in `row_as_of`.
@@ -65,6 +72,9 @@ pub const Client = struct {
     reply: *align(constants.cache_line_size) Body,
     reply_size: ?usize,
     request: *align(constants.cache_line_size) Body,
+    /// The previous request's round trip, sent with the next request so that the primary
+    /// records it as `client_request_round_trip` (0 until a request has completed).
+    latency_previous_ns: u32,
 
     /// Connects and registers a session; blocks until registered.
     pub fn init(client: *Client, allocator: std.mem.Allocator, options: Options) !void {
@@ -82,6 +92,7 @@ pub const Client = struct {
             .reply = undefined,
             .reply_size = null,
             .request = undefined,
+            .latency_previous_ns = 0,
         };
         errdefer client.io.deinit();
 
@@ -168,12 +179,7 @@ pub const Client = struct {
         try client.ensure_idle();
         const body = std.mem.asBytes(&filter);
         stdx.copy_disjoint(.exact, u8, client.request[0..body.len], body);
-        client.vsr_client.request(
-            on_reply,
-            @intFromPtr(client),
-            .get_changes,
-            client.request[0..body.len],
-        );
+        client.send(.get_changes, client.request[0..body.len]);
         try client.run_until_reply();
 
         const reply = stdx.bytes_as_slice(.exact, Change, client.reply[0..client.reply_size.?]);
@@ -193,12 +199,7 @@ pub const Client = struct {
         try client.ensure_idle();
         const body = std.mem.asBytes(&filter);
         stdx.copy_disjoint(.exact, u8, client.request[0..body.len], body);
-        client.vsr_client.request(
-            on_reply,
-            @intFromPtr(client),
-            .get_history,
-            client.request[0..body.len],
-        );
+        client.send(.get_history, client.request[0..body.len]);
         try client.run_until_reply();
 
         const reply = stdx.bytes_as_slice(.exact, Change, client.reply[0..client.reply_size.?]);
@@ -256,12 +257,7 @@ pub const Client = struct {
         encoder.add(@intCast(events.len));
         const body_size = encoder.finish();
 
-        client.vsr_client.request(
-            on_reply,
-            @intFromPtr(client),
-            operation,
-            client.request[0..body_size],
-        );
+        client.send(operation, client.request[0..body_size]);
         try client.run_until_reply();
 
         var decoder = MultiBatchDecoder.init(client.reply[0..client.reply_size.?], .{
@@ -271,6 +267,27 @@ pub const Client = struct {
         const results = decoder.pop().?;
         assert(results.len == event_count * operation.result_size());
         return results;
+    }
+
+    /// Like `vsr.Client.request`, but the header carries the previous round trip.
+    fn send(client: *Client, operation: Operation, events: []const u8) void {
+        assert(client.state == .waiting);
+        assert(events.len % operation.event_size() == 0);
+        assert(events.len <= client.vsr_client.batch_size_limit.?);
+
+        const message = client.vsr_client.get_message().build(.request);
+        message.header.* = .{
+            .client = client.vsr_client.id,
+            .request = 0, // Set by `raw_request`.
+            .cluster = client.options.cluster,
+            .command = .request,
+            .release = client.vsr_client.release,
+            .operation = operation.to_vsr(),
+            .size = @intCast(@sizeOf(vsr.Header) + events.len),
+            .previous_request_latency = client.latency_previous_ns,
+        };
+        stdx.copy_disjoint(.exact, u8, message.body_used(), events);
+        client.vsr_client.raw_request(on_reply, @intFromPtr(client), message);
     }
 
     fn ensure_idle(client: *Client) Error!void {
@@ -291,7 +308,12 @@ pub const Client = struct {
         var tick_next = start;
         while (true) {
             switch (client.state) {
-                .idle => return,
+                .idle => {
+                    // Saturates past 4.29 s, which a primary still records as a slow round trip.
+                    client.latency_previous_ns =
+                        std.math.lossyCast(u32, start.elapsed(client.time_os.monotonic()).ns);
+                    return;
+                },
                 .evicted => return error.Evicted,
                 .registering, .waiting => {},
                 .timed_out => unreachable,

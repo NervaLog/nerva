@@ -181,6 +181,7 @@ fn command_start(
             .batch_size_limit = args.request_size_limit - @sizeOf(vsr.Header),
             .lsm_forest_compaction_block_count = args.lsm_forest_compaction_block_count,
             .lsm_forest_node_count = args.lsm_forest_node_count,
+            .cache_entries_rows = args.cache_rows_count,
         },
         .message_bus_options = .{
             .configuration = args.addresses.slice(),

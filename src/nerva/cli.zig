@@ -8,6 +8,7 @@ const std = @import("std");
 
 const stdx = @import("stdx");
 const vsr = @import("../vsr.zig");
+const nerva = @import("../nerva.zig");
 const constants = @import("../constants.zig");
 const IO = @import("../io.zig").IO;
 const Storage = @import("../storage.zig").StorageType(IO);
@@ -31,6 +32,7 @@ const CLIArgs = union(enum) {
     start: struct {
         addresses: vsr.ClusterAddress,
         cache_grid: ?ByteSize = null,
+        cache_rows: ?ByteSize = null,
         statsd: ?[]const u8 = null,
         trace: ?[]const u8 = null,
         development: bool = false,
@@ -65,6 +67,7 @@ const CLIArgs = union(enum) {
         \\               [--development] [--log-debug] <path>
         \\
         \\  nerva start --addresses=<addresses> [--cache-grid=<size><KiB|MiB|GiB>]
+        \\              [--cache-rows=<size><KiB|MiB|GiB>]
         \\              [--statsd=<host:port>] [--trace=<path>]
         \\              [--development] [--log-debug] <path>
         \\
@@ -108,6 +111,10 @@ const CLIArgs = union(enum) {
         \\
         \\  --cache-grid=<size><KiB|MiB|GiB>
         \\        Memory for caching data file blocks.
+        \\
+        \\  --cache-rows=<size><KiB|MiB|GiB>
+        \\        Memory for caching rows (128 bytes each), rounded down to a whole number of
+        \\        cache sets. The default is the minimum, one set.
         \\
         \\  --statsd=<host:port>
         \\        Send the replica's metrics as statsd over UDP every 10 seconds. The port
@@ -163,6 +170,7 @@ pub const Command = union(enum) {
     pub const Start = struct {
         addresses: vsr.ClusterAddress,
         cache_grid_blocks: u32,
+        cache_rows_count: u32,
         storage_size_limit: u64,
         pipeline_requests_limit: u32,
         request_size_limit: u32,
@@ -189,6 +197,7 @@ pub fn parse_args(flags: *stdx.Flags) Command {
         .start => |start| .{ .start = start_resolve(.{
             .addresses = start.addresses,
             .cache_grid = start.cache_grid,
+            .cache_rows = start.cache_rows,
             .statsd = start.statsd,
             .trace = start.trace,
             .development = start.development,
@@ -233,6 +242,8 @@ const Error = error{
     ReplicaIndexOutOfRange,
     CacheGridTooSmall,
     CacheGridNotBlockMultiple,
+    CacheRowsTooSmall,
+    CacheRowsTooLarge,
     StatsdAddressInvalid,
     TracePathEmpty,
 };
@@ -253,6 +264,11 @@ fn error_message(err: Error) []const u8 {
             "--cache-grid must be a multiple of the block size ({} bytes)",
             .{constants.block_size},
         ),
+        error.CacheRowsTooSmall => std.fmt.comptimePrint(
+            "--cache-rows must be at least {} bytes",
+            .{cache_rows_size_multiple},
+        ),
+        error.CacheRowsTooLarge => "--cache-rows must hold fewer than 2^32 rows",
         error.StatsdAddressInvalid => "--statsd must be <host:port> with a non-zero port " ++
             "(IPv6 in brackets)",
         error.TracePathEmpty => "--trace must name a file",
@@ -271,12 +287,26 @@ const cache_grid_size_min = constants.block_size * Grid.Cache.value_count_max_mu
 const StartArgs = struct {
     addresses: vsr.ClusterAddress,
     cache_grid: ?ByteSize,
+    cache_rows: ?ByteSize,
     statsd: ?[]const u8,
     trace: ?[]const u8,
     development: bool,
     log_debug: bool,
     path: []const u8,
 };
+
+const cache_rows_multiple = StateMachine.cache_entries_rows_multiple;
+const cache_rows_size_multiple = cache_rows_multiple * @sizeOf(nerva.Row);
+
+/// Rows that fit in `size`, rounded down to whole cache sets.
+fn cache_rows_resolve(size: ?ByteSize) Error!u32 {
+    const bytes = if (size) |value| value.bytes() else return cache_rows_multiple;
+    const rows = @divFloor(bytes, @sizeOf(nerva.Row));
+    const rows_rounded = rows - rows % cache_rows_multiple;
+    if (rows_rounded == 0) return error.CacheRowsTooSmall;
+    if (rows_rounded > std.math.maxInt(u32)) return error.CacheRowsTooLarge;
+    return @intCast(rows_rounded);
+}
 
 const statsd_port_default = 8125;
 
@@ -300,6 +330,7 @@ fn start_resolve(start: StartArgs) Error!Command.Start {
     if (cache_grid_size < cache_grid_size_min) return error.CacheGridTooSmall;
     if (cache_grid_size % constants.block_size != 0) return error.CacheGridNotBlockMultiple;
 
+    const cache_rows_count = try cache_rows_resolve(start.cache_rows);
     const statsd: ?stdx.SocketAddress = if (start.statsd) |text| try statsd_parse(text) else null;
     if (start.trace) |path| {
         if (path.len == 0) return error.TracePathEmpty;
@@ -309,6 +340,7 @@ fn start_resolve(start: StartArgs) Error!Command.Start {
     return .{
         .addresses = start.addresses,
         .cache_grid_blocks = @intCast(@divExact(cache_grid_size, constants.block_size)),
+        .cache_rows_count = cache_rows_count,
         .storage_size_limit = constants.storage_size_limit_default,
         .pipeline_requests_limit = if (start.development)
             0
@@ -380,12 +412,38 @@ test statsd_parse {
     }
 }
 
+test cache_rows_resolve {
+    try std.testing.expectEqual(cache_rows_multiple, try cache_rows_resolve(null));
+
+    const mib_64: ByteSize = .{ .value = 64 * stdx.MiB };
+    const rows_64 = try cache_rows_resolve(mib_64);
+    try std.testing.expectEqual(@as(u32, 0), rows_64 % cache_rows_multiple);
+    try std.testing.expect(rows_64 <= 64 * stdx.MiB / @sizeOf(nerva.Row));
+    try std.testing.expect(rows_64 > 64 * stdx.MiB / @sizeOf(nerva.Row) - cache_rows_multiple);
+
+    // One byte short of a set rounds down to nothing; exactly a set is the minimum.
+    try std.testing.expectError(
+        error.CacheRowsTooSmall,
+        cache_rows_resolve(.{ .value = cache_rows_size_multiple - 1 }),
+    );
+    try std.testing.expectEqual(
+        cache_rows_multiple,
+        try cache_rows_resolve(.{ .value = cache_rows_size_multiple }),
+    );
+    // A size just over a set rounds down to one set.
+    try std.testing.expectEqual(
+        cache_rows_multiple,
+        try cache_rows_resolve(.{ .value = cache_rows_size_multiple + @sizeOf(nerva.Row) }),
+    );
+}
+
 test start_resolve {
     var diagnostic: ?[]const u8 = null;
     const addresses = try vsr.ClusterAddress.parse_flag_value("3001,3002,3003", &diagnostic);
     const start: StartArgs = .{
         .addresses = addresses,
         .cache_grid = null,
+        .cache_rows = null,
         .statsd = null,
         .trace = null,
         .development = true,
