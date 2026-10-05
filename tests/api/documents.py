@@ -12,8 +12,10 @@ Runs one replica and two API gateways, then:
   that shrank leaves trailing chunks behind, which a read must ignore);
 - each namespace's document feed, paged with random limits (some smaller than one document's
   chunks), equal to the model's list of writes;
-- limits: keys of 1024 bytes and values of 64 KiB accepted, one byte more refused; a commit too
-  large for one request refused whole; `as_of` not yet committed refused;
+- limits: keys of 1024 bytes and values of 512 KiB accepted, written in one transaction and read
+  back, one byte more refused (#25); a commit too large for one request refused whole; a `get`
+  of more chunks than 256 documents of 64 KiB answers 413, one just under answers 200; `as_of`
+  not yet committed refused;
 - document rows never appear in `/v1/changes`, and the documents table is refused by the row
   routes;
 - eight threads incrementing one document with read-modify-write through both gateways,
@@ -146,11 +148,15 @@ def check_limits(port, model):
         return request(port, "POST", "/v1/documents/commit",
                        {"namespace": namespace, "writes": writes})
 
-    status, body = commit([{"key": "x" * 1024, "value_hex": "ab" * (64 * 1024)}])
+    largest = [{"key": "x" * 1024, "value_hex": "ab" * (512 * 1024)}]
+    status, body = commit(largest)
     assert status == 200, body
-    model.apply(int(body["op"]), "9", [{"key": "x" * 1024, "value_hex": "ab" * (64 * 1024)}])
+    model.apply(int(body["op"]), "9", largest)
+    status, body = request(port, "POST", "/v1/documents/get",
+                           {"namespace": "9", "keys": ["x" * 1024]})
+    assert status == 200 and body["documents"][0]["value_hex"] == largest[0]["value_hex"], status
     for writes in ([{"key": "x" * 1025, "value_hex": ""}],
-                   [{"key": "a", "value_hex": "ab" * (64 * 1024 + 1)}],
+                   [{"key": "a", "value_hex": "ab" * (512 * 1024 + 1)}],
                    [{"key": "", "value_hex": ""}]):
         status, body = commit(writes)
         assert status == 400, (status, body)
@@ -164,6 +170,17 @@ def check_limits(port, model):
     status, body = request(port, "POST", "/v1/documents/get",
                            {"namespace": "9", "keys": ["a"], "as_of": str(10**15)})
     assert status == 400 and "not yet committed" in body["error"], body
+    # A get reads at most as many chunks as 256 documents of 64 KiB: 33 of 512 KiB are just
+    # over, 32 just under.
+    keys = [f"large/{i}" for i in range(33)]
+    for key in keys:
+        status, body = commit([{"key": key, "value_hex": "ef" * (512 * 1024)}], namespace="11")
+        assert status == 200, (status, body)
+    status, body = request(port, "POST", "/v1/documents/get", {"namespace": "11", "keys": keys})
+    assert status == 413 and "fewer keys" in body["error"], (status, body)
+    status, body = request(port, "POST", "/v1/documents/get",
+                           {"namespace": "11", "keys": keys[:32]})
+    assert status == 200 and all(d["exists"] for d in body["documents"]), (status, body if status != 200 else "")
 
 
 def check_isolation(port):

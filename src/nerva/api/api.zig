@@ -49,6 +49,7 @@ const assert = std.debug.assert;
 const nerva = @import("../../nerva.zig");
 const catalog = @import("../catalog.zig");
 const declared_views = @import("../view/declared.zig");
+const documents = @import("../documents.zig");
 const documents_routes = @import("documents_routes.zig");
 
 const Change = nerva.Change;
@@ -1542,7 +1543,7 @@ test "api: documents are written, read, conflict and deleted by key" {
         \\{"namespace":"7","writes":[{"key":"\ud800","delete":true}]}
         ,
         \\{"namespace":"7","writes":[{"key":"a","value_hex":"
-        ++ "00" ** (64 * 1024 + 1) ++
+        ++ "00" ** (documents.value_size_max + 1) ++
             \\"}]}
     };
     for (commit_refused) |body| {

@@ -134,7 +134,7 @@ fn main_smoke(gpa: std.mem.Allocator) !void {
             .vsr_superblock => 3,
             .nerva_adds => 1_000_000,
             .nerva_http_head => 50_000,
-            .nerva_documents => 200,
+            .nerva_documents => 25, // Values up to 512 KiB (N74).
 
             inline .ewah,
             .lsm_segmented_array,
