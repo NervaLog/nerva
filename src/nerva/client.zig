@@ -16,6 +16,7 @@ const nerva = @import("../nerva.zig");
 const IO = @import("../io.zig").IO;
 const MessageBus = @import("../message_bus.zig").MessageBusType(IO);
 const MessagePool = @import("../message_pool.zig").MessagePool;
+const MessageBuffer = @import("../message_buffer.zig").MessageBuffer;
 const Message = MessagePool.Message;
 const MultiBatchDecoder = vsr.multi_batch.MultiBatchDecoder;
 const MultiBatchEncoder = vsr.multi_batch.MultiBatchEncoder;
@@ -470,8 +471,9 @@ pub const Client = struct {
         log.warn("evicted: {s}", .{@tagName(eviction.header.reason)});
         // The VSR client's contract asks the callback to deinit it, but the callback runs inside
         // the message bus's receive path, which goes on to use the buffer `deinit` would free
-        // (#52). `Client.deinit` deinits it instead; the evicted VSR client processes no more
-        // messages because nothing drives its IO until then.
+        // (#52). `Client.deinit` deinits it instead. Nothing drives its IO after the call that
+        // received the eviction; messages other connections delivered in that same IO pass are
+        // dropped by the VSR client (a local patch, #74).
         client.state = .evicted;
     }
 
@@ -491,4 +493,16 @@ test "Client: a reply after the timeout is dropped (#42)" {
     Client.on_reply(@intFromPtr(&client), .register, 0, aligned);
     try std.testing.expectEqual(.timed_out, client.state);
     try std.testing.expectEqual(null, client.reply_size);
+}
+
+test "Client: a message after the eviction, in the same IO pass, is dropped (#74)" {
+    // Only the field `on_messages` reads before dropping the buffer is set.
+    var vsr_client: VSRClient = undefined;
+    vsr_client.evicted = true;
+    var pool = try MessagePool.init_capacity(std.testing.allocator, 1);
+    defer pool.deinit(std.testing.allocator);
+    var buffer = MessageBuffer.init(&pool);
+    defer buffer.deinit(&pool);
+    VSRClient.on_messages(&vsr_client.message_bus, &buffer);
+    try std.testing.expectEqual(.evicted, buffer.invalid.?);
 }
