@@ -2993,7 +2993,7 @@ pub fn StateMachineType(comptime Storage: type) type {
             if (table_views == nerva.views_per_table_max) {
                 return .{ .status = .table_views_full, .view_id = 0, .op = 0 };
             }
-            if (table_extremes > nerva.view_extremes_per_table_max) {
+            if (table_extremes > self.table_extremes_max()) {
                 return .{ .status = .table_extremes_full, .view_id = 0, .op = 0 };
             }
 
@@ -3019,6 +3019,13 @@ pub fn StateMachineType(comptime Storage: type) type {
 
         /// The rows one pulse adds to `view`: each may write a group and a member in each of the
         /// view's `min` and `max` slots, within the op's limits for both.
+        /// The `min` and `max` slots a table's views may hold between them: also no more than
+        /// one op's member budget, since a write takes a member in each slot (#68). Only
+        /// configurations with tiny requests (the VOPR's) are below `view_extremes_per_table_max`.
+        fn table_extremes_max(self: *const StateMachine) u32 {
+            return @min(nerva.view_extremes_per_table_max, self.member_writes_limit);
+        }
+
         fn backfill_rows_max(self: *const StateMachine, view: *const View) u32 {
             const extremes = @max(1, views.extreme_count(&view.definition));
             const rows = @min(self.group_writes_limit, @divFloor(self.member_writes_limit, extremes));

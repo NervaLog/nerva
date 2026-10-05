@@ -1935,7 +1935,12 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                 }
                 if (workload.model_views.items.len == nerva.views_max) break :expected .views_full;
                 if (table_views == nerva.views_per_table_max) break :expected .table_views_full;
-                if (table_extremes > nerva.view_extremes_per_table_max) {
+                // As the state machine's `table_extremes_max` (#68).
+                const extremes_max = @min(
+                    nerva.view_extremes_per_table_max,
+                    workload.member_writes_limit(),
+                );
+                if (table_extremes > extremes_max) {
                     workload.table_extremes_full += 1;
                     break :expected .table_extremes_full;
                 }

@@ -733,3 +733,11 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
   (api, documents, adds), `fuzz -- smoke` (exit 0; the vendored `lsm_segmented_array` reports
   17 s here, slower than smoke wants, unrelated).
 
+## 2026-10-05 — `min`/`max` slots bounded by the member budget (N77; #68)
+
+- `src/nerva/state_machine.zig`: `table_extremes_max`, `min(4, member_writes_limit)`, at
+  declaration. `src/nerva/workload.zig`: the VOPR model follows.
+- Verified: the seed that failed `main`'s lanes (17320319949900435868) and the other one
+  (11511081922386736357) pass; seeds 1, 2, 5 and 30 random in ReleaseSafe pass; `check`,
+  `test:fmt`, `test:unit` (the sandbox-denied perf test aside).
+
