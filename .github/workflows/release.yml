@@ -2,7 +2,8 @@
 # CI on that commit, then binaries for four targets, then the tag and the GitHub release.
 # A version with a suffix (0.2.0-rc.1) is a prerelease. Releasing a version twice fails.
 # The release notes are the version's section of CHANGELOG.md (`## v<VERSION> — <date>`); a
-# version without one is refused before CI runs.
+# version without one is refused before CI runs. Each release carries its software bill of
+# materials, `nerva-v<VERSION>.cdx.json` (CycloneDX, N62), covered by SHA256SUMS.
 name: Release
 
 on:
@@ -45,6 +46,11 @@ jobs:
         run: |
           .github/scripts/release_notes.sh "$TAG" > notes.md
           cat notes.md
+
+      - name: Refuse a version whose bill of materials cannot be written
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: python3 .github/scripts/sbom.py "$TAG" "$GITHUB_SHA" > /dev/null
 
       - name: Refuse a version already released
         env:
@@ -89,7 +95,8 @@ jobs:
             cp zig-out/bin/nerva LICENSE NOTICE "$name/"
             tar -czf "dist/$name.tar.gz" "$name"
           done
-          (cd dist && sha256sum -- *.tar.gz > SHA256SUMS)
+          python3 .github/scripts/sbom.py "$TAG" "$GITHUB_SHA" > "dist/nerva-$TAG.cdx.json"
+          (cd dist && sha256sum -- *.tar.gz *.cdx.json > SHA256SUMS)
 
       - name: Check the Linux x86_64 binary runs
         run: |
@@ -111,7 +118,8 @@ jobs:
             echo "---"
             echo
             echo "Nerva at commit $GITHUB_SHA. Binaries report \`$BINARY_VERSION\`." \
-              "Check downloads against \`SHA256SUMS\`."
+              "Check downloads against \`SHA256SUMS\`. What they are built from is in" \
+              "\`nerva-$TAG.cdx.json\` (CycloneDX)."
           } > notes.md
           gh release create "$TAG" dist/* "${prerelease[@]}" --target "$GITHUB_SHA" \
             --title "Nerva $TAG" --notes-file notes.md

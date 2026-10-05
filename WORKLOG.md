@@ -501,3 +501,14 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
   past a checkpoint while the v0.2.0 one panics at the first operation it does not know.
 - Mutation-tested: the gate off (a commit succeeds without replica 1), unannounced peers
   admitted, and prepares of another release admitted each fail a test.
+
+## 2026-10-05 — A software bill of materials with every release (N62)
+
+- `.github/scripts/sbom.py`: CycloneDX 1.5 JSON for a tag and commit, from `build.zig`,
+  UPSTREAM.md and `zig/download.sh`; refuses disagreeing or missing pins.
+- `.github/workflows/release.yml`: the `version` job checks it can be written; the release adds
+  `nerva-v<VERSION>.cdx.json` to the assets and to `SHA256SUMS`, and the notes name it.
+- `.github/scripts/test_sbom.py`, run in CI's `system` job. README: the release paragraph.
+- Verified: the tests (6), mutation-tested; strict validation of v0.3.0's SBOM against the
+  CycloneDX 1.5 schema; a dry run of the release step's `dist/` and `SHA256SUMS`.
+

@@ -104,7 +104,10 @@ unit, integration, API, view, mixed-release and demo tests, every fuzzer at its 
 2, 5 and one random seed (printed, so a failure replays), as parallel jobs (N57). A commit to `main` that changes `VERSION` runs CI on that commit, then
 publishes binaries for Linux and macOS (x86_64, aarch64) as GitHub release `v<VERSION>`
 (`release.yml`), with that version's section of [CHANGELOG.md](./CHANGELOG.md) as the release
-notes; releasing a version twice, or without notes, fails. A separate workflow,
+notes; releasing a version twice, or without notes, fails. Each release also carries its bill of
+materials, `nerva-v<VERSION>.cdx.json` (CycloneDX 1.5, N62): Nerva, the vendored TigerBeetle
+commit, and the Zig standard library and compiler, read from the repository's pins and covered
+by `SHA256SUMS`. A separate workflow,
 `fuzz.yml`, runs every fuzzer and the VOPR on random seeds for a time budget; it is started by hand
 on runners brought up for it.
 
