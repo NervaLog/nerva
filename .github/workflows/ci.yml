@@ -1,7 +1,7 @@
 # Every push and pull request to main, and every release (release.yml calls this first).
 # Every job runs on Botpike's own runners (Botpike/ci-runners): a Fly Machine started for the
 # job, performance-2x with 8 GB and a 10 GB volume that keeps the Zig cache between jobs.
-# The jobs run in parallel, balanced so none is much longer than the others (N51).
+# The jobs run in parallel, balanced so none is much longer than the others (N54).
 name: CI
 
 on:
@@ -92,6 +92,24 @@ jobs:
       # where it is allowed without hardware counters (UPSTREAM.md).
       - name: Unit tests
         run: ./zig/zig build test:unit
+
+  # Every fuzzer, vendored and Nerva's own, at its smoke size and seed (N46, N53), so a fuzzer that
+  # stops working fails here; a job of its own, so it does not lengthen the unit tests'.
+  # `lsm_segmented_array` logs "too slow for the smoke mode" in Debug; that is a warning, not a
+  # failure.
+  fuzz:
+    runs-on: [self-hosted, fly]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned Zig
+        run: eval "$INSTALL_ZIG"
+
+      - name: Fuzzers (smoke)
+        run: ./zig/zig build fuzz -- smoke
 
   # The demos, three replicas and all, while processes are crashed and restarted: each demo on its
   # own Machine, run exactly as `zig build -Drelease test:demo -- --seconds=75` runs it.

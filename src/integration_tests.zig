@@ -12,6 +12,7 @@ const testing = std.testing;
 
 const stdx = @import("stdx");
 const vsr = @import("vsr.zig");
+const constants = @import("constants.zig");
 const nerva = @import("nerva.zig");
 const Client = @import("nerva/client.zig").Client;
 const workload = @import("nerva/workload.zig");
@@ -364,6 +365,21 @@ fn scenario_cluster() !void {
     try expect_as_of(daemon_a, std.math.maxInt(u64), 0xbb);
     try testing.expect(op_put > 1); // Client registration commits first.
     try testing.expectEqual(null, try daemon_b.row_as_of(1, 1, op_put - 1));
+
+    // Latency: a reply ends the client's wait at once, not at the end of its 10 ms tick, so the
+    // median lookup is well under one tick (it was always at least one, N51).
+    {
+        var durations_ns: [50]u64 = undefined;
+        for (&durations_ns) |*duration_ns| {
+            var timer = try std.time.Timer.start();
+            _ = try lookup(daemon_a, 1, 1);
+            duration_ns.* = timer.read();
+        }
+        std.mem.sortUnstable(u64, &durations_ns, {}, std.sort.asc(u64));
+        const median_ns = durations_ns[durations_ns.len / 2];
+        std.debug.print("integration: lookup median {} us\n", .{median_ns / std.time.ns_per_us});
+        try testing.expect(median_ns < constants.tick_ms * std.time.ns_per_ms);
+    }
 
     // Observability: replica 0 (the primary) sends request timings and gauges over statsd, and
     // replica 1 has written commit spans to its trace file.

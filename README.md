@@ -59,7 +59,7 @@ simulator workload and tests).
 
 Rows are identified by `(table, id)` and hold a fixed 80-byte value. A row's **version** is the
 op of its last write; zero means it has never existed, and deletes leave a tombstone so versions
-stay exact. Four operations:
+stay exact. The operations:
 
 | Operation | Event → result | Semantics |
 |---|---|---|
@@ -67,6 +67,9 @@ stay exact. Four operations:
 | `commit` | `Entry` → `EntryResult` | One batch is one transaction of `read` (asserts `op_seen`), `put`, `delete` and `add` entries. If any read is stale (`conflict`), any add cannot apply, or any entry is invalid, nothing applies and the other entries report `aborted`; otherwise every entry reports `ok` with the commit op, and each add what it applied and the field's new value. |
 | `get_changes` | `ChangesFilter` → `Change[]` | Committed writes in op order from a timestamp cursor, ending with an `end` record that carries the next cursor and, when complete, the op the feed reflects. |
 | `get_history` | `HistoryFilter` → `Change[]` | One row's writes, newest first, through an index on the change feed. With `op_max = N`, the first change returned is the row as of op `N` (`Client.row_as_of`). |
+| `declare_view` | `ViewDefinition` → `DeclareResult` | Declares a view maintained from then on by every commit, with its fields resolved to offsets (N52). |
+| `get_view` | `ViewQuery` → `ViewRecord[]` | A maintained view's state, hash and group count, and a page of its groups (N52). |
+| `pulse` | — | Sent by the cluster to itself while a view is building: adds a bounded number of existing rows to it (N52). |
 
 Commits execute serially in op order, so validating each read's version at commit time gives
 serializable transactions over point reads.
@@ -97,8 +100,8 @@ in-memory model replayed in op order.
 Linux (io_uring) or macOS; x86_64 with AES or aarch64.
 
 CI (`.github/workflows/ci.yml`) runs on every push and pull request to `main`: typecheck, format,
-unit, integration, API, view and demo tests, and the VOPR on seeds 1, 2, 5 and one random seed (printed,
-so a failure replays), as parallel jobs (N51). A commit to `main` that changes `VERSION` runs CI on that commit, then
+unit, integration, API, view and demo tests, every fuzzer at its smoke size, and the VOPR on seeds 1,
+2, 5 and one random seed (printed, so a failure replays), as parallel jobs (N54). A commit to `main` that changes `VERSION` runs CI on that commit, then
 publishes binaries for Linux and macOS (x86_64, aarch64) as GitHub release `v<VERSION>`
 (`release.yml`), with that version's section of [CHANGELOG.md](./CHANGELOG.md) as the release
 notes; releasing a version twice, or without notes, fails.
@@ -208,8 +211,33 @@ answers for any op, including ops before it was declared, and every answer carri
 of its groups, so two view processes can show they agree. v0 keeps tables and their changes in
 `nerva view`'s memory (at most two million changes) and computes a view when it is read.
 `min_op=<n>` answers once the view process has applied op `n` (read-your-writes), and `504` at
-once for an op not yet committed; views are rebuilt from the feed when the process restarts. `zig build test:views` checks views against a
-model on two view processes.
+once for an op not yet committed; views are rebuilt from the feed when the process restarts.
+
+**Maintained views** (N52). A view whose aggregates are `count` and `sum` is also declared into
+the state machine, which keeps it inside every commit, like the rows: each write updates its
+row's groups, and every replica holds the same groups and the same hash at every op. Reading it
+reads the groups, not the rows, and nothing is lost when a process restarts:
+
+```bash
+curl -H 'X-Nerva-Key: secret' 'http://127.0.0.1:8080/v1/views/revenue/groups?limit=100'
+# {"view":"revenue","id":1,"state":"ready","op":"1240","hash":"…","group_count":"8",
+#  "groups":[{"section":4,"count":"369","sum_price":"184590"},…],"more":false,"cursor":null}
+```
+
+- A view declared over rows that already exist says `"state":"building"` until pulses (which the
+  cluster runs by itself) have added them, a bounded number per op; then `"ready"`.
+- Groups come in storage order, a page at a time (`cursor`, `limit`), not sorted by key.
+- The hash is the sum, modulo 2^256, of the groups' SHA-256 digests, and is part of the
+  replicated state.
+- An `add` to a field a maintained view filters or groups by is refused (`409 view_key_field`);
+  adds to summed fields are what views are for.
+- One op touches at most about 4,000 distinct groups, however many writes it has. A transaction
+  that would take an op past that is refused whole (`503 views_busy`), and can be retried.
+- `min` and `max`, and answers as of an op, are still `nerva view`'s (the declaration reply
+  says `"maintained": false`).
+
+`zig build test:views` checks `nerva view` against a model on two view processes, and the
+maintained views against `nerva view`.
 
 ## Demos
 

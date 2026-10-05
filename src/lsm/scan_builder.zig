@@ -124,6 +124,34 @@ pub fn ScanBuilderType(
             return scan;
         }
 
+        /// Initializes a Scan over a unique key, for values from `value_min` to `value_max`
+        /// inclusive (Nerva: backfill and view reads, N52).
+        /// Produces the criteria equivalent to `WHERE key BETWEEN $min AND $max`.
+        /// Results are ordered by key.
+        pub fn scan_unique_key_range(
+            self: *ScanBuilder,
+            comptime index: std.meta.FieldEnum(Groove.IndexTrees),
+            buffer: *ScanBuffer,
+            snapshot: u64,
+            value_min: UniqueKeyType(index),
+            value_max: UniqueKeyType(index),
+            direction: Direction,
+        ) *Scan {
+            assert(value_min <= value_max);
+            const field = comptime std.enums.nameCast(std.meta.FieldEnum(Scan.Dispatcher), index);
+            const scan = self.scan_add(field) catch unreachable;
+            const scan_impl = &@field(scan.dispatcher, @tagName(field));
+            scan_impl.init(
+                &@field(self.groove().indexes, @tagName(index)),
+                buffer,
+                snapshot,
+                value_min,
+                value_max,
+                direction,
+            );
+            return scan;
+        }
+
         /// Initializes a Scan over a unique key searching for an exact match.
         /// Produces the criteria equivalent to `WHERE id = $value`.
         /// Results are always unique.

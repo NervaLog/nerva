@@ -100,6 +100,12 @@ pub const IO = struct {
         }
     }
 
+    /// Like `run_for_ns`. On Linux, `run_once` returns as soon as a callback has run; here it
+    /// waits out `nanoseconds`, which is correct, only slower (Nerva patch, UPSTREAM.md).
+    pub fn run_once(self: *IO, nanoseconds: u63) !void {
+        return self.run_for_ns(nanoseconds);
+    }
+
     fn flush(self: *IO, wait_for_completions: bool) !void {
         var events: [256]posix.Kevent = undefined;
 
