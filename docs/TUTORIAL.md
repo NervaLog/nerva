@@ -653,7 +653,7 @@ hashes with maintained hashes, and `nerva view` hashes with `nerva view` hashes.
 | Reads | latest | latest, `min_op=<n>`, `as_of=<op>` |
 | Where the state lives | replicated, durable, in every replica | in the process's memory, rebuilt from the feed on restart |
 | Cost of a read | reads the groups | computes from rows held in memory (v0) |
-| Limit | about 4,000 distinct groups touched per op (`503 views_busy`, below) | two million changes in memory |
+| Limit | about 4,000 distinct groups touched per transaction (`413 views_too_large`, below) | two million changes in memory |
 
 ### Adds and views
 
@@ -675,19 +675,18 @@ n -d '{"entries":[{"kind":"add","table":5,"id":"3","offset":0,"type":"u64","delt
 
 Change such fields with a `put`.
 
-### Large transactions: `views_busy`
+### Large transactions: `views_too_large`
 
 Maintaining views costs work inside the commit, so one op may touch at most about 4,000
 distinct view groups, counted across all of a table's views. A row that moves between groups
-touches both. A transaction past that answers `503 {"status":"views_busy","index":…}` and
+touches both. A transaction past that answers `413 {"status":"views_too_large","index":…}` and
 applies nothing.
 
-**Do not retry `views_busy` unchanged: split the transaction.** The status suggests trying
-again later, but `nerva api` and the Zig client send one transaction per request, and each
-request is its own op. So `views_busy` always means that this transaction by itself touches too
-many groups, and every retry of it gets the same answer
-([#32](https://github.com/Botpike/nerva-ledger/issues/32)). It happens with bulk loads into a
-view grouped by a high-cardinality field. Send such loads in transactions of a few hundred rows.
+**Split the transaction**: no retry of it can succeed. It happens with bulk loads into a view
+grouped by a high-cardinality field. Send such loads in transactions of a few hundred rows.
+(`503 views_busy` means something else, which `nerva api` and the Zig client never meet: in a
+request that packs several transactions, earlier ones filled the op. Nothing applied, and a
+retry fits.)
 
 Groups are counted once however many writes land in them: a transaction of thousands of puts
 into the same few sections is fine.
@@ -762,18 +761,16 @@ curl -s $A/healthz
 # {"ok":true}
 ```
 
-`api.log` says `reconnected to the cluster`. The gateway replaces its broken connection on
-the next request for the cluster, at most once every 5 seconds, so a request or two may still
-see `503` while the replica opens. Then everything committed is there: a commit is acknowledged
+`api.log` says `reconnected to the cluster`. The gateway replaces its broken connection by
+itself, at most once every 5 seconds, whether or not requests arrive, so a request or two may
+still see `503` while the replica opens. Then everything committed is there: a commit is acknowledged
 only once it is durable on a quorum of replicas. With three replicas you can kill any one and
 the other two keep committing (if it was the primary, after a short election); the restarted
 one catches up by itself.
 
-> **Behind a load balancer**, the reconnect needs a request to trigger it. `/healthz` alone
-> does not: it stays `503` after the cluster recovers until a request for the cluster arrives
-> ([#44](https://github.com/Botpike/nerva-ledger/issues/44)). If your balancer stops routing
-> to a gateway whose health check fails, also send it a keyed request now and then (a lookup
-> of any row will do), or it never comes back by itself.
+> **Behind a load balancer**, `/healthz` is enough: a gateway taken out of rotation while the
+> cluster was down reconnects on its own and reports `200` again once it has. `nerva view`
+> does the same.
 
 ### The one rule about retries
 
@@ -1050,7 +1047,8 @@ NERVA_KEY=… nerva view --cluster=<id> --addresses=<…> --listen=<host:port>
 | 401 | Missing or wrong `X-Nerva-Key`. |
 | 413 | `request too complex`: the body would take more than 64 MiB once parsed (deeply nested or very long arrays). Nothing applied. |
 | 409 | `conflict` (stale read: `index`, current `op`), `out_of_bounds`, `row_absent`, `view_key_field`; or a layout or view declaration that contradicts an earlier one. Nothing applied. |
-| 503 | `cluster unavailable` (a commit **may** have applied) or `views_busy` (nothing applied; split the transaction, Part 7). |
+| 413 | `views_too_large`: the transaction touches more view groups than one op allows. Nothing applied; split it (Part 7). |
+| 503 | `cluster unavailable` (a commit **may** have applied) or `views_busy` (nothing applied; retry). |
 | 504 | `nerva view`: `min_op` not committed yet. |
 
 **Remember**

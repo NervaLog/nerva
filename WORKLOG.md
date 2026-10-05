@@ -560,6 +560,22 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
 - Verified: the tests (6), mutation-tested; strict validation of v0.3.0's SBOM against the
   CycloneDX 1.5 schema; a dry run of the release step's `dist/` and `SHA256SUMS`.
 
+## 2026-10-05 — Gateways recover on their own; late replies dropped (N64; #42, #44)
+
+- `src/nerva/client.zig`: `on_reply` drops a reply that arrives after the timeout (#42), with a
+  unit test.
+- `src/nerva/client_health.zig` (moved from `api/server.zig`): `ClientHealth`, plus
+  `idle_timeout_ms` so an idle gateway with a broken client wakes to replace it (#44).
+- `src/nerva/api/server.zig`: retries while idle. `src/nerva/view/server.zig`: a timeout or
+  eviction breaks the client instead of exiting; requests and `/healthz` answer 503 until it
+  is replaced (#42).
+- `tests/api/api.py`: recovery with only `/healthz` polled. `tests/views/declared.py`: a view
+  process survives a stall and recovers on its own. README and TUTORIAL updated.
+- Verified: `check`, `test:fmt`, `test:unit` 334/335 (the sandbox-denied perf test),
+  `test:views` and `test:api`. Against `main`'s binary the new checks fail: a stalled view
+  process answers 500 instead of 503, and `/healthz` stays 503 for 120 s after the cluster
+  recovers. Without the `on_reply` change the new unit test panics.
+
 ## 2026-10-05 — CI frees a nearly full runner volume (N65; #50)
 
 - `.github/scripts/free_disk.sh`: logs free space; below 6 GiB empties the Zig build cache and
@@ -574,6 +590,41 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
   `docker build --network host`, pushes to `registry.fly.io/nerva-perf`, and runs that image;
   without a local Docker it still uses Fly's remote builder.
 
+## 2026-10-05 — `nerva api` serves views whole (N66)
+
+- `src/nerva/api/api.zig`: `GET /v1/views/<name>` (the whole view, `nerva view`'s answer byte for
+  byte, with `view_hash` and `declared_op`; `as_of`, `min_op`), `GET /v1/views` (listing),
+  `GET /v1/views/<name>/definition` (the declaration, moved).
+- `src/nerva/view/declared.zig`: `render`, shared by both gateways.
+- `src/nerva.zig`, `state_machine.zig`: `Group.op`; reads as of an op scan only the groups
+  changed since, and a page ends after 128 scans; the `get_view` header names its view.
+- Demos read views from `nerva api` and compare its hash with a `nerva view` process's.
+- Tests: `tests/views/maintained.py` (byte-for-byte equality, the new routes and refusals), the
+  randomized test with pages ending early, format guard for `Group.op`. Mutation-tested.
+
+## 2026-10-05 — A client may not send `pulse` (N67; #33)
+
+- `src/nerva/internal_operations.zig`: `pulse_from_client`, unit-tested for every operation.
+- `src/vsr/replica.zig`: `on_request` evicts such a client (`invalid_request_operation`);
+  UPSTREAM.md.
+- Measured at `825355c`: one raw `pulse` from a client crashes the replicas
+  (`trace/event.zig`, invalid enum value), and again after a restart. With the guard (and #53's
+  client fix), the client is evicted and the integration scenario passes after it.
+- Verified: `check`, `test:fmt`, `test:unit` 337/338 (the sandbox-denied perf test); VOPR
+  `nerva` seeds 1, 2 and `testing` seed 1.
+
+## 2026-10-05 — `views_too_large` for a transaction no op can hold (N68; #32)
+
+- `src/nerva.zig`: `EntryStatus.views_too_large = 15`. `src/nerva/views.zig`: `Admission`.
+- `src/nerva/state_machine.zig`: `view_txn_admit` tells `busy` from `too_large`; commit reports
+  each. `src/nerva/workload.zig`: the VOPR model follows, and counts both.
+- `src/nerva/api/api.zig`: `413 {"status":"views_too_large"}`. README and TUTORIAL: split, do
+  not retry; `views_busy` is retryable and only for multi-transaction requests.
+- Tests: unit (too large; busy, then the same transaction alone commits); `test:views` (4,200
+  new groups answer 413; split in two, they commit). Format snapshot: the new status line.
+- Verified: `check`, `test:fmt`, `test:unit` (the sandbox-denied perf test aside), `test:views`;
+  VOPR seeds 1, 2, 5 (one `views_busy`, one `views_too_large`) and 2467272726192300042.
+
 ## 2026-10-05 — `nerva api` bounds a request's memory (N69; #31)
 
 - `src/nerva/api/memory_budget.zig`: an allocator that refuses past a limit and says so; unit
@@ -585,3 +636,12 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
   `test:api` (RSS 92 MiB, 100 MiB after both bodies); measured on `main`'s binary:
   91 → 788 MiB, then 527 MiB, both bodies answered 400; fixed: 92 → 133, 130 MiB, 413.
 
+## 2026-10-05 — An eviction no longer aborts a client (N70; #52)
+
+- `src/nerva/client.zig`: `on_eviction` records the eviction; `deinit` deinits the evicted
+  VSR client.
+- `src/integration_tests.zig`: the scenario ends with an eviction (`clients_max` newer
+  sessions), expecting `error.Evicted` twice.
+- Verified: `test:integration` passes (2.4 min); with `main`'s client it aborts in
+  `MessageBuffer.invalidate` after `evicted: no_session`. `check`, `test:fmt`, `test:unit`
+  336/337 (the sandbox-denied perf test).

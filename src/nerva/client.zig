@@ -156,8 +156,10 @@ pub const Client = struct {
                 if (start.elapsed(client.time_os.monotonic()).ns > client.options.timeout.ns) break;
                 client.run_io_once(start, &tick_next) catch break;
             }
-            client.vsr_client.deinit(allocator);
         }
+        // An evicted VSR client must process no more messages, so its IO is not driven again
+        // (#52): every call returned `error.Evicted` since.
+        client.vsr_client.deinit(allocator);
         allocator.free(client.request[0..]);
         allocator.free(client.reply[0..]);
         client.message_pool.deinit(allocator);
@@ -414,6 +416,12 @@ pub const Client = struct {
         _ = operation;
         _ = timestamp;
         const client: *Client = @ptrFromInt(@as(usize, @intCast(user_data)));
+        if (client.state == .timed_out) {
+            // The reply to a request this client gave up on, arriving while `deinit` closes its
+            // connections (#42): nobody waits for it.
+            log.debug("on_reply: dropping a reply after the timeout", .{});
+            return;
+        }
         assert(client.state == .waiting);
         assert(client.reply_size == null);
         stdx.copy_disjoint(.inexact, u8, client.reply, result);
@@ -424,8 +432,10 @@ pub const Client = struct {
     fn on_eviction(vsr_client: *VSRClient, eviction: *const Message.Eviction) void {
         const client: *Client = @fieldParentPtr("vsr_client", vsr_client);
         log.warn("evicted: {s}", .{@tagName(eviction.header.reason)});
-        // The eviction callback must deinit the VSR client.
-        vsr_client.deinit(client.allocator);
+        // The VSR client's contract asks the callback to deinit it, but the callback runs inside
+        // the message bus's receive path, which goes on to use the buffer `deinit` would free
+        // (#52). `Client.deinit` deinits it instead; the evicted VSR client processes no more
+        // messages because nothing drives its IO until then.
         client.state = .evicted;
     }
 
@@ -434,3 +444,15 @@ pub const Client = struct {
         return bytes[0..@sizeOf(Body)];
     }
 };
+
+test "Client: a reply after the timeout is dropped (#42)" {
+    // Only the fields `on_reply` reads are set: it must not touch the rest.
+    var client: Client = undefined;
+    client.state = .timed_out;
+    client.reply_size = null;
+    const result = [_]u8{0} ** constants.cache_line_size;
+    const aligned: []align(constants.cache_line_size) const u8 = @alignCast(&result);
+    Client.on_reply(@intFromPtr(&client), .register, 0, aligned);
+    try std.testing.expectEqual(.timed_out, client.state);
+    try std.testing.expectEqual(null, client.reply_size);
+}
