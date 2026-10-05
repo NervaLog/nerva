@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Runs one fuzzer, or the VOPR, on random seeds until a time budget is spent (N58).
+# Runs one fuzzer, or the VOPR, on random seeds until a time budget is spent (N59).
 #
 #   fuzz_loop.sh fuzz <fuzzer> <minutes>
 #   fuzz_loop.sh vopr <nerva|testing> <minutes>
