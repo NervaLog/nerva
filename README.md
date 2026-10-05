@@ -242,9 +242,13 @@ allocate at most 128 MiB: a body that would take more once parsed (deeply nested
 JSON arrays) answers `413 {"error":"request too complex"}`. What a request took is given back as
 soon as its reply is written; the gateway keeps at most 8 MiB between requests (N69).
 
-**Documents** hold values larger than a row: up to 64 KiB under a string key (up to 1024 bytes
+**Documents** hold values larger than a row: up to 512 KiB under a string key (up to 1024 bytes
 of UTF-8) in a namespace (a `u64`, as a decimal string). Nerva chunks them over rows of a
-reserved table:
+reserved table; a document is written in one commit, so 512 KiB is the most that stays atomic.
+Keep larger values (files, model outputs) outside Nerva, content-addressed, and store their hash
+in a document: Nerva then orders and versions the reference, and the blob store never needs to
+be transactional (N76). A `get` reads at most as many chunks as 256 documents of 64 KiB (about
+16 MiB of values); more answers `413`:
 
 | Route | Does |
 |---|---|
