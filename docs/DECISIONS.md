@@ -1231,6 +1231,6 @@ size at random, and its lanes on `main` (N74) hit this on four of four lanes acr
 (#68; seed 17320319949900435868 at `28cbd79`). Declaration now allows a table's views at most
 `min(view_extremes_per_table_max, member_writes_limit)` slots (`table_extremes_max`) and refuses
 more with `table_extremes_full`, as the VOPR's model does. Production is unchanged. Verified: the
-failing seeds now pass (the first refuses one declaration `table_extremes_full`), and 34 seeds in
-ReleaseSafe (1, 2, 5, both failing seeds, 29 random) pass.
+failing seeds now pass (the first refuses one declaration `table_extremes_full`), as do seeds 1,
+2, 5 and 30 random ones in ReleaseSafe.
 
