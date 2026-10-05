@@ -75,7 +75,10 @@ pub fn StateMachineType(comptime Storage: type) type {
         /// each `min` or `max` slot of its table: with one or two such slots, any request fits.
         pub const members_per_op_max: u32 = commit_entries_max;
         /// Groups per `get_view` page read as of a past op: each takes a scan (N62).
-        pub const view_as_of_limit_max = @min(128, view_groups_limit_max);
+        /// Scans a `get_view` page read as of a past op may take (N66): one per listed group
+        /// changed since `as_of`. The page ends at the group that would take one more.
+        /// 128 in production; few with the small messages of tests, so that pages end early.
+        pub const view_as_of_scans_max = @max(1, @min(128, @divFloor(view_groups_limit_max, 8)));
         /// Distinct groups one op may write (N52), each once: admission refuses a transaction
         /// that would take its op past this. Groups are twice the size of rows, so this bounds
         /// the groups tree's tables to the rows tree's size.
@@ -89,7 +92,7 @@ pub fn StateMachineType(comptime Storage: type) type {
             assert(lookup_rows_max > 0);
             assert(changes_limit_max > 0);
             assert(view_groups_limit_max > 0);
-            assert(view_as_of_limit_max > 0);
+            assert(view_as_of_scans_max > 0);
         }
 
         pub const Options = struct {
@@ -200,7 +203,7 @@ pub fn StateMachineType(comptime Storage: type) type {
                 .primary_key = "key",
                 .primary_key_orphaned = false,
                 .unique_keys = &[_][:0]const u8{"key"},
-                .ignored = &[_][:0]const u8{ "count", "group_key", "sums", "reserved" },
+                .ignored = &[_][:0]const u8{ "count", "group_key", "sums", "op", "reserved" },
                 .optional = &[_][:0]const u8{},
                 .derived = .{},
                 .objects_cache = true,
@@ -475,6 +478,9 @@ pub fn StateMachineType(comptime Storage: type) type {
         view_version: ?ViewVersion = null,
         group_versions: []?GroupVersion,
         group_versions_done: u32 = 0,
+        group_version_scans: u32 = 0,
+        /// The groups the page lists: fewer than requested when the scans ran out.
+        view_groups_listed: u32 = 0,
         view_version_buffer: [1]ViewVersion = undefined,
         group_version_buffer: [1]GroupVersion = undefined,
         /// The op being prefetched (`get_view` as of a past op clamps to it).
@@ -643,7 +649,7 @@ pub fn StateMachineType(comptime Storage: type) type {
             // Each scan reads one more member than the op may take from its slot.
             self.extreme_members = try allocator.alloc(Member, 2 * members_limit);
             errdefer allocator.free(self.extreme_members);
-            self.group_versions = try allocator.alloc(?GroupVersion, view_as_of_limit_max);
+            self.group_versions = try allocator.alloc(?GroupVersion, view_groups_limit_max);
             errdefer allocator.free(self.group_versions);
         }
 
@@ -2219,10 +2225,12 @@ pub fn StateMachineType(comptime Storage: type) type {
 
                 if (scratch.stored) |*group_stored| {
                     if (stdx.equal_bytes(Group, group_stored, group)) continue;
+                    group.op = op;
                     groups.update(.{ .old = group_stored, .new = group });
                 } else {
                     // Touched and left empty, never written.
                     if (group.timestamp == 0) continue;
+                    group.op = op;
                     groups.insert(group);
                 }
                 self.forest.grooves.group_versions.insert(&.{
@@ -2329,20 +2337,39 @@ pub fn StateMachineType(comptime Storage: type) type {
             self.forest.scan_buffer_pool.reset();
             self.forest.grooves.view_versions.scan_builder.reset();
             self.group_versions_done = 0;
+            self.group_version_scans = 0;
             self.prefetch_group_version_next();
         }
 
-        /// Stage 3 of `get_view` as of a past op: each listed group's version then, one scan
-        /// each.
+        /// Stage 3 of `get_view` as of a past op: each listed group's version then. A group no
+        /// op has changed since is as it was (N66); any other takes a scan, and the page ends
+        /// before the group that would take more than `view_as_of_scans_max`.
         fn prefetch_group_version_next(self: *StateMachine) void {
             const query = view_query(self.prefetch_input.?);
             const limit = view_query_limit(query).?;
             const listed = @min(self.view_groups_count.?, limit);
-            if (self.view_version == null or self.group_versions_done == listed) {
-                return self.prefetch_finish();
-            }
-            const group = &self.view_groups[self.group_versions_done];
             const as_of = view_query_as_of(query, self.prefetch_op);
+            self.view_groups_listed = listed;
+            if (self.view_version == null) return self.prefetch_finish();
+            while (self.group_versions_done < listed) : (self.group_versions_done += 1) {
+                const group = &self.view_groups[self.group_versions_done];
+                assert(group.op > 0);
+                if (group.op > as_of) {
+                    if (self.group_version_scans < view_as_of_scans_max) break;
+                    self.view_groups_listed = self.group_versions_done;
+                    return self.prefetch_finish();
+                }
+                self.group_versions[self.group_versions_done] = .{
+                    .version = nerva.group_version_key(group.key, group.op),
+                    .timestamp = group.timestamp,
+                    .op = group.op,
+                    .key = group.key,
+                    .count = group.count,
+                    .group_key = group.group_key,
+                    .sums = group.sums,
+                };
+            } else return self.prefetch_finish();
+            const group = &self.view_groups[self.group_versions_done];
             const group_versions = &self.forest.grooves.group_versions;
             const scan = group_versions.scan_builder.scan_prefix_range(
                 .version,
@@ -2371,6 +2398,7 @@ pub fn StateMachineType(comptime Storage: type) type {
             self.group_versions[self.group_versions_done] =
                 if (results.len == 1) results[0] else null;
             self.group_versions_done += 1;
+            self.group_version_scans += 1;
             self.forest.scan_buffer_pool.reset();
             self.forest.grooves.group_versions.scan_builder.reset();
             self.prefetch_group_version_next();
@@ -2387,7 +2415,6 @@ pub fn StateMachineType(comptime Storage: type) type {
             if (!stdx.zeroed(&query.reserved)) return null;
             // By id or by name, not both.
             if (query.view_id != 0 and !stdx.zeroed(&query.name)) return null;
-            if (query.as_of != 0) return @min(query.limit, view_as_of_limit_max);
             return @min(query.limit, view_groups_limit_max);
         }
 
@@ -2464,6 +2491,8 @@ pub fn StateMachineType(comptime Storage: type) type {
                 self.view_groups_count = null;
                 self.view_version = null;
                 self.group_versions_done = 0;
+                self.group_version_scans = 0;
+                self.view_groups_listed = 0;
             }
             const query = view_query(message_body_used);
             const limit = view_query_limit(query) orelse {
@@ -2486,6 +2515,8 @@ pub fn StateMachineType(comptime Storage: type) type {
             const view = &self.views_op[view_id - 1];
             assert(view.id == view_id);
             header.declared_op = view.declared_op;
+            const name = views.definition_name(&view.definition);
+            @memcpy(header.group_key[0..name.len], name);
             const as_of = query.as_of != 0;
             if (as_of) {
                 // As the op `as_of` left it (N62); missing if it was declared later.
@@ -2505,9 +2536,12 @@ pub fn StateMachineType(comptime Storage: type) type {
 
             const scanned = self.view_groups[0..self.view_groups_count.?];
             assert(scanned.len <= limit + 1);
-            if (as_of) assert(self.group_versions_done == @min(scanned.len, limit));
+            // As of an op, the scans may have ended the page early.
+            const listed = if (as_of) self.view_groups_listed else @min(scanned.len, limit);
+            assert(listed <= @min(scanned.len, limit));
+            if (as_of) assert(self.group_versions_done == listed);
             var count: usize = 0;
-            for (scanned[0..@min(scanned.len, limit)], 0..) |*group_now, index| {
+            for (scanned[0..listed], 0..) |*group_now, index| {
                 assert(group_now.key >> 64 == view.id);
                 const group: Group = if (as_of) group: {
                     // Not yet created at `as_of`.
@@ -2533,9 +2567,9 @@ pub fn StateMachineType(comptime Storage: type) type {
                 record.sums = group.sums;
                 count += 1;
             }
-            if (scanned.len > limit) {
+            if (scanned.len > listed) {
                 header.flags.more = true;
-                header.cursor = @truncate(scanned[limit].key);
+                header.cursor = @truncate(scanned[listed].key);
             }
             return (1 + count) * @sizeOf(ViewRecord);
         }

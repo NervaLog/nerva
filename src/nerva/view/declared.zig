@@ -203,7 +203,9 @@ fn table_viewable(table: u32) bool {
     return table < catalog.tables_reserved_min;
 }
 
-const Group = struct {
+/// A group of a view's answer, however it was computed: here from rows, or by `nerva api` from
+/// the groups the state machine maintains (N66).
+pub const Group = struct {
     /// A row of the group: its key fields are the group's key.
     sample: [value_size]u8,
     count: u64,
@@ -262,36 +264,45 @@ fn aggregate(
         }
     }
 
+    return render(arena, view, layout, groups.values());
+}
+
+/// A view's answer as `nerva view` serves it (N35): the groups sorted by key, fields in
+/// declaration order, 64-bit numbers as decimal strings, and the SHA-256 of exactly that JSON.
+/// Sorts `groups` in place.
+pub fn render(
+    arena: std.mem.Allocator,
+    view: *const catalog.View,
+    layout: *const catalog.Layout,
+    groups: []Group,
+) !DeclaredViews.Result {
     const Context = struct {
         view: *const catalog.View,
         layout: *const catalog.Layout,
-        groups: []const Group,
 
-        pub fn lessThan(context: @This(), a: usize, b: usize) bool {
+        fn less_than(context: @This(), a: Group, b: Group) bool {
             for (context.view.group_by) |name| {
                 const field = context.layout.field(name).?;
-                const sample_a = &context.groups[a].sample;
-                const sample_b = &context.groups[b].sample;
                 const order = if (field.type == .bytes) std.mem.order(
                     u8,
-                    sample_a[field.offset..][0..field.size],
-                    sample_b[field.offset..][0..field.size],
+                    a.sample[field.offset..][0..field.size],
+                    b.sample[field.offset..][0..field.size],
                 ) else std.math.order(
-                    catalog.field_integer(field, sample_a).?,
-                    catalog.field_integer(field, sample_b).?,
+                    catalog.field_integer(field, &a.sample).?,
+                    catalog.field_integer(field, &b.sample).?,
                 );
                 if (order != .eq) return order == .lt;
             }
             return false;
         }
     };
-    // Unstable is fine (group keys are unique), and `sort` is insertion sort: O(n²).
-    groups.sortUnstable(Context{ .view = view, .layout = layout, .groups = groups.values() });
+    // Unstable is fine: group keys are unique.
+    std.mem.sortUnstable(Group, groups, Context{ .view = view, .layout = layout }, Context.less_than);
 
     var out = std.ArrayList(u8).init(arena);
     const writer = out.writer();
     try writer.writeAll("[");
-    for (groups.values(), 0..) |*group, group_index| {
+    for (groups, 0..) |*group, group_index| {
         if (group_index > 0) try writer.writeAll(",");
         try writer.writeAll("{");
         for (view.group_by) |name| {

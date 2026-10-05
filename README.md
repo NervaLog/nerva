@@ -224,10 +224,11 @@ live in the log, in a reserved catalog table; the core still stores bytes and ne
 Both gateways (`nerva api`, `nerva view`) execute one request at a time but read up to 16
 connections at once, so a slow client holds up nobody; with all 16 busy, a new connection
 displaces the oldest one still sending its request. A request must arrive whole within 10 s
-of connecting and carries one request per connection (`Connection: close`). If `nerva api`
+of connecting and carries one request per connection (`Connection: close`). If a gateway
 loses its cluster session (a request times out after 30 s, or the session is evicted), it
 answers `503` and `/healthz` answers `503`, and it reconnects on its own, trying at most every
-5 s. Heads are parsed
+5 s whether or not requests arrive (N64); `nerva view` then reads the feed on from where it
+stopped. Heads are parsed
 strictly: lines end in CRLF, bodies have a `Content-Length` (no `Transfer-Encoding`), and
 anything malformed answers `400`.
 
@@ -248,45 +249,39 @@ writers on one row and on one document, and races fifty reservations on one budg
 ## Declared views
 
 A view is a declaration in the log, not code. Declare a table's layout, then a view over it,
-through `nerva api`; read it from `nerva view`, latest or as of any op:
+through `nerva api`, and read it there, latest or as of any op since it was declared:
 
 ```bash
 curl -X PUT -H 'X-Nerva-Key: secret' http://127.0.0.1:8080/v1/views/revenue -d '{
   "table": 5, "where": [{"field": "sold", "op": "eq", "value": true}],
   "group_by": ["section"], "aggregates": [{"fn": "count"}, {"fn": "sum", "field": "price"}]}'
-curl -H 'X-Nerva-Key: secret' 'http://127.0.0.1:8091/v1/views/revenue?as_of=1234'
-# {"view":"revenue","op":"1234","hash":"…","groups":[{"section":1,"count":"12","sum_price":"5400"},…]}
+curl -H 'X-Nerva-Key: secret' 'http://127.0.0.1:8080/v1/views/revenue?as_of=1234'
+# {"view":"revenue","op":"1234","hash":"…","view_hash":"…","declared_op":"812",
+#  "groups":[{"section":1,"count":"12","sum_price":"5400"},…]}
 ```
 
 `where` ANDs comparisons (`eq`, `ne`, `lt`, `le`, `gt`, `ge`) on numeric and bool fields;
-`group_by` takes up to three fields; aggregates are `count`, `sum`, `min` and `max`. A view
-answers for any op, including ops before it was declared, and every answer carries the SHA-256
-of its groups, so two view processes can show they agree. v0 keeps tables and their changes in
-`nerva view`'s memory (at most two million changes) and computes a view when it is read.
-`min_op=<n>` answers once the view process has applied op `n` (read-your-writes), and `504` at
-once for an op not yet committed; views are rebuilt from the feed when the process restarts.
+`group_by` takes up to three fields; aggregates are `count`, `sum`, `min` and `max`.
 
-**Maintained views** (N52, N62). Every view is also declared into the state machine, which keeps
-it inside every commit, like the rows: each write updates its row's groups, and every replica
-holds the same groups and the same hash at every op. Reading it reads the groups, not the rows,
-and nothing is lost when a process restarts:
+**Maintained by the replicas** (N52, N62, N66). The state machine keeps every view inside every
+commit, like the rows: each write updates its row's groups, and every replica holds the same
+groups at every op. Reading a view reads its groups, not the rows, and nothing is lost when a
+process restarts.
 
-```bash
-curl -H 'X-Nerva-Key: secret' 'http://127.0.0.1:8080/v1/views/revenue/groups?limit=100'
-# {"view":"revenue","id":1,"state":"ready","op":"1240","declared_op":"812","hash":"…",
-#  "group_count":"8","groups":[{"section":4,"count":"369","sum_price":"184590"},…],
-#  "more":false,"cursor":null}
-curl -H 'X-Nerva-Key: secret' 'http://127.0.0.1:8080/v1/views/revenue/groups?as_of=1000'
-# The view as op 1000 left it: the same shape, with "as_of":"1000".
-```
-
-- A view declared over rows that already exist says `"state":"building"` until pulses (which the
-  cluster runs by itself) have added them, a bounded number per op; then `"ready"`.
-- Groups come in storage order, a page at a time (`cursor`, `limit`), not sorted by key.
-- The hash is the sum, modulo 2^256, of the groups' SHA-256 digests, and is part of the
-  replicated state.
-- An `add` to a field a maintained view filters or groups by is refused (`409 view_key_field`);
-  adds to summed fields are what views are for.
+- `GET /v1/views/<name>` answers with the whole view, groups sorted by key, read at one op.
+  `hash` is the SHA-256 of the `groups` JSON exactly as served; `view_hash` is the replicated
+  hash, the sum modulo 2^256 of the groups' digests, the same at every replica. `as_of=<op>`
+  reads the view as that op left it (`404` before it was declared); `min_op=<n|latest>` asks for
+  at least op `n`. Either answers `504` for an op not yet committed, and a view still building
+  answers `503`. A view of more than 10,000 groups is read in pages instead:
+- `GET /v1/views/<name>/groups?cursor=&limit=&as_of=` pages through the groups in storage order,
+  with the view's state, `view_hash` and group count.
+- `GET /v1/views` lists the views (name, id, state, `declared_op`, group count);
+  `GET /v1/views/<name>/definition` is the declaration.
+- A view declared over rows that already exist is `building` until pulses (which the cluster
+  runs by itself) have added them, a bounded number per op; then `ready`.
+- An `add` to a field a view filters or groups by is refused (`409 view_key_field`); adds to
+  summed fields are what views are for.
 - One op touches at most about 4,000 distinct groups and 8,000 `min` and `max` members (a write
   takes one in each such slot of its table), however many writes it has. A transaction that
   would take an op past either is refused whole (`503 views_busy`), and can be retried; one that
@@ -294,12 +289,19 @@ curl -H 'X-Nerva-Key: secret' 'http://127.0.0.1:8080/v1/views/revenue/groups?as_
 - `min` and `max` stay exact when the row holding them is deleted, moved or changed: the state
   machine keeps each group's values in order (N62). A table's views have at most four `min` and
   `max` aggregates between them (a fifth is refused: `"maintained": false`).
-- `?as_of=<op>` reads the view as that op left it, for any committed op since the view was
-  declared (`404` before), at most 128 groups a page. Every op that changes a view keeps a
-  version of it and of each group it changed, so history grows with writes, as rows' does.
+- Every op that changes a view keeps a version of it and of each group it changed, so history
+  grows with writes, as rows' does. A read as of an op scans only for the groups changed since.
+
+**Recomputed by `nerva view`** (N35). `nerva view` follows the change feed, keeps tables and
+their changes in memory (at most two million changes), and computes a view when it is read, the
+same `GET /v1/views/<name>` with the same answer: the same groups and the same `hash`, byte for
+byte. It answers for any op, including ops before a view was declared, and `min_op=<n>` waits
+until it has applied op `n`. It is the independent check on the replicas: the demos show the
+two hashes side by side.
 
 `zig build test:views` checks `nerva view` against a model on two view processes, and the
-maintained views (latest and as of past ops, with `min` and `max`) against `nerva view`.
+maintained views (latest and as of past ops, with `min` and `max`, whole and in pages) against
+`nerva view`, byte for byte.
 
 ## Demos
 

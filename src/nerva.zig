@@ -439,7 +439,9 @@ pub const Group = extern struct {
     /// Per aggregate slot, an i128, little-endian: the sum (`sum`), the smallest or largest
     /// value (`min`, `max`; zero while the group is empty), or zero (`count`).
     sums: [view_aggregates_max][16]u8,
-    reserved: [64]u8 = @splat(0),
+    /// The last op that changed the group (N66): a read as of a later op needs no version.
+    op: u64 = 0,
+    reserved: [56]u8 = @splat(0),
 
     comptime {
         assert(@sizeOf(Group) == 256);
@@ -558,8 +560,8 @@ pub const ViewQuery = extern struct {
     /// With `view_id` zero: the view's name, zero-padded. Otherwise all zero.
     name: [32]u8 = @splat(0),
     reserved: [4]u8 = @splat(0),
-    /// Zero: the latest. Otherwise the view as the op `as_of` left it (N62), with at most
-    /// `StateMachine.view_as_of_limit_max` groups per page. Taken from v0.3.0's reserved
+    /// Zero: the latest. Otherwise the view as the op `as_of` left it (N62). A page then ends
+    /// early after `StateMachine.view_as_of_scans_max` groups changed since `as_of` (N66). Taken from v0.3.0's reserved
     /// bytes, which its clients send as zeros: their queries read the latest, as they did.
     as_of: u64 = 0,
 
@@ -591,7 +593,8 @@ pub const ViewRecord = extern struct {
     count: u64,
     /// Header: the view's hash.
     hash: [32]u8,
-    /// Group only.
+    /// Group: the group's key. Header (N66): the view's name, zero-padded (zero for an id never
+    /// declared).
     group_key: [group_key_size_max]u8,
     /// Group only.
     sums: [view_aggregates_max][16]u8,
