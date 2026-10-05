@@ -7,6 +7,7 @@ const SourceLocation = std.builtin.SourceLocation;
 const constants = @import("../constants.zig");
 const nerva = @import("../nerva.zig");
 const release_peers = @import("../nerva/release_peers.zig");
+const internal_operations = @import("../nerva/internal_operations.zig");
 
 const stdx = @import("stdx");
 const RingBufferType = stdx.RingBufferType;
@@ -6437,6 +6438,24 @@ pub fn ReplicaType(
                     self.log_prefix(),
                     message.header.client,
                     @intFromEnum(message.header.operation),
+                });
+                self.send_eviction_message_to_client(
+                    message.header.client,
+                    .invalid_request_operation,
+                );
+                return true;
+            }
+            // Nerva: the state machine operation that `vsr.Operation.pulse` maps to is the
+            // replica's own (sent with `client == 0`, which `Request.invalid_header` enforces for
+            // `.pulse` itself). A client may not send it under its own raw value either (#33).
+            if (internal_operations.pulse_from_client(
+                StateMachine.Operation,
+                message.header.client,
+                message.header.operation,
+            )) {
+                log.warn("{}: on_request: ignoring pulse from a client (client={})", .{
+                    self.log_prefix(),
+                    message.header.client,
                 });
                 self.send_eviction_message_to_client(
                     message.header.client,
