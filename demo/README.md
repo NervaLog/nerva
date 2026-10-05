@@ -14,8 +14,9 @@ Public demos of Nerva, built only on its general pieces (`nerva api`, layouts, d
   process; crashed processes come back after 20 s;
 - **declare** a view of their own, which answers for the whole show at once.
 
-Two view processes compute sales by section independently; the page compares their hashes at
-the same op. "Seats sold twice" counts purchases confirmed for a seat that already had one: it
+The page reads its views from `nerva api`, which the replicas keep inside every commit, and
+compares the answer's hash for sales by section with a `nerva view` process's recomputation
+from the log at the same op. "Seats sold twice" counts purchases confirmed for a seat that already had one: it
 must stay 0.
 
 ```bash
@@ -50,9 +51,9 @@ per visitor, a clear every hour (`--reset-minutes`), no free text except view na
 ## Shared pieces
 
 `cluster.py` is the supervisor (three replicas, the API, two view processes, crash and
-restart); `common.py` the demo base (views, agreement between the two view processes, visitor
-views, rate limits per visitor, a request handler that answers 500 rather than drop a
-connection); `nerva_http.py` a small client that never retries a commit. `--behind-proxy`
+restart); `common.py` the demo base (views read from the API, agreement between the API's
+answer and a view process's recomputation, visitor views, rate limits per visitor, a request
+handler that answers 500 rather than drop a connection); `nerva_http.py` a small client that never retries a commit. `--behind-proxy`
 identifies visitors by `Fly-Client-IP` or `X-Forwarded-For`; `--no-limits` is for tests.
 
 `zig build test:demo` runs both demos under random crashes.

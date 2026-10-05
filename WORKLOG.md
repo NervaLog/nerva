@@ -567,3 +567,15 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
 - Verified locally: with room it changes nothing; with the threshold forced above the free space
   it removes the build cache and the older toolchain, keeps the pinned one, and warns.
 
+
+## 2026-10-05 — `nerva api` serves views whole (N66)
+
+- `src/nerva/api/api.zig`: `GET /v1/views/<name>` (the whole view, `nerva view`'s answer byte for
+  byte, with `view_hash` and `declared_op`; `as_of`, `min_op`), `GET /v1/views` (listing),
+  `GET /v1/views/<name>/definition` (the declaration, moved).
+- `src/nerva/view/declared.zig`: `render`, shared by both gateways.
+- `src/nerva.zig`, `state_machine.zig`: `Group.op`; reads as of an op scan only the groups
+  changed since, and a page ends after 128 scans; the `get_view` header names its view.
+- Demos read views from `nerva api` and compare its hash with a `nerva view` process's.
+- Tests: `tests/views/maintained.py` (byte-for-byte equality, the new routes and refusals), the
+  randomized test with pages ending early, format guard for `Group.op`. Mutation-tested.

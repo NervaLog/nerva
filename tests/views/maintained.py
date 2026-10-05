@@ -19,6 +19,9 @@ that they build over existing rows. Then requires:
 - `min` and `max` to stay exact as the seats holding them are re-priced, deleted or moved;
 - every op compared earlier to read the same through `?as_of=<op>` at the end, as `nerva view`
   answers as of that op; and before a view's declaration, 404;
+- the whole view from `nerva api` (`GET /v1/views/<name>`, N66) to equal `nerva view`'s answer
+  byte for byte, latest and as of past ops; `min_op` and `as_of` ahead of the log to answer 504;
+  `/definition` and the listing; a view of more than 10,000 groups to be refused (400);
 - a view named `groups` to be read (404 before it exists, not a crash: #26) and declared.
 
 Usage: maintained.py <path to nerva> [--seed=N]
@@ -114,6 +117,12 @@ def check_against_oracle(api, view_port, name="revenue", as_of=None):
     assert ordered == body["groups"], (op, ordered[:3], body["groups"][:3])
     assert header["hash"] == view_hash(header["id"], name, groups), header
     assert int(header["group_count"]) == len(groups), header
+    # The whole view from `nerva api` (N66): `nerva view`'s answer, byte for byte, so its hash.
+    query = f"as_of={as_of}" if as_of else f"min_op={op}"
+    status, whole = request(api, "GET", f"/v1/views/{name}?{query}")
+    assert status == 200, (status, whole)
+    assert whole["groups"] == body["groups"] and whole["hash"] == body["hash"], (whole, body)
+    assert whole["view_hash"] == header["hash"], (whole, header)
     return op, len(groups)
 
 
@@ -210,12 +219,39 @@ def main():
         status, body = request(api, "GET", "/v1/views/extremes/groups?as_of=999999999")
         assert status == 400, (status, body)
 
+        # The whole view's routes (N66): an op not yet committed waits for nobody (504), as in
+        # `nerva view`; the declaration is at `/definition`; `GET /v1/views` lists the views.
+        status, body = request(api, "GET", "/v1/views/revenue?min_op=999999999")
+        assert status == 504, (status, body)
+        status, body = request(api, "GET", "/v1/views/revenue?as_of=999999999")
+        assert status == 504, (status, body)
+        status, body = request(api, "GET", f"/v1/views/extremes?as_of={declared_op - 1}")
+        assert status == 404, (status, body)
+        status, body = request(api, "GET", "/v1/views/revenue?as_of=5&min_op=5")
+        assert status == 400, (status, body)
+        status, body = request(api, "GET", "/v1/views/extremes/definition")
+        assert status == 200 and body["aggregates"][1]["fn"] == "min", (status, body)
+        status, body = request(api, "GET", "/v1/views")
+        assert status == 200, (status, body)
+        assert [v["name"] for v in body["views"]] == ["revenue", "extremes", "by_price"], body
+        assert body["views"][1]["declared_op"] == str(declared_op), body
+
+        # A view with more groups than one answer holds (10,000): 400, read it from `/groups`.
+        for start in (20_000, 24_000, 28_000):
+            status, body = commit(api, [put(SEATS + start + i, seat_value(3, start + i, True))
+                                        for i in range(4000)])
+            assert status == 200, (status, body)
+        status, body = request(api, "GET", "/v1/views/by_price")
+        assert status == 400 and "/groups" in body["error"], (status, body)
+
         # A view named `groups` (#26): reading it before it exists answers 404 (it crashed the
         # gateway), then it can be declared and its groups read at `/v1/views/groups/groups`.
         assert request(api, "GET", "/v1/views/groups")[0] == 404
         status, body = request(api, "PUT", "/v1/views/groups", REVENUE)
         assert status == 200, (status, body)
-        assert request(api, "GET", "/v1/views/groups")[0] == 200
+        while (status := request(api, "GET", "/v1/views/groups")[0]) == 503:  # Building.
+            time.sleep(0.2)
+        assert status == 200, status
         status, body = request(api, "GET", "/v1/views/groups/groups")
         assert status == 200 and "groups" in body, (status, body)
 

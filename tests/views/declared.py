@@ -160,7 +160,7 @@ def main():
         bad = {**REVENUE, "group_by": ["nope"]}
         assert request(api, "PUT", "/v1/views/bad", bad)[0] == 400
         assert request(api, "PUT", "/v1/views/Bad", REVENUE)[0] == 400
-        assert request(api, "GET", "/v1/views/revenue")[1]["table"] == TABLE
+        assert request(api, "GET", "/v1/views/revenue/definition")[1]["table"] == TABLE
 
         rows, history = {}, []   # history: (op, snapshot of rows)
         declared_unsold_at = None
