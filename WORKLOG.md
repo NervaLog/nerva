@@ -583,6 +583,16 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
 - Verified locally: with room it changes nothing; with the threshold forced above the free space
   it removes the build cache and the older toolchain, keeps the pinned one, and warns.
 
+## 2026-10-05 — An eviction no longer aborts a client (N66; #52)
+
+- `src/nerva/client.zig`: `on_eviction` records the eviction; `deinit` deinits the evicted
+  VSR client.
+- `src/integration_tests.zig`: the scenario ends with an eviction (`clients_max` newer
+  sessions), expecting `error.Evicted` twice.
+- Verified: `test:integration` passes (2.4 min); with `main`'s client it aborts in
+  `MessageBuffer.invalidate` after `evicted: no_session`. `check`, `test:fmt`, `test:unit`
+  336/337 (the sandbox-denied perf test).
+
 
 ## 2026-10-05 — `nerva api` serves views whole (N66)
 
