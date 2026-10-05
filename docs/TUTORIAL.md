@@ -1048,6 +1048,7 @@ NERVA_KEY=… nerva view --cluster=<id> --addresses=<…> --listen=<host:port>
 | 200 | Done. Commits carry their `op`. |
 | 400 | Invalid request; nothing applied. |
 | 401 | Missing or wrong `X-Nerva-Key`. |
+| 413 | `request too complex`: the body would take more than 64 MiB once parsed (deeply nested or very long arrays). Nothing applied. |
 | 409 | `conflict` (stale read: `index`, current `op`), `out_of_bounds`, `row_absent`, `view_key_field`; or a layout or view declaration that contradicts an earlier one. Nothing applied. |
 | 503 | `cluster unavailable` (a commit **may** have applied) or `views_busy` (nothing applied; split the transaction, Part 7). |
 | 504 | `nerva view`: `min_op` not committed yet. |

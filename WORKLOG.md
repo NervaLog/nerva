@@ -573,3 +573,15 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
   Docker, whose build containers cannot resolve DNS. `perf/nightly/fly-run.sh` now builds with
   `docker build --network host`, pushes to `registry.fly.io/nerva-perf`, and runs that image;
   without a local Docker it still uses Fly's remote builder.
+
+## 2026-10-05 — `nerva api` bounds a request's memory (N69; #31)
+
+- `src/nerva/api/memory_budget.zig`: an allocator that refuses past a limit and says so; unit
+  tests. `src/nerva/api/server.zig`: the request arena allocates through it (64 MiB), resets
+  keeping at most 8 MiB, and answers 413 when a request exceeds it.
+- `tests/api/api.py`: 4 MiB bodies of nested and of long arrays answer 413, RSS stays near its
+  baseline. README, TUTORIAL.
+- Verified: `check`, `test:fmt`, `test:unit` 338/339 (the sandbox-denied perf test),
+  `test:api` (RSS 92 MiB, 100 MiB after both bodies); measured on `main`'s binary:
+  91 → 788 MiB, then 527 MiB, both bodies answered 400; fixed: 92 → 133, 130 MiB, 413.
+

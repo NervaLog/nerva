@@ -24,6 +24,8 @@ Runs one replica and two API gateways, then:
   unhealthy, then recovers on its own (#27);
 - malformed request heads (a bare LF, folded lines, `Transfer-Encoding`, ...) answer 400 or are
   dropped, and the gateway serves the next request (N45);
+- a 4 MiB body of nested or long arrays to answer 413 and leave the gateway's memory near
+  where it was (#31);
 - 401 without the key, 404 and 405.
 
 Usage: api.py <path to nerva> [--seed=N] [--steps=N]
@@ -374,6 +376,40 @@ MALFORMED = [
 ]
 
 
+def rss_mib(pid):
+    with open(f"/proc/{pid}/status") as status:
+        for line in status:
+            if line.startswith("VmRSS:"):
+                return int(line.split()[1]) // 1024
+    raise AssertionError("no VmRSS")
+
+
+def check_request_memory(cluster):
+    # A 4 MiB body of nested or long arrays answers 413 rather than growing the gateway, and the
+    # gateway gives back what it took (#31: such bodies used to pin 0.5 to 0.8 GB for good).
+    port, pid = cluster.ports[0], cluster.processes[1].pid
+    baseline = rss_mib(pid)
+    depth = 2 * 1024 * 1024 - 64
+    bodies = {
+        "nested arrays": "[" * depth + "]" * depth,
+        "a long array": "[" + "0," * (depth - 1) + "0]",
+    }
+    for name, fields in bodies.items():
+        body = ('{"entries":[{"kind":"put","table":1,"id":"1","fields":' + fields + '}]}').encode()
+        assert len(body) <= 4 * 1024 * 1024, len(body)
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=60)
+        connection.request("POST", "/v1/commit", body=body,
+                           headers={"X-Nerva-Key": KEY, "Content-Type": "application/json"})
+        response = connection.getresponse()
+        text = response.read().decode()
+        connection.close()
+        assert response.status == 413 and "too complex" in text, (name, response.status, text)
+        after = rss_mib(pid)
+        assert after < baseline + 100, f"{name}: RSS {baseline} MiB before, {after} MiB after"
+    assert request(port, "GET", "/healthz", key=None)[0] == 200
+    return baseline, rss_mib(pid)
+
+
 def check_malformed(port):
     # Each is refused with 400 (or the connection is dropped), and the gateway still serves.
     for raw in MALFORMED:
@@ -509,6 +545,7 @@ def main():
         conflicts = counter_race(ports)
         check_connections(ports[0])
         check_malformed(ports[0])
+        rss = check_request_memory(cluster)
         check_multiline_body(ports[0])
         check_idle_flood(ports[0])
         check_trace_refuses_existing(nerva, cluster.tmp)
@@ -522,7 +559,8 @@ def main():
 
         print(f"api: PASSED ({steps} steps: {counts}; feed of {len(feed)} changes; "
               f"{len(keys)} histories; {as_of_reads} as-of reads; counter race with "
-              f"{conflicts} conflicts retried; seed {seed})")
+              f"{conflicts} conflicts retried; gateway RSS {rss[0]} MiB, {rss[1]} MiB after "
+              f"4 MiB nested bodies; seed {seed})")
     finally:
         cluster.close()
 

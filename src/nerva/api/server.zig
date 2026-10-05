@@ -10,6 +10,7 @@ const Client = @import("../client.zig").Client;
 const api = @import("api.zig");
 const http_connection = @import("../http_connection.zig");
 const CatalogStore = @import("catalog_store.zig").CatalogStore;
+const MemoryBudget = @import("memory_budget.zig");
 
 /// The largest request body: a full commit request in JSON is well under this.
 const body_size_max = 4 * 1024 * 1024;
@@ -86,13 +87,17 @@ pub fn serve(gpa: std.mem.Allocator, client: *Client, options: Options) !noretur
         .allocator = client.allocator,
         .options = client.options,
     };
-    var arena_instance = std.heap.ArenaAllocator.init(gpa);
+    // Each request's memory is bounded, and the arena gives back what one large request took
+    // (#31).
+    var budget = MemoryBudget.init(gpa, MemoryBudget.limit_default);
+    var arena_instance = std.heap.ArenaAllocator.init(budget.allocator());
     defer arena_instance.deinit();
 
     while (true) {
         // Requests are read from many connections at once, and served one at a time (N45).
         const received = try receiver.next(-1) orelse continue;
-        _ = arena_instance.reset(.retain_capacity);
+        _ = arena_instance.reset(.{ .retain_with_limit = MemoryBudget.retain_max });
+        budget.request_start();
         const arena = arena_instance.allocator();
         const reply = serve_request(
             arena,
@@ -103,6 +108,13 @@ pub fn serve(gpa: std.mem.Allocator, client: *Client, options: Options) !noretur
             &received.request,
         ) catch |err|
             reply: {
+                if (err == error.OutOfMemory and budget.exceeded) {
+                    log.warn("request: past its memory budget", .{});
+                    break :reply api.Reply{
+                        .status = 413,
+                        .body = "{\"error\":\"request too complex\"}",
+                    };
+                }
                 log.warn("request: {}", .{err});
                 break :reply api.Reply{ .status = 500, .body = "{\"error\":\"internal error\"}" };
             };

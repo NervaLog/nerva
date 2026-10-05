@@ -961,3 +961,17 @@ but the pinned one. A job then rebuilds from scratch, about a minute more. A thr
 always emptying keeps the cache's speed-up on most jobs. If space is still short afterwards, it
 warns and lists what is large, so the next full disk names its cause.
 
+**N69. `nerva api` spends at most 64 MiB on one request, and keeps at most 8 MiB.**
+Request bodies are parsed into `std.json.Value` in a per-request arena, which costs many times
+the body for nested or long arrays, and the arena was reset with `.retain_capacity`, so one
+4 MiB body pinned its peak for the gateway's life (#31; measured at `825355c`: 91 to 788 MiB for
+nested arrays, 527 MiB for a long one). The arena now allocates through `MemoryBudget`
+(`src/nerva/api/memory_budget.zig`), which refuses an allocation past 64 MiB held and records
+it; the gateway answers `413 {"error":"request too complex"}` instead of 500 and serves on. The
+arena is reset with `.retain_with_limit = 8 MiB`. A budget, rather than limits on JSON depth or
+array length, bounds every shape of body at once, including ones parsed into typed structs. 64 MiB
+is well above what any valid request needs (a full 4 MiB commit parses in a few MiB). Tests:
+unit tests of the budget (refusal, frees, an arena over nested JSON); `test:api` sends both
+bodies (413) and checks the gateway's RSS stays within 100 MiB of where it was (measured: 92 MiB
+before, 133 MiB after).
+
