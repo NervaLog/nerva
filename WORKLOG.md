@@ -583,6 +583,17 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
 - Verified locally: with room it changes nothing; with the threshold forced above the free space
   it removes the build cache and the older toolchain, keeps the pinned one, and warns.
 
+## 2026-10-05 — A client may not send `pulse` (N67; #33)
+
+- `src/nerva/internal_operations.zig`: `pulse_from_client`, unit-tested for every operation.
+- `src/vsr/replica.zig`: `on_request` evicts such a client (`invalid_request_operation`);
+  UPSTREAM.md.
+- Measured at `825355c`: one raw `pulse` from a client crashes the replicas
+  (`trace/event.zig`, invalid enum value), and again after a restart. With the guard (and #53's
+  client fix), the client is evicted and the integration scenario passes after it.
+- Verified: `check`, `test:fmt`, `test:unit` 337/338 (the sandbox-denied perf test); VOPR
+  `nerva` seeds 1, 2 and `testing` seed 1.
+
 ## 2026-10-05 — An eviction no longer aborts a client (N66; #52)
 
 - `src/nerva/client.zig`: `on_eviction` records the eviction; `deinit` deinits the evicted
