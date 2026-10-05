@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Writes the software bill of materials for a release, as CycloneDX 1.5 JSON (N62).
+"""Writes the software bill of materials for a release, as CycloneDX 1.5 JSON (N63).
 
 Usage: sbom.py <tag> <commit> [<repository root>]
 

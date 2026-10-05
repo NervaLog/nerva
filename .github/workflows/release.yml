@@ -3,7 +3,7 @@
 # A version with a suffix (0.2.0-rc.1) is a prerelease. Releasing a version twice fails.
 # The release notes are the version's section of CHANGELOG.md (`## v<VERSION> — <date>`); a
 # version without one is refused before CI runs. Each release carries its software bill of
-# materials, `nerva-v<VERSION>.cdx.json` (CycloneDX, N62), covered by SHA256SUMS.
+# materials, `nerva-v<VERSION>.cdx.json` (CycloneDX, N63), covered by SHA256SUMS.
 name: Release
 
 on:

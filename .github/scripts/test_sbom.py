@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for sbom.py (N62). Run from the repository root: python3 .github/scripts/test_sbom.py"""
+"""Tests for sbom.py (N63). Run from the repository root: python3 .github/scripts/test_sbom.py"""
 import contextlib
 import importlib.util
 import io

@@ -67,7 +67,7 @@ jobs:
       - name: Format
         run: ./zig/zig build test:fmt
 
-      - name: Release scripts (the bill of materials, N62)
+      - name: Release scripts (the bill of materials, N63)
         run: python3 .github/scripts/test_sbom.py
 
       - name: Integration (three real replicas)

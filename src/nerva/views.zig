@@ -3,6 +3,8 @@
 //! row belongs to at most one group of a view, the one its group_by fields' bytes name, if it
 //! passes the view's where clauses. Each group keeps a count and per-aggregate sums, and a view
 //! keeps the sum (modulo 2^256) of its non-empty groups' digests, so every replica agrees on it.
+//! A `min` or `max` slot is kept by the state machine from its members' order (N62); this file
+//! has their keys and ordering.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -19,8 +21,7 @@ const FieldRef = nerva.FieldRef;
 const Group = nerva.Group;
 const group_key_size_max = nerva.group_key_size_max;
 
-/// The definition's static checks, or null if it is valid. `unsupported` for `min` and `max`,
-/// once nothing else is wrong.
+/// The definition's static checks, or null if it is valid.
 pub fn definition_validate(definition: *const ViewDefinition) ?DeclareStatus {
     const name = definition_name(definition);
     if (name.len == 0) return .invalid;
@@ -63,7 +64,6 @@ pub fn definition_validate(definition: *const ViewDefinition) ?DeclareStatus {
     }
     if (key_size > group_key_size_max) return .invalid;
 
-    var min_or_max = false;
     for (&definition.aggregates, 0..) |*aggregate, index| {
         if (index >= definition.aggregate_count) {
             if (!stdx.zeroed(std.mem.asBytes(aggregate))) return .invalid;
@@ -76,12 +76,24 @@ pub fn definition_validate(definition: *const ViewDefinition) ?DeclareStatus {
                 if (!field_valid(aggregate.field) or aggregate.field.kind == .bytes) {
                     return .invalid;
                 }
-                if (aggregate.function != .sum) min_or_max = true;
             },
             _ => return .invalid,
         }
     }
-    return if (min_or_max) .unsupported else null;
+    return null;
+}
+
+/// The `min` and `max` aggregates of a definition.
+pub fn extreme_count(definition: *const ViewDefinition) u32 {
+    var count: u32 = 0;
+    for (definition.aggregates[0..definition.aggregate_count]) |*aggregate| {
+        if (extreme(aggregate.function)) count += 1;
+    }
+    return count;
+}
+
+pub fn extreme(function: nerva.AggregateFunction) bool {
+    return function == .min or function == .max;
 }
 
 fn field_valid(field: FieldRef) bool {
@@ -111,6 +123,46 @@ pub fn field_integer(field: FieldRef, value: *const [value_size]u8) i128 {
         .signed => std.mem.readInt(i64, bytes[0..8], .little),
         else => unreachable,
     };
+}
+
+/// A field's value as a u64 that orders as the field does (N62): unsigned and boolean fields as
+/// they are, signed fields with the sign bit flipped.
+pub fn field_ordered(field: FieldRef, value: *const [value_size]u8) u64 {
+    return integer_ordered(field.kind, field_integer(field, value));
+}
+
+pub fn integer_ordered(kind: nerva.FieldKind, integer: i128) u64 {
+    return switch (kind) {
+        .unsigned, .boolean => @intCast(integer),
+        .signed => @as(u64, @bitCast(@as(i64, @intCast(integer)))) ^ (1 << 63),
+        else => unreachable,
+    };
+}
+
+pub fn integer_from_ordered(kind: nerva.FieldKind, ordered: u64) i128 {
+    return switch (kind) {
+        .unsigned, .boolean => ordered,
+        .signed => @as(i64, @bitCast(ordered ^ (1 << 63))),
+        else => unreachable,
+    };
+}
+
+/// The prefix of a group's members of one slot in the members' order (N62). Persisted: never
+/// change the derivation. A collision is found when the order is read, and fails the view.
+pub fn member_order_prefix(
+    view_id: u64,
+    slot: u8,
+    key: *const [group_key_size_max]u8,
+) u64 {
+    assert(view_id >= 1 and view_id <= nerva.views_max);
+    assert(slot < nerva.view_aggregates_max);
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("nerva.view.member.v1");
+    hash.update(std.mem.asBytes(&std.mem.nativeToLittle(u64, view_id)));
+    hash.update(&.{slot});
+    hash.update(key);
+    const digest = hash.finalResult();
+    return std.mem.readInt(u64, digest[0..8], .little);
 }
 
 /// Whether the row passes every where clause.
@@ -160,7 +212,8 @@ pub fn group_tree_key(view_id: u64, key: *const [group_key_size_max]u8) u128 {
     return @as(u128, view_id) << 64 | group_hash;
 }
 
-/// Adds the row to, or removes it from, the group: its count and sums.
+/// Adds the row to, or removes it from, the group: its count and sums. `min` and `max` slots are
+/// left as they are: they need the group's other members (the state machine, N62).
 pub fn group_apply(
     definition: *const ViewDefinition,
     group: *Group,
@@ -188,7 +241,8 @@ pub fn group_apply(
                 };
                 std.mem.writeInt(i128, slot, updated, .little);
             },
-            else => unreachable, // `min` and `max` are refused by `definition_validate`.
+            .min, .max => {},
+            _ => unreachable,
         }
     }
 }
@@ -361,17 +415,12 @@ test "views: definitions are checked statically" {
                 for (&d.group_by) |*field| field.* = .{ .offset = 0, .size = 30, .kind = .bytes };
             }
         }.f },
-        .{ .status = .unsupported, .mutate = struct {
-            fn f(d: *ViewDefinition) void {
-                d.aggregates[1].function = .max;
-            }
-        }.f },
         .{
             .status = .invalid,
             .mutate = struct {
                 fn f(d: *ViewDefinition) void {
                     d.aggregates[1].function = .max;
-                    d.reserved_b[0] = 1; // Invalid takes precedence over unsupported.
+                    d.aggregates[1].field.kind = .bytes; // Bytes are not compared.
                 }
             }.f,
         },
@@ -381,6 +430,58 @@ test "views: definitions are checked statically" {
         case.mutate(&definition);
         try testing.expectEqual(case.status, definition_validate(&definition).?);
     }
+
+    var extremes = valid;
+    extremes.aggregate_count = 3;
+    extremes.aggregates[1].function = .max;
+    extremes.aggregates[2] = extremes.aggregates[1];
+    extremes.aggregates[2].function = .min;
+    try testing.expectEqual(null, definition_validate(&extremes));
+    try testing.expectEqual(@as(u32, 2), extreme_count(&extremes));
+    try testing.expectEqual(@as(u32, 0), extreme_count(&valid));
+}
+
+test "views: ordered values sort as their fields do" {
+    const signed: FieldRef = .{ .offset = 0, .size = 8, .kind = .signed };
+    const numbers = [_]i64{ std.math.minInt(i64), -5, -1, 0, 1, 7, std.math.maxInt(i64) };
+    var previous: ?u64 = null;
+    for (numbers) |number| {
+        var value: [value_size]u8 = @splat(0);
+        std.mem.writeInt(i64, value[0..8], number, .little);
+        const ordered = field_ordered(signed, &value);
+        if (previous) |p| try testing.expect(p < ordered);
+        previous = ordered;
+        try testing.expectEqual(@as(i128, number), integer_from_ordered(.signed, ordered));
+    }
+    const unsigned: FieldRef = .{ .offset = 0, .size = 2, .kind = .unsigned };
+    var value: [value_size]u8 = @splat(0);
+    std.mem.writeInt(u16, value[0..2], 513, .little);
+    try testing.expectEqual(@as(u64, 513), field_ordered(unsigned, &value));
+    try testing.expectEqual(@as(i128, 513), integer_from_ordered(.unsigned, 513));
+}
+
+test "views: member keys and orders keep views, slots and rows apart" {
+    const a = nerva.member_key(1, 0, 7);
+    try testing.expect(a != nerva.member_key(1, 1, 7));
+    try testing.expect(a != nerva.member_key(2, 0, 7));
+    try testing.expect(a != nerva.member_key(1, 0, 8));
+    try testing.expectEqual(@as(u64, 7), @as(u64, @truncate(a)));
+    try testing.expectEqual(@as(u128, 64), nerva.member_key(64, 5, std.math.maxInt(u64)) >> 72);
+
+    const key: [group_key_size_max]u8 = @splat(0);
+    const prefix = member_order_prefix(1, 0, &key);
+    try testing.expect(prefix != member_order_prefix(1, 1, &key));
+    try testing.expect(prefix != member_order_prefix(2, 0, &key));
+    // The order of a group's members is the order of their values.
+    try testing.expect(nerva.member_order(prefix, 3) < nerva.member_order(prefix, 4));
+
+    // A group's versions are adjacent and ordered by op, whatever the group hash.
+    const group = group_tree_key(1, &key);
+    const v1 = nerva.group_version_key(group, 1);
+    const v2 = nerva.group_version_key(group, 2);
+    try testing.expect(v1 < v2);
+    try testing.expectEqual(v1 + 1, v2);
+    try testing.expect(nerva.group_version_key(group_tree_key(2, &key), 0) > v2);
 }
 
 test "views: rows fall into groups, and leave them" {
