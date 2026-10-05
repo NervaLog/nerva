@@ -439,7 +439,8 @@ def check_trace_refuses_existing(nerva, tmp):
 
 def check_stall_recovery(cluster, port):
     # A cluster stall past the client's timeout (30 s) breaks the gateway's client; the gateway
-    # replaces it once the cluster is back, and /healthz says so meanwhile (#27).
+    # replaces it once the cluster is back, and /healthz says so meanwhile (#27). It recovers
+    # with only /healthz polled, as a load balancer would, and no request for the cluster (#44).
     replica = cluster.processes[0]
     replica.send_signal(signal.SIGSTOP)
     try:
@@ -448,15 +449,12 @@ def check_stall_recovery(cluster, port):
         assert request(port, "GET", "/healthz", key=None)[0] == 503
     finally:
         replica.send_signal(signal.SIGCONT)
-    deadline = time.monotonic() + 60
-    while True:
-        status, _ = request(port, "POST", "/v1/lookup", {"rows": [{"table": 1, "id": "0"}]})
-        if status == 200:
-            break
-        assert status == 503, status
-        assert time.monotonic() < deadline, "the gateway did not recover after the cluster did"
+    deadline = time.monotonic() + 120
+    while request(port, "GET", "/healthz", key=None)[0] != 200:
+        assert time.monotonic() < deadline, "/healthz did not recover after the cluster did"
         time.sleep(1)
-    assert request(port, "GET", "/healthz", key=None)[0] == 200
+    status, body = request(port, "POST", "/v1/lookup", {"rows": [{"table": 1, "id": "0"}]})
+    assert status == 200, (status, body)
 
 
 def main():
