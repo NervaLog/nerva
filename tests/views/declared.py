@@ -15,11 +15,14 @@ op and a model of the table. Halfway, declares a second view. Then requires:
 - `as_of` or `min_op` past the cluster's op to answer 504 at once, as the op is not committed
   yet (N45);
 - a client sending its request a byte at a time, or a malformed one, not to hold up the
-  next reader (N45).
+  next reader (N45);
+- after a cluster stall past the client's timeout, a view process to keep running, answer 503
+  (and `/healthz` 503) meanwhile, and recover on its own once the cluster is back, with no
+  request needed (#42).
 
 Usage: declared.py <path to nerva> [--seed=N] [--steps=N]
 """
-import hashlib, http.client, json, os, random, shutil, socket, subprocess, sys, tempfile, time
+import hashlib, http.client, json, os, random, shutil, signal, socket, subprocess, sys, tempfile, time
 
 KEY = "views-test-key"
 TABLE = 5
@@ -139,6 +142,29 @@ def check_answer(ports, name, op, expected):
     return hashes.pop()
 
 
+def check_stall_recovery(cluster, view, latest):
+    # A cluster stall past the client's timeout (30 s) breaks the view process's client. It must
+    # not exit, nor panic on the late reply when the client is replaced (#42), and must recover
+    # with nobody sending it requests.
+    process, port = view
+    replica = cluster.processes[0]
+    replica.send_signal(signal.SIGSTOP)
+    try:
+        status, body = request(port, "GET", "/v1/views/revenue?min_op=latest")
+        assert status == 503, (status, body)
+        assert request(port, "GET", "/healthz")[0] == 503
+    finally:
+        replica.send_signal(signal.SIGCONT)
+    started = time.monotonic()
+    while request(port, "GET", "/healthz")[0] != 200:
+        assert process.poll() is None, f"the view process exited ({process.returncode})"
+        assert time.monotonic() - started < 120, "the view process did not recover"
+        time.sleep(1)
+    assert process.poll() is None
+    status, body = request(port, "GET", "/v1/views/revenue?min_op=latest")
+    assert status == 200 and body["hash"] == latest["revenue"], (status, body)
+
+
 def main():
     nerva = sys.argv[1]
     seed = next((int(a.split("=")[1]) for a in sys.argv[2:] if a.startswith("--seed=")), 1)
@@ -228,6 +254,8 @@ def main():
             assert time.monotonic() - started < 2, "a dripping connection held up a reader"
             time.sleep(1)
         drip.close()
+
+        check_stall_recovery(cluster, views[1], latest)
 
         print(f"declared views: PASSED ({steps} writes; {len(samples)} ops checked as of, for 2 "
               f"views on 2 processes, plus a restart; seed {seed})")
