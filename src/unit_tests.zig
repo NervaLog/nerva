@@ -31,6 +31,7 @@ comptime {
     _ = @import("nerva/cli.zig");
     _ = @import("nerva/documents.zig");
     _ = @import("nerva/documents_benchmark.zig");
+    _ = @import("nerva/format_test.zig");
     _ = @import("nerva/http_connection.zig");
     _ = @import("nerva/latency_histogram.zig");
     _ = @import("nerva/state_machine_tests.zig");

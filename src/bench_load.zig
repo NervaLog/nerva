@@ -1,5 +1,5 @@
 //! `zig build bench:load`: a load generator for a Nerva cluster, for the nightly performance
-//! job and for measuring a change by hand (docs/DECISIONS.md N54).
+//! job and for measuring a change by hand (docs/DECISIONS.md N55).
 //!
 //! One thread and one blocking `Client` per `--clients`. Closed loop (`--rate=0`) sends the next
 //! request as soon as the last one answers; open loop (`--rate=<n>`) sends at fixed times and
