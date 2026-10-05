@@ -640,6 +640,23 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
   `MessageBuffer.invalidate` after `evicted: no_session`. `check`, `test:fmt`, `test:unit`
   336/337 (the sandbox-denied perf test).
 
+## 2026-10-05 — `--trace` cannot stop the replica (N71; #30)
+
+- `src/nerva/trace_file.zig`: `TraceFile`, a buffered writer that stops (with a warning) on a
+  write error or at its size limit, and never fails; unit tests. `src/nerva_main.zig`: the
+  tracer writes through it. `src/nerva/cli.zig`: `--trace-size-max` (default 1 GiB).
+- `tests/api/api.py`: a traced replica with `--trace-size-max=64KiB` under load stops tracing at
+  the cap and keeps serving. README, TUTORIAL.
+- Verified: `check`, `test:fmt`, `test:unit` 341/342 (the sandbox-denied perf test), `test:api`
+  (stopped at 65,503 bytes).
+- With it, #60 (N69 amended): the largest valid `documents/get` (256 × 64 KiB) got 413. The
+  budget sat below the arena, which sizes each block from the last, so it counted 330 MiB for a
+  request asking for about 100 MB. It now sits above the arena (counting what a request asks
+  for), at 128 MiB, and the arena is reset as soon as the reply is written; the `get` reply is
+  sized up front. `tests/api/api.py` checks that `get` answers 200 and that RSS comes back. On a 1 MiB
+  tmpfs: `main`'s replica panics (`Tracer.start: error.NoSpaceLeft`, 283 lookups in); the fix
+  logs `tracing stopped: writing it failed: error.NoSpaceLeft` and serves 54,915 lookups.
+
 ## 2026-10-05 — `views_too_large` for a transaction no op can hold (N72; #32)
 
 - `src/nerva.zig`: `EntryStatus.views_too_large = 15`. `src/nerva/views.zig`: `Admission`.

@@ -811,8 +811,9 @@ Three `nerva start` flags help when you run Nerva for real:
 - `--trace=<path>` writes a span trace you can open in [Perfetto](https://ui.perfetto.dev). It
   slows the replica, so use it to diagnose, not to measure, and give it a **new** file: an
   existing one is refused (`--trace: existing.json exists; give a new file`), so a typo cannot
-  overwrite your data file. Do not leave it on: the trace grows without bound, and a write error
-  to it stops the replica ([#30](https://github.com/Botpike/nerva-ledger/issues/30)).
+  overwrite your data file. Tracing stops, with `warning(trace_file): tracing stopped: …` in the
+  log, at `--trace-size-max` (default `1GiB`) or if writing fails (a full disk, say); the
+  replica runs on.
 - `--cache-grid=<size>` and `--cache-rows=<size>` size the block cache and the row cache (128
   bytes a row). The row cache defaults to its minimum, a few hundred rows.
 
@@ -1045,7 +1046,7 @@ NERVA_KEY=… nerva view --cluster=<id> --addresses=<…> --listen=<host:port>
 | 200 | Done. Commits carry their `op`. |
 | 400 | Invalid request; nothing applied. |
 | 401 | Missing or wrong `X-Nerva-Key`. |
-| 413 | `request too complex`: the body would take more than 64 MiB once parsed (deeply nested or very long arrays). Nothing applied. |
+| 413 | `request too complex`: the body would take more than 128 MiB once parsed (deeply nested or very long arrays). Nothing applied. |
 | 409 | `conflict` (stale read: `index`, current `op`), `out_of_bounds`, `row_absent`, `view_key_field`; or a layout or view declaration that contradicts an earlier one. Nothing applied. |
 | 413 | `views_too_large`: the transaction touches more view groups than one op allows. Nothing applied; split it (Part 7). |
 | 503 | `cluster unavailable` (a commit **may** have applied) or `views_busy` (nothing applied; retry). |

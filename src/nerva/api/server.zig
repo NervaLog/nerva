@@ -39,9 +39,9 @@ pub fn serve(gpa: std.mem.Allocator, client: *Client, options: Options) !noretur
     var health = try ClientHealth.init(client);
     // Each request's memory is bounded, and the arena gives back what one large request took
     // (#31).
-    var budget = MemoryBudget.init(gpa, MemoryBudget.limit_default);
-    var arena_instance = std.heap.ArenaAllocator.init(budget.allocator());
+    var arena_instance = std.heap.ArenaAllocator.init(gpa);
     defer arena_instance.deinit();
+    var budget = MemoryBudget.init(arena_instance.allocator(), MemoryBudget.limit_default);
 
     while (true) {
         // Requests are read from many connections at once, and served one at a time (N45).
@@ -50,9 +50,8 @@ pub fn serve(gpa: std.mem.Allocator, client: *Client, options: Options) !noretur
             _ = health.ready(client);
             continue;
         };
-        _ = arena_instance.reset(.{ .retain_with_limit = MemoryBudget.retain_max });
         budget.request_start();
-        const arena = arena_instance.allocator();
+        const arena = budget.allocator();
         const reply = serve_request(
             arena,
             client,
@@ -73,6 +72,9 @@ pub fn serve(gpa: std.mem.Allocator, client: *Client, options: Options) !noretur
                 break :reply api.Reply{ .status = 500, .body = "{\"error\":\"internal error\"}" };
             };
         receiver.respond(received, reply.status, reply.body);
+        // `respond` has written the reply: give back what the request took at once, rather than
+        // when the next request arrives (#60).
+        _ = arena_instance.reset(.{ .retain_with_limit = MemoryBudget.retain_max });
     }
 }
 
