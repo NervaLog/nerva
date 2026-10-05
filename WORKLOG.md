@@ -501,3 +501,19 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
   past a checkpoint while the v0.2.0 one panics at the first operation it does not know.
 - Mutation-tested: the gate off (a commit succeeds without replica 1), unannounced peers
   admitted, and prepares of another release admitted each fail a test.
+
+## 2026-10-05 — Tutorial
+
+- `docs/TUTORIAL.md`: a step-by-step tutorial for people new to Nerva. It covers a
+  one-replica cluster and `nerva api`, rows and versions, transactions (compare-and-set,
+  claims, atomicity, deletes), the change feed, history and as-of reads, layouts, adds,
+  maintained views and `nerva view`, documents, crashes and safe retries, operating a replica,
+  the Zig client, a contributor's tour of the code, and a cheat sheet. Linked from README.md.
+- Written at `eaa7520`, then updated for v0.3.0: releases and upgrades (N60, N61), multi-line
+  bodies (#36 fixed), the gateway's reconnect and `/healthz` (#27), `views_busy` that a retry
+  cannot fix (#32), `--statsd`, `--trace` and `--cache-rows`, `Client.reconnect`,
+  `test:release`.
+- Verified: every command and reply in it comes from one scripted run against a fresh
+  one-replica `--development` cluster at v0.3.0. The crash, outage and reconnect, retry,
+  layout and declaration claims were each checked separately.
+- Found while writing it: #36 (fixed in N58) and #37 (a duplicate of #27, fixed in N58).
