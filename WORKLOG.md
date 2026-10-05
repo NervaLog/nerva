@@ -420,3 +420,16 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
 - Tests: `cache_rows_resolve` and `LatencyHistogram` unit tests; `test:integration` checks round
   trips arrive over statsd (every replica now sends) and starts replica 2 with `--cache-rows`.
   Mutation-tested: sending 0 as the round trip fails it. Every bench:load workload ran locally.
+
+## 2026-10-05 — Nightly performance run (N56)
+
+- `.github/workflows/perf-nightly.yml`: nightly at 06:47 UTC and by hand; builds candidate and
+  baseline, runs them on a Fly Machine, compares, records on `perf-results`, files
+  `perf-regression` issues.
+- `perf/nightly/`: `run.sh` (on the Machine), `Dockerfile`, `fly-run.sh` (create, poll, collect,
+  destroy, sweep), `compare.py` and `test_compare.py` (7 tests).
+- `build.zig`: `bench:build` installs `bench`, `bench-stdx` and `bench-load` without running them.
+- Verified: `test_compare.py`; a local dry run of `run.sh` (two rounds, `--development`); a full
+  trial on Fly (one performance-8x Machine, created and destroyed), which passed and found the
+  Fly volume dominating production-config latency (N56).
+
