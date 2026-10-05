@@ -134,6 +134,17 @@ pub const Client = struct {
         assert(client.vsr_client.batch_size_limit.? > 0);
     }
 
+    /// Replaces a client that timed out or was evicted with a new session, in place, so that
+    /// references to it stay valid (#27). On failure the client is uninitialized: call `init`
+    /// again, never `deinit`.
+    pub fn reconnect(client: *Client) !void {
+        assert(client.state == .timed_out or client.state == .evicted);
+        const allocator = client.allocator;
+        const options = client.options;
+        client.deinit();
+        try client.init(allocator, options);
+    }
+
     pub fn deinit(client: *Client) void {
         const allocator = client.allocator;
         if (client.state != .evicted) {

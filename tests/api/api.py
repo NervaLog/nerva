@@ -19,13 +19,16 @@ Runs one replica and two API gateways, then:
 - the gateway serves one request per connection and reads many at once: a client holding its
   connection open, one that connects and sends nothing, or one that sends a byte at a time does
   not hold up the next client (N37, N45);
+- many idle connections do not hold up a request (#28); `start --trace` refuses an existing
+  file (#29); after a cluster stall past the client's timeout the gateway reports itself
+  unhealthy, then recovers on its own (#27);
 - malformed request heads (a bare LF, folded lines, `Transfer-Encoding`, ...) answer 400 or are
   dropped, and the gateway serves the next request (N45);
 - 401 without the key, 404 and 405.
 
 Usage: api.py <path to nerva> [--seed=N] [--steps=N]
 """
-import http.client, json, os, random, shutil, socket, subprocess, sys, tempfile, threading, time
+import http.client, json, os, random, shutil, signal, socket, subprocess, sys, tempfile, threading, time
 
 KEY = "api-test-key"
 TABLES = (1, 2)
@@ -386,6 +389,76 @@ def check_malformed(port):
         assert request(port, "GET", "/healthz", key=None)[0] == 200, raw[:60]
 
 
+def check_multiline_body(port):
+    # A pretty-printed body sent in one write with its head, as `curl -d` sends it, is served
+    # (#36; it was refused as a bare LF in the head).
+    body = b'{"rows":[\n  {"table":1,"id":"42"}\n]}\n'
+    head = (b"POST /v1/lookup HTTP/1.1\r\nX-Nerva-Key: " + KEY.encode() +
+            b"\r\nContent-Length: %d\r\n\r\n" % len(body))
+    connection = socket.create_connection(("127.0.0.1", port), timeout=30)
+    try:
+        connection.sendall(head + body)
+        reply = b""
+        while chunk := connection.recv(4096):
+            reply += chunk
+    finally:
+        connection.close()
+    assert reply.startswith(b"HTTP/1.1 200 "), reply[:200]
+    assert b'"id":"42"' in reply, reply[:400]
+
+
+def check_idle_flood(port):
+    # Idle connections cannot lock others out: with every slot busy, a new connection displaces
+    # the oldest one still sending its request (#28; it took 85 s before).
+    idle = []
+    for _ in range(200):
+        try:
+            idle.append(socket.create_connection(("127.0.0.1", port), timeout=5))
+        except OSError:
+            break
+    started = time.monotonic()
+    assert request(port, "GET", "/healthz", key=None)[0] == 200
+    waited = time.monotonic() - started
+    for connection in idle:
+        connection.close()
+    assert waited < 3, f"{len(idle)} idle connections held /healthz up for {waited:.1f} s"
+
+
+def check_trace_refuses_existing(nerva, tmp):
+    # `--trace` never truncates an existing file, such as a data file named by mistake (#29).
+    victim = os.path.join(tmp, "existing.bin")
+    with open(victim, "wb") as f:
+        f.write(b"x" * 100_000)
+    result = subprocess.run([nerva, "start", "--addresses=0", "--development", f"--trace={victim}",
+                             os.path.join(tmp, "0_0.nerva")], stdin=subprocess.DEVNULL,
+                            capture_output=True, timeout=60)
+    assert result.returncode != 0, "start --trace=<existing file> did not refuse"
+    with open(victim, "rb") as f:
+        assert f.read() == b"x" * 100_000, "start --trace=<existing file> changed the file"
+
+
+def check_stall_recovery(cluster, port):
+    # A cluster stall past the client's timeout (30 s) breaks the gateway's client; the gateway
+    # replaces it once the cluster is back, and /healthz says so meanwhile (#27).
+    replica = cluster.processes[0]
+    replica.send_signal(signal.SIGSTOP)
+    try:
+        status, body = request(port, "POST", "/v1/lookup", {"rows": [{"table": 1, "id": "0"}]})
+        assert status == 503, (status, body)
+        assert request(port, "GET", "/healthz", key=None)[0] == 503
+    finally:
+        replica.send_signal(signal.SIGCONT)
+    deadline = time.monotonic() + 60
+    while True:
+        status, _ = request(port, "POST", "/v1/lookup", {"rows": [{"table": 1, "id": "0"}]})
+        if status == 200:
+            break
+        assert status == 503, status
+        assert time.monotonic() < deadline, "the gateway did not recover after the cluster did"
+        time.sleep(1)
+    assert request(port, "GET", "/healthz", key=None)[0] == 200
+
+
 def main():
     nerva = sys.argv[1]
     seed = next((int(a.split("=")[1]) for a in sys.argv[2:] if a.startswith("--seed=")), 1)
@@ -436,6 +509,10 @@ def main():
         conflicts = counter_race(ports)
         check_connections(ports[0])
         check_malformed(ports[0])
+        check_multiline_body(ports[0])
+        check_idle_flood(ports[0])
+        check_trace_refuses_existing(nerva, cluster.tmp)
+        check_stall_recovery(cluster, ports[1])
         check_layouts(ports)
 
         assert request(ports[0], "POST", "/v1/lookup", {"rows": []}, key=None)[0] == 401
