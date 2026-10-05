@@ -408,3 +408,11 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
 - Merged after views (N52): the layouts guard covers views' types, operations and tree ids; the
   script guard caught N52's 5 timestamps per entry, and its snapshot was updated for it.
 
+## 2026-10-05 — Long fuzzing workflow (N55)
+
+- `.github/workflows/fuzz.yml` (dispatch only) and `.github/scripts/fuzz_loop.sh`: every fuzzer
+  and seven VOPR lanes on random seeds for a time budget, on Fly runners started for the run.
+- Verified locally: `nerva_adds` for a minute (319 runs, passing); the `canary` fuzzer's planted
+  failure is reported with its seed and replay command, and fails the job; the VOPR path (testing
+  state machine, 9 runs); the workflow parses, 16 fuzz and 7 VOPR jobs.
+
