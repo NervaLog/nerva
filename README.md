@@ -289,7 +289,8 @@ process restarts.
 - An `add` to a field a view filters or groups by is refused (`409 view_key_field`); adds to
   summed fields are what views are for.
 - One op touches at most about 4,000 distinct groups and 8,000 `min` and `max` members (a write
-  takes one in each such slot of its table), however many writes it has. A transaction that
+  takes one in each such slot of its table), however many writes it has: a transaction writes
+  at most about 4,000 rows of a table with two such slots, 2,000 with four. A transaction that
   exceeds them on its own is refused whole (`413 views_too_large`): it never fits, so split it.
   `503 views_busy` is only for a request that packs several transactions (Nerva's clients send
   one each), when earlier ones filled the op: nothing applied, retry it.

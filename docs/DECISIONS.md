@@ -863,8 +863,10 @@ committed op since its declaration.
   distinct members (`members_per_op_max`, 8,190 in production), and admission counts them as it
   counts groups (N52): a write counts its member in each `min` or `max` slot of each view whose
   filter its old or new value passes, and a transaction that would take the op past the limit
-  is refused whole (`views_busy`). With one or two such slots on a table any request fits; with
-  four, a transaction of more than about 2,000 writes to that table never does. The owner chose
+  is refused whole (`views_busy`). With one such slot on a table any request fits; with k, a
+  transaction of more than 8,190 / k writes to that table never does: 4,094 with two, 2,047 with
+  four (measured; this said two slots fit any request, corrected after the 0.0.4 hardening pass,
+  and such a transaction is refused `views_too_large` since N72). The owner chose
   this over sizing the members trees so that nothing is ever refused: measured on one replica
   (`--development`, RSS after start), `main` takes 1,014 MiB, this change 1,295 MiB, and with
   members sized for 4 × a request's entries 1,953 MiB. The 281 MiB are mostly the two version
@@ -1116,3 +1118,17 @@ rule. Tests: the unit test's transaction of `limit + 1` new groups now expects `
 and the request whose third transaction overflows only with the first two expects `views_busy`
 and then commits alone; `test:views` sends 4,200 new groups (413) and the same rows split in two
 (200 each).
+
+**N73. The op's `min`/`max` scratch holds two keys per member.**
+`extremes_gather` gives each touched member up to two (group, slot) keys: the group it left, when
+it held that group's value as stored, and the group it entered. `extremes_scratch` was sized for
+one per member, so one admitted transaction moving the holders of many groups' values to new
+groups (about 1,640 rows, each alone in its group, under four slots) overflowed it: every replica
+panicked (`integer overflow` in `getOrPutAssumeCapacity`), and again replaying the op after a
+restart (#62; reproduced at `8c206f2`, found by the 0.0.4 hardening pass). It is now sized for
+`2 * members_limit`, the most admission lets an op reach. Other scratch structures were checked
+against admission and are sized right. Tests: a state-machine test moves every holder the op's
+member limit admits to new groups in one transaction (it panicked; it now commits and every new
+group holds its row's values); at production limits, 2,047 rows moved in one transaction commit
+and the replica serves on.
+

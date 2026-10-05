@@ -668,3 +668,20 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
   new groups answer 413; split in two, they commit). Format snapshot: the new status line.
 - Verified: `check`, `test:fmt`, `test:unit` (the sandbox-denied perf test aside), `test:views`;
   VOPR seeds 1, 2, 5 (one `views_busy`, one `views_too_large`) and 2467272726192300042.
+
+## 2026-10-05 — `extremes_scratch` holds two keys per member (N73; #62)
+
+- `src/nerva/state_machine.zig`: `extremes_scratch` sized for `2 * members_limit`.
+- `src/nerva/state_machine_tests.zig`: one op moving every `min`/`max` holder it admits to new
+  groups (panicked with `integer overflow` before; now commits, groups checked).
+- N62 corrected: with two `min`/`max` slots a transaction holds at most 4,094 writes to the
+  table, not any number; README gives the per-slot bounds.
+- Verified: `check`, `test:fmt`, `test:unit` 341/342 (the sandbox-denied perf test),
+  `test:views`; VOPR seeds 1, 2, 5, 2588955253890934414. At production limits (the pass's
+  probe): 2,047 rows moved in one transaction commit and the view holds each; on `8c206f2` it
+  panicked every replica, and again after a restart.
+- Found by the 0.0.4 hardening pass (a background agent), which otherwise held up: `min`/`max`
+  against a model with ties, deletes, moves and refills; about 8,100 `as_of` comparisons across
+  checkpoints and restarts, in agreement with `nerva view`; backfill under load; 13 VOPR seeds;
+  fuzzers at smoke size; v0.3.0 clients refused by 0.0.4, as N62 intends.
+
