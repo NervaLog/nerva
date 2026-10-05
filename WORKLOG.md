@@ -741,3 +741,10 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
   (11511081922386736357) pass; seeds 1, 2, 5 and 30 random in ReleaseSafe pass; `check`,
   `test:fmt`, `test:unit` (the sandbox-denied perf test aside).
 
+## 2026-10-05 — `/groups` names its replicated hash `view_hash` (#66)
+
+- `src/nerva/api/api.zig`: `GET /v1/views/<name>/groups` sends `view_hash`, not `hash`, as the
+  whole view and the README already say. `tests/views/maintained.py` follows; TUTORIAL's example
+  and CHANGELOG v0.4.0 (an incompatible change from v0.3.0) say so; DECISIONS N66 notes it.
+- Verified: `check`, `test:fmt`, `test:views`.
+

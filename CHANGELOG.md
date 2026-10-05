@@ -48,6 +48,8 @@ curl -H 'X-Nerva-Key: secret' http://127.0.0.1:8080/v1/commit -d '{"entries": [
   `declared_op`. **It used to return the declaration, which moved to
   `GET /v1/views/<name>/definition`.** `GET /v1/views` lists the views. A view of more than
   10,000 groups is read in pages from `/groups`.
+- **`GET /v1/views/<name>/groups` names its replicated hash `view_hash`, as the whole view
+  does; it was `hash`** (#66). `hash` on `nerva api` now always means `nerva view`'s.
 - A view declared over a ledger's field is refused with `409`, and nothing is written.
 
 ### New: releases carry a bill of materials
