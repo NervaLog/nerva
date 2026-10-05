@@ -421,7 +421,19 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
   trips arrive over statsd (every replica now sends) and starts replica 2 with `--cache-rows`.
   Mutation-tested: sending 0 as the round trip fails it. Every bench:load workload ran locally.
 
-## 2026-10-05 — Release v0.3.0 (N58)
+## 2026-10-05 — Nightly performance run (N56)
+
+- `.github/workflows/perf-nightly.yml`: nightly at 06:47 UTC and by hand; builds candidate and
+  baseline, runs them on a Fly Machine, compares, records on `perf-results`, files
+  `perf-regression` issues.
+- `perf/nightly/`: `run.sh` (on the Machine), `Dockerfile`, `fly-run.sh` (create, poll, collect,
+  destroy, sweep), `compare.py` and `test_compare.py` (7 tests).
+- `build.zig`: `bench:build` installs `bench`, `bench-stdx` and `bench-load` without running them.
+- Verified: `test_compare.py`; a local dry run of `run.sh` (two rounds, `--development`); a full
+  trial on Fly (one performance-8x Machine, created and destroyed), which passed and found the
+  Fly volume dominating production-config latency (N56).
+
+## 2026-10-05 — Release v0.3.0 (N59)
 
 - `build.zig`: release `0.0.3`, clients from `0.0.2`. `CHANGELOG.md`: the v0.3.0 section
   (maintained views, metrics and traces, the faster client; #7–#10, #26–#29 and #36 fixed;
