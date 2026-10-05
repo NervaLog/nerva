@@ -389,6 +389,24 @@ def check_malformed(port):
         assert request(port, "GET", "/healthz", key=None)[0] == 200, raw[:60]
 
 
+def check_multiline_body(port):
+    # A pretty-printed body sent in one write with its head, as `curl -d` sends it, is served
+    # (#36; it was refused as a bare LF in the head).
+    body = b'{"rows":[\n  {"table":1,"id":"42"}\n]}\n'
+    head = (b"POST /v1/lookup HTTP/1.1\r\nX-Nerva-Key: " + KEY.encode() +
+            b"\r\nContent-Length: %d\r\n\r\n" % len(body))
+    connection = socket.create_connection(("127.0.0.1", port), timeout=30)
+    try:
+        connection.sendall(head + body)
+        reply = b""
+        while chunk := connection.recv(4096):
+            reply += chunk
+    finally:
+        connection.close()
+    assert reply.startswith(b"HTTP/1.1 200 "), reply[:200]
+    assert b'"id":"42"' in reply, reply[:400]
+
+
 def check_idle_flood(port):
     # Idle connections cannot lock others out: with every slot busy, a new connection displaces
     # the oldest one still sending its request (#28; it took 85 s before).
@@ -491,6 +509,7 @@ def main():
         conflicts = counter_race(ports)
         check_connections(ports[0])
         check_malformed(ports[0])
+        check_multiline_body(ports[0])
         check_idle_flood(ports[0])
         check_trace_refuses_existing(nerva, cluster.tmp)
         check_stall_recovery(cluster, ports[1])

@@ -421,7 +421,7 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
   trips arrive over statsd (every replica now sends) and starts replica 2 with `--cache-rows`.
   Mutation-tested: sending 0 as the round trip fails it. Every bench:load workload ran locally.
 
-## 2026-10-05 — Gateway fixes: routes, recovery, slots, trace files (N56; #26–#29)
+## 2026-10-05 — Gateway fixes: routes, recovery, slots, trace files (N56; #26–#29, #36)
 
 - `api.zig`: `/v1/views/groups` is the view named `groups`, not a groups route with no name
   (#26).
@@ -430,6 +430,8 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
 - `http_connection.zig`: with every slot busy, a new connection displaces the oldest one still
   sending its request (#28).
 - `nerva_main.zig`: `--trace` creates its file exclusively (#29).
+- `http_connection.zig`: the early bare-LF refusal scans only the head, so a body may hold
+  newlines when it arrives with its head (#36, found writing the tutorial).
 - Tests in `tests/api/api.py`, `tests/views/maintained.py` and a `Receiver` unit test, each
   failing on the binary before the fix.
 

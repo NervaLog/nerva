@@ -352,13 +352,17 @@ pub const Receiver = struct {
 
         if (slot.head == null) {
             const bytes = slot.buffer[0..slot.size];
-            // Refuse a bare LF at once, rather than wait for a CRLF CRLF that never comes.
-            for (bytes[size_before..], size_before..) |byte, index| {
+            const head_end = std.mem.indexOfPos(u8, bytes, size_before -| 3, "\r\n\r\n");
+            // Refuse a bare LF in the head at once, rather than wait for a CRLF CRLF that never
+            // comes. Bytes past the head are the body's, where an LF is just a byte (#36).
+            const head_read = if (head_end) |index| index + "\r\n\r\n".len else slot.size;
+            assert(head_read > size_before);
+            for (bytes[size_before..head_read], size_before..) |byte, index| {
                 if (byte == '\n' and (index == 0 or bytes[index - 1] != '\r')) {
                     return receiver.refuse(slot, "malformed request");
                 }
             }
-            const end = std.mem.indexOfPos(u8, bytes, size_before -| 3, "\r\n\r\n") orelse {
+            const end = head_end orelse {
                 if (slot.size == receiver.options.head_size_max) {
                     return receiver.refuse(slot, "request head too large");
                 }
@@ -603,6 +607,33 @@ test "Receiver: a slow client holds up nobody, and is closed at its deadline" {
     // The slow client never finishes: it is closed at its deadline, with no reply.
     try testing.expectEqual(null, try receiver.next(400));
     try testing.expectEqual(0, try slow.read(&reply));
+}
+
+test "Receiver: a body may hold LFs, though the head may not, when both arrive in one read" {
+    var receiver = try Receiver.init(
+        testing.allocator,
+        try std.net.Address.parseIp("127.0.0.1", 0),
+        .{ .connections_max = 2, .body_size_max = 64 },
+    );
+    defer receiver.deinit(testing.allocator);
+
+    // Head and a pretty-printed body in one write, as `curl -d` sends them (#36).
+    const client = try test_connect(&receiver);
+    defer client.close();
+    try client.writeAll("POST /v1/lookup HTTP/1.1\r\nContent-Length: 13\r\n\r\n{\"rows\":[\n]}\n");
+    const received = (try receiver.next(1000)).?;
+    try testing.expectEqualStrings("{\"rows\":[\n]}\n", received.request.body);
+    receiver.respond(received, 200, "{}");
+
+    // A bare LF in the head is still refused, with a body behind it in the same read.
+    const bare = try test_connect(&receiver);
+    defer bare.close();
+    try bare.writeAll("POST / HTTP/1.1\nContent-Length: 2\r\n\r\n{}");
+    try testing.expectEqual(null, try receiver.next(100));
+    var reply: [256]u8 = undefined;
+    const reply_size = try bare.readAll(&reply);
+    try testing.expect(std.mem.startsWith(u8, reply[0..reply_size], "HTTP/1.1 400 "));
+    try testing.expect(std.mem.indexOf(u8, reply[0..reply_size], "malformed request") != null);
 }
 
 test "Receiver: malformed and oversized requests are refused with 400" {

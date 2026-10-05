@@ -665,7 +665,7 @@ The rest of what the nightly performance job needs before it can measure anythin
   the nightly job, on dedicated machines, to settle.
 
 **N56. Gateway fixes from the second hardening pass: routes, recovery, slots, trace files.**
-Four bugs found by the second pass, each reproduced before it was fixed:
+Five bugs found by the second pass, each reproduced before it was fixed:
 - **`GET /v1/views/groups` crashed `nerva api` (#26).** The path matched both the views prefix and
   the groups suffix, and the name between them was sliced from 10 to 9. A path is a groups route
   only with a name between the two: `/v1/views/groups` is the view named `groups`, which can now
@@ -688,9 +688,14 @@ Four bugs found by the second pass, each reproduced before it was fixed:
   the backlog.
 - **`--trace=<path>` truncated whatever it named (#29)**, a data file included. It is now
   created exclusively, and an existing file is refused with a message.
+- **A body with a newline was refused when it arrived with its head (#36).** N45's early
+  refusal of a bare LF scanned every byte read so far, body included, so `curl -d` with
+  pretty-printed JSON (the README's own examples) got `400 malformed request` whenever head and
+  body shared a read. The scan now stops at the end of the head; the body is bytes.
 Tests that fail on the binary before these fixes: a view named `groups` read and declared
 (`tests/views/maintained.py`); 200 idle connections and `/healthz` within 3 s, `start --trace`
 of an existing file leaving it intact, and a replica stalled past the client's timeout, then
 resumed, with the gateway reporting itself unhealthy and recovering (`tests/api/api.py`); and a
-`Receiver` unit test of displacement.
+`Receiver` unit test of displacement; and a multi-line body sent in one write with its head
+(`tests/api/api.py`, and a `Receiver` unit test that also keeps a bare LF in the head refused).
 
