@@ -587,6 +587,15 @@ are maintained inside the commit, like rows. This first step covers `count` and 
   fail the unit tests and the VOPR (seeds 1, 3 and 7); rows past the cursor counted twice fail
   the backfill test; admission refusing one group early fails the VOPR (seed 7).
 
+**N53. CI runs every fuzzer at its smoke size.**
+`ci.yml`'s `test` job runs `zig build fuzz -- smoke` after the unit tests: every vendored fuzzer
+and Nerva's own (N46), each at a fixed seed and a size chosen to stay within its smoke budget.
+#6 went unnoticed because nothing ran the fuzzers; now a fuzzer that stops working fails CI. It
+was held back while CI moved to Botpike's own runners (N47). The fixed seed makes smoke a
+regression check, not a search: finding new bugs takes many seeds, which is a scheduled job's
+work, not every pull request's. `lsm_segmented_array` logs "too slow for the smoke mode" in a
+Debug build (about 20 s against its 10 s budget); that is a warning, not a failure.
+
 **N54. Format guards: tests that fail on any change to what Nerva puts on the wire or on disk.**
 Only struct sizes (comptime asserts), one document id vector and an empty formatted data file
 were pinned. Reordering fields of equal size, renumbering an enum value or tree id, or changing a

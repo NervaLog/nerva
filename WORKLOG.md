@@ -390,6 +390,12 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
   `test:views`. Mutation-tested (groups that never lose rows, the backfill cursor, admission off
   by one).
 
+## 2026-10-04 — CI runs the fuzzers' smoke pass (N53)
+
+- `.github/workflows/ci.yml`: the `test` job runs `zig build fuzz -- smoke` after the unit tests.
+  README lists it among CI's steps.
+- Verified locally: the smoke pass passes on `main`.
+
 ## 2026-10-04 — Format guards (N54)
 
 - `src/nerva/format_test.zig`: a snapshot of every wire and storage type's layout, enum values
