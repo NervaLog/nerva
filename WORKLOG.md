@@ -421,16 +421,99 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
   trips arrive over statsd (every replica now sends) and starts replica 2 with `--cache-rows`.
   Mutation-tested: sending 0 as the round trip fails it. Every bench:load workload ran locally.
 
+## 2026-10-05 — Nightly performance run (N56)
+
+- `.github/workflows/perf-nightly.yml`: nightly at 06:47 UTC and by hand; builds candidate and
+  baseline, runs them on a Fly Machine, compares, records on `perf-results`, files
+  `perf-regression` issues.
+- `perf/nightly/`: `run.sh` (on the Machine), `Dockerfile`, `fly-run.sh` (create, poll, collect,
+  destroy, sweep), `compare.py` and `test_compare.py` (7 tests).
+- `build.zig`: `bench:build` installs `bench`, `bench-stdx` and `bench-load` without running them.
+- Verified: `test_compare.py`; a local dry run of `run.sh` (two rounds, `--development`); a full
+  trial on Fly (one performance-8x Machine, created and destroyed), which passed and found the
+  Fly volume dominating production-config latency (N56).
+
+## 2026-10-05 — Faster CI: parallel test jobs, demos split, Zig kept on the volume (N57)
+
+- `.github/workflows/ci.yml`: `test` split into `unit` (unit tests) and `system` (typecheck,
+  format, integration, API, views); `demo` split into one job per demo, each building with
+  `-Drelease` and running its script as `test:demo` does, with a step that fails if build.zig's
+  demo list and the matrix differ; every job installs Zig from a copy kept on the runner's
+  volume, keyed by `zig/download.sh`'s hash, downloading only when it is missing or broken.
+  The fuzzers' smoke pass (N53) runs as a job of its own, `fuzz`.
+- Before (run 37240753012): critical path `test` 7m05, `demo` 6m03. After: the pull request's
+  own CI run (see the pull request).
+- Verified locally: the install snippet downloads once, then links the copy (0.03 s instead of
+  9 s), and recovers from a damaged copy; `zig build check` passes through the links;
+  actionlint is clean apart from the custom `fly` label.
+
+## 2026-10-05 — Gateway fixes: routes, recovery, slots, trace files (N58; #26–#29, #36)
+
+- `api.zig`: `/v1/views/groups` is the view named `groups`, not a groups route with no name
+  (#26).
+- `client.zig`, `api/server.zig`: `Client.reconnect`; the gateway replaces a client that timed
+  out or was evicted, at most every 5 s, answering 503 meanwhile, and `/healthz` reports it (#27).
+- `http_connection.zig`: with every slot busy, a new connection displaces the oldest one still
+  sending its request (#28).
+- `nerva_main.zig`: `--trace` creates its file exclusively (#29).
+- `http_connection.zig`: the early bare-LF refusal scans only the head, so a body may hold
+  newlines when it arrives with its head (#36, found writing the tutorial).
+- Tests in `tests/api/api.py`, `tests/views/maintained.py` and a `Receiver` unit test, each
+  failing on the binary before the fix.
+
+## 2026-10-05 — Long fuzzing workflow (N59)
+
+- `.github/workflows/fuzz.yml` (dispatch only) and `.github/scripts/fuzz_loop.sh`: every fuzzer
+  and seven VOPR lanes on random seeds for a time budget, on Fly runners started for the run.
+- Verified locally: `nerva_adds` for a minute (319 runs, passing); the `canary` fuzzer's planted
+  failure is reported with its seed and replay command, and fails the job; the VOPR path (testing
+  state machine, 9 runs); the workflow parses, 16 fuzz and 7 VOPR jobs.
+
+## 2026-10-05 — Release v0.3.0 (N60)
+
+- `build.zig`: release `0.0.3`, clients from `0.0.2`. `CHANGELOG.md`: the v0.3.0 section
+  (maintained views, metrics and traces, the faster client; #7–#10, #26–#29, #34 and #36
+  fixed; #30–#33 known; upgrade steps). `VERSION` 0.3.0.
+- Measured, with the v0.2.0 binary and a `0.0.3` build: a v0.2.0 `nerva api` commits and reads
+  against a `0.0.3` cluster; a `0.0.3` replica refuses a `0.0.2` data file
+  (`multiversion unsupported`); a mixed cluster runs until the `0.0.3` replica panics with
+  `checkpoint diverged` at op 960 (#34, commented). The replica_format golden checksum is
+  unchanged.
+- Verified: `check`, `test:fmt`, `test:unit` 328/329 (the sandbox-denied perf test).
+
+## 2026-10-05 — Replicas ignore peers that run another release (N61; #34)
+
+- `src/nerva/release_peers.zig`: `admits` (whether to handle a message, by its sender's announced
+  release, or a prepare's or block's own) and `announced` (the release a ping or pong carries).
+- `src/vsr/replica.zig`: option `release_peers_strict`; `on_message` records announcements and
+  drops what `admits` refuses, logging a peer of another release once; `tick_peer_connections`
+  forgets a disconnected peer's release and pings a newly connected peer; `send_ping(peer)`.
+  `src/message_bus.zig` and the simulated bus: `replica_connected`. `src/testing/cluster.zig`:
+  the option. `nerva start` sets it. UPSTREAM.md lists the patches.
+- `src/vopr.zig`: the `nerva` lane runs one release with the option on (no simulated upgrades,
+  which Nerva never performs); the `testing` lane is unchanged.
+- `zig build test:release` (`tests/release/mixed.py`, a second `nerva` with release `0.0.200`),
+  in CI's `system` job, CLAUDE.md and README.
+- Verified: unit tests (`release_peers`, 332/333 overall, the sandbox-denied perf test);
+  `test:release`; `test:integration`; VOPR `nerva` seeds 1, 2, 5, 16638486064026786667,
+  3787786164975552336 and `testing` seeds 1, 2; `check`, `test:fmt`. With the v0.2.0 binary: one
+  v0.3.0 replica among two v0.2.0 ones is ignored and ignores them; two v0.3.0 replicas commit
+  past a checkpoint while the v0.2.0 one panics at the first operation it does not know.
+- Mutation-tested: the gate off (a commit succeeds without replica 1), unannounced peers
+  admitted, and prepares of another release admitted each fail a test.
+
 ## 2026-10-05 — Tutorial
 
 - `docs/TUTORIAL.md`: a step-by-step tutorial for people new to Nerva. It covers a
   one-replica cluster and `nerva api`, rows and versions, transactions (compare-and-set,
   claims, atomicity, deletes), the change feed, history and as-of reads, layouts, adds,
-  maintained views and `nerva view`, documents, crashes and safe retries, the Zig client, a
-  contributor's tour of the code, and a cheat sheet. Linked from README.md.
+  maintained views and `nerva view`, documents, crashes and safe retries, operating a replica,
+  the Zig client, a contributor's tour of the code, and a cheat sheet. Linked from README.md.
+- Written at `eaa7520`, then updated for v0.3.0: releases and upgrades (N60, N61), multi-line
+  bodies (#36 fixed), the gateway's reconnect and `/healthz` (#27), `views_busy` that a retry
+  cannot fix (#32), `--statsd`, `--trace` and `--cache-rows`, `Client.reconnect`,
+  `test:release`.
 - Verified: every command and reply in it comes from one scripted run against a fresh
-  one-replica `--development` cluster at `eaa7520`. The crash, retry, layout and declaration
-  claims were each checked separately.
-- Found while writing it, filed, not fixed here: #36 (the gateways refuse a body containing a
-  newline when head and body arrive in one read; examples are single-line until it is fixed)
-  and #37 (`nerva api` answers 503 forever after one request times out).
+  one-replica `--development` cluster at v0.3.0. The crash, outage and reconnect, retry,
+  layout and declaration claims were each checked separately.
+- Found while writing it: #36 (fixed in N58) and #37 (a duplicate of #27, fixed in N58).

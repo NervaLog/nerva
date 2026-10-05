@@ -122,8 +122,10 @@ pub fn handle(
         if (method != .get and method != .put) {
             return error_reply(arena, 405, "method not allowed");
         }
+        // `/v1/views/<name>/groups`, with a name: `/v1/views/groups` is the view named `groups`.
         const groups = std.mem.startsWith(u8, path, views_prefix) and
-            std.mem.endsWith(u8, path, views_groups_suffix);
+            std.mem.endsWith(u8, path, views_groups_suffix) and
+            path.len > views_prefix.len + views_groups_suffix.len;
         if (groups and method != .get) return error_reply(arena, 405, "method not allowed");
         if (!groups and query.len > 0) return error_reply(arena, 400, "unexpected query");
         break :route if (std.mem.startsWith(u8, path, tables_prefix))

@@ -898,6 +898,12 @@ pub fn MessageBusType(comptime IO: type) type {
             }
         }
 
+        /// Nerva: whether the bus holds a connection to `replica` (N61). A replica that restarts
+        /// always loses its connections, so the replica forgets what release it announced.
+        pub fn replica_connected(bus: *const MessageBus, replica: u8) bool {
+            return bus.replicas[replica] != null;
+        }
+
         pub fn send_message_to_replica(bus: *MessageBus, replica: u8, message: *Message) void {
             // Messages sent by a replica to itself should never be passed to the message bus.
             if (bus.process == .replica) assert(replica != bus.process.replica);

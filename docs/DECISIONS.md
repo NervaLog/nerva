@@ -663,3 +663,172 @@ The rest of what the nightly performance job needs before it can measure anythin
   with p90 20 ms and p99 32 ms, in steps of the replicas' 10 ms tick. Either CPU contention (3
   replicas and 4 clients on 4 CPUs) or requests waiting on a replica tick: the first thing for
   the nightly job, on dedicated machines, to settle.
+
+**N56. A nightly A/B performance run on one Fly Machine.**
+`perf-nightly.yml` (06:47 UTC, and by hand) measures `main` against the last night that passed:
+- **Where.** The job runs on Botpike's CI runners (N47) and creates one dedicated Machine for the
+  night (performance-8x, 16 GB, a 50 GB volume) in the `nerva-perf` app, with both builds baked
+  into its image, and destroys it on exit, failure included; each night first sweeps anything
+  older than four hours. One Machine (three replicas and the load on localhost) keeps noise low
+  and the orchestration simple; replicas on separate Machines are a later step (v2).
+- **What.** `perf/nightly/run.sh` runs each build in each of three rounds, in alternating order
+  (A B, B A, A B) so drift over the night falls on both: every `benchmark:` test, then nine
+  `bench:load` workloads (c1, c1 batch 64, c2, c3, c3_adds, c4, c4 batch 64, c5 batch 1024, c7;
+  8 clients, 20 s each) against three replicas in production config. One JSON line per result.
+- **Verdict.** `perf/nightly/compare.py` pairs the builds within each round. A metric fails when
+  the candidate is worse than its threshold in every round (at least two), warns when the median
+  is worse, and improves when the median is better. Thresholds, fixed until calibrated: 10% for
+  throughput and microbenchmarks, 15% for p50, 25% for p99. A failed night files a
+  `perf-regression` issue and does not move the baseline; it never blocks a release (owner's
+  decision).
+- **Records.** Each night's results, log, verdict and summary go to `results/<date>-<commit>/` on
+  the `perf-results` branch, whose `baseline` file names the commit to beat.
+- **The baseline must build `bench:build`** (added here). A baseline from before it is replaced
+  by the candidate itself, which makes that night a measure of noise.
+- **Credentials.** The secret `FLY_API_TOKEN_PERF`; meant to be a deploy token scoped to
+  `nerva-perf` rather than an organization token.
+- **Trial** (2026-10-05, from a session, the same commit as both builds, 2 rounds of 5 s):
+  every metric passed, within 9% at the median. The Machine and volume were destroyed.
+- **Found by the trial, the first thing to investigate:** in production config on the Fly
+  volume, 8 clients reach only about 245 operations a second with a 31 ms median (c1, c4), against
+  about 1 ms locally with `--development`. The microbenchmarks match local numbers, so the CPU is
+  not the difference: most likely Direct IO writes, from three replicas sharing one volume capped
+  at 16,000 IOPS and 64 to 128 MiB/s. Until that is understood, the nightly's load numbers mostly
+  measure the volume; they still detect regressions, which is what they are for.
+
+**N57. CI runs its tests as parallel jobs, and keeps the Zig toolchain on the runner's volume.**
+Measured on run 37240753012, the single `test` job was the critical path at 7m05 (typecheck 48 s,
+format 0 s, unit 3m06, integration 29 s, API 2m10, views 21 s), then `demo` at 6m03 (a release
+build, the seat demo, then the canvas demo); the VOPR seeds take 40 s to 2m01. `ci.yml` now runs:
+- `unit`: the unit tests alone, the longest step.
+- `system` ("check, integration, API, views"): typecheck and format first, then the
+  integration, API and view tests. The typecheck builds the `nerva` binary those tests run, so
+  its 48 s is mostly work they would do anyway.
+- `demo`, one job per demo (`seats_chaos.py`, `canvas_chaos.py`): a release build, then the demo
+  with `--seconds=75`, exactly the command `zig build -Drelease test:demo -- --seconds=75` runs for
+  it. A step fails the job if build.zig's demo list and the matrix differ, so a new demo cannot
+  be left out of CI. Nothing a demo checks changed.
+- `vopr`, as before.
+- `fuzz`: every fuzzer's smoke pass (N53), a job of its own so it does not lengthen `unit`
+  (about 1.5 minutes).
+Every check that ran before still runs, on the same commands. There is no aggregate `test` job:
+this private repository's plan has no branch protection or rulesets (the API answers 403), so
+no check name is required, and `release.yml` depends on the called workflow as a whole. Should
+a required check be configured later, add an aggregate job then.
+Checkout cleans `./zig`, so each job spent 7 to 9 s downloading Zig. The toolchain is now kept on
+the Machine's volume at `$XDG_CACHE_HOME/nerva-toolchain/zig-<hash of zig/download.sh>` and
+linked into `./zig` (Zig finds its `lib` next to the real binary). Changing the pinned version
+changes the script, so the key. A copy is written aside and renamed when complete, used only if
+it runs and has its standard library, and otherwise replaced by a fresh download; download.sh
+then checks the version as before. `release.yml` still downloads (one job per release).
+A run now takes 10 Machines instead of 6, of the org's pool of 30.
+
+**N58. Gateway fixes from the second hardening pass: routes, recovery, slots, trace files.**
+Five bugs found by the second pass, each reproduced before it was fixed:
+- **`GET /v1/views/groups` crashed `nerva api` (#26).** The path matched both the views prefix and
+  the groups suffix, and the name between them was sliced from 10 to 9. A path is a groups route
+  only with a name between the two: `/v1/views/groups` is the view named `groups`, which can now
+  be read and declared, and `/v1/views/groups/groups` reads its groups.
+- **One timeout disabled `nerva api` for good (#27).** A client that timed out or was evicted
+  stays unusable, and the gateway never replaced it, while `/healthz` said 200. The gateway now
+  keeps the client's health: after a timeout or eviction it answers 503 at once, and the next
+  request for the cluster at least 5 s later replaces the client (`Client.reconnect`, or `init`
+  alone if a replacement failed partway, never `deinit` twice). `/healthz` answers 503 until it
+  is ready again, so a load balancer stops sending to it. The 5 s bound keeps an outage from
+  tying up the gateway's thread with a registration per request. `nerva view` still exits when
+  it cannot follow the feed, leaving recovery to its supervisor.
+- **Idle connections locked clients out (#28).** N45's 16 slots each held an idle connection for
+  its whole 10 s deadline, while new connections queued behind them: 200 idle connections held
+  `/healthz` up for 85 s, with no key. With every slot busy, the `Receiver` now still polls the
+  listening socket, and a waiting connection displaces the oldest one still sending its request
+  (closed without a reply). A client that sends its request promptly is served; an attacker must
+  open connections faster than a request arrives, not merely hold sixteen. Not a per-peer limit:
+  behind a proxy every client has one address. Amends N45, whose further connections waited in
+  the backlog.
+- **`--trace=<path>` truncated whatever it named (#29)**, a data file included. It is now
+  created exclusively, and an existing file is refused with a message.
+- **A body with a newline was refused when it arrived with its head (#36).** N45's early
+  refusal of a bare LF scanned every byte read so far, body included, so `curl -d` with
+  pretty-printed JSON (the README's own examples) got `400 malformed request` whenever head and
+  body shared a read. The scan now stops at the end of the head; the body is bytes.
+Tests that fail on the binary before these fixes: a view named `groups` read and declared
+(`tests/views/maintained.py`); 200 idle connections and `/healthz` within 3 s, `start --trace`
+of an existing file leaving it intact, and a replica stalled past the client's timeout, then
+resumed, with the gateway reporting itself unhealthy and recovering (`tests/api/api.py`); and a
+`Receiver` unit test of displacement; and a multi-line body sent in one write with its head
+(`tests/api/api.py`, and a `Receiver` unit test that also keeps a bare LF in the head refused).
+
+**N59. Long fuzzing, by hand, on runners started for it.**
+Smoke (N53) runs each fuzzer once at a fixed seed: it keeps fuzzers working, but finds little.
+Finding bugs takes many seeds. `.github/workflows/fuzz.yml` runs, on `workflow_dispatch` only,
+one job per fuzzer (all sixteen but `canary` and `smoke`), six VOPR lanes on Nerva's state
+machine and one on the testing state machine, each searching random seeds for a budget of
+minutes (default 120, at most 300). The owner starts Fly runners (Botpike/ci-runners) for a run
+and stops them afterwards, so it costs only while it runs. `.github/scripts/fuzz_loop.sh` builds
+once (ReleaseSafe), then gives each run a fresh seed and a 30-minute cap. A failing seed replays
+exactly, so the job prints the seed and the command that replays it, in its log and summary, and
+stops: one failing seed is the finding. A run past the cap is a warning, not a failure (some
+fuzzers' default sizes are long). Not scheduled: a schedule would need runners standing by.
+
+**N60. Release v0.3.0: the release string moves to `0.0.3`; clients from `0.0.2` are still
+accepted.**
+Maintained views (N52) changed what a commit does on every replica (5 timestamps per entry,
+operations 132–134, trees 5–8) without moving the release string, so v0.2.0 and later binaries
+both said `0.0.2` (#34). Owner's decision (N32, option (a) of #34): bump `release` to `0.0.3`
+and reformat, as for N43. `release_client_min` stays `0.0.2`: the client protocol only gained
+operations, and a v0.2.0 `nerva api` was measured committing and reading against a `0.0.3`
+cluster. Measured on what the bump does and does not do:
+- A `0.0.3` replica opening a `0.0.2` data file stops with `multiversion unsupported`: it looks
+  for `0.0.2` among the releases bundled in its binary, and Nerva bundles only its own (N43).
+- It does **not** keep releases apart on the wire. In a three-replica cluster with two v0.2.0
+  replicas and one freshly formatted `0.0.3` replica, the `0.0.3` replica joined as a backup,
+  was needed for quorum (and committed) once a v0.2.0 replica stopped, and panicked with
+  `checkpoint diverged` at op 960, the first checkpoint. TigerBeetle expects a newer binary to
+  run older releases' prepares with the older code it bundles; Nerva has no older code to run.
+  N61 makes replicas ignore peers of another release, so a mixed cluster cannot diverge.
+- The golden checksum of a formatted data file did not change: only the development release
+  `0.0.1` writes a different superblock (N43).
+v0.3.0's notes list #30–#33 as known issues; #38's fixes (#26–#29, #36) and N61 (#34) ship in
+it.
+
+**N61. Replicas ignore peers that run another release.**
+N60 measured that a release string only guards data files: a replica of another release joins
+the cluster, counts toward quorums while it executes the log with other code, and is caught only
+at the first checkpoint (#34). TigerBeetle lets releases mix because a newer binary bundles the
+older releases and runs their prepares with the older code; Nerva bundles one (N43). Owner's
+decision: fix it in v0.3.0.
+- **By peer, not by message.** Only pings and pongs carry their sender's running release; most
+  replica messages carry release 0. A replica records each peer's release from its pings and
+  pongs and handles a peer's messages only once that peer has announced the release it runs
+  itself (`nerva/release_peers.zig`, `admits`). A peer that has not announced yet counts for
+  nothing, about a second at startup. Prepares and blocks do not name their sender (any replica
+  relays or repairs them) but carry the release they were made in, so they are checked by that:
+  root and reserved prepares carry 0. Requests, client pings and replies pass:
+  `release_client_min` governs clients.
+- **Restarts.** A restart always drops the restarting replica's connections, so a replica
+  forgets a peer's release when the message bus no longer holds a connection to it, and pings a
+  peer as soon as a connection appears, so each side learns the other's release within a tick
+  rather than at the next ping timeout. (Pinging first on open, the first design, does not
+  work: the bus drops messages to replicas it is not yet connected to.)
+- **Opt-in, for Nerva.** `Replica.Options.release_peers_strict`, set by `nerva start`. Vendored
+  `replica_test.zig` and the VOPR's `testing` lane simulate TigerBeetle's in-place upgrades, in
+  which replicas of different releases cooperate, and keep upstream behaviour. The VOPR's `nerva`
+  lane simulated them too, a path Nerva never runs (N43: a new release is a reformat). It now runs
+  one release with the option on, as production does.
+- **With a v0.2.0 peer**, which ignores no one (measured with the v0.2.0 binary). One v0.3.0
+  replica and two v0.2.0: the v0.3.0 replica logs that it ignores both, drops their prepares,
+  and never counts; the v0.2.0 pair cannot commit without each other. Two v0.3.0 and one v0.2.0:
+  the v0.3.0 pair ignores the v0.2.0 replica and commits past a checkpoint; the v0.2.0 replica
+  takes the v0.3.0 primary's view, commits its prepares, and panics on the first operation it
+  does not know (`Operation.cast`, a views operation). Either way only one release's replicas
+  count toward quorums. Between v0.3.0 and later releases neither side executes the other's
+  prepares.
+Tests: unit tests of `admits`; `zig build test:release` (`tests/release/mixed.py`) builds a
+second `nerva` with release `0.0.200` and runs replicas 0 and 1 on one release and replica 2 on
+the other: both sides log the mismatch, nothing commits without replica 1, and with it back
+1,000 commits pass the first checkpoint with no panic (before: `checkpoint diverged`). VOPR
+seeds 1, 2, 5 and two random seeds on the `nerva` lane, 1 and 2 on `testing`. Mutation-tested:
+without the gate a commit succeeds with replica 1 stopped (`test:release`); admitting unannounced
+peers or prepares of another release fails the unit tests. Forgetting a release on disconnect is
+not covered by a failing test: a restart onto another release would need two binaries swapped on
+one replica index within a ping interval.
