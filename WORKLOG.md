@@ -560,3 +560,10 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
 - Verified: the tests (6), mutation-tested; strict validation of v0.3.0's SBOM against the
   CycloneDX 1.5 schema; a dry run of the release step's `dist/` and `SHA256SUMS`.
 
+## 2026-10-05 — CI frees a nearly full runner volume (N65; #50)
+
+- `.github/scripts/free_disk.sh`: logs free space; below 6 GiB empties the Zig build cache and
+  older toolchains. Run by `INSTALL_ZIG` in `ci.yml` and before the release build.
+- Verified locally: with room it changes nothing; with the threshold forced above the free space
+  it removes the build cache and the older toolchain, keeps the pinned one, and warns.
+

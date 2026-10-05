@@ -80,7 +80,9 @@ jobs:
           persist-credentials: false
 
       - name: Install the pinned Zig
-        run: ./zig/download.sh
+        run: |
+          .github/scripts/free_disk.sh
+          ./zig/download.sh
 
       # Every target is cross-compiled from Linux. The binary reports `<protocol>+<commit>`: the
       # protocol is the data file and protocol release (`release` in build.zig), changed
