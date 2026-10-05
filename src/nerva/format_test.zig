@@ -332,7 +332,8 @@ test "format: wire and storage layouts" {
         \\  count: offset 24, size 8, u64
         \\  group_key: offset 32, size 64, [64]u8
         \\  sums: offset 96, size 96, [6][16]u8
-        \\  reserved: offset 192, size 64, [64]u8
+        \\  op: offset 192, size 8, u64
+        \\  reserved: offset 200, size 56, [56]u8
         \\nerva.ViewQuery: extern struct, size 64
         \\  view_id: offset 0, size 8, u64
         \\  group_hash_min: offset 8, size 8, u64

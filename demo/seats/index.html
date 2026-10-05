@@ -166,12 +166,13 @@ select { width: 100%; font: inherit; font-size: 13px; background: var(--surface-
         </div>
       </div>
       <div class="card">
-        <h2>Two views, one answer</h2>
+        <h2>Maintained and recomputed, one answer</h2>
         <div class="agree"><span class="dot wait" id="agree-dot"></span>
           <div><div id="agree-text">Waiting for the views</div>
           <div class="muted mono" id="agree-hashes"></div></div></div>
-        <p class="muted" style="margin:8px 0 0">Two separate view processes compute sales by
-          section from the log. The hash of their answers must match.</p>
+        <p class="muted" style="margin:8px 0 0">Every replica keeps sales by section up to date
+          inside each commit; a separate view process recomputes it from the log. The hash of
+          their answers must match.</p>
       </div>
       <div class="card">
         <h2>Crash something</h2>
@@ -285,12 +286,12 @@ function render(state) {
       $("agree-text").textContent = same ? `Identical at op ${fmt(a.op)}` : `Disagree at op ${fmt(a.op)}`;
     } else if (a && b) {
       dot.className = "dot wait";
-      $("agree-text").textContent = "One view is a few ops ahead; comparing at the next read";
+      $("agree-text").textContent = "The two answered at different ops; comparing at the next read";
     } else {
       dot.className = "dot wait";
-      $("agree-text").textContent = `${a ? "View b" : "View a"} is down; the other is answering`;
+      $("agree-text").textContent = `${a ? "The view processes are" : "The gateway is"} down; the other is answering`;
     }
-    $("agree-hashes").textContent = [a, b].map((h, i) => `${"ab"[i]} ${h ? h.hash.slice(0, 16) : "down"}`).join("  ");
+    $("agree-hashes").textContent = [a, b].map((h, i) => `${["maintained", "recomputed"][i]} ${h ? h.hash.slice(0, 16) : "down"}`).join("  ");
     renderProcs(state.cluster);
     renderEvents(state.events);
     const slider = $("slider");

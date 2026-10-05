@@ -950,6 +950,33 @@ a bad tag or commit. The output for v0.3.0's commit passed strict validation aga
 CycloneDX 1.5 JSON schema (`cyclonedx-python-lib`, run once locally; not a CI dependency).
 Mutation-tested: dropping the version cross-check, or citing another host's archive, fails it.
 
+**N64. Gateways recover from a broken cluster client on their own; a late reply is dropped.**
+Two follow-ups to N58 (#27), found after v0.3.0:
+- **#42: a reply after the timeout panicked the client.** `Client.on_reply` asserted the
+  client was waiting. After a request times out, `deinit` (and so `reconnect`) still drives IO
+  while it closes the connections, and the reply to the abandoned request can arrive then.
+  `on_reply` now drops a reply in `timed_out`; any other state is asserted as before. Since N58
+  this could abort `nerva api` too, when the cluster was slow rather than down.
+- **#42: `nerva view` exited on one timeout.** It now keeps a `ClientHealth`, as `nerva api`
+  does: a request or feed read that times out (or an eviction) breaks the client; requests
+  answer 503 and `/healthz` 503 until it is replaced; then the follower reads the feed on from
+  its cursor, which a failed read leaves unchanged (`get_changes` is read before anything is
+  applied). The view keeps everything it had built, so nothing is rebuilt. A timeout during the
+  rebuild at startup still exits: the process has served nothing yet, and its supervisor
+  restarts it.
+- **#44: `/healthz` stayed 503 until a request arrived.** The client was replaced only inside a
+  request for the cluster, so a gateway taken out of rotation by a load balancer never got the
+  request that would bring it back. While the client is broken, both gateways now wake at least
+  every second and try to replace it, still at most every 5 s (`reconnect_interval_ns`). An
+  attempt blocks the gateway's one thread for up to the client's timeout, as it did inside a
+  request.
+`ClientHealth` moved from `api/server.zig` to `src/nerva/client_health.zig`, shared by both.
+Tests: a unit test delivers a reply to a timed-out client (it panicked before). In `test:api`,
+after a stall past the client's timeout, only `/healthz` is polled until it answers 200 (before:
+503 for as long as no request came). In `test:views`, a view process stalled the same way stays
+up, answers 503 and `/healthz` 503, then recovers with only `/healthz` polled and serves the
+same hash as before the stall (before: it exited).
+
 **N65. CI frees the runner volume before a job when it is nearly full.**
 Each runner Machine's 10 GB volume keeps the Zig toolchain and Zig's global build cache between
 jobs (N57). Nothing pruned the build cache, so as branches built it filled the volume, and jobs
@@ -977,3 +1004,69 @@ and the request whose third transaction overflows only with the first two expect
 and then commits alone; `test:views` sends 4,200 new groups (413) and the same rows split in two
 (200 each).
 
+**N67. A client may not send `pulse`.**
+`Operation.pulse` (134, N52) is the replica's own backfill operation: the replica sends it to
+itself as `vsr.Operation.pulse` with `client == 0`, and `Request.invalid_header` refuses that
+from a client. But a client could send the raw value 134: `vsr.Operation.valid` accepts it (it
+is in Nerva's enum), `from_vsr` maps it to `.pulse`, and `input_valid` accepts the empty body,
+and the replicas then crash executing it: the trace event's operation conversion
+(`trace/event.zig`) has no value 134 (`panic: invalid enum value`). Restarted replicas replay the
+committed prepare and crash again, so one request from any client that can reach the replicas
+took the cluster down for good (#33; measured at `825355c`). The replica's
+own pulse passes through the same `on_request` and `input_valid`, so the state machine cannot
+tell the two apart. A vendored check in `on_request`, beside the operation check, evicts a
+client (`invalid_request_operation`) whose request maps to the state machine's pulse operation
+without being `vsr.Operation.pulse` itself; the predicate is Nerva's
+(`internal_operations.pulse_from_client`), generic over the state machine, and unit-tested for
+every operation. Upstream TigerBeetle maps its own pulse the same way. The guard cannot repair a
+cluster whose log already holds a client's 134. End to end (once, with #53's client fix, since
+an eviction used to abort the client): the client gets `error.Evicted` and the cluster commits
+on; without the guard, as above.
+
+**N66. An evicted client is deinit'ed by `Client.deinit`, not by its eviction callback.**
+The vendored VSR client asks its eviction callback to deinit it, but calls the callback from
+inside the message bus's receive path, which then invalidates the receive buffer that `deinit`
+has just freed. Every eviction aborted the process (#52): `nerva api`, `nerva view` and Zig
+clients, whatever the reason (`no_session` after `clients_max` newer sessions, a release too
+low, an invalid operation such as #33's raw `pulse`). Nerva's `Client.on_eviction` now only
+records the eviction; `Client.deinit` (and so `reconnect`) deinits the VSR client. In between,
+nothing drives the client's IO, since every call returns `error.Evicted`, so the evicted VSR
+client processes no message. No vendored file changes. Test: `test:integration` ends by
+restarting replica 0 (down since the failover step, which makes registrations slow) and pushing
+a client's session out with `clients_max` newer ones; its next two requests get
+`error.Evicted` (before: the process aborted on an assertion in `MessageBuffer.invalidate`).
+
+
+**N66. `nerva api` serves views whole, as `nerva view` answers them; `nerva view` becomes the
+check.** The third step of N52 (design approved by the owner). Applications read views where
+they write, from replicated state, and `nerva view` stays as an independent recomputation.
+- **Routes.** `GET /v1/views/<name>` is now the view (it was the declaration, now at
+  `/definition`; before 1.0 anything may break): every group, sorted by key, rendered by the
+  same code as `nerva view` (`declared.render`, shared), so the answer, and `hash`, the SHA-256
+  of its `groups` JSON, are `nerva view`'s byte for byte. `view_hash` (the replicated hash, N52)
+  and `declared_op` come with it. `as_of` and `min_op` mean what they mean in `nerva view`, and
+  an op not yet committed answers 504 as there; a view still building or failed answers 503
+  rather than part of an answer. `GET /v1/views` lists the views the state machine maintains;
+  the `get_view` header now carries the view's name in `group_key` for it.
+- **One op.** The gateway reads the first page at the latest op (or `as_of`), and every later
+  page as of the first's op, so a whole answer is one op's even while writes go on. More than
+  10,000 groups is refused (400): such a view is read in pages from `/groups`.
+- **Reads as of an op scan only what changed.** `Group.op` (from `reserved`) is the last op that
+  changed a group. A read as of `a` takes a group whose `op <= a` as it stands, and scans for the
+  version of the others. A page as of an op ends before the group that would take more than 128
+  scans (`view_as_of_scans_max`; fewer with tests' small messages, so that pages end early), not
+  at 128 groups as in N62: a whole canvas (4,096 groups) as of an op costs 4 pages, and scans
+  only the pixels painted since.
+- **Demos.** The seat and canvas demos read their views from `nerva api`; the agreement panel
+  compares its hash with a `nerva view` process's at the same op ("maintained" and
+  "recomputed").
+- **Tests.** `tests/views/maintained.py` compares `GET /v1/views/<name>` with `nerva view`, byte
+  for byte, at every op it checks, latest and as of past ops; and checks 504 for `min_op` and
+  `as_of` past the log, 400 for both together, 404 before the declaration, `/definition`, the
+  listing, and the refusal past 10,000 groups. The randomized state machine test reads pages of
+  3 groups with 1 scan each, so pages end early. Mutation-tested: skipping the scan for a group
+  changed after `as_of`, and resuming the next page one group late, each fail it.
+- **Found.** The canvas test fails about three runs in four on `main` since N62, before this
+  change: a replica killed while another syncs stalls the cluster past `nerva view`'s 30 s
+  client timeout, and the process then exits (#42; #49 carries the fix). N62's heavier commits
+  for the canvas's per-pixel `max` view make such stalls longer.

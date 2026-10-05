@@ -761,18 +761,16 @@ curl -s $A/healthz
 # {"ok":true}
 ```
 
-`api.log` says `reconnected to the cluster`. The gateway replaces its broken connection on
-the next request for the cluster, at most once every 5 seconds, so a request or two may still
-see `503` while the replica opens. Then everything committed is there: a commit is acknowledged
+`api.log` says `reconnected to the cluster`. The gateway replaces its broken connection by
+itself, at most once every 5 seconds, whether or not requests arrive, so a request or two may
+still see `503` while the replica opens. Then everything committed is there: a commit is acknowledged
 only once it is durable on a quorum of replicas. With three replicas you can kill any one and
 the other two keep committing (if it was the primary, after a short election); the restarted
 one catches up by itself.
 
-> **Behind a load balancer**, the reconnect needs a request to trigger it. `/healthz` alone
-> does not: it stays `503` after the cluster recovers until a request for the cluster arrives
-> ([#44](https://github.com/Botpike/nerva-ledger/issues/44)). If your balancer stops routing
-> to a gateway whose health check fails, also send it a keyed request now and then (a lookup
-> of any row will do), or it never comes back by itself.
+> **Behind a load balancer**, `/healthz` is enough: a gateway taken out of rotation while the
+> cluster was down reconnects on its own and reports `200` again once it has. `nerva view`
+> does the same.
 
 ### The one rule about retries
 

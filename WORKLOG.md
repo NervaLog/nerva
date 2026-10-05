@@ -560,6 +560,22 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
 - Verified: the tests (6), mutation-tested; strict validation of v0.3.0's SBOM against the
   CycloneDX 1.5 schema; a dry run of the release step's `dist/` and `SHA256SUMS`.
 
+## 2026-10-05 — Gateways recover on their own; late replies dropped (N64; #42, #44)
+
+- `src/nerva/client.zig`: `on_reply` drops a reply that arrives after the timeout (#42), with a
+  unit test.
+- `src/nerva/client_health.zig` (moved from `api/server.zig`): `ClientHealth`, plus
+  `idle_timeout_ms` so an idle gateway with a broken client wakes to replace it (#44).
+- `src/nerva/api/server.zig`: retries while idle. `src/nerva/view/server.zig`: a timeout or
+  eviction breaks the client instead of exiting; requests and `/healthz` answer 503 until it
+  is replaced (#42).
+- `tests/api/api.py`: recovery with only `/healthz` polled. `tests/views/declared.py`: a view
+  process survives a stall and recovers on its own. README and TUTORIAL updated.
+- Verified: `check`, `test:fmt`, `test:unit` 334/335 (the sandbox-denied perf test),
+  `test:views` and `test:api`. Against `main`'s binary the new checks fail: a stalled view
+  process answers 500 instead of 503, and `/healthz` stays 503 for 120 s after the cluster
+  recovers. Without the `on_reply` change the new unit test panics.
+
 ## 2026-10-05 — CI frees a nearly full runner volume (N65; #50)
 
 - `.github/scripts/free_disk.sh`: logs free space; below 6 GiB empties the Zig build cache and
@@ -586,3 +602,36 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
 - Verified: `check`, `test:fmt`, `test:unit` (the sandbox-denied perf test aside), `test:views`;
   VOPR seeds 1, 2, 5 (one `views_busy`, one `views_too_large`) and 2467272726192300042.
 
+## 2026-10-05 — A client may not send `pulse` (N67; #33)
+
+- `src/nerva/internal_operations.zig`: `pulse_from_client`, unit-tested for every operation.
+- `src/vsr/replica.zig`: `on_request` evicts such a client (`invalid_request_operation`);
+  UPSTREAM.md.
+- Measured at `825355c`: one raw `pulse` from a client crashes the replicas
+  (`trace/event.zig`, invalid enum value), and again after a restart. With the guard (and #53's
+  client fix), the client is evicted and the integration scenario passes after it.
+- Verified: `check`, `test:fmt`, `test:unit` 337/338 (the sandbox-denied perf test); VOPR
+  `nerva` seeds 1, 2 and `testing` seed 1.
+
+## 2026-10-05 — An eviction no longer aborts a client (N66; #52)
+
+- `src/nerva/client.zig`: `on_eviction` records the eviction; `deinit` deinits the evicted
+  VSR client.
+- `src/integration_tests.zig`: the scenario ends with an eviction (`clients_max` newer
+  sessions), expecting `error.Evicted` twice.
+- Verified: `test:integration` passes (2.4 min); with `main`'s client it aborts in
+  `MessageBuffer.invalidate` after `evicted: no_session`. `check`, `test:fmt`, `test:unit`
+  336/337 (the sandbox-denied perf test).
+
+
+## 2026-10-05 — `nerva api` serves views whole (N66)
+
+- `src/nerva/api/api.zig`: `GET /v1/views/<name>` (the whole view, `nerva view`'s answer byte for
+  byte, with `view_hash` and `declared_op`; `as_of`, `min_op`), `GET /v1/views` (listing),
+  `GET /v1/views/<name>/definition` (the declaration, moved).
+- `src/nerva/view/declared.zig`: `render`, shared by both gateways.
+- `src/nerva.zig`, `state_machine.zig`: `Group.op`; reads as of an op scan only the groups
+  changed since, and a page ends after 128 scans; the `get_view` header names its view.
+- Demos read views from `nerva api` and compare its hash with a `nerva view` process's.
+- Tests: `tests/views/maintained.py` (byte-for-byte equality, the new routes and refusals), the
+  randomized test with pages ending early, format guard for `Group.op`. Mutation-tested.
