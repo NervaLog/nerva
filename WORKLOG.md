@@ -749,3 +749,13 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
 - Verified: in a simulated `_work` (this workspace, another repository's, `_temp`, `_actions`,
   `_tool`), the other workspace is removed and the rest kept; outside Actions nothing is.
 
+## 2026-10-05 — Messages after an eviction, in the same IO pass, are dropped (#74)
+
+- `src/vsr/client.zig` (vendored; UPSTREAM.md): `on_messages` drops a buffer received after the
+  eviction instead of asserting. `test:integration` aborted on it in CI: every replica evicts
+  the same session, and `IO.run_once` ran a second replica's receive after the first's
+  eviction. Since #52's fix (`46efdd7`), unreleased.
+- `src/nerva/client.zig`: the eviction comment says so; a unit test hands an evicted client a
+  buffer (it panics without the patch).
+- Verified: `check`, `test:fmt`, `test:unit`, `test:integration`, VOPR seed 1.
+
