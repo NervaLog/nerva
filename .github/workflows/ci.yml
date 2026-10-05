@@ -5,10 +5,13 @@
 name: CI
 
 on:
+  # Markdown alone (docs, WORKLOG, CHANGELOG) starts nothing (N68); release.yml's call still runs.
   push:
     branches: [main]
+    paths-ignore: ['**.md']
   pull_request:
     branches: [main]
+    paths-ignore: ['**.md']
   workflow_dispatch:
   workflow_call:
 

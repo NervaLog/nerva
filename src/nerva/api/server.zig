@@ -10,6 +10,7 @@ const Client = @import("../client.zig").Client;
 const api = @import("api.zig");
 const http_connection = @import("../http_connection.zig");
 const CatalogStore = @import("catalog_store.zig").CatalogStore;
+const MemoryBudget = @import("memory_budget.zig");
 const ClientHealth = @import("../client_health.zig").ClientHealth;
 
 /// The largest request body: a full commit request in JSON is well under this.
@@ -36,8 +37,11 @@ pub fn serve(gpa: std.mem.Allocator, client: *Client, options: Options) !noretur
 
     var layouts = CatalogStore.init(client);
     var health = try ClientHealth.init(client);
+    // Each request's memory is bounded, and the arena gives back what one large request took
+    // (#31).
     var arena_instance = std.heap.ArenaAllocator.init(gpa);
     defer arena_instance.deinit();
+    var budget = MemoryBudget.init(arena_instance.allocator(), MemoryBudget.limit_default);
 
     while (true) {
         // Requests are read from many connections at once, and served one at a time (N45).
@@ -46,8 +50,8 @@ pub fn serve(gpa: std.mem.Allocator, client: *Client, options: Options) !noretur
             _ = health.ready(client);
             continue;
         };
-        _ = arena_instance.reset(.retain_capacity);
-        const arena = arena_instance.allocator();
+        budget.request_start();
+        const arena = budget.allocator();
         const reply = serve_request(
             arena,
             client,
@@ -57,10 +61,20 @@ pub fn serve(gpa: std.mem.Allocator, client: *Client, options: Options) !noretur
             &received.request,
         ) catch |err|
             reply: {
+                if (err == error.OutOfMemory and budget.exceeded) {
+                    log.warn("request: past its memory budget", .{});
+                    break :reply api.Reply{
+                        .status = 413,
+                        .body = "{\"error\":\"request too complex\"}",
+                    };
+                }
                 log.warn("request: {}", .{err});
                 break :reply api.Reply{ .status = 500, .body = "{\"error\":\"internal error\"}" };
             };
         receiver.respond(received, reply.status, reply.body);
+        // `respond` has written the reply: give back what the request took at once, rather than
+        // when the next request arrives (#60).
+        _ = arena_instance.reset(.{ .retain_with_limit = MemoryBudget.retain_max });
     }
 }
 
