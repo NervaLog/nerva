@@ -1,0 +1,417 @@
+{
+ "overall": "pass",
+ "commits": {
+  "baseline": "a13ab67061086e7e9fd284f7476623feefdd6604",
+  "candidate": "ef2eaad0d0d498eb8a6d222283414f9940c9658b"
+ },
+ "health": {
+  "iops": 21804,
+  "mib_s": 85.2
+ },
+ "errors": [],
+ "metrics": [
+  {
+   "metric": "load c1/b1 ops/s",
+   "status": "pass",
+   "baseline": 240.1,
+   "candidate": 237.8,
+   "worse_by": -0.0051,
+   "worse_by_rounds": [
+    -0.0292,
+    0.074,
+    -0.0051
+   ],
+   "threshold": 0.1
+  },
+  {
+   "metric": "load c1/b1 p50 \u00b5s",
+   "status": "pass",
+   "baseline": 30719,
+   "candidate": 30719,
+   "worse_by": 0.0,
+   "worse_by_rounds": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "threshold": 0.15
+  },
+  {
+   "metric": "load c1/b1 p99 \u00b5s",
+   "status": "pass",
+   "baseline": 86015,
+   "candidate": 90111,
+   "worse_by": -0.0435,
+   "worse_by_rounds": [
+    -0.1645,
+    0.5333,
+    -0.0435
+   ],
+   "threshold": 0.25
+  },
+  {
+   "metric": "load c1/b64 ops/s",
+   "status": "pass",
+   "baseline": 239.8,
+   "candidate": 242.9,
+   "worse_by": -0.0016,
+   "worse_by_rounds": [
+    0.0684,
+    -0.0304,
+    -0.0016
+   ],
+   "threshold": 0.1
+  },
+  {
+   "metric": "load c1/b64 p50 \u00b5s",
+   "status": "pass",
+   "baseline": 31743,
+   "candidate": 31743,
+   "worse_by": 0.0,
+   "worse_by_rounds": [
+    0.0323,
+    -0.0323,
+    0.0
+   ],
+   "threshold": 0.15
+  },
+  {
+   "metric": "load c1/b64 p99 \u00b5s",
+   "status": "pass",
+   "baseline": 73727,
+   "candidate": 73727,
+   "worse_by": 0.0,
+   "worse_by_rounds": [
+    0.5556,
+    0.0,
+    -0.0556
+   ],
+   "threshold": 0.25
+  },
+  {
+   "metric": "load c2/b1 ops/s",
+   "status": "pass",
+   "baseline": 124.4,
+   "candidate": 118.0,
+   "worse_by": -0.0185,
+   "worse_by_rounds": [
+    -0.0185,
+    -0.0786,
+    0.1264
+   ],
+   "threshold": 0.1
+  },
+  {
+   "metric": "load c2/b1 p50 \u00b5s",
+   "status": "pass",
+   "baseline": 61439,
+   "candidate": 73727,
+   "worse_by": 0.0,
+   "worse_by_rounds": [
+    0.0,
+    0.0,
+    0.2
+   ],
+   "threshold": 0.15
+  },
+  {
+   "metric": "load c2/b1 p99 \u00b5s",
+   "status": "pass",
+   "baseline": 122879,
+   "candidate": 131071,
+   "worse_by": -0.0667,
+   "worse_by_rounds": [
+    -0.0667,
+    -0.3333,
+    0.6
+   ],
+   "threshold": 0.25
+  },
+  {
+   "metric": "load c3/b1 ops/s",
+   "status": "pass",
+   "baseline": 57.0,
+   "candidate": 57.5,
+   "worse_by": -0.0088,
+   "worse_by_rounds": [
+    0.0017,
+    -0.0482,
+    -0.0088
+   ],
+   "threshold": 0.1
+  },
+  {
+   "metric": "load c3/b1 p50 \u00b5s",
+   "status": "pass",
+   "baseline": 90111,
+   "candidate": 90111,
+   "worse_by": 0.0,
+   "worse_by_rounds": [
+    0.0,
+    0.0952,
+    -0.0909
+   ],
+   "threshold": 0.15
+  },
+  {
+   "metric": "load c3/b1 p99 \u00b5s",
+   "status": "pass",
+   "baseline": 884735,
+   "candidate": 786431,
+   "worse_by": -0.0741,
+   "worse_by_rounds": [
+    -0.0435,
+    -0.1724,
+    -0.0741
+   ],
+   "threshold": 0.25
+  },
+  {
+   "metric": "load c3_adds/b1 ops/s",
+   "status": "pass",
+   "baseline": 251.8,
+   "candidate": 252.8,
+   "worse_by": 0.0152,
+   "worse_by_rounds": [
+    0.0794,
+    -0.0205,
+    0.0152
+   ],
+   "threshold": 0.1
+  },
+  {
+   "metric": "load c3_adds/b1 p50 \u00b5s",
+   "status": "pass",
+   "baseline": 30719,
+   "candidate": 30719,
+   "worse_by": 0.0,
+   "worse_by_rounds": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "threshold": 0.15
+  },
+  {
+   "metric": "load c3_adds/b1 p99 \u00b5s",
+   "status": "pass",
+   "baseline": 61439,
+   "candidate": 61439,
+   "worse_by": 0.0,
+   "worse_by_rounds": [
+    1.0,
+    -0.136,
+    0.0
+   ],
+   "threshold": 0.25
+  },
+  {
+   "metric": "load c4/b1 ops/s",
+   "status": "pass",
+   "baseline": 243.4,
+   "candidate": 253.7,
+   "worse_by": 0.0053,
+   "worse_by_rounds": [
+    -0.0558,
+    0.0149,
+    0.0053
+   ],
+   "threshold": 0.1
+  },
+  {
+   "metric": "load c4/b1 p50 \u00b5s",
+   "status": "pass",
+   "baseline": 30719,
+   "candidate": 30719,
+   "worse_by": 0.0,
+   "worse_by_rounds": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "threshold": 0.15
+  },
+  {
+   "metric": "load c4/b1 p99 \u00b5s",
+   "status": "pass",
+   "baseline": 73727,
+   "candidate": 61439,
+   "worse_by": -0.1667,
+   "worse_by_rounds": [
+    -0.25,
+    -0.1667,
+    0.0556
+   ],
+   "threshold": 0.25
+  },
+  {
+   "metric": "load c4/b64 ops/s",
+   "status": "pass",
+   "baseline": 243.8,
+   "candidate": 256.3,
+   "worse_by": -0.0179,
+   "worse_by_rounds": [
+    0.0148,
+    -0.0693,
+    -0.0179
+   ],
+   "threshold": 0.1
+  },
+  {
+   "metric": "load c4/b64 p50 \u00b5s",
+   "status": "pass",
+   "baseline": 30719,
+   "candidate": 30719,
+   "worse_by": 0.0,
+   "worse_by_rounds": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "threshold": 0.15
+  },
+  {
+   "metric": "load c4/b64 p99 \u00b5s",
+   "status": "pass",
+   "baseline": 73727,
+   "candidate": 61439,
+   "worse_by": -0.1667,
+   "worse_by_rounds": [
+    0.2222,
+    -0.1667,
+    -0.1667
+   ],
+   "threshold": 0.25
+  },
+  {
+   "metric": "load c5/b1024 ops/s",
+   "status": "pass",
+   "baseline": 237.8,
+   "candidate": 245.9,
+   "worse_by": -0.0341,
+   "worse_by_rounds": [
+    -0.108,
+    0.0505,
+    -0.0341
+   ],
+   "threshold": 0.1
+  },
+  {
+   "metric": "load c5/b1024 p50 \u00b5s",
+   "status": "pass",
+   "baseline": 30719,
+   "candidate": 30719,
+   "worse_by": 0.0,
+   "worse_by_rounds": [
+    -0.0323,
+    0.0333,
+    0.0
+   ],
+   "threshold": 0.15
+  },
+  {
+   "metric": "load c5/b1024 p99 \u00b5s",
+   "status": "pass",
+   "baseline": 94207,
+   "candidate": 73727,
+   "worse_by": -0.2174,
+   "worse_by_rounds": [
+    -0.38,
+    0.2222,
+    -0.2174
+   ],
+   "threshold": 0.25
+  },
+  {
+   "metric": "load c7/b1 ops/s",
+   "status": "pass",
+   "baseline": 201.8,
+   "candidate": 204.6,
+   "worse_by": -0.0127,
+   "worse_by_rounds": [
+    -0.0139,
+    -0.0127,
+    -0.009
+   ],
+   "threshold": 0.1
+  },
+  {
+   "metric": "load c7/b1 p50 \u00b5s",
+   "status": "pass",
+   "baseline": 40959,
+   "candidate": 40959,
+   "worse_by": 0.0,
+   "worse_by_rounds": [
+    0.25,
+    0.0,
+    0.0
+   ],
+   "threshold": 0.15
+  },
+  {
+   "metric": "load c7/b1 p99 \u00b5s",
+   "status": "pass",
+   "baseline": 102399,
+   "candidate": 102399,
+   "worse_by": 0.0,
+   "worse_by_rounds": [
+    0.0,
+    0.0,
+    -0.1071
+   ],
+   "threshold": 0.25
+  },
+  {
+   "metric": "micro declared_views.as_of_middle_ns",
+   "status": "pass",
+   "baseline": 222662032,
+   "candidate": 225679441,
+   "worse_by": 0.0136,
+   "worse_by_rounds": [
+    0.0331,
+    0.0136,
+    -0.0097
+   ],
+   "threshold": 0.1
+  },
+  {
+   "metric": "micro declared_views.latest_ns",
+   "status": "pass",
+   "baseline": 100893842,
+   "candidate": 101497744,
+   "worse_by": 0.006,
+   "worse_by_rounds": [
+    0.0904,
+    0.006,
+    0.0002
+   ],
+   "threshold": 0.1
+  },
+  {
+   "metric": "micro documents.decode_ns_per_document",
+   "status": "pass",
+   "baseline": 10273,
+   "candidate": 10227,
+   "worse_by": -0.0035,
+   "worse_by_rounds": [
+    0.016,
+    -0.0045,
+    -0.0035
+   ],
+   "threshold": 0.1
+  },
+  {
+   "metric": "micro documents.encode_ns_per_document",
+   "status": "pass",
+   "baseline": 756054,
+   "candidate": 756151,
+   "worse_by": 0.0014,
+   "worse_by_rounds": [
+    0.0026,
+    -0.001,
+    0.0014
+   ],
+   "threshold": 0.1
+  }
+ ]
+}
