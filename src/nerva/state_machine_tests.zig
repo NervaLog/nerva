@@ -1019,3 +1019,135 @@ test "views: reads page through the groups, and say when a view is missing" {
     try testing.expectEqual(@as(usize, 1), missing.len);
     try testing.expectEqual(nerva.ViewState.missing, missing[0].state);
 }
+
+test "format: what a fixed script commits" {
+    // A format guard (N54): every result, row and change a fixed script produces, summarized and
+    // checksummed. A change to what the state machine stores (ops, timestamps, tombstones, add
+    // results, change values) fails here; a meant one updates the snapshot and says why.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const context = try context_init(&arena);
+
+    const signed_add: Entry = .{
+        .id = 3,
+        .table = 1,
+        .kind = .add,
+        .op_seen = 0,
+        .value = (nerva.Add{
+            .delta = -5,
+            .min = 0,
+            .max = 0,
+            .delta_from = 0,
+            .offset = 8,
+            .field = .i64,
+            .flags = .{ .create = true },
+        }).value(),
+    };
+    const requests = [_][]const []const Entry{
+        // Puts, adds creating a row (unsigned and signed), all in one request.
+        &.{
+            &.{ put(1, 1, 0xA1), put(1, 2, 0xA2) },
+            &.{ add(1, 3, 0, 100, .{ .create = true }), signed_add },
+        },
+        // A delete; a read at the version seen, then a put.
+        &.{ &.{delete(1, 2)}, &.{ read(1, 1, 1), put(1, 1, 0xB1) } },
+        // A re-create; a clamped reservation moved by `delta_from`.
+        &.{
+            &.{put(1, 2, 0xC2)},
+            &.{
+                add(1, 3, 0, -150, .{ .min = 0, .clamp = true }),
+                add(1, 3, 16, 0, .{ .delta_from = 0 }),
+            },
+        },
+        // A stale read: the transaction fails whole.
+        &.{&.{ read(1, 1, 1), put(1, 4, 0xD4) }},
+    };
+
+    var summary = std.ArrayList(u8).init(arena.allocator());
+    const writer = summary.writer();
+    var checksum_input = std.ArrayList(u8).init(arena.allocator());
+
+    for (requests, 0..) |request, request_index| {
+        const results = try context.commit(request);
+        for (results, 0..) |transaction, transaction_index| {
+            for (transaction) |result| {
+                try writer.print("commit {}.{}: {s} op={} applied={} value={}\n", .{
+                    request_index,
+                    transaction_index,
+                    @tagName(result.status),
+                    result.op,
+                    result.applied,
+                    result.value,
+                });
+                try checksum_input.appendSlice(std.mem.asBytes(&result));
+            }
+        }
+    }
+    for (1..5) |id| {
+        const row = try context.lookup(1, id);
+        try writer.print("row 1/{}: exists={} op={} op_read={} value[0..24]={}\n", .{
+            id,
+            row.flags.exists,
+            row.op,
+            row.op_read,
+            std.fmt.fmtSliceHexLower(row.value[0..24]),
+        });
+        try checksum_input.appendSlice(std.mem.asBytes(&row));
+    }
+    for (try context.changes(0, 100)) |change| {
+        try writer.print("change: {s} {}/{} op={} timestamp={} more={}\n", .{
+            @tagName(change.kind),
+            change.table,
+            change.id,
+            change.op,
+            change.timestamp,
+            change.flags.more,
+        });
+        try checksum_input.appendSlice(std.mem.asBytes(&change));
+    }
+    for (try context.history(history_filter(1, 2, 100, std.math.maxInt(u64), 0))) |change| {
+        try writer.print("history 1/2: {s} op={} timestamp={}\n", .{
+            @tagName(change.kind),
+            change.op,
+            change.timestamp,
+        });
+        try checksum_input.appendSlice(std.mem.asBytes(&change));
+    }
+    try writer.print("checksum: {x:0>32}\n", .{vsr.checksum(checksum_input.items)});
+
+    const snap = stdx.Snap.snap_fn("src");
+    try snap(@src(),
+        \\commit 0.0: ok op=1 applied=0 value=0
+        \\commit 0.0: ok op=1 applied=0 value=0
+        \\commit 0.1: ok op=1 applied=100 value=100
+        \\commit 0.1: ok op=1 applied=-5 value=18446744073709551611
+        \\commit 1.0: ok op=2 applied=0 value=0
+        \\commit 1.1: ok op=2 applied=0 value=0
+        \\commit 1.1: ok op=2 applied=0 value=0
+        \\commit 2.0: ok op=3 applied=0 value=0
+        \\commit 2.1: ok op=3 applied=-100 value=0
+        \\commit 2.1: ok op=3 applied=100 value=100
+        \\commit 3.0: conflict op=2 applied=0 value=0
+        \\commit 3.0: aborted op=0 applied=0 value=0
+        \\row 1/1: exists=true op=2 op_read=5 value[0..24]=b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1
+        \\row 1/2: exists=true op=3 op_read=6 value[0..24]=c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2
+        \\row 1/3: exists=true op=3 op_read=7 value[0..24]=0000000000000000fbffffffffffffff6400000000000000
+        \\row 1/4: exists=false op=0 op_read=8 value[0..24]=000000000000000000000000000000000000000000000000
+        \\change: put 1/1 op=1 timestamp=1 more=false
+        \\change: put 1/2 op=1 timestamp=6 more=false
+        \\change: put 1/3 op=1 timestamp=11 more=false
+        \\change: put 1/3 op=1 timestamp=16 more=false
+        \\change: delete 1/2 op=2 timestamp=21 more=false
+        \\change: put 1/1 op=2 timestamp=31 more=false
+        \\change: put 1/2 op=3 timestamp=36 more=false
+        \\change: put 1/3 op=3 timestamp=41 more=false
+        \\change: put 1/3 op=3 timestamp=46 more=false
+        \\change: end 0/0 op=9 timestamp=47 more=false
+        \\history 1/2: put op=3 timestamp=36
+        \\history 1/2: delete op=2 timestamp=21
+        \\history 1/2: put op=1 timestamp=6
+        \\history 1/2: end op=10 timestamp=0
+        \\checksum: 1da1fb8303b359f4e064856cfe0b241f
+        \\
+    ).diff(summary.items);
+}
