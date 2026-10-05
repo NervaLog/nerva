@@ -100,7 +100,7 @@ in-memory model replayed in op order.
 Linux (io_uring) or macOS; x86_64 with AES or aarch64.
 
 CI (`.github/workflows/ci.yml`) runs on every push and pull request to `main`: typecheck, format,
-unit, integration, API, view and demo tests, every fuzzer at its smoke size, and the VOPR on seeds 1,
+unit, integration, API, view, mixed-release and demo tests, every fuzzer at its smoke size, and the VOPR on seeds 1,
 2, 5 and one random seed (printed, so a failure replays), as parallel jobs (N57). A commit to `main` that changes `VERSION` runs CI on that commit, then
 publishes binaries for Linux and macOS (x86_64, aarch64) as GitHub release `v<VERSION>`
 (`release.yml`), with that version's section of [CHANGELOG.md](./CHANGELOG.md) as the release
@@ -108,9 +108,13 @@ notes; releasing a version twice, or without notes, fails. A separate workflow,
 `fuzz.yml`, runs every fuzzer and the VOPR on random seeds for a time budget; it is started by hand
 on runners brought up for it.
 
-Binaries report `<protocol>+<commit>`. The protocol release (`0.0.2` since adds, N43) is what
-replicas, clients and data files check: binaries of different protocol releases do not mix in
-one cluster, and data files formatted by v0.1.0 (protocol `0.0.1`) must be reformatted.
+Binaries report `<protocol>+<commit>`. The protocol release (`0.0.3` since maintained views,
+N60) is what data files and clients check: a replica refuses a data file of another release, so
+upgrading means reformatting, and accepts clients from `0.0.2` on. A replica ignores peers that
+run another release (N61): in a cluster mixing releases, only replicas of one release count
+toward each other's quorums, and each logs the others it ignores. Upgrade by stopping every
+replica, reformatting, and starting them all on the new release. `zig build test:release` runs a
+cluster of two releases.
 
 ## Running a cluster
 
@@ -255,7 +259,7 @@ of its groups, so two view processes can show they agree. v0 keeps tables and th
 `min_op=<n>` answers once the view process has applied op `n` (read-your-writes), and `504` at
 once for an op not yet committed; views are rebuilt from the feed when the process restarts.
 
-**Maintained views** (N52, N60). Every view is also declared into the state machine, which keeps
+**Maintained views** (N52, N62). Every view is also declared into the state machine, which keeps
 it inside every commit, like the rows: each write updates its row's groups, and every replica
 holds the same groups and the same hash at every op. Reading it reads the groups, not the rows,
 and nothing is lost when a process restarts:
@@ -281,7 +285,7 @@ curl -H 'X-Nerva-Key: secret' 'http://127.0.0.1:8080/v1/views/revenue/groups?as_
   would take an op past either is refused whole (`503 views_busy`), and can be retried; one that
   exceeds them on its own never fits, so split it.
 - `min` and `max` stay exact when the row holding them is deleted, moved or changed: the state
-  machine keeps each group's values in order (N60). A table's views have at most four `min` and
+  machine keeps each group's values in order (N62). A table's views have at most four `min` and
   `max` aggregates between them (a fifth is refused: `"maintained": false`).
 - `?as_of=<op>` reads the view as that op left it, for any committed op since the view was
   declared (`404` before), at most 128 groups a page. Every op that changes a view keeps a

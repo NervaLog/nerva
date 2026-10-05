@@ -413,7 +413,11 @@ fn options_swarm(prng: *stdx.PRNG) Simulator.Options {
         .client_count = client_count,
         .storage_size_limit = storage_size_limit,
         .seed = prng.int(u64),
-        .releases = &releases,
+        // Nerva runs one release per cluster and never upgrades in place (N43): its replicas
+        // ignore peers of another release (N61). The testing lane simulates TigerBeetle's
+        // multiversion upgrades.
+        .releases = if (state_machine == .nerva) releases[0..1] else &releases,
+        .release_peers_strict = state_machine == .nerva,
         .client_release = releases[0].release,
         .reformats_max = replica_count + 2, // Arbitrary reformat limit.
 
@@ -500,8 +504,14 @@ fn options_swarm(prng: *stdx.PRNG) Simulator.Options {
         .replica_unpause_probability = ratio(8, 1_000_000),
         .replica_unpause_stability = prng.int_inclusive(u32, 1_000),
 
-        .replica_release_advance_probability = ratio(1, 1_000_000),
-        .replica_release_catchup_probability = ratio(1, 100_000),
+        .replica_release_advance_probability = if (state_machine == .nerva)
+            Ratio.zero()
+        else
+            ratio(1, 1_000_000),
+        .replica_release_catchup_probability = if (state_machine == .nerva)
+            Ratio.zero()
+        else
+            ratio(1, 100_000),
 
         .requests_max = constants.journal_slot_count * 3,
         .request_probability = ratio(prng.range_inclusive(u8, 1, 100), 100),
@@ -527,6 +537,7 @@ fn options_performance(prng: *stdx.PRNG) Simulator.Options {
         .storage_size_limit = vsr.sector_floor(200 * MiB),
         .seed = prng.int(u64),
         .releases = releases[0..1],
+        .release_peers_strict = state_machine == .nerva,
         .client_release = releases[0].release,
         .reformats_max = 0,
 

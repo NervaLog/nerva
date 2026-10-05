@@ -245,14 +245,14 @@ pub fn WorkloadType(comptime StateMachine: type) type {
         view_op_keys: std.AutoHashMapUnmanaged(u128, void) = .{},
         view_txn_keys: std.ArrayListUnmanaged(u128) = .{},
         view_txn_busy: std.ArrayListUnmanaged(bool) = .{},
-        /// The same for members (N60).
+        /// The same for members (N62).
         view_op_members: std.AutoHashMapUnmanaged(u128, void) = .{},
         view_txn_members: std.ArrayListUnmanaged(u128) = .{},
         views_busy_members: u64 = 0,
         view_reads_ready: u64 = 0,
         view_reads_building: u64 = 0,
         views_busy: u64 = 0,
-        /// Coverage of N60: reads as of a past op, groups with a min or max checked, and
+        /// Coverage of N62: reads as of a past op, groups with a min or max checked, and
         /// declarations refused for too many of them.
         view_reads_as_of: u64 = 0,
         view_extremes_checked: u64 = 0,
@@ -327,7 +327,7 @@ pub fn WorkloadType(comptime StateMachine: type) type {
             return @max(1, @divFloor(Operation.commit.event_max(workload.options.batch_size_limit), 2));
         }
 
-        /// The state machine's `member_writes_limit` (N60): a request's entries.
+        /// The state machine's `member_writes_limit` (N62): a request's entries.
         fn member_writes_limit(workload: *const Workload) u32 {
             return Operation.commit.event_max(workload.options.batch_size_limit);
         }
@@ -481,7 +481,7 @@ pub fn WorkloadType(comptime StateMachine: type) type {
             for (definition.group_by[0..definition.group_by_count]) |*field| {
                 field.* = .{ .offset = prng.int_inclusive(u8, value_size - 1), .size = 1, .kind = .unsigned };
             }
-            // A count, then sums, mins and maxes (N60) of 64-bit fields, unsigned or signed.
+            // A count, then sums, mins and maxes (N62) of 64-bit fields, unsigned or signed.
             definition.aggregate_count = prng.range_inclusive(u8, 2, 3);
             definition.aggregates[0] = .{ .function = .count, .field = std.mem.zeroes(nerva.FieldRef) };
             for (definition.aggregates[1..definition.aggregate_count]) |*aggregate| {
@@ -516,7 +516,7 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                 .group_hash_min = if (prng.chance(stdx.PRNG.ratio(3, 4))) 0 else prng.int(u64),
                 // Zero is an invalid limit, and must return nothing.
                 .limit = if (prng.chance(stdx.PRNG.ratio(1, 10))) 0 else prng.range_inclusive(u32, 1, 32),
-                // As of a past op (N60), sometimes one not yet committed (the latest, then).
+                // As of a past op (N62), sometimes one not yet committed (the latest, then).
                 .as_of = switch (prng.int_inclusive(u8, 3)) {
                     0, 1 => 0,
                     2 => prng.range_inclusive(u64, 1, workload.op_max + 1),
@@ -1282,7 +1282,7 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                             workload.view_txn_keys.append(allocator, key) catch @panic("OOM");
                         }
                         // And its member in each `min` or `max` slot, if either value is in the
-                        // view (N60).
+                        // view (N62).
                         if (!matched) continue;
                         const definition = &view.definition;
                         const aggregates = definition.aggregates[0..definition.aggregate_count];
@@ -1486,7 +1486,7 @@ pub fn WorkloadType(comptime StateMachine: type) type {
         }
 
         /// Adds a row to a model group: its count and sums with `views.group_apply`, and its
-        /// `min` and `max` slots here, apart from the state machine's members (N60).
+        /// `min` and `max` slots here, apart from the state machine's members (N62).
         fn model_group_add(
             definition: *const ViewDefinition,
             group: *nerva.Group,

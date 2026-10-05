@@ -154,7 +154,7 @@ pub fn ScanBuilderType(
 
         /// Initializes a Scan over the secondary index specified by `index`, for prefixes from
         /// `prefix_min` to `prefix_max` inclusive, at any timestamp (Nerva: the order of a
-        /// view group's members and a group's versions, N60).
+        /// view group's members and a group's versions, N62).
         /// Produces the criteria equivalent to `WHERE field BETWEEN $min AND $max`.
         /// Results are ordered by `field`, then by `timestamp`.
         pub fn scan_prefix_range(

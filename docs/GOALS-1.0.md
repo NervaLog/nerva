@@ -98,7 +98,7 @@ holding facts, receipts and views. Nerva must support the second arrangement eit
    latest or as of any op, with a hash per answer (N34, N35); demonstrated by the seat and
    canvas demos under crashes (N36, N38). Views are also maintained by the state machine
    itself, with a hash every replica agrees on (N52), `min` and `max` included, and read as of
-   any op (N60); `nerva api` serving them in place of `nerva view` is next.
+   any op (N62); `nerva api` serving them in place of `nerva view` is next.
 6. **Effect sinks** (G5) and **conditional operations for hot balances** (G8).
    - G8 ✅ adds: bounded, clampable changes to a 64-bit field inside the commit, which never
      conflict; `delta_from` moves exactly what an earlier add took (N42). The VOPR checks that

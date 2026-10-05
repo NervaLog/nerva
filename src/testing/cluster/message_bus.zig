@@ -87,6 +87,12 @@ pub const MessageBus = struct {
         bus.resume_scheduled = true;
     }
 
+    /// Nerva (N61): the simulated network has no connections. A simulated replica restarts on the
+    /// same release, so what a peer announced stays true.
+    pub fn replica_connected(_: *const MessageBus, _: u8) bool {
+        return true;
+    }
+
     pub fn send_message_to_replica(bus: *MessageBus, replica: u8, message: *Message) void {
         // Messages sent by a process to itself should never be passed to the message bus
         if (bus.process == .replica) assert(replica != bus.process.replica);

@@ -108,7 +108,7 @@ test "format: wire and storage layouts" {
         nerva.ViewRecord,
         nerva.ViewRecord.Kind,
         nerva.ViewRecord.Flags,
-        // min, max and as_of (N60): the members, group versions and view versions trees.
+        // min, max and as_of (N62): the members, group versions and view versions trees.
         nerva.Member,
         nerva.Member.Flags,
         nerva.GroupVersion,
@@ -430,7 +430,7 @@ test "format: persisted derivations" {
     try testing.expectEqual(@as(u64, 4613465043632273798), documents.tail_id(id0, 1));
     try testing.expectEqual(@as(u64, 4590579942568114901), documents.tail_id(id0, 2));
 
-    // Views' members and versions (N60), computed apart from this code (Python's hashlib and
+    // Views' members and versions (N62), computed apart from this code (Python's hashlib and
     // integers): the members tree's keys and the order prefix, and both versions' keys.
     var group_key: [nerva.group_key_size_max]u8 = @splat(0);
     group_key[0] = 7;

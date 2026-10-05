@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Views maintained by the state machine (docs/DECISIONS.md N52, N60), against `nerva view` (v0,
+"""Views maintained by the state machine (docs/DECISIONS.md N52, N62), against `nerva view` (v0,
 N35) as the oracle.
 
 One replica, `nerva api` and one `nerva view` process. Writes 5,000 seats, more than one pulse
@@ -202,7 +202,7 @@ def main():
         assert status == 503 and body["status"] == "views_busy", (status, body)
         assert maintained(api, "revenue")[1]["hash"] == before  # Nothing applied.
 
-        # As of every op compared above: the same groups, read now (N60).
+        # As of every op compared above: the same groups, read now (N62).
         for name, op, _ in list(checks):
             checks.append((name,) + check_against_oracle(api, view_port, name, as_of=op))
         status, body = request(api, "GET", f"/v1/views/extremes/groups?as_of={declared_op - 1}")

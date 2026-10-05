@@ -16,7 +16,7 @@
 //!     PUT  /v1/views/<name>  {"table": 5, "where": […], "group_by": […], "aggregates": […]}
 //!     GET  /v1/views/<name>  (the declaration)
 //!     GET  /v1/views/<name>/groups?cursor=<c>&limit=<n>&as_of=<op>
-//!                            (the view, maintained by the state machine: N52, N60)
+//!                            (the view, maintained by the state machine: N52, N62)
 //!     POST /v1/documents/get, POST /v1/documents/commit, GET /v1/documents/changes
 //!                            (larger values, by key: `documents_routes.zig`)
 //!
@@ -709,7 +709,7 @@ fn views(
                     const declared = try client.declare_view(&definition);
                     const reason: ?[]const u8 = switch (declared.status) {
                         .created, .exists => null,
-                        .unsupported => unreachable, // No longer returned (N60).
+                        .unsupported => unreachable, // No longer returned (N62).
                         .table_extremes_full => "the table's views have too many min and max " ++
                             "aggregates (at most 4)",
                         .views_full => "the cluster's views are full",
@@ -740,7 +740,7 @@ fn views(
 ///
 ///     GET /v1/views/<name>/groups?cursor=<c>&limit=<n>&as_of=<op>
 ///
-/// With `as_of`, the view as that op left it (N60); `as_of` must already be committed, and a
+/// With `as_of`, the view as that op left it (N62); `as_of` must already be committed, and a
 /// page holds at most 128 groups.
 fn view_groups(
     arena: std.mem.Allocator,

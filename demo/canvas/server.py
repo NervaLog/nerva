@@ -81,7 +81,7 @@ class Canvas(Demo):
 
     def reset(self):
         """A blank canvas, in two transactions of half the rows each: the `canvas` view keeps a
-        group per pixel, and one op takes at most 4,095 distinct groups (N52, N60). The epoch
+        group per pixel, and one op takes at most 4,095 distinct groups (N52, N62). The epoch
         starts at the second op, the first at which the whole canvas is blank."""
         blank = [{"kind": "put", "table": PIXELS, "id": str(pixel_id(x, y)),
                   "fields": {"x": x, "y": y, "color": 0, "paints": 0, "painter": "0"}}

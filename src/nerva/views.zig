@@ -3,7 +3,7 @@
 //! row belongs to at most one group of a view, the one its group_by fields' bytes name, if it
 //! passes the view's where clauses. Each group keeps a count and per-aggregate sums, and a view
 //! keeps the sum (modulo 2^256) of its non-empty groups' digests, so every replica agrees on it.
-//! A `min` or `max` slot is kept by the state machine from its members' order (N60); this file
+//! A `min` or `max` slot is kept by the state machine from its members' order (N62); this file
 //! has their keys and ordering.
 
 const std = @import("std");
@@ -125,7 +125,7 @@ pub fn field_integer(field: FieldRef, value: *const [value_size]u8) i128 {
     };
 }
 
-/// A field's value as a u64 that orders as the field does (N60): unsigned and boolean fields as
+/// A field's value as a u64 that orders as the field does (N62): unsigned and boolean fields as
 /// they are, signed fields with the sign bit flipped.
 pub fn field_ordered(field: FieldRef, value: *const [value_size]u8) u64 {
     return integer_ordered(field.kind, field_integer(field, value));
@@ -147,7 +147,7 @@ pub fn integer_from_ordered(kind: nerva.FieldKind, ordered: u64) i128 {
     };
 }
 
-/// The prefix of a group's members of one slot in the members' order (N60). Persisted: never
+/// The prefix of a group's members of one slot in the members' order (N62). Persisted: never
 /// change the derivation. A collision is found when the order is read, and fails the view.
 pub fn member_order_prefix(
     view_id: u64,
@@ -213,7 +213,7 @@ pub fn group_tree_key(view_id: u64, key: *const [group_key_size_max]u8) u128 {
 }
 
 /// Adds the row to, or removes it from, the group: its count and sums. `min` and `max` slots are
-/// left as they are: they need the group's other members (the state machine, N60).
+/// left as they are: they need the group's other members (the state machine, N62).
 pub fn group_apply(
     definition: *const ViewDefinition,
     group: *Group,

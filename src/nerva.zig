@@ -51,13 +51,13 @@ pub const tree_ids = struct {
 
     pub const GroupVersion = .{
         .timestamp = 12,
-        // `group_version_key`: a group's versions, by op (N60).
+        // `group_version_key`: a group's versions, by op (N62).
         .version = 13,
     };
 
     pub const ViewVersion = .{
         .timestamp = 14,
-        // `view_version_key`: a view's versions, by op (N60).
+        // `view_version_key`: a view's versions, by op (N62).
         .version = 15,
     };
 };
@@ -275,7 +275,7 @@ pub const group_key_size_max = 64;
 // The budget of group writes per op, and the rows a pulse backfills, depend on the message
 // size: `StateMachine.groups_per_op_max`.
 
-/// `min` and `max` aggregates over one table, counted across its views (N60): each is a member
+/// `min` and `max` aggregates over one table, counted across its views (N62): each is a member
 /// of its group's order for every row in the view.
 pub const view_extremes_per_table_max = 4;
 
@@ -371,7 +371,7 @@ pub const DeclareStatus = enum(u32) {
     table_invalid = 5,
     views_full = 6,
     table_views_full = 7,
-    /// No longer returned: `min` and `max` are maintained since N60.
+    /// No longer returned: `min` and `max` are maintained since N62.
     unsupported = 8,
     /// The table's views would have more than `view_extremes_per_table_max` `min` and `max`
     /// aggregates.
@@ -447,7 +447,7 @@ pub const Group = extern struct {
     }
 };
 
-/// A row's place in one `min` or `max` slot of a view (N60): one per view, slot and row the
+/// A row's place in one `min` or `max` slot of a view (N62): one per view, slot and row the
 /// view has seen. Never removed: a row that leaves the view is kept, absent (out of `order`).
 pub const Member = extern struct {
     /// `member_key(view_id, slot, row id)`.
@@ -477,7 +477,7 @@ pub const Member = extern struct {
     }
 };
 
-/// A group as one op left it (N60): written once for every group an op changes, so a view can
+/// A group as one op left it (N62): written once for every group an op changes, so a view can
 /// be read as of a past op.
 pub const GroupVersion = extern struct {
     /// `group_version_key(group key, op)`.
@@ -497,7 +497,7 @@ pub const GroupVersion = extern struct {
     }
 };
 
-/// A view's header as one op left it (N60): written once for every view an op changes.
+/// A view's header as one op left it (N62): written once for every view an op changes.
 pub const ViewVersion = extern struct {
     /// `view_version_key(view_id, op)`.
     version: u128,
@@ -553,7 +553,7 @@ pub const ViewQuery = extern struct {
     view_id: u64,
     /// Groups with `group_hash >= group_hash_min`. Zero: from the first.
     group_hash_min: u64,
-    /// Zero: the latest. Otherwise the view as the op `as_of` left it (N60), with at most
+    /// Zero: the latest. Otherwise the view as the op `as_of` left it (N62), with at most
     /// `StateMachine.view_as_of_limit_max` groups per page.
     as_of: u64 = 0,
     /// Groups per page, at most; zero is invalid.

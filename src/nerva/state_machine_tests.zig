@@ -1023,7 +1023,7 @@ test "views: declarations, adds and transactions over the op's groups are refuse
     different.where_count = 0;
     different.where[0] = std.mem.zeroes(nerva.Where);
     try testing.expectEqual(nerva.DeclareStatus.different, (try context.declare(different)).status);
-    // `min` and `max` count against their table's limit, across its views (N60).
+    // `min` and `max` count against their table's limit, across its views (N62).
     var extremes = revenue_view("m");
     extremes.table = 7;
     extremes.aggregate_count = 3;
@@ -1260,7 +1260,7 @@ test "format: what a fixed script commits" {
     ).diff(summary.items);
 }
 
-// ---- min, max and as_of (N60) ----
+// ---- min, max and as_of (N62) ----
 
 /// A row of table 5 as the extremes test writes it: `section` u8 at 0, `price` u64 at 8, `sold`
 /// bool at 16, `temperature` i64 at 24.

@@ -469,7 +469,40 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
   failure is reported with its seed and replay command, and fails the job; the VOPR path (testing
   state machine, 9 runs); the workflow parses, 16 fuzz and 7 VOPR jobs.
 
-## 2026-10-05 — Views: min, max and as_of in the state machine (N60)
+## 2026-10-05 — Release v0.3.0 (N60)
+
+- `build.zig`: release `0.0.3`, clients from `0.0.2`. `CHANGELOG.md`: the v0.3.0 section
+  (maintained views, metrics and traces, the faster client; #7–#10, #26–#29, #34 and #36
+  fixed; #30–#33 known; upgrade steps). `VERSION` 0.3.0.
+- Measured, with the v0.2.0 binary and a `0.0.3` build: a v0.2.0 `nerva api` commits and reads
+  against a `0.0.3` cluster; a `0.0.3` replica refuses a `0.0.2` data file
+  (`multiversion unsupported`); a mixed cluster runs until the `0.0.3` replica panics with
+  `checkpoint diverged` at op 960 (#34, commented). The replica_format golden checksum is
+  unchanged.
+- Verified: `check`, `test:fmt`, `test:unit` 328/329 (the sandbox-denied perf test).
+
+## 2026-10-05 — Replicas ignore peers that run another release (N61; #34)
+
+- `src/nerva/release_peers.zig`: `admits` (whether to handle a message, by its sender's announced
+  release, or a prepare's or block's own) and `announced` (the release a ping or pong carries).
+- `src/vsr/replica.zig`: option `release_peers_strict`; `on_message` records announcements and
+  drops what `admits` refuses, logging a peer of another release once; `tick_peer_connections`
+  forgets a disconnected peer's release and pings a newly connected peer; `send_ping(peer)`.
+  `src/message_bus.zig` and the simulated bus: `replica_connected`. `src/testing/cluster.zig`:
+  the option. `nerva start` sets it. UPSTREAM.md lists the patches.
+- `src/vopr.zig`: the `nerva` lane runs one release with the option on (no simulated upgrades,
+  which Nerva never performs); the `testing` lane is unchanged.
+- `zig build test:release` (`tests/release/mixed.py`, a second `nerva` with release `0.0.200`),
+  in CI's `system` job, CLAUDE.md and README.
+- Verified: unit tests (`release_peers`, 332/333 overall, the sandbox-denied perf test);
+  `test:release`; `test:integration`; VOPR `nerva` seeds 1, 2, 5, 16638486064026786667,
+  3787786164975552336 and `testing` seeds 1, 2; `check`, `test:fmt`. With the v0.2.0 binary: one
+  v0.3.0 replica among two v0.2.0 ones is ignored and ignores them; two v0.3.0 replicas commit
+  past a checkpoint while the v0.2.0 one panics at the first operation it does not know.
+- Mutation-tested: the gate off (a commit succeeds without replica 1), unannounced peers
+  admitted, and prepares of another release admitted each fail a test.
+
+## 2026-10-05 — Views: min, max and as_of in the state machine (N62)
 
 - `src/nerva.zig`: `Member`, `GroupVersion`, `ViewVersion`; `member_key`, `member_order`,
   `group_version_key`, `view_version_key`; tree ids 9–15; `ViewQuery.as_of`;
@@ -492,4 +525,4 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
   and `as_of` test against a model (with member refusals); the VOPR model of both, reading
   declared views more often; `tests/views/maintained.py` with a `min` and `max` view and
   `as_of`; format guards updated. Mutation-tested: three planted bugs fail the unit test; the
-  VOPR catches a blunt one but not those three (N60 says why).
+  VOPR catches a blunt one but not those three (N62 says why).

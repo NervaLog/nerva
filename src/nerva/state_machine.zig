@@ -67,14 +67,14 @@ pub fn StateMachineType(comptime Storage: type) type {
 
         /// Timestamps a commit entry takes: its change, then one per view of its table, for a
         /// group the entry creates (N52), then one per `min` or `max` slot of its table, for a
-        /// member the entry creates (N60).
+        /// member the entry creates (N62).
         pub const entry_timestamps =
             1 + nerva.views_per_table_max + nerva.view_extremes_per_table_max;
-        /// Distinct members one op may write, each once (N60): admission refuses a transaction
+        /// Distinct members one op may write, each once (N62): admission refuses a transaction
         /// that would take its op past this, as it does for groups. A write takes a member in
         /// each `min` or `max` slot of its table: with one or two such slots, any request fits.
         pub const members_per_op_max: u32 = commit_entries_max;
-        /// Groups per `get_view` page read as of a past op: each takes a scan (N60).
+        /// Groups per `get_view` page read as of a past op: each takes a scan (N62).
         pub const view_as_of_limit_max = @min(128, view_groups_limit_max);
         /// Distinct groups one op may write (N52), each once: admission refuses a transaction
         /// that would take its op past this. Groups are twice the size of rows, so this bounds
@@ -349,7 +349,7 @@ pub fn StateMachineType(comptime Storage: type) type {
         /// One `min` or `max` slot of one group.
         const ExtremeKey = struct { group: u128, slot: u8 };
 
-        /// What an op did to one `min` or `max` slot of a group (N60), gathered from the
+        /// What an op did to one `min` or `max` slot of a group (N62), gathered from the
         /// members it touched before the slot's new value is computed.
         const ExtremeScratch = struct {
             /// The best value among the touched members now in the group.
@@ -359,7 +359,7 @@ pub fn StateMachineType(comptime Storage: type) type {
             stored_left: bool = false,
         };
 
-        /// The start of a group's members' order of one slot, as prefetched (N60): the first
+        /// The start of a group's members' order of one slot, as prefetched (N62): the first
         /// `removals_max + 1` members, or all of them.
         const ExtremeScan = struct {
             key: ExtremeKey,
@@ -430,7 +430,7 @@ pub fn StateMachineType(comptime Storage: type) type {
         view_op_keys: std.AutoHashMapUnmanaged(u128, void) = .{},
         /// The keys the transaction being admitted added, to take back if it does not fit.
         view_txn_keys: std.ArrayListUnmanaged(u128) = .{},
-        /// The same for members (N60): the op's distinct members as admitted so far, and those
+        /// The same for members (N62): the op's distinct members as admitted so far, and those
         /// the transaction being admitted added.
         view_op_members: std.AutoHashMapUnmanaged(u128, void) = .{},
         view_txn_members: std.ArrayListUnmanaged(u128) = .{},
@@ -447,7 +447,7 @@ pub fn StateMachineType(comptime Storage: type) type {
         /// The building view a pulse backfills (an index into `views_op`), if any.
         backfill_view: ?u32 = null,
 
-        // ---- min, max and as_of (N60) ----
+        // ---- min, max and as_of (N62) ----
 
         /// `members_per_op_max` for this `batch_size_limit`.
         member_writes_limit: u32,
@@ -831,7 +831,7 @@ pub fn StateMachineType(comptime Storage: type) type {
         }
 
         /// Timestamps an op takes, below those of its writes, for the versions of the groups and
-        /// views it changes (N60).
+        /// views it changes (N62).
         fn versions_reserve(self: *const StateMachine, operation: Operation) u64 {
             return switch (operation) {
                 .commit, .pulse => self.group_writes_limit + nerva.views_max,
@@ -1638,7 +1638,7 @@ pub fn StateMachineType(comptime Storage: type) type {
             }
         }
 
-        /// Stage 3 of `commit` (N60): the members admission counted, in every `min` or `max`
+        /// Stage 3 of `commit` (N62): the members admission counted, in every `min` or `max`
         /// slot of every admitted write's table (enqueued by `prefetch_commit_groups`).
         fn prefetch_commit_members(self: *StateMachine) void {
             const members = &self.forest.grooves.members;
@@ -1681,7 +1681,7 @@ pub fn StateMachineType(comptime Storage: type) type {
             }
         }
 
-        /// Stage 4 of `commit` (N60). For every slot a write may take a member out of (from
+        /// Stage 4 of `commit` (N62). For every slot a write may take a member out of (from
         /// the rows as they are before the op, as admission counts), counts the writes that
         /// may; and where one of them may take away the member holding the group's value,
         /// prefetches the first `removals_max + 1` members of the slot's order, one scan each.
@@ -2050,7 +2050,7 @@ pub fn StateMachineType(comptime Storage: type) type {
 
         /// Ends an op that may have changed views (commit, pulse): settles the `min` and `max`
         /// of every group it touched, then writes back its groups, members and views, each
-        /// once, with their versions (N60).
+        /// once, with their versions (N62).
         fn views_finish(self: *StateMachine, op: u64) void {
             self.views_finish_groups(op);
             self.views_finish_views(op);
@@ -2297,7 +2297,7 @@ pub fn StateMachineType(comptime Storage: type) type {
             return @min(query.as_of, op);
         }
 
-        /// Stage 2 of `get_view` as of a past op (N60): the view's version then.
+        /// Stage 2 of `get_view` as of a past op (N62): the view's version then.
         fn prefetch_view_version(self: *StateMachine) void {
             const query = view_query(self.prefetch_input.?);
             const view_id = self.view_query_id(query).?;
@@ -2488,7 +2488,7 @@ pub fn StateMachineType(comptime Storage: type) type {
             header.declared_op = view.declared_op;
             const as_of = query.as_of != 0;
             if (as_of) {
-                // As the op `as_of` left it (N60); missing if it was declared later.
+                // As the op `as_of` left it (N62); missing if it was declared later.
                 const version = self.view_version orelse {
                     header.state = .missing;
                     return @sizeOf(ViewRecord);
