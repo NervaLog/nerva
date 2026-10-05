@@ -717,3 +717,19 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
 - Verified: `check`, `test:fmt`, `test:unit` (the sandbox-denied perf test aside), `test:api`,
   `test:views`, `test:integration`, `test:release`, `fuzz -- smoke`, VOPR seeds; four planted
   bugs, each caught.
+
+## 2026-10-05 — Documents of up to 512 KiB (N76; #25)
+
+- `src/nerva/documents.zig`: `value_size_max` 512 KiB. `src/nerva/api/documents_routes.zig`: a
+  compile-time check that the largest document fits one production commit with room; a `get`
+  reads at most as many chunks as 256 documents of 64 KiB (413 past that).
+- `tests/api/documents.py`: a 512 KiB value under a 1024-byte key, written and read back; one
+  byte more refused; the `get` cap at its edge (33 × 512 KiB: 413; 32: 200). `src/nerva/api/api.zig`:
+  the unit test's oversized value follows the limit. `src/fuzz_tests.zig`: the documents
+  fuzzer's smoke count is 25 (values are up to 8 times larger).
+- README and TUTORIAL: the limits, and content-addressed blobs with their hash in a document for
+  larger values.
+- Verified: `check`, `test:fmt`, `test:unit` 344/345 (the sandbox-denied perf test), `test:api`
+  (api, documents, adds), `fuzz -- smoke` (exit 0; the vendored `lsm_segmented_array` reports
+  17 s here, slower than smoke wants, unrelated).
+
