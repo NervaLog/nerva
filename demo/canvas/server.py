@@ -80,11 +80,15 @@ class Canvas(Demo):
         self.reset()
 
     def reset(self):
-        """A blank canvas: one transaction, so the epoch starts at one op."""
-        op = self.commit_retrying([
-            {"kind": "put", "table": PIXELS, "id": str(pixel_id(x, y)),
-             "fields": {"x": x, "y": y, "color": 0, "paints": 0, "painter": "0"}}
-            for y in range(SIZE) for x in range(SIZE)])
+        """A blank canvas, in two transactions of half the rows each: the `canvas` view keeps a
+        group per pixel, and one op takes at most 4,095 distinct groups (N52, N60). The epoch
+        starts at the second op, the first at which the whole canvas is blank."""
+        blank = [{"kind": "put", "table": PIXELS, "id": str(pixel_id(x, y)),
+                  "fields": {"x": x, "y": y, "color": 0, "paints": 0, "painter": "0"}}
+                 for y in range(SIZE) for x in range(SIZE)]
+        half = len(blank) // 2
+        self.commit_retrying(blank[:half])
+        op = self.commit_retrying(blank[half:])
         with self.lock:
             self.epoch += 1
             self.epoch_start_op = op

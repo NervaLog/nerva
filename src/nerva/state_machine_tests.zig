@@ -41,11 +41,16 @@ const Context = struct {
     reply: *align(constants.cache_line_size) Body,
     op: u64 = 1,
     prefetching: bool = false,
+    /// Set while the forest compacts or checkpoints.
+    forest_busy: bool = false,
+    superblock_context: SuperBlock.Context = undefined,
 
     fn init(context: *Context, arena: std.mem.Allocator) !void {
         context.* = .{
             .arena = arena,
-            .storage = try fixtures.init_storage(arena, .{ .size = 4096 }),
+            .storage = try fixtures.init_storage(arena, .{
+                .size = constants.storage_size_limit_default,
+            }),
             .time_sim = fixtures.init_time(.{}),
             .trace = undefined,
             .superblock = undefined,
@@ -56,17 +61,104 @@ const Context = struct {
         };
         context.time_sim.ticks = 1;
         context.trace = try fixtures.init_tracer(arena, context.time_sim.interface(), .{});
-        context.superblock = try fixtures.init_superblock(arena, &context.storage, .{
-            .storage_size_limit = data_file_size_min,
-        });
-        // Pretend that the superblock is open so that the Forest can initialize.
-        context.superblock.opened = true;
-        context.superblock.working.vsr_state.checkpoint.header.op = 0;
+        try fixtures.storage_format(arena, &context.storage, .{});
+        context.superblock = try fixtures.init_superblock(arena, &context.storage, .{});
+        fixtures.open_superblock(&context.superblock);
         context.grid = try fixtures.init_grid(arena, &context.trace, &context.superblock, .{});
+        fixtures.open_grid(&context.grid);
+        // The first checkpoint is trivially durable.
+        context.grid.free_set.mark_checkpoint_durable();
         try context.state_machine.init(arena, context.time_sim.interface(), &context.grid, .{
             .batch_size_limit = constants.message_body_size_max,
-            .lsm_forest_node_count = 1,
+            .lsm_forest_node_count = 1024,
         });
+        context.forest_busy = true;
+        context.state_machine.open(forest_callback);
+        context.forest_run();
+    }
+
+    fn forest_callback(state_machine: *StateMachine) void {
+        const context: *Context = @fieldParentPtr("state_machine", state_machine);
+        assert(context.forest_busy);
+        context.forest_busy = false;
+    }
+
+    fn forest_run(context: *Context) void {
+        while (context.forest_busy) context.storage.run();
+    }
+
+    /// Ends an op as the replica does: compacts, and checkpoints when the op triggers one, so
+    /// that tests may run for many ops.
+    fn op_end(context: *Context) void {
+        const op = context.op;
+        context.op += 1;
+
+        context.forest_busy = true;
+        context.state_machine.compact(forest_callback, op);
+        context.forest_run();
+
+        const checkpoint_op_previous = context.superblock.working.vsr_state.checkpoint.header.op;
+        const trigger = vsr.Checkpoint.trigger_for_checkpoint(
+            vsr.Checkpoint.checkpoint_after(checkpoint_op_previous),
+        );
+        if (trigger == null or op != trigger.?) return;
+        const checkpoint_op = op - constants.lsm_compaction_ops;
+
+        context.forest_busy = true;
+        context.state_machine.checkpoint(forest_callback);
+        context.forest_run();
+
+        const Grid_ = @TypeOf(context.grid);
+        const grid_done = struct {
+            var done = false;
+            fn callback(_: *Grid_) void {
+                done = true;
+            }
+        };
+        grid_done.done = false;
+        context.grid.checkpoint(grid_done.callback);
+        while (!grid_done.done) context.storage.run();
+
+        context.forest_busy = true;
+        context.superblock.checkpoint(superblock_callback, &context.superblock_context, .{
+            .header = header: {
+                var header = vsr.Header.Prepare.root(fixtures.cluster);
+                header.op = checkpoint_op;
+                header.set_checksum();
+                break :header header;
+            },
+            .view_attributes = null,
+            .manifest_references = context.state_machine.forest.manifest_log
+                .checkpoint_references(),
+            .free_set_references = .{
+                .blocks_acquired = context.grid
+                    .free_set_checkpoint_blocks_acquired.checkpoint_reference(),
+                .blocks_released = context.grid
+                    .free_set_checkpoint_blocks_released.checkpoint_reference(),
+            },
+            .client_sessions_reference = .{
+                .last_block_checksum = 0,
+                .last_block_address = 0,
+                .trailer_size = 0,
+                .checksum = vsr.checksum(&.{}),
+            },
+            .commit_max = checkpoint_op + 1,
+            .sync_op_min = 0,
+            .sync_op_max = 0,
+            .storage_size = data_file_size_min +
+                (context.grid.free_set.highest_address_acquired() orelse 0) * constants.block_size,
+            .release = vsr.Release.minimum,
+        });
+        context.forest_run();
+        // One process: every checkpoint is durable at once.
+        context.grid.mark_checkpoint_not_durable();
+        context.grid.free_set.mark_checkpoint_durable();
+    }
+
+    fn superblock_callback(superblock_context: *SuperBlock.Context) void {
+        const context: *Context = @alignCast(@fieldParentPtr("superblock_context", superblock_context));
+        assert(context.forest_busy);
+        context.forest_busy = false;
     }
 
     /// Executes one request of `operation`, whose events are split into `batches`, and
@@ -122,9 +214,10 @@ const Context = struct {
             context.reply,
         );
         state_machine.commit_timestamp = timestamp;
-        context.op += 1;
-
+        // The reply is copied out below, before the next op.
         const reply = context.reply[0..reply_size];
+        defer context.op_end();
+
         if (comptime !operation.is_multi_batch()) {
             const results = try context.arena.dupe(
                 Result,
@@ -204,7 +297,7 @@ const Context = struct {
         const reply_size = state_machine.commit(1, context.op, timestamp, .pulse, body, context.reply);
         assert(reply_size == 0);
         state_machine.commit_timestamp = timestamp;
-        context.op += 1;
+        context.op_end();
     }
 
     /// Pulses until no view is building; returns the number of pulses.
@@ -930,9 +1023,24 @@ test "views: declarations, adds and transactions over the op's groups are refuse
     different.where_count = 0;
     different.where[0] = std.mem.zeroes(nerva.Where);
     try testing.expectEqual(nerva.DeclareStatus.different, (try context.declare(different)).status);
-    var with_max = revenue_view("b");
-    with_max.aggregates[1].function = .max;
-    try testing.expectEqual(nerva.DeclareStatus.unsupported, (try context.declare(with_max)).status);
+    // `min` and `max` count against their table's limit, across its views (N60).
+    var extremes = revenue_view("m");
+    extremes.table = 7;
+    extremes.aggregate_count = 3;
+    extremes.aggregates[1].function = .max;
+    extremes.aggregates[2] = extremes.aggregates[1];
+    extremes.aggregates[2].function = .min;
+    try testing.expectEqual(nerva.DeclareStatus.created, (try context.declare(extremes)).status);
+    @memcpy(extremes.name[0..2], "mm");
+    try testing.expectEqual(nerva.DeclareStatus.created, (try context.declare(extremes)).status);
+    @memcpy(extremes.name[0..3], "mmm");
+    try testing.expectEqual(
+        nerva.DeclareStatus.table_extremes_full,
+        (try context.declare(extremes)).status,
+    );
+    var one_more = revenue_view("n");
+    one_more.table = 7;
+    try testing.expectEqual(nerva.DeclareStatus.created, (try context.declare(one_more)).status);
     var reserved = revenue_view("c");
     reserved.table = 0xFFFF_0001;
     try testing.expectEqual(nerva.DeclareStatus.table_invalid, (try context.declare(reserved)).status);
@@ -1133,21 +1241,274 @@ test "format: what a fixed script commits" {
         \\row 1/2: exists=true op=3 op_read=6 value[0..24]=c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2
         \\row 1/3: exists=true op=3 op_read=7 value[0..24]=0000000000000000fbffffffffffffff6400000000000000
         \\row 1/4: exists=false op=0 op_read=8 value[0..24]=000000000000000000000000000000000000000000000000
-        \\change: put 1/1 op=1 timestamp=1 more=false
-        \\change: put 1/2 op=1 timestamp=6 more=false
-        \\change: put 1/3 op=1 timestamp=11 more=false
-        \\change: put 1/3 op=1 timestamp=16 more=false
-        \\change: delete 1/2 op=2 timestamp=21 more=false
-        \\change: put 1/1 op=2 timestamp=31 more=false
-        \\change: put 1/2 op=3 timestamp=36 more=false
-        \\change: put 1/3 op=3 timestamp=41 more=false
-        \\change: put 1/3 op=3 timestamp=46 more=false
-        \\change: end 0/0 op=9 timestamp=47 more=false
-        \\history 1/2: put op=3 timestamp=36
-        \\history 1/2: delete op=2 timestamp=21
-        \\history 1/2: put op=1 timestamp=6
+        \\change: put 1/1 op=1 timestamp=79 more=false
+        \\change: put 1/2 op=1 timestamp=88 more=false
+        \\change: put 1/3 op=1 timestamp=97 more=false
+        \\change: put 1/3 op=1 timestamp=106 more=false
+        \\change: delete 1/2 op=2 timestamp=193 more=false
+        \\change: put 1/1 op=2 timestamp=211 more=false
+        \\change: put 1/2 op=3 timestamp=298 more=false
+        \\change: put 1/3 op=3 timestamp=307 more=false
+        \\change: put 1/3 op=3 timestamp=316 more=false
+        \\change: end 0/0 op=9 timestamp=317 more=false
+        \\history 1/2: put op=3 timestamp=298
+        \\history 1/2: delete op=2 timestamp=193
+        \\history 1/2: put op=1 timestamp=88
         \\history 1/2: end op=10 timestamp=0
-        \\checksum: 1da1fb8303b359f4e064856cfe0b241f
+        \\checksum: d34675c73c5d0555e0d2e0fda1cbc312
         \\
     ).diff(summary.items);
+}
+
+// ---- min, max and as_of (N60) ----
+
+/// A row of table 5 as the extremes test writes it: `section` u8 at 0, `price` u64 at 8, `sold`
+/// bool at 16, `temperature` i64 at 24.
+fn reading(section: u8, price: u64, sold: bool, temperature: i64) [nerva.value_size]u8 {
+    var row: [nerva.value_size]u8 = @splat(0);
+    row[0] = section;
+    std.mem.writeInt(u64, row[8..16], price, .little);
+    row[16] = @intFromBool(sold);
+    std.mem.writeInt(i64, row[24..32], temperature, .little);
+    return row;
+}
+
+/// View 1: sold rows by section, with count, min, max and sum of the price. View 2: every row
+/// by `sold`, with min and max of the (signed) temperature. Four `min` and `max` slots: the
+/// table's limit.
+fn extremes_views() [2]nerva.ViewDefinition {
+    const price: nerva.FieldRef = .{ .offset = 8, .size = 8, .kind = .unsigned };
+    const temperature: nerva.FieldRef = .{ .offset = 24, .size = 8, .kind = .signed };
+    var prices = revenue_view("prices");
+    prices.aggregate_count = 4;
+    prices.aggregates[1] = .{ .function = .min, .field = price };
+    prices.aggregates[2] = .{ .function = .max, .field = price };
+    prices.aggregates[3] = .{ .function = .sum, .field = price };
+    var temperatures = std.mem.zeroes(nerva.ViewDefinition);
+    @memcpy(temperatures.name[0..12], "temperatures");
+    temperatures.table = 5;
+    temperatures.group_by_count = 1;
+    temperatures.group_by[0] = .{ .offset = 16, .size = 1, .kind = .boolean };
+    temperatures.aggregate_count = 2;
+    temperatures.aggregates[0] = .{ .function = .min, .field = temperature };
+    temperatures.aggregates[1] = .{ .function = .max, .field = temperature };
+    return .{ prices, temperatures };
+}
+
+/// A view's groups, computed apart from the state machine: by key byte, the count and each
+/// slot's i128.
+const ExpectedGroups = struct {
+    present: [8]bool = @splat(false),
+    count: [8]u64 = @splat(0),
+    slots: [8][nerva.view_aggregates_max]i128 = @splat(@splat(0)),
+
+    fn from_rows(rows: *const std.AutoArrayHashMapUnmanaged(u64, [nerva.value_size]u8), view_index: u32) ExpectedGroups {
+        var groups: ExpectedGroups = .{};
+        for (rows.values()) |*row| {
+            const section = row[0];
+            const price: i128 = std.mem.readInt(u64, row[8..16], .little);
+            const sold = row[16] == 1;
+            const temperature: i128 = std.mem.readInt(i64, row[24..32], .little);
+            const key: u8, const values: [2]i128 = switch (view_index) {
+                0 => if (sold) .{ section, .{ price, price } } else continue,
+                1 => .{ @intFromBool(sold), .{ temperature, temperature } },
+                else => unreachable,
+            };
+            const slots = &groups.slots[key];
+            if (!groups.present[key]) {
+                groups.present[key] = true;
+                if (view_index == 0) {
+                    slots[1] = price;
+                    slots[2] = price;
+                } else {
+                    slots[0] = temperature;
+                    slots[1] = temperature;
+                }
+            }
+            groups.count[key] += 1;
+            if (view_index == 0) {
+                slots[1] = @min(slots[1], values[0]);
+                slots[2] = @max(slots[2], values[1]);
+                slots[3] += price;
+            } else {
+                slots[0] = @min(slots[0], values[0]);
+                slots[1] = @max(slots[1], values[1]);
+            }
+        }
+        return groups;
+    }
+};
+
+/// Every page of a view's groups, latest (`as_of` zero) or as of a past op, checked against
+/// the header's hash and group count.
+fn view_groups_read(context: *Context, view_id: u64, as_of: u64) !struct {
+    state: nerva.ViewState,
+    groups: ExpectedGroups,
+} {
+    var groups: ExpectedGroups = .{};
+    var hash: [32]u8 = @splat(0);
+    var group_count: u64 = 0;
+    var cursor: u64 = 0;
+    while (true) {
+        const records = try context.view(.{
+            .view_id = view_id,
+            .group_hash_min = cursor,
+            .as_of = as_of,
+            .limit = 3,
+        });
+        const header = records[0];
+        try testing.expectEqual(nerva.ViewRecord.Kind.header, header.kind);
+        if (header.state == .missing) {
+            try testing.expectEqual(@as(usize, 1), records.len);
+            return .{ .state = .missing, .groups = groups };
+        }
+        for (records[1..]) |*record| {
+            try testing.expect(record.count > 0);
+            const key = record.group_key[0];
+            try testing.expect(!groups.present[key]);
+            groups.present[key] = true;
+            groups.count[key] = record.count;
+            for (&groups.slots[key], &record.sums) |*slot, *sum| {
+                slot.* = std.mem.readInt(i128, sum, .little);
+            }
+            var group = std.mem.zeroes(nerva.Group);
+            group.count = record.count;
+            group.group_key = record.group_key;
+            group.sums = record.sums;
+            views.hash_update(&hash, &views.group_digest(view_id, &group), .add);
+            group_count += 1;
+        }
+        if (!header.flags.more) {
+            try testing.expectEqual(header.hash, hash);
+            try testing.expectEqual(header.group_count, group_count);
+            return .{ .state = header.state, .groups = groups };
+        }
+        cursor = header.cursor;
+    }
+}
+
+test "views: min and max stay exact as the rows holding them leave, and read as of any op" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const context = try context_init(&arena);
+    var prng = std.Random.DefaultPrng.init(42);
+    const random = prng.random();
+
+    // The model: present rows by id, and each view's groups after every op checked.
+    var rows: std.AutoArrayHashMapUnmanaged(u64, [nerva.value_size]u8) = .{};
+    const Snapshot = struct { op: u64, groups: [2]ExpectedGroups };
+    var snapshots: std.ArrayListUnmanaged(Snapshot) = .{};
+
+    const ids = 24;
+    const step = struct {
+        /// One request of a few transactions over distinct rows each (no duplicate writes):
+        /// puts, deletes and adds to the price, with few prices so that ties are common. A
+        /// transaction the op's members do not fit is refused whole (`views_busy`). Returns
+        /// the number refused.
+        fn request(
+            ctx: *Context,
+            arena_allocator: std.mem.Allocator,
+            prng_random: std.Random,
+            model: *std.AutoArrayHashMapUnmanaged(u64, [nerva.value_size]u8),
+        ) !u32 {
+            const transactions = try arena_allocator.alloc([]Entry, prng_random.intRangeAtMost(usize, 1, 3));
+            for (transactions) |*transaction| {
+                const count = prng_random.intRangeAtMost(usize, 1, 3);
+                transaction.* = try arena_allocator.alloc(Entry, count);
+                var taken: std.StaticBitSet(ids) = .initEmpty();
+                for (transaction.*) |*entry| {
+                    var id = prng_random.uintLessThan(u64, ids);
+                    while (taken.isSet(id)) id = (id + 1) % ids;
+                    taken.set(id);
+                    entry.* = switch (prng_random.uintLessThan(u8, 10)) {
+                        0...5 => entry: {
+                            var e = put(5, id, 0);
+                            e.value = reading(
+                                prng_random.uintLessThan(u8, 3),
+                                prng_random.uintLessThan(u64, 6),
+                                prng_random.boolean(),
+                                prng_random.intRangeAtMost(i64, -4, 4),
+                            );
+                            break :entry e;
+                        },
+                        6, 7 => delete(5, id),
+                        else => add(5, id, 8, prng_random.intRangeAtMost(i64, 1, 3), .{ .create = true }),
+                    };
+                }
+            }
+            const results = try ctx.commit(transactions);
+            var refused: u32 = 0;
+            for (transactions, results) |transaction, transaction_results| {
+                if (transaction_results[0].status == .views_busy) {
+                    for (transaction_results[1..]) |result| {
+                        try testing.expectEqual(nerva.EntryStatus.aborted, result.status);
+                    }
+                    refused += 1;
+                    continue;
+                }
+                for (transaction_results) |result| try testing.expectEqual(nerva.EntryStatus.ok, result.status);
+                for (transaction) |*entry| switch (entry.kind) {
+                    .put => try model.put(arena_allocator, entry.id, entry.value),
+                    .delete => _ = model.swapRemove(entry.id),
+                    .add => {
+                        const parameters = nerva.Add.from_entry(entry);
+                        const row = try model.getOrPut(arena_allocator, entry.id);
+                        if (!row.found_existing) row.value_ptr.* = @splat(0);
+                        const old = std.mem.readInt(u64, row.value_ptr[8..16], .little);
+                        std.mem.writeInt(u64, row.value_ptr[8..16], old + @as(u64, @intCast(parameters.delta)), .little);
+                    },
+                    else => unreachable,
+                };
+            }
+            return refused;
+        }
+    };
+
+    // Rows before the views: they are backfilled, with commits between the pulses.
+    for (0..10) |_| _ = try step.request(context, allocator, random, &rows);
+    const definitions = extremes_views();
+    const op_before = context.op;
+    for (definitions) |definition| {
+        try testing.expectEqual(nerva.DeclareStatus.created, (try context.declare(definition)).status);
+    }
+    var extra = revenue_view("extra");
+    extra.aggregates[1].function = .min;
+    try testing.expectEqual(nerva.DeclareStatus.table_extremes_full, (try context.declare(extra)).status);
+    while (context.state_machine.pulse_needed(0)) {
+        context.pulse();
+        _ = try step.request(context, allocator, random, &rows);
+    }
+
+    // Four `min` and `max` slots take four members per write: some ops' later transactions do
+    // not fit (`member_writes_limit` is small in tests), and are refused.
+    var refused: u32 = 0;
+    for (0..300) |_| {
+        refused += try step.request(context, allocator, random, &rows);
+        const op = context.op - 1;
+        var snapshot: Snapshot = .{ .op = op, .groups = undefined };
+        for (0..2) |index| {
+            snapshot.groups[index] = ExpectedGroups.from_rows(&rows, @intCast(index));
+            const read_now = try view_groups_read(context, index + 1, 0);
+            try testing.expectEqual(nerva.ViewState.ready, read_now.state);
+            try testing.expectEqual(snapshot.groups[index], read_now.groups);
+        }
+        try snapshots.append(allocator, snapshot);
+    }
+
+    try testing.expect(refused > 0);
+    try testing.expect(refused < 300);
+
+    // As of past ops: the view as each op left it (and the reads since changed nothing).
+    for (snapshots.items) |*snapshot| {
+        for (0..2) |index| {
+            const read_then = try view_groups_read(context, index + 1, snapshot.op);
+            try testing.expectEqual(nerva.ViewState.ready, read_then.state);
+            try testing.expectEqual(snapshot.groups[index], read_then.groups);
+        }
+    }
+    // Before the declaration, the view did not exist.
+    try testing.expectEqual(nerva.ViewState.missing, (try view_groups_read(context, 1, op_before - 1)).state);
+    // While it was building, it was.
+    try testing.expectEqual(nerva.ViewState.building, (try view_groups_read(context, 1, op_before)).state);
 }

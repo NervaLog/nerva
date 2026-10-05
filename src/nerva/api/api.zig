@@ -14,7 +14,9 @@
 //!     PUT  /v1/tables/<t>   {"name": "seats", "fields": [{"name": "price", "type": "u64"}, …]}
 //!     GET  /v1/tables/<t>
 //!     PUT  /v1/views/<name>  {"table": 5, "where": […], "group_by": […], "aggregates": […]}
-//!     GET  /v1/views/<name>  (the declaration; `nerva view` serves the view itself)
+//!     GET  /v1/views/<name>  (the declaration)
+//!     GET  /v1/views/<name>/groups?cursor=<c>&limit=<n>&as_of=<op>
+//!                            (the view, maintained by the state machine: N52, N60)
 //!     POST /v1/documents/get, POST /v1/documents/commit, GET /v1/documents/changes
 //!                            (larger values, by key: `documents_routes.zig`)
 //!
@@ -707,7 +709,9 @@ fn views(
                     const declared = try client.declare_view(&definition);
                     const reason: ?[]const u8 = switch (declared.status) {
                         .created, .exists => null,
-                        .unsupported => "min and max are not maintained yet: read it from nerva view",
+                        .unsupported => unreachable, // No longer returned (N60).
+                        .table_extremes_full => "the table's views have too many min and max " ++
+                            "aggregates (at most 4)",
                         .views_full => "the cluster's views are full",
                         .table_views_full => "the table's views are full",
                         .different => "declared differently in the state machine",
@@ -734,7 +738,10 @@ fn views(
 /// Groups of a view maintained by the state machine (N52), in storage order, with the view's
 /// state, hash and group count as of the read's op.
 ///
-///     GET /v1/views/<name>/groups?cursor=<c>&limit=<n>
+///     GET /v1/views/<name>/groups?cursor=<c>&limit=<n>&as_of=<op>
+///
+/// With `as_of`, the view as that op left it (N60); `as_of` must already be committed, and a
+/// page holds at most 128 groups.
 fn view_groups(
     arena: std.mem.Allocator,
     client: anytype,
@@ -743,8 +750,13 @@ fn view_groups(
     query: []const u8,
 ) !Reply {
     try catalog.view_name_validate(name);
-    const parameters = try query_parse(arena, query, &.{ "cursor", "limit" });
+    const parameters = try query_parse(arena, query, &.{ "cursor", "limit", "as_of" });
     const cursor = if (parameters.get("cursor")) |text| try u64_parse(text, "cursor") else 0;
+    const as_of: u64 = if (parameters.get("as_of")) |text| as_of: {
+        const op = try u64_parse(text, "as_of");
+        if (op == 0) return bad("as_of must be positive");
+        break :as_of op;
+    } else 0;
     const limit = if (parameters.get("limit")) |text|
         try limit_parse(text)
     else
@@ -753,15 +765,22 @@ fn view_groups(
     const view = try layouts.view(arena, name) orelse return error_reply(arena, 404, "no such view");
     const layout = try layouts.layout(arena, view.table) orelse return error.Corrupt;
 
-    var query_view: nerva.ViewQuery = .{ .view_id = 0, .group_hash_min = cursor, .limit = limit };
+    var query_view: nerva.ViewQuery = .{
+        .view_id = 0,
+        .group_hash_min = cursor,
+        .as_of = as_of,
+        .limit = limit,
+    };
     @memcpy(query_view.name[0..name.len], name);
     const records = try arena.alloc(nerva.ViewRecord, limit + 1);
     const count = try client.get_view(query_view, records);
     assert(count >= 1);
     const header = records[0];
     assert(header.kind == .header);
+    if (as_of != 0 and as_of >= header.op) return bad("as_of is not yet committed");
     if (header.state == .missing) {
-        return error_reply(arena, 404, "this view is not maintained (min and max: nerva view)");
+        if (as_of != 0) return error_reply(arena, 404, "the view was declared after as_of");
+        return error_reply(arena, 404, "this view is not maintained by the state machine");
     }
 
     var out = Writer.init(arena);
@@ -771,6 +790,12 @@ fn view_groups(
         @tagName(header.state),
     });
     try out.number(header.op);
+    try out.raw(",\"declared_op\":");
+    try out.number(header.declared_op);
+    if (as_of != 0) {
+        try out.raw(",\"as_of\":");
+        try out.number(as_of);
+    }
     try out.raw(",\"hash\":");
     try out.hex(&header.hash);
     try out.raw(",\"group_count\":");
@@ -795,8 +820,8 @@ fn view_groups(
         try out.number(record.count);
         for (view.aggregates, 0..) |aggregate, slot| {
             if (aggregate.function == .count) continue;
-            assert(aggregate.function == .sum);
-            try out.print(",\"sum_{s}\":\"{}\"", .{
+            try out.print(",\"{s}_{s}\":\"{}\"", .{
+                @tagName(aggregate.function),
                 aggregate.field.?,
                 std.mem.readInt(i128, &record.sums[slot], .little),
             });

@@ -152,6 +152,35 @@ pub fn ScanBuilderType(
             return scan;
         }
 
+        /// Initializes a Scan over the secondary index specified by `index`, for prefixes from
+        /// `prefix_min` to `prefix_max` inclusive, at any timestamp (Nerva: the order of a
+        /// view group's members and a group's versions, N60).
+        /// Produces the criteria equivalent to `WHERE field BETWEEN $min AND $max`.
+        /// Results are ordered by `field`, then by `timestamp`.
+        pub fn scan_prefix_range(
+            self: *ScanBuilder,
+            comptime index: std.meta.FieldEnum(Groove.IndexTrees),
+            buffer: *ScanBuffer,
+            snapshot: u64,
+            prefix_min: CompositeKeyPrefixType(index),
+            prefix_max: CompositeKeyPrefixType(index),
+            direction: Direction,
+        ) *Scan {
+            assert(prefix_min <= prefix_max);
+            const field = comptime std.enums.nameCast(std.meta.FieldEnum(Scan.Dispatcher), index);
+            const scan = self.scan_add(field) catch unreachable;
+            const scan_impl = &@field(scan.dispatcher, @tagName(field));
+            scan_impl.init(
+                &@field(self.groove().indexes, @tagName(index)),
+                buffer,
+                snapshot,
+                key_from_value(index, prefix_min, TimestampRange.timestamp_min),
+                key_from_value(index, prefix_max, TimestampRange.timestamp_max),
+                direction,
+            );
+            return scan;
+        }
+
         /// Initializes a Scan over a unique key searching for an exact match.
         /// Produces the criteria equivalent to `WHERE id = $value`.
         /// Results are always unique.

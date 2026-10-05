@@ -18,6 +18,7 @@ const Snap = stdx.Snap;
 const snap = Snap.snap_fn("src");
 
 const nerva = @import("../nerva.zig");
+const views = @import("views.zig");
 const documents = @import("documents.zig");
 const catalog = @import("catalog.zig");
 
@@ -107,6 +108,11 @@ test "format: wire and storage layouts" {
         nerva.ViewRecord,
         nerva.ViewRecord.Kind,
         nerva.ViewRecord.Flags,
+        // min, max and as_of (N60): the members, group versions and view versions trees.
+        nerva.Member,
+        nerva.Member.Flags,
+        nerva.GroupVersion,
+        nerva.ViewVersion,
     }) |T| try layout_render(writer, T);
 
     // Tree ids name the LSM trees in the data file: never renumber them (CLAUDE.md).
@@ -296,6 +302,7 @@ test "format: wire and storage layouts" {
         \\  views_full = 6
         \\  table_views_full = 7
         \\  unsupported = 8
+        \\  table_extremes_full = 9
         \\nerva.DeclareResult: extern struct, size 32
         \\  status: offset 0, size 4, nerva.DeclareStatus
         \\  reserved_a: offset 4, size 4, u32
@@ -328,9 +335,10 @@ test "format: wire and storage layouts" {
         \\nerva.ViewQuery: extern struct, size 64
         \\  view_id: offset 0, size 8, u64
         \\  group_hash_min: offset 8, size 8, u64
-        \\  limit: offset 16, size 4, u32
-        \\  name: offset 20, size 32, [32]u8
-        \\  reserved: offset 52, size 12, [12]u8
+        \\  as_of: offset 16, size 8, u64
+        \\  limit: offset 24, size 4, u32
+        \\  name: offset 28, size 32, [32]u8
+        \\  reserved: offset 60, size 4, [4]u8
         \\nerva.ViewRecord: extern struct, size 256
         \\  kind: offset 0, size 1, nerva.ViewRecord.Kind
         \\  state: offset 1, size 1, nerva.ViewState
@@ -352,6 +360,37 @@ test "format: wire and storage layouts" {
         \\nerva.ViewRecord.Flags: packed struct, size 1
         \\  more: bit 0, 1 bits, bool
         \\  padding: bit 1, 7 bits, u7
+        \\nerva.Member: extern struct, size 128
+        \\  key: offset 0, size 16, u128
+        \\  position: offset 16, size 16, u128
+        \\  timestamp: offset 32, size 8, u64
+        \\  view_id: offset 40, size 4, u32
+        \\  slot: offset 44, size 1, u8
+        \\  flags: offset 45, size 1, nerva.Member.Flags
+        \\  reserved: offset 46, size 2, [2]u8
+        \\  group_key: offset 48, size 64, [64]u8
+        \\  value: offset 112, size 16, [16]u8
+        \\nerva.Member.Flags: packed struct, size 1
+        \\  present: bit 0, 1 bits, bool
+        \\  padding: bit 1, 7 bits, u7
+        \\nerva.GroupVersion: extern struct, size 256
+        \\  version: offset 0, size 16, u128
+        \\  timestamp: offset 16, size 8, u64
+        \\  op: offset 24, size 8, u64
+        \\  key: offset 32, size 16, u128
+        \\  count: offset 48, size 8, u64
+        \\  group_key: offset 56, size 64, [64]u8
+        \\  sums: offset 120, size 96, [6][16]u8
+        \\  reserved: offset 216, size 40, [40]u8
+        \\nerva.ViewVersion: extern struct, size 128
+        \\  version: offset 0, size 16, u128
+        \\  timestamp: offset 16, size 8, u64
+        \\  op: offset 24, size 8, u64
+        \\  group_count: offset 32, size 8, u64
+        \\  state: offset 40, size 1, nerva.ViewState
+        \\  reserved_a: offset 41, size 7, [7]u8
+        \\  hash: offset 48, size 32, [32]u8
+        \\  reserved_b: offset 80, size 48, [48]u8
         \\tree_ids:
         \\  Row.timestamp = 1
         \\  Row.key = 2
@@ -361,6 +400,13 @@ test "format: wire and storage layouts" {
         \\  View.id = 6
         \\  Group.timestamp = 7
         \\  Group.key = 8
+        \\  Member.timestamp = 9
+        \\  Member.key = 10
+        \\  Member.order = 11
+        \\  GroupVersion.timestamp = 12
+        \\  GroupVersion.version = 13
+        \\  ViewVersion.timestamp = 14
+        \\  ViewVersion.version = 15
         \\
     ).diff(out.items);
 }
@@ -383,6 +429,18 @@ test "format: persisted derivations" {
     try testing.expectEqual(@as(u64, 14508685050127223560), id0);
     try testing.expectEqual(@as(u64, 4613465043632273798), documents.tail_id(id0, 1));
     try testing.expectEqual(@as(u64, 4590579942568114901), documents.tail_id(id0, 2));
+
+    // Views' members and versions (N60), computed apart from this code (Python's hashlib and
+    // integers): the members tree's keys and the order prefix, and both versions' keys.
+    var group_key: [nerva.group_key_size_max]u8 = @splat(0);
+    group_key[0] = 7;
+    try testing.expectEqual(@as(u64, 647901329103683596), views.member_order_prefix(1, 2, &group_key));
+    try testing.expectEqual(@as(u128, 14203992936756354744419), nerva.member_key(3, 2, 99));
+    try testing.expectEqual(
+        @as(u128, 5166132196011238418138295778693611525),
+        nerva.group_version_key(1 << 64 | 17400499127971693294, 5),
+    );
+    try testing.expectEqual(@as(u128, 55340232221128654853), nerva.view_version_key(3, 5));
 
     // The catalog stores layouts and views as canonical JSON, compares declarations by it, and
     // packs a layout's fields into rows: all three are persisted.

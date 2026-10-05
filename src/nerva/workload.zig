@@ -245,9 +245,18 @@ pub fn WorkloadType(comptime StateMachine: type) type {
         view_op_keys: std.AutoHashMapUnmanaged(u128, void) = .{},
         view_txn_keys: std.ArrayListUnmanaged(u128) = .{},
         view_txn_busy: std.ArrayListUnmanaged(bool) = .{},
+        /// The same for members (N60).
+        view_op_members: std.AutoHashMapUnmanaged(u128, void) = .{},
+        view_txn_members: std.ArrayListUnmanaged(u128) = .{},
+        views_busy_members: u64 = 0,
         view_reads_ready: u64 = 0,
         view_reads_building: u64 = 0,
         views_busy: u64 = 0,
+        /// Coverage of N60: reads as of a past op, groups with a min or max checked, and
+        /// declarations refused for too many of them.
+        view_reads_as_of: u64 = 0,
+        view_extremes_checked: u64 = 0,
+        table_extremes_full: u64 = 0,
 
         budgets: std.AutoHashMapUnmanaged(u64, Budget) = .{},
         budget_transactions: u64 = 0,
@@ -305,11 +314,22 @@ pub fn WorkloadType(comptime StateMachine: type) type {
             }
         };
 
-        const ModelView = struct { id: u64, declared_op: u64, definition: ViewDefinition, ready: bool };
+        const ModelView = struct {
+            id: u64,
+            declared_op: u64,
+            definition: ViewDefinition,
+            /// The first op a read found the view ready at: it is ready as of every op since.
+            ready_op: ?u64,
+        };
 
         /// The state machine's `group_writes_limit` for this batch size.
         fn group_writes_limit(workload: *const Workload) u32 {
             return @max(1, @divFloor(Operation.commit.event_max(workload.options.batch_size_limit), 2));
+        }
+
+        /// The state machine's `member_writes_limit` (N60): a request's entries.
+        fn member_writes_limit(workload: *const Workload) u32 {
+            return Operation.commit.event_max(workload.options.batch_size_limit);
         }
 
         pub fn init(
@@ -355,10 +375,19 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                 workload.pulses,
                 workload.views_busy,
             });
+            log.info("views as_of reads={} extremes checked={} table_extremes_full={} " ++
+                "views_busy for members={}", .{
+                workload.view_reads_as_of,
+                workload.view_extremes_checked,
+                workload.table_extremes_full,
+                workload.views_busy_members,
+            });
             workload.model_views.deinit(allocator);
             workload.view_op_keys.deinit(allocator);
             workload.view_txn_keys.deinit(allocator);
             workload.view_txn_busy.deinit(allocator);
+            workload.view_op_members.deinit(allocator);
+            workload.view_txn_members.deinit(allocator);
             log.info("full batches={} invalid entries={} future reads={} invalid filters={} " ++
                 "limits clamped={} cursors continued={}", .{
                 workload.full_batches,
@@ -452,14 +481,24 @@ pub fn WorkloadType(comptime StateMachine: type) type {
             for (definition.group_by[0..definition.group_by_count]) |*field| {
                 field.* = .{ .offset = prng.int_inclusive(u8, value_size - 1), .size = 1, .kind = .unsigned };
             }
-            definition.aggregate_count = 2;
+            // A count, then sums, mins and maxes (N60) of 64-bit fields, unsigned or signed.
+            definition.aggregate_count = prng.range_inclusive(u8, 2, 3);
             definition.aggregates[0] = .{ .function = .count, .field = std.mem.zeroes(nerva.FieldRef) };
-            definition.aggregates[1] = .{
-                .function = .sum,
-                .field = .{ .offset = 8 * prng.int_inclusive(u8, 9), .size = 8, .kind = .unsigned },
-            };
+            for (definition.aggregates[1..definition.aggregate_count]) |*aggregate| {
+                aggregate.* = .{
+                    .function = switch (prng.int_inclusive(u8, 2)) {
+                        0 => .sum,
+                        1 => .min,
+                        else => .max,
+                    },
+                    .field = .{
+                        .offset = 8 * prng.int_inclusive(u8, 9),
+                        .size = 8,
+                        .kind = if (prng.boolean()) .unsigned else .signed,
+                    },
+                };
+            }
             if (prng.chance(stdx.PRNG.ratio(1, 20))) definition.reserved_b[0] = 1;
-            if (prng.chance(stdx.PRNG.ratio(1, 20))) definition.aggregates[1].function = .max;
             return @sizeOf(ViewDefinition);
         }
 
@@ -467,11 +506,22 @@ pub fn WorkloadType(comptime StateMachine: type) type {
             const prng = workload.prng;
             const query: *nerva.ViewQuery =
                 @alignCast(std.mem.bytesAsValue(nerva.ViewQuery, body[0..@sizeOf(nerva.ViewQuery)]));
+            const views_count = workload.model_views.items.len;
             query.* = .{
-                .view_id = prng.int_inclusive(u64, workload.model_views.items.len + 1),
+                // Mostly a declared view; sometimes zero, or one not yet declared.
+                .view_id = if (views_count > 0 and prng.chance(stdx.PRNG.ratio(7, 8)))
+                    prng.range_inclusive(u64, 1, views_count)
+                else
+                    prng.int_inclusive(u64, views_count + 1),
                 .group_hash_min = if (prng.chance(stdx.PRNG.ratio(3, 4))) 0 else prng.int(u64),
                 // Zero is an invalid limit, and must return nothing.
-                .limit = prng.int_inclusive(u32, 8),
+                .limit = if (prng.chance(stdx.PRNG.ratio(1, 10))) 0 else prng.range_inclusive(u32, 1, 32),
+                // As of a past op (N60), sometimes one not yet committed (the latest, then).
+                .as_of = switch (prng.int_inclusive(u8, 3)) {
+                    0, 1 => 0,
+                    2 => prng.range_inclusive(u64, 1, workload.op_max + 1),
+                    else => workload.op_max + prng.range_inclusive(u64, 1, 1000),
+                },
             };
             return @sizeOf(nerva.ViewQuery);
         }
@@ -1205,19 +1255,23 @@ pub fn WorkloadType(comptime StateMachine: type) type {
             }) catch unreachable;
             const allocator = workload.allocator;
             workload.view_op_keys.clearRetainingCapacity();
+            workload.view_op_members.clearRetainingCapacity();
             workload.view_txn_busy.clearRetainingCapacity();
             while (request.pop()) |batch| {
                 const entries = stdx.bytes_as_slice(.exact, Entry, batch);
                 workload.view_txn_keys.clearRetainingCapacity();
+                workload.view_txn_members.clearRetainingCapacity();
                 const admitted = admit: for (entries) |*entry| {
                     if (!workload.entry_viewed(entry)) continue;
                     const version = workload.row_version(nerva.row_key(entry.table, entry.id));
                     const value_old: ?[value_size]u8 = if (version.exists) version.value else null;
                     for (workload.model_views.items) |*view| {
                         if (view.definition.table != entry.table) continue;
+                        var matched = false;
                         for (views.entry_values(entry, value_old)) |candidate| {
                             const value = candidate orelse continue;
                             if (!views.row_matches(&view.definition, &value)) continue;
+                            matched = true;
                             const group_key = views.group_key(&view.definition, &value);
                             const key = views.group_tree_key(view.id, &group_key);
                             if (workload.view_op_keys.contains(key)) continue;
@@ -1227,11 +1281,30 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                             workload.view_op_keys.put(allocator, key, {}) catch @panic("OOM");
                             workload.view_txn_keys.append(allocator, key) catch @panic("OOM");
                         }
+                        // And its member in each `min` or `max` slot, if either value is in the
+                        // view (N60).
+                        if (!matched) continue;
+                        const definition = &view.definition;
+                        const aggregates = definition.aggregates[0..definition.aggregate_count];
+                        for (aggregates, 0..) |*aggregate, slot| {
+                            if (!views.extreme(aggregate.function)) continue;
+                            const key = nerva.member_key(view.id, @intCast(slot), entry.id);
+                            if (workload.view_op_members.contains(key)) continue;
+                            if (workload.view_op_members.count() == workload.member_writes_limit()) {
+                                workload.views_busy_members += 1;
+                                break :admit false;
+                            }
+                            workload.view_op_members.put(allocator, key, {}) catch @panic("OOM");
+                            workload.view_txn_members.append(allocator, key) catch @panic("OOM");
+                        }
                     }
                 } else true;
                 if (!admitted) {
                     for (workload.view_txn_keys.items) |key| {
                         assert(workload.view_op_keys.remove(key));
+                    }
+                    for (workload.view_txn_members.items) |key| {
+                        assert(workload.view_op_members.remove(key));
                     }
                 }
                 workload.view_txn_busy.append(allocator, !admitted) catch @panic("OOM");
@@ -1266,6 +1339,7 @@ pub fn WorkloadType(comptime StateMachine: type) type {
             const expected: nerva.DeclareStatus = expected: {
                 if (views.definition_validate(definition)) |status| break :expected status;
                 var table_views: u32 = 0;
+                var table_extremes: u32 = views.extreme_count(definition);
                 for (workload.model_views.items) |*view| {
                     const name = views.definition_name(&view.definition);
                     if (std.mem.eql(u8, name, views.definition_name(definition))) {
@@ -1276,10 +1350,17 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                         }
                         break :expected .different;
                     }
-                    if (view.definition.table == definition.table) table_views += 1;
+                    if (view.definition.table == definition.table) {
+                        table_views += 1;
+                        table_extremes += views.extreme_count(&view.definition);
+                    }
                 }
                 if (workload.model_views.items.len == nerva.views_max) break :expected .views_full;
                 if (table_views == nerva.views_per_table_max) break :expected .table_views_full;
+                if (table_extremes > nerva.view_extremes_per_table_max) {
+                    workload.table_extremes_full += 1;
+                    break :expected .table_extremes_full;
+                }
                 break :expected .created;
             };
             assert(result.status == expected);
@@ -1291,7 +1372,7 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                     .id = result.view_id,
                     .declared_op = result.op,
                     .definition = definition.*,
-                    .ready = false,
+                    .ready_op = null,
                 }) catch @panic("OOM");
             } else if (expected != .exists) {
                 assert(result.view_id == 0 and result.op == 0);
@@ -1328,7 +1409,19 @@ pub fn WorkloadType(comptime StateMachine: type) type {
             }
             const view = &workload.model_views.items[query.view_id - 1];
             assert(header.declared_op == view.declared_op);
-            assert(records.len - 1 <= @min(query.limit, StateMachine.view_groups_limit_max));
+            // As of an op, clamped to the read's: no version is newer.
+            const as_of: u64 = if (query.as_of == 0) op_executed else @min(query.as_of, op_executed);
+            if (query.as_of != 0) workload.view_reads_as_of += 1;
+            if (as_of < view.declared_op) {
+                assert(header.state == .missing);
+                assert(records.len == 1);
+                return;
+            }
+            const limit_max = if (query.as_of == 0)
+                StateMachine.view_groups_limit_max
+            else
+                StateMachine.view_as_of_limit_max;
+            assert(records.len - 1 <= @min(query.limit, limit_max));
             for (records[1..]) |*record| {
                 assert(record.kind == .group);
                 assert(record.count > 0);
@@ -1337,31 +1430,33 @@ pub fn WorkloadType(comptime StateMachine: type) type {
             }
             switch (header.state) {
                 .building => {
-                    assert(!view.ready); // A ready view never builds again.
+                    // A ready view never builds again.
+                    if (view.ready_op) |ready_op| assert(as_of < ready_op);
                     workload.view_reads_building += 1;
                     return;
                 },
                 .ready => {},
                 .missing, .failed => unreachable, // No collisions among a few hundred groups.
             }
-            view.ready = true;
+            view.ready_op = @min(view.ready_op orelse as_of, as_of);
             workload.view_reads_ready += 1;
 
-            // The model's groups, from the rows as of this op.
+            // The model's groups, from the rows as of `as_of`.
+            var rows_then = workload.rows_as_of(as_of);
+            defer rows_then.deinit(workload.allocator);
             var groups: std.AutoArrayHashMapUnmanaged([nerva.group_key_size_max]u8, nerva.Group) = .{};
             defer groups.deinit(workload.allocator);
-            var rows = workload.rows.iterator();
+            var rows = rows_then.iterator();
             while (rows.next()) |row| {
                 if (@as(u32, @intCast(row.key_ptr.* >> 64)) != view.definition.table) continue;
-                if (!row.value_ptr.exists) continue;
-                if (!views.row_matches(&view.definition, &row.value_ptr.value)) continue;
-                const key = views.group_key(&view.definition, &row.value_ptr.value);
+                if (!views.row_matches(&view.definition, row.value_ptr)) continue;
+                const key = views.group_key(&view.definition, row.value_ptr);
                 const entry = groups.getOrPut(workload.allocator, key) catch @panic("OOM");
                 if (!entry.found_existing) {
                     entry.value_ptr.* = std.mem.zeroes(nerva.Group);
                     entry.value_ptr.group_key = key;
                 }
-                views.group_apply(&view.definition, entry.value_ptr, &row.value_ptr.value, .add);
+                model_group_add(&view.definition, entry.value_ptr, row.value_ptr);
             }
 
             var hash: [32]u8 = @splat(0);
@@ -1385,8 +1480,48 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                 assert(std.mem.eql(u8, &record.group_key, &group.group_key));
                 assert(record.count == group.count);
                 assert(std.mem.eql(u8, std.mem.sliceAsBytes(&record.sums), std.mem.sliceAsBytes(&group.sums)));
+                if (views.extreme_count(&view.definition) > 0) workload.view_extremes_checked += 1;
             }
             assert(in_range == records.len - 1);
+        }
+
+        /// Adds a row to a model group: its count and sums with `views.group_apply`, and its
+        /// `min` and `max` slots here, apart from the state machine's members (N60).
+        fn model_group_add(
+            definition: *const ViewDefinition,
+            group: *nerva.Group,
+            value: *const [value_size]u8,
+        ) void {
+            const first = group.count == 0;
+            views.group_apply(definition, group, value, .add);
+            for (definition.aggregates[0..definition.aggregate_count], 0..) |*aggregate, slot| {
+                const number = switch (aggregate.function) {
+                    .min, .max => views.field_integer(aggregate.field, value),
+                    else => continue,
+                };
+                const current = std.mem.readInt(i128, &group.sums[slot], .little);
+                const best = if (first) number else switch (aggregate.function) {
+                    .min => @min(current, number),
+                    .max => @max(current, number),
+                    else => unreachable,
+                };
+                std.mem.writeInt(i128, &group.sums[slot], best, .little);
+            }
+        }
+
+        /// The rows that existed after `op`, replayed from the change feed.
+        fn rows_as_of(workload: *const Workload, op: u64) std.AutoHashMapUnmanaged(u128, [value_size]u8) {
+            var rows: std.AutoHashMapUnmanaged(u128, [value_size]u8) = .{};
+            for (workload.changes.items) |*change| {
+                if (change.op > op) break;
+                const key = nerva.row_key(change.table, change.id);
+                switch (change.kind) {
+                    .put => rows.put(workload.allocator, key, change.value) catch @panic("OOM"),
+                    .delete => _ = rows.remove(key),
+                    else => unreachable,
+                }
+            }
+            return rows;
         }
 
         fn row_version(workload: *const Workload, key: u128) Version {
