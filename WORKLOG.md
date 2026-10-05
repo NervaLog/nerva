@@ -549,3 +549,11 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
   declared views more often; `tests/views/maintained.py` with a `min` and `max` view and
   `as_of`; format guards updated. Mutation-tested: three planted bugs fail the unit test; the
   VOPR catches a blunt one but not those three (N62 says why).
+
+## 2026-10-05 — CI frees a nearly full runner volume (N65; #50)
+
+- `.github/scripts/free_disk.sh`: logs free space; below 6 GiB empties the Zig build cache and
+  older toolchains. Run by `INSTALL_ZIG` in `ci.yml` and before the release build.
+- Verified locally: with room it changes nothing; with the threshold forced above the free space
+  it removes the build cache and the older toolchain, keeps the pinned one, and warns.
+
