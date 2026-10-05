@@ -741,3 +741,15 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
   (11511081922386736357) pass; seeds 1, 2, 5 and 30 random in ReleaseSafe pass; `check`,
   `test:fmt`, `test:unit` (the sandbox-denied perf test aside).
 
+## 2026-10-05 — A view is cataloged only under the state machine's definition (N78; #70)
+
+- `src/nerva/api/api.zig`: `PUT /v1/views/<name>` with no catalog document answers 409 to
+  `different` and `ledger_field` and writes nothing; with the identical document, 200 and the
+  reason. The fake client and catalog in its tests now declare and keep views; a unit test covers
+  the two-gateway race and the repeat PUT.
+- `tests/api/ledgers.py`: a view cataloged while its table's views were full, a ledger over its
+  field, then the same view again (200, unmaintained).
+- Verified: the hardening probes (a gateway stopped between declaring and cataloging: two hits in
+  40 tries, each left one definition; the repeat PUT: 200), `check`, `test:fmt`, `test:unit`,
+  `test:api`, `test:views`.
+
