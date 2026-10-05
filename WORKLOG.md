@@ -550,6 +550,16 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
   `as_of`; format guards updated. Mutation-tested: three planted bugs fail the unit test; the
   VOPR catches a blunt one but not those three (N62 says why).
 
+## 2026-10-05 — A software bill of materials with every release (N63)
+
+- `.github/scripts/sbom.py`: CycloneDX 1.5 JSON for a tag and commit, from `build.zig`,
+  UPSTREAM.md and `zig/download.sh`; refuses disagreeing or missing pins.
+- `.github/workflows/release.yml`: the `version` job checks it can be written; the release adds
+  `nerva-v<VERSION>.cdx.json` to the assets and to `SHA256SUMS`, and the notes name it.
+- `.github/scripts/test_sbom.py`, run in CI's `system` job. README: the release paragraph.
+- Verified: the tests (6), mutation-tested; strict validation of v0.3.0's SBOM against the
+  CycloneDX 1.5 schema; a dry run of the release step's `dist/` and `SHA256SUMS`.
+
 ## 2026-10-05 — Gateways recover on their own; late replies dropped (N64; #42, #44)
 
 - `src/nerva/client.zig`: `on_reply` drops a reply that arrives after the timeout (#42), with a
