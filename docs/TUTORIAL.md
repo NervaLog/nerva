@@ -2,13 +2,14 @@
 
 This tutorial takes you from an empty directory to a running Nerva cluster, then through every
 capability it has today: rows and versions, transactions, the change feed and time travel, typed
-layouts, conflict-free counters, declared views, documents, and surviving a crash. It ends with a
+layouts, conflict-free counters, conserved ledgers, declared views, documents, and surviving a
+crash. It ends with a
 tour of the code for people who want to change Nerva itself.
 
 It assumes you are comfortable with a shell, `curl` and JSON, and know roughly what a database
 transaction is. You do not need to know Zig until the last two parts.
 
-Every reply shown below is real output from a run of these exact commands against v0.3.0.
+Every reply shown below is real output from a run of these exact commands against v0.4.0.
 **Your op numbers will differ**: see "Ops move on their own" in Part 2.
 
 > Nerva is a research database (see the [README](../README.md)). Do not put data in it that you
@@ -22,7 +23,7 @@ Every reply shown below is real output from a run of these exact commands agains
 - [Part 3: Transactions](#part-3-transactions)
 - [Part 4: The log: changes, history, time travel](#part-4-the-log-changes-history-time-travel)
 - [Part 5: Layouts: typed fields instead of hex](#part-5-layouts-typed-fields-instead-of-hex)
-- [Part 6: Adds: counters and budgets without conflicts](#part-6-adds-counters-and-budgets-without-conflicts)
+- [Part 6: Adds and ledgers: counters and balances](#part-6-adds-and-ledgers-counters-and-balances)
 - [Part 7: Declared views](#part-7-declared-views)
 - [Part 8: Documents: larger values by key](#part-8-documents-larger-values-by-key)
 - [Part 9: Crashes, timeouts and retries](#part-9-crashes-timeouts-and-retries)
@@ -64,7 +65,7 @@ Nerva's own code is the state machine on top, plus the gateways and tools around
 ```
              curl / your app (JSON over HTTP)
                  │                       │
-        writes and reads           view reads
+     writes, reads, views        independent check
                  ▼                       ▼
          ┌──────────────┐        ┌──────────────┐
          │  nerva api   │        │  nerva view  │   gateways: stateless, restartable
@@ -81,7 +82,8 @@ Nerva's own code is the state machine on top, plus the gateways and tools around
 - **`nerva start`** runs a replica: one data file, one member of the consensus group.
 - **`nerva api`** is a gateway that turns JSON over HTTP into Nerva requests. It holds no
   data of its own.
-- **`nerva view`** follows the change feed and answers declared views, latest or as of any op.
+- **`nerva view`** follows the change feed and recomputes declared views on its own, as an
+  independent check on the views the replicas maintain. It is optional.
 
 ---
 
@@ -98,16 +100,17 @@ cd nerva-ledger
 ./zig/download.sh      # installs Zig 0.14.1 into ./zig
 ./zig/zig build        # builds zig-out/bin/nerva (a few minutes the first time)
 ./zig-out/bin/nerva version
-# Nerva version 0.0.3+4033927
+# Nerva version 0.0.4+28cbd79
 ```
 
-The version is `<protocol release>+<commit>`: `0.0.3` is the protocol release of v0.3.0. It
+The version is `<protocol release>+<commit>`: `0.0.4` is the protocol release of v0.4.0. It
 decides which replicas, data files and clients work together (see "One release per cluster"
 below).
 
-Or skip the build: v0.3.0 binaries for Linux and macOS (x86_64, aarch64) are on the
-[releases page](https://github.com/Botpike/nerva-ledger/releases). This tutorial matches
-v0.3.0; [CHANGELOG.md](../CHANGELOG.md) lists what each release changed.
+Or skip the build: v0.4.0 binaries for Linux and macOS (x86_64, aarch64) are on the
+[releases page](https://github.com/Botpike/nerva-ledger/releases), each with a bill of
+materials (`nerva-v0.4.0.cdx.json`) listing exactly what went into it. This tutorial matches
+v0.4.0; [CHANGELOG.md](../CHANGELOG.md) lists what each release changed.
 
 ### Start one replica
 
@@ -180,15 +183,15 @@ Every replica of a cluster must run the same release (the part of `nerva version
 `+`). A replica ignores peers that run another release, and says so in its log:
 
 ```
-error(replica): … replica 2 runs release 0.0.2, this replica runs 0.0.3: ignoring it (a cluster must run one release)
+error(replica): … replica 2 runs release 0.0.3, this replica runs 0.0.4: ignoring it (a cluster must run one release)
 ```
 
 Ignored peers count toward nobody's quorum, so a cluster with mixed releases may stop
 committing. Data files are tied to a release too: a replica refuses a file formatted by
 another one. Upgrading therefore means: stop every replica, format new data files with the
-new binary, start them all on it, and load your data again. Clients and gateways are more
-lenient: replicas accept clients from release `0.0.2` (v0.2.0) on, so `nerva api` can be
-upgraded after the cluster.
+new binary, start them all on it, and load your data again. Clients follow the same rule: a
+v0.4.0 replica refuses clients of older releases when they register, so upgrade `nerva api`,
+`nerva view` and any Zig client together with the cluster.
 
 ---
 
@@ -480,7 +483,7 @@ Some things to know about layouts:
 
 ---
 
-## Part 6: Adds: counters and budgets without conflicts
+## Part 6: Adds and ledgers: counters and balances
 
 Compare-and-set is the right tool for claims, but the wrong one for a **hot counter**. If fifty
 clients decrement one budget at once with read-then-write, forty-nine of them conflict and
@@ -547,6 +550,115 @@ Adds are ordinary writes everywhere else: they appear in the change feed (as the
 in history and in as-of reads. Without a layout, name the field by byte `offset` and `type`
 (`u64` or `i64`) instead of `field`.
 
+### Ledgers: balances the cluster conserves
+
+The budget above is only as safe as the requests your application sends. A bug that sends a
+lone `+50`, or a `put` of the whole row, creates money. A **ledger** moves that rule into the
+cluster: you declare a set of `i64` fields as **conserved**, and from then on the state machine
+changes them in one way only, by a **pair** of adds that moves one amount from one field of the
+ledger to another. No request, however it is built, can create or destroy value, overdraw a
+field with a floor, or overwrite a balance.
+
+Two tables: accounts, with money `available` and `held`, and a source of funds outside the
+system (the bank, say). Then the ledger over their three fields:
+
+```bash
+n -X PUT $A/v1/tables/7 -d '{"name":"accounts","fields":[{"name":"available","type":"i64"},{"name":"held","type":"i64"}]}'
+# {"table":7,"layout":"created"}
+n -X PUT $A/v1/tables/8 -d '{"name":"sources","fields":[{"name":"balance","type":"i64"}]}'
+# {"table":8,"layout":"created"}
+
+n -X PUT $A/v1/ledgers/1 -d '{"fields":[
+  {"table":7,"field":"available","floor":"0"},
+  {"table":7,"field":"held","floor":"0"},
+  {"table":8,"field":"balance","floor":null}]}'
+# {"ledger":1,"declared":"created","op":"75"}
+```
+
+`available` and `held` may never go below 0. `balance` has no floor, so it can go negative: that
+is how money enters the system, and its negative balance is what was paid in.
+
+**Fund** account 1 with 100. The first entry is the pair's first half (`"pair": true`); the
+next entry is its partner, which names it in `delta_from` and moves exactly what it took:
+
+```bash
+n -d '{"entries":[
+  {"kind":"add","table":8,"id":"1","field":"balance","delta":"-100","pair":true,"create":true},
+  {"kind":"add","table":7,"id":"1","field":"available","delta_from":0,"create":true}]}' $A/v1/commit
+# {"status":"committed","op":"94","adds":[{"index":0,"applied":"-100","value":"-100"},{"index":1,"applied":"100","value":"100"}]}
+```
+
+**Reserve** up to 30 at a time, as in the budget, but now as a pair. The first half may
+`clamp` at its floor; the partner never clamps. Run four times:
+
+```bash
+n -d '{"entries":[
+  {"kind":"add","table":7,"id":"1","field":"available","delta":"-30","pair":true,"clamp":true},
+  {"kind":"add","table":7,"id":"1","field":"held","delta_from":0}]}' $A/v1/commit
+```
+```json
+{"status":"committed","op":"97","adds":[{"index":0,"applied":"-30","value":"70"},{"index":1,"applied":"30","value":"30"}]}
+{"status":"committed","op":"100","adds":[{"index":0,"applied":"-30","value":"40"},{"index":1,"applied":"30","value":"60"}]}
+{"status":"committed","op":"103","adds":[{"index":0,"applied":"-30","value":"10"},{"index":1,"applied":"30","value":"90"}]}
+{"status":"committed","op":"106","adds":[{"index":0,"applied":"-10","value":"0"},{"index":1,"applied":"10","value":"100"}]}
+```
+
+**Post** 25 of what is held to account 2, another row:
+
+```bash
+n -d '{"entries":[
+  {"kind":"add","table":7,"id":"1","field":"held","delta":"-25","pair":true},
+  {"kind":"add","table":7,"id":"2","field":"available","delta_from":0,"create":true}]}' $A/v1/commit
+# {"status":"committed","op":"109","adds":[{"index":0,"applied":"-25","value":"75"},{"index":1,"applied":"25","value":"25"}]}
+```
+
+Now try to break it:
+
+```bash
+# A lone add to a conserved field: it would create money.
+n -d '{"entries":[{"kind":"add","table":7,"id":"1","field":"available","delta":"5"}]}' $A/v1/commit
+# {"status":"unpaired","index":0}                          (409)
+
+# A put that overwrites a balance.
+n -d '{"entries":[{"kind":"put","table":7,"id":"1","fields":{"available":"1000","held":"0"}}]}' $A/v1/commit
+# {"status":"conserved_write","index":0}                   (409)
+
+# Pay out 26 from an account holding 25: the floor stops it.
+n -d '{"entries":[
+  {"kind":"add","table":7,"id":"2","field":"available","delta":"-26","pair":true},
+  {"kind":"add","table":8,"id":"1","field":"balance","delta_from":0}]}' $A/v1/commit
+# {"status":"out_of_bounds","index":0,"value":"25"}        (409)
+```
+
+And check the books:
+
+```bash
+n -d '{"rows":[{"table":8,"id":"1"},{"table":7,"id":"1"},{"table":7,"id":"2"}]}' $A/v1/lookup
+# … "fields":{"balance":"-100"} … "fields":{"available":"0","held":"75"} … "fields":{"available":"25","held":"0"} …
+```
+
+−100 + 0 + 75 + 25 = 0, as it was when the ledger was declared, and as it is at every op.
+
+The rules, in full:
+
+- **A pair** is an add with `"pair": true` at index `i` and its partner at `i + 1`: an add to
+  another field of the same ledger (another row, or another field of the same row) whose
+  `delta_from` is `i`, without `min`, `max`, `clamp` or `pair`. A transaction may hold several
+  pairs and other entries. Anything else that adds to a conserved field is `unpaired`.
+- **Floors.** The first half clamps at its floor with `clamp`, or fails `out_of_bounds`. The
+  partner never clamps: if its floor stops it, the whole transaction is `out_of_bounds`.
+- **Other writes.** A put may write a row's other fields, or create a row with its conserved
+  fields at zero. Changing a conserved field's bytes, or deleting a row whose conserved fields
+  are not all zero, is `conserved_write`.
+- **Declarations** are immutable: sending the same one again answers `"declared":"exists"`
+  with its original op, and a different one under the same id is `409 ledger_immutable`. A
+  field belongs to one ledger at most (`ledger_field_taken`), and a view may not filter or
+  group by a conserved field (Part 7). There can be at most 64 ledgers, of 2 to 16 fields each.
+  `GET /v1/ledgers/1` reads a declaration back.
+
+The simulator checks this invariant after every commit, under crashes and disk faults: every
+ledger's total stays what it was when it was declared, and no field ever moves past its floor.
+
 ---
 
 ## Part 7: Declared views
@@ -574,86 +686,145 @@ A view is immutable. Declaring the same name with the same definition again answ
 different definition, it answers `409` ("declared differently; views are immutable"): pick a new
 name instead.
 
-There are two ways to read a view, and the difference is worth understanding.
+The state machine maintains every view **inside every commit**, alongside the rows: each
+write updates its row's groups, and every replica holds the same groups at every op. Reading a
+view reads its groups, not the rows, and nothing has to be rebuilt when a process restarts.
 
-### 1. Maintained by the replicas (`nerva api`)
-
-`"maintained": true` means the view uses only `count` and `sum`, so **the state machine
-maintains it inside every commit**, alongside the rows. Every replica holds the same groups and
-the same hash at every op, and reading it reads the groups, not the rows:
+### Read a view
 
 ```bash
-n "$A/v1/views/revenue/groups?limit=100"
+n $A/v1/views/revenue
 ```
 ```json
-{"view":"revenue","id":1,"state":"ready","op":"77",
- "hash":"0c8ceeee30d22fcca2f2a5b97e80be1cf94912ed80cfc7218ff1225874c29739",
- "group_count":"2",
+{"view":"revenue","op":"142",
+ "hash":"aa945a74f02106ab0fd8759a5c46e31be48aff918a4f737b0638215c6d10026a",
+ "view_hash":"0c8ceeee30d22fcca2f2a5b97e80be1cf94912ed80cfc7218ff1225874c29739",
+ "declared_op":"129",
  "groups":[{"section":1,"count":"1","sum_price":"100"},
-           {"section":2,"count":"2","sum_price":"500"}],
- "more":false,"cursor":null}
+           {"section":2,"count":"2","sum_price":"500"}]}
 ```
 
 Seat 2 (section 1) is not sold, so section 1 counts one seat. The view was declared after the
-seats were written, and it still counts them: a view declared over existing rows reports
-`"state":"building"` while the cluster backfills them, a bounded number per op, then `"ready"`.
-With four rows, that was instant. Groups come a page at a time, in storage order (by group
-hash, not by key); follow `cursor` while `more` is true.
+seats were written, and it still counts them: a view declared over existing rows is
+`building` while the cluster backfills them, a bounded number per op, and reads answer `503`
+until it is `ready`. With four rows, that was instant.
 
-### 2. Computed by `nerva view`, at any op
+The answer is the whole view, read at one op (`op`), with groups sorted by key. It carries two
+hashes:
 
-`nerva view` is a separate process that follows the change feed and answers any declared view,
-latest or **as of any op**, including ops from before the view was declared. Start one:
+- **`hash`** is the SHA-256 of the `groups` JSON exactly as served. Two answers with the same
+  groups have the same `hash`, whoever computed them (see "Check it independently" below).
+- **`view_hash`** is the replicas' own hash of the view's state (a sum of per-group digests,
+  cheap to update on every write). Every replica holds the same `view_hash` at every op.
+
+`GET /v1/views` lists the views, and `/definition` reads a declaration back:
+
+```bash
+n $A/v1/views
+# {"views":[{"name":"revenue","id":1,"state":"ready","declared_op":"129","group_count":"2"}]}
+n $A/v1/views/revenue/definition
+# {"table":5,"where":[{"field":"sold","op":"eq","value":"1"}],"group_by":["section"],"aggregates":[{"fn":"count"},{"fn":"sum","field":"price"}]}
+```
+
+### Read the past, and your own writes
+
+Sell seat 2 and note the op:
+
+```bash
+n -d '{"entries":[{"kind":"put","table":5,"id":"2","fields":{"section":1,"price":"100","sold":true}}]}' $A/v1/commit
+# {"status":"committed","op":"160"}
+```
+
+`min_op` asks for a view that reflects at least that op. Use it when the write went through
+another gateway, or when you pass an op between services:
+
+```bash
+n "$A/v1/views/revenue?min_op=160"
+# {"view":"revenue","op":"165","hash":"2560a945…","view_hash":"3ab4f4c8…","declared_op":"129","groups":[{"section":1,"count":"2","sum_price":"200"},{"section":2,"count":"2","sum_price":"500"}]}
+```
+
+`as_of` reads the view exactly as an op left it. Here it is just before the sale:
+
+```bash
+n "$A/v1/views/revenue?as_of=159"
+# {"view":"revenue","op":"159","hash":"aa945a74…","view_hash":"0c8ceeee…","declared_op":"129","groups":[{"section":1,"count":"1","sum_price":"100"},{"section":2,"count":"2","sum_price":"500"}]}
+
+n "$A/v1/views/revenue?as_of=128"
+# {"error":"the view was declared after as_of"}            (404)
+n "$A/v1/views/revenue?as_of=999999999"
+# {"error":"as_of is not yet committed"}                   (504)
+```
+
+Op 159 has the same groups as op 142, so it has the same `hash`. **A hash is a function of the
+groups only**: two gateways, two clusters fed the same writes, or `nerva view` all agree on it
+exactly, so checking that two copies of a report agree means comparing 64 hex digits. (Every run
+of this tutorial so far, on fresh clusters of three different releases, hashed the groups above
+to `2560a945…`.)
+
+### Large views: pages
+
+A view of more than 10,000 groups is too big to answer whole. Read it a page at a time from
+`/groups` instead, following `cursor` while `more` is true:
+
+```bash
+n "$A/v1/views/revenue/groups?limit=1"
+# {"view":"revenue","id":1,"state":"ready","op":"185","declared_op":"129","hash":"3ab4f4c8…","group_count":"2","groups":[{"section":1,"count":"2","sum_price":"200"}],"more":true,"cursor":"17233920722255747274"}
+n "$A/v1/views/revenue/groups?limit=1&cursor=17233920722255747274"
+# {… "groups":[{"section":2,"count":"2","sum_price":"500"}],"more":false,"cursor":null}
+```
+
+Pages come in storage order (by group hash, not by key), each read at its own op; `as_of` pins
+them all to one. Note that **`hash` here is the replicated hash**, the one called `view_hash`
+on the whole-view route ([#66](https://github.com/Botpike/nerva-ledger/issues/66)).
+
+### `min` and `max`
+
+`min` and `max` stay exact even when the row holding them changes or disappears, because the
+replicas keep each group's values in order. Declare a second view:
+
+```bash
+n -X PUT $A/v1/views/cheapest -d '{"table":5,"group_by":["section"],"aggregates":[{"fn":"count"},{"fn":"min","field":"price"},{"fn":"max","field":"price"}]}'
+# {"view":"cheapest","declared":"created","maintained":true}
+```
+
+Add a cheap seat to section 2, read the view, delete the seat, and read it again:
+
+```bash
+n -d '{"entries":[{"kind":"put","table":5,"id":"5","fields":{"section":2,"price":"90","sold":false}}]}' $A/v1/commit
+n $A/v1/views/cheapest
+# {… "groups":[{"section":1,"count":"2","min_price":"100","max_price":"100"},{"section":2,"count":"3","min_price":"90","max_price":"250"}]}
+
+n -d '{"entries":[{"kind":"delete","table":5,"id":"5"}]}' $A/v1/commit
+n $A/v1/views/cheapest
+# {… "groups":[{"section":1,"count":"2","min_price":"100","max_price":"100"},{"section":2,"count":"2","min_price":"250","max_price":"250"}]}
+```
+
+A table's views may have at most four `min` and `max` aggregates between them. A view that
+would add a fifth is still declared, but answers `"maintained": false` with a `reason` ("the
+table's views have too many min and max aggregates (at most 4)"). `nerva api` answers `404` for
+it, and only `nerva view` (below) serves it.
+
+### Check it independently: `nerva view`
+
+`nerva view` is a separate process that follows the change feed, keeps the rows in memory, and
+computes views from them when asked: none of the replicas' view code is involved. It serves the
+same route with the same answer, so it is the independent check on the replicas:
 
 ```bash
 $NERVA view --cluster=1 --addresses=3001 --listen=127.0.0.1:8091 > view.log 2>&1 &
 V=http://127.0.0.1:8091
 
-n $V/v1/views
-# {"views":["revenue"]}
-n "$V/v1/views/revenue?min_op=latest"
-# {"view":"revenue","op":"87","hash":"aa945a74…","groups":[{"section":1,"count":"1","sum_price":"100"},{"section":2,"count":"2","sum_price":"500"}]}
+n "$A/v1/views/revenue?as_of=229"
+# {"view":"revenue","op":"229","hash":"2560a945…","view_hash":"3ab4f4c8…","declared_op":"129","groups":[…]}
+n "$V/v1/views/revenue?as_of=229"
+# {"view":"revenue","op":"229","hash":"2560a945…","groups":[…]}
 ```
 
-Now sell seat 2 and note the op:
-
-```bash
-n -d '{"entries":[{"kind":"put","table":5,"id":"2","fields":{"section":1,"price":"100","sold":true}}]}' $A/v1/commit
-# {"status":"committed","op":"90"}
-```
-
-**Read your own write.** `nerva view` is asynchronous: it may not have applied op 90 yet. Ask
-for "at least op 90" and it waits until it has:
-
-```bash
-n "$V/v1/views/revenue?min_op=90"
-# {"view":"revenue","op":"91","hash":"2560a945…","groups":[{"section":1,"count":"2","sum_price":"200"},{"section":2,"count":"2","sum_price":"500"}]}
-```
-
-**Read the past.** The view just before the sale:
-
-```bash
-n "$V/v1/views/revenue?as_of=89"
-# {"view":"revenue","op":"89","hash":"aa945a74…","groups":[{"section":1,"count":"1","sum_price":"100"},{"section":2,"count":"2","sum_price":"500"}]}
-```
-
-Op 89 has the same groups as op 87, so it has the same hash. **A hash is a function of the
-groups only**: two `nerva view` processes, or two clusters fed the same writes, agree on it
-exactly. You can check that two copies of a report agree by comparing 64 hex digits. (Every
-run of this tutorial so far, on fresh clusters of two different releases, hashed the groups
-above to `2560a945…`.)
-
-The two kinds of hash are computed differently: `nerva view` hashes its whole answer, while the
-replicas sum per-group digests so that one write updates the hash cheaply. Compare maintained
-hashes with maintained hashes, and `nerva view` hashes with `nerva view` hashes.
-
-| | Maintained (`/v1/views/<name>/groups` on `nerva api`) | `nerva view` (`/v1/views/<name>`) |
-|---|---|---|
-| Aggregates | `count`, `sum` | `count`, `sum`, `min`, `max` |
-| Reads | latest | latest, `min_op=<n>`, `as_of=<op>` |
-| Where the state lives | replicated, durable, in every replica | in the process's memory, rebuilt from the feed on restart |
-| Cost of a read | reads the groups | computes from rows held in memory (v0) |
-| Limit | about 4,000 distinct groups touched per transaction (`413 views_too_large`, below) | two million changes in memory |
+The groups are byte for byte the same, so `hash` is the same. `nerva view` can also answer for
+ops before a view was declared (`as_of=128` works there), and its `min_op` waits until it has
+read that far into the feed. It holds at most two million changes in memory and rebuilds from
+the feed when it restarts, so treat it as a checker and a tool, not as the place to serve
+views from.
 
 ### Adds and views
 
@@ -661,7 +832,7 @@ Adds to a summed field are what maintained views are for, and they work as expec
 
 ```bash
 n -d '{"entries":[{"kind":"add","table":5,"id":"3","field":"price","delta":"-50"}]}' $A/v1/commit
-# {"status":"committed","op":"99","adds":[{"index":0,"applied":"-50","value":"200"}]}
+# {"status":"committed","op":"238","adds":[{"index":0,"applied":"-50","value":"200"}]}
 ```
 
 An add to a field that a view **filters or groups by** is refused, because an add must never
@@ -675,6 +846,18 @@ n -d '{"entries":[{"kind":"add","table":5,"id":"3","offset":0,"type":"u64","delt
 
 Change such fields with a `put`.
 
+Ledgers (Part 6) have a matching rule. A view may sum a conserved field, or take its `min` or
+`max`, but may not filter or group by one, since only pairs of adds may change it:
+
+```bash
+n -X PUT $A/v1/views/by_available -d '{"table":7,"group_by":["available"],"aggregates":[{"fn":"count"}]}'
+# {"error":"the view filters or groups by a field of a ledger"}       (409)
+n -X PUT $A/v1/views/total_held -d '{"table":7,"group_by":[],"aggregates":[{"fn":"sum","field":"held"}]}'
+# {"view":"total_held","declared":"created","maintained":true}
+n $A/v1/views/total_held
+# {"view":"total_held","op":"256",…,"declared_op":"248","groups":[{"sum_held":"75"}]}
+```
+
 ### Large transactions: `views_too_large`
 
 Maintaining views costs work inside the commit, so one op may touch at most about 4,000
@@ -683,7 +866,18 @@ touches both. A transaction past that answers `413 {"status":"views_too_large","
 applies nothing.
 
 **Split the transaction**: no retry of it can succeed. It happens with bulk loads into a view
-grouped by a high-cardinality field. Send such loads in transactions of a few hundred rows.
+grouped by a high-cardinality field. For example, with a view `by_price` grouping seats by
+price, one commit of 5,000 seats at 5,000 different prices:
+
+```bash
+n -X PUT $A/v1/views/by_price -d '{"table":5,"group_by":["price"],"aggregates":[{"fn":"count"}]}'
+n -d @bulk.json $A/v1/commit        # 5,000 puts, each a new price
+# {"status":"views_too_large","index":0}                   (413)
+```
+
+Send such loads in transactions of a few hundred rows. `min` and `max` add a second limit:
+each write takes one of about 8,000 member slots per op for every `min` or `max` on its table,
+so a table with four of them takes about 2,000 rows per transaction.
 (`503 views_busy` means something else, which `nerva api` and the Zig client never meet: in a
 request that packs several transactions, earlier ones filled the op. Nothing applied, and a
 retry fits.)
@@ -703,17 +897,17 @@ means "must not exist".
 ```bash
 # {"items":[]} as hex
 n -d '{"namespace":"7","reads":[{"key":"cart/alice","version":"0"}],"writes":[{"key":"cart/alice","value_hex":"7b226974656d73223a5b5d7d"}]}' $A/v1/documents/commit
-# {"status":"committed","op":"101"}
+# {"status":"committed","op":"271"}
 
 n -d '{"namespace":"7","keys":["cart/alice","cart/bob"]}' $A/v1/documents/get
-# {"op":"103","documents":[{"key":"cart/alice","exists":true,"version":"101","value_hex":"7b226974656d73223a5b5d7d"},{"key":"cart/bob","exists":false,"version":"0","value_hex":""}]}
+# {"op":"272","documents":[{"key":"cart/alice","exists":true,"version":"271","value_hex":"7b226974656d73223a5b5d7d"},{"key":"cart/bob","exists":false,"version":"0","value_hex":""}]}
 ```
 
 A stale read conflicts and names the key:
 
 ```bash
 n -d '{"namespace":"7","reads":[{"key":"cart/alice","version":"0"}],"writes":[{"key":"cart/alice","delete":true}]}' $A/v1/documents/commit
-# {"status":"conflict","key":"cart/alice","version":"101"}     (409)
+# {"status":"conflict","key":"cart/alice","version":"271"}     (409)
 ```
 
 `documents/get` takes up to 256 keys and an optional `"as_of"`. A commit carries up to about
@@ -721,7 +915,7 @@ n -d '{"namespace":"7","reads":[{"key":"cart/alice","version":"0"}],"writes":[{"
 
 ```bash
 n "$A/v1/documents/changes?namespace=7&limit=1000"
-# {"documents":[{"key":"cart/alice","op":"101","kind":"put","value_hex":"7b2269…"}],"more":false,"cursor":"…","op":"105"}
+# {"documents":[{"key":"cart/alice","op":"271","kind":"put","value_hex":"7b2269…"}],"more":false,"cursor":"…","op":"274"}
 ```
 
 This feed is filtered from the shared change feed, `limit` records at a time, so a page can come
@@ -756,7 +950,7 @@ From then on, requests answer `503` at once instead of each waiting 30 seconds, 
 $NERVA start --addresses=3001 --development 1_0.nerva >> replica.log 2>&1 &
 # …about ten seconds later:
 n -d '{"rows":[{"table":6,"id":"1"}]}' $A/v1/lookup
-# {"op":"110","rows":[{"table":6,"id":"1","exists":true,"op":"55",…,"fields":{"available":"0","held":"50"}}]}
+# {"op":"324","rows":[{"table":6,"id":"1","exists":true,"op":"55",…,"fields":{"available":"0","held":"50"}}]}
 curl -s $A/healthz
 # {"ok":true}
 ```
@@ -770,7 +964,7 @@ one catches up by itself.
 
 > **Behind a load balancer**, `/healthz` is enough: a gateway taken out of rotation while the
 > cluster was down reconnects on its own and reports `200` again once it has. `nerva view`
-> does the same.
+> does the same, and reads on from where it stopped in the feed.
 
 ### The one rule about retries
 
@@ -784,18 +978,19 @@ writes safe to retry:
 - **Claims** with `op_seen: "0"` behave the same way.
 - **Adds** are *not* idempotent: a retried `-30` takes 30 again. Pair an add with a claim on
   a request-id row in the same transaction, so a retry conflicts instead of applying twice.
-  Here request 9001 claims row `(7, 9001)` and settles 10 of what is held, and is sent twice:
+  Here request 9001 claims row `(9, 9001)` and settles 10 of what is held, and is sent twice:
 
   ```bash
   n -d '{"entries":[
-    {"kind":"read","table":7,"id":"9001","op_seen":"0"},
-    {"kind":"put","table":7,"id":"9001","value_hex":"01"},
+    {"kind":"read","table":9,"id":"9001","op_seen":"0"},
+    {"kind":"put","table":9,"id":"9001","value_hex":"01"},
     {"kind":"add","table":6,"id":"1","field":"held","delta":"-10","min":"0"}]}' $A/v1/commit
-  # first:  {"status":"committed","op":"115","adds":[{"index":2,"applied":"-10","value":"40"}]}
-  # again:  {"status":"conflict","index":0,"op":"115"}     ← already applied, at op 115
+  # first:  {"status":"committed","op":"331","adds":[{"index":2,"applied":"-10","value":"40"}]}
+  # again:  {"status":"conflict","index":0,"op":"331"}     ← already applied, at op 331
   ```
 
-  The conflict's `op` even tells you which op the first attempt committed at.
+  The conflict's `op` even tells you which op the first attempt committed at. Ledger pairs
+  are adds too: make them safe to retry the same way.
 
 The demos' client (`demo/nerva_http.py`) never retries a commit for this reason.
 
@@ -878,9 +1073,13 @@ try client.lookup_rows(&.{.{ .id = 42, .table = 1 }}, &rows);
 const change: ?nerva.Change = try client.row_as_of(1, 42, op);
 ```
 
-Also available: `get_changes`, `get_history`, `declare_view` and `get_view`. When a call
-returns `error.Timeout` (the request may still have committed) or `error.Evicted`, the client
-cannot make further calls. `client.reconnect()` replaces its session in place, which is what
+Also available: `get_changes`, `get_history`, `declare_view`, `get_view`, `declare_ledger`
+and `get_ledger`. A ledger pair is two `add` entries whose `Add` parameters set `flags.pair` on
+the first and `flags.delta_from` on the second; the statuses `unpaired`, `conserved_write` and
+`views_too_large` come back in `EntryResult.status` like any other. When a call returns
+`error.Timeout` (the request may still have committed) or `error.Evicted` (the cluster dropped
+the session, for example because more than 64 sessions were registered over its life), the
+client cannot make further calls. `client.reconnect()` replaces its session in place, which is what
 `nerva api` does. If `reconnect` itself fails, the client is uninitialized: call `init` again,
 never `deinit`.
 
@@ -891,7 +1090,7 @@ never `deinit`.
 Read this part before changing Nerva itself. Then read, in order: [CLAUDE.md](../CLAUDE.md)
 (the working protocol, which applies to people too), [docs/TIGER_STYLE.md](./TIGER_STYLE.md)
 (the coding style, which is mandatory), [docs/DECISIONS.md](./DECISIONS.md) (why things are
-the way they are, numbered N1…N61) and [UPSTREAM.md](../UPSTREAM.md) (what is vendored and
+the way they are, numbered N1…N75) and [UPSTREAM.md](../UPSTREAM.md) (what is vendored and
 patched).
 
 ### Where things are
@@ -901,14 +1100,18 @@ patched).
 | `src/nerva.zig` | Public wire and storage types: `Row`, `Entry`, `EntryResult`, `Add`, `Change`, view types, `Operation`, `tree_ids`. Start here. |
 | `src/nerva/state_machine.zig` | The commit core: `prefetch` and `commit` for every operation. |
 | `src/nerva/views.zig` | The pure parts of maintained views: validation, group keys, digests. |
+| `src/nerva/ledgers.zig` | Ledgers: a declaration's checks, and the index that finds conserved fields (N75). |
 | `src/nerva/catalog.zig` | Layouts and view declarations as data; field packing. |
 | `src/nerva/documents.zig` | Chunking documents over rows. |
 | `src/nerva/client.zig` | The blocking Zig client. |
-| `src/nerva/api/` | `nerva api`: JSON routes (`api.zig`, `documents_routes.zig`). |
+| `src/nerva/api/` | `nerva api`: JSON routes (`api.zig`, `documents_routes.zig`), and the per-request memory budget (`memory_budget.zig`). |
+| `src/nerva/client_health.zig` | A gateway's cluster client, and replacing it when it breaks. |
 | `src/nerva/view/` | `nerva view`: the feed follower and declared views computed in memory. |
 | `src/nerva/http_connection.zig` | The gateways' strict, bounded HTTP/1.1 receiver. |
 | `src/nerva/cli.zig`, `src/nerva_main.zig` | The `nerva` binary's commands and flags. |
 | `src/nerva/release_peers.zig` | Which peers a replica listens to: only those running its own release (N61). |
+| `src/nerva/internal_operations.zig` | Operations only the cluster may send itself, such as `pulse` (N67). |
+| `src/nerva/trace_file.zig` | The buffered, bounded writer behind `--trace` (N71). |
 | `src/nerva/workload.zig` | The VOPR workload: random traffic checked against a model. |
 | `src/nerva/*_tests.zig`, `*_fuzz.zig`, `format_test.zig` | Deterministic tests, fuzzers, format guards. |
 | `src/vsr/`, `src/lsm/`, `src/io/`, `src/testing/`, … | Vendored from TigerBeetle. Prefer not to touch. |
@@ -982,8 +1185,10 @@ check it.
 | `./zig/zig build test:demo` | Both demos under random crashes | ~3 min |
 
 `benchmark.perf: usage example` fails in sandboxes that deny `perf_event_open`; that is the
-environment, not your change. Everything else must pass. CI runs all of it on every pull
-request, as parallel jobs. Two more workflows run outside pull requests: `fuzz.yml` (every
+environment, not your change. Everything else must pass. CI runs all of it, as parallel jobs,
+on every pull request that changes more than Markdown. On a pull request the VOPR runs four
+seeds in Debug; on `main` it runs in ReleaseSafe on about 300 random seeds per push, so a
+failure found there comes with a seed to replay. Two more workflows run outside pull requests: `fuzz.yml` (every
 fuzzer and the VOPR on random seeds for a time budget, started by hand) and
 `perf-nightly.yml` (benchmarks of `main` against the last good night, which file an issue on a
 regression).
@@ -1000,7 +1205,8 @@ regression).
 - **Golden values** (snapshots, checksums) change only with an explanation of why.
 - **Pre-existing bugs** you find get a GitHub issue, even if you fix them in the same pull
   request.
-- **Releases** are a `CHANGELOG.md` section plus a `VERSION` bump, in their own commit.
+- **Releases** are a `CHANGELOG.md` section plus a `VERSION` bump, in their own commit. Each
+  release publishes binaries, `SHA256SUMS` and a bill of materials.
 
 A good first exercise: read `src/nerva.zig` top to bottom, then follow one `commit` request
 through `state_machine.zig` (`input_valid` → `prepare` → `prefetch` → `commit`) and find
@@ -1015,7 +1221,8 @@ result.
 
 ```bash
 nerva format --cluster=<id> --replica=<i> --replica-count=<n> [--development] <file>
-nerva start  --addresses=<a0,a1,…> [--development] [--cache-grid=…] [--statsd=…] <file>
+nerva start  --addresses=<a0,a1,…> [--development] [--cache-grid=…] [--cache-rows=…]
+             [--statsd=<host:port>] [--trace=<new file>] [--trace-size-max=…] <file>
 NERVA_KEY=… nerva api  --cluster=<id> --addresses=<…> --listen=<host:port>
 NERVA_KEY=… nerva view --cluster=<id> --addresses=<…> --listen=<host:port>
 ```
@@ -1030,14 +1237,20 @@ NERVA_KEY=… nerva view --cluster=<id> --addresses=<…> --listen=<host:port>
 | `GET /v1/history` | `?table=&id=&op_max=<n\|latest>&cursor=&limit=` |
 | `GET /v1/row` | `?table=&id=&as_of=` |
 | `PUT`, `GET /v1/tables/<t>` | `{"name","fields":[{"name","type"}]}` |
-| `PUT`, `GET /v1/views/<name>` | `{"table","where","group_by","aggregates"}` |
-| `GET /v1/views/<name>/groups` | `?limit=&cursor=` (a view named `groups`: `/v1/views/groups/groups`) |
+| `PUT /v1/ledgers/<id>` | `{"fields":[{"table","field" or "offset","floor"}]}` (2 to 16 `i64` fields) |
+| `GET /v1/ledgers/<id>` | the declaration |
+| `PUT /v1/views/<name>` | `{"table","where","group_by","aggregates"}` |
+| `GET /v1/views` | every maintained view, with its state |
+| `GET /v1/views/<name>` | the whole view; `?min_op=<n\|latest>` or `?as_of=<op>` |
+| `GET /v1/views/<name>/groups` | `?limit=&cursor=&as_of=` (a view named `groups`: `/v1/views/groups/groups`) |
+| `GET /v1/views/<name>/definition` | the declaration |
 | `POST /v1/documents/get` | `{"namespace","keys":[…],"as_of"?}` |
 | `POST /v1/documents/commit` | `{"namespace","reads":[{"key","version"}],"writes":[…]}` |
 | `GET /v1/documents/changes` | `?namespace=&cursor=&limit=` |
 | `GET /healthz` | no key needed; `503` while the gateway cannot reach the cluster |
 
-**`nerva view` routes**: `GET /v1/views`, `GET /v1/views/<name>?min_op=<n|latest>` or `?as_of=<op>`.
+**`nerva view` routes**: `GET /v1/views` (names), `GET /v1/views/<name>?min_op=<n|latest>` or
+`?as_of=<op>`: the same answer as `nerva api`'s, computed independently.
 
 **Statuses**
 
@@ -1046,11 +1259,11 @@ NERVA_KEY=… nerva view --cluster=<id> --addresses=<…> --listen=<host:port>
 | 200 | Done. Commits carry their `op`. |
 | 400 | Invalid request; nothing applied. |
 | 401 | Missing or wrong `X-Nerva-Key`. |
-| 413 | `request too complex`: the body would take more than 128 MiB once parsed (deeply nested or very long arrays). Nothing applied. |
-| 409 | `conflict` (stale read: `index`, current `op`), `out_of_bounds`, `row_absent`, `view_key_field`; or a layout or view declaration that contradicts an earlier one. Nothing applied. |
-| 413 | `views_too_large`: the transaction touches more view groups than one op allows. Nothing applied; split it (Part 7). |
-| 503 | `cluster unavailable` (a commit **may** have applied) or `views_busy` (nothing applied; retry). |
-| 504 | `nerva view`: `min_op` not committed yet. |
+| 404 | No such route, view or ledger; a view read `as_of` an op before its declaration; a view that is not maintained (read it from `nerva view`). |
+| 409 | `conflict` (stale read: `index`, current `op`), `out_of_bounds`, `row_absent`, `view_key_field`, `unpaired`, `conserved_write`; or a layout, view or ledger declaration that contradicts an earlier one (`ledger_immutable`, `ledger_field_taken`, …). Nothing applied. |
+| 413 | `views_too_large`: the transaction touches more view groups than one op allows; split it (Part 7). Or `request too complex`: the body would take more than 128 MiB once parsed. Nothing applied. |
+| 503 | `cluster unavailable` (a commit **may** have applied), a view still `building`, or `views_busy` (nothing applied; retry). |
+| 504 | A view's `min_op` or `as_of` is an op not yet committed. |
 
 **Remember**
 
@@ -1059,4 +1272,5 @@ NERVA_KEY=… nerva view --cluster=<id> --addresses=<…> --listen=<host:port>
 - 64-bit numbers are strings.
 - Follow cursors until `more` is false.
 - Never blindly retry a commit.
-- Every replica of a cluster runs the same release; upgrading means reformatting.
+- Every replica and client of a cluster runs the same release; upgrading means reformatting.
+- Balances that must add up belong in a ledger.

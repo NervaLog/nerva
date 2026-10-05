@@ -717,3 +717,23 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
 - Verified: `check`, `test:fmt`, `test:unit` (the sandbox-denied perf test aside), `test:api`,
   `test:views`, `test:integration`, `test:release`, `fuzz -- smoke`, VOPR seeds; four planted
   bugs, each caught.
+
+## 2026-10-05 — Tutorial for v0.4.0
+
+- `docs/TUTORIAL.md` updated for v0.4.0 (`0.0.4`):
+  - Part 6 gains "Ledgers": declaring one, then funding, reserving and posting as pairs, and
+    the three refusals (`unpaired`, `conserved_write`, `out_of_bounds`) (N75).
+  - Part 7 is rewritten around views served by `nerva api`: whole reads with `hash`,
+    `view_hash` and `declared_op`, `min_op` and `as_of`, pages, `min` and `max` staying
+    exact through a delete, the four-`min`/`max` limit, views over ledger fields, a real
+    `views_too_large`, and `nerva view` as the independent byte-for-byte check (N62, N66, N72).
+  - Clients must match the replicas' release (N62). The bill of materials (N63). The CI
+    changes (N68, N74). Zig client: `declare_ledger`, `get_ledger`, pairs, and eviction. Code
+    map, decisions N1–N75, cheat sheet.
+  - The request-id example in Part 9 moves to table 9, clear of the ledger's tables.
+- Verified: every reply is from one scripted run against a fresh one-replica cluster at
+  `28cbd79`, identical to the earlier runs through Part 6's budget. Checked separately: a fifth
+  `min`/`max` aggregate (declared, not maintained, served by `nerva view`); `/healthz` alone
+  recovering after an outage (#44 fixed).
+- Found while updating it: #66 (`hash` means the replicated hash on `/groups` but the JSON hash
+  on the whole-view route; the README says `/groups` sends `view_hash`).
