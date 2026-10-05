@@ -435,7 +435,9 @@ fn scenario_cluster() !void {
     // Eviction: a client whose session the replicas dropped is evicted on its next request,
     // and gets `error.Evicted` (it used to abort the process, #52). Sessions outlive their
     // clients, so registering `clients_max` more pushes the oldest one out. Last: it pushes out
-    // every earlier session too.
+    // every earlier session too. Replica 0 is restarted first: with it down, each new client
+    // first waits on it, and registering 64 takes minutes.
+    try cluster.start(0);
     {
         const evictee = try cluster.client();
         defer cluster.client_deinit(evictee);
