@@ -1,0 +1,148 @@
+# Nightly performance comparison (docs/DECISIONS.md N56): builds the candidate (main) and the
+# baseline (the last night that passed), runs both on one dedicated Fly Machine in interleaved
+# rounds (perf/nightly/), and reports. A regression files a `perf-regression` issue; it never
+# blocks a release.
+name: Perf nightly
+
+on:
+  schedule:
+    - cron: '47 6 * * *'
+  workflow_dispatch:
+    inputs:
+      candidate:
+        description: 'Commit or branch to measure'
+        default: 'main'
+      baseline:
+        description: 'Commit or branch to compare against (empty: the last night that passed)'
+        default: ''
+      rounds:
+        description: 'Rounds, each running both builds'
+        default: '3'
+      seconds:
+        description: 'Seconds per load workload'
+        default: '20'
+
+permissions:
+  contents: write # the perf-results branch
+  issues: write # perf-regression issues
+
+concurrency:
+  group: perf-nightly
+  cancel-in-progress: false
+
+jobs:
+  nightly:
+    runs-on: [self-hosted, fly]
+    timeout-minutes: 180
+    env:
+      FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_PERF }}
+      CANDIDATE: ${{ inputs.candidate || 'main' }}
+      BASELINE: ${{ inputs.baseline }}
+      PERF_ROUNDS: ${{ inputs.rounds || '3' }}
+      PERF_SECONDS: ${{ inputs.seconds || '20' }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          fetch-depth: 0
+
+      - name: Choose the commits
+        id: commits
+        run: |
+          resolve() { git rev-parse --verify --quiet "origin/$1^{commit}" || git rev-parse --verify "$1^{commit}"; }
+          candidate=$(resolve "$CANDIDATE")
+          if [ -n "$BASELINE" ]; then
+            baseline=$(resolve "$BASELINE")
+          elif git fetch --quiet origin perf-results && git show origin/perf-results:baseline > /dev/null 2>&1; then
+            baseline=$(git show origin/perf-results:baseline | tr -d '[:space:]')
+          else
+            baseline=$(git rev-parse "$candidate~1")
+          fi
+          echo "candidate=$candidate" >> "$GITHUB_OUTPUT"
+          echo "baseline=$baseline" >> "$GITHUB_OUTPUT"
+          echo "Candidate \`$candidate\`, baseline \`$baseline\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install the pinned Zig
+        run: ./zig/download.sh
+
+      # A baseline from before `bench:build` existed cannot be built for this job; the night
+      # then compares the candidate with itself (a measure of noise) and becomes the baseline.
+      - name: Build both commits
+        env:
+          CANDIDATE_SHA: ${{ steps.commits.outputs.candidate }}
+          BASELINE_SHA: ${{ steps.commits.outputs.baseline }}
+        run: |
+          build() { # role sha
+            local tree="$RUNNER_TEMP/tree-$1"
+            git worktree add --force --detach "$tree" "$2"
+            cp -r zig/zig zig/lib "$tree/zig/"
+            (cd "$tree" && ./zig/zig build -Drelease && ./zig/zig build -Drelease bench:build) || return 1
+            mkdir -p "$RUNNER_TEMP/builds/$1"
+            cp "$tree"/zig-out/bin/{nerva,bench,bench-load} "$RUNNER_TEMP/builds/$1/"
+            echo "$2" > "$RUNNER_TEMP/builds/$1/commit"
+          }
+          build candidate "$CANDIDATE_SHA"
+          if ! build baseline "$BASELINE_SHA"; then
+            echo "::warning::baseline $BASELINE_SHA cannot be built here; comparing the candidate with itself"
+            rm -rf "$RUNNER_TEMP/builds/baseline"
+            cp -r "$RUNNER_TEMP/builds/candidate" "$RUNNER_TEMP/builds/baseline"
+          fi
+
+      - name: Install flyctl
+        run: |
+          curl -fsSL https://fly.io/install.sh | sh
+          echo "$HOME/.fly/bin" >> "$GITHUB_PATH"
+
+      - name: Run on Fly
+        run: perf/nightly/fly-run.sh "$RUNNER_TEMP/builds" "$RUNNER_TEMP/results.jsonl"
+
+      - name: Compare
+        id: compare
+        run: |
+          python3 perf/nightly/compare.py "$RUNNER_TEMP/results.jsonl" \
+            --summary "$RUNNER_TEMP/summary.md" --verdict "$RUNNER_TEMP/verdict.json"
+          cat "$RUNNER_TEMP/summary.md" >> "$GITHUB_STEP_SUMMARY"
+          overall=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["overall"])' "$RUNNER_TEMP/verdict.json")
+          echo "overall=$overall" >> "$GITHUB_OUTPUT"
+
+      - name: Record on the perf-results branch
+        if: always() && steps.compare.outcome == 'success'
+        env:
+          CANDIDATE_SHA: ${{ steps.commits.outputs.candidate }}
+          OVERALL: ${{ steps.compare.outputs.overall }}
+        run: |
+          results="$RUNNER_TEMP/perf-results"
+          if git fetch --quiet origin perf-results; then
+            git worktree add --force "$results" origin/perf-results
+            git -C "$results" checkout -B perf-results
+          else
+            git worktree add --force --detach "$results"
+            git -C "$results" checkout --orphan perf-results
+            git -C "$results" rm -rfq .
+          fi
+          night="results/$(date -u +%Y-%m-%d)-${CANDIDATE_SHA:0:12}"
+          mkdir -p "$results/$night"
+          cp "$RUNNER_TEMP"/{results.jsonl,results.log,verdict.json,summary.md} "$results/$night/" 2>/dev/null || true
+          # The candidate becomes the next baseline unless it regressed.
+          if [ "$OVERALL" != fail ]; then echo "$CANDIDATE_SHA" > "$results/baseline"; fi
+          git -C "$results" add -A
+          git -C "$results" -c user.name="perf-nightly" -c user.email="perf-nightly@users.noreply.github.com" \
+            commit -qm "Nightly $(date -u +%Y-%m-%d): ${CANDIDATE_SHA:0:12} $OVERALL"
+          git -C "$results" push origin perf-results
+
+      - name: File a perf-regression issue
+        if: steps.compare.outputs.overall == 'fail'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_SHA: ${{ steps.commits.outputs.candidate }}
+        run: |
+          gh label create perf-regression --color B60205 --description "Nightly performance regression" --force
+          {
+            cat "$RUNNER_TEMP/summary.md"
+            echo
+            echo "Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo
+            echo "Reproduce with the workflow's manual run (candidate and baseline as above), or locally:"
+            echo '`./zig/zig build -Drelease bench:load -- --local --workload=<workload> --batch=<batch>`'
+          } > "$RUNNER_TEMP/issue.md"
+          gh issue create --title "Performance regression at ${CANDIDATE_SHA:0:12}" \
+            --label perf-regression --body-file "$RUNNER_TEMP/issue.md"

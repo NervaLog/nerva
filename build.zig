@@ -88,6 +88,10 @@ pub fn build(b: *std.Build) !void {
         .fuzz = b.step("fuzz", "Run non-VOPR fuzzers"),
         .fuzz_build = b.step("fuzz:build", "Build non-VOPR fuzzers"),
         .bench = b.step("bench", "Run every `benchmark:` test for real (ReleaseSafe)"),
+        .bench_build = b.step(
+            "bench:build",
+            "Install the benchmark binaries and bench-load to zig-out/bin, without running them",
+        ),
         .bench_load = b.step("bench:load", "Run the load generator (ReleaseSafe; pass flags after --)"),
     };
 
@@ -241,6 +245,7 @@ pub fn build(b: *std.Build) !void {
         .filters = bench_filters,
     });
     for ([_]*std.Build.Step.Compile{ stdx_benchmarks, benchmarks }) |compile| {
+        steps.bench_build.dependOn(&b.addInstallArtifact(compile, .{}).step);
         const run = b.addRunArtifact(compile);
         run.setCwd(b.path("."));
         run.has_side_effects = true; // Never cached: a benchmark is run to be measured.
@@ -267,6 +272,7 @@ pub fn build(b: *std.Build) !void {
     bench_load.root_module.addOptions("vsr_options", vsr_options_test);
     bench_load.root_module.addOptions("bench_load_options", bench_load_options);
     steps.check.dependOn(&bench_load.step);
+    steps.bench_build.dependOn(&b.addInstallArtifact(bench_load, .{}).step);
     const run_bench_load = b.addRunArtifact(bench_load);
     if (b.args) |args| run_bench_load.addArgs(args);
     run_bench_load.has_side_effects = true;
