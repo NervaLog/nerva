@@ -416,6 +416,12 @@ pub const Client = struct {
         _ = operation;
         _ = timestamp;
         const client: *Client = @ptrFromInt(@as(usize, @intCast(user_data)));
+        if (client.state == .timed_out) {
+            // The reply to a request this client gave up on, arriving while `deinit` closes its
+            // connections (#42): nobody waits for it.
+            log.debug("on_reply: dropping a reply after the timeout", .{});
+            return;
+        }
         assert(client.state == .waiting);
         assert(client.reply_size == null);
         stdx.copy_disjoint(.inexact, u8, client.reply, result);
@@ -438,3 +444,15 @@ pub const Client = struct {
         return bytes[0..@sizeOf(Body)];
     }
 };
+
+test "Client: a reply after the timeout is dropped (#42)" {
+    // Only the fields `on_reply` reads are set: it must not touch the rest.
+    var client: Client = undefined;
+    client.state = .timed_out;
+    client.reply_size = null;
+    const result = [_]u8{0} ** constants.cache_line_size;
+    const aligned: []align(constants.cache_line_size) const u8 = @alignCast(&result);
+    Client.on_reply(@intFromPtr(&client), .register, 0, aligned);
+    try std.testing.expectEqual(.timed_out, client.state);
+    try std.testing.expectEqual(null, client.reply_size);
+}

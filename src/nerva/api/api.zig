@@ -14,7 +14,10 @@
 //!     PUT  /v1/tables/<t>   {"name": "seats", "fields": [{"name": "price", "type": "u64"}, …]}
 //!     GET  /v1/tables/<t>
 //!     PUT  /v1/views/<name>  {"table": 5, "where": […], "group_by": […], "aggregates": […]}
-//!     GET  /v1/views/<name>  (the declaration)
+//!     GET  /v1/views         (the views the state machine maintains)
+//!     GET  /v1/views/<name>?min_op=<n|latest>|as_of=<op>
+//!                            (the view, whole, as `nerva view` answers it: N66)
+//!     GET  /v1/views/<name>/definition
 //!     GET  /v1/views/<name>/groups?cursor=<c>&limit=<n>&as_of=<op>
 //!                            (the view, maintained by the state machine: N52, N62)
 //!     POST /v1/documents/get, POST /v1/documents/commit, GET /v1/documents/changes
@@ -45,6 +48,7 @@ const assert = std.debug.assert;
 
 const nerva = @import("../../nerva.zig");
 const catalog = @import("../catalog.zig");
+const declared_views = @import("../view/declared.zig");
 const documents_routes = @import("documents_routes.zig");
 
 const Change = nerva.Change;
@@ -77,6 +81,8 @@ const Route = enum {
     documents_commit,
     documents_changes,
     view_groups,
+    view_definition,
+    view_list,
 };
 
 const routes = [_]struct { path: []const u8, route: Route, method: Method }{
@@ -93,6 +99,10 @@ const routes = [_]struct { path: []const u8, route: Route, method: Method }{
 const tables_prefix = "/v1/tables/";
 const views_prefix = "/v1/views/";
 const views_groups_suffix = "/groups";
+const views_definition_suffix = "/definition";
+/// The most groups `GET /v1/views/<name>` answers with at once (N66); larger views are read in
+/// pages from `/groups`.
+pub const view_answer_groups_max = 10_000;
 
 /// What `handle` needs of the catalog (`catalog_store.zig` in the server, a map in tests):
 ///
@@ -118,22 +128,40 @@ pub fn handle(
     const path = target[0..question];
     const query = if (question < target.len) target[question + 1 ..] else "";
 
-    const route: Route = if (std.mem.startsWith(u8, path, tables_prefix) or
+    const route: Route = if (std.mem.eql(u8, path, "/v1/views")) route: {
+        if (method != .get) return error_reply(arena, 405, "method not allowed");
+        if (query.len > 0) return error_reply(arena, 400, "unexpected query");
+        break :route .view_list;
+    } else if (std.mem.startsWith(u8, path, tables_prefix) or
         std.mem.startsWith(u8, path, views_prefix))
     route: {
         if (method != .get and method != .put) {
             return error_reply(arena, 405, "method not allowed");
         }
-        // `/v1/views/<name>/groups`, with a name: `/v1/views/groups` is the view named `groups`.
-        const groups = std.mem.startsWith(u8, path, views_prefix) and
-            std.mem.endsWith(u8, path, views_groups_suffix) and
-            path.len > views_prefix.len + views_groups_suffix.len;
-        if (groups and method != .get) return error_reply(arena, 405, "method not allowed");
-        if (!groups and query.len > 0) return error_reply(arena, 400, "unexpected query");
-        break :route if (std.mem.startsWith(u8, path, tables_prefix))
+        // `/v1/views/<name>/groups` and `/definition`, with a name: `/v1/views/groups` is the
+        // view named `groups`.
+        const view_suffix = struct {
+            fn is(path_: []const u8, suffix: []const u8) bool {
+                return std.mem.startsWith(u8, path_, views_prefix) and
+                    std.mem.endsWith(u8, path_, suffix) and
+                    path_.len > views_prefix.len + suffix.len;
+            }
+        }.is;
+        const groups = view_suffix(path, views_groups_suffix);
+        const definition = view_suffix(path, views_definition_suffix);
+        const tables_route = std.mem.startsWith(u8, path, tables_prefix);
+        if ((groups or definition) and method != .get) {
+            return error_reply(arena, 405, "method not allowed");
+        }
+        // A view takes `as_of` and `min_op` (N66); a table or a definition takes none.
+        const queried = groups or (!tables_route and !definition and method == .get);
+        if (!queried and query.len > 0) return error_reply(arena, 400, "unexpected query");
+        break :route if (tables_route)
             .tables
         else if (groups)
             .view_groups
+        else if (definition)
+            .view_definition
         else
             .views;
     } else route: {
@@ -153,7 +181,13 @@ pub fn handle(
         .history => history(arena, client, &cache, query),
         .row => row(arena, client, &cache, query),
         .tables => tables(arena, layouts, method, path[tables_prefix.len..], body),
-        .views => views(arena, client, layouts, method, path[views_prefix.len..], body),
+        .views => views(arena, client, layouts, method, path[views_prefix.len..], query, body),
+        .view_definition => view_definition(
+            arena,
+            layouts,
+            path[views_prefix.len .. path.len - views_definition_suffix.len],
+        ),
+        .view_list => view_list(arena, client),
         .view_groups => view_groups(
             arena,
             client,
@@ -680,17 +714,13 @@ fn views(
     layouts: anytype,
     method: Method,
     name: []const u8,
+    query: []const u8,
     body: []const u8,
 ) !Reply {
     try catalog.view_name_validate(name);
     var out = Writer.init(arena);
     switch (method) {
-        .get => {
-            const view = try layouts.view(arena, name) orelse
-                return error_reply(arena, 404, "no such view");
-            try out.raw(try catalog.view_render(arena, &view));
-            return .{ .status = 200, .body = out.items() };
-        },
+        .get => return view_answer(arena, client, layouts, name, query),
         .put => {
             const view = try catalog.view_parse(arena, body);
             try table_check(view.table);
@@ -862,6 +892,165 @@ fn table_parse(text: ?[]const u8) error{BadRequest}!u32 {
 fn table_check(table: u32) error{BadRequest}!void {
     if (table == 0) return bad("table must not be zero");
     if (table >= catalog.tables_reserved_min) return bad("table is reserved");
+}
+
+/// A view's declaration (N34), as stored in the catalog.
+///
+///     GET /v1/views/<name>/definition
+fn view_definition(arena: std.mem.Allocator, layouts: anytype, name: []const u8) !Reply {
+    try catalog.view_name_validate(name);
+    const view = try layouts.view(arena, name) orelse return error_reply(arena, 404, "no such view");
+    return .{ .status = 200, .body = try catalog.view_render(arena, &view) };
+}
+
+/// The views the state machine maintains, in declaration order (N66).
+///
+///     GET /v1/views
+fn view_list(arena: std.mem.Allocator, client: anytype) !Reply {
+    var out = Writer.init(arena);
+    try out.raw("{\"views\":[");
+    var records: [2]nerva.ViewRecord = undefined;
+    for (1..nerva.views_max + 1) |id| {
+        const count = try client.get_view(.{ .view_id = id, .group_hash_min = 0, .limit = 1 }, &records);
+        assert(count >= 1);
+        const header = records[0];
+        assert(header.kind == .header);
+        if (header.state == .missing) break;
+        if (id > 1) try out.raw(",");
+        const name_size = std.mem.indexOfScalar(u8, &header.group_key, 0) orelse
+            header.group_key.len;
+        try out.print("{{\"name\":\"{s}\",\"id\":{},\"state\":\"{s}\",\"declared_op\":", .{
+            header.group_key[0..name_size],
+            id,
+            @tagName(header.state),
+        });
+        try out.number(header.declared_op);
+        try out.raw(",\"group_count\":");
+        try out.number(header.group_count);
+        try out.raw("}");
+    }
+    try out.raw("]}");
+    return .{ .status = 200, .body = out.items() };
+}
+
+/// A view maintained by the state machine, whole, as `nerva view` answers it (N35, N66): the
+/// groups sorted by key, and `hash`, the SHA-256 of the `groups` JSON as served, so that the two
+/// can be compared byte for byte. Also `view_hash`, the replicated hash (N52), and
+/// `declared_op`. Every page is read at one op: the first at the latest (or `as_of`), the rest
+/// as of the first's. A view with more than `view_answer_groups_max` groups is read from
+/// `/groups` instead.
+///
+///     GET /v1/views/<name>?min_op=<n|latest>
+///     GET /v1/views/<name>?as_of=<op>
+///
+/// As in `nerva view`, an op not yet committed answers 504. A view still building, or failed,
+/// answers 503: its groups are not yet the view's.
+fn view_answer(
+    arena: std.mem.Allocator,
+    client: anytype,
+    layouts: anytype,
+    name: []const u8,
+    query: []const u8,
+) !Reply {
+    const parameters = try query_parse(arena, query, &.{ "min_op", "as_of" });
+    const min_op: ?u64 = if (parameters.get("min_op")) |text|
+        if (std.mem.eql(u8, text, "latest")) null else try u64_parse(text, "min_op")
+    else
+        null;
+    const as_of: u64 = if (parameters.get("as_of")) |text| as_of: {
+        const op = try u64_parse(text, "as_of");
+        if (op == 0) return bad("as_of must be positive");
+        break :as_of op;
+    } else 0;
+    if (as_of != 0 and parameters.get("min_op") != null) return bad("min_op or as_of, not both");
+
+    const view = try layouts.view(arena, name) orelse return error_reply(arena, 404, "no such view");
+    const layout = try layouts.layout(arena, view.table) orelse return error.Corrupt;
+
+    const records = try arena.alloc(nerva.ViewRecord, page_limit_max + 1);
+    var groups: std.ArrayListUnmanaged(declared_views.Group) = .{};
+    var read_op: ?u64 = null;
+    var view_hash: [32]u8 = undefined;
+    var declared_op: u64 = 0;
+    var cursor: u64 = 0;
+    while (true) {
+        var query_view: nerva.ViewQuery = .{
+            .view_id = 0,
+            .group_hash_min = cursor,
+            .limit = page_limit_max,
+            // Every page after the first as of the first's op: one answer, at one op.
+            .as_of = if (read_op) |op| op else as_of,
+        };
+        @memcpy(query_view.name[0..name.len], name);
+        const count = try client.get_view(query_view, records);
+        assert(count >= 1);
+        const header = records[0];
+        assert(header.kind == .header);
+        if (read_op == null) {
+            read_op = header.op;
+            // Committed ops are below the read's own.
+            if (as_of >= header.op) return error_reply(arena, 504, "as_of is not yet committed");
+            if (min_op) |op| {
+                if (op >= header.op) return error_reply(arena, 504, "min_op is not yet committed");
+            }
+            switch (header.state) {
+                .ready => {},
+                .missing => return error_reply(arena, 404, if (as_of != 0)
+                    "the view was declared after as_of"
+                else
+                    "this view is not maintained by the state machine"),
+                .building => return error_reply(arena, 503, "the view is still building"),
+                .failed => return error_reply(arena, 503, "the view failed (a hash collision)"),
+            }
+            view_hash = header.hash;
+            declared_op = header.declared_op;
+        } else {
+            assert(header.state == .ready);
+            assert(std.mem.eql(u8, &header.hash, &view_hash));
+        }
+        if (groups.items.len + count - 1 > view_answer_groups_max) {
+            return bad("the view has more groups than one answer holds: read it from /groups");
+        }
+        for (records[1..count]) |*record| {
+            assert(record.kind == .group);
+            var group: declared_views.Group = .{
+                .sample = @splat(0),
+                .count = record.count,
+                .values = @splat(0),
+            };
+            // The group key's fields, placed back at their offsets.
+            var key_offset: usize = 0;
+            for (view.group_by) |field_name| {
+                const field = layout.field(field_name).?;
+                @memcpy(
+                    group.sample[field.offset..][0..field.size],
+                    record.group_key[key_offset..][0..field.size],
+                );
+                key_offset += field.size;
+            }
+            for (view.aggregates, 0..) |_, slot| {
+                group.values[slot] = std.mem.readInt(i128, &record.sums[slot], .little);
+            }
+            try groups.append(arena, group);
+        }
+        if (!header.flags.more) break;
+        cursor = header.cursor;
+    }
+
+    const answer = try declared_views.render(arena, &view, &layout, groups.items);
+    var out = Writer.init(arena);
+    try out.print("{{\"view\":\"{s}\",\"op\":", .{name});
+    try out.number(if (as_of != 0) as_of else read_op.?);
+    try out.raw(",\"hash\":");
+    try out.hex(&answer.hash);
+    try out.raw(",\"view_hash\":");
+    try out.hex(&view_hash);
+    try out.raw(",\"declared_op\":");
+    try out.number(declared_op);
+    try out.raw(",\"groups\":");
+    try out.raw(answer.groups);
+    try out.raw("}");
+    return .{ .status = 200, .body = out.items() };
 }
 
 pub fn limit_parse(text: ?[]const u8) error{BadRequest}!u32 {

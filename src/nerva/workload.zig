@@ -1417,10 +1417,8 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                 assert(records.len == 1);
                 return;
             }
-            const limit_max = if (query.as_of == 0)
-                StateMachine.view_groups_limit_max
-            else
-                StateMachine.view_as_of_limit_max;
+            // As of an op, a page may end early, when its scans ran out (N66).
+            const limit_max = StateMachine.view_groups_limit_max;
             assert(records.len - 1 <= @min(query.limit, limit_max));
             for (records[1..]) |*record| {
                 assert(record.kind == .group);
