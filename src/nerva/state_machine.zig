@@ -427,8 +427,9 @@ pub fn StateMachineType(comptime Storage: type) type {
         views_stored: [nerva.views_max]View = undefined,
         views_op_count: u32 = 0,
         /// Per request, the transactions the views budget refused: prefetch decides, commit
-        /// obeys (N52).
+        /// obeys (N52). Of those, the ones too large for any op (#32).
         view_txn_busy: std.DynamicBitSetUnmanaged = .{},
+        view_txn_too_large: std.DynamicBitSetUnmanaged = .{},
         /// The op's distinct groups, as admitted so far (prefetch); looked up only.
         view_op_keys: std.AutoHashMapUnmanaged(u128, void) = .{},
         /// The keys the transaction being admitted added, to take back if it does not fit.
@@ -621,6 +622,11 @@ pub fn StateMachineType(comptime Storage: type) type {
                 request_batches_max,
             );
             errdefer self.view_txn_busy.deinit(allocator);
+            self.view_txn_too_large = try std.DynamicBitSetUnmanaged.initEmpty(
+                allocator,
+                request_batches_max,
+            );
+            errdefer self.view_txn_too_large.deinit(allocator);
             try self.view_op_keys.ensureTotalCapacity(allocator, groups_limit);
             errdefer self.view_op_keys.deinit(allocator);
             try self.view_txn_keys.ensureTotalCapacity(allocator, groups_limit);
@@ -669,6 +675,7 @@ pub fn StateMachineType(comptime Storage: type) type {
             self.view_txn_keys.deinit(allocator);
             self.view_op_keys.deinit(allocator);
             self.view_txn_busy.deinit(allocator);
+            self.view_txn_too_large.deinit(allocator);
             allocator.free(self.view_groups);
             allocator.free(self.backfill_rows);
             self.add_rows.deinit(allocator);
@@ -689,6 +696,7 @@ pub fn StateMachineType(comptime Storage: type) type {
                 .backfill_rows = self.backfill_rows,
                 .view_groups = self.view_groups,
                 .view_txn_busy = self.view_txn_busy,
+                .view_txn_too_large = self.view_txn_too_large,
                 .view_op_keys = self.view_op_keys,
                 .view_txn_keys = self.view_txn_keys,
                 .groups_touched = self.groups_touched,
@@ -1145,7 +1153,12 @@ pub fn StateMachineType(comptime Storage: type) type {
                         op,
                         batch_timestamp,
                         batch,
-                        self.view_txn_busy.isSet(batch_index),
+                        if (self.view_txn_too_large.isSet(batch_index))
+                            .too_large
+                        else if (self.view_txn_busy.isSet(batch_index))
+                            .busy
+                        else
+                            .fits,
                         reply_encoder.writable().?,
                     ),
                     .get_changes, .get_history, .get_view, .declare_view, .pulse => {
@@ -1200,7 +1213,7 @@ pub fn StateMachineType(comptime Storage: type) type {
             op: u64,
             timestamp: u64,
             batch: []const u8,
-            views_busy: bool,
+            admission: views.Admission,
             output: []u8,
         ) usize {
             const entries = stdx.bytes_as_slice(.exact, Entry, batch);
@@ -1208,7 +1221,7 @@ pub fn StateMachineType(comptime Storage: type) type {
             assert(entries.len <= self.write_keys.len);
 
             // Resolving the adds fills in each add's result (`applied`, `value`).
-            const failure = self.commit_failure(entries, views_busy) orelse
+            const failure = self.commit_failure(entries, admission) orelse
                 self.adds_resolve(entries, results);
             if (failure) |f| {
                 for (results, 0..) |*result, index| {
@@ -1237,14 +1250,22 @@ pub fn StateMachineType(comptime Storage: type) type {
         }
 
         /// The first reason the transaction cannot commit, or null.
-        /// The views budget comes first (prefetch decided it, `views_busy`), then static checks,
-        /// then duplicate writes, then read conflicts.
-        fn commit_failure(self: *StateMachine, entries: []const Entry, views_busy: bool) ?Failure {
-            if (views_busy) {
+        /// The views budget comes first (prefetch decided it: `views_busy`, `views_too_large`),
+        /// then static checks, then duplicate writes, then read conflicts.
+        fn commit_failure(
+            self: *StateMachine,
+            entries: []const Entry,
+            admission: views.Admission,
+        ) ?Failure {
+            if (admission != .fits) {
                 const index = for (entries, 0..) |*entry, index| {
                     if (self.entry_viewed(entry)) break index;
                 } else unreachable; // A transaction without groups always fits.
-                return .{ .index = @intCast(index), .status = .views_busy, .op = 0 };
+                return .{
+                    .index = @intCast(index),
+                    .status = if (admission == .too_large) .views_too_large else .views_busy,
+                    .op = 0,
+                };
             }
             for (entries, 0..) |*entry, index| {
                 if (nerva.entry_validate(entry)) |status| {
@@ -1530,14 +1551,23 @@ pub fn StateMachineType(comptime Storage: type) type {
             const members = &self.forest.grooves.members;
             members.prefetch_setup(self.prefetch_snapshot.?);
             self.view_txn_busy.unsetAll();
+            self.view_txn_too_large.unsetAll();
             self.view_op_keys.clearRetainingCapacity();
             self.view_op_members.clearRetainingCapacity();
             var batch_index: u32 = 0;
             while (decoder.pop()) |batch| : (batch_index += 1) {
                 const entries = stdx.bytes_as_slice(.exact, Entry, batch);
-                if (!self.view_txn_admit(entries)) {
-                    self.view_txn_busy.set(batch_index);
-                    continue;
+                switch (self.view_txn_admit(entries)) {
+                    .fits => {},
+                    .busy => {
+                        self.view_txn_busy.set(batch_index);
+                        continue;
+                    },
+                    .too_large => {
+                        self.view_txn_busy.set(batch_index);
+                        self.view_txn_too_large.set(batch_index);
+                        continue;
+                    },
                 }
                 for (self.view_txn_keys.items) |key| groups.prefetch_enqueue(.{ .key = key });
                 for (self.view_txn_members.items) |key| members.prefetch_enqueue(.{ .key = key });
@@ -1551,10 +1581,10 @@ pub fn StateMachineType(comptime Storage: type) type {
         /// and `view_txn_members` hold those it added). Otherwise leaves the op's as they were.
         /// A write counts, in each view of its table, the groups of its old and new values that
         /// pass the view's filter, and if either does, its member in each `min` or `max` slot.
-        fn view_txn_admit(self: *StateMachine, entries: []const Entry) bool {
+        fn view_txn_admit(self: *StateMachine, entries: []const Entry) views.Admission {
             self.view_txn_keys.clearRetainingCapacity();
             self.view_txn_members.clearRetainingCapacity();
-            const fits = fits: {
+            const admission: views.Admission = admission: {
                 for (entries) |*entry| {
                     if (!self.entry_viewed(entry)) continue;
                     const rows = &self.forest.grooves.rows;
@@ -1575,7 +1605,9 @@ pub fn StateMachineType(comptime Storage: type) type {
                             const op_keys = &self.view_op_keys;
                             const txn_keys = &self.view_txn_keys;
                             if (!admit(op_keys, txn_keys, key, self.group_writes_limit)) {
-                                break :fits false;
+                                // Too large if the op's budget holds only this transaction's.
+                                const own = txn_keys.items.len == op_keys.count();
+                                break :admission if (own) .too_large else .busy;
                             }
                         }
                         if (!matched) continue;
@@ -1587,14 +1619,15 @@ pub fn StateMachineType(comptime Storage: type) type {
                             const op_keys = &self.view_op_members;
                             const txn_keys = &self.view_txn_members;
                             if (!admit(op_keys, txn_keys, key, self.member_writes_limit)) {
-                                break :fits false;
+                                const own = txn_keys.items.len == op_keys.count();
+                                break :admission if (own) .too_large else .busy;
                             }
                         }
                     }
                 }
-                break :fits true;
+                break :admission .fits;
             };
-            if (!fits) {
+            if (admission != .fits) {
                 for (self.view_txn_keys.items) |added| assert(self.view_op_keys.remove(added));
                 for (self.view_txn_members.items) |added| {
                     assert(self.view_op_members.remove(added));
@@ -1602,7 +1635,7 @@ pub fn StateMachineType(comptime Storage: type) type {
                 self.view_txn_keys.clearRetainingCapacity();
                 self.view_txn_members.clearRetainingCapacity();
             }
-            return fits;
+            return admission;
         }
 
         /// Counts `key` in the op's set, and the transaction's list, unless already counted; false

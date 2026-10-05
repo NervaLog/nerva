@@ -583,6 +583,25 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
 - Verified locally: with room it changes nothing; with the threshold forced above the free space
   it removes the build cache and the older toolchain, keeps the pinned one, and warns.
 
+## 2026-10-05 — Nightly: build the image on the host network
+
+- The first nightly run failed building its image: `fly machine run .` used the runner's local
+  Docker, whose build containers cannot resolve DNS. `perf/nightly/fly-run.sh` now builds with
+  `docker build --network host`, pushes to `registry.fly.io/nerva-perf`, and runs that image;
+  without a local Docker it still uses Fly's remote builder.
+
+## 2026-10-05 — `views_too_large` for a transaction no op can hold (N68; #32)
+
+- `src/nerva.zig`: `EntryStatus.views_too_large = 15`. `src/nerva/views.zig`: `Admission`.
+- `src/nerva/state_machine.zig`: `view_txn_admit` tells `busy` from `too_large`; commit reports
+  each. `src/nerva/workload.zig`: the VOPR model follows, and counts both.
+- `src/nerva/api/api.zig`: `413 {"status":"views_too_large"}`. README and TUTORIAL: split, do
+  not retry; `views_busy` is retryable and only for multi-transaction requests.
+- Tests: unit (too large; busy, then the same transaction alone commits); `test:views` (4,200
+  new groups answer 413; split in two, they commit). Format snapshot: the new status line.
+- Verified: `check`, `test:fmt`, `test:unit` (the sandbox-denied perf test aside), `test:views`;
+  VOPR seeds 1, 2, 5 (one `views_busy`, one `views_too_large`) and 2467272726192300042.
+
 ## 2026-10-05 — A client may not send `pulse` (N67; #33)
 
 - `src/nerva/internal_operations.zig`: `pulse_from_client`, unit-tested for every operation.

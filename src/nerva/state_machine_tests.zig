@@ -1089,8 +1089,10 @@ test "views: declarations, adds and transactions over the op's groups are refuse
     const allocator = arena.allocator();
     const too_many = try priced(allocator, limit + 1, 1_000_000);
     const small = try priced(allocator, 1, 4_000_000);
+    // A transaction past the op's budget on its own can never fit: `views_too_large`, not
+    // `views_busy` (#32). The next transaction of the request still fits.
     const refused = try context.commit(&.{ too_many, small });
-    try testing.expectEqual(nerva.EntryStatus.views_busy, refused[0][0].status);
+    try testing.expectEqual(nerva.EntryStatus.views_too_large, refused[0][0].status);
     for (refused[0][1..]) |result| try testing.expectEqual(nerva.EntryStatus.aborted, result.status);
     try testing.expectEqual(nerva.EntryStatus.ok, refused[1][0].status);
 
@@ -1101,7 +1103,10 @@ test "views: declarations, adds and transactions over the op's groups are refuse
     const results = try context.commit(&.{ fits, counted, over });
     for (results[0]) |result| try testing.expectEqual(nerva.EntryStatus.ok, result.status);
     try testing.expectEqual(nerva.EntryStatus.ok, results[1][0].status);
+    // Past the budget only with the op's earlier transactions: a later op takes it.
     try testing.expectEqual(nerva.EntryStatus.views_busy, results[2][0].status);
+    const retried = try context.commit(&.{over});
+    try testing.expectEqual(nerva.EntryStatus.ok, retried[0][0].status);
 }
 
 test "views: reads page through the groups, and say when a view is missing" {

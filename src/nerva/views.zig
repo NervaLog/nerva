@@ -83,6 +83,15 @@ pub fn definition_validate(definition: *const ViewDefinition) ?DeclareStatus {
     return null;
 }
 
+/// Whether a transaction's view group and member writes fit in its op (N52, N62).
+pub const Admission = enum {
+    fits,
+    /// Not with the op's earlier transactions: `views_busy`.
+    busy,
+    /// Not in any op: `views_too_large` (#32).
+    too_large,
+};
+
 /// The `min` and `max` aggregates of a definition.
 pub fn extreme_count(definition: *const ViewDefinition) u32 {
     var count: u32 = 0;
