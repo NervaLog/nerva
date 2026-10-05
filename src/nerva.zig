@@ -553,14 +553,15 @@ pub const ViewQuery = extern struct {
     view_id: u64,
     /// Groups with `group_hash >= group_hash_min`. Zero: from the first.
     group_hash_min: u64,
-    /// Zero: the latest. Otherwise the view as the op `as_of` left it (N62), with at most
-    /// `StateMachine.view_as_of_limit_max` groups per page.
-    as_of: u64 = 0,
     /// Groups per page, at most; zero is invalid.
     limit: u32,
     /// With `view_id` zero: the view's name, zero-padded. Otherwise all zero.
     name: [32]u8 = @splat(0),
     reserved: [4]u8 = @splat(0),
+    /// Zero: the latest. Otherwise the view as the op `as_of` left it (N62), with at most
+    /// `StateMachine.view_as_of_limit_max` groups per page. Taken from v0.3.0's reserved
+    /// bytes, which its clients send as zeros: their queries read the latest, as they did.
+    as_of: u64 = 0,
 
     comptime {
         assert(@sizeOf(ViewQuery) == 64);

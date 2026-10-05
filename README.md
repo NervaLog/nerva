@@ -108,9 +108,10 @@ notes; releasing a version twice, or without notes, fails. A separate workflow,
 `fuzz.yml`, runs every fuzzer and the VOPR on random seeds for a time budget; it is started by hand
 on runners brought up for it.
 
-Binaries report `<protocol>+<commit>`. The protocol release (`0.0.3` since maintained views,
-N60) is what data files and clients check: a replica refuses a data file of another release, so
-upgrading means reformatting, and accepts clients from `0.0.2` on. A replica ignores peers that
+Binaries report `<protocol>+<commit>`. The protocol release (`0.0.4` since views' `min`, `max`
+and `as_of`, N62) is what data files and clients check: a replica refuses a data file of another
+release, so upgrading means reformatting, and accepts clients of its own release only (a v0.3.0
+`nerva api` is refused at registration). A replica ignores peers that
 run another release (N61): in a cluster mixing releases, only replicas of one release count
 toward each other's quorums, and each logs the others it ignores. Upgrade by stopping every
 replica, reformatting, and starting them all on the new release. `zig build test:release` runs a

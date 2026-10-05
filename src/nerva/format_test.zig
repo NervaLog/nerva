@@ -335,10 +335,10 @@ test "format: wire and storage layouts" {
         \\nerva.ViewQuery: extern struct, size 64
         \\  view_id: offset 0, size 8, u64
         \\  group_hash_min: offset 8, size 8, u64
-        \\  as_of: offset 16, size 8, u64
-        \\  limit: offset 24, size 4, u32
-        \\  name: offset 28, size 32, [32]u8
-        \\  reserved: offset 60, size 4, [4]u8
+        \\  limit: offset 16, size 4, u32
+        \\  name: offset 20, size 32, [32]u8
+        \\  reserved: offset 52, size 4, [4]u8
+        \\  as_of: offset 56, size 8, u64
         \\nerva.ViewRecord: extern struct, size 256
         \\  kind: offset 0, size 1, nerva.ViewRecord.Kind
         \\  state: offset 1, size 1, nerva.ViewState

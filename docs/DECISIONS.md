@@ -878,8 +878,8 @@ committed op since its declaration.
   the op. Each op reserves timestamps for them, below its writes' (`group_writes_limit` plus
   `views_max`), so entries keep the top of the op's range as before. A version key orders a
   group's versions by op (`view_id`, the group hash, then the op in 57 bits: ops below 2^57).
-  `ViewQuery.as_of` (zero: the latest; taken from `reserved`, so `limit` and `name` moved; N52's
-  layout was never released) reads the view's last version at or before `as_of`, then walks the
+  `ViewQuery.as_of` (zero: the latest; the last 8 of v0.3.0's 12 reserved bytes, which its
+  clients send as zeros, so their queries still read the latest) reads the view's last version at or before `as_of`, then walks the
   current groups in storage order (groups are never removed) and reads each one's last version,
   one scan per group: so an `as_of` page holds at most 128 groups (`view_as_of_limit_max`). A
   group with no version then did not exist yet; a view with none, `missing`. `as_of` past the
@@ -911,7 +911,18 @@ committed op since its declaration.
   seeds 1 and 13), but the two subtler of those bugs pass seeds 1, 2, 3 and 13: its few reads of
   ready views rarely meet a group whose holder left, or a group changed at exactly `as_of`.
   The unit test is what guards them.
+- **Release `0.0.4`, clients from `0.0.4`** (owner's decisions, on N32 and N60). What a commit
+  does on every replica changed (9 timestamps per entry, a reserve per op, trees 9 to 15), so a
+  `0.0.3` and a `0.0.4` replica would diverge: the release string moves, data files must be
+  reformatted, and N61 keeps replicas of the two releases apart. Clients of v0.3.0 are refused:
+  a v0.3.0 `nerva api` asserts that a maintained view's aggregates are sums, and does not know
+  status 9, so against this cluster it would crash on a `min` or `max` view. Measured: a `0.0.2`
+  `nerva api` is evicted at registration with `client_release_too_low`, and then segfaults, an
+  older bug in the client's eviction (#48). `ViewQuery` keeps v0.3.0's layout regardless:
+  `as_of` takes the last 8 of its 12 reserved bytes, so had old clients been kept, their
+  queries would still read the latest. The formatted data file's golden checksum is unchanged,
+  as for `0.0.3` (N60).
 - **Format guards** (N54) updated, as they should fail on all of this: the layouts snapshot
-  gains the three new types, tree ids 9 to 15, `table_extremes_full` and `ViewQuery`'s new
-  layout; the script snapshot's change timestamps step by 9 per entry, plus each op's reserve
+  gains the three new types, tree ids 9 to 15, `table_extremes_full` and `ViewQuery.as_of` in
+  its reserved bytes; the script snapshot's change timestamps step by 9 per entry, plus each op's reserve
   for versions.

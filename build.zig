@@ -9,8 +9,8 @@ const VoprStateMachine = enum { nerva, testing };
 const VoprLog = enum { short, full };
 
 // Nerva has no client releases yet; every build is "the" release.
-const release = "0.0.3";
-const release_client_min = "0.0.2";
+const release = "0.0.4";
+const release_client_min = "0.0.4";
 // Only `zig build test:release` builds this release, to run a cluster of two releases (N61).
 const release_test_other = "0.0.200";
 

@@ -519,6 +519,10 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
   `<fn>_<field>`; `min` and `max` maintained.
 - Admission counts members as well as groups (`member_writes_limit`, a request's entries);
   pulses add at most what both limits allow. Replica RSS: 1,014 MiB on `main`, 1,295 MiB here.
+- `build.zig`: release `0.0.4`, clients from `0.0.4` (owner's decisions; README, UPSTREAM.md).
+  `ViewQuery.as_of` in v0.3.0's reserved bytes, so its layout is otherwise unchanged. Found and
+  filed while checking: #42 (`nerva view` exits on a timeout; the canvas test flakes under
+  load) and #48 (an evicted client segfaults).
 - `demo/canvas/server.py`: the reset is two transactions (its per-pixel `canvas` view, now
   maintained, needs 4,096 groups for one).
 - Tests: the state machine tests' harness compacts and checkpoints; a randomized `min`, `max`
