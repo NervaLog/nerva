@@ -613,17 +613,11 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
 - Verified: `check`, `test:fmt`, `test:unit` 337/338 (the sandbox-denied perf test); VOPR
   `nerva` seeds 1, 2 and `testing` seed 1.
 
-## 2026-10-05 — `views_too_large` for a transaction no op can hold (N68; #32)
+## 2026-10-05 — No CI for Markdown-only changes (N68)
 
-- `src/nerva.zig`: `EntryStatus.views_too_large = 15`. `src/nerva/views.zig`: `Admission`.
-- `src/nerva/state_machine.zig`: `view_txn_admit` tells `busy` from `too_large`; commit reports
-  each. `src/nerva/workload.zig`: the VOPR model follows, and counts both.
-- `src/nerva/api/api.zig`: `413 {"status":"views_too_large"}`. README and TUTORIAL: split, do
-  not retry; `views_busy` is retryable and only for multi-transaction requests.
-- Tests: unit (too large; busy, then the same transaction alone commits); `test:views` (4,200
-  new groups answer 413; split in two, they commit). Format snapshot: the new status line.
-- Verified: `check`, `test:fmt`, `test:unit` (the sandbox-denied perf test aside), `test:views`;
-  VOPR seeds 1, 2, 5 (one `views_busy`, one `views_too_large`) and 2467272726192300042.
+- `.github/workflows/ci.yml`: `paths-ignore: ['**.md']` on push and pull request; release.yml's
+  call to it is unaffected.
+- README's CI paragraph and DECISIONS N68 say so.
 
 ## 2026-10-05 — `nerva api` bounds a request's memory (N69; #31)
 
@@ -645,3 +639,15 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
 - Verified: `test:integration` passes (2.4 min); with `main`'s client it aborts in
   `MessageBuffer.invalidate` after `evicted: no_session`. `check`, `test:fmt`, `test:unit`
   336/337 (the sandbox-denied perf test).
+
+## 2026-10-05 — `views_too_large` for a transaction no op can hold (N72; #32)
+
+- `src/nerva.zig`: `EntryStatus.views_too_large = 15`. `src/nerva/views.zig`: `Admission`.
+- `src/nerva/state_machine.zig`: `view_txn_admit` tells `busy` from `too_large`; commit reports
+  each. `src/nerva/workload.zig`: the VOPR model follows, and counts both.
+- `src/nerva/api/api.zig`: `413 {"status":"views_too_large"}`. README and TUTORIAL: split, do
+  not retry; `views_busy` is retryable and only for multi-transaction requests.
+- Tests: unit (too large; busy, then the same transaction alone commits); `test:views` (4,200
+  new groups answer 413; split in two, they commit). Format snapshot: the new status line.
+- Verified: `check`, `test:fmt`, `test:unit` (the sandbox-denied perf test aside), `test:views`;
+  VOPR seeds 1, 2, 5 (one `views_busy`, one `views_too_large`) and 2467272726192300042.

@@ -1041,21 +1041,15 @@ cluster whose log already holds a client's 134. End to end (once, with #53's cli
 an eviction used to abort the client): the client gets `error.Evicted` and the cluster commits
 on; without the guard, as above.
 
-**N68. A transaction too large for any op gets `views_too_large` (413), not `views_busy`.**
-`views_busy` (N52) said "retry in a later op", but a transaction whose own distinct view groups
-(or `min`/`max` members, N62) exceed the per-op budget fits in no op, and every retry got the
-same answer (#32). Nerva's clients send one transaction per request, so for them every
-`views_busy` was this case. Admission (`view_txn_admit`) now returns `views.Admission`: `fits`,
-`busy`, or `too_large`, which is decided when the budget runs out: if every group (or member)
-the op has counted is this transaction's own, it would fill any op alone. A transaction that
-shares keys with earlier ones of the request and is also too large alone gets `busy` first, then
-`too_large` when retried alone. New status `views_too_large = 15`, appended (persisted values
-keep their numbers; the format snapshot gains that line). `nerva api` answers `413
-{"status":"views_too_large","index":…}`; `views_busy` stays 503. The VOPR workload models the same
-rule. Tests: the unit test's transaction of `limit + 1` new groups now expects `views_too_large`,
-and the request whose third transaction overflows only with the first two expects `views_busy`
-and then commits alone; `test:views` sends 4,200 new groups (413) and the same rows split in two
-(200 each).
+**N68. CI does not run for a change to Markdown alone.**
+
+A push or pull request whose every changed file is Markdown (the README, WORKLOG, DECISIONS,
+CHANGELOG, docs/) starts no CI run: `ci.yml` has `paths-ignore: ['**.md']` on both. No code or
+test reads a Markdown file, so such a run could only repeat the last result, in nine jobs for
+about five minutes. No check is required on `main` (the repository's plan has no branch
+protection), so a run that never starts blocks no merge. A release still runs CI first:
+`release.yml` calls `ci.yml`, and a call is not filtered by paths. If a test ever reads a
+Markdown file, it must be added back to the filter.
 
 **N69. `nerva api` spends at most 64 MiB on one request, and keeps at most 8 MiB.**
 Request bodies are parsed into `std.json.Value` in a per-request arena, which costs many times
@@ -1083,3 +1077,19 @@ client processes no message. No vendored file changes. Test: `test:integration` 
 restarting replica 0 (down since the failover step, which makes registrations slow) and pushing
 a client's session out with `clients_max` newer ones; its next two requests get
 `error.Evicted` (before: the process aborted on an assertion in `MessageBuffer.invalidate`).
+
+**N72. A transaction too large for any op gets `views_too_large` (413), not `views_busy`.**
+`views_busy` (N52) said "retry in a later op", but a transaction whose own distinct view groups
+(or `min`/`max` members, N62) exceed the per-op budget fits in no op, and every retry got the
+same answer (#32). Nerva's clients send one transaction per request, so for them every
+`views_busy` was this case. Admission (`view_txn_admit`) now returns `views.Admission`: `fits`,
+`busy`, or `too_large`, which is decided when the budget runs out: if every group (or member)
+the op has counted is this transaction's own, it would fill any op alone. A transaction that
+shares keys with earlier ones of the request and is also too large alone gets `busy` first, then
+`too_large` when retried alone. New status `views_too_large = 15`, appended (persisted values
+keep their numbers; the format snapshot gains that line). `nerva api` answers `413
+{"status":"views_too_large","index":…}`; `views_busy` stays 503. The VOPR workload models the same
+rule. Tests: the unit test's transaction of `limit + 1` new groups now expects `views_too_large`,
+and the request whose third transaction overflows only with the first two expects `views_busy`
+and then commits alone; `test:views` sends 4,200 new groups (413) and the same rows split in two
+(200 each).
