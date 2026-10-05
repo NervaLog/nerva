@@ -59,6 +59,12 @@ pub const IO = struct {
         return self.flush(.non_blocking);
     }
 
+    /// Like `run_for_ns`. On Linux, `run_once` returns as soon as a callback has run; here it
+    /// waits out `nanoseconds`, which is correct, only slower (Nerva patch, UPSTREAM.md).
+    pub fn run_once(self: *IO, nanoseconds: u63) !void {
+        return self.run_for_ns(nanoseconds);
+    }
+
     pub fn run_for_ns(self: *IO, nanoseconds: u63) !void {
         assert(!self.run_for_ns_active);
         self.run_for_ns_active = true;
