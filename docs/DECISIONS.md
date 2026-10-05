@@ -988,55 +988,6 @@ but the pinned one. A job then rebuilds from scratch, about a minute more. A thr
 always emptying keeps the cache's speed-up on most jobs. If space is still short afterwards, it
 warns and lists what is large, so the next full disk names its cause.
 
-**N68. A transaction too large for any op gets `views_too_large` (413), not `views_busy`.**
-`views_busy` (N52) said "retry in a later op", but a transaction whose own distinct view groups
-(or `min`/`max` members, N62) exceed the per-op budget fits in no op, and every retry got the
-same answer (#32). Nerva's clients send one transaction per request, so for them every
-`views_busy` was this case. Admission (`view_txn_admit`) now returns `views.Admission`: `fits`,
-`busy`, or `too_large`, which is decided when the budget runs out: if every group (or member)
-the op has counted is this transaction's own, it would fill any op alone. A transaction that
-shares keys with earlier ones of the request and is also too large alone gets `busy` first, then
-`too_large` when retried alone. New status `views_too_large = 15`, appended (persisted values
-keep their numbers; the format snapshot gains that line). `nerva api` answers `413
-{"status":"views_too_large","index":…}`; `views_busy` stays 503. The VOPR workload models the same
-rule. Tests: the unit test's transaction of `limit + 1` new groups now expects `views_too_large`,
-and the request whose third transaction overflows only with the first two expects `views_busy`
-and then commits alone; `test:views` sends 4,200 new groups (413) and the same rows split in two
-(200 each).
-
-**N67. A client may not send `pulse`.**
-`Operation.pulse` (134, N52) is the replica's own backfill operation: the replica sends it to
-itself as `vsr.Operation.pulse` with `client == 0`, and `Request.invalid_header` refuses that
-from a client. But a client could send the raw value 134: `vsr.Operation.valid` accepts it (it
-is in Nerva's enum), `from_vsr` maps it to `.pulse`, and `input_valid` accepts the empty body,
-and the replicas then crash executing it: the trace event's operation conversion
-(`trace/event.zig`) has no value 134 (`panic: invalid enum value`). Restarted replicas replay the
-committed prepare and crash again, so one request from any client that can reach the replicas
-took the cluster down for good (#33; measured at `825355c`). The replica's
-own pulse passes through the same `on_request` and `input_valid`, so the state machine cannot
-tell the two apart. A vendored check in `on_request`, beside the operation check, evicts a
-client (`invalid_request_operation`) whose request maps to the state machine's pulse operation
-without being `vsr.Operation.pulse` itself; the predicate is Nerva's
-(`internal_operations.pulse_from_client`), generic over the state machine, and unit-tested for
-every operation. Upstream TigerBeetle maps its own pulse the same way. The guard cannot repair a
-cluster whose log already holds a client's 134. End to end (once, with #53's client fix, since
-an eviction used to abort the client): the client gets `error.Evicted` and the cluster commits
-on; without the guard, as above.
-
-**N66. An evicted client is deinit'ed by `Client.deinit`, not by its eviction callback.**
-The vendored VSR client asks its eviction callback to deinit it, but calls the callback from
-inside the message bus's receive path, which then invalidates the receive buffer that `deinit`
-has just freed. Every eviction aborted the process (#52): `nerva api`, `nerva view` and Zig
-clients, whatever the reason (`no_session` after `clients_max` newer sessions, a release too
-low, an invalid operation such as #33's raw `pulse`). Nerva's `Client.on_eviction` now only
-records the eviction; `Client.deinit` (and so `reconnect`) deinits the VSR client. In between,
-nothing drives the client's IO, since every call returns `error.Evicted`, so the evicted VSR
-client processes no message. No vendored file changes. Test: `test:integration` ends by
-restarting replica 0 (down since the failover step, which makes registrations slow) and pushing
-a client's session out with `clients_max` newer ones; its next two requests get
-`error.Evicted` (before: the process aborted on an assertion in `MessageBuffer.invalidate`).
-
-
 **N66. `nerva api` serves views whole, as `nerva view` answers them; `nerva view` becomes the
 check.** The third step of N52 (design approved by the owner). Applications read views where
 they write, from replicated state, and `nerva view` stays as an independent recomputation.
@@ -1071,6 +1022,25 @@ they write, from replicated state, and `nerva view` stays as an independent reco
   client timeout, and the process then exits (#42; #49 carries the fix). N62's heavier commits
   for the canvas's per-pixel `max` view make such stalls longer.
 
+**N67. A client may not send `pulse`.**
+`Operation.pulse` (134, N52) is the replica's own backfill operation: the replica sends it to
+itself as `vsr.Operation.pulse` with `client == 0`, and `Request.invalid_header` refuses that
+from a client. But a client could send the raw value 134: `vsr.Operation.valid` accepts it (it
+is in Nerva's enum), `from_vsr` maps it to `.pulse`, and `input_valid` accepts the empty body,
+and the replicas then crash executing it: the trace event's operation conversion
+(`trace/event.zig`) has no value 134 (`panic: invalid enum value`). Restarted replicas replay the
+committed prepare and crash again, so one request from any client that can reach the replicas
+took the cluster down for good (#33; measured at `825355c`). The replica's
+own pulse passes through the same `on_request` and `input_valid`, so the state machine cannot
+tell the two apart. A vendored check in `on_request`, beside the operation check, evicts a
+client (`invalid_request_operation`) whose request maps to the state machine's pulse operation
+without being `vsr.Operation.pulse` itself; the predicate is Nerva's
+(`internal_operations.pulse_from_client`), generic over the state machine, and unit-tested for
+every operation. Upstream TigerBeetle maps its own pulse the same way. The guard cannot repair a
+cluster whose log already holds a client's 134. End to end (once, with #53's client fix, since
+an eviction used to abort the client): the client gets `error.Evicted` and the cluster commits
+on; without the guard, as above.
+
 **N68. CI does not run for a change to Markdown alone.**
 
 A push or pull request whose every changed file is Markdown (the README, WORKLOG, DECISIONS,
@@ -1080,3 +1050,46 @@ about five minutes. No check is required on `main` (the repository's plan has no
 protection), so a run that never starts blocks no merge. A release still runs CI first:
 `release.yml` calls `ci.yml`, and a call is not filtered by paths. If a test ever reads a
 Markdown file, it must be added back to the filter.
+
+**N69. `nerva api` spends at most 64 MiB on one request, and keeps at most 8 MiB.**
+Request bodies are parsed into `std.json.Value` in a per-request arena, which costs many times
+the body for nested or long arrays, and the arena was reset with `.retain_capacity`, so one
+4 MiB body pinned its peak for the gateway's life (#31; measured at `825355c`: 91 to 788 MiB for
+nested arrays, 527 MiB for a long one). The arena now allocates through `MemoryBudget`
+(`src/nerva/api/memory_budget.zig`), which refuses an allocation past 64 MiB held and records
+it; the gateway answers `413 {"error":"request too complex"}` instead of 500 and serves on. The
+arena is reset with `.retain_with_limit = 8 MiB`. A budget, rather than limits on JSON depth or
+array length, bounds every shape of body at once, including ones parsed into typed structs. 64 MiB
+is well above what any valid request needs (a full 4 MiB commit parses in a few MiB). Tests:
+unit tests of the budget (refusal, frees, an arena over nested JSON); `test:api` sends both
+bodies (413) and checks the gateway's RSS stays within 100 MiB of where it was (measured: 92 MiB
+before, 133 MiB after).
+
+**N70. An evicted client is deinit'ed by `Client.deinit`, not by its eviction callback.**
+The vendored VSR client asks its eviction callback to deinit it, but calls the callback from
+inside the message bus's receive path, which then invalidates the receive buffer that `deinit`
+has just freed. Every eviction aborted the process (#52): `nerva api`, `nerva view` and Zig
+clients, whatever the reason (`no_session` after `clients_max` newer sessions, a release too
+low, an invalid operation such as #33's raw `pulse`). Nerva's `Client.on_eviction` now only
+records the eviction; `Client.deinit` (and so `reconnect`) deinits the VSR client. In between,
+nothing drives the client's IO, since every call returns `error.Evicted`, so the evicted VSR
+client processes no message. No vendored file changes. Test: `test:integration` ends by
+restarting replica 0 (down since the failover step, which makes registrations slow) and pushing
+a client's session out with `clients_max` newer ones; its next two requests get
+`error.Evicted` (before: the process aborted on an assertion in `MessageBuffer.invalidate`).
+
+**N72. A transaction too large for any op gets `views_too_large` (413), not `views_busy`.**
+`views_busy` (N52) said "retry in a later op", but a transaction whose own distinct view groups
+(or `min`/`max` members, N62) exceed the per-op budget fits in no op, and every retry got the
+same answer (#32). Nerva's clients send one transaction per request, so for them every
+`views_busy` was this case. Admission (`view_txn_admit`) now returns `views.Admission`: `fits`,
+`busy`, or `too_large`, which is decided when the budget runs out: if every group (or member)
+the op has counted is this transaction's own, it would fill any op alone. A transaction that
+shares keys with earlier ones of the request and is also too large alone gets `busy` first, then
+`too_large` when retried alone. New status `views_too_large = 15`, appended (persisted values
+keep their numbers; the format snapshot gains that line). `nerva api` answers `413
+{"status":"views_too_large","index":…}`; `views_busy` stays 503. The VOPR workload models the same
+rule. Tests: the unit test's transaction of `limit + 1` new groups now expects `views_too_large`,
+and the request whose third transaction overflows only with the first two expects `views_busy`
+and then commits alone; `test:views` sends 4,200 new groups (413) and the same rows split in two
+(200 each).
