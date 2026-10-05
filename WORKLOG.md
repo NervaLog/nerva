@@ -517,3 +517,16 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
   one-replica `--development` cluster at v0.3.0. The crash, outage and reconnect, retry,
   layout and declaration claims were each checked separately.
 - Found while writing it: #36 (fixed in N58) and #37 (a duplicate of #27, fixed in N58).
+
+## 2026-10-05 — Gateways recover on their own; late replies dropped (N63; #42, #44)
+
+- `src/nerva/client.zig`: `on_reply` drops a reply that arrives after the timeout (#42), with a
+  unit test.
+- `src/nerva/client_health.zig` (moved from `api/server.zig`): `ClientHealth`, plus
+  `idle_timeout_ms` so an idle gateway with a broken client wakes to replace it (#44).
+- `src/nerva/api/server.zig`: retries while idle. `src/nerva/view/server.zig`: a timeout or
+  eviction breaks the client instead of exiting; requests and `/healthz` answer 503 until it
+  is replaced (#42).
+- `tests/api/api.py`: recovery with only `/healthz` polled. `tests/views/declared.py`: a view
+  process survives a stall and recovers on its own. README and TUTORIAL updated.
+

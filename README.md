@@ -220,10 +220,11 @@ live in the log, in a reserved catalog table; the core still stores bytes and ne
 Both gateways (`nerva api`, `nerva view`) execute one request at a time but read up to 16
 connections at once, so a slow client holds up nobody; with all 16 busy, a new connection
 displaces the oldest one still sending its request. A request must arrive whole within 10 s
-of connecting and carries one request per connection (`Connection: close`). If `nerva api`
+of connecting and carries one request per connection (`Connection: close`). If a gateway
 loses its cluster session (a request times out after 30 s, or the session is evicted), it
 answers `503` and `/healthz` answers `503`, and it reconnects on its own, trying at most every
-5 s. Heads are parsed
+5 s whether or not requests arrive (N63); `nerva view` then reads the feed on from where it
+stopped. Heads are parsed
 strictly: lines end in CRLF, bodies have a `Content-Length` (no `Transfer-Encoding`), and
 anything malformed answers `400`.
 

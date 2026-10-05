@@ -10,56 +10,10 @@ const Client = @import("../client.zig").Client;
 const api = @import("api.zig");
 const http_connection = @import("../http_connection.zig");
 const CatalogStore = @import("catalog_store.zig").CatalogStore;
+const ClientHealth = @import("../client_health.zig").ClientHealth;
 
 /// The largest request body: a full commit request in JSON is well under this.
 const body_size_max = 4 * 1024 * 1024;
-/// Between attempts to replace a client that timed out or was evicted (#27): in between, requests
-/// for the cluster answer 503 at once rather than each waiting out a registration.
-const reconnect_interval_ns = 5 * std.time.ns_per_s;
-
-/// The cluster client's health (#27). A request that times out, or a session evicted, breaks the
-/// client; the next request for the cluster after `reconnect_interval_ns` replaces it. `/healthz`
-/// reports it, so that a gateway that cannot reach the cluster is not taken for a healthy one.
-const ClientHealth = struct {
-    state: enum {
-        ready,
-        /// Timed out or evicted: `deinit` it, then `init` a new one (`Client.reconnect`).
-        broken,
-        /// A replacement failed partway: the memory is uninitialized; only `init` it.
-        gone,
-    } = .ready,
-    /// When it broke, or the last attempt to replace it failed (a `timer` reading).
-    since_ns: u64 = 0,
-    timer: std.time.Timer,
-    allocator: std.mem.Allocator,
-    options: Client.Options,
-
-    fn broke(health: *ClientHealth) void {
-        health.state = .broken;
-        health.since_ns = health.timer.read();
-    }
-
-    /// Ready, or replaced now if it has been long enough since the last attempt.
-    fn ready(health: *ClientHealth, client: *Client) bool {
-        if (health.state == .ready) return true;
-        if (health.timer.read() - health.since_ns < reconnect_interval_ns) return false;
-        const result = switch (health.state) {
-            .ready => unreachable,
-            .broken => client.reconnect(),
-            .gone => client.init(health.allocator, health.options),
-        };
-        result catch |err| {
-            log.err("reconnecting to the cluster: {}", .{err});
-            health.state = .gone;
-            health.since_ns = health.timer.read();
-            return false;
-        };
-        log.info("reconnected to the cluster", .{});
-        health.state = .ready;
-        return true;
-    }
-};
-
 /// Connections whose requests are read at once (N45): each holds a buffer of `body_size_max`.
 const connections_max = 16;
 
@@ -81,17 +35,17 @@ pub fn serve(gpa: std.mem.Allocator, client: *Client, options: Options) !noretur
     if (options.on_listening) |on_listening| on_listening(receiver.listen_address());
 
     var layouts = CatalogStore.init(client);
-    var health: ClientHealth = .{
-        .timer = try std.time.Timer.start(),
-        .allocator = client.allocator,
-        .options = client.options,
-    };
+    var health = try ClientHealth.init(client);
     var arena_instance = std.heap.ArenaAllocator.init(gpa);
     defer arena_instance.deinit();
 
     while (true) {
         // Requests are read from many connections at once, and served one at a time (N45).
-        const received = try receiver.next(-1) orelse continue;
+        const received = try receiver.next(health.idle_timeout_ms(-1)) orelse {
+            // Idle with a broken client: replace it without waiting for a request (#44).
+            _ = health.ready(client);
+            continue;
+        };
         _ = arena_instance.reset(.retain_capacity);
         const arena = arena_instance.allocator();
         const reply = serve_request(

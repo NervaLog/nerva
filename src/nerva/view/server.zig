@@ -7,7 +7,9 @@
 //!
 //! One thread: between requests the process follows the feed; a request whose `min_op` (or
 //! `as_of`) is ahead of the watermark reads the feed to its end, and answers 504 if the op has
-//! still not been committed (N23, N45).
+//! still not been committed (N23, N45). A request that times out, or a session evicted, breaks
+//! the client: requests answer 503 and `/healthz` 503 until it is replaced (`client_health.zig`,
+//! #42), and the feed is read again from where it stopped.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -17,6 +19,7 @@ const Client = @import("../client.zig").Client;
 const http_connection = @import("../http_connection.zig");
 const FollowerType = @import("follower.zig").FollowerType;
 const DeclaredViews = @import("declared.zig").DeclaredViews;
+const ClientHealth = @import("../client_health.zig").ClientHealth;
 
 /// Connections whose requests are read at once (N45).
 const connections_max = 16;
@@ -41,6 +44,7 @@ pub fn serve(gpa: std.mem.Allocator, client: *Client, options: Options) !noretur
     // Rebuild from the start of the feed before serving (N22).
     try follower.catch_up();
     log.info("caught up through op {}", .{follower.watermark});
+    var health = try ClientHealth.init(client);
 
     var receiver = try http_connection.Receiver.init(gpa, options.listen, .{
         .connections_max = connections_max,
@@ -55,14 +59,30 @@ pub fn serve(gpa: std.mem.Allocator, client: *Client, options: Options) !noretur
 
     while (true) {
         // Requests are read from many connections at once, and served one at a time (N45).
-        const received = try receiver.next(idle_poll_ms) orelse {
-            // Idle: keep up with the feed so reads rarely wait.
-            _ = try follower.poll();
+        const received = try receiver.next(health.idle_timeout_ms(idle_poll_ms)) orelse {
+            // Idle: keep up with the feed so reads rarely wait, once the client is ready.
+            if (health.ready(client)) {
+                _ = follower.poll() catch |err| switch (err) {
+                    error.Timeout, error.Evicted => {
+                        log.err("following the feed: {}", .{err});
+                        health.broke();
+                    },
+                    else => return err,
+                };
+            }
             continue;
         };
         _ = arena_instance.reset(.retain_capacity);
         const arena = arena_instance.allocator();
-        const reply = serve_request(arena, &follower, &views, options, &received.request) catch |err|
+        const reply = serve_request(
+            arena,
+            client,
+            &health,
+            &follower,
+            &views,
+            options,
+            &received.request,
+        ) catch |err|
             reply: {
                 log.warn("request: {}", .{err});
                 break :reply Reply{ .status = 500, .body = "{\"error\":\"internal error\"}" };
@@ -79,6 +99,8 @@ const Reply = struct {
 
 fn serve_request(
     arena: std.mem.Allocator,
+    client: *Client,
+    health: *ClientHealth,
     follower: *Follower,
     views: *DeclaredViews,
     options: Options,
@@ -88,15 +110,32 @@ fn serve_request(
         return .{ .status = 405, .body = "{\"error\":\"method not allowed\"}" };
     }
     const target = request.target;
-    if (std.mem.eql(u8, target, "/healthz")) return .{ .status = 200, .body = "{\"ok\":true}" };
+    if (std.mem.eql(u8, target, "/healthz")) {
+        if (health.state != .ready) return unavailable_healthz;
+        return .{ .status = 200, .body = "{\"ok\":true}" };
+    }
     if (!http_connection.key_matches(request.key, options.key)) {
         return .{ .status = 401, .body = "{\"error\":\"invalid key\"}" };
     }
 
     const declared = declared_target(target) orelse
         return .{ .status = 404, .body = "{\"error\":\"not found\"}" };
-    return serve_declared(arena, follower, views, declared);
+    if (!health.ready(client)) return unavailable;
+    return serve_declared(arena, follower, views, declared) catch |err| switch (err) {
+        error.Timeout, error.Evicted => {
+            log.err("{s}: {}", .{ target, err });
+            health.broke();
+            return unavailable;
+        },
+        else => return err,
+    };
 }
+
+const unavailable: Reply = .{ .status = 503, .body = "{\"error\":\"cluster unavailable\"}" };
+const unavailable_healthz: Reply = .{
+    .status = 503,
+    .body = "{\"ok\":false,\"error\":\"cluster unavailable\"}",
+};
 
 /// A request for a declared view, or for their list.
 const DeclaredTarget = struct {
