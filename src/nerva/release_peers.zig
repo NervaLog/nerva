@@ -65,11 +65,17 @@ pub fn admits(
             if (prepare.release.value == 0) return true;
             if (prepare.release.value < release_client_min.value or
                 prepare.release.value > release.value) return false;
-            // Relayed or repaired by any replica: refused only once its maker is known to run
-            // another release, or to be of another export.
-            if (prepare.replica == replica or prepare.replica >= peer_origins.len) return true;
-            if (peer_releases_last[prepare.replica]) |maker_release| {
-                if (maker_release.value != release.value) return false;
+            // Relayed or repaired by any replica: refused once its maker is known to run another
+            // release, or to be of another export. An older client's prepare is admitted only
+            // from a maker known to run this release: a replica of that older release makes
+            // prepares of its own clients' release too, before this one has heard from it.
+            if (prepare.replica == replica) return true;
+            if (prepare.replica >= peer_origins.len) return false;
+            const maker_release = peer_releases_last[prepare.replica];
+            if (maker_release) |known| {
+                if (known.value != release.value) return false;
+            } else {
+                if (prepare.release.value != release.value) return false;
             }
             if (peer_origins[prepare.replica]) |maker_origin| {
                 if (!std.mem.eql(u8, &maker_origin, origin)) return false;
@@ -275,8 +281,13 @@ test "release_peers: a prepare is refused for its client's release, or its maker
         try testing.expect(peers.admits(prepare.frame_const()));
         prepare.replica = 0;
         try testing.expect(peers.admits(prepare.frame_const()));
-        prepare.replica = 3; // Made by a replica not heard from (it may have crashed since).
-        try testing.expect(peers.admits(prepare.frame_const()));
+        prepare.replica = 3; // Made by a replica not heard from (it may have crashed since):
+        // admitted for this release's clients only, since a replica of the older release would
+        // make prepares of its own clients' release.
+        try testing.expectEqual(
+            release_client.value == release_this.value,
+            peers.admits(prepare.frame_const()),
+        );
         prepare.replica = 2; // Made by a replica of another release, with a client we accept.
         try testing.expect(!peers.admits(prepare.frame_const()));
         prepare.replica = 4; // Made by a replica of another export.

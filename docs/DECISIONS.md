@@ -1496,31 +1496,40 @@ format change, but blind to exports that reach different checkpoints).
   rejects them (`reserved != 0`); it ignores a peer of another release anyway (N61).
 - **The gate** (`release_peers.zig`, N61's): a peer's messages are handled only once its ping or
   pong has announced this replica's release and origin. A prepare does not name its sender, but
-  names the primary that made it: it is refused when that primary last announced another
-  release or another origin. What a peer last announced is remembered across connections for
-  this, so prepares a primary made before it crashed are still repaired by others (refusing
-  prepares from a maker not yet heard from, as first designed, would have lost them).
-- **A prepare carries its client's release**, not its primary's (the vendored primary copies
-  the request's). N61 admitted only prepares of the replica's own release, which held while
-  clients had to match it; with clients from 0.0.4, every backup dropped the prepares of a 0.0.4
-  client's requests, and a cluster of more than one replica could not commit them (the test
-  found it: a 0.0.4 gateway's registration timed out with one replica down). Prepares are now
-  admitted with any client release the replica accepts, unless their maker announced another
-  release; so a v0.4.0 primary's prepares, which carry 0.0.4 too, still never reach a 0.0.5
-  backup once it has heard from it. Left open: a prepare from another export that
-  arrives before its maker's first ping still meets the vendored `checkpoint diverged` panic, as
-  before; peers ping on connecting, and no test has reached it.
-- **The refusal:** a replica exits with `origin_mismatch` (status 8) once so many of the
-  cluster's replicas announced another origin that the rest, with it, can never reach the
-  larger of the replication and view-change quorums (three replicas: two others; six: three).
-  Its message names both exports and says to import it again. The others log once that they
-  ignore it and run on. With three exports in a cluster of three, a replica stops once it has
-  heard both others, before it answers the second; so the last may have heard neither before
-  they stopped, and then stays up alone and commits nothing (the test allows either). Nothing from a peer of
-  another export is handled, so nothing of it is written to the refused replica's file.
-- **What it costs:** a replica of an imported cluster is replaced by importing it from the
-  cluster's export (it then catches up, past checkpoints), not by `nerva format`: a formatted
-  file's origin is none, and an imported cluster refuses it.
+  names the primary that made it: it is refused when that primary last announced another release or
+  another origin. What a peer last announced is remembered across connections for this, so prepares
+  a primary made before it crashed are still repaired by others (refusing prepares from a maker not
+  yet heard from, as first designed, would have lost them). Left open: a prepare of this release
+  from another export that arrives before its maker's first ping still meets the vendored
+  `checkpoint diverged` panic, as before; peers ping on connecting, and no test has reached it.
+- **A prepare carries its client's release**, not its primary's (the vendored primary copies the
+  request's). N61 admitted only prepares of the replica's own release, so every backup dropped the
+  prepares of an older accepted client's requests, its registration included, and a cluster of more
+  than one replica could not serve it. This is as old as N61: v0.3.0 accepted clients from 0.0.2,
+  which could not even register with a cluster of more than one replica; v0.4.0 hid it by accepting
+  clients of its own release only (#93). With clients from 0.0.4 the test found it (a 0.0.4
+  gateway's registration timed out with one replica down). Prepares are now admitted with any client
+  release the replica accepts, unless their maker announced another release; one of an older
+  client's release only from a maker known to run this release, since a v0.4.0 primary's prepares
+  carry 0.0.4 too, and may arrive before its first ping.
+- **The refusal:** a replica exits with `origin_mismatch` (status 8) once so many of the cluster's
+  replicas announced another origin that the rest, with it, can never reach the larger of the
+  replication and view-change quorums (three replicas: two others; six: three). Its message names
+  both exports and says to import it again. The others log once that they ignore it and run on. With
+  three exports in a cluster of three, a replica stops once it has heard both others, before it
+  answers the second; so the last may have heard neither before they stopped, and then stays up
+  alone and commits nothing (the test allows either). Nothing from a peer of another export is
+  handled, so nothing of it is written to the refused replica's file.
+- **What it costs:** a replica of an imported cluster cannot be replaced by `nerva format` (its
+  origin is none, and an imported cluster refuses it). Nor is it safe to replace it by
+  importing it alone from the cluster's export, though that replacement joins and catches up:
+  it has forgotten every prepare the lost replica acknowledged, so a view change after one more
+  failure could leave out an op committed with that acknowledgement (upstream's
+  `replica_reformat.zig` exists for this: a reformatted replica first commits a pipeline of
+  requests and takes a view two past the cluster's, so that it makes no promise it cannot keep).
+  Until a replacement takes the same precautions (`import --replace` or `nerva recover`, its own
+  design), the only safe replacement is a new export and import of every replica. A replica
+  imported from the export that has never started has acknowledged nothing, and may start late.
 - **Release 0.0.5**, clients from 0.0.4 (`release_client_min`): client messages did not change,
   so v0.4.0's clients and gateways (Botpike's APP-L2 and INF-1) keep working. Data files move to
   0.0.5 by export and import, as N80. `VERSION` is unchanged: the owner decides when it ships.
@@ -1531,8 +1540,6 @@ format change, but blind to exports that reach different checkpoints).
   `tests/release/origins.py`: three exports before the first checkpoint; replica 0 (the first view's
   primary) from B, replicas 1 and 2 from A: replica 0 exits 8 naming B, 1 and 2 commit on; one
   export each: two or three exit 8, and one left up commits nothing; replicas 0 and 1 from A commit
-  past a checkpoint, replica 2 imported from A then joins and carries the quorum with replica 1
-  stopped; a `nerva api` built as 0.0.4 commits and reads; replica 0 lost, imported again at a new
-  address with no survivor restarted, joins and carries the quorum (a replica dials only replicas of
-  higher index, so a replacement at a new address needs the survivors of lower index restarted with
-  the new `--addresses`, and no others). No log shows a panic.
+  past a checkpoint, replica 2, imported from A and never started before, then joins and carries the
+  quorum with replica 1 stopped; a `nerva api` built as 0.0.4 commits and reads. No log shows a
+  panic.

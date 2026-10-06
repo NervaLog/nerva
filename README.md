@@ -189,11 +189,12 @@ nerva start --addresses=3001,3002,3003 0_0.nerva   # and 0_1, 0_2
   (none, for `nerva format`). Replicas handle a peer only once it has announced their export. A
   replica whose peers of other exports leave it no quorum exits with status 8, naming both
   exports, and nothing from them reaches its data file: import it again from the cluster's
-  export. The others log that they ignore it and run on. A replica imported later from the same
-  export joins and catches up; so a lost replica of an imported cluster is replaced by importing
-  it from the cluster's export, not by `nerva format`. A replica dials only the replicas after it
-  in `--addresses`, so a replacement at a new address needs the replicas before it (and
-  gateways) restarted with the new addresses, and no others.
+  export. The others log that they ignore it and run on. A replica imported from the cluster's
+  export that has not started yet may start later and catch up.
+- **Replacing a lost replica**: export the cluster and import every replica again (the cluster
+  is closed meanwhile). Importing only the lost one is not safe: its replacement forgets the
+  prepares the lost replica acknowledged, and with one more failure a committed op could be lost
+  (N84). A formatted replica cannot join an imported cluster either: its origin is none.
 - A view declared only through the Zig client, with no catalog document, cannot be imported:
   `import` refuses it. Declare views through `nerva api`.
 - Measured (`perf/upgrade.py`, a 4-CPU sandbox, `--development`): a million changes over
