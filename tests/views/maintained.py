@@ -67,7 +67,7 @@ def maintained(api, name, as_of=None):
         target += f"&as_of={as_of}" if as_of else ""
         status, body = request(api, "GET", target)
         assert status == 200, (status, body)
-        hashes.add(body["hash"])
+        hashes.add(body["view_hash"])
         groups += body["groups"]
         if not body["more"]:
             break
@@ -115,14 +115,14 @@ def check_against_oracle(api, view_port, name="revenue", as_of=None):
     assert status == 200, (status, body)
     ordered = sorted(groups, key=lambda group: group["section"])
     assert ordered == body["groups"], (op, ordered[:3], body["groups"][:3])
-    assert header["hash"] == view_hash(header["id"], name, groups), header
+    assert header["view_hash"] == view_hash(header["id"], name, groups), header
     assert int(header["group_count"]) == len(groups), header
     # The whole view from `nerva api` (N66): `nerva view`'s answer, byte for byte, so its hash.
     query = f"as_of={as_of}" if as_of else f"min_op={op}"
     status, whole = request(api, "GET", f"/v1/views/{name}?{query}")
     assert status == 200, (status, whole)
     assert whole["groups"] == body["groups"] and whole["hash"] == body["hash"], (whole, body)
-    assert whole["view_hash"] == header["hash"], (whole, header)
+    assert whole["view_hash"] == header["view_hash"], (whole, header)
     return op, len(groups)
 
 
@@ -206,11 +206,11 @@ def main():
         assert status == 200 and body["maintained"] is True, body
         while maintained(api, "by_price")[1]["state"] != "ready":
             time.sleep(0.2)
-        before = maintained(api, "revenue")[1]["hash"]
+        before = maintained(api, "revenue")[1]["view_hash"]
         large = [put(SEATS + 10_000 + i, seat_value(2, 10_000 + i, True)) for i in range(4200)]
         status, body = commit(api, large)
         assert status == 413 and body["status"] == "views_too_large", (status, body)
-        assert maintained(api, "revenue")[1]["hash"] == before  # Nothing applied.
+        assert maintained(api, "revenue")[1]["view_hash"] == before  # Nothing applied.
         for half in (large[:2100], large[2100:]):
             status, body = commit(api, half)
             assert status == 200, (status, body)

@@ -216,7 +216,8 @@ def view_groups(port, name, as_of=None):
         if as_of is not None:
             target += f"&as_of={as_of}"
         body = ok(port, "GET", target)
-        header = {k: body.get(k) for k in ("state", "hash", "group_count")}
+        # Indexed, not `get`: a key renamed away must fail here, not compare None with None.
+        header = {k: body[k] for k in ("state", "view_hash", "group_count")}
         groups += body["groups"]
         if not body["more"]:
             return header, groups
