@@ -905,9 +905,12 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
 - `documents.chunk_id_from(id0, chunk)`: the write paths (`nerva api`'s commit, the Zig
   transaction's get and put) take chunk 0's id once per document instead of hashing the key for
   every chunk. Encoding at 64 KiB: 635 µs on `main`, 225 µs now; 512 KiB: 5.47 ms to 1.96 ms.
-- `declared_views.latest_ns` does not reproduce outside Fly (134–153 ms for both builds, with
-  or without the 512 KiB documents benchmark before it); recorded in N83 as the heap the larger
-  documents benchmark left, to be confirmed by the next night.
+- `declared_views.latest_ns`: caused by the documents benchmark running before it in the same
+  process; a reviewer reproduced it (about 80 ms after 64 KiB documents, about 109 ms after
+  512 KiB), this sandbox does not (137–152 ms after either). Isolating benchmarks is #91.
+- Review (the effort sentinel): tail-chunk ids pinned as vectors from Python's hashlib (the test
+  compared `chunk_id` with itself); `nerva import` names catalog chunks from chunk 0's id; N83's
+  wording (the encode series drops, the benchmark's commit, which paths changed).
 - Verified: `check`, `test:unit` (all but the sandbox's `benchmark.perf: usage example`),
   `test:fmt`, `test:api` (with `tests/api/documents.py`: a 512 KiB value under a 1024-byte key,
   one byte more refused, the `get` cap at its edge).

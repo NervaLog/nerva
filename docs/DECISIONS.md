@@ -1464,13 +1464,15 @@ for itself, never derived from a limit that may move.
   vectors computed outside this code, and encoding about 2.8 times faster (64 KiB: 635 µs to
   225 µs; 512 KiB: 5.47 ms to 1.96 ms). Tests, fuzzers and the view benchmark still call
   `chunk_id` per chunk: harmless there.
-- **`declared_views.latest_ns` (assumed: not reproduced).** On Fly the candidate's `latest` was
-  about 141 ms in all three rounds against about 100 ms, while `as_of_middle_ns` did not move. In
-  the sandbox both builds take 134–153 ms, with the 512 KiB documents benchmark before it in the
-  same process or without it; the one change to that path in the range, sorting `Group`s instead
-  of the hash map's entries (N66), is the same speed. `latest` walks a map of a million rows
-  built on the process's heap, after the documents benchmark has run in it; `as_of` builds its
-  own map in a fresh arena. So the likely cause is the heap the 512 KiB benchmark leaves behind
-  (layout, huge pages; the sandbox's transparent huge pages are `madvise`, so it cannot show
-  this), and restoring the 64 KiB benchmark restores the heap it ran after. The next night
-  confirms it or reopens #88.
+- **`declared_views.latest_ns`: the documents benchmark before it, in the same process.** On
+  Fly the candidate's `latest` was about 141 ms in all three rounds against about 100 ms, while
+  `as_of_middle_ns` did not move. `latest` walks a map of a million rows built on the process's
+  heap after the documents benchmark has run in it; `as_of` builds its own in a fresh arena. A
+  reviewer reproduced it on another machine (transparent huge pages `madvise`): with the
+  documents benchmark first, `latest` took 74.6, 81.3 and 79.6 ms after 64 KiB documents and
+  108.8, 98.4 and 124.7 ms after 512 KiB (+37%), and `4a8aef3` the same (about 75 ms and
+  108–110 ms). In this session's 4-CPU sandbox it does not reproduce (interleaved, four rounds:
+  137–152 ms after either), so it depends on the machine, not on huge pages. The only change to
+  that path in the range, sorting `Group`s instead of the hash map's entries (N66), is the same
+  speed. The 64 KiB benchmark restores the process `latest` ran in before; #91 is the cause
+  (benchmarks share one process), left for later. The next night confirms the fix.
