@@ -781,6 +781,18 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
   `test:api`, `test:views`, `test:integration`, `test:release` (mixed releases, then the
   upgrade), `fuzz -- smoke`, VOPR seeds 1, 2 and 5 in ReleaseSafe.
 
+## 2026-10-05 — A view is cataloged only under the state machine's definition (N78; #70)
+
+- `src/nerva/api/api.zig`: `PUT /v1/views/<name>` with no catalog document answers 409 to
+  `different` and `ledger_field` and writes nothing; with the identical document, 200 and the
+  reason. The fake client and catalog in its tests now declare and keep views; a unit test covers
+  the two-gateway race and the repeat PUT.
+- `tests/api/ledgers.py`: a view cataloged while its table's views were full, a ledger over its
+  field, then the same view again (200, unmaintained).
+- Verified: the hardening probes (a gateway stopped between declaring and cataloging: two hits in
+  40 tries, each left one definition; the repeat PUT: 200), `check`, `test:fmt`, `test:unit`,
+  `test:api`, `test:views`.
+
 ## 2026-10-06 — v0.4.0 release preparation: docs and CLI messages (#77)
 
 - CHANGELOG v0.4.0, from the release-readiness audit: a request's budget is 128 MiB (it said
@@ -811,4 +823,3 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
 - Verified: the hardening probes (every crafted case refuses cleanly or imports; a failed check
   exits 1 and leaves no file; a killed import leaves only `.importing`), the declaration-window
   sweep, `check`, `test:fmt`, `test:unit`, `test:release`, `test:demo`.
-
