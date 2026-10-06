@@ -4,7 +4,8 @@ Guidance for Claude Code when working in this repository.
 
 **Read first, every session:** [README.md](./README.md) (design),
 [docs/GOALS-1.0.md](./docs/GOALS-1.0.md) (1.0 goals),
-[docs/DECISIONS.md](./docs/DECISIONS.md) (decision log: add to it when you decide something),
+[docs/DECISIONS.md](./docs/DECISIONS.md) and `docs/decisions/` (the decision log; see "Decisions and
+change notes" for how to add to it),
 [UPSTREAM.md](./UPSTREAM.md) (what is vendored), and [docs/TIGER_STYLE.md](./docs/TIGER_STYLE.md)
 (coding style, mandatory).
 
@@ -52,7 +53,7 @@ that changes more than Markdown (N68). A
 commit that changes `VERSION` publishes release `v<VERSION>` (`release.yml`) after CI passes: to
 release, add the version's "what's new" section to `CHANGELOG.md` (`## v<VERSION> — <date>`,
 written for people running Nerva: new capabilities with examples, fixes with their issues, and
-upgrade steps), then bump `VERSION` (and add a WORKLOG entry) in its own commit. The section
+upgrade steps), then bump `VERSION` (and add a worklog note, `worklog/<number>.md`) in its own commit. The section
 becomes the GitHub release notes; a version without one is refused.
 
 ## Vendored code
@@ -63,36 +64,99 @@ becomes the GitHub release notes; a version without one is refused.
 - Golden values (snapshots, checksums) may only be updated after explaining *why* they changed.
   Update snapshots with `SNAP_UPDATE=1 ./zig/zig build test:unit -- "<test name>"`.
 
-## Working protocol
+## Decisions and change notes
 
-### Modes
+A pull request never edits a shared log. When every pull request appended to the same file, they
+collided with each other and took the same numbers. Each pull request now adds small files of its
+own, named by its number.
 
-Announce the mode in one line when entering it, followed by a brief plan:
+**Open the pull request first**, as a draft, so that you have its number.
 
-- `🔍 Switching to DISCOVERY mode.` — finding existing code (here or upstream TigerBeetle).
-- `🧑‍🎓 Switching to LEARN mode.` — understanding a module before changing it. Pause and
-  summarize after ~15–20 files.
-- `🐣 Switching to BASIC mode.` — small, well-defined changes.
-- `🧠 Switching to DEEP WORK mode.` — larger or fuzzy changes.
-- `📝 Switching to DOCUMENTING mode.` — doc comments and docs, only with consent.
-- `🧪 Switching to TESTING mode.` — adding tests, VOPR workloads, fuzzers.
+### Decisions
 
-### Confirm before building
+- A decision goes in `docs/decisions/P<number>-<short-slug>.md`, for example
+  `docs/decisions/P62-cancel-kills-the-process-group.md`. Cite it as `P62`. A second decision in the same
+  pull request is `P62b`, then `P62c`.
+- The file starts with a header, then a one-line title, the decision, the reason and what it costs:
 
-1. Confirm new **types** (structs, enums, unions, wire formats, on-disk layouts) and **function
-   signatures** before implementing them.
-2. Propose a few **test cases** (unit, fuzz, or VOPR workload checks) and confirm them.
-3. Ask focused questions at the **bottom** of a message, prefixed `**Question:**`; prefer yes/no or
-   explicit options; one or a few at a time.
+  ```
+  ---
+  id: P62
+  date: 2026-10-06
+  area: Money
+  amends: D12
+  ---
+  ```
 
-### DEEP WORK
+  `area` is one of the section headings in `docs/DECISIONS.md`. `amends` (or `supersedes`) is optional and
+  names the earlier decision this one changes.
+- `docs/DECISIONS.md` is frozen: never edit it. N1 to N83 there keep their numbers and stay in
+  force.
+- Never edit another pull request's decision file. To change any earlier decision, old or new,
+  write a new one with `amends` or `supersedes`. The earlier text stays as it was.
+- Nothing builds an index yet. To learn what has been decided, read `docs/DECISIONS.md` and every file
+  in `docs/decisions/`.
 
-Step 1 (design) is mandatory: types, on-disk/wire formats, function signatures, test strategy.
-End it with `DEEP WORK Step 1 complete`, a design summary, and
-`Do you approve this design? Should I proceed to Step 2: Implementation?` — then wait.
+### Change notes
 
-Step 2 (implementation): types first, then signatures with `@panic("TODO")` bodies, then fill one
-function at a time, running `check` and relevant tests after each.
+- The worklog entry for a pull request goes in `worklog/<number>.md`: the date, the
+  pull request, and a few lines on the work completed. Do not edit `WORKLOG.md`, which is frozen.
+- If a pull request merged without one, the next pull request adds `worklog/<that number>.md`.
+
+## Working rules
+
+Most sessions in this repository run unattended: a task arrives as a spec or an issue, and nobody
+answers questions while you work. Assume that is your situation unless a person is replying in the
+session. These rules say what you decide yourself, what makes you stop, and what done means.
+
+### Decide yourself
+
+Inside the task you were given, you do not need permission for:
+
+- new types, function signatures and modules under `src/nerva/` that follow existing patterns;
+- new tests, VOPR workload checks and fuzzers;
+- doc comments, README or CHANGELOG text the change makes wrong, and the worklog note;
+- a design choice the task leaves open. Take the option closest to existing code and record it as
+  a decision (see "Decisions"), in the same pull request.
+
+When the task is larger than one file or its requirements are fuzzy, write the design first at the
+top of the pull request description (types, wire and on-disk formats, signatures, test strategy),
+then implement it in small steps, running `./zig/zig build check` and the relevant tests between
+each.
+
+### Stop
+
+Each of these stops the work. Do not go round it, and do not merge.
+
+1. **A persisted format changes**: an on-disk layout, a wire format, or a persisted identifier
+   (`tree_ids`, `Operation` values). A data file written by the last release must still open.
+2. **A vendored file changes** (anything `UPSTREAM.md` lists), unless the task names that patch.
+3. **A golden value changes** (a snapshot or checksum) and you cannot say exactly why.
+4. **An invariant above needs an exception**, however small or temporary.
+5. **The toolchain changes**: the Zig version `zig/download.sh` pins, or a new dependency.
+6. **The task contradicts** `README.md`, `docs/GOALS-1.0.md` or a decision (`docs/DECISIONS.md`,
+   `docs/decisions/`).
+7. **You cannot reach the exit criteria** below.
+
+When you stop:
+
+- Push what passes `./zig/zig build check` and open the pull request as a **draft**.
+- Put `**Question:**` as the first line of its description: one question, yes/no or a short list
+  of options, with the one you would choose and why.
+- Finish the parts of the task the question does not touch. Leave the rest undone.
+- The session that wrote a stopped pull request never merges it. The owner answers first.
+
+If a person is replying in the session, ask them the same question there instead and wait.
+
+### Pull request description
+
+Every description states these, and they must be true of the final diff, not of the plan:
+
+- **Formats:** `none`, or each on-disk layout, wire format or persisted identifier the diff changes.
+- **Vendored:** `none`, or each vendored file the diff touches, with its `UPSTREAM.md` entry.
+- **Not verified:** anything you did not run or could not test, or `nothing`.
+
+Check them against `git diff --name-only origin/main...` before you write them.
 
 ### Pre-existing bugs
 
@@ -111,7 +175,8 @@ You are not done until:
 2. `./zig/zig build test:fmt` passes.
 3. Cleanup pass: no dead code, no stray `TODO` without a reason, assertions on new invariants.
 4. README.md / UPSTREAM.md updated if behaviour, design or vendored code changed.
-5. **WORKLOG.md** has an entry for the change.
-6. You have summarized what changed and where.
+5. `worklog/<number>.md` exists for the change, and any decision you took is in `docs/decisions/`.
+6. The pull request description carries the three statements above.
 
-If stuck, show the last compiling version, the exact error, and ask a focused `**Question:**`.
+A failing VOPR seed, integration run or Jepsen run is a finding, never noise: do not re-run it until
+it passes. Reproduce it from its seed, then fix it or file it (see "Pre-existing bugs").
