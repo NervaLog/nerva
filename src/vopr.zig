@@ -279,7 +279,9 @@ pub fn main() !void {
         upgrades_done =
             for (simulator.cluster.replicas, simulator.cluster.replica_health) |*replica, health| {
                 if (health != .up) continue;
-                const release_latest = releases[simulator.replica_releases_limit - 1].release;
+                // Nerva: the lane's own releases (the `nerva` lane runs one, not `releases[0]`).
+                const release_latest = simulator.options.cluster
+                    .releases[simulator.replica_releases_limit - 1].release;
                 if (replica.release.value == release_latest.value) {
                     break true;
                 }
