@@ -120,12 +120,17 @@ class Cluster:
             raise AssertionError(f"replica {index} did not exit: {self.log(index)[-3000:]}")
 
     def gateway(self, nerva=None):
+        log = os.path.join(self.tmp, f"{self.name}_api_{len(self.gateways)}.log")
         process = subprocess.Popen(
             [nerva or self.nerva, "api", "--cluster=0", f"--addresses={self.addresses}",
              "--listen=127.0.0.1:0"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL, env={**os.environ, "NERVA_KEY": KEY}, text=True)
+            stderr=open(log, "w"), env={**os.environ, "NERVA_KEY": KEY}, text=True)
         self.gateways.append(process)
-        return int(process.stdout.readline())
+        line = process.stdout.readline()
+        if not line:
+            with open(log, errors="replace") as f:
+                raise AssertionError(f"the gateway exited: {f.read()[-3000:]}")
+        return int(line)
 
     def check_running(self, indexes):
         for index in indexes:
