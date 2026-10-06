@@ -136,6 +136,17 @@ pub fn key_matches(key_header: ?[]const u8, key: []const u8) bool {
     return equal and key_header != null;
 }
 
+/// Whether `key_header` is either of a gateway's keys: `key`, or `key_next` while a rotation
+/// moves clients to it (`NERVA_KEY_NEXT`). Both are always compared, so the time says neither
+/// whether a key matched nor which.
+pub fn keys_match(key_header: ?[]const u8, key: []const u8, key_next: ?[]const u8) bool {
+    assert(key_next == null or key_next.?.len > 0);
+    const matches_key = key_matches(key_header, key);
+    // Without a next key, the same comparison again: the time is the same either way.
+    const matches_next = key_matches(key_header, key_next orelse key);
+    return matches_key or (key_next != null and matches_next);
+}
+
 pub const Options = struct {
     /// Connections read at once. A further connection displaces the oldest one still sending its
     /// request (or, with every slot's request complete, waits until one is served).
@@ -572,6 +583,19 @@ test key_matches {
     try testing.expect(!key_matches("secret2", "secret"));
     try testing.expect(!key_matches("", "secret"));
     try testing.expect(!key_matches(null, "secret"));
+}
+
+test keys_match {
+    // One key: as `key_matches`.
+    try testing.expect(keys_match("old", "old", null));
+    try testing.expect(!keys_match("new", "old", null));
+    try testing.expect(!keys_match(null, "old", null));
+    // During a rotation, either.
+    try testing.expect(keys_match("old", "old", "new"));
+    try testing.expect(keys_match("new", "old", "new"));
+    try testing.expect(!keys_match("neW", "old", "new"));
+    try testing.expect(!keys_match("", "old", "new"));
+    try testing.expect(!keys_match(null, "old", "new"));
 }
 
 fn test_connect(receiver: *const Receiver) !std.net.Stream {

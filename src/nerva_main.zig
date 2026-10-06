@@ -436,9 +436,21 @@ fn command_start(
     }
 }
 
-fn command_view(gpa: std.mem.Allocator, args: *const cli.Command.View) !void {
+/// A gateway's keys: `NERVA_KEY`, and `NERVA_KEY_NEXT` while clients move to a new key. To
+/// rotate without refusing anyone: set NERVA_KEY_NEXT on every gateway, move clients to it, then
+/// make it NERVA_KEY and unset NERVA_KEY_NEXT.
+fn gateway_keys(comptime command: []const u8) struct { key: []const u8, key_next: ?[]const u8 } {
     const key = std.posix.getenv("NERVA_KEY") orelse "";
-    if (key.len == 0) vsr.fatal(.cli, "view: set NERVA_KEY", .{});
+    if (key.len == 0) vsr.fatal(.cli, command ++ ": set NERVA_KEY", .{});
+    const key_next = std.posix.getenv("NERVA_KEY_NEXT") orelse "";
+    if (key_next.len > 0) {
+        log.info(command ++ ": accepting NERVA_KEY and NERVA_KEY_NEXT", .{});
+    }
+    return .{ .key = key, .key_next = if (key_next.len > 0) key_next else null };
+}
+
+fn command_view(gpa: std.mem.Allocator, args: *const cli.Command.View) !void {
+    const keys = gateway_keys("view");
 
     var client: Client = undefined;
     try client.init(gpa, .{
@@ -450,14 +462,14 @@ fn command_view(gpa: std.mem.Allocator, args: *const cli.Command.View) !void {
 
     try view_server.serve(gpa, &client, .{
         .listen = args.listen,
-        .key = key,
+        .key = keys.key,
+        .key_next = keys.key_next,
         .on_listening = on_listening,
     });
 }
 
 fn command_api(gpa: std.mem.Allocator, args: *const cli.Command.Api) !void {
-    const key = std.posix.getenv("NERVA_KEY") orelse "";
-    if (key.len == 0) vsr.fatal(.cli, "api: set NERVA_KEY", .{});
+    const keys = gateway_keys("api");
 
     var client: Client = undefined;
     try client.init(gpa, .{
@@ -469,7 +481,8 @@ fn command_api(gpa: std.mem.Allocator, args: *const cli.Command.Api) !void {
 
     try api_server.serve(gpa, &client, .{
         .listen = args.listen,
-        .key = key,
+        .key = keys.key,
+        .key_next = keys.key_next,
         .on_listening = on_listening,
     });
 }

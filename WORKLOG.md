@@ -914,3 +914,16 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
 - Verified: `check`, `test:unit` (all but the sandbox's `benchmark.perf: usage example`),
   `test:fmt`, `test:api` (with `tests/api/documents.py`: a 512 KiB value under a 1024-byte key,
   one byte more refused, the `get` cap at its edge).
+
+## 2026-10-06 — Gateways rotate keys with NERVA_KEY_NEXT (INF-1)
+
+- Requested by INF-1 (NV-3's key rotation): `nerva api` and `nerva view` also accept the key in
+  `NERVA_KEY_NEXT` when it is set, so a rotation (set NERVA_KEY_NEXT on every gateway, move
+  clients, make it NERVA_KEY) never refuses a client holding either key.
+- `http_connection.keys_match` compares a request's key with both keys every time, each by
+  `key_matches` (both hashed, the digests compared in constant time), so the time says neither
+  whether nor which one matched. A gateway logs at start that it accepts both.
+- Tests: `keys_match` unit cases; `tests/api/keys.py` (in `test:api`) walks both gateways through
+  a rotation and checks every key, a wrong one, an empty one and none at each step.
+- README: the rotation, under the JSON API.
+

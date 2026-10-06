@@ -30,12 +30,16 @@ const Follower = FollowerType(DeclaredViews);
 
 pub const Options = struct {
     listen: std.net.Address,
+    /// Compared against `X-Nerva-Key`. Never empty.
     key: []const u8,
+    /// Also accepted while clients move to it (`NERVA_KEY_NEXT`); never empty when set.
+    key_next: ?[]const u8 = null,
     on_listening: ?*const fn (address: std.net.Address) void = null,
 };
 
 pub fn serve(gpa: std.mem.Allocator, client: *Client, options: Options) !noreturn {
     assert(options.key.len > 0);
+    assert(options.key_next == null or options.key_next.?.len > 0);
     var views = DeclaredViews.init(gpa);
     defer views.deinit();
     var follower = try Follower.init(gpa, client, &views);
@@ -114,7 +118,7 @@ fn serve_request(
         if (health.state != .ready) return unavailable_healthz;
         return .{ .status = 200, .body = "{\"ok\":true}" };
     }
-    if (!http_connection.key_matches(request.key, options.key)) {
+    if (!http_connection.keys_match(request.key, options.key, options.key_next)) {
         return .{ .status = 401, .body = "{\"error\":\"invalid key\"}" };
     }
 

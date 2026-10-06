@@ -273,6 +273,11 @@ curl -H 'X-Nerva-Key: secret' -d '{"entries":[{"kind":"put","table":1,"id":"5","
 | `PUT /v1/ledgers/<id>` `{"fields":[{"table","field" or "offset","floor"}]}` | Declare a ledger: 2 to 16 conserved `i64` fields (below). `200` created or exists, with its `op`; `409` `ledger_immutable`, `ledger_field_taken`, `field_viewed` or `ledgers_full`; `400` invalid. |
 | `GET /v1/ledgers/<id>` | The ledger's fields, floors and the op it was declared at. |
 
+**Keys.** Every route but `/healthz` needs `X-Nerva-Key` to match `NERVA_KEY`, compared in
+constant time, and so does `nerva view`. To rotate the key without refusing anyone, start each
+gateway with the new key in `NERVA_KEY_NEXT` too (it accepts either), move clients to the new
+key, then restart each gateway with it as `NERVA_KEY` alone.
+
 64-bit numbers (ids, ops, cursors) are decimal strings; values are the 80 bytes as hex. Layouts
 live in the log, in a reserved catalog table; the core still stores bytes and never reads them.
 
