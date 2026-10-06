@@ -1452,14 +1452,18 @@ The nightly of 2026-10-06 (#88) failed `documents.encode_ns_per_document` and
 630–670 µs and decode it in 18–19 µs. Nothing slowed down: the benchmark took
 `documents.value_size_max` as its size, so when N76 raised that from 64 KiB to 512 KiB the
 benchmark started timing documents 8 times larger, and encoding and decoding are linear in the
-size. The benchmark is back at 64 KiB, the size its metrics have always reported, so the series
-stays comparable; `value_size=524288` times the largest. A benchmark's default size is now chosen
+size. The benchmark is back at 64 KiB, the size its metrics reported from its start (88cc5e6) to
+#85; `value_size=524288` times the largest. The decode series stays comparable across the change;
+the encode series drops about 2.8 times from the old baseline, for the change below. A benchmark's default size is now chosen
 for itself, never derived from a limit that may move.
-- **Encoding hashed the key once per chunk.** Every write path called `chunk_id(namespace, key,
-  chunk)` for each chunk, and each call hashes the key (up to 1 KiB) before the tail's own
-  SHA-256. Now `row_id` is taken once per document and `chunk_id_from(id0, chunk)` names each
-  chunk: the same ids (a unit test compares both over the largest document, every chunk), and
-  encoding about 2.8 times faster (64 KiB: 635 µs to 225 µs; 512 KiB: 5.47 ms to 1.96 ms).
+- **Encoding hashed the key once per chunk.** `nerva api`'s documents commit, the Zig
+  transaction's `get` and `put`, and `nerva import`'s catalog reads called `chunk_id(namespace,
+  key, chunk)` for each chunk, and each call hashes the key (up to 1 KiB) before the tail's own
+  SHA-256. Now they take `row_id` once per document and name each chunk with
+  `chunk_id_from(id0, chunk)` (or `tail_id`): the same ids, which a unit test pins as fixed
+  vectors computed outside this code, and encoding about 2.8 times faster (64 KiB: 635 µs to
+  225 µs; 512 KiB: 5.47 ms to 1.96 ms). Tests, fuzzers and the view benchmark still call
+  `chunk_id` per chunk: harmless there.
 - **`declared_views.latest_ns` (assumed: not reproduced).** On Fly the candidate's `latest` was
   about 141 ms in all three rounds against about 100 ms, while `as_of_middle_ns` did not move. In
   the sandbox both builds take 134–153 ms, with the 512 KiB documents benchmark before it in the

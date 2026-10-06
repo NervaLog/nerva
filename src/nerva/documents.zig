@@ -450,14 +450,19 @@ test "documents: row ids are stable and separate keys, chunks and namespaces" {
     try testing.expect(chunk_id(0, "k", 1) != chunk_id(0, "k", 2));
 }
 
-test "documents: ids from chunk 0's id are every chunk's id (#88)" {
-    const key = "k" ** key_size_max;
-    const count = chunk_count(key.len, value_size_max);
-    const id0 = row_id(7, key);
-    for (0..count) |chunk| {
-        const expected = chunk_id(7, key, @intCast(chunk));
-        try testing.expectEqual(expected, chunk_id_from(id0, @intCast(chunk)));
-    }
+test "documents: tail chunks' ids are stable (#88)" {
+    // Fixed vectors (computed with Python's hashlib, not this code): the tails of "table.5",
+    // up to the last chunk of the largest document. Changing the derivation would orphan every
+    // stored document's tails.
+    const id0 = row_id(0, "table.5");
+    try testing.expectEqual(@as(u64, 4613465043632273798), chunk_id_from(id0, 1));
+    try testing.expectEqual(@as(u64, 4590579942568114901), chunk_id_from(id0, 2));
+    try testing.expectEqual(
+        @as(u64, 11947710669345664337),
+        chunk_id_from(id0, chunk_count(key_size_max, value_size_max) - 1),
+    );
+    try testing.expectEqual(id0, chunk_id_from(id0, 0));
+    try testing.expectEqual(chunk_id_from(id0, 2), chunk_id(0, "table.5", 2));
 }
 
 /// A client over rows held in memory, with their history, for `TransactionType`. A test can have

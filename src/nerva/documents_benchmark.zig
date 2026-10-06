@@ -13,7 +13,7 @@ test "benchmark: documents" {
     var bench: Bench = .init();
     defer bench.deinit();
 
-    // 64 KiB, the size this benchmark has measured since the nightly began (N55), not
+    // 64 KiB, the size this benchmark measured from its start (88cc5e6, N55) to #85, not
     // `value_size_max`: the time is linear in the size, and a larger default moves the metric
     // and the heap later benchmarks run in, without any code changing (#88). Time the largest
     // document with `value_size=524288`.
