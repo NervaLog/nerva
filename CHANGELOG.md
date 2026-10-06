@@ -109,6 +109,8 @@ chunks as 256 documents of 64 KiB, and answers `413` past that: ask for fewer ke
 - With `--trace`, a full or failing trace disk panicked the replica, and the trace grew
   without bound. Trace writes are buffered and bounded now, and a write error stops tracing,
   not the replica. (#30)
+- A bad view name was refused with a message about field names. It now says "a view name".
+  (#77)
 
 ### Upgrading from v0.3.0
 
