@@ -64,6 +64,9 @@ pub const PlanView = struct {
 /// What pass 1 learned from a verified export.
 pub const Plan = struct {
     summary: export_file.Summary,
+    /// The export's identity, its `end` record's SHA-256: the data file's `VSRState.origin`
+    /// (P90).
+    origin: [32]u8,
     /// The last change's timestamp (zero without changes).
     timestamp_max: u64,
     /// The most changes of one op.
@@ -96,6 +99,7 @@ pub fn plan(arena: std.mem.Allocator, path: []const u8) !Plan {
 
     var result: Plan = .{
         .summary = undefined,
+        .origin = undefined,
         .timestamp_max = 0,
         .op_changes_max = 0,
         .views = undefined,
@@ -158,6 +162,7 @@ pub fn plan(arena: std.mem.Allocator, path: []const u8) !Plan {
         .summary => |*summary| result.summary = summary.*,
     };
     // The reader returns null only once everything checked.
+    result.origin = reader.digest;
     assert(view_count == result.summary.view_count);
     assert(ledger_count == result.summary.ledger_count);
     result.checks_table = checks_table.items;
@@ -970,4 +975,32 @@ pub fn ImporterType(comptime Storage: type) type {
             }
         }
     };
+}
+
+test "import: the data file records the export it was imported from, a formatted one none (P90)" {
+    const Storage = @import("../testing/storage.zig").Storage;
+    const fixtures = @import("../testing/fixtures.zig");
+    const allocator = std.testing.allocator;
+
+    const origin: [32]u8 = @splat(0x5a);
+    for ([_][32]u8{ @splat(0), origin }) |expected| {
+        var storage = try fixtures.init_storage(allocator, .{
+            .size = data_file_size_min,
+            .iops_write_max = replica_format.writes_max,
+        });
+        defer storage.deinit(allocator);
+        try replica_format.format(Storage, allocator, &storage, .{
+            .cluster = 0,
+            .release = vsr.Release.minimum,
+            .replica = 1,
+            .replica_count = 3,
+            .view = null,
+            .origin = expected,
+        });
+        for (0..constants.superblock_copies) |copy| {
+            const header = storage.superblock_header(@intCast(copy));
+            try std.testing.expectEqualSlices(u8, &expected, &header.vsr_state.origin);
+            try std.testing.expect(stdx.zeroed(&header.vsr_state.reserved));
+        }
+    }
 }

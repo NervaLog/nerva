@@ -136,15 +136,31 @@ pub fn key_matches(key_header: ?[]const u8, key: []const u8) bool {
     return equal and key_header != null;
 }
 
-/// Whether `key_header` is either of a gateway's keys: `key`, or `key_next` while a rotation
-/// moves clients to it (`NERVA_KEY_NEXT`). Both are always compared, so the time says neither
-/// whether a key matched nor which.
-pub fn keys_match(key_header: ?[]const u8, key: []const u8, key_next: ?[]const u8) bool {
-    assert(key_next == null or key_next.?.len > 0);
-    const matches_key = key_matches(key_header, key);
-    // Without a next key, the same comparison again: the time is the same either way.
-    const matches_next = key_matches(key_header, key_next orelse key);
-    return matches_key or (key_next != null and matches_next);
+/// A gateway's keys (P96): `X-Nerva-Key` must equal `current` or, during a rotation, `next`.
+pub const Keys = struct {
+    current: []const u8,
+    next: ?[]const u8 = null,
+
+    /// Why `NERVA_KEY` (`current`) and `NERVA_KEY_NEXT` (`next`) cannot be used, if they cannot:
+    /// each set key is non-empty, and `next` differs from `current`. The message names no key.
+    pub fn invalid(current: []const u8, next: ?[]const u8) ?[]const u8 {
+        if (current.len == 0) return "set NERVA_KEY";
+        const key_next = next orelse return null;
+        if (key_next.len == 0) return "NERVA_KEY_NEXT is set but empty";
+        if (std.mem.eql(u8, current, key_next)) return "NERVA_KEY_NEXT equals NERVA_KEY";
+        return null;
+    }
+};
+
+/// Whether `candidate` (`X-Nerva-Key`, if sent) is one of `keys`. Both keys are always compared,
+/// each in constant time (`key_matches`), with no early return: the time taken does not tell
+/// which key matched, nor whether a next key is set.
+pub fn key_accepted(keys: Keys, candidate: ?[]const u8) bool {
+    assert(Keys.invalid(keys.current, keys.next) == null);
+    const current = key_matches(candidate, keys.current);
+    const next = key_matches(candidate, keys.next orelse keys.current);
+    const next_set = keys.next != null;
+    return (@intFromBool(current) | (@intFromBool(next) & @intFromBool(next_set))) == 1;
 }
 
 pub const Options = struct {
@@ -585,17 +601,32 @@ test key_matches {
     try testing.expect(!key_matches(null, "secret"));
 }
 
-test keys_match {
-    // One key: as `key_matches`.
-    try testing.expect(keys_match("old", "old", null));
-    try testing.expect(!keys_match("new", "old", null));
-    try testing.expect(!keys_match(null, "old", null));
-    // During a rotation, either.
-    try testing.expect(keys_match("old", "old", "new"));
-    try testing.expect(keys_match("new", "old", "new"));
-    try testing.expect(!keys_match("neW", "old", "new"));
-    try testing.expect(!keys_match("", "old", "new"));
-    try testing.expect(!keys_match(null, "old", "new"));
+test key_accepted {
+    const current_only: Keys = .{ .current = "current-key" };
+    try testing.expect(key_accepted(current_only, "current-key"));
+    try testing.expect(!key_accepted(current_only, "next-key"));
+    try testing.expect(!key_accepted(current_only, ""));
+    try testing.expect(!key_accepted(current_only, null));
+
+    const rotating: Keys = .{ .current = "current-key", .next = "next-key" };
+    try testing.expect(key_accepted(rotating, "current-key"));
+    try testing.expect(key_accepted(rotating, "next-key"));
+    try testing.expect(!key_accepted(rotating, "other-key"));
+    try testing.expect(!key_accepted(rotating, "next-keY"));
+    try testing.expect(!key_accepted(rotating, ""));
+    try testing.expect(!key_accepted(rotating, null));
+}
+
+test "Keys.invalid" {
+    try testing.expectEqual(null, Keys.invalid("current-key", null));
+    try testing.expectEqual(null, Keys.invalid("current-key", "next-key"));
+    try testing.expectEqualStrings("set NERVA_KEY", Keys.invalid("", null).?);
+    try testing.expectEqualStrings("set NERVA_KEY", Keys.invalid("", "next-key").?);
+    try testing.expect(Keys.invalid("current-key", "") != null);
+    try testing.expectEqualStrings(
+        "NERVA_KEY_NEXT equals NERVA_KEY",
+        Keys.invalid("same-key", "same-key").?,
+    );
 }
 
 fn test_connect(receiver: *const Receiver) !std.net.Stream {

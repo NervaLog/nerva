@@ -14,9 +14,11 @@ const cli = @import("nerva/cli.zig");
 const Client = @import("nerva/client.zig").Client;
 const view_server = @import("nerva/view/server.zig");
 const api_server = @import("nerva/api/server.zig");
+const http_connection = @import("nerva/http_connection.zig");
 const export_file = @import("nerva/export_file.zig");
 const export_ = @import("nerva/export.zig");
 const import_ = @import("nerva/import.zig");
+const release_peers = @import("nerva/release_peers.zig");
 
 const IO = @import("io.zig").IO;
 const Tracer = @import("trace.zig").Tracer;
@@ -288,18 +290,25 @@ fn command_import(
         .replica_count = args.replica_count,
         .release = config.process.release,
         .view = null,
+        .origin = plan.origin,
     });
     try import_.ImporterType(Storage).run(gpa, time, &tracer, &storage, .{
         .cluster = args.cluster,
         .release = config.process.release,
         .input = args.input,
     }, plan);
-    log.info("{}: imported {s}: cluster={} replica_count={} op={}", .{
+    // Import cannot see the cluster, so it says what it needs (P90): a replica imported alone
+    // into a cluster that ran on has forgotten the prepares the replica it replaces acknowledged.
+    log.warn("{}: start this replica only with every replica imported from {s}, before the " ++
+        "cluster runs; to replace a replica of a running cluster, export it again and import " ++
+        "every replica", .{ args.replica, args.input });
+    log.info("{}: imported {s}: cluster={} replica_count={} op={} export={s}", .{
         args.replica,
         args.input,
         args.cluster,
         args.replica_count,
         plan.summary.as_of,
+        release_peers.origin_name(&plan.origin),
     });
 }
 
@@ -330,13 +339,15 @@ fn command_export(gpa: std.mem.Allocator, args: *const cli.Command.Export) !void
     const summary = try export_.run(gpa, &client, &writer, args.as_of);
     try buffered.flush();
     try file.sync();
-    log.info("exported to {s}: op {}, {} changes, {} views, {} ledgers, {} tables", .{
+    log.info("exported to {s}: op {}, {} changes, {} views, {} ledgers, {} tables, " ++
+        "export {s}", .{
         args.output,
         summary.as_of,
         summary.change_count,
         summary.view_count,
         summary.ledger_count,
         summary.table_count,
+        release_peers.origin_name(&writer.digest),
     });
 }
 
@@ -401,10 +412,11 @@ fn command_start(
         replica.replica,
         @divFloor(counting_allocator.live_size(), MiB),
     });
-    log.info("{}: cluster={}: listening on {}", .{
+    log.info("{}: cluster={}: listening on {}; data file from export {s}", .{
         replica.replica,
         replica.cluster,
         replica.message_bus.accept_address.?,
+        release_peers.origin_name(&replica.superblock.working.vsr_state.origin),
     });
 
     // `--addresses=0`: the OS picks a free port, which is printed (alone) to stdout so a parent
@@ -436,25 +448,6 @@ fn command_start(
     }
 }
 
-/// A gateway's keys: `NERVA_KEY`, and `NERVA_KEY_NEXT` while clients move to a new key. To
-/// rotate without refusing anyone: set NERVA_KEY_NEXT on every gateway, move clients to it, then
-/// make it NERVA_KEY and unset NERVA_KEY_NEXT.
-fn gateway_keys(comptime command: []const u8) struct { key: []const u8, key_next: ?[]const u8 } {
-    const key = std.posix.getenv("NERVA_KEY") orelse "";
-    if (key.len == 0) vsr.fatal(.cli, command ++ ": set NERVA_KEY", .{});
-    const key_next = std.posix.getenv("NERVA_KEY_NEXT") orelse "";
-    if (key_next.len > 0) {
-        log.info(command ++ ": accepting NERVA_KEY and NERVA_KEY_NEXT", .{});
-        if (std.mem.eql(u8, key_next, key)) {
-            log.warn(command ++ ": NERVA_KEY_NEXT is the same as NERVA_KEY", .{});
-        }
-        if (std.mem.trim(u8, key_next, " \t\r\n").len == 0) {
-            log.warn(command ++ ": NERVA_KEY_NEXT is only whitespace", .{});
-        }
-    }
-    return .{ .key = key, .key_next = if (key_next.len > 0) key_next else null };
-}
-
 fn command_view(gpa: std.mem.Allocator, args: *const cli.Command.View) !void {
     const keys = gateway_keys("view");
 
@@ -468,8 +461,7 @@ fn command_view(gpa: std.mem.Allocator, args: *const cli.Command.View) !void {
 
     try view_server.serve(gpa, &client, .{
         .listen = args.listen,
-        .key = keys.key,
-        .key_next = keys.key_next,
+        .keys = keys,
         .on_listening = on_listening,
     });
 }
@@ -487,10 +479,21 @@ fn command_api(gpa: std.mem.Allocator, args: *const cli.Command.Api) !void {
 
     try api_server.serve(gpa, &client, .{
         .listen = args.listen,
-        .key = keys.key,
-        .key_next = keys.key_next,
+        .keys = keys,
         .on_listening = on_listening,
     });
+}
+
+/// `NERVA_KEY` and, during a rotation, `NERVA_KEY_NEXT` (P96). Exits if they cannot be used; the
+/// message never names a key.
+fn gateway_keys(comptime command: []const u8) http_connection.Keys {
+    const current = std.posix.getenv("NERVA_KEY") orelse "";
+    const next = std.posix.getenv("NERVA_KEY_NEXT");
+    if (http_connection.Keys.invalid(current, next)) |reason| {
+        vsr.fatal(.cli, command ++ ": {s}", .{reason});
+    }
+    if (next != null) log.info(command ++ ": accepting NERVA_KEY and NERVA_KEY_NEXT", .{});
+    return .{ .current = current, .next = next };
 }
 
 /// For `--listen=…:0`: print the bound port, alone, so a parent process can learn it.
