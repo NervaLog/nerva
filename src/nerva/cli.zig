@@ -115,11 +115,12 @@ const CLIArgs = union(enum) {
         \\  start    Run a replica from the data file at <path>.
         \\
         \\  view     Follow the cluster's change feed and serve declared views. The key is
-        \\           read from NERVA_KEY.
+        \\           read from NERVA_KEY (and, during a rotation, NERVA_KEY_NEXT).
         \\
         \\  api      Serve the cluster as JSON over HTTP: rows, transactions, the feed,
         \\           history, layouts, views, ledgers and documents. The key is read from the
-        \\           NERVA_KEY environment variable.
+        \\           NERVA_KEY environment variable; during a rotation, NERVA_KEY_NEXT is
+        \\           accepted too.
         \\
         \\  export   Write the cluster's changes up to an op, its views and ledgers, and
         \\           checks, to a new file at --output, for `import` of another release.
@@ -174,8 +175,8 @@ const CLIArgs = union(enum) {
         \\        The export file. `export` refuses an existing file.
         \\
         \\  --listen=<host:port>
-        \\        Where to serve HTTP. The bound port is printed to stdout (use port 0 for an
-        \\        ephemeral one).
+        \\        Where to serve HTTP: <ipv4>:<port>, or [<ipv6>]:<port>. The bound port is printed
+        \\        to stdout (use port 0 for an ephemeral one).
         \\
         \\  --development
         \\        Allow running without Direct IO, with small default caches.
@@ -280,14 +281,14 @@ pub fn parse_args(flags: *stdx.Flags) Command {
             .cluster = view.cluster,
             .addresses = view.addresses,
             .listen = listen_parse(view.listen) orelse
-                vsr.fatal(.cli, "view: --listen must be <ipv4>:<port>", .{}),
+                vsr.fatal(.cli, "view: --listen must be <ipv4>:<port> or [<ipv6>]:<port>", .{}),
             .log_debug = view.log_debug,
         } },
         .api => |api| .{ .api = .{
             .cluster = api.cluster,
             .addresses = api.addresses,
             .listen = listen_parse(api.listen) orelse
-                vsr.fatal(.cli, "api: --listen must be <ipv4>:<port>", .{}),
+                vsr.fatal(.cli, "api: --listen must be <ipv4>:<port> or [<ipv6>]:<port>", .{}),
             .log_debug = api.log_debug,
         } },
         .@"export" => |args| .{ .@"export" = .{
@@ -341,10 +342,17 @@ test as_of_parse {
     }
 }
 
+/// `<ipv4>:<port>`, or `[<ipv6>]:<port>` as `--addresses` takes it (Fly's private network is
+/// IPv6 only).
 fn listen_parse(text: []const u8) ?std.net.Address {
     const colon = std.mem.lastIndexOfScalar(u8, text, ':') orelse return null;
     const port = std.fmt.parseInt(u16, text[colon + 1 ..], 10) catch return null;
-    return std.net.Address.parseIp4(text[0..colon], port) catch null;
+    const host = text[0..colon];
+    if (host.len > 0 and host[0] == '[') {
+        if (host.len < 3 or host[host.len - 1] != ']') return null;
+        return std.net.Address.parseIp6(host[1 .. host.len - 1], port) catch null;
+    }
+    return std.net.Address.parseIp4(host, port) catch null;
 }
 
 test listen_parse {
@@ -353,6 +361,24 @@ test listen_parse {
     try std.testing.expect(listen_parse("8090") == null);
     try std.testing.expect(listen_parse("localhost:8090") == null);
     try std.testing.expect(listen_parse("127.0.0.1:99999") == null);
+
+    const loopback = listen_parse("[::1]:8090").?;
+    try std.testing.expectEqual(@as(u16, 8090), loopback.getPort());
+    try std.testing.expectEqual(std.posix.AF.INET6, loopback.any.family);
+    try std.testing.expect((try std.net.Address.parseIp6("::1", 8090)).eql(loopback));
+    try std.testing.expectEqual(
+        @as(u16, 0),
+        listen_parse("[fdaa:0:1:a7b:1::2]:0").?.getPort(),
+    );
+    try std.testing.expectEqual(std.posix.AF.INET6, listen_parse("[::]:8080").?.any.family);
+    // Bracketed only, as `--addresses` takes them; no names, no zone ids.
+    try std.testing.expect(listen_parse("::1:8090") == null);
+    try std.testing.expect(listen_parse("[::1]8090") == null);
+    try std.testing.expect(listen_parse("[::1:8090") == null);
+    try std.testing.expect(listen_parse("[]:8090") == null);
+    try std.testing.expect(listen_parse("[localhost]:8090") == null);
+    try std.testing.expect(listen_parse("[127.0.0.1]:8090") == null);
+    try std.testing.expect(listen_parse("[::1]:99999") == null);
 }
 
 const Error = error{

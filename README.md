@@ -121,14 +121,15 @@ on runners brought up for it. [tests/jepsen](./tests/jepsen/README.md) is a Jeps
 real nodes, clients through `nerva api`, kills, pauses and partitions, and a history checked
 against what Nerva promises (a declared ledger's conservation, so far); it runs by hand (N82).
 
-Binaries report `<protocol>+<commit>`. The protocol release (`0.0.4` since views' `min`, `max`
-and `as_of`, N62) is what data files and clients check: a replica refuses a data file of another
-release, so upgrading means new data files, and accepts clients of its own release only (a v0.3.0
-`nerva api` is refused at registration). A replica ignores peers that
+Binaries report `<protocol>+<commit>`. The protocol release (`0.0.5` since data files record
+the export they were imported from, P90) is what data files and clients check: a replica refuses
+a data file of another release, so upgrading means new data files, and accepts clients from
+`0.0.4` on (v0.4.0's; a v0.3.0 `nerva api` is refused at registration). A replica ignores peers that
 run another release (N61): in a cluster mixing releases, only replicas of one release count
 toward each other's quorums, and each logs the others it ignores. A cluster moves to a new
 release with its data by export and import (below, N80). `zig build test:release` runs a cluster
-of two releases, and an upgrade from this build to another release.
+of two releases, an upgrade from this build to another release, and replicas imported from
+different exports.
 
 ## Running a cluster
 
@@ -183,6 +184,17 @@ nerva start --addresses=3001,3002,3003 0_0.nerva   # and 0_1, 0_2
   history starts there; client sessions do not carry over.
 - Op numbers jump: the new cluster goes on from the first checkpoint at or after the export's
   op. Versions and feed cursors from before stay valid.
+- **Every replica from one export** (P90). An export is named by its SHA-256 (`export` prints
+  it; `import` and `start` log it), and every data file records the export it was imported from
+  (none, for `nerva format`). Replicas handle a peer only once it has announced their export. A
+  replica whose peers of other exports leave it no quorum exits with status 8, naming both
+  exports, and nothing from them reaches its data file: import it again from the cluster's
+  export. The others log that they ignore it and run on. A replica imported from the cluster's
+  export that has not started yet may start later and catch up.
+- **Replacing a lost replica**: export the cluster and import every replica again (the cluster
+  is closed meanwhile). Importing only the lost one is not safe: its replacement forgets the
+  prepares the lost replica acknowledged, and with one more failure a committed op could be lost
+  (P90). A formatted replica cannot join an imported cluster either: its origin is none.
 - A view declared only through the Zig client, with no catalog document, cannot be imported:
   `import` refuses it. Declare views through `nerva api`.
 - Measured (`perf/upgrade.py`, a 4-CPU sandbox, `--development`): a million changes over
@@ -260,6 +272,9 @@ NERVA_KEY=secret ./zig-out/bin/nerva api --cluster=1 --addresses=3001,3002,3003 
 curl -H 'X-Nerva-Key: secret' -d '{"entries":[{"kind":"put","table":1,"id":"5","value_hex":"c0ffee"}]}' \
     http://127.0.0.1:8080/v1/commit        # {"status":"committed","op":"42"}
 ```
+
+`--listen` (for `nerva api` and `nerva view`) takes `<ipv4>:<port>` or `[<ipv6>]:<port>`, as
+`--addresses` does: `--listen=[::]:8080` serves every IPv6 address, as on an IPv6-only network.
 
 | Route | Does |
 |---|---|
@@ -418,6 +433,50 @@ two hashes side by side.
 `zig build test:views` checks `nerva view` against a model on two view processes, and the
 maintained views (latest and as of past ops, with `min` and `max`, whole and in pages) against
 `nerva view`, byte for byte.
+
+## Limits
+
+Every limit a caller can hit, in one place. Each is a constant in the code, asserted where it is
+used; the sections above say why.
+
+**Gateways** (`nerva api`, `nerva view`):
+- A request body is at most 4 MiB; a larger `Content-Length` answers
+  `400 {"error":"body too large"}` before the body is read.
+- A `nerva api` request may allocate at most 128 MiB once parsed; more answers
+  `413 {"error":"request too complex"}`. Between requests the gateway keeps at most 8 MiB.
+- 16 connections are read at once. With all 16 busy, a new connection displaces the oldest one
+  still sending its request.
+- A request must arrive whole within 10 s of connecting, and its reply is written within another
+  10 s. One request per connection (`Connection: close`).
+- Every request but `GET /healthz` needs `X-Nerva-Key`, equal to `NERVA_KEY` or, during a
+  rotation, `NERVA_KEY_NEXT`; anything else answers `401`.
+- A gateway's cluster session times out a request after 30 s; the gateway then answers `503`
+  until it has reconnected.
+
+**Documents:** a value is at most 512 KiB, under a key of at most 1024 bytes of UTF-8. A commit
+carries about 600 KB of keys and values. A `get` takes at most 256 keys, and reads at most as
+many chunks as 256 documents of 64 KiB; more answers `413`.
+
+**Views:** one op touches at most about 4,000 distinct groups and 8,000 `min` and `max` members.
+A transaction that exceeds them alone answers `413 views_too_large` (split it); one that only
+fails to fit after earlier transactions of the same request answers `503 views_busy` (retry).
+A view of more than 10,000 groups is read in pages. A table's views have at most four `min` and
+`max` aggregates between them.
+
+**Client sessions:** a cluster holds 64 client sessions. Every gateway, `nerva view` and Zig
+client takes one; a 65th evicts the session that committed least recently, whose next request
+fails (gateways reconnect on their own).
+
+**Network.** Gateways authenticate their callers with `X-Nerva-Key`, but send it, and every
+reply, in plain HTTP: put them behind TLS (a load balancer or proxy) when callers are not on a
+private network. Replicas do not yet authenticate each other: anyone who can reach a replica's
+port can act as a replica or a client. Run replicas on a private network that only the cluster
+and its gateways can reach.
+
+To rotate a gateway key without downtime: restart every gateway with the new key as
+`NERVA_KEY_NEXT` (it accepts both); move every caller to the new key; then restart every gateway
+with the new key as `NERVA_KEY` and no `NERVA_KEY_NEXT`. Each set key must be non-empty, and the
+two must differ; a gateway refuses to start otherwise, without printing either key (P96).
 
 ## Demos
 
