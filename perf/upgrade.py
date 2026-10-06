@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Measures `nerva export` and `nerva import` (docs/DECISIONS.md N78): wall time and peak memory.
+"""Measures `nerva export` and `nerva import` (docs/DECISIONS.md N80): wall time and peak memory.
 
 Usage: upgrade.py <nerva> <bench-load> [--changes=1000000] [--batch=1024]
                   [--dir=<scratch directory>] [--development]

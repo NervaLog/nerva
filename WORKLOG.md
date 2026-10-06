@@ -741,8 +741,16 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
   (11511081922386736357) pass; seeds 1, 2, 5 and 30 random in ReleaseSafe pass; `check`,
   `test:fmt`, `test:unit` (the sandbox-denied perf test aside).
 
+## 2026-10-05 — CI removes other repositories' workspaces when the disk is still short (N79)
 
-## 2026-10-05 — A new release keeps the data: `nerva export` and `nerva import` (N78, NV-2)
+- `.github/scripts/free_disk.sh`: after emptying the Zig caches, if either filesystem is still
+  below `FREE_MIN_GIB`, removes the other directories in the runner's work directory but its own
+  workspace and the runner's `_*` directories, only under Actions.
+- Verified: in a simulated `_work` (this workspace, another repository's, `_temp`, `_actions`,
+  `_tool`), the other workspace is removed and the rest kept; outside Actions nothing is.
+
+
+## 2026-10-05 — A new release keeps the data: `nerva export` and `nerva import` (N80, NV-2)
 
 - `src/nerva/export_file.zig`: the export file (`NERVAEXP`, version 1; framed records with a
   CRC-32 each; sections in order; a summary; an `end` record with the SHA-256 of all before it),
@@ -766,9 +774,9 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
   bypasses a commit's rules and refuses impossible histories; `LedgerQuery` by slot);
   `export_file.zig` (round trip, every corruption); format guards (`LedgerQuery`, a golden
   export); `tests/release/upgrade.py` in `test:release`; `perf/upgrade.py` for measurement.
-- Docs: README "Upgrading a cluster"; DECISIONS N78; CHANGELOG v0.4.0.
+- Docs: README "Upgrading a cluster"; DECISIONS N80; CHANGELOG v0.4.0.
 - Measured (`perf/upgrade.py`): 1,011,632 changes over 972,000 rows export in 5.8 s (365 MiB)
-  and import in 14.0 s (1,188 MiB); details in N78.
+  and import in 14.0 s (1,188 MiB); details in N80.
 - Verified: `check`, `test:fmt`, `test:unit` 359/360 (the sandbox-denied perf test),
   `test:api`, `test:views`, `test:integration`, `test:release` (mixed releases, then the
   upgrade), `fuzz -- smoke`, VOPR seeds 1, 2 and 5 in ReleaseSafe.

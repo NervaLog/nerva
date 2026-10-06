@@ -355,7 +355,7 @@ pub fn build(b: *std.Build) !void {
         .target = target,
         .mode = mode,
     });
-    // Then an upgrade: an export from `nerva`, imported by the other release (N78). One after
+    // Then an upgrade: an export from `nerva`, imported by the other release (N80). One after
     // the other: each runs a cluster.
     var release_previous: ?*std.Build.Step = null;
     for ([_][]const u8{ "mixed.py", "upgrade.py" }) |script| {

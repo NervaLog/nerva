@@ -1,4 +1,4 @@
-//! `nerva export` (docs/DECISIONS.md N78): a client of a running cluster that writes the change
+//! `nerva export` (docs/DECISIONS.md N80): a client of a running cluster that writes the change
 //! feed up to an op, the declarations of its views and ledgers, and checks of the state at that
 //! op, to an export file (`export_file.zig`). Another release's `nerva import` replays it.
 //!

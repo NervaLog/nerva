@@ -266,7 +266,7 @@ pub const Client = struct {
         return client.get_ledger_query(.{ .id = id });
     }
 
-    /// The ledger declared `slot`th (from 1); all zero if fewer were declared (N78).
+    /// The ledger declared `slot`th (from 1); all zero if fewer were declared (N80).
     pub fn get_ledger_slot(client: *Client, slot: u64) Error!nerva.Ledger {
         assert(slot != 0);
         return client.get_ledger_query(.{ .id = 0, .slot = slot });

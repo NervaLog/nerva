@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""A cluster upgraded to another release keeps its data (docs/DECISIONS.md N78, NV-2).
+"""A cluster upgraded to another release keeps its data (docs/DECISIONS.md N80, NV-2).
 
 Usage: upgrade.py <nerva> <nerva of another release>
 

@@ -1239,7 +1239,7 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                         nerva.LedgerQuery,
                         body[0..@sizeOf(nerva.LedgerQuery)],
                     ));
-                    // By id, or by slot (N78).
+                    // By id, or by slot (N80).
                     query.* = if (prng.boolean())
                         .{ .id = prng.range_inclusive(u32, 1, 2) }
                     else

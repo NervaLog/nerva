@@ -1,4 +1,4 @@
-//! The export file (docs/DECISIONS.md N78): a cluster's change feed, the declarations of its
+//! The export file (docs/DECISIONS.md N80): a cluster's change feed, the declarations of its
 //! views and ledgers, and checks, as `nerva export` writes them and `nerva import` reads them.
 //!
 //! Release-independent: it carries what a client can read (changes, names, ops, definitions),

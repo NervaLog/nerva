@@ -123,7 +123,7 @@ release, so upgrading means new data files, and accepts clients of its own relea
 `nerva api` is refused at registration). A replica ignores peers that
 run another release (N61): in a cluster mixing releases, only replicas of one release count
 toward each other's quorums, and each logs the others it ignores. A cluster moves to a new
-release with its data by export and import (below, N78). `zig build test:release` runs a cluster
+release with its data by export and import (below, N80). `zig build test:release` runs a cluster
 of two releases, and an upgrade from this build to another release.
 
 ## Running a cluster
@@ -145,7 +145,7 @@ of two releases, and an upgrade from this build to another release.
 
 A new release keeps the data: the old release's `nerva export` writes what a client can read,
 and the new release's `nerva import` rebuilds each replica's data file from it, recomputing
-everything derived (views, versions, ledger indexes) with its own code (N78).
+everything derived (views, versions, ledger indexes) with its own code (N80).
 
 ```bash
 # 1. With the old release, while the cluster runs (stop writers first, or pass --as-of=<op>):

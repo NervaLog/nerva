@@ -5,7 +5,7 @@
 //!   persisted enum's values, rendered by reflection and compared to a snapshot.
 //! - Golden values for what Nerva derives and stores: row keys, document chunk ids, the catalog's
 //!   canonical layout and view JSON, and how a layout packs fields into a row.
-//! - The export file's bytes (N78): one release writes it, another reads it, so its format
+//! - The export file's bytes (N80): one release writes it, another reads it, so its format
 //!   changes only with its format version.
 //!
 //! What a fixed script of commits stores is guarded in `state_machine_tests.zig`, beside the

@@ -75,6 +75,11 @@ nerva start --addresses=3001,3002,3003 1_0.nerva
 
 Each release has a CycloneDX 1.5 software bill of materials next to its binaries.
 
+### New: larger documents
+
+A document holds up to 512 KiB (it was 64 KiB), the most one commit writes atomically. Larger
+values belong outside Nerva, stored by their hash. (#25)
+
 ### Fixed
 
 - One request with the raw operation value 134 (`pulse`) from any client crashed every replica,
@@ -94,10 +99,6 @@ Each release has a CycloneDX 1.5 software bill of materials next to its binaries
   not the replica. (#30)
 - One transaction moving the holders of many groups' `min` or `max` to new groups (about 1,600
   rows) panicked every replica, again on restart. (#62)
-
-### Known issues
-
-- A document holds at most 64 KiB. (#25)
 
 ### Upgrading from v0.3.0
 

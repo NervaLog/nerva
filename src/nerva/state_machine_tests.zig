@@ -1309,7 +1309,7 @@ test "ledger: declarations are immutable, one ledger per field, and survive a re
     const definition = accounts_ledger();
     try testing.expect(stdx.equal_bytes(nerva.LedgerDefinition, &stored.definition, &definition));
     try testing.expect(stdx.zeroed(std.mem.asBytes(&try context.get_ledger(2))));
-    // By slot (N78); never by both, nor with reserved bytes.
+    // By slot (N80); never by both, nor with reserved bytes.
     const by_slot = try context.get_ledger_query(.{ .id = 0, .slot = 1 });
     try testing.expect(stdx.equal_bytes(nerva.Ledger, &stored, &by_slot));
     for ([_]nerva.LedgerQuery{
@@ -2198,7 +2198,7 @@ test "views: one op moving every min and max holder it admits to new groups (#62
     try testing.expectEqual(rows, seen);
 }
 
-// ---- Restore (N78) ----
+// ---- Restore (N80) ----
 
 /// Seats with `min` and `max` of the price as well: every kind of view state a restore rebuilds.
 fn extremes_view(name: []const u8) nerva.ViewDefinition {
@@ -2236,7 +2236,7 @@ const RestoreDeclaration = union(enum) {
     ledger: nerva.LedgerDefinition,
 };
 
-/// Restores one op as `nerva import` does (N78), after compacting the ops before it.
+/// Restores one op as `nerva import` does (N80), after compacting the ops before it.
 fn restore_op(
     context: *Context,
     op: u64,

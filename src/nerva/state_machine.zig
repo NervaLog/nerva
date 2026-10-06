@@ -530,7 +530,7 @@ pub fn StateMachineType(comptime Storage: type) type {
         version_timestamp: u64 = 0,
         version_timestamp_max: u64 = 0,
 
-        // ---- Restore (N78) ----
+        // ---- Restore (N80) ----
 
         /// Set from `restore_prefetch` to the end of the matching `restore_*` commit.
         restoring: bool = false,
@@ -2969,7 +2969,7 @@ pub fn StateMachineType(comptime Storage: type) type {
         }
 
         /// Declares a view in `state`: `building` (pulses add the rows already written, none
-        /// possibly), or `ready` when restoring one whose table has no rows (N78).
+        /// possibly), or `ready` when restoring one whose table has no rows (N80).
         fn view_declare(
             self: *StateMachine,
             op: u64,
@@ -3098,7 +3098,7 @@ pub fn StateMachineType(comptime Storage: type) type {
             return 0;
         }
 
-        // ---- Restore (N78) ----
+        // ---- Restore (N80) ----
         //
         // `nerva import` rebuilds a cluster's state from another release's export: every change
         // at its recorded op and timestamp, and the declarations of views and ledgers at theirs.

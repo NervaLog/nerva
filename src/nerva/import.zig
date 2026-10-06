@@ -1,4 +1,4 @@
-//! `nerva import` (docs/DECISIONS.md N78): one replica's data file, rebuilt from an export
+//! `nerva import` (docs/DECISIONS.md N80): one replica's data file, rebuilt from an export
 //! (`export_file.zig`) by this release's code, so that a cluster keeps its data across releases.
 //!
 //! Run once per replica, on the same export: every replica's file holds the same state, since
@@ -669,7 +669,7 @@ pub fn ImporterType(comptime Storage: type) type {
                 for (views, restore.plan.checks_view[0..views.len]) |*view, *check| {
                     assert(view.id == check.id);
                     if (view.state != .ready or check.state != .ready) {
-                        // Building: the new cluster's pulses add the rows (N78).
+                        // Building: the new cluster's pulses add the rows (N80).
                         log.info("view {}: {s} here, {s} in the export: not compared", .{
                             view.id,
                             @tagName(view.state),

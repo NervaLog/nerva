@@ -37,7 +37,7 @@ the VOPR simulator are vendored from TigerBeetle; Nerva's own code is `src/nerva
 ./zig/zig build test:integration  # Real 3-replica cluster + client (~20 s, ~3.5 GiB disk)
 ./zig/zig build test:api      # nerva api (JSON), documents and adds against models, races (~3 min)
 ./zig/zig build test:views    # declared views against a model; maintained views against nerva view (~2 min)
-./zig/zig build test:release  # a cluster of two releases: the odd replica is ignored (~1 min)
+./zig/zig build test:release  # two releases: the odd replica is ignored; export, import (~2.5 min)
 ./zig/zig build test:demo     # seat and canvas demos (3 replicas each) under crashes (~3 min)
 ./zig/zig build               # zig-out/bin/nerva
 ./zig/zig fmt src build.zig

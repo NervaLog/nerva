@@ -197,7 +197,7 @@ fn command_format(
     });
 }
 
-/// Formats the data file, then restores the export into it (N78).
+/// Formats the data file, then restores the export into it (N80).
 fn command_import(
     gpa: std.mem.Allocator,
     args: *const cli.Command.Import,
@@ -244,7 +244,7 @@ fn command_import(
     });
 }
 
-/// Writes the export to a new file; a failure leaves the caller to remove it (N78).
+/// Writes the export to a new file; a failure leaves the caller to remove it (N80).
 fn command_export(gpa: std.mem.Allocator, args: *const cli.Command.Export) !void {
     // Never an existing file: a path given by mistake would be truncated.
     const file = std.fs.cwd().createFile(args.output, .{ .exclusive = true }) catch |err|
