@@ -892,3 +892,6 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
   `nerva view`); `/healthz` alone recovering after an outage; `hash`, `view_hash` and as-of
   history carrying over an import, and a view declared over existing rows rebuilt.
 - Found while updating it: #66 (fixed for v0.4.0 in #73).
+## 2026-10-06 — GOALS-1.0: documents hold 512 KiB
+
+- `docs/GOALS-1.0.md`: G7's status said documents hold up to 64 KiB; N76 raised that to 512 KiB.
