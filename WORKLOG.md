@@ -869,25 +869,6 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
   nothing was sent (now a failure: 860 unknown transfers became 1); and the refusal check then
   counted those failures as refusals (now only Nerva's statuses are).
 
-- `src/vsr/client.zig` (vendored; UPSTREAM.md): `on_messages` drops a buffer received after the
-  eviction instead of asserting. `test:integration` aborted on it in CI: every replica evicts
-  the same session, and `IO.run_once` ran a second replica's receive after the first's
-  eviction. Since #52's fix (`46efdd7`), unreleased.
-- `src/nerva/client.zig`: the eviction comment says so; a unit test hands an evicted client a
-  buffer (it panics without the patch).
-- Verified: `check`, `test:fmt`, `test:unit`, `test:integration`, VOPR seed 1.
-## 2026-10-05 — A view is cataloged only under the state machine's definition (N78; #70)
-
-- `src/nerva/api/api.zig`: `PUT /v1/views/<name>` with no catalog document answers 409 to
-  `different` and `ledger_field` and writes nothing; with the identical document, 200 and the
-  reason. The fake client and catalog in its tests now declare and keep views; a unit test covers
-  the two-gateway race and the repeat PUT.
-- `tests/api/ledgers.py`: a view cataloged while its table's views were full, a ledger over its
-  field, then the same view again (200, unmaintained).
-- Verified: the hardening probes (a gateway stopped between declaring and cataloging: two hits in
-  40 tries, each left one definition; the repeat PUT: 200), `check`, `test:fmt`, `test:unit`,
-  `test:api`, `test:views`.
-
 ## 2026-10-06 — GOALS-1.0: documents hold 512 KiB
 
 - `docs/GOALS-1.0.md`: G7's status said documents hold up to 64 KiB; N76 raised that to 512 KiB.
