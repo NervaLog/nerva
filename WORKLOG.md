@@ -784,7 +784,8 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
 ## 2026-10-05 — `/groups` names its replicated hash `view_hash` (#66)
 
 - `src/nerva/api/api.zig`: `GET /v1/views/<name>/groups` sends `view_hash`, not `hash`, as the
-  whole view and the README already say. `tests/views/maintained.py` follows; CHANGELOG v0.4.0
+  whole view and the README already say. `tests/views/maintained.py` and
+  `tests/release/upgrade.py` (#76) follow; CHANGELOG v0.4.0
   (an incompatible change from v0.3.0) says so; DECISIONS N66 notes it. The tutorial is left
   to #67, which rewrites the views part.
 - Verified: `check`, `test:fmt`, `test:views`.
