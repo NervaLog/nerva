@@ -31,7 +31,7 @@ Runs one replica and two API gateways, then:
 - 401 without the key, 404 and 405;
 - a gateway given `NERVA_KEY` and `NERVA_KEY_NEXT` accepts either and answers 401 to any other
   key; a `NERVA_KEY_NEXT` that is empty or equals `NERVA_KEY` is refused at start, without
-  printing a key (N85).
+  printing a key (P96).
 
 Usage: api.py <path to nerva> [--seed=N] [--steps=N]
 """
@@ -542,7 +542,7 @@ def check_trace_bounded(nerva, tmp):
 
 
 def check_key_rotation(cluster):
-    # During a key rotation a gateway accepts both keys, and nothing else (N85).
+    # During a key rotation a gateway accepts both keys, and nothing else (P96).
     port = cluster.gateway({"NERVA_KEY": KEY, "NERVA_KEY_NEXT": KEY_NEXT})
     lookup = {"rows": [{"table": 1, "id": "0"}]}
     assert request(port, "POST", "/v1/lookup", lookup, key=KEY)[0] == 200

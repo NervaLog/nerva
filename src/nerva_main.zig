@@ -473,7 +473,7 @@ fn command_api(gpa: std.mem.Allocator, args: *const cli.Command.Api) !void {
     });
 }
 
-/// `NERVA_KEY` and, during a rotation, `NERVA_KEY_NEXT` (N85). Exits if they cannot be used; the
+/// `NERVA_KEY` and, during a rotation, `NERVA_KEY_NEXT` (P96). Exits if they cannot be used; the
 /// message never names a key.
 fn gateway_keys(comptime command: []const u8) http_connection.Keys {
     const current = std.posix.getenv("NERVA_KEY") orelse "";

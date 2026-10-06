@@ -914,21 +914,3 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
 - Verified: `check`, `test:unit` (all but the sandbox's `benchmark.perf: usage example`),
   `test:fmt`, `test:api` (with `tests/api/documents.py`: a 512 KiB value under a 1024-byte key,
   one byte more refused, the `get` cap at its edge).
-
-## 2026-10-06 — Gateway key rotation (`NERVA_KEY_NEXT`) and README "Limits" (N85, NV-3)
-
-- `http_connection.Keys` and `key_accepted(keys, candidate)`: `nerva api` and `nerva view` accept
-  `X-Nerva-Key` equal to `NERVA_KEY` or, when set, `NERVA_KEY_NEXT`. Both keys are always
-  compared, each in constant time (`key_matches`), with no early return.
-- `Keys.invalid`: a gateway refuses to start when `NERVA_KEY` is empty, `NERVA_KEY_NEXT` is set
-  but empty, or the two are equal; the message names the variable, never the key.
-- README "Limits": every limit a caller can hit, each checked against the code (an oversized body
-  answers `400 body too large`, not `413`), the network's trust assumptions, and the gateway key
-  rotation. CLI help mentions `NERVA_KEY_NEXT`.
-- Tests: unit (`key_accepted`: current, next, neither, unset next; `Keys.invalid`: equal keys,
-  empty next, empty current); `test:api` starts a gateway with both keys (both 200; missing,
-  wrong, near-miss keys 401; the next key 401 on a gateway without it) and checks that unusable
-  keys stop the gateway without printing them.
-- Verified: `check`, `test:fmt`, `test:unit` (`test-unit` 281 passed, 1 skipped; with stdx 365 of
-  366, the failure `benchmark.perf: usage example`, perf_event_open denied in this sandbox),
-  `test:api`, `test:views`, `fuzz -- smoke`.

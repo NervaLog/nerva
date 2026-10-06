@@ -136,7 +136,7 @@ pub fn key_matches(key_header: ?[]const u8, key: []const u8) bool {
     return equal and key_header != null;
 }
 
-/// A gateway's keys (N85): `X-Nerva-Key` must equal `current` or, during a rotation, `next`.
+/// A gateway's keys (P96): `X-Nerva-Key` must equal `current` or, during a rotation, `next`.
 pub const Keys = struct {
     current: []const u8,
     next: ?[]const u8 = null,
