@@ -907,6 +907,13 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
 - Release `0.0.5`, clients from `0.0.4`: v0.4.0's clients keep working. `VERSION` unchanged.
 - Vendored: `superblock.zig`, `message_header.zig`, `vsr.zig` (`FatalReason`), `replica.zig`,
   `build.zig` (UPSTREAM.md).
+- Found by the 0.0.4 client test: a prepare carries its client's release, and backups admitted
+  only their own, so 0.0.4 clients could not commit to a cluster of more than one replica. Now
+  any accepted client release, unless the prepare's maker last announced another release.
 - Tests: `release_peers`, `export_file` and `import` unit tests; `tests/release/origins.py`
   (#81's case, three exports, a late import of the same export joining past a checkpoint, a
-  0.0.4 client).
+  0.0.4 client, replica 0 replaced at a new address with no survivor restarted).
+- Verified: `check`; `test:unit` (all but the sandbox's `benchmark.perf: usage example`);
+  `test:fmt`; `test:release` (mixed, upgrade, origins); `test:integration`; VOPR in ReleaseSafe,
+  seeds 1, 2, 5, 7270286294366828260, 6604808796972244986, 6787702322491963533 and
+  4693188925445828544.
