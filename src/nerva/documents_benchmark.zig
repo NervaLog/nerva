@@ -13,7 +13,12 @@ test "benchmark: documents" {
     var bench: Bench = .init();
     defer bench.deinit();
 
-    const value_size = bench.parameter("value_size", 4 * stdx.KiB, documents.value_size_max);
+    // 64 KiB, the size this benchmark has measured since the nightly began (N55), not
+    // `value_size_max`: the time is linear in the size, and a larger default moves the metric
+    // and the heap later benchmarks run in, without any code changing (#88). Time the largest
+    // document with `value_size=524288`.
+    const value_size = bench.parameter("value_size", 4 * stdx.KiB, 64 * stdx.KiB);
+    assert(value_size <= documents.value_size_max);
     const document_count = bench.parameter("document_count", 2, 200);
 
     var arena_instance = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -38,8 +43,9 @@ test "benchmark: documents" {
         bench.start();
         for (encoded, 0..) |*chunks, index| {
             chunks.* = try documents.chunks_encode(arena, index, key, value);
+            const id0 = documents.row_id(index, key);
             for (0..chunks.len) |chunk| {
-                checksum +%= documents.chunk_id(index, key, @intCast(chunk));
+                checksum +%= documents.chunk_id_from(id0, @intCast(chunk));
             }
         }
         encode_sample.* = bench.stop();
