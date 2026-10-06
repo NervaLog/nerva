@@ -749,6 +749,38 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
 - Verified: in a simulated `_work` (this workspace, another repository's, `_temp`, `_actions`,
   `_tool`), the other workspace is removed and the rest kept; outside Actions nothing is.
 
+
+## 2026-10-05 — A new release keeps the data: `nerva export` and `nerva import` (N80, NV-2)
+
+- `src/nerva/export_file.zig`: the export file (`NERVAEXP`, version 1; framed records with a
+  CRC-32 each; sections in order; a summary; an `end` record with the SHA-256 of all before it),
+  its writer and its checking reader.
+- `src/nerva/export.zig`, `nerva export`: a client that writes every change up to `--as-of`,
+  the views (name, id, op) and ledgers (definition, op), and checks (view hashes as of the op,
+  ledger totals and per-table row hashes computed from the feed).
+- `src/nerva/import.zig`, `nerva import`: pass 1 checks the whole export and rebuilds views'
+  definitions from their catalog documents; pass 2 formats the data file and restores every op
+  at its number in process, compacting every op and checkpointing at every trigger, writes the
+  WAL and superblock a replica leaves at the last checkpoint (from the `nv2-proto` prototype,
+  generalised to WAL slots that wrap), and checks the restored forest; any failure removes the
+  file.
+- `src/nerva/state_machine.zig`: `restore_prefetch`, `restore_changes`, `restore_view`,
+  `restore_ledger` (in process only), the rows scan for checks, `view_declare` taking the
+  initial state; `get_ledger` by `slot`. `src/nerva.zig`: `LedgerQuery.slot` (from its
+  reserved bytes). `src/nerva/client.zig`: `get_ledger_slot`. `src/nerva/workload.zig`: the
+  VOPR queries ledgers by slot too.
+- `src/nerva/cli.zig`, `src/nerva_main.zig`: the two commands; `--as-of` parsing tested.
+- Tests: `state_machine_tests.zig` (a fixed history restored reads as committed; restore
+  bypasses a commit's rules and refuses impossible histories; `LedgerQuery` by slot);
+  `export_file.zig` (round trip, every corruption); format guards (`LedgerQuery`, a golden
+  export); `tests/release/upgrade.py` in `test:release`; `perf/upgrade.py` for measurement.
+- Docs: README "Upgrading a cluster"; DECISIONS N80; CHANGELOG v0.4.0.
+- Measured (`perf/upgrade.py`): 1,011,632 changes over 972,000 rows export in 5.8 s (365 MiB)
+  and import in 14.0 s (1,188 MiB); details in N80.
+- Verified: `check`, `test:fmt`, `test:unit` 359/360 (the sandbox-denied perf test),
+  `test:api`, `test:views`, `test:integration`, `test:release` (mixed releases, then the
+  upgrade), `fuzz -- smoke`, VOPR seeds 1, 2 and 5 in ReleaseSafe.
+
 ## 2026-10-05 — `/groups` names its replicated hash `view_hash` (#66)
 
 - `src/nerva/api/api.zig`: `GET /v1/views/<name>/groups` sends `view_hash`, not `hash`, as the
@@ -766,4 +798,3 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
 - `src/nerva/client.zig`: the eviction comment says so; a unit test hands an evicted client a
   buffer (it panics without the patch).
 - Verified: `check`, `test:fmt`, `test:unit`, `test:integration`, VOPR seed 1.
-

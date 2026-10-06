@@ -1,4 +1,4 @@
-//! The `nerva` binary: `format`, `start` and `version`.
+//! The `nerva` binary: `format`, `start`, `view`, `api`, `export`, `import` and `version`.
 //!
 //! Trimmed from TigerBeetle's `src/tigerbeetle/main.zig`: no REPL, benchmark, inspection, AOF or
 //! upgrades between releases (every replica runs the single bundled release).
@@ -14,6 +14,9 @@ const cli = @import("nerva/cli.zig");
 const Client = @import("nerva/client.zig").Client;
 const view_server = @import("nerva/view/server.zig");
 const api_server = @import("nerva/api/server.zig");
+const export_file = @import("nerva/export_file.zig");
+const export_ = @import("nerva/export.zig");
+const import_ = @import("nerva/import.zig");
 
 const IO = @import("io.zig").IO;
 const Tracer = @import("trace.zig").Tracer;
@@ -73,6 +76,40 @@ pub fn main() !void {
         .api => |*args| {
             log_level_runtime = if (args.log_debug) .debug else .info;
             try command_api(gpa, args);
+        },
+        .@"export" => |*args| {
+            log_level_runtime = if (args.log_debug) .debug else .info;
+            command_export(gpa, args) catch |err| {
+                std.fs.cwd().deleteFile(args.output) catch {};
+                vsr.fatal(.cli, "export: {s}", .{@errorName(err)});
+            };
+        },
+        .import => |*args| {
+            log_level_runtime = if (args.log_debug) .debug else .info;
+            // Pass 1, before the data file exists: the whole export is checked.
+            var arena = std.heap.ArenaAllocator.init(gpa);
+            defer arena.deinit();
+            const plan = import_.plan(arena.allocator(), args.input) catch |err| switch (err) {
+                error.Corrupt => vsr.fatal(.cli, "import: {s}: {s}", .{
+                    args.input,
+                    export_file.corrupt_reason,
+                }),
+                else => vsr.fatal(.cli, "import: {s}: {s}", .{ args.input, @errorName(err) }),
+            };
+            if (std.fs.cwd().access(args.path, .{})) {
+                vsr.fatal(.cli, "import: {s} exists; give a new file", .{args.path});
+            } else |_| {}
+            // Pass 2. Any failure removes the data file, which the import created.
+            command_import(gpa, args, &plan) catch |err| {
+                std.fs.cwd().deleteFile(args.path) catch {};
+                switch (err) {
+                    error.Corrupt => vsr.fatal(.cli, "import: {s}: {s}", .{
+                        args.input,
+                        export_file.corrupt_reason,
+                    }),
+                    else => vsr.fatal(.cli, "import: {s}", .{@errorName(err)}),
+                }
+            };
         },
         inline .format, .start => |*args, tag| {
             log_level_runtime = if (args.log_debug) .debug else .info;
@@ -135,7 +172,7 @@ pub fn main() !void {
             switch (tag) {
                 .format => try command_format(gpa, &storage, args),
                 .start => try command_start(gpa, &io, time, &tracer, &storage, args),
-                .version, .view, .api => comptime unreachable,
+                .version, .view, .api, .@"export", .import => comptime unreachable,
             }
         },
     }
@@ -157,6 +194,90 @@ fn command_format(
         args.replica,
         args.cluster,
         args.replica_count,
+    });
+}
+
+/// Formats the data file, then restores the export into it (N80).
+fn command_import(
+    gpa: std.mem.Allocator,
+    args: *const cli.Command.Import,
+    plan: *const import_.Plan,
+) !void {
+    var io = try IO.init(2048, 0);
+    defer io.deinit();
+    var time_os: stdx.TimeOS = .{};
+    const time = time_os.interface();
+    var tracer = try Tracer.init(gpa, time, .unknown, .{});
+    defer tracer.deinit(gpa);
+
+    var storage = try Storage.init(&io, &tracer, .{
+        .path = args.path,
+        .size_min = data_file_size_min,
+        .purpose = .format,
+        .direct_io = if (!constants.direct_io)
+            .direct_io_disabled
+        else if (args.development)
+            .direct_io_optional
+        else
+            .direct_io_required,
+    });
+    defer storage.deinit();
+
+    try vsr.format(Storage, gpa, &storage, .{
+        .cluster = args.cluster,
+        .replica = args.replica,
+        .replica_count = args.replica_count,
+        .release = config.process.release,
+        .view = null,
+    });
+    try import_.ImporterType(Storage).run(gpa, time, &tracer, &storage, .{
+        .cluster = args.cluster,
+        .release = config.process.release,
+        .input = args.input,
+    }, plan);
+    log.info("{}: imported {s}: cluster={} replica_count={} op={}", .{
+        args.replica,
+        args.input,
+        args.cluster,
+        args.replica_count,
+        plan.summary.as_of,
+    });
+}
+
+/// Writes the export to a new file; a failure leaves the caller to remove it (N80).
+fn command_export(gpa: std.mem.Allocator, args: *const cli.Command.Export) !void {
+    // Never an existing file: a path given by mistake would be truncated.
+    const file = std.fs.cwd().createFile(args.output, .{ .exclusive = true }) catch |err|
+        switch (err) {
+            error.PathAlreadyExists => vsr.fatal(
+                .cli,
+                "export: {s} exists; give a new file",
+                .{args.output},
+            ),
+            else => return err,
+        };
+    defer file.close();
+
+    var client: Client = undefined;
+    try client.init(gpa, .{
+        .cluster = args.cluster,
+        .addresses = args.addresses.slice(),
+        .timeout = stdx.Duration.seconds(30),
+    });
+    defer client.deinit();
+
+    var buffered = std.io.bufferedWriter(file.writer());
+    var writer = try export_file.WriterType(@TypeOf(buffered).Writer).init(buffered.writer());
+    const summary = try export_.run(gpa, &client, &writer, args.as_of);
+    try buffered.flush();
+    try file.sync();
+    log.info("exported to {s}: op {}, {} changes, {} views, {} ledgers, {} tables", .{
+        args.output,
+        summary.as_of,
+        summary.change_count,
+        summary.view_count,
+        summary.ledger_count,
+        summary.table_count,
     });
 }
 
