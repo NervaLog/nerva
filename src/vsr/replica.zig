@@ -295,6 +295,9 @@ pub fn ReplicaType(
         /// one arrives, and kept across connections (N84). Only consulted when
         /// release_peers_strict.
         peer_origins: [constants.members_max]?[32]u8 = @splat(null),
+        /// Nerva: each peer's release from its latest ping or pong on any connection, for the
+        /// prepares it made (`release_peers.admits`, N84).
+        peer_releases_last: [constants.members_max]?vsr.Release = @splat(null),
         /// Nerva: whether the message bus held a connection to each peer at the last tick.
         peer_connected: [constants.members_max]bool = @splat(false),
 
@@ -1795,9 +1798,11 @@ pub fn ReplicaType(
                 }
                 if (!release_peers.admits(
                     self.release,
+                    self.release_client_min,
                     &self.superblock.working.vsr_state.origin,
                     self.replica,
                     &self.peer_releases,
+                    &self.peer_releases_last,
                     &self.peer_origins,
                     message.header,
                 )) {
@@ -3674,6 +3679,7 @@ pub fn ReplicaType(
                 });
             }
             self.peer_releases[peer] = release;
+            self.peer_releases_last[peer] = release;
         }
 
         /// Nerva: records the origin a peer announced in a ping or pong, says once when it is not

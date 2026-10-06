@@ -13,7 +13,9 @@ journal (#81). Now each data file records its export, and:
   neither before they stopped, and stays up alone);
 - replicas 0 and 1 from A commit past a checkpoint, then replica 2 is imported from A and
   started: it joins, and counts toward the quorum once replica 1 stops;
-- a `nerva api` of `release_client_min` (the second binary) commits and reads against them.
+- a `nerva api` of `release_client_min` (the second binary) commits and reads against them;
+- replica 0 lost and imported again from A at a new address, with no survivor restarted: it
+  joins, and counts toward the quorum once replica 1 stops.
 Nothing panics.
 """
 import http.client
@@ -107,6 +109,13 @@ class Cluster:
              self.data_file(index)],
             stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
             stderr=open(self.data_file(index) + ".log", "a"))
+
+    def move(self, index):
+        """Gives replica `index` a new port, as a replacement machine gets a new address; the
+        running replicas keep the addresses they started with."""
+        ports = self.addresses.split(",")
+        ports[index] = str(free_ports(1)[0])
+        self.addresses = ",".join(ports)
 
     def stop(self, index):
         self.replicas[index].kill()
@@ -267,6 +276,28 @@ def main():
         assert status == 200 and reply["rows"][0]["exists"], (status, reply)
         assert int(reply["rows"][0]["op"]) == op, reply
         late.check_running([0, 2])
+
+        # 5. Replica 0 lost and replaced at a new address, imported from the same export, with no
+        # survivor restarted: a replica dials only higher indexes, so replica 0 reaches 1 and 2.
+        late.start(1)
+        port = late.gateway()
+        for _ in range(50):
+            put(port, next_id)
+            next_id += 1
+        late.stop(0)
+        os.remove(late.data_file(0))
+        late.move(0)
+        late.prepare(0, late.data_file(0))
+        late.start(0)
+        port = late.gateway()  # With the new address.
+        for _ in range(50):
+            put(port, next_id)
+            next_id += 1
+        late.stop(1)  # Now nothing commits unless replica 0, at its new address, counts.
+        for _ in range(50):
+            put(port, next_id)
+            next_id += 1
+        late.check_running([0, 2])
         late.close()
         clusters.remove(late)
 
@@ -274,7 +305,8 @@ def main():
               f"{STATUS_ORIGIN_MISMATCH} and the rest commit on; of three exports, {exited} "
               f"exit; a "
               f"replica imported later from the same export joins past a checkpoint; a client of "
-              f"release_client_min commits; {time.monotonic() - started:.0f} s)")
+              f"release_client_min commits; a replacement at a new address joins; "
+              f"{time.monotonic() - started:.0f} s)")
     finally:
         for cluster in clusters:
             cluster.close()

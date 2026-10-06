@@ -8,16 +8,20 @@
 //! peer's messages only once that peer has announced (in a ping or pong) the release this
 //! replica runs.
 //!
-//! Most replica messages carry release 0, so the check is by peer, not by message. Prepares and
-//! blocks do not name their sender (a prepare may be relayed or repaired by any replica), but
-//! carry the release they were made in, which in Nerva is always the cluster's one release.
+//! Most replica messages carry release 0, so the check is by peer, not by message. Blocks do not
+//! name their sender, but carry the release they were made in. A prepare carries the release of
+//! the client whose request it holds (`replica.zig` copies the request's), any from
+//! `release_client_min` up, and names the primary that made it (`replica`), though any replica
+//! may relay or repair it: it is admitted with a client release this replica accepts, unless its
+//! maker last announced another release.
 //!
 //! The same gate keeps apart replicas imported from different exports (N84, #81): a ping or pong
 //! also announces its sender's origin (`VSRState.origin`, the export's SHA-256, or zero for a
 //! formatted data file), and a peer counts only once it has announced this replica's origin. A
-//! prepare names the primary that made it (`replica`), not its sender: it is refused when that
-//! primary announced another origin. Origins, unlike releases, are remembered across connections,
-//! so that prepares a primary made before it crashed are still repaired. A replica whose peers
+//! prepare is refused when its maker announced another origin. What a peer last announced is
+//! remembered across connections for prepares, so that prepares a primary made before it crashed
+//! are still repaired; its messages need an announcement on its current connection. A replica
+//! whose peers
 //! are so many of other exports that it can never reach a quorum with its own stops
 //! (`origin_refused`): it would never be of use, and the operator must import it again.
 
@@ -30,20 +34,26 @@ const vsr = @import("../vsr.zig");
 const constants = @import("../constants.zig");
 const Header = vsr.Header;
 
-/// Whether a replica running `release`, as replica `replica`, imported from `origin`, should
-/// handle a message with `header`, given each peer's announced release (`peer_releases`, null if
-/// not announced on its current connection) and origin (`peer_origins`, null if never announced).
-/// A ping or pong is checked after its own announcement has been recorded.
+/// Whether a replica running `release` (accepting clients from `release_client_min`), as replica
+/// `replica`, imported from `origin`, should handle a message with `header`, given each peer's
+/// announced release on its current connection (`peer_releases`, null if none yet), and the
+/// release and origin it last announced on any (`peer_releases_last`, `peer_origins`, null if
+/// never). A ping or pong is checked after its own announcement has been recorded.
 pub fn admits(
     release: vsr.Release,
+    release_client_min: vsr.Release,
     origin: *const [32]u8,
     replica: u8,
     peer_releases: []const ?vsr.Release,
+    peer_releases_last: []const ?vsr.Release,
     peer_origins: []const ?[32]u8,
     header: *const Header,
 ) bool {
     assert(release.value != 0);
+    assert(release_client_min.value != 0);
+    assert(release_client_min.value <= release.value);
     assert(peer_releases.len == constants.members_max);
+    assert(peer_releases_last.len == constants.members_max);
     assert(peer_origins.len == constants.members_max);
 
     switch (header.into_any()) {
@@ -53,12 +63,18 @@ pub fn admits(
         // Root and reserved prepares carry release 0.
         .prepare => |prepare| {
             if (prepare.release.value == 0) return true;
-            if (prepare.release.value != release.value) return false;
-            // Relayed or repaired by any replica: refused only once its maker is known to be of
-            // another export.
+            if (prepare.release.value < release_client_min.value or
+                prepare.release.value > release.value) return false;
+            // Relayed or repaired by any replica: refused only once its maker is known to run
+            // another release, or to be of another export.
             if (prepare.replica == replica or prepare.replica >= peer_origins.len) return true;
-            const maker_origin = peer_origins[prepare.replica] orelse return true;
-            return std.mem.eql(u8, &maker_origin, origin);
+            if (peer_releases_last[prepare.replica]) |maker_release| {
+                if (maker_release.value != release.value) return false;
+            }
+            if (peer_origins[prepare.replica]) |maker_origin| {
+                if (!std.mem.eql(u8, &maker_origin, origin)) return false;
+            }
+            return true;
         },
         .block => |block| return block.release.value == release.value,
         else => {},
@@ -151,32 +167,43 @@ const testing = std.testing;
 
 const release_this = vsr.Release.from(.{ .major = 0, .minor = 0, .patch = 3 });
 const release_other = vsr.Release.from(.{ .major = 0, .minor = 0, .patch = 2 });
+/// This replica accepts clients from `release_other` on.
+const release_client_min_this = release_other;
+const release_newer = vsr.Release.from(.{ .major = 0, .minor = 0, .patch = 4 });
 const origin_this: [32]u8 = @splat(0xaa);
 const origin_other: [32]u8 = @splat(0xbb);
 
 const TestPeers = struct {
     releases: [constants.members_max]?vsr.Release,
+    releases_last: [constants.members_max]?vsr.Release,
     origins: [constants.members_max]?[32]u8,
 
     /// Replica 1 is of this release and origin, 2 of another release, 3 has announced nothing,
     /// 4 is of this release and another origin.
     fn init() TestPeers {
-        var peers: TestPeers = .{ .releases = @splat(null), .origins = @splat(null) };
+        var peers: TestPeers = .{
+            .releases = @splat(null),
+            .releases_last = @splat(null),
+            .origins = @splat(null),
+        };
         peers.releases[1] = release_this;
         peers.origins[1] = origin_this;
         peers.releases[2] = release_other;
         peers.origins[2] = origin_this;
         peers.releases[4] = release_this;
         peers.origins[4] = origin_other;
+        peers.releases_last = peers.releases;
         return peers;
     }
 
     fn admits(peers: *const TestPeers, header: *const Header) bool {
         return release_peers_admits(
             release_this,
+            release_client_min_this,
             &origin_this,
             0,
             &peers.releases,
+            &peers.releases_last,
             &peers.origins,
             header,
         );
@@ -237,20 +264,35 @@ test "release_peers: a ping or pong is admitted by what it announces" {
     try testing.expectEqual(null, announced(commit.frame_const()));
 }
 
-test "release_peers: a prepare is refused for its release, or its maker's other export" {
-    const peers: TestPeers = .init();
+test "release_peers: a prepare is refused for its client's release, or its maker's" {
+    var peers: TestPeers = .init();
     var prepare: Header.Prepare =
-        std.mem.zeroInit(Header.Prepare, .{ .command = .prepare, .replica = 2 });
-    prepare.release = release_this; // Made by a replica since moved to another release.
-    try testing.expect(peers.admits(prepare.frame_const()));
-    prepare.replica = 3; // Made by a replica not heard from (it may have crashed since).
-    try testing.expect(peers.admits(prepare.frame_const()));
-    prepare.replica = 4; // Made by a replica of another export.
-    try testing.expect(!peers.admits(prepare.frame_const()));
-    prepare.replica = 0;
-    try testing.expect(peers.admits(prepare.frame_const()));
-    prepare.release = release_other;
+        std.mem.zeroInit(Header.Prepare, .{ .command = .prepare, .replica = 1 });
+    // A prepare carries its client's release: any this replica accepts.
+    for ([_]vsr.Release{ release_this, release_other }) |release_client| {
+        prepare.release = release_client;
+        prepare.replica = 1; // Made by a replica of this release and export.
+        try testing.expect(peers.admits(prepare.frame_const()));
+        prepare.replica = 0;
+        try testing.expect(peers.admits(prepare.frame_const()));
+        prepare.replica = 3; // Made by a replica not heard from (it may have crashed since).
+        try testing.expect(peers.admits(prepare.frame_const()));
+        prepare.replica = 2; // Made by a replica of another release, with a client we accept.
+        try testing.expect(!peers.admits(prepare.frame_const()));
+        prepare.replica = 4; // Made by a replica of another export.
+        try testing.expect(!peers.admits(prepare.frame_const()));
+    }
+    // A client release this replica does not accept, whoever made it.
     prepare.replica = 1;
+    prepare.release = release_newer;
+    try testing.expect(!peers.admits(prepare.frame_const()));
+    prepare.release = vsr.Release.from(.{ .major = 0, .minor = 0, .patch = 1 });
+    try testing.expect(!peers.admits(prepare.frame_const()));
+    // Its maker's last release counts after its connection is gone.
+    prepare.release = release_this;
+    peers.releases[1] = null;
+    try testing.expect(peers.admits(prepare.frame_const()));
+    peers.releases_last[1] = release_newer;
     try testing.expect(!peers.admits(prepare.frame_const()));
     prepare.release = vsr.Release.zero; // Root and reserved prepares.
     prepare.replica = 4;

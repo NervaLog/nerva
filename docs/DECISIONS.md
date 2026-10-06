@@ -1463,10 +1463,18 @@ format change, but blind to exports that reach different checkpoints).
   rejects them (`reserved != 0`); it ignores a peer of another release anyway (N61).
 - **The gate** (`release_peers.zig`, N61's): a peer's messages are handled only once its ping or
   pong has announced this replica's release and origin. A prepare does not name its sender, but
-  names the primary that made it: it is refused when that primary announced another origin.
-  Origins, unlike releases, are remembered across connections, so prepares a primary made
-  before it crashed are still repaired by others (refusing prepares from a maker not yet heard
-  from, as first designed, would have lost them). Left open: a prepare from another export that
+  names the primary that made it: it is refused when that primary last announced another
+  release or another origin. What a peer last announced is remembered across connections for
+  this, so prepares a primary made before it crashed are still repaired by others (refusing
+  prepares from a maker not yet heard from, as first designed, would have lost them).
+- **A prepare carries its client's release**, not its primary's (the vendored primary copies
+  the request's). N61 admitted only prepares of the replica's own release, which held while
+  clients had to match it; with clients from 0.0.4, every backup dropped the prepares of a 0.0.4
+  client's requests, and a cluster of more than one replica could not commit them (the test
+  found it: a 0.0.4 gateway's registration timed out with one replica down). Prepares are now
+  admitted with any client release the replica accepts, unless their maker announced another
+  release; so a v0.4.0 primary's prepares, which carry 0.0.4 too, still never reach a 0.0.5
+  backup once it has heard from it. Left open: a prepare from another export that
   arrives before its maker's first ping still meets the vendored `checkpoint diverged` panic, as
   before; peers ping on connecting, and no test has reached it.
 - **The refusal:** a replica exits with `origin_mismatch` (status 8) once so many of the
@@ -1483,12 +1491,15 @@ format change, but blind to exports that reach different checkpoints).
 - **Release 0.0.5**, clients from 0.0.4 (`release_client_min`): client messages did not change,
   so v0.4.0's clients and gateways (Botpike's APP-L2 and INF-1) keep working. Data files move to
   0.0.5 by export and import, as N80. `VERSION` is unchanged: the owner decides when it ships.
-- **Tests.** Unit: the gate by release and origin, prepares by their maker, the refusal at the
-  quorum's edge for 1 to 6 replicas (`release_peers.zig`); the export file's digest from writer
-  and reader, and another export's differing (`export_file.zig`); a formatted file's origin, all
-  superblock copies (`import.zig`); the header offsets (comptime). `tests/release/origins.py`:
-  three exports before the first checkpoint; replica 0 (the first view's primary) from B,
-  replicas 1 and 2 from A: replica 0 exits 8 naming B, 1 and 2 commit on; one export each: two
-  or three exit 8, and one left up commits nothing; replicas 0 and 1 from A commit past a checkpoint, replica 2 imported from A then joins
-  and carries the quorum with replica 1 stopped; a `nerva api` built as 0.0.4 commits and reads.
-  No log shows a panic.
+- **Tests.** Unit: the gate by release and origin, prepares by their client's release and their
+  maker, the refusal at the quorum's edge for 1 to 6 replicas (`release_peers.zig`); the export
+  file's digest from writer and reader, and another export's differing (`export_file.zig`); a
+  formatted file's origin, all superblock copies (`import.zig`); the header offsets (comptime).
+  `tests/release/origins.py`: three exports before the first checkpoint; replica 0 (the first view's
+  primary) from B, replicas 1 and 2 from A: replica 0 exits 8 naming B, 1 and 2 commit on; one
+  export each: two or three exit 8, and one left up commits nothing; replicas 0 and 1 from A commit
+  past a checkpoint, replica 2 imported from A then joins and carries the quorum with replica 1
+  stopped; a `nerva api` built as 0.0.4 commits and reads; replica 0 lost, imported again at a new
+  address with no survivor restarted, joins and carries the quorum (a replica dials only replicas of
+  higher index, so a replacement at a new address needs the survivors of lower index restarted with
+  the new `--addresses`, and no others). No log shows a panic.
