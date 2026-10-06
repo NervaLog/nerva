@@ -13,7 +13,8 @@ Runs one replica and two API gateways, then:
 - each refusal: unpaired halves, a partner that clamps or sits outside the ledger, a partner
   stopped by its floor, puts, deletes and straddling adds of balances, a different
   declaration under the same id, a field in two ledgers, views over a conserved field in either
-  order (the later one leaves no catalog document), and invalid declarations.
+  order (the later one leaves no catalog document), a ledger over a view that is cataloged but
+  not maintained (the view again still answers 200), and invalid declarations.
 
 Usage: ledgers.py <path to nerva> [--seed=N]
 """
@@ -25,12 +26,15 @@ from api import Cluster, request  # noqa: E402
 ACCOUNTS = 40
 SOURCES = 41
 GROUPED = 42
+CATALOGED = 43
 ACCOUNTS_LAYOUT = {"name": "accounts", "fields": [{"name": "available", "type": "i64"},
                                                   {"name": "held", "type": "i64"},
                                                   {"name": "note", "type": "u64"}]}
 SOURCES_LAYOUT = {"name": "sources", "fields": [{"name": "balance", "type": "i64"}]}
 GROUPED_LAYOUT = {"name": "grouped", "fields": [{"name": "kind", "type": "i64"},
                                                 {"name": "amount", "type": "i64"}]}
+CATALOGED_LAYOUT = {"name": "cataloged", "fields": [*GROUPED_LAYOUT["fields"],
+                                                    {"name": "other", "type": "u8"}]}
 LEDGER = {"fields": [
     # Out of order on purpose: the gateway sorts them.
     {"table": SOURCES, "offset": 0, "floor": None},
@@ -227,6 +231,25 @@ def check_refusals(ports):
         "aggregates": [{"fn": "count"}]})
     assert status == 409, body
     assert request(port, "GET", "/v1/views/funded/definition")[0] == 404
+
+    # A view cataloged while its table's views were full maintains nothing, so a ledger may then
+    # take its field; the same view again still answers 200, unmaintained (#70).
+    status, body = request(port, "PUT", f"/v1/tables/{CATALOGED}", CATALOGED_LAYOUT)
+    assert status == 200, body
+    for index in range(4):
+        status, body = request(port, "PUT", f"/v1/views/full_{index}", {
+            "table": CATALOGED, "aggregates": [{"fn": "count"}], "where": [
+                {"field": "other", "op": "gt", "value": index}]})
+        assert status == 200 and body["maintained"], body
+    by_kind = {"table": CATALOGED, "group_by": ["kind"], "aggregates": [{"fn": "count"}]}
+    status, body = request(port, "PUT", "/v1/views/cataloged", by_kind)
+    assert status == 200 and not body["maintained"], body
+    status, body = request(port, "PUT", "/v1/ledgers/5", {"fields": [
+        {"table": CATALOGED, "field": "kind"}, {"table": CATALOGED, "field": "amount"}]})
+    assert status == 200 and body["declared"] == "created", body
+    status, body = request(port, "PUT", "/v1/views/cataloged", by_kind)
+    assert status == 200 and body["declared"] == "unchanged" and not body["maintained"], body
+    assert body["reason"] == "the view filters or groups by a field of a ledger", body
 
     invalid = [
         ("/v1/ledgers/0", LEDGER),
