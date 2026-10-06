@@ -914,3 +914,18 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
 - Verified: `check`, `test:unit` (all but the sandbox's `benchmark.perf: usage example`),
   `test:fmt`, `test:api` (with `tests/api/documents.py`: a 512 KiB value under a 1024-byte key,
   one byte more refused, the `get` cap at its edge).
+
+## 2026-10-06 — A gateway retries an address it cannot open, instead of aborting (#92)
+
+- Reported by INF-1 (Nerva on Fly): `nerva api` with `--addresses=[::1]:…` on a kernel without
+  IPv6 aborted on the vendored message bus's assertion in `tick_connect` (every dialed replica
+  holds a connection) after `init_tcp` failed with `AddressFamilyNotSupported`. Upstream has the
+  same code.
+- `src/message_bus.zig`: `tick_connect` counts the replicas whose socket could not be opened;
+  `connect_connection` logs the error once per replica until a dial reaches it, and dials again
+  every tick. A gateway that never reaches its cluster now exits after its 30 s registration
+  timeout with an error, as for any unreachable cluster. UPSTREAM.md records the patch.
+- `tests/api/addresses.py` (in `test:api`): a gateway given `[::1]` exits 1 on its timeout,
+  says the error once, and never panics, with or without IPv6 on the host; it fails on the
+  build before this fix (the panic at `message_bus.zig:341`).
+

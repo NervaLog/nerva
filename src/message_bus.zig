@@ -335,10 +335,16 @@ pub fn MessageBusType(comptime IO: type) type {
                 // The client connects to all replicas.
                 .client => 0,
             };
+            // Nerva: a replica whose socket could not be opened (`init_tcp`, say an address
+            // family the kernel lacks) stays unconnected, and is dialed again next tick (#92).
+            var unopened: usize = 0;
             for (bus.replicas[replica_next..], replica_next..) |connection, replica| {
-                if (connection == null) bus.connect(@intCast(replica));
+                if (connection == null) {
+                    bus.connect(@intCast(replica));
+                    if (bus.replicas[replica] == null) unopened += 1;
+                }
             }
-            assert(bus.connections_used >= bus.replicas.len - replica_next);
+            assert(bus.connections_used + unopened >= bus.replicas.len - replica_next);
         }
 
         fn tick_accept(bus: *MessageBus) void {
@@ -512,10 +518,19 @@ pub fn MessageBusType(comptime IO: type) type {
 
             const family = bus.replicas_addresses[replica].ip.family();
             connection.fd = init_tcp(bus.io, bus.process, family) catch |err| {
-                log.err("{}: connect_to_replica: init_tcp error={s}", .{
-                    bus.id,
-                    @errorName(err),
-                });
+                // Nerva: retried every tick, so said once until the replica is reached (#92).
+                const attempts = &bus.replicas_connect_attempts[replica];
+                if (attempts.* == 0) {
+                    log.err("{}: connect_to_replica: init_tcp error={s} to={} " ++
+                        "(retrying; said once)", .{ bus.id, @errorName(err), replica });
+                } else {
+                    log.debug("{}: connect_to_replica: init_tcp error={s} to={}", .{
+                        bus.id,
+                        @errorName(err),
+                        replica,
+                    });
+                }
+                attempts.* +|= 1;
                 return;
             };
             connection.peer = .{ .replica = replica };
