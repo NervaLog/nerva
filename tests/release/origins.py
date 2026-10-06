@@ -10,7 +10,7 @@ journal (#81). Now each data file records its export, and:
 - replicas 1 and 2 from A, replica 0 (the first view's primary) from B: replica 0 exits with
   status 8 (`origin_mismatch`), naming both exports; replicas 1 and 2 ignore it and commit;
 - each replica from another export: at least two exit with status 8 (the last may have heard
-  only one peer before they stopped, and stays up alone);
+  neither before they stopped, and stays up alone);
 - replicas 0 and 1 from A commit past a checkpoint, then replica 2 is imported from A and
   started: it joins, and counts toward the quorum once replica 1 stops;
 - a `nerva api` of `release_client_min` (the second binary) commits and reads against them.
@@ -216,8 +216,8 @@ def main():
         clusters.remove(split)
 
         # 2. Three exports: no replica can reach a quorum. A replica stops once it has heard two
-        # peers of other exports; the last may have heard only one before they stopped, and
-        # then stays up alone, ignoring them, and commits nothing.
+        # peers of other exports, before it answers the second; so the last may have heard
+        # neither before they stopped, and then stays up alone, committing nothing.
         apart = Cluster(tmp, "apart", nerva, importer(lambda index: index))
         clusters.append(apart)
         deadline = time.monotonic() + 60
@@ -228,9 +228,7 @@ def main():
         exited = 0
         for index, replica in enumerate(apart.replicas):
             status = replica.poll()
-            if status is None:
-                assert "was imported from export" in apart.log(index), apart.log(index)[-3000:]
-            else:
+            if status is not None:
                 assert status == STATUS_ORIGIN_MISMATCH, (index, status, apart.log(index)[-3000:])
                 exited += 1
         assert exited >= 2

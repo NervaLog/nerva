@@ -1474,8 +1474,8 @@ format change, but blind to exports that reach different checkpoints).
   larger of the replication and view-change quorums (three replicas: two others; six: three).
   Its message names both exports and says to import it again. The others log once that they
   ignore it and run on. With three exports in a cluster of three, a replica stops once it has
-  heard both others; the last may have heard only one before they stopped, and then stays up
-  alone, ignoring it, and commits nothing (the test allows either). Nothing from a peer of
+  heard both others, before it answers the second; so the last may have heard neither before
+  they stopped, and then stays up alone and commits nothing (the test allows either). Nothing from a peer of
   another export is handled, so nothing of it is written to the refused replica's file.
 - **What it costs:** a replica of an imported cluster is replaced by importing it from the
   cluster's export (it then catches up, past checkpoints), not by `nerva format`: a formatted
@@ -1489,6 +1489,6 @@ format change, but blind to exports that reach different checkpoints).
   superblock copies (`import.zig`); the header offsets (comptime). `tests/release/origins.py`:
   three exports before the first checkpoint; replica 0 (the first view's primary) from B,
   replicas 1 and 2 from A: replica 0 exits 8 naming B, 1 and 2 commit on; one export each: two
-  or three exit 8, and one left up ignores the others; replicas 0 and 1 from A commit past a checkpoint, replica 2 imported from A then joins
+  or three exit 8, and one left up commits nothing; replicas 0 and 1 from A commit past a checkpoint, replica 2 imported from A then joins
   and carries the quorum with replica 1 stopped; a `nerva api` built as 0.0.4 commits and reads.
   No log shows a panic.
