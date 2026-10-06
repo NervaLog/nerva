@@ -157,8 +157,11 @@ class Seats(Demo):
     def state(self, params):
         as_of = params.get("as_of")
         seat_map = self.view("seat_map", as_of)
-        sales_a, sales_b, hashes = self.agreement("sales_by_section", as_of)
-        remaining = self.view("remaining_by_price", as_of)
+        # The other views at the map's op: buyers keep buying, so a later read could count
+        # seats the map does not show yet (#82).
+        pin = as_of or (seat_map["op"] if seat_map else None)
+        sales_a, sales_b, hashes = self.agreement("sales_by_section", pin)
+        remaining = self.view("remaining_by_price", pin)
         with self.lock:
             return 200, {
                 **self.common_state(),

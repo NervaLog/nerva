@@ -76,6 +76,9 @@ nerva start --addresses=3001,3002,3003 1_0.nerva
   release's `nerva export` and the new release's `nerva import`.
 - A view declared only through the Zig client, without a catalog document, cannot be imported:
   `nerva import` refuses it. Declare views through `nerva api`.
+- `nerva export` refuses an export that `nerva import` would refuse, before anything is
+  stopped. `nerva import` writes `<path>.importing` and names it `<path>` only once its checks
+  pass, so a failed or interrupted import leaves no data file to start.
 - `--as-of=<op>` exports the cluster as of an op; by default, as of the export's start.
 - See README, "Upgrading a cluster".
 

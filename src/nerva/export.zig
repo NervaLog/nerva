@@ -15,6 +15,8 @@ const constants = @import("../constants.zig");
 const nerva = @import("../nerva.zig");
 const ledgers = @import("ledgers.zig");
 const export_file = @import("export_file.zig");
+const catalog = @import("catalog.zig");
+const import_ = @import("import.zig");
 const Client = @import("client.zig").Client;
 
 const changes_page_limit =
@@ -25,6 +27,10 @@ pub const Error = error{
     AsOfAhead,
     /// More distinct tables than an export checks.
     TooManyTables,
+    /// More catalog rows than an import restores.
+    TooManyCatalogRows,
+    /// A view that `nerva import` would refuse (the log says why).
+    ViewRefused,
 };
 
 const RowState = struct {
@@ -65,6 +71,23 @@ pub fn run(
     const change_count = try changes_export(gpa, client, writer, as_of, &rows);
     log.info("{} changes, {} rows", .{ change_count, rows.count() });
 
+    // What `nerva import` checks first, checked here too: an export it would refuse is found
+    // before the replicas are stopped (#79).
+    var arena_instance = std.heap.ArenaAllocator.init(gpa);
+    defer arena_instance.deinit();
+    const arena = arena_instance.allocator();
+    var catalog_rows: import_.CatalogRows = .{};
+    var rows_iterator = rows.iterator();
+    while (rows_iterator.next()) |entry| {
+        if (!entry.value_ptr.live) continue;
+        if (entry.key_ptr.* >> 64 != catalog.table_catalog) continue;
+        if (catalog_rows.count() == import_.catalog_rows_max) {
+            log.err("the catalog has more than {} rows", .{import_.catalog_rows_max});
+            return error.TooManyCatalogRows;
+        }
+        try catalog_rows.put(arena, @truncate(entry.key_ptr.*), entry.value_ptr.value);
+    }
+
     var checks_view: [nerva.views_max]export_file.CheckView = undefined;
     var view_count: u32 = 0;
     while (view_count < nerva.views_max) {
@@ -77,11 +100,26 @@ pub fn run(
         if (latest.state == .missing) break;
         if (latest.declared_op > as_of) break; // Ids follow declaration order.
         assert(stdx.zeroed(latest.group_key[32..]));
-        try writer.write(&.{ .view = .{
+        const view: export_file.View = .{
             .name = latest.group_key[0..32].*,
             .id = id,
             .declared_op = latest.declared_op,
-        } });
+        };
+        _ = import_.view_definition(arena, &catalog_rows, &view) catch |err| switch (err) {
+            error.Refused => {
+                // Most often a gateway between declaring the view and writing its catalog
+                // document: the next export finds it. A gateway that stopped there leaves the
+                // view without one until `PUT /v1/views/<name>` is sent again.
+                log.err("view {s}: `nerva import` would refuse it as of op {}: export again " ++
+                    "later, or PUT the view again through `nerva api`", .{
+                    std.mem.sliceTo(&view.name, 0),
+                    as_of,
+                });
+                return error.ViewRefused;
+            },
+            else => return err,
+        };
+        try writer.write(&.{ .view = view });
         const then = try view_header(client, .{
             .view_id = id,
             .group_hash_min = 0,

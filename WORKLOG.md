@@ -796,3 +796,19 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
   refuses an existing data file before reading the export. `src/nerva/cli.zig`: the help lists
   `--trace-size-max` and what `api` serves.
 - Verified: `check`, `test:unit -- "catalog:"`.
+
+## 2026-10-06 — Export and import hardened (N81; #78, #79, #80, #82)
+
+- `src/nerva_main.zig`, `src/nerva/import.zig`: import writes `<path>.importing`, flushes on
+  any error, and links the file to `<path>` only after its checks pass, then syncs the
+  directory (#78). Pass 1 refuses check ids out of order, timestamps past 2^62 and ops past
+  2^48 (#80); progress every 2^20 ops; the catalog limit counts rows, not writes.
+- `src/nerva/export.zig`: export runs `import.view_definition` on each view and the catalog
+  limit before finishing (#79); `nerva_main.zig` names these errors and `TooManyTables`.
+- `demo/seats/server.py`: the sales and remaining views are read at the seat map's op (#82).
+- README, CHANGELOG v0.4.0, DECISIONS N80 and N81. Deferred: #81 (replicas from different
+  exports).
+- Verified: the hardening probes (every crafted case refuses cleanly or imports; a failed check
+  exits 1 and leaves no file; a killed import leaves only `.importing`), the declaration-window
+  sweep, `check`, `test:fmt`, `test:unit`, `test:release`, `test:demo`.
+

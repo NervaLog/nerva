@@ -166,10 +166,14 @@ nerva start --addresses=3001,3002,3003 0_0.nerva   # and 0_1, 0_2
   its op and timestamp, the views' names and ops, the ledgers' definitions and ops, and checks:
   each view's hash, each ledger's total, and a hash of each table's rows. It is versioned,
   checksummed record by record (CRC-32) and as a whole (SHA-256); `export` never overwrites a
-  file.
+  file. It refuses an export `import` would refuse, such as one taken while a gateway was
+  between declaring a view and writing its catalog document (export again, or PUT the view
+  again if that gateway stopped), so nothing is stopped for an export that cannot be used (N81).
 - `import` checks the whole export before it creates the data file, restores every op at its
-  number, then compares its state with the checks. On a damaged export or a mismatch it exits
-  non-zero and removes the file. Every replica's file is identical.
+  number, then compares its state with the checks. It writes `<path>.importing` and gives it its
+  name only once the checks pass: on a damaged export, a mismatch or a crash, no data file is
+  left to start (a killed import leaves `<path>.importing`; remove it and import again). Every
+  replica's file is identical.
 - What carries over: rows, versions (a client's `op_seen` still holds), history, `row?as_of`,
   the change feed with its timestamps (a cursor from before continues), documents, layouts,
   ledgers, and every view's answer and hash. A view declared over rows that already existed is
