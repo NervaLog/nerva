@@ -26,7 +26,7 @@ Every reply shown below is real output from a run of these exact commands agains
 - [Part 6: Adds and ledgers: counters and balances](#part-6-adds-and-ledgers-counters-and-balances)
 - [Part 7: Declared views](#part-7-declared-views)
 - [Part 8: Documents: larger values by key](#part-8-documents-larger-values-by-key)
-- [Part 9: Crashes, timeouts and retries](#part-9-crashes-timeouts-and-retries)
+- [Part 9: Crashes, retries and upgrades](#part-9-crashes-retries-and-upgrades)
 - [Part 10: The Zig client](#part-10-the-zig-client)
 - [Part 11: Inside Nerva, for contributors](#part-11-inside-nerva-for-contributors)
 - [Cheat sheet](#cheat-sheet)
@@ -100,7 +100,7 @@ cd nerva-ledger
 ./zig/download.sh      # installs Zig 0.14.1 into ./zig
 ./zig/zig build        # builds zig-out/bin/nerva (a few minutes the first time)
 ./zig-out/bin/nerva version
-# Nerva version 0.0.4+28cbd79
+# Nerva version 0.0.4+549159e
 ```
 
 The version is `<protocol release>+<commit>`: `0.0.4` is the protocol release of v0.4.0. It
@@ -188,10 +188,10 @@ error(replica): … replica 2 runs release 0.0.3, this replica runs 0.0.4: ignor
 
 Ignored peers count toward nobody's quorum, so a cluster with mixed releases may stop
 committing. Data files are tied to a release too: a replica refuses a file formatted by
-another one. Upgrading therefore means: stop every replica, format new data files with the
-new binary, start them all on it, and load your data again. Clients follow the same rule: a
-v0.4.0 replica refuses clients of older releases when they register, so upgrade `nerva api`,
-`nerva view` and any Zig client together with the cluster.
+another one. So a cluster moves to a new release all at once, with its data carried over by
+`nerva export` and `nerva import` ("Moving to a new release" in Part 9). Clients follow the
+same rule: a v0.4.0 replica refuses clients of older releases when they register, so upgrade
+`nerva api`, `nerva view` and any Zig client together with the cluster.
 
 ---
 
@@ -768,14 +768,14 @@ A view of more than 10,000 groups is too big to answer whole. Read it a page at 
 
 ```bash
 n "$A/v1/views/revenue/groups?limit=1"
-# {"view":"revenue","id":1,"state":"ready","op":"185","declared_op":"129","hash":"3ab4f4c8…","group_count":"2","groups":[{"section":1,"count":"2","sum_price":"200"}],"more":true,"cursor":"17233920722255747274"}
+# {"view":"revenue","id":1,"state":"ready","op":"185","declared_op":"129","view_hash":"3ab4f4c8…","group_count":"2","groups":[{"section":1,"count":"2","sum_price":"200"}],"more":true,"cursor":"17233920722255747274"}
 n "$A/v1/views/revenue/groups?limit=1&cursor=17233920722255747274"
 # {… "groups":[{"section":2,"count":"2","sum_price":"500"}],"more":false,"cursor":null}
 ```
 
 Pages come in storage order (by group hash, not by key), each read at its own op; `as_of` pins
-them all to one. Note that **`hash` here is the replicated hash**, the one called `view_hash`
-on the whole-view route ([#66](https://github.com/Botpike/nerva-ledger/issues/66)).
+them all to one. Each page carries the replicated `view_hash`, the same on every page while
+the view does not change. Reading a view of more than 10,000 groups whole answers `400`.
 
 ### `min` and `max`
 
@@ -799,7 +799,8 @@ n $A/v1/views/cheapest
 # {… "groups":[{"section":1,"count":"2","min_price":"100","max_price":"100"},{"section":2,"count":"2","min_price":"250","max_price":"250"}]}
 ```
 
-A table's views may have at most four `min` and `max` aggregates between them. A view that
+A table has at most four views, and its views may have at most four `min` and `max`
+aggregates between them (64 views in the whole cluster). A view that
 would add a fifth is still declared, but answers `"maintained": false` with a `reason` ("the
 table's views have too many min and max aggregates (at most 4)"). `nerva api` answers `404` for
 it, and only `nerva view` (below) serves it.
@@ -897,17 +898,17 @@ means "must not exist".
 ```bash
 # {"items":[]} as hex
 n -d '{"namespace":"7","reads":[{"key":"cart/alice","version":"0"}],"writes":[{"key":"cart/alice","value_hex":"7b226974656d73223a5b5d7d"}]}' $A/v1/documents/commit
-# {"status":"committed","op":"271"}
+# {"status":"committed","op":"270"}
 
 n -d '{"namespace":"7","keys":["cart/alice","cart/bob"]}' $A/v1/documents/get
-# {"op":"272","documents":[{"key":"cart/alice","exists":true,"version":"271","value_hex":"7b226974656d73223a5b5d7d"},{"key":"cart/bob","exists":false,"version":"0","value_hex":""}]}
+# {"op":"271","documents":[{"key":"cart/alice","exists":true,"version":"270","value_hex":"7b226974656d73223a5b5d7d"},{"key":"cart/bob","exists":false,"version":"0","value_hex":""}]}
 ```
 
 A stale read conflicts and names the key:
 
 ```bash
 n -d '{"namespace":"7","reads":[{"key":"cart/alice","version":"0"}],"writes":[{"key":"cart/alice","delete":true}]}' $A/v1/documents/commit
-# {"status":"conflict","key":"cart/alice","version":"271"}     (409)
+# {"status":"conflict","key":"cart/alice","version":"270"}     (409)
 ```
 
 `documents/get` takes up to 256 keys and an optional `"as_of"`, and reads at most about 16 MiB of
@@ -924,7 +925,7 @@ Each namespace has its own feed:
 
 ```bash
 n "$A/v1/documents/changes?namespace=7&limit=1000"
-# {"documents":[{"key":"cart/alice","op":"271","kind":"put","value_hex":"7b2269…"}],"more":false,"cursor":"…","op":"274"}
+# {"documents":[{"key":"cart/alice","op":"270","kind":"put","value_hex":"7b2269…"}],"more":false,"cursor":"…","op":"273"}
 ```
 
 This feed is filtered from the shared change feed, `limit` records at a time, so a page can come
@@ -933,7 +934,7 @@ going", not "done". Always loop until `more` is false.
 
 ---
 
-## Part 9: Crashes, timeouts and retries
+## Part 9: Crashes, retries and upgrades
 
 Kill the replica the hard way, as in a power cut:
 
@@ -959,7 +960,7 @@ From then on, requests answer `503` at once instead of each waiting 30 seconds, 
 $NERVA start --addresses=3001 --development 1_0.nerva >> replica.log 2>&1 &
 # …about ten seconds later:
 n -d '{"rows":[{"table":6,"id":"1"}]}' $A/v1/lookup
-# {"op":"324","rows":[{"table":6,"id":"1","exists":true,"op":"55",…,"fields":{"available":"0","held":"50"}}]}
+# {"op":"280","rows":[{"table":6,"id":"1","exists":true,"op":"55",…,"fields":{"available":"0","held":"50"}}]}
 curl -s $A/healthz
 # {"ok":true}
 ```
@@ -994,14 +995,84 @@ writes safe to retry:
     {"kind":"read","table":9,"id":"9001","op_seen":"0"},
     {"kind":"put","table":9,"id":"9001","value_hex":"01"},
     {"kind":"add","table":6,"id":"1","field":"held","delta":"-10","min":"0"}]}' $A/v1/commit
-  # first:  {"status":"committed","op":"331","adds":[{"index":2,"applied":"-10","value":"40"}]}
-  # again:  {"status":"conflict","index":0,"op":"331"}     ← already applied, at op 331
+  # first:  {"status":"committed","op":"286","adds":[{"index":2,"applied":"-10","value":"40"}]}
+  # again:  {"status":"conflict","index":0,"op":"286"}     ← already applied, at op 286
   ```
 
   The conflict's `op` even tells you which op the first attempt committed at. Ledger pairs
   are adds too: make them safe to retry the same way.
 
 The demos' client (`demo/nerva_http.py`) never retries a commit for this reason.
+
+### Moving to a new release
+
+A new release runs on new data files (see "One release per cluster" in Part 1), and from
+v0.4.0 on your data comes along. The **old** release's `nerva export` reads everything a client
+can read from the running cluster into one file. The **new** release's `nerva import` builds
+each replica's data file from that file, recomputing everything derived (views, versions,
+ledger indexes) with its own code, and checks the result against the export before it gives you
+a file to start.
+
+You can rehearse the whole procedure with one release. Note a feed cursor first, so you can
+check that it survives:
+
+```bash
+n "$A/v1/changes?limit=1000"          # … "more":false,"cursor":"1791265301982935903" …
+
+$NERVA export --cluster=1 --addresses=3001 --output=cluster.nerva-export
+# info(export_): exporting as of op 317 (the cluster is at op 317)
+# info(main): exported to cluster.nerva-export: op 317, 52 changes, 4 views, 1 ledgers, 8 tables
+```
+
+The export is taken while the cluster runs, as of the op it started at (`--as-of=<op>` picks
+another). Stop writers first, or everything committed after that op is not in it. It never
+overwrites a file (`export: cluster.nerva-export exists; give a new file`), and it refuses up
+front an export that `import` would refuse, before you have stopped anything.
+
+Now stop every replica, and with the new binary import once per replica, each into a **new**
+data file:
+
+```bash
+kill <pid of nerva start>            # every replica
+$NERVA import --cluster=1 --replica=0 --replica-count=1 --input=cluster.nerva-export \
+    --development 1_0.new.nerva
+# info(import_): view 3: building here, ready in the export: not compared
+# info(import_): view 4: building here, ready in the export: not compared
+# info(import_): checks passed: 4 views, 1 ledgers, 8 tables
+# info(main): 0: imported cluster.nerva-export: cluster=1 replica_count=1 op=317
+
+$NERVA start --addresses=3001 --development 1_0.new.nerva >> replica.log 2>&1 &
+```
+
+`import` writes `1_0.new.nerva.importing` and renames it only once every check has passed, so
+a damaged export, a mismatch or a crash never leaves a data file you could start by mistake.
+The gateways reconnect by themselves (in a real upgrade, restart them on the new release). What
+came across:
+
+```bash
+n -d '{"rows":[{"table":1,"id":"42"},{"table":6,"id":"1"}]}' $A/v1/lookup
+# {"op":"1042","rows":[{"table":1,"id":"42","exists":true,"op":"10",…},{"table":6,"id":"1","exists":true,"op":"286",…,"fields":{"available":"0","held":"40"}}]}
+n $A/v1/views/revenue
+# {"view":"revenue","op":"1050","hash":"590cfdb8…",…,"declared_op":"129","groups":[{"section":1,"count":"2","sum_price":"200"},{"section":2,"count":"2","sum_price":"450"}]}
+n "$A/v1/changes?cursor=1791265301982935903&limit=10"
+# {"changes":[],"more":false,"cursor":"1791265301982935903","op":"1057"}
+```
+
+- **Versions survive.** Row 42 still says version `10`, so a client holding `op_seen: "10"`
+  can still compare-and-set against it.
+- **Op numbers jump.** The new cluster continues from the first checkpoint at or after the
+  export's op (op 317 became op 1042 here). Never assume ops are consecutive.
+- **Cursors survive.** The cursor taken before the export reads on: nothing new yet, and after
+  one more write, exactly that write.
+- **Views, ledgers, documents and layouts survive**, with each view's answer and both of its
+  hashes. Views 3 and 4 above were declared over rows that already existed, so the new cluster
+  rebuilds them after it starts (`building`, then `ready`), and their as-of history starts
+  again from there. Client sessions start again too.
+- A view declared only through the Zig client has no catalog document, and `import` refuses
+  it. Declare views through `nerva api`.
+
+v0.3.0 has no `nerva export`, so moving from v0.3.0 to v0.4.0 still means loading your data
+again. From v0.4.0 on, every upgrade works as above.
 
 ### Watching a replica
 
@@ -1082,8 +1153,8 @@ try client.lookup_rows(&.{.{ .id = 42, .table = 1 }}, &rows);
 const change: ?nerva.Change = try client.row_as_of(1, 42, op);
 ```
 
-Also available: `get_changes`, `get_history`, `declare_view`, `get_view`, `declare_ledger`
-and `get_ledger`. A ledger pair is two `add` entries whose `Add` parameters set `flags.pair` on
+Also available: `get_changes`, `get_history`, `declare_view`, `get_view`, `declare_ledger`,
+`get_ledger` and `get_ledger_slot` (to list the ledgers). A ledger pair is two `add` entries whose `Add` parameters set `flags.pair` on
 the first and `flags.delta_from` on the second; the statuses `unpaired`, `conserved_write` and
 `views_too_large` come back in `EntryResult.status` like any other. When a call returns
 `error.Timeout` (the request may still have committed) or `error.Evicted` (the cluster dropped
@@ -1099,7 +1170,7 @@ never `deinit`.
 Read this part before changing Nerva itself. Then read, in order: [CLAUDE.md](../CLAUDE.md)
 (the working protocol, which applies to people too), [docs/TIGER_STYLE.md](./TIGER_STYLE.md)
 (the coding style, which is mandatory), [docs/DECISIONS.md](./DECISIONS.md) (why things are
-the way they are, numbered N1…N75) and [UPSTREAM.md](../UPSTREAM.md) (what is vendored and
+the way they are, numbered N1…N81) and [UPSTREAM.md](../UPSTREAM.md) (what is vendored and
 patched).
 
 ### Where things are
@@ -1190,7 +1261,7 @@ check it.
 | `./zig/zig build test:integration` | Three real replicas and the Zig client | ~20 s, 3.5 GiB disk |
 | `./zig/zig build test:api` | Every JSON route against a model; write races | ~3 min |
 | `./zig/zig build test:views` | Declared and maintained views against models | ~2 min |
-| `./zig/zig build test:release` | A cluster of two releases: the odd replica is ignored | ~1 min |
+| `./zig/zig build test:release` | A cluster of two releases (the odd replica is ignored), and an upgrade by export and import | ~1 min |
 | `./zig/zig build test:demo` | Both demos under random crashes | ~3 min |
 
 `benchmark.perf: usage example` fails in sandboxes that deny `perf_event_open`; that is the
@@ -1234,6 +1305,8 @@ nerva start  --addresses=<a0,a1,…> [--development] [--cache-grid=…] [--cache
              [--statsd=<host:port>] [--trace=<new file>] [--trace-size-max=…] <file>
 NERVA_KEY=… nerva api  --cluster=<id> --addresses=<…> --listen=<host:port>
 NERVA_KEY=… nerva view --cluster=<id> --addresses=<…> --listen=<host:port>
+nerva export --cluster=<id> --addresses=<…> [--as-of=<op>] --output=<new file>
+nerva import --cluster=<id> --replica=<i> --replica-count=<n> --input=<export> [--development] <file>
 ```
 
 **`nerva api` routes** (header `X-Nerva-Key`)
@@ -1281,5 +1354,5 @@ NERVA_KEY=… nerva view --cluster=<id> --addresses=<…> --listen=<host:port>
 - 64-bit numbers are strings.
 - Follow cursors until `more` is false.
 - Never blindly retry a commit.
-- Every replica and client of a cluster runs the same release; upgrading means reformatting.
+- Every replica and client of a cluster runs the same release; upgrade by export and import.
 - Balances that must add up belong in a ledger.

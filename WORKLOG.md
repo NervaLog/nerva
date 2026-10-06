@@ -851,22 +851,25 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
 - The release carries #72, #73, #75 and #83, merged here after the release-candidate
   hardening (N81). Known and deferred: #81.
 
-## 2026-10-05 — Tutorial for v0.4.0
+## 2026-10-06 — Tutorial for v0.4.0
 
-- `docs/TUTORIAL.md` updated for v0.4.0 (`0.0.4`):
+- `docs/TUTORIAL.md` updated for the released v0.4.0 (`0.0.4`):
   - Part 6 gains "Ledgers": declaring one, then funding, reserving and posting as pairs, and
     the three refusals (`unpaired`, `conserved_write`, `out_of_bounds`) (N75).
   - Part 7 is rewritten around views served by `nerva api`: whole reads with `hash`,
-    `view_hash` and `declared_op`, `min_op` and `as_of`, pages, `min` and `max` staying
-    exact through a delete, the four-`min`/`max` limit, views over ledger fields, a real
-    `views_too_large`, and `nerva view` as the independent byte-for-byte check (N62, N66, N72).
-  - Clients must match the replicas' release (N62). The bill of materials (N63). The CI
-    changes (N68, N74). Zig client: `declare_ledger`, `get_ledger`, pairs, and eviction. Code
-    map, decisions N1–N75, cheat sheet.
+    `view_hash` and `declared_op`, `min_op` and `as_of`, pages (`view_hash`, #66), `min` and
+    `max` staying exact through a delete, the per-table limits, views over ledger fields, a
+    real `views_too_large`, and `nerva view` as the independent byte-for-byte check (N62, N66,
+    N72).
+  - Part 9 gains "Moving to a new release": an export and import rehearsed on one release, and
+    what carries over (N80, N81).
+  - Clients must match the replicas' release (N62). The bill of materials (N63). CI (N68,
+    N74). Zig client: ledger calls, `get_ledger_slot`, eviction. Code map, decisions N1–N81,
+    cheat sheet. Part 8 keeps #65's 512 KiB documents.
   - The request-id example in Part 9 moves to table 9, clear of the ledger's tables.
-- Verified: every reply is from one scripted run against a fresh one-replica cluster at
-  `28cbd79`, identical to the earlier runs through Part 6's budget. Checked separately: a fifth
-  `min`/`max` aggregate (declared, not maintained, served by `nerva view`); `/healthz` alone
-  recovering after an outage (#44 fixed).
-- Found while updating it: #66 (`hash` means the replicated hash on `/groups` but the JSON hash
-  on the whole-view route; the README says `/groups` sends `view_hash`).
+- Verified: every reply is from one scripted run against a fresh one-replica cluster at v0.4.0
+  (`549159e` plus this branch's docs), identical to the earlier runs through Part 6's budget.
+  Checked separately: a fifth `min`/`max` aggregate (declared, not maintained, served by
+  `nerva view`); `/healthz` alone recovering after an outage; `hash`, `view_hash` and as-of
+  history carrying over an import, and a view declared over existing rows rebuilt.
+- Found while updating it: #66 (fixed for v0.4.0 in #73).
