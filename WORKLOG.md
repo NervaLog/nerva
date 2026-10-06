@@ -841,3 +841,7 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
 - Verified: the hardening probes (a gateway stopped between declaring and cataloging: two hits in
   40 tries, each left one definition; the repeat PUT: 200), `check`, `test:fmt`, `test:unit`,
   `test:api`, `test:views`.
+
+## 2026-10-06 — GOALS-1.0: documents hold 512 KiB
+
+- `docs/GOALS-1.0.md`: G7's status said documents hold up to 64 KiB; N76 raised that to 512 KiB.
