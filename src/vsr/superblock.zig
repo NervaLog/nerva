@@ -145,7 +145,12 @@ pub const SuperBlockHeader = extern struct {
         /// Number of replicas (determines sizes of the quorums), part of VSR configuration.
         replica_count: u8,
 
-        reserved: [779]u8 = @splat(0),
+        /// Nerva: the SHA-256 of the export `nerva import` built this data file from, or zero if
+        /// `nerva format` made it. Every update keeps it; replicas of one cluster must agree on
+        /// it (P90, #81).
+        origin: [32]u8 = @splat(0),
+
+        reserved: [747]u8 = @splat(0),
 
         comptime {
             assert(@sizeOf(VSRState) == 2048);
@@ -160,6 +165,7 @@ pub const SuperBlockHeader = extern struct {
             replica_count: u8,
             release: vsr.Release,
             view: u32,
+            origin: [32]u8 = @splat(0),
         }) VSRState {
             return .{
                 .checkpoint = .{
@@ -196,6 +202,7 @@ pub const SuperBlockHeader = extern struct {
                 .sync_op_max = 0,
                 .log_view = 0,
                 .view = options.view,
+                .origin = options.origin,
             };
         }
 
@@ -286,6 +293,10 @@ pub const SuperBlockHeader = extern struct {
             }
             assert(old.replica_id == new.replica_id);
             assert(old.replica_count == new.replica_count);
+            // Set once, when the data file is formatted (from the root state).
+            const old_root = old.checkpoint.header.checksum == 0 and
+                old.checkpoint.header.op == 0;
+            assert(old_root or stdx.equal_bytes([32]u8, &old.origin, &new.origin));
             assert(stdx.equal_bytes([constants.members_max]u128, &old.members, &new.members));
 
             if (old.checkpoint.header.op > new.checkpoint.header.op) return false;
@@ -756,6 +767,8 @@ pub fn SuperBlockType(comptime Storage: type) type {
             /// Set to null during initial cluster formatting.
             /// Set to the target view when constructing a new data file for a reformatted replica.
             view: ?u32,
+            /// Nerva: `VSRState.origin` (P90).
+            origin: [32]u8 = @splat(0),
         };
 
         pub fn format(
@@ -844,6 +857,7 @@ pub fn SuperBlockType(comptime Storage: type) type {
                     .members = members,
                     .replica_count = options.replica_count,
                     .view = options.view orelse 0,
+                    .origin = options.origin,
                 }),
                 .view_headers = vsr.Headers.ViewChangeArray.root(options.cluster),
             };

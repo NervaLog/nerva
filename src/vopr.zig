@@ -279,7 +279,9 @@ pub fn main() !void {
         upgrades_done =
             for (simulator.cluster.replicas, simulator.cluster.replica_health) |*replica, health| {
                 if (health != .up) continue;
-                const release_latest = releases[simulator.replica_releases_limit - 1].release;
+                // Nerva: the lane's own releases (the `nerva` lane runs one, not `releases[0]`).
+                const release_latest = simulator.options.cluster
+                    .releases[simulator.replica_releases_limit - 1].release;
                 if (replica.release.value == release_latest.value) {
                     break true;
                 }
@@ -416,9 +418,21 @@ fn options_swarm(prng: *stdx.PRNG) Simulator.Options {
         // Nerva runs one release per cluster and never upgrades in place (N43): its replicas
         // ignore peers of another release (N61). The testing lane simulates TigerBeetle's
         // multiversion upgrades.
-        .releases = if (state_machine == .nerva) releases[0..1] else &releases,
+        // Nerva's one release is 0.0.2, which accepts clients from 0.0.1: the clients run either,
+        // so prepares of an older client's release cross the replicas' gate (P90). The origin,
+        // every replica's, is none (formatted) or an export's (imported), and reformatted replicas
+        // take it too.
+        .releases = if (state_machine == .nerva) releases[1..2] else &releases,
         .release_peers_strict = state_machine == .nerva,
-        .client_release = releases[0].release,
+        .client_release = if (state_machine == .nerva and prng.boolean())
+            releases[1].release
+        else
+            releases[0].release,
+        .origin = if (state_machine == .nerva and prng.boolean()) origin: {
+            var origin: [32]u8 = undefined;
+            prng.fill(&origin);
+            break :origin origin;
+        } else @splat(0),
         .reformats_max = replica_count + 2, // Arbitrary reformat limit.
 
         .state_machine = switch (state_machine) {

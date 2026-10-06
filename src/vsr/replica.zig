@@ -291,6 +291,13 @@ pub fn ReplicaType(
         /// Nerva: each peer's running release, from its latest ping or pong; null until one
         /// arrives. Only consulted when release_peers_strict.
         peer_releases: [constants.members_max]?vsr.Release = @splat(null),
+        /// Nerva: each peer's origin (`VSRState.origin`), from its latest ping or pong; null until
+        /// one arrives, and kept across connections (P90). Only consulted when
+        /// release_peers_strict.
+        peer_origins: [constants.members_max]?[32]u8 = @splat(null),
+        /// Nerva: each peer's release from its latest ping or pong on any connection, for the
+        /// prepares it made (`release_peers.admits`, P90).
+        peer_releases_last: [constants.members_max]?vsr.Release = @splat(null),
         /// Nerva: whether the message bus held a connection to each peer at the last tick.
         peer_connected: [constants.members_max]bool = @splat(false),
 
@@ -1787,16 +1794,20 @@ pub fn ReplicaType(
             if (self.release_peers_strict) {
                 if (release_peers.announced(message.header)) |announcement| {
                     self.on_release_announced(announcement.replica, announcement.release);
+                    self.on_origin_announced(announcement.replica, &announcement.origin);
                 }
                 if (!release_peers.admits(
                     self.release,
+                    self.release_client_min,
+                    &self.superblock.working.vsr_state.origin,
                     self.replica,
                     &self.peer_releases,
+                    &self.peer_releases_last,
+                    &self.peer_origins,
                     message.header,
                 )) {
-                    log.debug("{}: on_message: ignoring (peer release unknown or other)", .{
-                        self.log_prefix(),
-                    });
+                    log.debug("{}: on_message: ignoring (peer release or origin unknown or " ++
+                        "other)", .{self.log_prefix()});
                     return;
                 }
             }
@@ -1903,6 +1914,7 @@ pub fn ReplicaType(
                 // Copy the ping's monotonic timestamp to our pong and add our wall clock sample:
                 .ping_timestamp_monotonic = message.header.ping_timestamp_monotonic,
                 .pong_timestamp_wall = @bitCast(self.clock.realtime()),
+                .origin = self.superblock.working.vsr_state.origin, // P90.
             }));
 
             if (message.header.replica < self.replica_count) {
@@ -3667,6 +3679,52 @@ pub fn ReplicaType(
                 });
             }
             self.peer_releases[peer] = release;
+            self.peer_releases_last[peer] = release;
+        }
+
+        /// Nerva: records the origin a peer announced in a ping or pong, says once when it is not
+        /// this replica's, and stops this replica when peers of other exports leave it no quorum
+        /// (P90, #81).
+        fn on_origin_announced(self: *Replica, peer: u8, origin: *const [32]u8) void {
+            assert(self.release_peers_strict);
+            if (peer == self.replica or peer >= self.node_count) return;
+            const origin_self = &self.superblock.working.vsr_state.origin;
+            const known = self.peer_origins[peer];
+            if (!std.mem.eql(u8, origin, origin_self) and
+                (known == null or !std.mem.eql(u8, &known.?, origin)))
+            {
+                log.err("{}: replica {} was imported from export {s}, this replica from {s}: " ++
+                    "ignoring it (every replica must be imported from the same export)", .{
+                    self.log_prefix(),
+                    peer,
+                    release_peers.origin_name(origin),
+                    release_peers.origin_name(origin_self),
+                });
+            }
+            self.peer_origins[peer] = origin.*;
+            if (release_peers.origin_refused(
+                self.replica_count,
+                self.replica,
+                origin_self,
+                &self.peer_origins,
+            )) {
+                vsr.fatal(.origin_mismatch, "{}: this replica was imported from export {s}, but " ++
+                    "{} of the cluster's {} replicas announce another: it can never reach a " ++
+                    "quorum. Import every replica from the same export: import this one again " ++
+                    "(replica {} announces {s})", .{
+                    self.log_prefix(),
+                    release_peers.origin_name(origin_self),
+                    release_peers.origin_others(
+                        self.replica_count,
+                        self.replica,
+                        origin_self,
+                        &self.peer_origins,
+                    ),
+                    self.replica_count,
+                    peer,
+                    release_peers.origin_name(origin),
+                });
+            }
         }
 
         /// Sends a ping to one peer, or to every other replica and standby (`peer` null).
@@ -3692,6 +3750,7 @@ pub fn ReplicaType(
                 .checkpoint_op = self.op_checkpoint(),
                 .ping_timestamp_monotonic = self.clock.monotonic().ns,
                 .release_count = releases.count,
+                .origin = self.superblock.working.vsr_state.origin, // P90.
             };
 
             const ping_versions = std.mem.bytesAsSlice(vsr.Release, message.body_used());
