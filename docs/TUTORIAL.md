@@ -56,6 +56,21 @@ follow from it, and they run through the whole tutorial:
    by section for sold seats", and from then on every commit maintains it, with a hash that two
    copies can compare.
 
+### What Nerva is for
+
+Nerva is meant to be a **system of record for autonomous agency**. When software agents act on
+someone's behalf (spending from a budget, claiming a job, asking for and acting on an approval),
+the questions that follow are an auditor's: what ran, who authorized it, and was what it relied
+on current? A system of record answers them from its own guarantees, without depending on the
+care of every application around it. Here is how Nerva's guarantees answer them. Each
+authorization, receipt and balance change is a position in one log. A claim is a compare-and-set
+that exactly one agent wins (Part 3). A budget is a ledger that no request can overdraw or
+inflate (Part 6). What an agent knew when it decided is a read as of the op of its decision
+(Part 4), and a report is a view whose hash anyone can check (Part 7). Nerva itself stays
+general: it knows nothing about agents, and each application's own rules live in that
+application. Two parts of this picture are still to come: exactly-once effects on outside
+systems, and approvals tied to an identity ([docs/GOALS-1.0.md](./GOALS-1.0.md), G5 and G7).
+
 The machinery underneath (Viewstamped Replication consensus, an LSM storage engine, io_uring
 IO and a deterministic simulator) is vendored from [TigerBeetle](https://github.com/tigerbeetle/tigerbeetle).
 Nerva's own code is the state machine on top, plus the gateways and tools around it.

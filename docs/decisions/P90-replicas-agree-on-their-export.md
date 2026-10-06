@@ -34,9 +34,12 @@ format change, but blind to exports that reach different checkpoints).
   lives in memory only. Persisting it would be another on-disk change for a narrow race; rejected.)
 - **Left open, and why it is acceptable:** a prepare from a replica of another release or export
   that arrives before its maker's first ping is not refused by the gate. It still cannot do harm
-  silently: its checkpoint id is another lineage's, and a backup in normal status stops on the
-  vendored `checkpoint diverged` panic before it acknowledges it; peers ping on connecting, and no
-  test has reached it.
+  silently: its checkpoint id is another lineage's, and a backup stops loudly before it
+  acknowledges it, in one of two places. In normal status, `on_prepare` stops on the vendored
+  `checkpoint diverged` panic. If the op lands past the backup's `op_prepare_max`, `on_prepare`
+  skips that check, but repairing the ops below it stops on the assertion in `repair_header` that
+  a header's checkpoint id is the backup's own (`checkpoint_id_for_op`). Peers ping on connecting,
+  and no test has reached it.
 - **A prepare carries its client's release**, not its primary's (the vendored primary copies the
   request's). N61 admitted only prepares of the replica's own release, so every backup dropped the
   prepares of an older accepted client's requests, its registration included, and a cluster of more
@@ -83,10 +86,12 @@ format change, but blind to exports that reach different checkpoints).
   primary) from B, replicas 1 and 2 from A: replica 0 exits 8 naming B, 1 and 2 commit on; one
   export each: two or three exit 8, and one left up commits nothing; replicas 0 and 1 from A commit
   past a checkpoint, replica 2, imported from A and never started before, then joins and carries the
-  quorum with replica 1 stopped; a `nerva api` built as 0.0.4 commits and reads, and commits again
-  after its primary dies with commits in flight and both others restart (a liveness check only: it
-  passes on the earlier gate too, so it does not reach the repair the review described; the gate's
-  decision for a maker not heard from is pinned by the unit test, which fails on the earlier gate).
+  quorum with replica 1 stopped; a `nerva api` built as 0.0.4 commits and reads; through it, the
+  backup X that is the next view's primary stops, the primary and the other backup Y commit 21
+  ops at quorum 2, both die, and X and Y restart: X becomes the primary once it has repaired the
+  dead primary's prepares from Y, and they commit again (on the earlier gate nothing commits in
+  180 s, twice out of twice; on this one it passed four times out of four). The unit test pins
+  the gate's decision for a maker not heard from.
   No log shows a panic. VOPR: the `nerva` lane's release is 0.0.2, accepting clients from 0.0.1; its
   clients run 0.0.1 or 0.0.2 by seed, so older clients' prepares cross the gate under faults, and
   every replica's origin, reformatted ones' too, is none or random by seed.
