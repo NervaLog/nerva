@@ -121,14 +121,15 @@ on runners brought up for it. [tests/jepsen](./tests/jepsen/README.md) is a Jeps
 real nodes, clients through `nerva api`, kills, pauses and partitions, and a history checked
 against what Nerva promises (a declared ledger's conservation, so far); it runs by hand (N82).
 
-Binaries report `<protocol>+<commit>`. The protocol release (`0.0.4` since views' `min`, `max`
-and `as_of`, N62) is what data files and clients check: a replica refuses a data file of another
-release, so upgrading means new data files, and accepts clients of its own release only (a v0.3.0
-`nerva api` is refused at registration). A replica ignores peers that
+Binaries report `<protocol>+<commit>`. The protocol release (`0.0.5` since data files record
+the export they were imported from, N84) is what data files and clients check: a replica refuses
+a data file of another release, so upgrading means new data files, and accepts clients from
+`0.0.4` on (v0.4.0's; a v0.3.0 `nerva api` is refused at registration). A replica ignores peers that
 run another release (N61): in a cluster mixing releases, only replicas of one release count
 toward each other's quorums, and each logs the others it ignores. A cluster moves to a new
 release with its data by export and import (below, N80). `zig build test:release` runs a cluster
-of two releases, and an upgrade from this build to another release.
+of two releases, an upgrade from this build to another release, and replicas imported from
+different exports.
 
 ## Running a cluster
 
@@ -183,6 +184,14 @@ nerva start --addresses=3001,3002,3003 0_0.nerva   # and 0_1, 0_2
   history starts there; client sessions do not carry over.
 - Op numbers jump: the new cluster goes on from the first checkpoint at or after the export's
   op. Versions and feed cursors from before stay valid.
+- **Every replica from one export** (N84). An export is named by its SHA-256 (`export` prints
+  it; `import` and `start` log it), and every data file records the export it was imported from
+  (none, for `nerva format`). Replicas handle a peer only once it has announced their export. A
+  replica whose peers of other exports leave it no quorum exits with status 8, naming both
+  exports, and nothing from them reaches its data file: import it again from the cluster's
+  export. The others log that they ignore it and run on. A replica imported later from the same
+  export joins and catches up; so a lost replica of an imported cluster is replaced by importing
+  it from the cluster's export, not by `nerva format`.
 - A view declared only through the Zig client, with no catalog document, cannot be imported:
   `import` refuses it. Declare views through `nerva api`.
 - Measured (`perf/upgrade.py`, a 4-CPU sandbox, `--development`): a million changes over

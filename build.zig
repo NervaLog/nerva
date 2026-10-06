@@ -357,16 +357,33 @@ pub fn build(b: *std.Build) !void {
         .target = target,
         .mode = mode,
     });
-    // Then an upgrade: an export from `nerva`, imported by the other release (N80). One after
-    // the other: each runs a cluster.
+    // `origins.py` also runs a client of the oldest release this build accepts: the same code
+    // under `release_client_min` (N84).
+    const vsr_options_client = b.addOptions();
+    vsr_options_client.addOption(?[40]u8, "git_commit", options.git_commit[0..40].*);
+    vsr_options_client.addOption(bool, "config_verify", options.config_verify);
+    vsr_options_client.addOption([]const u8, "release", release_client_min);
+    vsr_options_client.addOption([]const u8, "release_client_min", release_client_min);
+    const nerva_client_min = nerva_executable(b, .{
+        .stdx_module = stdx_module,
+        .vsr_options = vsr_options_client,
+        .target = target,
+        .mode = mode,
+    });
+    // Then an upgrade: an export from `nerva`, imported by the other release (N80); then
+    // replicas imported from different exports (N84). One after the other: each runs a cluster.
     var release_previous: ?*std.Build.Step = null;
-    for ([_][]const u8{ "mixed.py", "upgrade.py" }) |script| {
+    for ([_][]const u8{ "mixed.py", "upgrade.py", "origins.py" }) |script| {
         const run_release_test = b.addSystemCommand(&.{
             "python3",
             b.fmt("tests/release/{s}", .{script}),
         });
         run_release_test.addFileArg(nerva.getEmittedBin());
-        run_release_test.addFileArg(nerva_other.getEmittedBin());
+        const nerva_second = if (std.mem.eql(u8, script, "origins.py"))
+            nerva_client_min
+        else
+            nerva_other;
+        run_release_test.addFileArg(nerva_second.getEmittedBin());
         if (b.args) |args| run_release_test.addArgs(args);
         run_release_test.setCwd(b.path("."));
         run_release_test.has_side_effects = true;

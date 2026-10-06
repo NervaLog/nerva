@@ -1416,7 +1416,7 @@ the old cluster was stopped.
   says to export again, or to PUT the view again if that gateway stopped (#79). Import counts a
   catalog row once however often it is written.
 - Not done, recorded for later: replicas imported from two different exports that reach the
-  same checkpoint stop on an assertion when they meet, not a message (#81).
+  same checkpoint stop on an assertion when they meet, not a message (#81). Done in N84.
 
 **N82. A Jepsen suite tests real processes through `nerva api`; it runs on Fly, nightly.**
 The VOPR simulates replicas, not processes: Jepsen's TigerBeetle report (2025) found its bugs
@@ -1443,3 +1443,50 @@ choice over a separate repository.
   Docker as root), not on the Hetzner fuzzing fleet: a few hours a night bills by the second.
 - **Not replayable.** A run has no seed; a failure is reproduced as a VOPR seed or unit test
   before it is fixed, so it stays covered.
+
+**N84. Every data file records the export it was imported from; replicas of other exports are
+refused, and release 0.0.5 accepts clients from 0.0.4.**
+Extends N80 and N81 (#81). Replicas imported from two exports that reach one checkpoint met
+there with different logs, and the odd one panicked in the vendored journal
+(`find_latest_headers_break_between`) after the view change: loud, but an assertion, not the
+operator's mistake named. Import cannot see the other replicas' files, so the check is where
+replicas meet. Chosen by the owner over comparing the checkpoint ids pings already carry (no
+format change, but blind to exports that reach different checkpoints).
+- **The export's identity** is the SHA-256 its `end` record holds (N80): `nerva export` prints
+  it, `nerva import` logs it and writes it to the data file, `nerva start` logs it. Two exports
+  of one cluster at different ops are different exports, even with no write between them.
+- **On disk:** `VSRState.origin: [32]u8`, from the superblock's reserved bytes; zero for
+  `nerva format`. Every superblock update copies the VSR state, so it lasts the file's life;
+  `monotonic` asserts that nothing after the root state changes it. A formatted file's bytes are
+  unchanged (the golden checksum holds).
+- **On the wire:** pings and pongs carry `origin` in their reserved bytes. A 0.0.4 replica
+  rejects them (`reserved != 0`); it ignores a peer of another release anyway (N61).
+- **The gate** (`release_peers.zig`, N61's): a peer's messages are handled only once its ping or
+  pong has announced this replica's release and origin. A prepare does not name its sender, but
+  names the primary that made it: it is refused when that primary announced another origin.
+  Origins, unlike releases, are remembered across connections, so prepares a primary made
+  before it crashed are still repaired by others (refusing prepares from a maker not yet heard
+  from, as first designed, would have lost them). Left open: a prepare from another export that
+  arrives before its maker's first ping still meets the vendored `checkpoint diverged` panic, as
+  before; peers ping on connecting, and no test has reached it.
+- **The refusal:** a replica exits with `origin_mismatch` (status 8) once so many of the
+  cluster's replicas announced another origin that the rest, with it, can never reach the
+  larger of the replication and view-change quorums (three replicas: two others; six: three).
+  Its message names both exports and says to import it again. The others log once that they
+  ignore it and run on. With three exports in a cluster of three, all three exit. Nothing from a
+  peer of another export is handled, so nothing of it is written to the refused replica's file.
+- **What it costs:** a replica of an imported cluster is replaced by importing it from the
+  cluster's export (it then catches up, past checkpoints), not by `nerva format`: a formatted
+  file's origin is none, and an imported cluster refuses it.
+- **Release 0.0.5**, clients from 0.0.4 (`release_client_min`): client messages did not change,
+  so v0.4.0's clients and gateways (Botpike's APP-L2 and INF-1) keep working. Data files move to
+  0.0.5 by export and import, as N80. `VERSION` is unchanged: the owner decides when it ships.
+- **Tests.** Unit: the gate by release and origin, prepares by their maker, the refusal at the
+  quorum's edge for 1 to 6 replicas (`release_peers.zig`); the export file's digest from writer
+  and reader, and another export's differing (`export_file.zig`); a formatted file's origin, all
+  superblock copies (`import.zig`); the header offsets (comptime). `tests/release/origins.py`:
+  three exports before the first checkpoint; replica 0 (the first view's primary) from B,
+  replicas 1 and 2 from A: replica 0 exits 8 naming B, 1 and 2 commit on; one export each: all
+  exit 8; replicas 0 and 1 from A commit past a checkpoint, replica 2 imported from A then joins
+  and carries the quorum with replica 1 stopped; a `nerva api` built as 0.0.4 commits and reads.
+  No log shows a panic.
