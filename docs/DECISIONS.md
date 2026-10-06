@@ -1476,3 +1476,13 @@ for itself, never derived from a limit that may move.
   that path in the range, sorting `Group`s instead of the hash map's entries (N66), is the same
   speed. The 64 KiB benchmark restores the process `latest` ran in before; #91 is the cause
   (benchmarks share one process), left for later. The next night confirms the fix.
+
+**N85. Every release is preceded by an adversarial review.** The owner, 2026-10-06. Reviews during
+v0.5.0's work found a bug that two releases had shipped with: older clients could not register
+with a multi-replica cluster (#93, present since v0.3.0). PR reviews look at one change at a
+time; a release needs a review of everything it ships, together. So before the `VERSION`
+commit, a bot that did none of the release's work reviews the release candidate to break it:
+the diff since the last tag, every vendored patch, upgrade and downgrade, the invariants in
+CLAUDE.md, plus VOPR seeds, fuzzers and the release, integration and Jepsen suites. Findings are
+issues labelled `release-review`; the release waits until each blocker is fixed or waived by the
+owner in writing, and the CHANGELOG section links them. CLAUDE.md, "Commands", states the rule.

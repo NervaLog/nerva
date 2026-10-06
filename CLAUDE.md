@@ -55,6 +55,16 @@ written for people running Nerva: new capabilities with examples, fixes with the
 upgrade steps), then bump `VERSION` (and add a WORKLOG entry) in its own commit. The section
 becomes the GitHub release notes; a version without one is refused.
 
+**Before every release, an adversarial review (N85).** Before the `VERSION` commit, a separate
+bot with no part in the release's work reviews the release candidate (the `main` commit to be
+released) adversarially: its job is to break it, not to approve it. It reads every change since
+the last tag, every vendored patch (UPSTREAM.md) and the upgrade and downgrade paths, hunts for
+invariant violations (determinism, `commit` doing IO, unbounded queues, renumbered identifiers,
+lost committed ops), and runs VOPR seeds, the fuzzers and the release, integration and Jepsen
+suites against it. Each finding is a GitHub issue labelled `release-review`. The release waits
+until every blocker is fixed or the owner waives it in writing, and the CHANGELOG section links
+the review's issues.
+
 ## Vendored code
 
 - Prefer adding code under `src/nerva/` over editing vendored files.
