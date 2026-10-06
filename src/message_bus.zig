@@ -86,6 +86,10 @@ pub fn MessageBusType(comptime IO: type) type {
         /// Nerva (P102): what this replica proves in the replica handshake. Null on a client's
         /// bus, and on a replica's without cluster keys (the fuzzer), where no handshake happens.
         peer_auth: ?PeerAuth,
+        /// Nerva (P102): each replica's origin, as its last completed handshake proved it. Kept
+        /// after the connection closes, so that a peer that stops right after its handshake still
+        /// counts toward P90's refusal (`peer_origin_authenticated`).
+        peer_origins_authenticated: [constants.members_max]?[32]u8 = @splat(null),
 
         comptime {
             // Assert it is correct to use u32 to track sizes.
@@ -977,6 +981,13 @@ pub fn MessageBusType(comptime IO: type) type {
             }
         }
 
+        /// Nerva (P102): the origin `replica` proved in its last completed handshake, if any.
+        pub fn peer_origin_authenticated(bus: *const MessageBus, replica: u8) ?[32]u8 {
+            assert(bus.process == .replica);
+            assert(replica != bus.process.replica);
+            return bus.peer_origins_authenticated[replica];
+        }
+
         /// Nerva: whether the bus holds a connection to `replica` (N61). A replica that restarts
         /// always loses its connections, so the replica forgets what release it announced.
         pub fn replica_connected(bus: *const MessageBus, replica: u8) bool {
@@ -1530,6 +1541,7 @@ pub fn MessageBusType(comptime IO: type) type {
                     assert(proof.invalid() == null);
                     connection.auth = .authenticated;
                     connection.auth_origin = challenge.origin;
+                    bus.peer_origins_authenticated[challenge.replica] = challenge.origin;
                     bus.replicas_connect_attempts[challenge.replica] = 0;
                     log.info("{}: peer_auth: authenticated replica={}", .{
                         bus.id,
@@ -1560,6 +1572,7 @@ pub fn MessageBusType(comptime IO: type) type {
                     assert(bus.replicas[replica] == connection);
                     connection.auth = .authenticated;
                     connection.auth_origin = origin;
+                    bus.peer_origins_authenticated[replica] = origin;
                     log.info("{}: peer_auth: authenticated replica={}", .{ bus.id, replica });
                     return .consumed;
                 },

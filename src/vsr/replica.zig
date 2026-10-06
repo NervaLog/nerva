@@ -3678,6 +3678,17 @@ pub fn ReplicaType(
                 if (!connected) self.peer_releases[peer] = null;
                 if (connected and !self.peer_connected[peer]) self.send_ping(peer);
                 self.peer_connected[peer] = connected;
+                // Nerva: the origin a handshake proved counts as announced, even when the peer
+                // stops before its first ping (P90, P102): with three exports, each replica then
+                // hears both others.
+                if (comptime @hasDecl(MessageBus, "peer_origin_authenticated")) {
+                    if (self.message_bus.peer_origin_authenticated(peer)) |origin| {
+                        const known = self.peer_origins[peer];
+                        if (known == null or !std.mem.eql(u8, &known.?, &origin)) {
+                            self.on_origin_announced(peer, &origin);
+                        }
+                    }
+                }
             }
         }
 

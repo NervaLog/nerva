@@ -33,6 +33,13 @@ replicas (certificates to issue and rotate, and a TLS stack in the vendored bus)
   an authenticated connection whose ping or pong announces another origin than its proof covered,
   so P90's gate decides on origins the key vouched for. The handshake does not refuse a peer of
   another origin itself: P90's gate needs to hear it, to count it and exit with status 8.
+- **A handshake's origin counts as announced.** The bus remembers the origin each replica's last
+  completed handshake proved (`peer_origin_authenticated`, kept after the connection closes),
+  and the replica's tick gives it to P90's `on_origin_announced`. Found by `origins.py` after
+  merging P90's latest: with three exports, replicas 0 and 1 both dialed replica 2, which heard
+  their pings, counted two other exports and exited before sending its own, so 0 and 1 never
+  heard its origin, each counted one other export, and both stayed up. The handshake delivered
+  replica 2's origin to both before its exit; it now counts.
 - **A zero origin is not adopted.** A formatted replica (origin zero) never joins an imported
   cluster (P90 refuses it before any sync), so it never syncs and never takes the cluster's
   origin; its origin stays what its data file holds for the file's life (`monotonic` asserts it).
