@@ -122,7 +122,7 @@ real nodes, clients through `nerva api`, kills, pauses and partitions, and a his
 against what Nerva promises (a declared ledger's conservation, so far); it runs by hand (N82).
 
 Binaries report `<protocol>+<commit>`. The protocol release (`0.0.5` since data files record
-the export they were imported from, N84) is what data files and clients check: a replica refuses
+the export they were imported from, P90) is what data files and clients check: a replica refuses
 a data file of another release, so upgrading means new data files, and accepts clients from
 `0.0.4` on (v0.4.0's; a v0.3.0 `nerva api` is refused at registration). A replica ignores peers that
 run another release (N61): in a cluster mixing releases, only replicas of one release count
@@ -184,7 +184,7 @@ nerva start --addresses=3001,3002,3003 0_0.nerva   # and 0_1, 0_2
   history starts there; client sessions do not carry over.
 - Op numbers jump: the new cluster goes on from the first checkpoint at or after the export's
   op. Versions and feed cursors from before stay valid.
-- **Every replica from one export** (N84). An export is named by its SHA-256 (`export` prints
+- **Every replica from one export** (P90). An export is named by its SHA-256 (`export` prints
   it; `import` and `start` log it), and every data file records the export it was imported from
   (none, for `nerva format`). Replicas handle a peer only once it has announced their export. A
   replica whose peers of other exports leave it no quorum exits with status 8, naming both
@@ -194,7 +194,7 @@ nerva start --addresses=3001,3002,3003 0_0.nerva   # and 0_1, 0_2
 - **Replacing a lost replica**: export the cluster and import every replica again (the cluster
   is closed meanwhile). Importing only the lost one is not safe: its replacement forgets the
   prepares the lost replica acknowledged, and with one more failure a committed op could be lost
-  (N84). A formatted replica cannot join an imported cluster either: its origin is none.
+  (P90). A formatted replica cannot join an imported cluster either: its origin is none.
 - A view declared only through the Zig client, with no catalog document, cannot be imported:
   `import` refuses it. Declare views through `nerva api`.
 - Measured (`perf/upgrade.py`, a 4-CPU sandbox, `--development`): a million changes over

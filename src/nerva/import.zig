@@ -65,7 +65,7 @@ pub const PlanView = struct {
 pub const Plan = struct {
     summary: export_file.Summary,
     /// The export's identity, its `end` record's SHA-256: the data file's `VSRState.origin`
-    /// (N84).
+    /// (P90).
     origin: [32]u8,
     /// The last change's timestamp (zero without changes).
     timestamp_max: u64,
@@ -977,7 +977,7 @@ pub fn ImporterType(comptime Storage: type) type {
     };
 }
 
-test "import: the data file records the export it was imported from, a formatted one none (N84)" {
+test "import: the data file records the export it was imported from, a formatted one none (P90)" {
     const Storage = @import("../testing/storage.zig").Storage;
     const fixtures = @import("../testing/fixtures.zig");
     const allocator = std.testing.allocator;

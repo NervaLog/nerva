@@ -703,7 +703,7 @@ pub const FatalReason = enum(u8) {
     storage_size_would_exceed_limit = 5,
     forest_tables_count_would_exceed_limit = 6,
     unknown_vsr_command = 7,
-    /// Nerva: too many peers were imported from another export for this replica to join (N84).
+    /// Nerva: too many peers were imported from another export for this replica to join (P90).
     origin_mismatch = 8,
 
     pub fn exit_status(reason: FatalReason) u8 {

@@ -147,7 +147,7 @@ pub const SuperBlockHeader = extern struct {
 
         /// Nerva: the SHA-256 of the export `nerva import` built this data file from, or zero if
         /// `nerva format` made it. Every update keeps it; replicas of one cluster must agree on
-        /// it (N84, #81).
+        /// it (P90, #81).
         origin: [32]u8 = @splat(0),
 
         reserved: [747]u8 = @splat(0),
@@ -767,7 +767,7 @@ pub fn SuperBlockType(comptime Storage: type) type {
             /// Set to null during initial cluster formatting.
             /// Set to the target view when constructing a new data file for a reformatted replica.
             view: ?u32,
-            /// Nerva: `VSRState.origin` (N84).
+            /// Nerva: `VSRState.origin` (P90).
             origin: [32]u8 = @splat(0),
         };
 

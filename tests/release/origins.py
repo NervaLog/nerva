@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Replicas imported from different exports refuse each other (docs/DECISIONS.md N84, #81).
+"""Replicas imported from different exports refuse each other (docs/DECISIONS.md P90, #81).
 
 Usage: origins.py <nerva> <nerva of release_client_min>
 
 A cluster formatted by `nerva` commits a few transactions between three exports (A, B, C), all
-before the first checkpoint, so that an import of each reaches the same checkpoint: before N84,
+before the first checkpoint, so that an import of each reaches the same checkpoint: before P90,
 replicas imported from two of them met at that checkpoint and the odd one panicked in the
 journal (#81). Now each data file records its export, and:
 - replicas 1 and 2 from A, replica 0 (the first view's primary) from B: replica 0 exits with
@@ -13,7 +13,9 @@ journal (#81). Now each data file records its export, and:
   neither before they stopped, and stays up alone);
 - replicas 0 and 1 from A commit past a checkpoint, then replica 2, imported from A and never
   started before, starts: it joins, and counts toward the quorum once replica 1 stops;
-- a `nerva api` of `release_client_min` (the second binary) commits and reads against them.
+- a `nerva api` of `release_client_min` (the second binary) commits and reads against them;
+- through that older client, the primary dies with commits in flight and both others restart:
+  they repair its prepares from each other and commit again.
 Nothing panics.
 """
 import http.client
@@ -26,6 +28,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 KEY = "origins-test-key"
@@ -249,7 +252,7 @@ def main():
 
         # 3. A replica imported from the same export but not started until later (it has
         # acknowledged nothing) joins and counts toward the quorum. Not a replacement of a lost
-        # replica, which would have forgotten what it acknowledged (N84).
+        # replica, which would have forgotten what it acknowledged (P90).
         late = Cluster(tmp, "late", nerva, importer(lambda index: 0), start=(0, 1))
         clusters.append(late)
         port = late.gateway()
@@ -275,16 +278,64 @@ def main():
         assert status == 200 and reply["rows"][0]["exists"], (status, reply)
         assert int(reply["rows"][0]["op"]) == op, reply
         late.check_running([0, 2])
-
         late.close()
         clusters.remove(late)
+
+        # 5. An older client's prepares are repaired after the primary dies and both others
+        # restart: neither has heard from the dead primary since, and every prepare carries the
+        # 0.0.4 client's release (P90; the review of #90).
+        def format_(index, path):
+            subprocess.run([nerva, "format", "--cluster=0", f"--replica={index}",
+                            "--replica-count=3", "--development", path], check=True,
+                           capture_output=True)
+
+        restart = Cluster(tmp, "restart", nerva, format_)
+        clusters.append(restart)
+        port = restart.gateway(nerva_client)
+        for _ in range(30):
+            put(port, next_id)
+            next_id += 1
+        primary = max(range(3), key=lambda index: max(
+            [int(m) for m in re.findall(r"transition_to_normal\w*: view=(\d+) primary",
+                                       restart.log(index))] or [-1]))
+        survivors = [index for index in range(3) if index != primary]
+        in_flight = {"next": 1_000_000, "stop": False}
+
+        def load():  # Commits in flight while the replicas go down, so their logs differ.
+            while not in_flight["stop"]:
+                try:
+                    request(port, "POST", "/v1/commit", {"entries": [
+                        {"kind": "put", "table": TABLE, "id": str(in_flight["next"]),
+                         "value_hex": "ab"}]}, timeout=5)
+                except (TimeoutError, ConnectionError, http.client.HTTPException, OSError):
+                    pass
+                in_flight["next"] += 1
+
+        loader = threading.Thread(target=load)
+        loader.start()
+        time.sleep(1)
+        restart.stop(primary)
+        time.sleep(0.5)
+        for index in survivors:
+            restart.stop(index)
+        in_flight["stop"] = True
+        loader.join()
+        for index in survivors:
+            restart.start(index)
+        for _ in range(20):
+            put(port, next_id)
+            next_id += 1
+        restart.check_running(survivors)
+        restart.close()
+        clusters.remove(restart)
 
         print(f"origins: PASSED (replicas of another export exit with status "
               f"{STATUS_ORIGIN_MISMATCH} and the rest commit on; of three exports, {exited} "
               f"exit; a "
               f"replica imported from the same export and started later joins past a "
               f"checkpoint; a client of "
-              f"release_client_min commits; {time.monotonic() - started:.0f} s)")
+              f"release_client_min commits, and commits again after its primary dies and the "
+              f"others restart; {time.monotonic() - started:.0f} s)")
     finally:
         for cluster in clusters:
             cluster.close()

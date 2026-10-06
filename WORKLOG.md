@@ -914,25 +914,3 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
 - Verified: `check`, `test:unit` (all but the sandbox's `benchmark.perf: usage example`),
   `test:fmt`, `test:api` (with `tests/api/documents.py`: a 512 KiB value under a 1024-byte key,
   one byte more refused, the `get` cap at its edge).
-
-## 2026-10-06 — Replicas of other exports refused; release 0.0.5 (N84, #81)
-
-- Every data file records the export it was imported from (`VSRState.origin`, the export's
-  SHA-256; none for `nerva format`); pings and pongs announce it; `release_peers` handles a peer
-  only once it announced this replica's release and origin, and refuses prepares made by a
-  primary of another export. A replica that can never reach a quorum with replicas of its own
-  export exits with status 8 (`origin_mismatch`), naming both exports; the others ignore it.
-- `nerva export` prints the export's SHA-256; `import` and `start` log it.
-- Release `0.0.5`, clients from `0.0.4`: v0.4.0's clients keep working. `VERSION` unchanged.
-- Vendored: `superblock.zig`, `message_header.zig`, `vsr.zig` (`FatalReason`), `replica.zig`,
-  `build.zig` (UPSTREAM.md).
-- Found by the 0.0.4 client test: a prepare carries its client's release, and backups admitted
-  only their own, so 0.0.4 clients could not commit to a cluster of more than one replica. Now
-  any accepted client release, unless the prepare's maker last announced another release.
-- Tests: `release_peers`, `export_file` and `import` unit tests; `tests/release/origins.py`
-  (#81's case, three exports, a late import of the same export joining past a checkpoint, a
-  0.0.4 client, replica 0 replaced at a new address with no survivor restarted).
-- Verified: `check`; `test:unit` (all but the sandbox's `benchmark.perf: usage example`);
-  `test:fmt`; `test:release` (mixed, upgrade, origins); `test:integration`; VOPR in ReleaseSafe,
-  seeds 1, 2, 5, 7270286294366828260, 6604808796972244986, 6787702322491963533 and
-  4693188925445828544.

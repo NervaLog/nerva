@@ -292,11 +292,11 @@ pub fn ReplicaType(
         /// arrives. Only consulted when release_peers_strict.
         peer_releases: [constants.members_max]?vsr.Release = @splat(null),
         /// Nerva: each peer's origin (`VSRState.origin`), from its latest ping or pong; null until
-        /// one arrives, and kept across connections (N84). Only consulted when
+        /// one arrives, and kept across connections (P90). Only consulted when
         /// release_peers_strict.
         peer_origins: [constants.members_max]?[32]u8 = @splat(null),
         /// Nerva: each peer's release from its latest ping or pong on any connection, for the
-        /// prepares it made (`release_peers.admits`, N84).
+        /// prepares it made (`release_peers.admits`, P90).
         peer_releases_last: [constants.members_max]?vsr.Release = @splat(null),
         /// Nerva: whether the message bus held a connection to each peer at the last tick.
         peer_connected: [constants.members_max]bool = @splat(false),
@@ -1914,7 +1914,7 @@ pub fn ReplicaType(
                 // Copy the ping's monotonic timestamp to our pong and add our wall clock sample:
                 .ping_timestamp_monotonic = message.header.ping_timestamp_monotonic,
                 .pong_timestamp_wall = @bitCast(self.clock.realtime()),
-                .origin = self.superblock.working.vsr_state.origin, // N84.
+                .origin = self.superblock.working.vsr_state.origin, // P90.
             }));
 
             if (message.header.replica < self.replica_count) {
@@ -3684,7 +3684,7 @@ pub fn ReplicaType(
 
         /// Nerva: records the origin a peer announced in a ping or pong, says once when it is not
         /// this replica's, and stops this replica when peers of other exports leave it no quorum
-        /// (N84, #81).
+        /// (P90, #81).
         fn on_origin_announced(self: *Replica, peer: u8, origin: *const [32]u8) void {
             assert(self.release_peers_strict);
             if (peer == self.replica or peer >= self.node_count) return;
@@ -3750,7 +3750,7 @@ pub fn ReplicaType(
                 .checkpoint_op = self.op_checkpoint(),
                 .ping_timestamp_monotonic = self.clock.monotonic().ns,
                 .release_count = releases.count,
-                .origin = self.superblock.working.vsr_state.origin, // N84.
+                .origin = self.superblock.working.vsr_state.origin, // P90.
             };
 
             const ping_versions = std.mem.bytesAsSlice(vsr.Release, message.body_used());

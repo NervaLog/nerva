@@ -397,7 +397,7 @@ pub const Header = extern struct {
 
         ping_timestamp_monotonic: u64,
         release_count: u16,
-        /// Nerva: the sender's `VSRState.origin` (N84).
+        /// Nerva: the sender's `VSRState.origin` (P90).
         origin: [32]u8,
         reserved: [62]u8 = @splat(0),
 
@@ -450,7 +450,7 @@ pub const Header = extern struct {
 
         ping_timestamp_monotonic: u64,
         pong_timestamp_wall: u64,
-        /// Nerva: the sender's `VSRState.origin` (N84).
+        /// Nerva: the sender's `VSRState.origin` (P90).
         origin: [32]u8,
 
         reserved: [80]u8 = @splat(0),
@@ -1704,7 +1704,7 @@ fn format_header_field_skip(
 }
 
 // Nerva: `origin` took reserved bytes of pings and pongs; every other field stays where
-// TigerBeetle put it (N84).
+// TigerBeetle put it (P90).
 comptime {
     assert(@offsetOf(Header.Ping, "checkpoint_id") == 128);
     assert(@offsetOf(Header.Ping, "release_count") == 160);
