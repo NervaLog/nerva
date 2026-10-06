@@ -842,3 +842,11 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
 - Verified: the hardening probes (every crafted case refuses cleanly or imports; a failed check
   exits 1 and leaves no file; a killed import leaves only `.importing`), the declaration-window
   sweep, `check`, `test:fmt`, `test:unit`, `test:release`, `test:demo`.
+
+## 2026-10-06 — Release v0.4.0
+
+- `VERSION` 0.4.0: `release.yml` publishes `v0.4.0` once CI passes, with CHANGELOG.md's v0.4.0
+  section as its notes, the binaries, the CycloneDX bill of materials and `SHA256SUMS`.
+  Binaries report `0.0.4+<commit>` (`build.zig`, unchanged).
+- The release carries #72, #73, #75 and #83, merged here after the release-candidate
+  hardening (N81). Known and deferred: #81.
