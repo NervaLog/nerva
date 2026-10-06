@@ -84,7 +84,9 @@ format change, but blind to exports that reach different checkpoints).
   export each: two or three exit 8, and one left up commits nothing; replicas 0 and 1 from A commit
   past a checkpoint, replica 2, imported from A and never started before, then joins and carries the
   quorum with replica 1 stopped; a `nerva api` built as 0.0.4 commits and reads, and commits again
-  after its primary dies with commits in flight and both others restart. No log shows a panic. VOPR:
-  the `nerva` lane's release is 0.0.2, accepting clients from 0.0.1; its clients run 0.0.1 or 0.0.2
-  by seed, so older clients' prepares cross the gate under faults, and every replica's origin,
-  reformatted ones' too, is none or random by seed.
+  after its primary dies with commits in flight and both others restart (a liveness check only: it
+  passes on the earlier gate too, so it does not reach the repair the review described; the gate's
+  decision for a maker not heard from is pinned by the unit test, which fails on the earlier gate).
+  No log shows a panic. VOPR: the `nerva` lane's release is 0.0.2, accepting clients from 0.0.1; its
+  clients run 0.0.1 or 0.0.2 by seed, so older clients' prepares cross the gate under faults, and
+  every replica's origin, reformatted ones' too, is none or random by seed.

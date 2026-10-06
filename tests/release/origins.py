@@ -281,9 +281,10 @@ def main():
         late.close()
         clusters.remove(late)
 
-        # 5. An older client's prepares are repaired after the primary dies and both others
-        # restart: neither has heard from the dead primary since, and every prepare carries the
-        # 0.0.4 client's release (P90; the review of #90).
+        # 5. Through an older client, the primary dies with commits in flight and both others
+        # restart: the cluster commits again (P90; the review of #90). A liveness check: it does
+        # not force the survivors to repair the dead primary's prepares from each other, the case
+        # the review found (release_peers' unit test pins the gate's decision for it).
         def format_(index, path):
             subprocess.run([nerva, "format", "--cluster=0", f"--replica={index}",
                             "--replica-count=3", "--development", path], check=True,
