@@ -112,7 +112,10 @@ const CLIArgs = union(enum) {
         \\
         \\  format   Create a replica's data file at <path>.
         \\
-        \\  start    Run a replica from the data file at <path>.
+        \\  start    Run a replica from the data file at <path>. Replicas prove to each other
+        \\           that they hold the cluster key, NERVA_CLUSTER_KEY (at least 32 bytes;
+        \\           NERVA_CLUSTER_KEY_NEXT is also accepted, to rotate it). Without it, only
+        \\           --development with loopback addresses runs, on a public key.
         \\
         \\  view     Follow the cluster's change feed and serve declared views. The key is
         \\           read from NERVA_KEY (and, during a rotation, NERVA_KEY_NEXT).

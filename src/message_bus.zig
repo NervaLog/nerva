@@ -6,6 +6,8 @@ const constants = @import("constants.zig");
 const log = std.log.scoped(.message_bus);
 
 const vsr = @import("vsr.zig");
+const Header = vsr.Header;
+const peer_auth = @import("nerva/peer_auth.zig");
 
 const stdx = @import("stdx");
 const maybe = stdx.maybe;
@@ -84,6 +86,14 @@ pub fn MessageBusType(comptime IO: type) type {
 
         trace: ?*Tracer,
 
+        /// Nerva (P102): what this replica proves in the replica handshake. Null on a client's
+        /// bus, and on a replica's without cluster keys (the fuzzer), where no handshake happens.
+        peer_auth: ?PeerAuth,
+        /// Nerva (P102): each replica's origin, as its last completed handshake proved it. Kept
+        /// after the connection closes, so that a peer that stops right after its handshake still
+        /// counts toward P90's refusal (`peer_origin_authenticated`).
+        peer_origins_authenticated: [constants.members_max]?[32]u8 = @splat(null),
+
         comptime {
             // Assert it is correct to use u32 to track sizes.
             assert(constants.message_size_max < std.math.maxInt(u32));
@@ -95,6 +105,17 @@ pub fn MessageBusType(comptime IO: type) type {
             trace: ?*Tracer,
             clients_limit: ?u32 = null,
             time: Time,
+            /// Nerva (P102): set by the replica; see `MessageBus.peer_auth`.
+            peer_auth: ?PeerAuth = null,
+        };
+
+        /// Nerva (P102): the cluster keys, and what this replica's proofs bind.
+        pub const PeerAuth = struct {
+            keys: peer_auth.Keys,
+            cluster: u128,
+            release: vsr.Release,
+            /// This replica's `VSRState.origin` (P90).
+            origin: [32]u8,
         };
         const Address = stdx.SocketAddress;
         const MessageBus = @This();
@@ -109,7 +130,14 @@ pub fn MessageBusType(comptime IO: type) type {
         ) !MessageBus {
             switch (process_id) {
                 .replica => assert(options.clients_limit.? > 0),
-                .client => assert(options.clients_limit == null),
+                .client => {
+                    assert(options.clients_limit == null);
+                    assert(options.peer_auth == null);
+                },
+            }
+            if (options.peer_auth) |auth| {
+                assert(peer_auth.Keys.invalid(auth.keys.current, auth.keys.next) == null);
+                assert(auth.release.value != 0);
             }
 
             const connections_max: u32 = switch (process_id) {
@@ -182,6 +210,7 @@ pub fn MessageBusType(comptime IO: type) type {
                 .replicas_unopened = replicas_unopened,
                 .prng = stdx.PRNG.from_seed(prng_seed),
                 .trace = options.trace,
+                .peer_auth = options.peer_auth,
             };
 
             switch (process_id) {
@@ -326,6 +355,31 @@ pub fn MessageBusType(comptime IO: type) type {
             assert(bus.process == .replica);
             bus.tick_connect();
             bus.tick_accept(); // Only replicas accept connections from other replicas and clients.
+            if (bus.peer_auth != null) bus.tick_handshakes();
+        }
+
+        /// Nerva (P102): closes every connection still handshaking after
+        /// `peer_auth.handshake_ticks_max` ticks.
+        fn tick_handshakes(bus: *MessageBus) void {
+            assert(bus.peer_auth != null);
+            for (bus.connections) |*connection| {
+                if (connection.state != .connected) continue;
+                switch (connection.auth) {
+                    .none, .authenticated => continue,
+                    .hello, .challenge => {},
+                }
+                // Messages wait only on a dialed connection, and only in its send queue.
+                assert(connection.send_queue.count <= constants.connection_send_queue_max_replica);
+                if (connection.auth == .challenge) assert(connection.send_queue.empty());
+                connection.auth_ticks += 1;
+                if (connection.auth_ticks > peer_auth.handshake_ticks_max) {
+                    log.warn("{}: peer_auth: handshake with {} timed out, closing", .{
+                        bus.id,
+                        connection.peer,
+                    });
+                    bus.terminate(connection, .shutdown);
+                }
+            }
         }
 
         // The same as tick, but asserts a client and avoids accept, allowing Zig's lazy semantics
@@ -651,7 +705,12 @@ pub fn MessageBusType(comptime IO: type) type {
             assert(connection.recv_buffer == null);
             connection.recv_buffer = MessageBuffer.init(bus.pool);
             bus.recv(connection);
-            bus.send(connection);
+            // Nerva (P102): queued messages wait until both sides have proved the cluster key.
+            if (bus.peer_auth != null) {
+                bus.handshake_dial(connection);
+            } else {
+                bus.send(connection);
+            }
             assert(connection.state == .connected);
         }
 
@@ -726,7 +785,12 @@ pub fn MessageBusType(comptime IO: type) type {
             switch (connection.peer) {
                 .replica => |replica_index| {
                     assert(replica_index < bus.replicas.len);
-                    if (bus.replicas_connect_attempts[replica_index] != 0) {
+                    // Nerva (P102): with cluster keys, bytes count only once the replica is
+                    // authenticated (the handshake resets the attempts as it completes), so a
+                    // replica with another key is redialed with backoff, not in a storm.
+                    const authenticated = bus.peer_auth == null or
+                        connection.auth == .authenticated;
+                    if (authenticated and bus.replicas_connect_attempts[replica_index] != 0) {
                         bus.replicas_connect_attempts[replica_index] = 0;
                     }
                 },
@@ -874,6 +938,25 @@ pub fn MessageBusType(comptime IO: type) type {
                 // can send back to them.
                 .replica => {
                     while (connection.recv_buffer.?.next_header()) |header| {
+                        // Nerva (P102): the bus handles the handshake, and refuses what a
+                        // connection may not send before or after it.
+                        if (bus.peer_auth != null) {
+                            switch (bus.handshake_recv(connection, &header)) {
+                                .deliver => {},
+                                .consumed => {
+                                    const message = connection.recv_buffer.?.consume_message(
+                                        bus.pool,
+                                        &header,
+                                    );
+                                    bus.unref(message);
+                                    continue;
+                                },
+                                .close => {
+                                    connection.recv_buffer.?.invalidate(.misdirected);
+                                    continue;
+                                },
+                            }
+                        }
                         if (bus.recv_update_peer(connection, header.peer_type())) {
                             connection.recv_buffer.?.suspend_message(&header);
                         } else {
@@ -921,6 +1004,13 @@ pub fn MessageBusType(comptime IO: type) type {
                     bus.recv(connection);
                 }
             }
+        }
+
+        /// Nerva (P102): the origin `replica` proved in its last completed handshake, if any.
+        pub fn peer_origin_authenticated(bus: *const MessageBus, replica: u8) ?[32]u8 {
+            assert(bus.process == .replica);
+            assert(replica != bus.process.replica);
+            return bus.peer_origins_authenticated[replica];
         }
 
         /// Nerva: whether the bus holds a connection to `replica` (N61). A replica that restarts
@@ -985,8 +1075,25 @@ pub fn MessageBusType(comptime IO: type) type {
                 assert(connection.peer == .replica);
                 return;
             }
+            // Nerva (P102): a replica connection sends only once authenticated; until then its
+            // messages wait in the send queue, which bounds them.
+            if (!bus.send_ready(connection)) {
+                assert(connection.peer == .replica);
+                assert(connection.send_queue.count <= constants.connection_send_queue_max_replica);
+                return;
+            }
             // If there is no send operation currently in progress, start one.
             if (!connection.send_submitted) bus.send(connection);
+        }
+
+        /// Nerva (P102): whether the send loop may run on this connection.
+        fn send_ready(bus: *const MessageBus, connection: *const Connection) bool {
+            if (bus.peer_auth == null) return true;
+            return switch (connection.peer) {
+                .replica => connection.auth == .authenticated,
+                .client, .client_likely => true,
+                .unknown => unreachable,
+            };
         }
 
         /// Send loop.
@@ -1331,6 +1438,321 @@ pub fn MessageBusType(comptime IO: type) type {
             send_queue: SendQueue,
             /// For connections_suspended.
             link: QueueType(Connection).Link = .{},
+
+            /// Nerva (P102): the replica handshake on this connection.
+            auth: Auth = .none,
+            /// Ticks spent handshaking (`peer_auth.handshake_ticks_max`).
+            auth_ticks: u32 = 0,
+            /// The peer's origin, as its proof bound it: its pings and pongs must announce it.
+            auth_origin: [32]u8 = @splat(0),
+            /// The handshake message being sent, and the one to send after it.
+            auth_header: Header = undefined,
+            auth_header_next: ?Header = null,
         };
+
+        /// Nerva (P102).
+        const Auth = union(enum) {
+            /// No handshake: a client, a peer not yet known, or a bus without cluster keys.
+            none,
+            /// Dialing: the hello, with this nonce, is sent; the challenge is awaited.
+            hello: u128,
+            /// Accepting: the challenge is sent; the dialing replica's proof is awaited.
+            challenge: peer_auth.Transcript,
+            /// Both replicas proved the key: replica messages flow.
+            authenticated,
+        };
+
+        /// Nerva (P102): sends `peer_hello` on a connection this replica dialed.
+        fn handshake_dial(bus: *MessageBus, connection: *Connection) void {
+            const auth = &bus.peer_auth.?;
+            assert(connection.state == .connected);
+            assert(connection.peer == .replica);
+            assert(connection.peer.replica > bus.process.replica);
+            assert(connection.auth == .none);
+
+            const nonce = peer_auth.nonce();
+            connection.auth = .{ .hello = nonce };
+            connection.auth_ticks = 0;
+            var hello: Header.PeerHello = .{
+                .cluster = auth.cluster,
+                .release = auth.release,
+                .command = .peer_hello,
+                .replica = bus.process.replica,
+                .nonce = nonce,
+                .origin = auth.origin,
+            };
+            hello.set_checksum_body(&.{});
+            hello.set_checksum();
+            assert(hello.invalid() == null);
+            bus.handshake_send(connection, hello.frame_const());
+        }
+
+        const HandshakeAction = enum { deliver, consumed, close };
+
+        /// Nerva (P102): what to do with a message on a bus with cluster keys. The handshake's
+        /// own messages are consumed here. Before it completes, a connection may send only
+        /// what a client sends; after, a replica may not claim to be another.
+        fn handshake_recv(
+            bus: *MessageBus,
+            connection: *Connection,
+            header: *const Header,
+        ) HandshakeAction {
+            const auth = &bus.peer_auth.?;
+            assert(connection.state == .connected);
+
+            const command = header.command;
+            const handshake = command == .peer_hello or command == .peer_challenge or
+                command == .peer_proof;
+            if (handshake) {
+                if (header.invalid()) |reason| {
+                    return bus.handshake_refuse(connection, reason);
+                }
+                if (header.cluster != auth.cluster) {
+                    return bus.handshake_refuse(connection, "wrong cluster");
+                }
+            }
+            const client_message = command == .request or command == .ping_client;
+
+            switch (connection.auth) {
+                .none => switch (connection.peer) {
+                    .unknown => {
+                        if (command == .peer_hello) {
+                            return bus.handshake_accept(connection, header.into_const(
+                                .peer_hello,
+                            ).?);
+                        }
+                        if (client_message) return .deliver;
+                        return bus.handshake_refuse(connection, "replica message before handshake");
+                    },
+                    .client, .client_likely => {
+                        if (client_message) return .deliver;
+                        return bus.handshake_refuse(connection, "not a client message");
+                    },
+                    // A replica's connection is dialed into `.hello`, or accepted into
+                    // `.challenge`; it is never without a handshake.
+                    .replica => unreachable,
+                },
+                .hello => |nonce_dialing| {
+                    const challenge = header.into_const(.peer_challenge) orelse
+                        return bus.handshake_refuse(connection, "expected peer_challenge");
+                    assert(connection.peer == .replica);
+                    if (challenge.replica != connection.peer.replica) {
+                        return bus.handshake_refuse(connection, "challenge from another replica");
+                    }
+                    if (challenge.nonce == nonce_dialing) {
+                        return bus.handshake_refuse(connection, "challenge repeats our nonce");
+                    }
+                    const transcript: peer_auth.Transcript = .{
+                        .cluster = auth.cluster,
+                        .dialing = bus.process.replica,
+                        .accepting = challenge.replica,
+                        .nonce_dialing = nonce_dialing,
+                        .nonce_accepting = challenge.nonce,
+                        .origin_dialing = auth.origin,
+                        .origin_accepting = challenge.origin,
+                    };
+                    if (!peer_auth.verify(&auth.keys, .accepting, &transcript, &challenge.mac)) {
+                        return bus.handshake_refuse(connection, "wrong cluster key");
+                    }
+                    var proof: Header.PeerProof = .{
+                        .cluster = auth.cluster,
+                        .release = auth.release,
+                        .command = .peer_proof,
+                        .replica = bus.process.replica,
+                        .mac = peer_auth.proof(auth.keys.current, .dialing, &transcript),
+                    };
+                    proof.set_checksum_body(&.{});
+                    proof.set_checksum();
+                    assert(proof.invalid() == null);
+                    connection.auth = .authenticated;
+                    connection.auth_origin = challenge.origin;
+                    bus.peer_origins_authenticated[challenge.replica] = challenge.origin;
+                    bus.replicas_connect_attempts[challenge.replica] = 0;
+                    log.info("{}: peer_auth: authenticated replica={}", .{
+                        bus.id,
+                        connection.peer.replica,
+                    });
+                    // The proof goes first; the send loop follows it (`handshake_send_callback`).
+                    bus.handshake_send(connection, proof.frame_const());
+                    return .consumed;
+                },
+                .challenge => |*transcript| {
+                    assert(connection.peer == .unknown);
+                    assert(connection.send_queue.empty());
+                    const proof = header.into_const(.peer_proof) orelse
+                        return bus.handshake_refuse(connection, "expected peer_proof");
+                    if (proof.replica != transcript.dialing) {
+                        return bus.handshake_refuse(connection, "proof from another replica");
+                    }
+                    if (!peer_auth.verify(&auth.keys, .dialing, transcript, &proof.mac)) {
+                        return bus.handshake_refuse(connection, "wrong cluster key");
+                    }
+                    const replica = transcript.dialing;
+                    const origin = transcript.origin_dialing;
+                    // Replaces any older connection from this replica.
+                    if (!bus.recv_update_peer(connection, .{ .replica = replica })) {
+                        return bus.handshake_refuse(connection, "replica index out of range");
+                    }
+                    assert(connection.peer == .replica);
+                    assert(bus.replicas[replica] == connection);
+                    connection.auth = .authenticated;
+                    connection.auth_origin = origin;
+                    bus.peer_origins_authenticated[replica] = origin;
+                    log.info("{}: peer_auth: authenticated replica={}", .{ bus.id, replica });
+                    return .consumed;
+                },
+                .authenticated => {
+                    assert(connection.peer == .replica);
+                    if (handshake) return bus.handshake_refuse(connection, "handshake repeated");
+                    switch (header.peer_type()) {
+                        .replica => |replica| if (replica != connection.peer.replica) {
+                            return bus.handshake_refuse(connection, "claims another replica");
+                        },
+                        .unknown, .client, .client_likely => {},
+                    }
+                    const origin: ?[32]u8 = switch (header.into_any()) {
+                        inline .ping, .pong => |announcement| announcement.origin,
+                        else => null,
+                    };
+                    if (origin) |announced| {
+                        if (!std.mem.eql(u8, &announced, &connection.auth_origin)) {
+                            return bus.handshake_refuse(connection, "announces another origin");
+                        }
+                    }
+                    return .deliver;
+                },
+            }
+        }
+
+        /// Nerva (P102): answers `peer_hello` on an accepted connection with `peer_challenge`.
+        fn handshake_accept(
+            bus: *MessageBus,
+            connection: *Connection,
+            hello: *const Header.PeerHello,
+        ) HandshakeAction {
+            const auth = &bus.peer_auth.?;
+            assert(connection.peer == .unknown);
+            assert(connection.auth == .none);
+            assert(connection.send_queue.empty());
+            // Replicas dial only those after them: a hello from this replica or one after it
+            // is not a replica's.
+            if (hello.replica >= bus.process.replica) {
+                return bus.handshake_refuse(connection, "hello from a replica that must not dial");
+            }
+            assert(hello.replica < bus.replicas.len);
+
+            var transcript: peer_auth.Transcript = .{
+                .cluster = auth.cluster,
+                .dialing = hello.replica,
+                .accepting = bus.process.replica,
+                .nonce_dialing = hello.nonce,
+                .nonce_accepting = undefined,
+                .origin_dialing = hello.origin,
+                .origin_accepting = auth.origin,
+            };
+            transcript.nonce_accepting = peer_auth.nonce();
+            while (transcript.nonce_accepting == hello.nonce) {
+                transcript.nonce_accepting = peer_auth.nonce();
+            }
+            var challenge: Header.PeerChallenge = .{
+                .cluster = auth.cluster,
+                .release = auth.release,
+                .command = .peer_challenge,
+                .replica = bus.process.replica,
+                .nonce = transcript.nonce_accepting,
+                .mac = peer_auth.proof(auth.keys.current, .accepting, &transcript),
+                .origin = auth.origin,
+            };
+            challenge.set_checksum_body(&.{});
+            challenge.set_checksum();
+            assert(challenge.invalid() == null);
+            connection.auth = .{ .challenge = transcript };
+            connection.auth_ticks = 0;
+            bus.handshake_send(connection, challenge.frame_const());
+            return .consumed;
+        }
+
+        fn handshake_refuse(
+            bus: *MessageBus,
+            connection: *Connection,
+            reason: []const u8,
+        ) HandshakeAction {
+            log.warn("{}: peer_auth: closing connection from={}: {s}", .{
+                bus.id,
+                connection.peer,
+                reason,
+            });
+            return .close;
+        }
+
+        /// Nerva (P102): sends one handshake message, or holds it until the one being sent is.
+        fn handshake_send(bus: *MessageBus, connection: *Connection, header: *const Header) void {
+            assert(connection.state == .connected);
+            assert(header.size == @sizeOf(Header));
+            if (connection.send_submitted) {
+                // Only the dialing replica sends twice (hello, then proof), and the proof
+                // answers a challenge that answers the hello.
+                assert(header.command == .peer_proof);
+                assert(connection.auth_header.command == .peer_hello);
+                assert(connection.auth_header_next == null);
+                connection.auth_header_next = header.*;
+                return;
+            }
+            assert(connection.send_progress == 0);
+            connection.auth_header = header.*;
+            bus.handshake_send_submit(connection);
+        }
+
+        fn handshake_send_submit(bus: *MessageBus, connection: *Connection) void {
+            assert(!connection.send_submitted);
+            assert(connection.send_progress < @sizeOf(Header));
+            connection.send_submitted = true;
+            bus.io.send(
+                *MessageBus,
+                bus,
+                handshake_send_callback,
+                &connection.send_completion,
+                connection.fd.?,
+                std.mem.asBytes(&connection.auth_header)[connection.send_progress..],
+            );
+        }
+
+        fn handshake_send_callback(
+            bus: *MessageBus,
+            completion: *IO.Completion,
+            result: IO.SendError!usize,
+        ) void {
+            const connection: *Connection = @alignCast(
+                @fieldParentPtr("send_completion", completion),
+            );
+            assert(connection.send_submitted);
+            connection.send_submitted = false;
+            if (connection.state == .terminating) {
+                bus.terminate_join(connection);
+                return;
+            }
+            assert(connection.state == .connected);
+            const write_size = result catch |err| {
+                log.warn("{}: peer_auth: send to={} {}", .{ bus.id, connection.peer, err });
+                bus.terminate(connection, .shutdown);
+                return;
+            };
+            connection.send_progress += @intCast(write_size);
+            assert(connection.send_progress <= @sizeOf(Header));
+            if (connection.send_progress < @sizeOf(Header)) {
+                bus.handshake_send_submit(connection);
+                return;
+            }
+            connection.send_progress = 0;
+            if (connection.auth_header_next) |next| {
+                connection.auth_header = next;
+                connection.auth_header_next = null;
+                bus.handshake_send_submit(connection);
+                return;
+            }
+            if (connection.auth == .authenticated and !connection.send_queue.empty()) {
+                bus.send(connection);
+            }
+        }
     };
 }

@@ -16,6 +16,8 @@ const constants = @import("constants.zig");
 const nerva = @import("nerva.zig");
 const Client = @import("nerva/client.zig").Client;
 const workload = @import("nerva/workload.zig");
+const peer_auth = @import("nerva/peer_auth.zig");
+const Header = vsr.Header;
 
 const Entry = nerva.Entry;
 const EntryResult = nerva.EntryResult;
@@ -38,12 +40,24 @@ pub fn main() !void {
     gpa = gpa_instance.allocator();
 
     try scenario_cluster();
+    try scenario_peer_auth();
     std.debug.print("integration: PASSED\n", .{});
 }
 
 const cluster_id: u128 = 0; // Test binaries refuse any other cluster id.
 const replica_count = 3;
 const timeout = stdx.Duration.seconds(60);
+
+/// Replicas authenticate each other with a real cluster key, never the development key (P102).
+const cluster_key = "integration-cluster-key-0123456789abcdef";
+const cluster_key_new = "integration-cluster-key-rotated-0123456789";
+const cluster_key_wrong = "integration-cluster-key-wrong-0123456789ab";
+
+comptime {
+    assert(cluster_key.len >= peer_auth.key_length_min);
+    assert(cluster_key_new.len >= peer_auth.key_length_min);
+    assert(cluster_key_wrong.len >= peer_auth.key_length_min);
+}
 
 const Cluster = struct {
     gpa: std.mem.Allocator,
@@ -53,6 +67,9 @@ const Cluster = struct {
     processes: [replica_count]?std.process.Child,
     /// Every replica sends its metrics here (`--statsd`).
     statsd: StatsdListener,
+    /// Each replica's environment: its cluster keys (P102).
+    environments: [replica_count]std.process.EnvMap,
+    trace_started: bool = false,
 
     fn init() !*Cluster {
         const cluster = try gpa.create(Cluster);
@@ -89,7 +106,15 @@ const Cluster = struct {
             .addresses = undefined,
             .processes = @splat(null),
             .statsd = statsd,
+            .environments = undefined,
         };
+        for (&cluster.environments, 0..) |*environment, index| {
+            errdefer for (cluster.environments[0..index]) |*done| done.deinit();
+            environment.* = try std.process.getEnvMap(gpa);
+            environment.remove("NERVA_CLUSTER_KEY_NEXT");
+            try environment.put("NERVA_CLUSTER_KEY", cluster_key);
+        }
+        errdefer for (&cluster.environments) |*environment| environment.deinit();
         const parsed = try vsr.parse_addresses(addresses_flag, &cluster.addresses);
         assert(parsed.len == replica_count);
 
@@ -100,6 +125,7 @@ const Cluster = struct {
 
     fn deinit(cluster: *Cluster) void {
         for (0..replica_count) |replica| cluster.stop(@intCast(replica));
+        for (&cluster.environments) |*environment| environment.deinit();
         cluster.statsd.deinit();
         cluster.gpa.free(cluster.addresses_flag);
         std.fs.deleteTreeAbsolute(cluster.tmp_path) catch {};
@@ -110,6 +136,31 @@ const Cluster = struct {
     fn data_file(cluster: *const Cluster, buffer: []u8, replica: u8) []const u8 {
         return std.fmt.bufPrint(buffer, "{s}/0_{}.nerva", .{ cluster.tmp_path, replica }) catch
             unreachable;
+    }
+
+    fn log_file(cluster: *const Cluster, buffer: []u8, replica: u8) []const u8 {
+        return std.fmt.bufPrint(buffer, "{s}/replica_{}.log", .{ cluster.tmp_path, replica }) catch
+            unreachable;
+    }
+
+    /// Prints the end of every replica's log.
+    fn logs_print(cluster: *const Cluster) void {
+        for (0..replica_count) |replica| {
+            var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+            const log = std.fs.cwd().readFileAlloc(
+                cluster.gpa,
+                cluster.log_file(&path_buffer, @intCast(replica)),
+                256 * stdx.MiB,
+            ) catch continue;
+            defer cluster.gpa.free(log);
+            const tail_size = 16 * 1024;
+            const tail = log[log.len -| tail_size..];
+            std.debug.print("--- replica {} log (last {} bytes) ---\n{s}\n", .{
+                replica,
+                tail.len,
+                tail,
+            });
+        }
     }
 
     /// Replica 1 writes its span trace here (`--trace`).
@@ -148,7 +199,16 @@ const Cluster = struct {
         var trace_buffer: [std.fs.max_path_bytes]u8 = undefined;
         var observe_buffer: [std.fs.max_path_bytes + 16]u8 = undefined;
         var statsd_buffer: [64]u8 = undefined;
-        var argv: stdx.BoundedArrayType([]const u8, 7) = .{};
+        var log_buffer: [std.fs.max_path_bytes]u8 = undefined;
+        var argv: stdx.BoundedArrayType([]const u8, 10) = .{};
+        // Each replica's log is appended to `replica_<n>.log`, shown if a scenario fails.
+        argv.push("/bin/sh");
+        argv.push("-c");
+        argv.push("exec \"$0\" \"$@\" 2>>\"$NERVA_TEST_LOG\"");
+        try cluster.environments[replica].put(
+            "NERVA_TEST_LOG",
+            cluster.log_file(&log_buffer, replica),
+        );
         argv.push(nerva_exe);
         argv.push("start");
         argv.push(try std.fmt.bufPrint(
@@ -164,19 +224,42 @@ const Cluster = struct {
         }));
         switch (replica) {
             0 => {},
-            1 => argv.push(try std.fmt.bufPrint(&observe_buffer, "--trace={s}", .{
-                cluster.trace_file(&trace_buffer),
-            })),
+            // Only on its first start: `--trace` refuses an existing file.
+            1 => if (!cluster.trace_started) {
+                cluster.trace_started = true;
+                argv.push(try std.fmt.bufPrint(&observe_buffer, "--trace={s}", .{
+                    cluster.trace_file(&trace_buffer),
+                }));
+            },
             2 => argv.push("--cache-rows=64MiB"),
             else => unreachable,
         }
         argv.push(cluster.data_file(&path_buffer, replica));
         var process = std.process.Child.init(argv.const_slice(), cluster.gpa);
+        process.env_map = &cluster.environments[replica];
         process.stdin_behavior = .Ignore;
         process.stdout_behavior = .Ignore;
         process.stderr_behavior = .Ignore;
         try process.spawn();
         cluster.processes[replica] = process;
+    }
+
+    /// Restarts `replica` with these cluster keys.
+    fn restart_with_keys(
+        cluster: *Cluster,
+        replica: u8,
+        current: []const u8,
+        next: ?[]const u8,
+    ) !void {
+        cluster.stop(replica);
+        const environment = &cluster.environments[replica];
+        try environment.put("NERVA_CLUSTER_KEY", current);
+        if (next) |key_next| {
+            try environment.put("NERVA_CLUSTER_KEY_NEXT", key_next);
+        } else {
+            environment.remove("NERVA_CLUSTER_KEY_NEXT");
+        }
+        try cluster.start(replica);
     }
 
     fn stop(cluster: *Cluster, replica: u8) void {
@@ -187,12 +270,16 @@ const Cluster = struct {
     }
 
     fn client(cluster: *Cluster) !*Client {
+        return cluster.client_with_timeout(timeout);
+    }
+
+    fn client_with_timeout(cluster: *Cluster, client_timeout: stdx.Duration) !*Client {
         const result = try cluster.gpa.create(Client);
         errdefer cluster.gpa.destroy(result);
         try result.init(cluster.gpa, .{
             .cluster = cluster_id,
             .addresses = &cluster.addresses,
-            .timeout = timeout,
+            .timeout = client_timeout,
         });
         return result;
     }
@@ -293,6 +380,7 @@ fn expect_as_of(client: *Client, op: u64, byte: u8) !void {
 
 fn commit(client: *Client, entries: []const Entry) ![]const EntryResult {
     const results = try gpa.alloc(EntryResult, entries.len);
+    errdefer gpa.free(results);
     try client.commit(entries, results);
     return results;
 }
@@ -306,6 +394,7 @@ fn expect_statuses(results: []const EntryResult, statuses: []const nerva.EntrySt
 fn scenario_cluster() !void {
     const cluster = try Cluster.init();
     defer cluster.deinit();
+    errdefer cluster.logs_print();
 
     const daemon_a = try cluster.client();
     defer cluster.client_deinit(daemon_a);
@@ -445,4 +534,224 @@ fn scenario_cluster() !void {
         try testing.expectError(error.Evicted, lookup(evictee, 1, 1));
         try testing.expectError(error.Evicted, lookup(evictee, 1, 1));
     }
+}
+
+/// Replicas authenticate each other (P102): a peer without the cluster key is refused whatever it
+/// sends, a replica with another key stays outside the cluster, and the key rotates while the
+/// cluster commits.
+fn scenario_peer_auth() !void {
+    const cluster = try Cluster.init();
+    defer cluster.deinit();
+    errdefer cluster.logs_print();
+
+    const daemon = try cluster.client();
+    defer cluster.client_deinit(daemon);
+    try commit_ok(daemon, 1);
+
+    // A rogue peer sends replica 2 a well-formed ping claiming to be replica 1: closed unread.
+    {
+        const stream = try peer_connect(cluster.addresses[2]);
+        defer stream.close();
+        var ping = ping_from(1);
+        try stream.writeAll(ping.bytes());
+        try expect_closed(stream);
+    }
+    // A hello from replica 2 to itself, or from a replica after it: closed (replicas dial only
+    // those after them).
+    for ([_]u8{ 1, 2 }) |claimed| {
+        const stream = try peer_connect(cluster.addresses[1]);
+        defer stream.close();
+        const hello = hello_from(claimed, 0x1234);
+        try stream.writeAll(std.mem.asBytes(&hello));
+        try expect_closed(stream);
+    }
+    // A hello claiming replica 0 is challenged; the challenge proves replica 2 holds the key,
+    // and a proof under another key is refused.
+    {
+        const stream = try peer_connect(cluster.addresses[2]);
+        defer stream.close();
+        const transcript = try handshake_begin(stream, 2, 0x5678);
+        var proof = proof_from(0, cluster_key_wrong, &transcript);
+        try stream.writeAll(std.mem.asBytes(&proof));
+        try expect_closed(stream);
+    }
+    // A proof under the key is accepted: replica 2 then talks to us as replica 0. Holding the
+    // key is all it takes. Replica 0 is down meanwhile, or it would reconnect and displace us.
+    cluster.stop(0);
+    {
+        const stream = try peer_connect(cluster.addresses[2]);
+        defer stream.close();
+        const transcript = try handshake_begin(stream, 2, 0x9abc);
+        var proof = proof_from(0, cluster_key, &transcript);
+        try stream.writeAll(std.mem.asBytes(&proof));
+        const header = try read_header(stream);
+        try testing.expectEqual(@as(u8, 2), header.replica);
+        try testing.expect(header.peer_type() == .replica);
+    }
+    try cluster.start(0);
+    try commit_ok(daemon, 2);
+
+    // A replica with another key stays outside: with replica 0 down, replicas 1 and 2 (other
+    // key) cannot form a quorum.
+    try cluster.restart_with_keys(2, cluster_key_wrong, null);
+    try commit_ok(daemon, 3);
+    {
+        const daemon_short = try cluster.client_with_timeout(stdx.Duration.seconds(10));
+        defer cluster.client_deinit(daemon_short);
+        cluster.stop(0);
+        const results = commit(daemon_short, &.{put(4, 4)});
+        if (results) |committed| {
+            gpa.free(committed);
+            return error.CommittedWithWrongKey;
+        } else |err| try testing.expectEqual(error.Timeout, err);
+    }
+    try cluster.start(0);
+    try cluster.restart_with_keys(2, cluster_key, null);
+    try commit_ok(daemon, 5);
+
+    // A rolling rotation, one replica at a time; after each restart the replica just restarted
+    // is needed for the quorum, with the next one down, so it must have authenticated under the
+    // keys of that step.
+    const steps = [_]struct { current: []const u8, next: ?[]const u8 }{
+        .{ .current = cluster_key, .next = cluster_key_new },
+        .{ .current = cluster_key_new, .next = cluster_key },
+        .{ .current = cluster_key_new, .next = null },
+    };
+    var row: u64 = 10;
+    for (steps) |step| {
+        for (0..replica_count) |replica_usize| {
+            const replica: u8 = @intCast(replica_usize);
+            try cluster.restart_with_keys(replica, step.current, step.next);
+            const replica_next: u8 = @intCast((replica_usize + 1) % replica_count);
+            cluster.stop(replica_next);
+            try commit_ok(daemon, row);
+            row += 1;
+            try cluster.start(replica_next);
+        }
+    }
+    try commit_ok(daemon, row);
+}
+
+fn commit_ok(client: *Client, key: u64) !void {
+    const results = try commit(client, &.{put(key, @truncate(key))});
+    defer gpa.free(results);
+    try expect_statuses(results, &.{.ok});
+}
+
+fn peer_connect(address: stdx.SocketAddress) !std.net.Stream {
+    const stream = try std.net.tcpConnectToAddress(address.to_std());
+    errdefer stream.close();
+    const receive_timeout: std.posix.timeval = .{ .sec = 10, .usec = 0 };
+    try std.posix.setsockopt(
+        stream.handle,
+        std.posix.SOL.SOCKET,
+        std.posix.SO.RCVTIMEO,
+        std.mem.asBytes(&receive_timeout),
+    );
+    return stream;
+}
+
+/// The replica closes the connection without sending anything.
+fn expect_closed(stream: std.net.Stream) !void {
+    var buffer: [@sizeOf(Header)]u8 = undefined;
+    const size = stream.read(&buffer) catch |err| switch (err) {
+        error.ConnectionResetByPeer => 0,
+        else => return err, // WouldBlock: the replica kept the connection open.
+    };
+    try testing.expectEqual(@as(usize, 0), size);
+}
+
+fn read_header(stream: std.net.Stream) !Header {
+    var header: Header = undefined;
+    try stream.reader().readNoEof(std.mem.asBytes(&header));
+    try testing.expect(header.valid_checksum());
+    return header;
+}
+
+fn hello_from(replica: u8, nonce: u128) Header.PeerHello {
+    var hello: Header.PeerHello = .{
+        .cluster = cluster_id,
+        .release = constants.config.process.release,
+        .command = .peer_hello,
+        .replica = replica,
+        .nonce = nonce,
+        .origin = @splat(0),
+    };
+    hello.set_checksum_body(&.{});
+    hello.set_checksum();
+    return hello;
+}
+
+fn proof_from(
+    replica: u8,
+    key: []const u8,
+    transcript: *const peer_auth.Transcript,
+) Header.PeerProof {
+    var proof: Header.PeerProof = .{
+        .cluster = cluster_id,
+        .release = constants.config.process.release,
+        .command = .peer_proof,
+        .replica = replica,
+        .mac = peer_auth.proof(key, .dialing, transcript),
+    };
+    proof.set_checksum_body(&.{});
+    proof.set_checksum();
+    return proof;
+}
+
+/// Sends a hello as replica 0 and checks the challenge: from `accepting`, proving the key.
+fn handshake_begin(stream: std.net.Stream, accepting: u8, nonce: u128) !peer_auth.Transcript {
+    const hello = hello_from(0, nonce);
+    try stream.writeAll(std.mem.asBytes(&hello));
+    const header = try read_header(stream);
+    const challenge = header.into_const(.peer_challenge) orelse return error.NotAChallenge;
+    try testing.expectEqual(accepting, challenge.replica);
+    const transcript: peer_auth.Transcript = .{
+        .cluster = cluster_id,
+        .dialing = 0,
+        .accepting = accepting,
+        .nonce_dialing = nonce,
+        .nonce_accepting = challenge.nonce,
+        .origin_dialing = @splat(0),
+        .origin_accepting = challenge.origin,
+    };
+    const keys: peer_auth.Keys = .{ .current = cluster_key };
+    try testing.expect(peer_auth.verify(&keys, .accepting, &transcript, &challenge.mac));
+    const keys_wrong: peer_auth.Keys = .{ .current = cluster_key_wrong };
+    try testing.expect(!peer_auth.verify(&keys_wrong, .accepting, &transcript, &challenge.mac));
+    return transcript;
+}
+
+/// A well-formed ping, as replica `replica` of this release would send.
+const PingMessage = extern struct {
+    header: Header.Ping,
+    releases: [constants.vsr_releases_max]vsr.Release,
+
+    fn bytes(message: *const PingMessage) []const u8 {
+        return std.mem.asBytes(message);
+    }
+};
+
+fn ping_from(replica: u8) PingMessage {
+    var message: PingMessage = .{
+        .header = .{
+            .cluster = cluster_id,
+            .size = @sizeOf(PingMessage),
+            .view = 0,
+            .release = constants.config.process.release,
+            .command = .ping,
+            .replica = replica,
+            .checkpoint_id = 0,
+            .checkpoint_op = 0,
+            .ping_timestamp_monotonic = 1,
+            .release_count = 1,
+            .origin = @splat(0),
+        },
+        .releases = @splat(vsr.Release.zero),
+    };
+    message.releases[0] = constants.config.process.release;
+    message.header.set_checksum_body(std.mem.sliceAsBytes(&message.releases));
+    message.header.set_checksum();
+    assert(message.header.invalid() == null);
+    return message;
 }

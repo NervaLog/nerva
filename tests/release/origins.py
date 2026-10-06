@@ -31,6 +31,9 @@ import sys
 import tempfile
 import time
 
+# Replicas authenticate each other with a real cluster key, never the development key (P102).
+os.environ["NERVA_CLUSTER_KEY"] = os.urandom(32).hex()
+
 KEY = "origins-test-key"
 TABLE = 3
 EXPORT_COMMITS = 40  # Between exports: all three stay before the first checkpoint (op 959).

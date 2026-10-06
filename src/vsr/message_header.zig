@@ -102,6 +102,9 @@ pub const Header = extern struct {
             .deprecated_21 => Deprecated,
             .deprecated_22 => Deprecated,
             .deprecated_23 => Deprecated,
+            .peer_hello => PeerHello,
+            .peer_challenge => PeerChallenge,
+            .peer_proof => PeerProof,
         };
     }
 
@@ -235,6 +238,12 @@ pub const Header = extern struct {
             .deprecated_21,
             .deprecated_22,
             .deprecated_23,
+            => .unknown,
+
+            // Nerva: the message bus handles the handshake before it classifies a peer (P102).
+            .peer_hello,
+            .peer_challenge,
+            .peer_proof,
             => .unknown,
         };
     }
@@ -473,6 +482,142 @@ pub const Header = extern struct {
             if (self.release.value == 0) return "release == 0";
             if (self.ping_timestamp_monotonic == 0) return "ping_timestamp_monotonic == 0";
             if (self.pong_timestamp_wall == 0) return "pong_timestamp_wall == 0";
+            if (!stdx.zeroed(&self.reserved)) return "reserved != 0";
+            return null;
+        }
+    };
+
+    /// Nerva (P102): the dialing replica opens the handshake on a connection it made. `replica`
+    /// is the dialing replica, which dials only replicas after it.
+    pub const PeerHello = extern struct {
+        checksum: u128 = 0,
+        checksum_padding: u128 = 0,
+        checksum_body: u128 = 0,
+        checksum_body_padding: u128 = 0,
+        nonce_reserved: u128 = 0,
+        cluster: u128,
+        size: u32 = @sizeOf(Header),
+        epoch: u32 = 0,
+        view: u32 = 0, // Always 0.
+        release: vsr.Release,
+        protocol: u16 = vsr.Version,
+        command: Command,
+        replica: u8,
+        reserved_frame: [12]u8 = @splat(0),
+
+        /// Fresh for every connection.
+        nonce: u128,
+        /// The dialing replica's `VSRState.origin` (P90).
+        origin: [32]u8,
+        reserved: [80]u8 = @splat(0),
+
+        pub const frame = HeaderFunctionsType(@This()).frame;
+        pub const frame_const = HeaderFunctionsType(@This()).frame_const;
+        pub const invalid = HeaderFunctionsType(@This()).invalid;
+        pub const calculate_checksum = HeaderFunctionsType(@This()).calculate_checksum;
+        pub const calculate_checksum_body = HeaderFunctionsType(@This()).calculate_checksum_body;
+        pub const set_checksum = HeaderFunctionsType(@This()).set_checksum;
+        pub const set_checksum_body = HeaderFunctionsType(@This()).set_checksum_body;
+        pub const valid_checksum = HeaderFunctionsType(@This()).valid_checksum;
+        pub const valid_checksum_body = HeaderFunctionsType(@This()).valid_checksum_body;
+        pub const format = HeaderFunctionsType(@This()).format;
+
+        fn invalid_header(self: *const @This()) ?[]const u8 {
+            assert(self.command == .peer_hello);
+            if (self.size != @sizeOf(Header)) return "size != @sizeOf(Header)";
+            if (self.checksum_body != checksum_body_empty) return "checksum_body != expected";
+            if (self.view != 0) return "view != 0";
+            if (self.release.value == 0) return "release == 0";
+            if (self.nonce == 0) return "nonce == 0";
+            if (!stdx.zeroed(&self.reserved)) return "reserved != 0";
+            return null;
+        }
+    };
+
+    /// Nerva (P102): the accepting replica answers a hello with its nonce, its origin, and its
+    /// proof that it holds the cluster key (`peer_auth.proof`).
+    pub const PeerChallenge = extern struct {
+        checksum: u128 = 0,
+        checksum_padding: u128 = 0,
+        checksum_body: u128 = 0,
+        checksum_body_padding: u128 = 0,
+        nonce_reserved: u128 = 0,
+        cluster: u128,
+        size: u32 = @sizeOf(Header),
+        epoch: u32 = 0,
+        view: u32 = 0, // Always 0.
+        release: vsr.Release,
+        protocol: u16 = vsr.Version,
+        command: Command,
+        replica: u8,
+        reserved_frame: [12]u8 = @splat(0),
+
+        nonce: u128,
+        mac: [16]u8,
+        /// The accepting replica's `VSRState.origin` (P90).
+        origin: [32]u8,
+        reserved: [64]u8 = @splat(0),
+
+        pub const frame = HeaderFunctionsType(@This()).frame;
+        pub const frame_const = HeaderFunctionsType(@This()).frame_const;
+        pub const invalid = HeaderFunctionsType(@This()).invalid;
+        pub const calculate_checksum = HeaderFunctionsType(@This()).calculate_checksum;
+        pub const calculate_checksum_body = HeaderFunctionsType(@This()).calculate_checksum_body;
+        pub const set_checksum = HeaderFunctionsType(@This()).set_checksum;
+        pub const set_checksum_body = HeaderFunctionsType(@This()).set_checksum_body;
+        pub const valid_checksum = HeaderFunctionsType(@This()).valid_checksum;
+        pub const valid_checksum_body = HeaderFunctionsType(@This()).valid_checksum_body;
+        pub const format = HeaderFunctionsType(@This()).format;
+
+        fn invalid_header(self: *const @This()) ?[]const u8 {
+            assert(self.command == .peer_challenge);
+            if (self.size != @sizeOf(Header)) return "size != @sizeOf(Header)";
+            if (self.checksum_body != checksum_body_empty) return "checksum_body != expected";
+            if (self.view != 0) return "view != 0";
+            if (self.release.value == 0) return "release == 0";
+            if (self.nonce == 0) return "nonce == 0";
+            if (!stdx.zeroed(&self.reserved)) return "reserved != 0";
+            return null;
+        }
+    };
+
+    /// Nerva (P102): the dialing replica's proof that it holds the cluster key.
+    pub const PeerProof = extern struct {
+        checksum: u128 = 0,
+        checksum_padding: u128 = 0,
+        checksum_body: u128 = 0,
+        checksum_body_padding: u128 = 0,
+        nonce_reserved: u128 = 0,
+        cluster: u128,
+        size: u32 = @sizeOf(Header),
+        epoch: u32 = 0,
+        view: u32 = 0, // Always 0.
+        release: vsr.Release,
+        protocol: u16 = vsr.Version,
+        command: Command,
+        replica: u8,
+        reserved_frame: [12]u8 = @splat(0),
+
+        mac: [16]u8,
+        reserved: [112]u8 = @splat(0),
+
+        pub const frame = HeaderFunctionsType(@This()).frame;
+        pub const frame_const = HeaderFunctionsType(@This()).frame_const;
+        pub const invalid = HeaderFunctionsType(@This()).invalid;
+        pub const calculate_checksum = HeaderFunctionsType(@This()).calculate_checksum;
+        pub const calculate_checksum_body = HeaderFunctionsType(@This()).calculate_checksum_body;
+        pub const set_checksum = HeaderFunctionsType(@This()).set_checksum;
+        pub const set_checksum_body = HeaderFunctionsType(@This()).set_checksum_body;
+        pub const valid_checksum = HeaderFunctionsType(@This()).valid_checksum;
+        pub const valid_checksum_body = HeaderFunctionsType(@This()).valid_checksum_body;
+        pub const format = HeaderFunctionsType(@This()).format;
+
+        fn invalid_header(self: *const @This()) ?[]const u8 {
+            assert(self.command == .peer_proof);
+            if (self.size != @sizeOf(Header)) return "size != @sizeOf(Header)";
+            if (self.checksum_body != checksum_body_empty) return "checksum_body != expected";
+            if (self.view != 0) return "view != 0";
+            if (self.release.value == 0) return "release == 0";
             if (!stdx.zeroed(&self.reserved)) return "reserved != 0";
             return null;
         }
@@ -1713,6 +1858,13 @@ comptime {
     assert(@offsetOf(Header.Pong, "pong_timestamp_wall") == 136);
     assert(@offsetOf(Header.Pong, "origin") == 144);
     assert(@offsetOf(Header.Pong, "reserved") == 176);
+    // The handshake's fields (P102).
+    assert(@offsetOf(Header.PeerHello, "nonce") == 128);
+    assert(@offsetOf(Header.PeerHello, "origin") == 144);
+    assert(@offsetOf(Header.PeerChallenge, "nonce") == 128);
+    assert(@offsetOf(Header.PeerChallenge, "mac") == 144);
+    assert(@offsetOf(Header.PeerChallenge, "origin") == 160);
+    assert(@offsetOf(Header.PeerProof, "mac") == 128);
 }
 
 // Verify each Command's header type.

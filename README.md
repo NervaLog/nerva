@@ -126,7 +126,10 @@ the export they were imported from, P90) is what data files and clients check: a
 a data file of another release, so upgrading means new data files, and accepts clients from
 `0.0.4` on (v0.4.0's; a v0.3.0 `nerva api` is refused at registration). A replica ignores peers that
 run another release (N61): in a cluster mixing releases, only replicas of one release count
-toward each other's quorums, and each logs the others it ignores. A cluster moves to a new
+toward each other's quorums, and each logs the others it ignores. From `0.0.5`, replicas also
+authenticate each other before anything else (P102, below), which `0.0.4` replicas cannot do: a
+`0.0.4` replica and a `0.0.5` replica close every connection between them, so **never run them in
+one cluster**. A cluster moves to a new
 release with its data by export and import (below, N80). `zig build test:release` runs a cluster
 of two releases, an upgrade from this build to another release, and replicas imported from
 different exports.
@@ -139,13 +142,44 @@ different exports.
 ./zig-out/bin/nerva format --cluster=0 --replica=1 --replica-count=3 0_1.nerva
 ./zig-out/bin/nerva format --cluster=0 --replica=2 --replica-count=3 0_2.nerva
 
-# Every replica gets every address, in replica order.
+# Every replica gets every address, in replica order, and the same cluster key.
+export NERVA_CLUSTER_KEY="$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
 ./zig-out/bin/nerva start --addresses=3001,3002,3003 0_0.nerva   # and 0_1, 0_2
 ```
 
 `--development` relaxes Direct IO and uses small caches. Clients use `src/nerva/client.zig`:
 `lookup_rows`, `commit`, `get_changes`, `get_history`, views and ledgers, blocking, one
 request in flight per client.
+
+### Replicas authenticate each other
+
+Before any replica message flows on a connection between two replicas, each proves that it
+holds the cluster key, `NERVA_CLUSTER_KEY` (P102). A process without it cannot join the cluster,
+pose as a replica, or send a replica message: the connection is closed first. Clients and
+gateways do not hold the key and are not affected.
+
+- **The key**: at least 32 bytes, the same on every replica, and secret. `nerva start` refuses
+  to run without it, and never prints it. With `--development` and every address a loopback
+  address (`127.0.0.1`, `::1`, or bare ports), an unset key falls back to a public development
+  key, with a warning; that key authenticates nothing, so it is never used elsewhere.
+- **Rotating it**, one replica restart at a time, with no downtime:
+  1. restart every replica with the new key as `NERVA_CLUSTER_KEY_NEXT`;
+  2. restart every replica with the new key as `NERVA_CLUSTER_KEY` and the old one as
+     `NERVA_CLUSTER_KEY_NEXT`;
+  3. restart every replica without `NERVA_CLUSTER_KEY_NEXT`.
+
+  A replica proves with `NERVA_CLUSTER_KEY` and accepts proofs under either key.
+- **The handshake**: the replica that dials (the lower index) sends a fresh nonce; the other
+  answers with its own nonce and an HMAC-SHA256 under the key of both nonces, both replicas, the
+  cluster and both data files' origins (P90); the dialing replica checks it and answers with its
+  own. A replica's pings must then announce the origin its proof covered. A connection still
+  handshaking after 5 seconds is closed, and a replica refused with a wrong key is redialed with
+  backoff (it logs `wrong cluster key`).
+- **What it does not cover**: the key proves who opened a connection, but what follows is not
+  encrypted or signed. Someone on the network path between two replicas could still read or
+  alter it. Run replicas on a private network that encrypts: WireGuard, or Fly.io's private
+  network (6PN), which is WireGuard. Put gateways (`nerva api`, `nerva view`) behind TLS for any
+  caller off that network.
 
 ### Upgrading a cluster
 
@@ -161,7 +195,8 @@ nerva export --cluster=0 --addresses=3001,3002,3003 --output=cluster.nerva-expor
 nerva import --cluster=0 --replica=0 --replica-count=3 --input=cluster.nerva-export 0_0.nerva
 nerva import --cluster=0 --replica=1 --replica-count=3 --input=cluster.nerva-export 0_1.nerva
 nerva import --cluster=0 --replica=2 --replica-count=3 --input=cluster.nerva-export 0_2.nerva
-# 3. Start the replicas on the new release, then clients and gateways of the new release.
+# 3. Start the replicas on the new release (with NERVA_CLUSTER_KEY from 0.0.5 on), then
+#    clients and gateways of the new release.
 nerva start --addresses=3001,3002,3003 0_0.nerva   # and 0_1, 0_2
 ```
 
@@ -469,9 +504,11 @@ fails (gateways reconnect on their own).
 
 **Network.** Gateways authenticate their callers with `X-Nerva-Key`, but send it, and every
 reply, in plain HTTP: put them behind TLS (a load balancer or proxy) when callers are not on a
-private network. Replicas do not yet authenticate each other: anyone who can reach a replica's
-port can act as a replica or a client. Run replicas on a private network that only the cluster
-and its gateways can reach.
+private network. Replicas authenticate each other with the cluster key (P102, "Replicas
+authenticate each other" above), but their traffic is neither encrypted nor signed after the
+handshake, and anyone who can reach a replica's port can still act as a client. Run replicas on a
+private network that encrypts (WireGuard, or Fly.io's 6PN) and that only the cluster and its
+gateways can reach.
 
 To rotate a gateway key without downtime: restart every gateway with the new key as
 `NERVA_KEY_NEXT` (it accepts both); move every caller to the new key; then restart every gateway

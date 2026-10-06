@@ -280,6 +280,11 @@ pub const Command = enum(u8) {
 
     view = 24,
 
+    // Nerva: the replica handshake (P102). Only the message bus sends and handles these.
+    peer_hello = 25,
+    peer_challenge = 26,
+    peer_proof = 27,
+
     // If a command is removed from the protocol, its ordinal is added here and can't be re-used.
     deprecated_12 = 12, // .view without checkpoint
     deprecated_21 = 21, // .request_sync_checkpoint

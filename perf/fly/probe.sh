@@ -5,6 +5,9 @@ set -u
 out=/data/probe.txt
 exec > >(tee "$out") 2>&1
 section() { echo; echo "=== $*"; }
+# Replicas authenticate each other (P102); any key of 32 bytes or more.
+NERVA_CLUSTER_KEY="$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+export NERVA_CLUSTER_KEY
 
 section host
 uname -a; nproc; free -m; df -h /data; findmnt -no FSTYPE,OPTIONS /data

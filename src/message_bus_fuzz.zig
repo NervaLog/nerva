@@ -9,6 +9,10 @@
 //!    - replicas and clients send pings and ping_clients (respectively), to ensure peer
 //!      identification,
 //!    - replica nodes occasionally send ping_clients, to test peer misidentification handling.
+//!
+//! Nerva (P102): in half the runs, replicas authenticate each other with a cluster key; in half
+//! of those, replica 2 holds another key, and no replica message may pass between it and the
+//! others in either direction.
 const std = @import("std");
 const assert = std.debug.assert;
 const maybe = stdx.maybe;
@@ -48,6 +52,10 @@ pub fn main(gpa: std.mem.Allocator, args: fuzz.FuzzArgs) !void {
     // Note that this probability is conditional on sending a ping.
     const message_bus_ping_misdirect_probability = ratio(prng.range_inclusive(u64, 0, 3), 10);
 
+    const peer_auth_enabled = prng.boolean();
+    const rogue: ?u8 = if (peer_auth_enabled and prng.boolean()) replica_count - 1 else null;
+    log.info("peer_auth={} rogue={?}", .{ peer_auth_enabled, rogue });
+
     const configuration: []const stdx.SocketAddress = &.{
         .{ .ip = .@"127.0.0.1", .port = 3000 },
         .{ .ip = .@"127.0.0.1", .port = 3001 },
@@ -69,6 +77,16 @@ pub fn main(gpa: std.mem.Allocator, args: fuzz.FuzzArgs) !void {
         command_weights.ping_client = 0;
         // requests are interesting since they may originate from both clients and replicas.
         command_weights.request *= 20;
+        // An authenticated connection is closed by a handshake message, so it would never be
+        // delivered; without keys, they are delivered like any message of an unknown peer.
+        if (peer_auth_enabled) {
+            command_weights.prepare += command_weights.peer_hello;
+            command_weights.prepare += command_weights.peer_challenge;
+            command_weights.prepare += command_weights.peer_proof;
+            command_weights.peer_hello = 0;
+            command_weights.peer_challenge = 0;
+            command_weights.peer_proof = 0;
+        }
         break :weights command_weights;
     };
 
@@ -124,9 +142,18 @@ pub fn main(gpa: std.mem.Allocator, args: fuzz.FuzzArgs) !void {
                     .time = time,
                     .clients_limit = clients_limit,
                     .trace = null,
+                    .peer_auth = if (peer_auth_enabled) .{
+                        .keys = .{
+                            .current = if (rogue != null and rogue.? == i) key_rogue else key,
+                        },
+                        .cluster = 0,
+                        .release = vsr.Release.minimum,
+                        .origin = @splat(0),
+                    } else null,
                 },
             ),
             .id = @intCast(i),
+            .rogue = rogue,
         };
         try node.message_bus.listen();
     }
@@ -153,6 +180,7 @@ pub fn main(gpa: std.mem.Allocator, args: fuzz.FuzzArgs) !void {
                 },
             ),
             .id = @intCast(replica_count + i),
+            .rogue = rogue,
         };
     }
     defer for (nodes[replica_count..]) |*node| node.message_bus.deinit(gpa);
@@ -226,6 +254,15 @@ pub fn main(gpa: std.mem.Allocator, args: fuzz.FuzzArgs) !void {
             random_node(&prng, message_header.replica, node_count)
         else
             @intCast(prng.index(nodes[0..replica_count]));
+        // Replica messages to or from the replica with another key are never delivered.
+        if (rogue) |replica_rogue| {
+            if (node_source < replica_count and node_target < replica_count and
+                (node_source == replica_rogue or node_target == replica_rogue))
+            {
+                messages.items.len -= 1;
+                continue;
+            }
+        }
         try messages_pending.putNoClobber(gpa, message_header.checksum, .{
             .buffer = message[0..message_header.size],
             .source = node_source,
@@ -287,6 +324,16 @@ pub fn main(gpa: std.mem.Allocator, args: fuzz.FuzzArgs) !void {
     }
     assert(messages_pending.count() == 0);
 
+    // The replica with another key was never authenticated, by either side.
+    if (rogue) |replica_rogue| {
+        for (nodes[0..replica_count], 0..) |*node, replica| {
+            for (node.message_bus.replicas, 0..) |connection, peer| {
+                if (replica != replica_rogue and peer != replica_rogue) continue;
+                if (connection) |c| assert(c.auth != .authenticated);
+            }
+        }
+    }
+
     log.info("Passed!", .{});
 }
 
@@ -333,12 +380,17 @@ const NodeOptions = struct {
     }
 };
 
+const key = "message-bus-fuzz-cluster-key-0123456789";
+const key_rogue = "message-bus-fuzz-another-key-0123456789";
+
 const Node = struct {
     prng: *stdx.PRNG,
     options: NodeOptions,
     messages_pending: *std.AutoArrayHashMapUnmanaged(u128, MessagePending),
     message_bus: MessageBus,
     id: u8,
+    /// Nerva (P102): the replica with another cluster key, if any.
+    rogue: ?u8,
 
     fn send_message(node: *Node, target: u8, message: *Message) void {
         if (target < node.message_bus.replicas_addresses.len) {
@@ -353,6 +405,18 @@ const Node = struct {
         const node: *Node = @fieldParentPtr("message_bus", message_bus);
         while (buffer.next_header()) |header| {
             assert(header.valid_checksum());
+
+            // Nerva (P102): only clients send requests and ping_clients; every other message
+            // names the replica that sent it. None passes between the replica with another key
+            // and the others.
+            if (node.rogue) |rogue| {
+                if (message_bus.process == .replica and
+                    header.command != .request and header.command != .ping_client)
+                {
+                    assert(node.id != rogue);
+                    assert(header.replica != rogue);
+                }
+            }
 
             if (node.prng.chance(node.options.message_suspend_probability)) {
                 buffer.suspend_message(&header);
