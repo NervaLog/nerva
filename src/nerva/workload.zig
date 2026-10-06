@@ -1239,7 +1239,11 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                         nerva.LedgerQuery,
                         body[0..@sizeOf(nerva.LedgerQuery)],
                     ));
-                    query.* = .{ .id = prng.range_inclusive(u32, 1, 2) };
+                    // By id, or by slot (N78).
+                    query.* = if (prng.boolean())
+                        .{ .id = prng.range_inclusive(u32, 1, 2) }
+                    else
+                        .{ .id = 0, .slot = prng.range_inclusive(u64, 1, 2) };
                     return .{ .operation = .get_ledger, .size = @sizeOf(nerva.LedgerQuery) };
                 },
                 .probe => {
@@ -1470,7 +1474,11 @@ pub fn WorkloadType(comptime StateMachine: type) type {
             const result = &results[0];
             workload.ledger_reads += 1;
             for (workload.model_ledgers.items, 1..) |*ledger, slot| {
-                if (ledger.definition.id != query.id) continue;
+                if (query.id == 0) {
+                    if (query.slot != slot) continue;
+                } else {
+                    if (ledger.definition.id != query.id) continue;
+                }
                 assert(result.slot == slot);
                 assert(result.op == ledger.op);
                 assert(result.timestamp > 0);

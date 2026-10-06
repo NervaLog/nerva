@@ -58,6 +58,26 @@ const CLIArgs = union(enum) {
         log_debug: bool = false,
     },
 
+    @"export": struct {
+        cluster: u128,
+        addresses: vsr.ClusterAddress,
+        as_of: []const u8 = "latest",
+        output: []const u8,
+        log_debug: bool = false,
+    },
+
+    import: struct {
+        cluster: u128,
+        replica: u8,
+        replica_count: u8,
+        input: []const u8,
+        development: bool = false,
+        log_debug: bool = false,
+
+        @"--": void,
+        path: []const u8,
+    },
+
     version: struct {},
 
     pub const help =
@@ -79,6 +99,12 @@ const CLIArgs = union(enum) {
         \\  nerva api --cluster=<integer> --addresses=<addresses> --listen=<host:port>
         \\            [--log-debug]
         \\
+        \\  nerva export --cluster=<integer> --addresses=<addresses> [--as-of=<op>|latest]
+        \\               --output=<path> [--log-debug]
+        \\
+        \\  nerva import --cluster=<integer> --replica=<index> --replica-count=<integer>
+        \\               --input=<path> [--development] [--log-debug] <path>
+        \\
         \\  nerva version
         \\
         \\Commands:
@@ -92,6 +118,13 @@ const CLIArgs = union(enum) {
         \\
         \\  api      Serve the cluster's operations (lookup, commit, changes, history) as JSON
         \\           over HTTP. The key is read from the NERVA_KEY environment variable.
+        \\
+        \\  export   Write the cluster's changes up to an op, its views and ledgers, and
+        \\           checks, to a new file at --output, for `import` of another release.
+        \\
+        \\  import   Create a replica's data file at <path> from an export: run once per
+        \\           replica, on the same export, then start the replicas. Fails, and
+        \\           removes <path>, if the export is damaged or the checks do not match.
         \\
         \\  version  Print the version.
         \\
@@ -131,6 +164,13 @@ const CLIArgs = union(enum) {
         \\  --trace-size-max=<size><KiB|MiB|GiB>
         \\        The largest trace file (default 1GiB).
         \\
+        \\  --as-of=<op>|latest
+        \\        Export every change at or before this op (default: the op of the export's
+        \\        first read).
+        \\
+        \\  --output=<path>, --input=<path>
+        \\        The export file. `export` refuses an existing file.
+        \\
         \\  --listen=<host:port>
         \\        Where to serve HTTP. The bound port is printed to stdout (use port 0 for an
         \\        ephemeral one).
@@ -149,7 +189,28 @@ pub const Command = union(enum) {
     start: Start,
     view: View,
     api: Api,
+    @"export": Export,
+    import: Import,
     version,
+
+    pub const Export = struct {
+        cluster: u128,
+        addresses: vsr.ClusterAddress,
+        /// Null: the op of the export's first read.
+        as_of: ?u64,
+        output: []const u8,
+        log_debug: bool,
+    };
+
+    pub const Import = struct {
+        cluster: u128,
+        replica: u8,
+        replica_count: u8,
+        input: []const u8,
+        development: bool,
+        log_debug: bool,
+        path: []const u8,
+    };
 
     pub const Api = struct {
         cluster: u128,
@@ -227,8 +288,55 @@ pub fn parse_args(flags: *stdx.Flags) Command {
                 vsr.fatal(.cli, "api: --listen must be <ipv4>:<port>", .{}),
             .log_debug = api.log_debug,
         } },
+        .@"export" => |args| .{ .@"export" = .{
+            .cluster = args.cluster,
+            .addresses = args.addresses,
+            .as_of = as_of_parse(args.as_of) catch
+                vsr.fatal(.cli, "export: --as-of must be an op above zero, or latest", .{}),
+            .output = if (args.output.len == 0)
+                vsr.fatal(.cli, "export: --output must name a file", .{})
+            else
+                args.output,
+            .log_debug = args.log_debug,
+        } },
+        .import => |args| import: {
+            const format = format_validate(.{
+                .cluster = args.cluster,
+                .replica = args.replica,
+                .replica_count = args.replica_count,
+                .development = args.development,
+                .log_debug = args.log_debug,
+                .path = args.path,
+            }) catch |err| vsr.fatal(.cli, "import: {s}", .{error_message(err)});
+            if (args.input.len == 0) vsr.fatal(.cli, "import: --input must name a file", .{});
+            break :import .{ .import = .{
+                .cluster = format.cluster,
+                .replica = format.replica,
+                .replica_count = format.replica_count,
+                .input = args.input,
+                .development = format.development,
+                .log_debug = format.log_debug,
+                .path = format.path,
+            } };
+        },
         .version => .version,
     };
+}
+
+/// `--as-of`: an op above zero, or `latest` (null).
+fn as_of_parse(text: []const u8) error{Invalid}!?u64 {
+    if (std.mem.eql(u8, text, "latest")) return null;
+    const op = std.fmt.parseInt(u64, text, 10) catch return error.Invalid;
+    if (op == 0) return error.Invalid;
+    return op;
+}
+
+test as_of_parse {
+    try std.testing.expectEqual(@as(?u64, null), try as_of_parse("latest"));
+    try std.testing.expectEqual(@as(?u64, 1234), try as_of_parse("1234"));
+    for ([_][]const u8{ "", "0", "-1", "12x", "Latest" }) |text| {
+        try std.testing.expectError(error.Invalid, as_of_parse(text));
+    }
 }
 
 fn listen_parse(text: []const u8) ?std.net.Address {

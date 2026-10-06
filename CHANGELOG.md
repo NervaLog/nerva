@@ -50,6 +50,27 @@ curl -H 'X-Nerva-Key: secret' http://127.0.0.1:8080/v1/commit -d '{"entries": [
   10,000 groups is read in pages from `/groups`.
 - A view declared over a ledger's field is refused with `409`, and nothing is written.
 
+### New: upgrades keep the data
+
+From this release on, a cluster moves to the next release with its data. The old release's
+`nerva export` writes the cluster's changes, views, ledgers and checks to a file; the new
+release's `nerva import` builds each replica's data file from it, recomputing views and
+everything else derived with its own code, and refuses a damaged export or a state that does
+not match the checks.
+
+```bash
+nerva export --cluster=1 --addresses=3001,3002,3003 --output=cluster.nerva-export
+# Stop the replicas; with the new release, once per replica:
+nerva import --cluster=1 --replica=0 --replica-count=3 --input=cluster.nerva-export 1_0.nerva
+nerva start --addresses=3001,3002,3003 1_0.nerva
+```
+
+- Rows, versions, history, `row?as_of`, the change feed and its cursors, documents, layouts,
+  ledgers and every view's answer carry over. A view declared over rows that already existed is
+  rebuilt after the new cluster starts; client sessions start again.
+- `--as-of=<op>` exports the cluster as of an op; by default, as of the export's start.
+- See README, "Upgrading a cluster".
+
 ### New: releases carry a bill of materials
 
 Each release has a CycloneDX 1.5 software bill of materials next to its binaries.
@@ -85,7 +106,10 @@ Each release has a CycloneDX 1.5 software bill of materials next to its binaries
   stops on a v0.3.0 data file. Load your data again.
 - **Upgrade clients and gateways too.** v0.4.0 replicas refuse clients older than v0.4.0.
 - `GET /v1/views/<name>` now answers the view; read the declaration at `/definition`.
-- Zig client users: new operations `declare_ledger` and `get_ledger`, `AddFlags.pair`, new
+- v0.3.0 has no `nerva export`: this upgrade still means loading your data again. The next
+  one will not.
+- Zig client users: new operations `declare_ledger` and `get_ledger` (by id, or by `slot` to
+  list them: `Client.get_ledger_slot`), `AddFlags.pair`, new
   statuses `views_too_large` (15), `unpaired` (16) and `conserved_write` (17), and
   `DeclareStatus.ledger_field`. Existing values keep their numbers.
 

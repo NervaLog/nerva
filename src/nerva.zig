@@ -781,10 +781,13 @@ pub const DeclareLedgerResult = extern struct {
     }
 };
 
-/// The `get_ledger` event.
+/// The `get_ledger` event: a ledger by `id`, or by `slot` (its place in declaration order, from
+/// 1) when `id` is zero, so that every ledger can be listed (`nerva export`, N78). Not both.
 pub const LedgerQuery = extern struct {
     id: u32,
-    reserved: [12]u8 = @splat(0),
+    reserved: [4]u8 = @splat(0),
+    /// Taken from 0.0.4's reserved bytes before it shipped.
+    slot: u64 = 0,
 
     comptime {
         assert(@sizeOf(LedgerQuery) == 16);

@@ -5,6 +5,8 @@
 //!   persisted enum's values, rendered by reflection and compared to a snapshot.
 //! - Golden values for what Nerva derives and stores: row keys, document chunk ids, the catalog's
 //!   canonical layout and view JSON, and how a layout packs fields into a row.
+//! - The export file's bytes (N78): one release writes it, another reads it, so its format
+//!   changes only with its format version.
 //!
 //! What a fixed script of commits stores is guarded in `state_machine_tests.zig`, beside the
 //! harness it uses. A change that is meant must update these, with `SNAP_UPDATE=1`, and say why
@@ -21,6 +23,7 @@ const nerva = @import("../nerva.zig");
 const views = @import("views.zig");
 const documents = @import("documents.zig");
 const catalog = @import("catalog.zig");
+const export_file = @import("export_file.zig");
 
 /// The size, and each field's offset (or bit, for a packed struct), size and type, of a struct;
 /// or the tag type and every value of an enum.
@@ -436,7 +439,8 @@ test "format: wire and storage layouts" {
         \\  op: offset 8, size 8, u64
         \\nerva.LedgerQuery: extern struct, size 16
         \\  id: offset 0, size 4, u32
-        \\  reserved: offset 4, size 12, [12]u8
+        \\  reserved: offset 4, size 4, [4]u8
+        \\  slot: offset 8, size 8, u64
         \\nerva.Ledger: extern struct, size 512
         \\  slot: offset 0, size 8, u64
         \\  timestamp: offset 8, size 8, u64
@@ -526,5 +530,73 @@ test "format: persisted derivations" {
         try catalog.layout_render(arena, &layout),
         try catalog.view_render(arena, &view),
         std.fmt.fmtSliceHexLower(&row),
+    });
+}
+
+test "format: the export file" {
+    var out = std.ArrayList(u8).init(testing.allocator);
+    defer out.deinit();
+    var writer = try export_file.WriterType(std.ArrayList(u8).Writer).init(out.writer());
+
+    var value: [nerva.value_size]u8 = @splat(0);
+    value[0] = 0xaa;
+    value[79] = 0x55;
+    try writer.write(&.{ .change = .{
+        .table = 5,
+        .id = 7,
+        .op = 3,
+        .timestamp = 1_700_000_000_000_000_000,
+        .kind = .put,
+        .value = value,
+    } });
+    try writer.write(&.{ .change = .{
+        .table = 0xFFFF_0001,
+        .id = std.math.maxInt(u64),
+        .op = 4,
+        .timestamp = 1_700_000_000_000_000_009,
+        .kind = .delete,
+        .value = @splat(0),
+    } });
+    var name: [32]u8 = @splat(0);
+    @memcpy(name[0..7], "revenue");
+    try writer.write(&.{ .view = .{ .name = name, .id = 1, .declared_op = 2 } });
+    var definition = std.mem.zeroes(nerva.LedgerDefinition);
+    definition.id = 9;
+    definition.field_count = 2;
+    definition.fields[0] = .{ .table = 7, .offset = 0, .flags = .{ .floor = true }, .floor = -1 };
+    definition.fields[1] = .{ .table = 7, .offset = 8, .flags = .{}, .floor = 0 };
+    try writer.write(&.{ .ledger = .{ .op = 4, .definition = definition } });
+    try writer.write(&.{ .check_view = .{
+        .id = 1,
+        .state = .ready,
+        .group_count = 3,
+        .hash = @splat(0x11),
+    } });
+    try writer.write(&.{ .check_ledger = .{ .id = 9, .total = -5 } });
+    try writer.write(&.{ .check_table = .{
+        .table = 5,
+        .row_count = 1,
+        .rows_hash = @splat(0x22),
+    } });
+    try writer.write(&.{ .summary = .{
+        .as_of = 4,
+        .change_count = 2,
+        .view_count = 1,
+        .ledger_count = 1,
+        .table_count = 1,
+    } });
+    try writer.finish();
+
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(out.items, &digest, .{});
+    try snap(@src(),
+        \\size: 800
+        \\header and first record: 4e4552564145585001000000000000006d00000001000000050000000700000000000000030000000000000000002a36fe9c971701aa000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000558a95ff8a
+        \\sha256: cabcdbdf6d9006b821ad049c7e974460ac0f39573518b09b488e005fb2a8a5b3
+        \\
+    ).diff_fmt("size: {}\nheader and first record: {s}\nsha256: {s}\n", .{
+        out.items.len,
+        std.fmt.fmtSliceHexLower(out.items[0 .. export_file.header_size + 8 + 109 + 4]),
+        std.fmt.fmtSliceHexLower(&digest),
     });
 }

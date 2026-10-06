@@ -119,12 +119,12 @@ on runners brought up for it.
 
 Binaries report `<protocol>+<commit>`. The protocol release (`0.0.4` since views' `min`, `max`
 and `as_of`, N62) is what data files and clients check: a replica refuses a data file of another
-release, so upgrading means reformatting, and accepts clients of its own release only (a v0.3.0
+release, so upgrading means new data files, and accepts clients of its own release only (a v0.3.0
 `nerva api` is refused at registration). A replica ignores peers that
 run another release (N61): in a cluster mixing releases, only replicas of one release count
-toward each other's quorums, and each logs the others it ignores. Upgrade by stopping every
-replica, reformatting, and starting them all on the new release. `zig build test:release` runs a
-cluster of two releases.
+toward each other's quorums, and each logs the others it ignores. A cluster moves to a new
+release with its data by export and import (below, N78). `zig build test:release` runs a cluster
+of two releases, and an upgrade from this build to another release.
 
 ## Running a cluster
 
@@ -140,6 +140,40 @@ cluster of two releases.
 
 `--development` relaxes Direct IO and uses small caches. Clients use `src/nerva/client.zig`:
 `lookup_rows`, `commit` and `get_changes`, blocking, one request in flight per client.
+
+### Upgrading a cluster
+
+A new release keeps the data: the old release's `nerva export` writes what a client can read,
+and the new release's `nerva import` rebuilds each replica's data file from it, recomputing
+everything derived (views, versions, ledger indexes) with its own code (N78).
+
+```bash
+# 1. With the old release, while the cluster runs (stop writers first, or pass --as-of=<op>):
+nerva export --cluster=0 --addresses=3001,3002,3003 --output=cluster.nerva-export
+# 2. Stop every replica. With the new release, once per replica, on the same export:
+nerva import --cluster=0 --replica=0 --replica-count=3 --input=cluster.nerva-export 0_0.nerva
+nerva import --cluster=0 --replica=1 --replica-count=3 --input=cluster.nerva-export 0_1.nerva
+nerva import --cluster=0 --replica=2 --replica-count=3 --input=cluster.nerva-export 0_2.nerva
+# 3. Start the replicas on the new release, then clients and gateways of the new release.
+nerva start --addresses=3001,3002,3003 0_0.nerva   # and 0_1, 0_2
+```
+
+- The export holds every change up to its op (`--as-of`, by default the op it starts at), with
+  its op and timestamp, the views' names and ops, the ledgers' definitions and ops, and checks:
+  each view's hash, each ledger's total, and a hash of each table's rows. It is versioned,
+  checksummed record by record (CRC-32) and as a whole (SHA-256); `export` never overwrites a
+  file.
+- `import` checks the whole export before it creates the data file, restores every op at its
+  number, then compares its state with the checks. On a damaged export or a mismatch it exits
+  non-zero and removes the file. Every replica's file is identical.
+- What carries over: rows, versions (a client's `op_seen` still holds), history, `row?as_of`,
+  the change feed with its timestamps (a cursor from before continues), documents, layouts,
+  ledgers, and every view's answer and hash. A view declared over rows that already existed is
+  rebuilt by the new cluster after it starts (`"state": "building"` until then), and its as-of
+  history starts there; client sessions do not carry over.
+- Measured (`perf/upgrade.py`, a 4-CPU sandbox, `--development`): a million changes over
+  970,000 rows exported in 5.8 s (365 MiB at most) and imported in 14 s (1.2 GiB, the state
+  machine's fixed allocation, as a replica's); the export file is 121 bytes a change.
 
 ### Metrics and traces
 

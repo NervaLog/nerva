@@ -86,7 +86,7 @@ pub fn build(b: *std.Build) !void {
         .test_views = b.step("test:views", "Check declared views against a model (python3)"),
         .test_release = b.step(
             "test:release",
-            "Check that replicas of two releases do not form one cluster (python3)",
+            "Run a cluster of two releases, and an upgrade by export and import (python3)",
         ),
         .test_demo = b.step("test:demo", "Run the demos under crashes (python3)"),
         .vopr = b.step("vopr", "Run the VOPR"),
@@ -355,13 +355,23 @@ pub fn build(b: *std.Build) !void {
         .target = target,
         .mode = mode,
     });
-    const run_release_test = b.addSystemCommand(&.{ "python3", "tests/release/mixed.py" });
-    run_release_test.addFileArg(nerva.getEmittedBin());
-    run_release_test.addFileArg(nerva_other.getEmittedBin());
-    if (b.args) |args| run_release_test.addArgs(args);
-    run_release_test.setCwd(b.path("."));
-    run_release_test.has_side_effects = true;
-    steps.test_release.dependOn(&run_release_test.step);
+    // Then an upgrade: an export from `nerva`, imported by the other release (N78). One after
+    // the other: each runs a cluster.
+    var release_previous: ?*std.Build.Step = null;
+    for ([_][]const u8{ "mixed.py", "upgrade.py" }) |script| {
+        const run_release_test = b.addSystemCommand(&.{
+            "python3",
+            b.fmt("tests/release/{s}", .{script}),
+        });
+        run_release_test.addFileArg(nerva.getEmittedBin());
+        run_release_test.addFileArg(nerva_other.getEmittedBin());
+        if (b.args) |args| run_release_test.addArgs(args);
+        run_release_test.setCwd(b.path("."));
+        run_release_test.has_side_effects = true;
+        if (release_previous) |previous| run_release_test.step.dependOn(previous);
+        release_previous = &run_release_test.step;
+        steps.test_release.dependOn(&run_release_test.step);
+    }
 
     // zig build test:demo: the demos under crashes, one after the other (each runs a cluster).
     var demo_previous: ?*std.Build.Step = null;

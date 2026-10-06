@@ -262,8 +262,18 @@ pub const Client = struct {
 
     /// A ledger's declaration and the op it was declared at; all zero if `id` is not declared.
     pub fn get_ledger(client: *Client, id: u32) Error!nerva.Ledger {
+        assert(id != 0);
+        return client.get_ledger_query(.{ .id = id });
+    }
+
+    /// The ledger declared `slot`th (from 1); all zero if fewer were declared (N78).
+    pub fn get_ledger_slot(client: *Client, slot: u64) Error!nerva.Ledger {
+        assert(slot != 0);
+        return client.get_ledger_query(.{ .id = 0, .slot = slot });
+    }
+
+    fn get_ledger_query(client: *Client, query: nerva.LedgerQuery) Error!nerva.Ledger {
         try client.ensure_idle();
-        const query: nerva.LedgerQuery = .{ .id = id };
         const body = std.mem.asBytes(&query);
         stdx.copy_disjoint(.exact, u8, client.request[0..body.len], body);
         client.send(.get_ledger, client.request[0..body.len]);

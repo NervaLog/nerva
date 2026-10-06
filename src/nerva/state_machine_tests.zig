@@ -284,7 +284,11 @@ const Context = struct {
     }
 
     fn get_ledger(context: *Context, id: u32) !nerva.Ledger {
-        const results = try context.execute(.get_ledger, &.{&.{.{ .id = id }}});
+        return context.get_ledger_query(.{ .id = id });
+    }
+
+    fn get_ledger_query(context: *Context, query: nerva.LedgerQuery) !nerva.Ledger {
+        const results = try context.execute(.get_ledger, &.{&.{query}});
         assert(results[0].len == 1);
         return results[0][0];
     }
@@ -1305,6 +1309,17 @@ test "ledger: declarations are immutable, one ledger per field, and survive a re
     const definition = accounts_ledger();
     try testing.expect(stdx.equal_bytes(nerva.LedgerDefinition, &stored.definition, &definition));
     try testing.expect(stdx.zeroed(std.mem.asBytes(&try context.get_ledger(2))));
+    // By slot (N78); never by both, nor with reserved bytes.
+    const by_slot = try context.get_ledger_query(.{ .id = 0, .slot = 1 });
+    try testing.expect(stdx.equal_bytes(nerva.Ledger, &stored, &by_slot));
+    for ([_]nerva.LedgerQuery{
+        .{ .id = 0, .slot = 2 },
+        .{ .id = 1, .slot = 1 },
+        .{ .id = 0, .slot = 1, .reserved = .{ 0, 0, 0, 1 } },
+        .{ .id = 0 },
+    }) |query| {
+        try testing.expect(stdx.zeroed(std.mem.asBytes(&try context.get_ledger_query(query))));
+    }
 
     // Writes on every kind of table id, the reserved ones included, leave the declaration.
     _ = try context.commit(&.{
@@ -2181,4 +2196,285 @@ test "views: one op moving every min and max holder it admits to new groups (#62
         cursor = header.cursor;
     }
     try testing.expectEqual(rows, seen);
+}
+
+// ---- Restore (N78) ----
+
+/// Seats with `min` and `max` of the price as well: every kind of view state a restore rebuilds.
+fn extremes_view(name: []const u8) nerva.ViewDefinition {
+    var definition = revenue_view(name);
+    definition.where_count = 0;
+    definition.where[0] = std.mem.zeroes(nerva.Where);
+    definition.aggregate_count = 4;
+    definition.aggregates[2] = .{
+        .function = .min,
+        .field = .{ .offset = 8, .size = 8, .kind = .unsigned },
+    };
+    definition.aggregates[3] = .{
+        .function = .max,
+        .field = .{ .offset = 8, .size = 8, .kind = .unsigned },
+    };
+    return definition;
+}
+
+/// Every change of the feed, paged.
+fn changes_all(context: *Context) ![]const Change {
+    var all = std.ArrayList(Change).init(context.arena);
+    var cursor: u64 = 0;
+    while (true) {
+        const page = try context.changes(cursor, StateMachine.changes_limit_max);
+        const end = page[page.len - 1];
+        try testing.expectEqual(nerva.ChangeKind.end, end.kind);
+        try all.appendSlice(page[0 .. page.len - 1]);
+        if (!end.flags.more) return all.items;
+        cursor = end.timestamp;
+    }
+}
+
+const RestoreDeclaration = union(enum) {
+    view: struct { id: u64, definition: nerva.ViewDefinition },
+    ledger: nerva.LedgerDefinition,
+};
+
+/// Restores one op as `nerva import` does (N78), after compacting the ops before it.
+fn restore_op(
+    context: *Context,
+    op: u64,
+    changes: []const Change,
+    declaration: ?RestoreDeclaration,
+    timestamp_next: *u64,
+) !void {
+    assert(op >= context.op);
+    assert((changes.len > 0) != (declaration != null));
+    while (context.op < op) context.op_end();
+    const state_machine = &context.state_machine;
+    const operation: Operation, const size = if (declaration) |declared| switch (declared) {
+        .view => |*view| size: {
+            stdx.copy_disjoint(.inexact, u8, context.request, std.mem.asBytes(&view.definition));
+            break :size .{ .declare_view, @sizeOf(nerva.ViewDefinition) };
+        },
+        .ledger => |*definition| size: {
+            stdx.copy_disjoint(.inexact, u8, context.request, std.mem.asBytes(definition));
+            break :size .{ .declare_ledger, @sizeOf(nerva.LedgerDefinition) };
+        },
+    } else .{ .commit, state_machine.restore_entries(changes, context.request) };
+    context.prefetching = true;
+    state_machine.restore_prefetch(
+        prefetch_callback_restore,
+        op,
+        operation,
+        context.request[0..size],
+    );
+    while (context.prefetching) context.storage.run();
+    defer context.op_end();
+    if (declaration) |declared| switch (declared) {
+        .view => |*view| try state_machine.restore_view(
+            op,
+            &view.definition,
+            view.id,
+            timestamp_next,
+        ),
+        .ledger => |*definition| try state_machine.restore_ledger(op, definition, timestamp_next),
+    } else try state_machine.restore_changes(op, changes, timestamp_next);
+}
+
+fn prefetch_callback_restore(state_machine: *StateMachine) void {
+    const context: *Context = @fieldParentPtr("state_machine", state_machine);
+    assert(context.prefetching);
+    context.prefetching = false;
+}
+
+/// A view's header, latest or as of an op.
+fn view_header(context: *Context, view_id: u64, as_of: u64) !nerva.ViewRecord {
+    const records = try context.view(.{
+        .view_id = view_id,
+        .group_hash_min = 0,
+        .limit = 1,
+        .as_of = as_of,
+    });
+    return records[0];
+}
+
+test "restore: a history restored at its ops reads as it was committed" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const original = try context_init(&arena);
+
+    // A view declared before its table has rows, then a ledger.
+    const early = try original.declare(extremes_view("early"));
+    try testing.expectEqual(nerva.DeclareStatus.created, early.status);
+    try testing.expectEqual(@as(u32, 1), original.pulse_until_ready());
+    try ledger_funded(original, 50);
+    const ledger_op = (try original.get_ledger(1)).op;
+
+    // Puts, deletes, adds and pairs; several transactions in one op, a row written twice in
+    // one op, a row deleted and put back.
+    for (0..12) |round| {
+        const id: u64 = round % 5;
+        _ = try original.commit(&.{
+            &.{
+                seat(id, @intCast(round % 3), 10 * round, round % 2 == 0),
+                seat(20 + round, 1, 7, true),
+            },
+            &.{ seat(id, 2, 5 + round, true), add(1, 3, 0, 4, .{ .create = true }) },
+            &.{
+                move(accounts, 1, 0, -2, .{ .pair = true }),
+                partner(accounts, 1, 8, 0),
+            },
+        });
+        if (round % 4 == 3) _ = try original.commit(&.{&.{ delete(5, id), delete(5, 20 + round) }});
+        _ = try original.lookup(5, id); // An op without changes.
+    }
+    // A view over rows that already exist: it backfills in pulses.
+    const late = try original.declare(revenue_view("late"));
+    try testing.expectEqual(nerva.DeclareStatus.created, late.status);
+    _ = original.pulse_until_ready();
+    _ = try original.commit(&.{&.{ seat(1, 0, 3, true), delete(5, 2) }});
+    const as_of = original.op - 1;
+
+    // The export, as `nerva export` reads it: the feed, the declarations and their ops.
+    const changes = try changes_all(original);
+    const early_header = try view_header(original, early.view_id, 0);
+    const late_header = try view_header(original, late.view_id, 0);
+
+    // The restore, as `nerva import` drives it: every op at its number.
+    const restored = try context_init(&arena);
+    var timestamp_next = changes[changes.len - 1].timestamp + StateMachine.entry_timestamps;
+    var index: usize = 0;
+    var op: u64 = 1;
+    while (op <= as_of) : (op += 1) {
+        if (op == early.op) {
+            try restore_op(restored, op, &.{}, .{ .view = .{
+                .id = early.view_id,
+                .definition = extremes_view("early"),
+            } }, &timestamp_next);
+        } else if (op == late.op) {
+            try restore_op(restored, op, &.{}, .{ .view = .{
+                .id = late.view_id,
+                .definition = revenue_view("late"),
+            } }, &timestamp_next);
+        } else if (op == ledger_op) {
+            try restore_op(restored, op, &.{}, .{ .ledger = accounts_ledger() }, &timestamp_next);
+        } else {
+            const start = index;
+            while (index < changes.len and changes[index].op == op) index += 1;
+            if (index > start) {
+                try restore_op(restored, op, changes[start..index], null, &timestamp_next);
+            }
+        }
+    }
+    try testing.expectEqual(changes.len, index);
+    while (restored.op <= as_of) restored.op_end();
+
+    // The feed: every change at its op and timestamp, so cursors stay valid.
+    const changes_restored = try changes_all(restored);
+    try testing.expectEqual(changes.len, changes_restored.len);
+    for (changes, changes_restored) |expected, actual| {
+        try testing.expect(stdx.equal_bytes(Change, &expected, &actual));
+    }
+    // Rows, their versions and histories, and the ledger's total.
+    for ([_]u32{ 1, 5, accounts, sources }) |table| {
+        for (0..40) |id| {
+            const expected = try original.lookup(table, id);
+            const actual = try restored.lookup(table, id);
+            try testing.expectEqual(expected.flags, actual.flags);
+            try testing.expectEqual(expected.op, actual.op);
+            try testing.expectEqual(expected.value, actual.value);
+            const filter: nerva.HistoryFilter = .{
+                .table = table,
+                .id = id,
+                .limit = 64,
+                .op_max = std.math.maxInt(u64),
+                .timestamp_max = 0,
+            };
+            const history_expected = try original.history(filter);
+            const history_actual = try restored.history(filter);
+            try testing.expectEqual(history_expected.len, history_actual.len);
+            // All but the `end` record, whose op is the read's.
+            const count = history_expected.len - 1;
+            for (history_expected[0..count], history_actual[0..count]) |a, b| {
+                try testing.expect(stdx.equal_bytes(Change, &a, &b));
+            }
+        }
+    }
+    try testing.expectEqual(try ledger_total(original), try ledger_total(restored));
+    const ledger_restored = try restored.get_ledger(1);
+    try testing.expectEqual(ledger_op, ledger_restored.op);
+    try testing.expectEqual(@as(u64, 1), ledger_restored.slot);
+
+    // The view declared before rows: ready, the same hash, and the same as of every op after
+    // the original's first pulse (the restore has none: it is ready at its declaration).
+    const early_restored = try view_header(restored, early.view_id, 0);
+    try testing.expectEqual(nerva.ViewState.ready, early_restored.state);
+    try testing.expectEqual(early_header.hash, early_restored.hash);
+    try testing.expectEqual(early_header.group_count, early_restored.group_count);
+    try testing.expectEqual(early.op, early_restored.declared_op);
+    op = early.op + 2;
+    while (op <= as_of) : (op += 1) {
+        const expected = try view_header(original, early.view_id, op);
+        const actual = try view_header(restored, early.view_id, op);
+        try testing.expectEqual(expected.state, actual.state);
+        try testing.expectEqual(expected.hash, actual.hash);
+        try testing.expectEqual(expected.group_count, actual.group_count);
+    }
+    // The view declared over existing rows: building, until the new cluster's pulses add them.
+    const late_building = try view_header(restored, late.view_id, 0);
+    try testing.expectEqual(nerva.ViewState.building, late_building.state);
+    try testing.expect(restored.pulse_until_ready() > 0);
+    const late_restored = try view_header(restored, late.view_id, 0);
+    try testing.expectEqual(late_header.hash, late_restored.hash);
+    try testing.expectEqual(late_header.group_count, late_restored.group_count);
+    try testing.expectEqual(
+        try view_sections(original, late.view_id),
+        try view_sections(restored, late.view_id),
+    );
+
+    // The restored cluster commits on: a read of a restored version, and the view follows.
+    const version = (try restored.lookup(5, 1)).op;
+    const results = try restored.commit(&.{&.{ read(5, 1, version), seat(1, 1, 1, true) }});
+    try expect_statuses(results[0], &.{ .ok, .ok });
+    _ = try original.commit(&.{&.{ read(5, 1, version), seat(1, 1, 1, true) }});
+    try testing.expectEqual(
+        (try view_header(original, early.view_id, 0)).hash,
+        (try view_header(restored, early.view_id, 0)).hash,
+    );
+}
+
+test "restore: the rules a commit checks are not checked again" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const context = try context_init(&arena);
+    var timestamp_next: u64 = 1_000_000;
+
+    try restore_op(context, 1, &.{}, .{ .ledger = accounts_ledger() }, &timestamp_next);
+    // A put of a conserved field, alone: a commit refuses it; a restore writes it.
+    var balance: [nerva.value_size]u8 = @splat(0);
+    std.mem.writeInt(i64, balance[0..8], 100, .little);
+    const change: Change = .{
+        .id = 1,
+        .table = accounts,
+        .kind = .put,
+        .flags = .{},
+        .op = 2,
+        .timestamp = 500,
+        .value = balance,
+    };
+    try restore_op(context, 2, &.{change}, null, &timestamp_next);
+    try testing.expectEqual(100, signed(try context.lookup(accounts, 1), 0));
+    var entry = put(accounts, 2, 0);
+    entry.value = balance;
+    try expect_statuses((try context.commit(&.{&.{entry}}))[0], &.{.conserved_write});
+
+    // A history no commit writes is refused: a delete of a row that is not there, timestamps
+    // closer than an entry's block.
+    var absent = change;
+    absent.kind = .delete;
+    absent.id = 9;
+    absent.value = @splat(0);
+    absent.op = context.op;
+    absent.timestamp = 600;
+    try testing.expectError(
+        error.HistoryInvalid,
+        restore_op(context, context.op, &.{absent}, null, &timestamp_next),
+    );
 }
