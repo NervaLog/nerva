@@ -59,9 +59,14 @@ pub fn chunk_count(key_size: usize, value_size_: usize) u32 {
     return @intCast(1 + stdx.div_ceil(payload - chunk0_payload, value_size));
 }
 
-/// The row id of chunk `chunk` of `key`.
+/// The row id of chunk `chunk` of `key`. To name every chunk of a document, take `row_id` once
+/// and `chunk_id_from` for each: `chunk_id` hashes the key again for every chunk (#88).
 pub fn chunk_id(namespace: u64, key: []const u8, chunk: u32) u64 {
-    const id0 = row_id(namespace, key);
+    return chunk_id_from(row_id(namespace, key), chunk);
+}
+
+/// The row id of chunk `chunk` of the document whose chunk 0 has id `id0`.
+pub fn chunk_id_from(id0: u64, chunk: u32) u64 {
     return if (chunk == 0) id0 else tail_id(id0, chunk);
 }
 
@@ -223,7 +228,8 @@ pub fn TransactionType(comptime ClientType: type) type {
             if (key.len > key_size_max) return error.TooLarge;
             const arena = transaction.arena;
 
-            const chunk0 = try transaction.lookup(row_id(transaction.namespace, key));
+            const id0 = row_id(transaction.namespace, key);
+            const chunk0 = try transaction.lookup(id0);
             const value: ?[]const u8 = if (!chunk0.flags.exists) null else value: {
                 const count = try chunk0_count(&chunk0.value);
                 const chunks = try arena.alloc([value_size]u8, count);
@@ -232,7 +238,7 @@ pub fn TransactionType(comptime ClientType: type) type {
                     const keys = try arena.alloc(RowKey, count - 1);
                     for (keys, 1..) |*row_key, chunk| {
                         row_key.* = .{
-                            .id = chunk_id(transaction.namespace, key, @intCast(chunk)),
+                            .id = tail_id(id0, @intCast(chunk)),
                             .table = transaction.table,
                         };
                     }
@@ -271,8 +277,9 @@ pub fn TransactionType(comptime ClientType: type) type {
             if (key.len > key_size_max or value.len > value_size_max) return error.TooLarge;
             const arena = transaction.arena;
             const chunks = try chunks_encode(arena, transaction.namespace, key, value);
+            const id0 = row_id(transaction.namespace, key);
             for (chunks, 0..) |*chunk, index| {
-                const id = chunk_id(transaction.namespace, key, @intCast(index));
+                const id = chunk_id_from(id0, @intCast(index));
                 try transaction.writes.put(arena, id, .{
                     .id = id,
                     .table = transaction.table,
@@ -441,6 +448,21 @@ test "documents: row ids are stable and separate keys, chunks and namespaces" {
     try testing.expectEqual(row_id(0, "k"), chunk_id(0, "k", 0));
     try testing.expectEqual(tail_id(row_id(0, "k"), 3), chunk_id(0, "k", 3));
     try testing.expect(chunk_id(0, "k", 1) != chunk_id(0, "k", 2));
+}
+
+test "documents: tail chunks' ids are stable (#88)" {
+    // Fixed vectors (computed with Python's hashlib, not this code): the tails of "table.5",
+    // up to the last chunk of the largest document. Changing the derivation would orphan every
+    // stored document's tails.
+    const id0 = row_id(0, "table.5");
+    try testing.expectEqual(@as(u64, 4613465043632273798), chunk_id_from(id0, 1));
+    try testing.expectEqual(@as(u64, 4590579942568114901), chunk_id_from(id0, 2));
+    try testing.expectEqual(
+        @as(u64, 11947710669345664337),
+        chunk_id_from(id0, chunk_count(key_size_max, value_size_max) - 1),
+    );
+    try testing.expectEqual(id0, chunk_id_from(id0, 0));
+    try testing.expectEqual(chunk_id_from(id0, 2), chunk_id(0, "table.5", 2));
 }
 
 /// A client over rows held in memory, with their history, for `TransactionType`. A test can have
