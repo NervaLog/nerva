@@ -350,6 +350,9 @@ pub fn WriterType(comptime Inner: type) type {
         hash: std.crypto.hash.sha2.Sha256,
         section: u32 = 0,
         finished: bool = false,
+        /// The `end` record's SHA-256, once finished: the export's identity, which every data
+        /// file imported from it records (`VSRState.origin`, N84).
+        digest: [32]u8 = undefined,
 
         pub fn init(inner: Inner) !Writer {
             var writer: Writer = .{ .inner = inner, .hash = .init(.{}) };
@@ -377,6 +380,7 @@ pub fn WriterType(comptime Inner: type) type {
             const digest = writer.hash.finalResult();
             try writer.write_frame(.end, &digest);
             writer.finished = true;
+            writer.digest = digest;
         }
 
         fn write_frame(writer: *Writer, kind: RecordKind, body: []const u8) !void {
@@ -425,6 +429,8 @@ pub fn ReaderType(comptime Inner: type) type {
         check_view_count: u32 = 0,
         check_ledger_count: u32 = 0,
         summary: ?Summary = null,
+        /// The `end` record's SHA-256, once `next` returned null (see `WriterType.digest`).
+        digest: [32]u8 = undefined,
 
         pub fn init(inner: Inner) !Reader {
             var reader: Reader = .{ .inner = inner, .hash = .init(.{}) };
@@ -477,6 +483,7 @@ pub fn ReaderType(comptime Inner: type) type {
                     return corrupt("bytes follow the end record");
                 }
                 reader.state = .ended;
+                reader.digest = body[0..32].*;
                 return null;
             }
             const record = try decode(kind, body);
@@ -655,6 +662,35 @@ test "export file: records round-trip" {
     for (records, decoded) |expected, actual| {
         try testing.expectEqualDeep(expected, actual);
     }
+}
+
+test "export file: the writer and the reader name an export by its end record (N84)" {
+    var arena_instance = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_instance.deinit();
+    const arena = arena_instance.allocator();
+
+    const records = try test_records(arena);
+    var out = std.ArrayList(u8).init(arena);
+    var writer = try WriterType(std.ArrayList(u8).Writer).init(out.writer());
+    for (records) |*record| try writer.write(record);
+    try writer.finish();
+    // The end record's body, the last 32 bytes before its CRC-32.
+    const bytes = out.items;
+    try testing.expectEqualSlices(u8, bytes[bytes.len - 4 - 32 ..][0..32], &writer.digest);
+
+    var stream = std.io.fixedBufferStream(bytes);
+    var reader = try ReaderType(@TypeOf(stream).Reader).init(stream.reader());
+    while (try reader.next()) |_| {}
+    try testing.expectEqualSlices(u8, &writer.digest, &reader.digest);
+
+    // Another export (one record differs) is another origin.
+    var other = try arena.dupe(Record, records);
+    other[other.len - 1].summary.as_of += 1;
+    var out_other = std.ArrayList(u8).init(arena);
+    var writer_other = try WriterType(std.ArrayList(u8).Writer).init(out_other.writer());
+    for (other) |*record| try writer_other.write(record);
+    try writer_other.finish();
+    try testing.expect(!std.mem.eql(u8, &writer.digest, &writer_other.digest));
 }
 
 test "export file: one byte changed, a truncation, or a record moved, each fails" {
