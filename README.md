@@ -261,6 +261,9 @@ curl -H 'X-Nerva-Key: secret' -d '{"entries":[{"kind":"put","table":1,"id":"5","
     http://127.0.0.1:8080/v1/commit        # {"status":"committed","op":"42"}
 ```
 
+`--listen` (for `nerva api` and `nerva view`) takes `<ipv4>:<port>` or `[<ipv6>]:<port>`, as
+`--addresses` does: `--listen=[::]:8080` serves every IPv6 address, as on an IPv6-only network.
+
 | Route | Does |
 |---|---|
 | `POST /v1/lookup` `{"rows":[{"table","id"}]}` | Point reads: `exists`, version `op`, `value_hex`, and the `op` read at. |
