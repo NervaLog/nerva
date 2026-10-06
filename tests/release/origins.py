@@ -138,7 +138,13 @@ class Cluster:
         line = process.stdout.readline()
         if not line:
             with open(log, errors="replace") as f:
-                raise AssertionError(f"the gateway exited: {f.read()[-3000:]}")
+                gateway_log = f.read()[-3000:]
+            replicas = "\n".join(
+                f"replica {index}: " + ("not started" if replica is None else
+                                        f"exit status {replica.poll()}") +
+                f"\n{self.log(index)[-4000:]}"
+                for index, replica in enumerate(self.replicas))
+            raise AssertionError(f"the gateway exited: {gateway_log}\n{replicas}")
         return int(line)
 
     def check_running(self, indexes):
