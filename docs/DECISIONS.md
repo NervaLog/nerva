@@ -997,7 +997,9 @@ they write, from replicated state, and `nerva view` stays as an independent reco
   `/definition`; before 1.0 anything may break): every group, sorted by key, rendered by the
   same code as `nerva view` (`declared.render`, shared), so the answer, and `hash`, the SHA-256
   of its `groups` JSON, are `nerva view`'s byte for byte. `view_hash` (the replicated hash, N52)
-  and `declared_op` come with it. `as_of` and `min_op` mean what they mean in `nerva view`, and
+  and `declared_op` come with it; `/groups` names the replicated hash `view_hash` too (it
+  said `hash` until #66, renamed before v0.4.0 shipped), so `hash` always means `nerva
+  view`'s. `as_of` and `min_op` mean what they mean in `nerva view`, and
   an op not yet committed answers 504 as there; a view still building or failed answers 503
   rather than part of an answer. `GET /v1/views` lists the views the state machine maintains;
   the `get_view` header now carries the view's name in `group_key` for it.

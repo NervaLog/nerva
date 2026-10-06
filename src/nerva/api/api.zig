@@ -1029,7 +1029,7 @@ fn view_groups(
         try out.raw(",\"as_of\":");
         try out.number(as_of);
     }
-    try out.raw(",\"hash\":");
+    try out.raw(",\"view_hash\":");
     try out.hex(&header.hash);
     try out.raw(",\"group_count\":");
     try out.number(header.group_count);
