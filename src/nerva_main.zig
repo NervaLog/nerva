@@ -17,6 +17,7 @@ const api_server = @import("nerva/api/server.zig");
 const export_file = @import("nerva/export_file.zig");
 const export_ = @import("nerva/export.zig");
 const import_ = @import("nerva/import.zig");
+const release_peers = @import("nerva/release_peers.zig");
 
 const IO = @import("io.zig").IO;
 const Tracer = @import("trace.zig").Tracer;
@@ -288,18 +289,25 @@ fn command_import(
         .replica_count = args.replica_count,
         .release = config.process.release,
         .view = null,
+        .origin = plan.origin,
     });
     try import_.ImporterType(Storage).run(gpa, time, &tracer, &storage, .{
         .cluster = args.cluster,
         .release = config.process.release,
         .input = args.input,
     }, plan);
-    log.info("{}: imported {s}: cluster={} replica_count={} op={}", .{
+    // Import cannot see the cluster, so it says what it needs (P90): a replica imported alone
+    // into a cluster that ran on has forgotten the prepares the replica it replaces acknowledged.
+    log.warn("{}: start this replica only with every replica imported from {s}, before the " ++
+        "cluster runs; to replace a replica of a running cluster, export it again and import " ++
+        "every replica", .{ args.replica, args.input });
+    log.info("{}: imported {s}: cluster={} replica_count={} op={} export={s}", .{
         args.replica,
         args.input,
         args.cluster,
         args.replica_count,
         plan.summary.as_of,
+        release_peers.origin_name(&plan.origin),
     });
 }
 
@@ -330,13 +338,15 @@ fn command_export(gpa: std.mem.Allocator, args: *const cli.Command.Export) !void
     const summary = try export_.run(gpa, &client, &writer, args.as_of);
     try buffered.flush();
     try file.sync();
-    log.info("exported to {s}: op {}, {} changes, {} views, {} ledgers, {} tables", .{
+    log.info("exported to {s}: op {}, {} changes, {} views, {} ledgers, {} tables, " ++
+        "export {s}", .{
         args.output,
         summary.as_of,
         summary.change_count,
         summary.view_count,
         summary.ledger_count,
         summary.table_count,
+        release_peers.origin_name(&writer.digest),
     });
 }
 
@@ -401,10 +411,11 @@ fn command_start(
         replica.replica,
         @divFloor(counting_allocator.live_size(), MiB),
     });
-    log.info("{}: cluster={}: listening on {}", .{
+    log.info("{}: cluster={}: listening on {}; data file from export {s}", .{
         replica.replica,
         replica.cluster,
         replica.message_bus.accept_address.?,
+        release_peers.origin_name(&replica.superblock.working.vsr_state.origin),
     });
 
     // `--addresses=0`: the OS picks a free port, which is printed (alone) to stdout so a parent
