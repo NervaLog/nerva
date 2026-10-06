@@ -108,13 +108,6 @@ class Cluster:
             stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
             stderr=open(self.data_file(index) + ".log", "a"))
 
-    def move(self, index):
-        """Gives replica `index` a new port, as a replacement machine gets a new address; the
-        running replicas keep the addresses they started with."""
-        ports = self.addresses.split(",")
-        ports[index] = str(free_ports(1)[0])
-        self.addresses = ",".join(ports)
-
     def stop(self, index):
         self.replicas[index].kill()
         self.replicas[index].wait()

@@ -296,6 +296,11 @@ fn command_import(
         .release = config.process.release,
         .input = args.input,
     }, plan);
+    // Import cannot see the cluster, so it says what it needs (N84): a replica imported alone
+    // into a cluster that ran on has forgotten the prepares the replica it replaces acknowledged.
+    log.warn("{}: start this replica only with every replica imported from {s}, before the " ++
+        "cluster runs; to replace a replica of a running cluster, export it again and import " ++
+        "every replica", .{ args.replica, args.input });
     log.info("{}: imported {s}: cluster={} replica_count={} op={} export={s}", .{
         args.replica,
         args.input,

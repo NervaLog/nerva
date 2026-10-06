@@ -93,6 +93,8 @@ pub fn ClusterType(comptime StateMachineType: anytype) type {
             state_machine: StateMachine.Options,
             /// Nerva: replicas ignore peers of another release (N61). Needs one release.
             release_peers_strict: bool = false,
+            /// Nerva: every replica's `VSRState.origin`, as `nerva import` writes it (N84).
+            origin: [32]u8 = @splat(0),
         };
 
         pub const Callbacks = struct {
@@ -367,6 +369,7 @@ pub fn ClusterType(comptime StateMachineType: anytype) type {
                         .replica = @intCast(replica_index),
                         .replica_count = options.cluster.replica_count,
                         .view = null,
+                        .origin = options.cluster.origin,
                     },
                 );
             }
@@ -874,6 +877,7 @@ pub fn ClusterType(comptime StateMachineType: anytype) type {
                     .replica = @intCast(replica_index),
                     .replica_count = cluster.options.replica_count,
                     .view = null,
+                    .origin = cluster.options.origin,
                 },
             );
             cluster.replica_reformats[replica_index].?.start();

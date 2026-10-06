@@ -1521,15 +1521,25 @@ format change, but blind to exports that reach different checkpoints).
   alone and commits nothing (the test allows either). Nothing from a peer of another export is
   handled, so nothing of it is written to the refused replica's file.
 - **What it costs:** a replica of an imported cluster cannot be replaced by `nerva format` (its
-  origin is none, and an imported cluster refuses it). Nor is it safe to replace it by
-  importing it alone from the cluster's export, though that replacement joins and catches up:
-  it has forgotten every prepare the lost replica acknowledged, so a view change after one more
-  failure could leave out an op committed with that acknowledgement (upstream's
-  `replica_reformat.zig` exists for this: a reformatted replica first commits a pipeline of
-  requests and takes a view two past the cluster's, so that it makes no promise it cannot keep).
-  Until a replacement takes the same precautions (`import --replace` or `nerva recover`, its own
-  design), the only safe replacement is a new export and import of every replica. A replica
-  imported from the export that has never started has acknowledged nothing, and may start late.
+  origin is none, and an imported cluster refuses it). Nor is it safe to replace it by importing it
+  alone from the cluster's export, though that replacement joins and catches up: it has forgotten
+  every prepare the lost replica acknowledged, so a view change after one more failure could leave
+  out an op committed with that acknowledgement (upstream's `replica_reformat.zig` exists for this:
+  a reformatted replica first commits a pipeline of requests and takes a view two past the
+  cluster's, so that it makes no promise it cannot keep). Until a replacement takes the same
+  precautions (`import --replace` or `nerva recover`, its own design), the only safe replacement is
+  a new export and import of every replica. A replica imported from the export that has never
+  started has acknowledged nothing, and may start late. Seen in CI on this change's first test:
+  replica 0 lost and imported again joined a view change, and replica 2 then stopped on the vendored
+  assertion that a new view's op is at least its commit_max (`set_op_and_commit_max`, from
+  `on_view`): the view the amnesiac replica helped form ended below an op replica 2 knew committed.
+  The test no longer does it.
+- **Downgrade:** a v0.4.0 replica given a 0.0.5 data file stops and writes nothing (its SHA-256
+  unchanged), but not with a message: a formatted file reaches the vendored `multiversion
+  unsupported` panic, as any other release's file has since N61 (#95), and an imported one an
+  assertion that the superblock's reserved bytes are zero, which `origin` now holds. v0.4.0 cannot
+  change; going back means exporting with 0.0.5 and importing with v0.4.0, which reads the export
+  (format version 1; checked on a small export).
 - **Release 0.0.5**, clients from 0.0.4 (`release_client_min`): client messages did not change,
   so v0.4.0's clients and gateways (Botpike's APP-L2 and INF-1) keep working. Data files move to
   0.0.5 by export and import, as N80. `VERSION` is unchanged: the owner decides when it ships.
@@ -1542,4 +1552,6 @@ format change, but blind to exports that reach different checkpoints).
   export each: two or three exit 8, and one left up commits nothing; replicas 0 and 1 from A commit
   past a checkpoint, replica 2, imported from A and never started before, then joins and carries the
   quorum with replica 1 stopped; a `nerva api` built as 0.0.4 commits and reads. No log shows a
-  panic.
+  panic. VOPR: the `nerva` lane's release is 0.0.2, accepting clients from 0.0.1; its clients run
+  0.0.1 or 0.0.2 by seed, so older clients' prepares cross the gate under faults, and every
+  replica's origin, reformatted ones' too, is none or random by seed.
