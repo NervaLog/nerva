@@ -6,10 +6,12 @@ Usage: keys.py <nerva>
 Against one replica, `nerva api` and `nerva view` with NERVA_KEY alone refuse the next key; with
 NERVA_KEY and NERVA_KEY_NEXT they take either (and refuse any other, or none); once NERVA_KEY is
 the next key and NERVA_KEY_NEXT unset, the old key is refused. That is a rotation in three
-restarts of each gateway, with no moment where a client holding either key is refused.
+restarts of each gateway, with no moment where a client holding either key is refused. A next
+key equal to the key, or only whitespace, is warned about at start.
 """
 import http.client
 import os
+import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -40,6 +42,21 @@ def gateway(cluster, command, key, key_next=None):
     return process, int(process.stdout.readline())
 
 
+def warnings(cluster, key, key_next):
+    """What a gateway started with these keys warns about them, once it listens."""
+    env = {**os.environ, "NERVA_KEY": key, "NERVA_KEY_NEXT": key_next}
+    process = subprocess.Popen([cluster.nerva, "api", "--cluster=0",
+                                f"--addresses={cluster.address}", "--listen=127.0.0.1:0"],
+                               stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, env=env, text=True)
+    line = process.stdout.readline()
+    process.kill()
+    _, log = process.communicate()
+    assert line, log[-3000:]
+    return [warning for warning in ("is the same as NERVA_KEY", "is only whitespace")
+            if warning in log]
+
+
 def main():
     cluster = Cluster(sys.argv[1])
     try:
@@ -62,8 +79,13 @@ def main():
                     checked += 1
                 process.kill()
                 process.wait()
+        # A next key that is the key itself, or only whitespace, is almost certainly a mistake.
+        assert warnings(cluster, OLD, NEW) == []
+        assert warnings(cluster, OLD, OLD) == ["is the same as NERVA_KEY"]
+        assert warnings(cluster, OLD, " \t") == ["is only whitespace"]
         print(f"keys: PASSED (api and view rotate from one key to another through NERVA_KEY_NEXT; "
-              f"{checked} requests)")
+              f"{checked} requests; a next key equal to the key, or only whitespace, is warned "
+              f"about)")
     finally:
         cluster.close()
 

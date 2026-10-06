@@ -445,6 +445,12 @@ fn gateway_keys(comptime command: []const u8) struct { key: []const u8, key_next
     const key_next = std.posix.getenv("NERVA_KEY_NEXT") orelse "";
     if (key_next.len > 0) {
         log.info(command ++ ": accepting NERVA_KEY and NERVA_KEY_NEXT", .{});
+        if (std.mem.eql(u8, key_next, key)) {
+            log.warn(command ++ ": NERVA_KEY_NEXT is the same as NERVA_KEY", .{});
+        }
+        if (std.mem.trim(u8, key_next, " \t\r\n").len == 0) {
+            log.warn(command ++ ": NERVA_KEY_NEXT is only whitespace", .{});
+        }
     }
     return .{ .key = key, .key_next = if (key_next.len > 0) key_next else null };
 }
