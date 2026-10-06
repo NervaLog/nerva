@@ -297,7 +297,7 @@ fn command_import(
         .release = config.process.release,
         .input = args.input,
     }, plan);
-    // Import cannot see the cluster, so it says what it needs (N84): a replica imported alone
+    // Import cannot see the cluster, so it says what it needs (P90): a replica imported alone
     // into a cluster that ran on has forgotten the prepares the replica it replaces acknowledged.
     log.warn("{}: start this replica only with every replica imported from {s}, before the " ++
         "cluster runs; to replace a replica of a running cluster, export it again and import " ++
@@ -379,7 +379,7 @@ fn command_start(
         .multiversion = .single_release(config.process.release),
         // Nerva bundles only its own release: peers of another release are ignored (N61, #34).
         .release_peers_strict = true,
-        // Replicas prove to each other that they hold the cluster key (N86).
+        // Replicas prove to each other that they hold the cluster key (P102).
         .peer_keys = peer_keys,
         .pipeline_requests_limit = args.pipeline_requests_limit,
         .storage_size_limit = args.storage_size_limit,
@@ -452,7 +452,7 @@ fn command_start(
     }
 }
 
-/// The cluster keys replicas authenticate each other with (N86), from `NERVA_CLUSTER_KEY` and
+/// The cluster keys replicas authenticate each other with (P102), from `NERVA_CLUSTER_KEY` and
 /// `NERVA_CLUSTER_KEY_NEXT`. Exits, naming the variable and never a key, when they cannot be used.
 fn cluster_keys(args: *const cli.Command.Start) peer_auth.Keys {
     const resolved = peer_auth.keys_resolve(

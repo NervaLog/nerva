@@ -15,7 +15,7 @@
 //! may relay or repair it: it is admitted with a client release this replica accepts, unless its
 //! maker last announced another release.
 //!
-//! The same gate keeps apart replicas imported from different exports (N84, #81): a ping or pong
+//! The same gate keeps apart replicas imported from different exports (P90, #81): a ping or pong
 //! also announces its sender's origin (`VSRState.origin`, the export's SHA-256, or zero for a
 //! formatted data file), and a peer counts only once it has announced this replica's origin. A
 //! prepare is refused when its maker announced another origin. What a peer last announced is
@@ -66,16 +66,14 @@ pub fn admits(
             if (prepare.release.value < release_client_min.value or
                 prepare.release.value > release.value) return false;
             // Relayed or repaired by any replica: refused once its maker is known to run another
-            // release, or to be of another export. An older client's prepare is admitted only
-            // from a maker known to run this release: a replica of that older release makes
-            // prepares of its own clients' release too, before this one has heard from it.
+            // release, or to be of another export. A maker not heard from since this replica
+            // started is admitted, whatever accepted client release the prepare carries: after a
+            // primary dies and the others restart, they repair its prepares from each other, and
+            // none can hear from it again (P90).
             if (prepare.replica == replica) return true;
             if (prepare.replica >= peer_origins.len) return false;
-            const maker_release = peer_releases_last[prepare.replica];
-            if (maker_release) |known| {
-                if (known.value != release.value) return false;
-            } else {
-                if (prepare.release.value != release.value) return false;
+            if (peer_releases_last[prepare.replica]) |maker_release| {
+                if (maker_release.value != release.value) return false;
             }
             if (peer_origins[prepare.replica]) |maker_origin| {
                 if (!std.mem.eql(u8, &maker_origin, origin)) return false;
@@ -281,13 +279,8 @@ test "release_peers: a prepare is refused for its client's release, or its maker
         try testing.expect(peers.admits(prepare.frame_const()));
         prepare.replica = 0;
         try testing.expect(peers.admits(prepare.frame_const()));
-        prepare.replica = 3; // Made by a replica not heard from (it may have crashed since):
-        // admitted for this release's clients only, since a replica of the older release would
-        // make prepares of its own clients' release.
-        try testing.expectEqual(
-            release_client.value == release_this.value,
-            peers.admits(prepare.frame_const()),
-        );
+        prepare.replica = 3; // Made by a replica not heard from (it may have crashed since).
+        try testing.expect(peers.admits(prepare.frame_const()));
         prepare.replica = 2; // Made by a replica of another release, with a client we accept.
         try testing.expect(!peers.admits(prepare.frame_const()));
         prepare.replica = 4; // Made by a replica of another export.

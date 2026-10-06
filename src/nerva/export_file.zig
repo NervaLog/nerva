@@ -351,7 +351,7 @@ pub fn WriterType(comptime Inner: type) type {
         section: u32 = 0,
         finished: bool = false,
         /// The `end` record's SHA-256, once finished: the export's identity, which every data
-        /// file imported from it records (`VSRState.origin`, N84).
+        /// file imported from it records (`VSRState.origin`, P90).
         digest: [32]u8 = undefined,
 
         pub fn init(inner: Inner) !Writer {
@@ -664,7 +664,7 @@ test "export file: records round-trip" {
     }
 }
 
-test "export file: the writer and the reader name an export by its end record (N84)" {
+test "export file: the writer and the reader name an export by its end record (P90)" {
     var arena_instance = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_instance.deinit();
     const arena = arena_instance.allocator();

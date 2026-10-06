@@ -24,7 +24,7 @@ Usage: declared.py <path to nerva> [--seed=N] [--steps=N]
 """
 import hashlib, http.client, json, os, random, shutil, signal, socket, subprocess, sys, tempfile, time
 
-# Replicas authenticate each other with a real cluster key, never the development key (N86).
+# Replicas authenticate each other with a real cluster key, never the development key (P102).
 os.environ["NERVA_CLUSTER_KEY"] = os.urandom(32).hex()
 
 KEY = "views-test-key"

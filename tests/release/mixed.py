@@ -22,7 +22,7 @@ import sys
 import tempfile
 import time
 
-# Replicas authenticate each other with a real cluster key, never the development key (N86).
+# Replicas authenticate each other with a real cluster key, never the development key (P102).
 os.environ["NERVA_CLUSTER_KEY"] = os.urandom(32).hex()
 
 KEY = "release-test-key"

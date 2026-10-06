@@ -293,11 +293,11 @@ pub fn ReplicaType(
         /// arrives. Only consulted when release_peers_strict.
         peer_releases: [constants.members_max]?vsr.Release = @splat(null),
         /// Nerva: each peer's origin (`VSRState.origin`), from its latest ping or pong; null until
-        /// one arrives, and kept across connections (N84). Only consulted when
+        /// one arrives, and kept across connections (P90). Only consulted when
         /// release_peers_strict.
         peer_origins: [constants.members_max]?[32]u8 = @splat(null),
         /// Nerva: each peer's release from its latest ping or pong on any connection, for the
-        /// prepares it made (`release_peers.admits`, N84).
+        /// prepares it made (`release_peers.admits`, P90).
         peer_releases_last: [constants.members_max]?vsr.Release = @splat(null),
         /// Nerva: whether the message bus held a connection to each peer at the last tick.
         peer_connected: [constants.members_max]bool = @splat(false),
@@ -665,7 +665,7 @@ pub fn ReplicaType(
             release_client_min: vsr.Release,
             multiversion: Multiversion,
             release_peers_strict: bool = false,
-            /// Nerva: the cluster keys this replica authenticates its peers with (N86).
+            /// Nerva: the cluster keys this replica authenticates its peers with (P102).
             peer_keys: ?peer_auth.Keys = null,
             test_context: ?*anyopaque = null,
             timeout_prepare_ticks: ?u64 = null,
@@ -738,7 +738,7 @@ pub fn ReplicaType(
             self.test_context = options.test_context;
 
             // Nerva: a replica given cluster keys authenticates its peers, and its proofs bind its
-            // origin (N84, N86).
+            // origin (P90, P102).
             var message_bus_options = options.message_bus_options;
             if (comptime @hasDecl(MessageBus, "PeerAuth")) {
                 if (options.peer_keys) |keys| {
@@ -1886,7 +1886,7 @@ pub fn ReplicaType(
                 .get_blocks => |m| self.on_get_blocks(m),
                 .block => |m| self.on_block(m),
                 // A replica should never handle misdirected messages intended for a client:
-                // Nerva: a bus with cluster keys consumes the handshake itself (N86).
+                // Nerva: a bus with cluster keys consumes the handshake itself (P102).
                 .pong_client, .eviction, .peer_hello, .peer_challenge, .peer_proof => {
                     log.warn("{}: on_message: misdirected message ({s})", .{
                         self.log_prefix(),
@@ -1934,7 +1934,7 @@ pub fn ReplicaType(
                 // Copy the ping's monotonic timestamp to our pong and add our wall clock sample:
                 .ping_timestamp_monotonic = message.header.ping_timestamp_monotonic,
                 .pong_timestamp_wall = @bitCast(self.clock.realtime()),
-                .origin = self.superblock.working.vsr_state.origin, // N84.
+                .origin = self.superblock.working.vsr_state.origin, // P90.
             }));
 
             if (message.header.replica < self.replica_count) {
@@ -3704,7 +3704,7 @@ pub fn ReplicaType(
 
         /// Nerva: records the origin a peer announced in a ping or pong, says once when it is not
         /// this replica's, and stops this replica when peers of other exports leave it no quorum
-        /// (N84, #81).
+        /// (P90, #81).
         fn on_origin_announced(self: *Replica, peer: u8, origin: *const [32]u8) void {
             assert(self.release_peers_strict);
             if (peer == self.replica or peer >= self.node_count) return;
@@ -3770,7 +3770,7 @@ pub fn ReplicaType(
                 .checkpoint_op = self.op_checkpoint(),
                 .ping_timestamp_monotonic = self.clock.monotonic().ns,
                 .release_count = releases.count,
-                .origin = self.superblock.working.vsr_state.origin, // N84.
+                .origin = self.superblock.working.vsr_state.origin, // P90.
             };
 
             const ping_versions = std.mem.bytesAsSlice(vsr.Release, message.body_used());
@@ -9264,7 +9264,7 @@ pub fn ReplicaType(
                 .deprecated_21,
                 .deprecated_22,
                 .deprecated_23,
-                // Nerva: only the message bus sends the handshake (N86).
+                // Nerva: only the message bus sends the handshake (P102).
                 .peer_hello,
                 .peer_challenge,
                 .peer_proof,
@@ -9391,7 +9391,7 @@ pub fn ReplicaType(
                 .deprecated_21,
                 .deprecated_22,
                 .deprecated_23,
-                // Nerva: only the message bus sends the handshake (N86).
+                // Nerva: only the message bus sends the handshake (P102).
                 .peer_hello,
                 .peer_challenge,
                 .peer_proof,

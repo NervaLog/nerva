@@ -240,7 +240,7 @@ pub const Header = extern struct {
             .deprecated_23,
             => .unknown,
 
-            // Nerva: the message bus handles the handshake before it classifies a peer (N86).
+            // Nerva: the message bus handles the handshake before it classifies a peer (P102).
             .peer_hello,
             .peer_challenge,
             .peer_proof,
@@ -406,7 +406,7 @@ pub const Header = extern struct {
 
         ping_timestamp_monotonic: u64,
         release_count: u16,
-        /// Nerva: the sender's `VSRState.origin` (N84).
+        /// Nerva: the sender's `VSRState.origin` (P90).
         origin: [32]u8,
         reserved: [62]u8 = @splat(0),
 
@@ -459,7 +459,7 @@ pub const Header = extern struct {
 
         ping_timestamp_monotonic: u64,
         pong_timestamp_wall: u64,
-        /// Nerva: the sender's `VSRState.origin` (N84).
+        /// Nerva: the sender's `VSRState.origin` (P90).
         origin: [32]u8,
 
         reserved: [80]u8 = @splat(0),
@@ -487,7 +487,7 @@ pub const Header = extern struct {
         }
     };
 
-    /// Nerva (N86): the dialing replica opens the handshake on a connection it made. `replica`
+    /// Nerva (P102): the dialing replica opens the handshake on a connection it made. `replica`
     /// is the dialing replica, which dials only replicas after it.
     pub const PeerHello = extern struct {
         checksum: u128 = 0,
@@ -507,7 +507,7 @@ pub const Header = extern struct {
 
         /// Fresh for every connection.
         nonce: u128,
-        /// The dialing replica's `VSRState.origin` (N84).
+        /// The dialing replica's `VSRState.origin` (P90).
         origin: [32]u8,
         reserved: [80]u8 = @splat(0),
 
@@ -534,7 +534,7 @@ pub const Header = extern struct {
         }
     };
 
-    /// Nerva (N86): the accepting replica answers a hello with its nonce, its origin, and its
+    /// Nerva (P102): the accepting replica answers a hello with its nonce, its origin, and its
     /// proof that it holds the cluster key (`peer_auth.proof`).
     pub const PeerChallenge = extern struct {
         checksum: u128 = 0,
@@ -554,7 +554,7 @@ pub const Header = extern struct {
 
         nonce: u128,
         mac: [16]u8,
-        /// The accepting replica's `VSRState.origin` (N84).
+        /// The accepting replica's `VSRState.origin` (P90).
         origin: [32]u8,
         reserved: [64]u8 = @splat(0),
 
@@ -581,7 +581,7 @@ pub const Header = extern struct {
         }
     };
 
-    /// Nerva (N86): the dialing replica's proof that it holds the cluster key.
+    /// Nerva (P102): the dialing replica's proof that it holds the cluster key.
     pub const PeerProof = extern struct {
         checksum: u128 = 0,
         checksum_padding: u128 = 0,
@@ -1849,7 +1849,7 @@ fn format_header_field_skip(
 }
 
 // Nerva: `origin` took reserved bytes of pings and pongs; every other field stays where
-// TigerBeetle put it (N84).
+// TigerBeetle put it (P90).
 comptime {
     assert(@offsetOf(Header.Ping, "checkpoint_id") == 128);
     assert(@offsetOf(Header.Ping, "release_count") == 160);
@@ -1858,7 +1858,7 @@ comptime {
     assert(@offsetOf(Header.Pong, "pong_timestamp_wall") == 136);
     assert(@offsetOf(Header.Pong, "origin") == 144);
     assert(@offsetOf(Header.Pong, "reserved") == 176);
-    // The handshake's fields (N86).
+    // The handshake's fields (P102).
     assert(@offsetOf(Header.PeerHello, "nonce") == 128);
     assert(@offsetOf(Header.PeerHello, "origin") == 144);
     assert(@offsetOf(Header.PeerChallenge, "nonce") == 128);

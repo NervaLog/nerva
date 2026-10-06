@@ -48,7 +48,7 @@ const cluster_id: u128 = 0; // Test binaries refuse any other cluster id.
 const replica_count = 3;
 const timeout = stdx.Duration.seconds(60);
 
-/// Replicas authenticate each other with a real cluster key, never the development key (N86).
+/// Replicas authenticate each other with a real cluster key, never the development key (P102).
 const cluster_key = "integration-cluster-key-0123456789abcdef";
 const cluster_key_new = "integration-cluster-key-rotated-0123456789";
 const cluster_key_wrong = "integration-cluster-key-wrong-0123456789ab";
@@ -67,7 +67,7 @@ const Cluster = struct {
     processes: [replica_count]?std.process.Child,
     /// Every replica sends its metrics here (`--statsd`).
     statsd: StatsdListener,
-    /// Each replica's environment: its cluster keys (N86).
+    /// Each replica's environment: its cluster keys (P102).
     environments: [replica_count]std.process.EnvMap,
     trace_started: bool = false,
 
@@ -536,7 +536,7 @@ fn scenario_cluster() !void {
     }
 }
 
-/// Replicas authenticate each other (N86): a peer without the cluster key is refused whatever it
+/// Replicas authenticate each other (P102): a peer without the cluster key is refused whatever it
 /// sends, a replica with another key stays outside the cluster, and the key rotates while the
 /// cluster commits.
 fn scenario_peer_auth() !void {

@@ -1,4 +1,4 @@
-//! Replicas authenticate each other (N86, NV-3): before any replica message flows on a
+//! Replicas authenticate each other (P102, NV-3): before any replica message flows on a
 //! replica-to-replica connection, each side proves it holds the cluster key, `NERVA_CLUSTER_KEY`.
 //!
 //! The replica that dials (the lower index; replicas dial only those after them) sends
@@ -8,7 +8,7 @@
 //! the whole transcript: the cluster, both replicas, both nonces and both origins, with the
 //! prover's role. Fresh nonces on both sides make a recorded handshake useless, the role keeps a
 //! proof from being reflected back, and the origins bind what each side said it was imported
-//! from (N84) to the key, so a ping or pong on the connection must later announce the same.
+//! from (P90) to the key, so a ping or pong on the connection must later announce the same.
 //!
 //! A replica proves with its current key and accepts a proof under either the current or the
 //! next key (`NERVA_CLUSTER_KEY_NEXT`), so the key is rotated by restarting replicas one at a

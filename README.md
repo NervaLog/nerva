@@ -122,12 +122,12 @@ real nodes, clients through `nerva api`, kills, pauses and partitions, and a his
 against what Nerva promises (a declared ledger's conservation, so far); it runs by hand (N82).
 
 Binaries report `<protocol>+<commit>`. The protocol release (`0.0.5` since data files record
-the export they were imported from, N84) is what data files and clients check: a replica refuses
+the export they were imported from, P90) is what data files and clients check: a replica refuses
 a data file of another release, so upgrading means new data files, and accepts clients from
 `0.0.4` on (v0.4.0's; a v0.3.0 `nerva api` is refused at registration). A replica ignores peers that
 run another release (N61): in a cluster mixing releases, only replicas of one release count
 toward each other's quorums, and each logs the others it ignores. From `0.0.5`, replicas also
-authenticate each other before anything else (N86, below), which `0.0.4` replicas cannot do: a
+authenticate each other before anything else (P102, below), which `0.0.4` replicas cannot do: a
 `0.0.4` replica and a `0.0.5` replica close every connection between them, so **never run them in
 one cluster**. A cluster moves to a new
 release with its data by export and import (below, N80). `zig build test:release` runs a cluster
@@ -154,7 +154,7 @@ request in flight per client.
 ### Replicas authenticate each other
 
 Before any replica message flows on a connection between two replicas, each proves that it
-holds the cluster key, `NERVA_CLUSTER_KEY` (N86). A process without it cannot join the cluster,
+holds the cluster key, `NERVA_CLUSTER_KEY` (P102). A process without it cannot join the cluster,
 pose as a replica, or send a replica message: the connection is closed first. Clients and
 gateways do not hold the key and are not affected.
 
@@ -171,7 +171,7 @@ gateways do not hold the key and are not affected.
   A replica proves with `NERVA_CLUSTER_KEY` and accepts proofs under either key.
 - **The handshake**: the replica that dials (the lower index) sends a fresh nonce; the other
   answers with its own nonce and an HMAC-SHA256 under the key of both nonces, both replicas, the
-  cluster and both data files' origins (N84); the dialing replica checks it and answers with its
+  cluster and both data files' origins (P90); the dialing replica checks it and answers with its
   own. A replica's pings must then announce the origin its proof covered. A connection still
   handshaking after 5 seconds is closed, and a replica refused with a wrong key is redialed with
   backoff (it logs `wrong cluster key`).
@@ -219,7 +219,7 @@ nerva start --addresses=3001,3002,3003 0_0.nerva   # and 0_1, 0_2
   history starts there; client sessions do not carry over.
 - Op numbers jump: the new cluster goes on from the first checkpoint at or after the export's
   op. Versions and feed cursors from before stay valid.
-- **Every replica from one export** (N84). An export is named by its SHA-256 (`export` prints
+- **Every replica from one export** (P90). An export is named by its SHA-256 (`export` prints
   it; `import` and `start` log it), and every data file records the export it was imported from
   (none, for `nerva format`). Replicas handle a peer only once it has announced their export. A
   replica whose peers of other exports leave it no quorum exits with status 8, naming both
@@ -229,7 +229,7 @@ nerva start --addresses=3001,3002,3003 0_0.nerva   # and 0_1, 0_2
 - **Replacing a lost replica**: export the cluster and import every replica again (the cluster
   is closed meanwhile). Importing only the lost one is not safe: its replacement forgets the
   prepares the lost replica acknowledged, and with one more failure a committed op could be lost
-  (N84). A formatted replica cannot join an imported cluster either: its origin is none.
+  (P90). A formatted replica cannot join an imported cluster either: its origin is none.
 - A view declared only through the Zig client, with no catalog document, cannot be imported:
   `import` refuses it. Declare views through `nerva api`.
 - Measured (`perf/upgrade.py`, a 4-CPU sandbox, `--development`): a million changes over

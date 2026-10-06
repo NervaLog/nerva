@@ -419,7 +419,7 @@ fn options_swarm(prng: *stdx.PRNG) Simulator.Options {
         // ignore peers of another release (N61). The testing lane simulates TigerBeetle's
         // multiversion upgrades.
         // Nerva's one release is 0.0.2, which accepts clients from 0.0.1: the clients run either,
-        // so prepares of an older client's release cross the replicas' gate (N84). The origin,
+        // so prepares of an older client's release cross the replicas' gate (P90). The origin,
         // every replica's, is none (formatted) or an export's (imported), and reformatted replicas
         // take it too.
         .releases = if (state_machine == .nerva) releases[1..2] else &releases,

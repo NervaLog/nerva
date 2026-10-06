@@ -93,7 +93,7 @@ pub fn ClusterType(comptime StateMachineType: anytype) type {
             state_machine: StateMachine.Options,
             /// Nerva: replicas ignore peers of another release (N61). Needs one release.
             release_peers_strict: bool = false,
-            /// Nerva: every replica's `VSRState.origin`, as `nerva import` writes it (N84).
+            /// Nerva: every replica's `VSRState.origin`, as `nerva import` writes it (P90).
             origin: [32]u8 = @splat(0),
         };
 

@@ -83,7 +83,7 @@ pub fn MessageBusType(comptime IO: type) type {
 
         trace: ?*Tracer,
 
-        /// Nerva (N86): what this replica proves in the replica handshake. Null on a client's
+        /// Nerva (P102): what this replica proves in the replica handshake. Null on a client's
         /// bus, and on a replica's without cluster keys (the fuzzer), where no handshake happens.
         peer_auth: ?PeerAuth,
 
@@ -98,16 +98,16 @@ pub fn MessageBusType(comptime IO: type) type {
             trace: ?*Tracer,
             clients_limit: ?u32 = null,
             time: Time,
-            /// Nerva (N86): set by the replica; see `MessageBus.peer_auth`.
+            /// Nerva (P102): set by the replica; see `MessageBus.peer_auth`.
             peer_auth: ?PeerAuth = null,
         };
 
-        /// Nerva (N86): the cluster keys, and what this replica's proofs bind.
+        /// Nerva (P102): the cluster keys, and what this replica's proofs bind.
         pub const PeerAuth = struct {
             keys: peer_auth.Keys,
             cluster: u128,
             release: vsr.Release,
-            /// This replica's `VSRState.origin` (N84).
+            /// This replica's `VSRState.origin` (P90).
             origin: [32]u8,
         };
         const Address = stdx.SocketAddress;
@@ -345,7 +345,7 @@ pub fn MessageBusType(comptime IO: type) type {
             if (bus.peer_auth != null) bus.tick_handshakes();
         }
 
-        /// Nerva (N86): closes every connection still handshaking after
+        /// Nerva (P102): closes every connection still handshaking after
         /// `peer_auth.handshake_ticks_max` ticks.
         fn tick_handshakes(bus: *MessageBus) void {
             assert(bus.peer_auth != null);
@@ -676,7 +676,7 @@ pub fn MessageBusType(comptime IO: type) type {
             assert(connection.recv_buffer == null);
             connection.recv_buffer = MessageBuffer.init(bus.pool);
             bus.recv(connection);
-            // Nerva (N86): queued messages wait until both sides have proved the cluster key.
+            // Nerva (P102): queued messages wait until both sides have proved the cluster key.
             if (bus.peer_auth != null) {
                 bus.handshake_dial(connection);
             } else {
@@ -756,7 +756,7 @@ pub fn MessageBusType(comptime IO: type) type {
             switch (connection.peer) {
                 .replica => |replica_index| {
                     assert(replica_index < bus.replicas.len);
-                    // Nerva (N86): with cluster keys, bytes count only once the replica is
+                    // Nerva (P102): with cluster keys, bytes count only once the replica is
                     // authenticated (the handshake resets the attempts as it completes), so a
                     // replica with another key is redialed with backoff, not in a storm.
                     const authenticated = bus.peer_auth == null or
@@ -909,7 +909,7 @@ pub fn MessageBusType(comptime IO: type) type {
                 // can send back to them.
                 .replica => {
                     while (connection.recv_buffer.?.next_header()) |header| {
-                        // Nerva (N86): the bus handles the handshake, and refuses what a
+                        // Nerva (P102): the bus handles the handshake, and refuses what a
                         // connection may not send before or after it.
                         if (bus.peer_auth != null) {
                             switch (bus.handshake_recv(connection, &header)) {
@@ -1039,7 +1039,7 @@ pub fn MessageBusType(comptime IO: type) type {
                 assert(connection.peer == .replica);
                 return;
             }
-            // Nerva (N86): a replica connection sends only once authenticated; until then its
+            // Nerva (P102): a replica connection sends only once authenticated; until then its
             // messages wait in the send queue, which bounds them.
             if (!bus.send_ready(connection)) {
                 assert(connection.peer == .replica);
@@ -1050,7 +1050,7 @@ pub fn MessageBusType(comptime IO: type) type {
             if (!connection.send_submitted) bus.send(connection);
         }
 
-        /// Nerva (N86): whether the send loop may run on this connection.
+        /// Nerva (P102): whether the send loop may run on this connection.
         fn send_ready(bus: *const MessageBus, connection: *const Connection) bool {
             if (bus.peer_auth == null) return true;
             return switch (connection.peer) {
@@ -1403,7 +1403,7 @@ pub fn MessageBusType(comptime IO: type) type {
             /// For connections_suspended.
             link: QueueType(Connection).Link = .{},
 
-            /// Nerva (N86): the replica handshake on this connection.
+            /// Nerva (P102): the replica handshake on this connection.
             auth: Auth = .none,
             /// Ticks spent handshaking (`peer_auth.handshake_ticks_max`).
             auth_ticks: u32 = 0,
@@ -1414,7 +1414,7 @@ pub fn MessageBusType(comptime IO: type) type {
             auth_header_next: ?Header = null,
         };
 
-        /// Nerva (N86).
+        /// Nerva (P102).
         const Auth = union(enum) {
             /// No handshake: a client, a peer not yet known, or a bus without cluster keys.
             none,
@@ -1426,7 +1426,7 @@ pub fn MessageBusType(comptime IO: type) type {
             authenticated,
         };
 
-        /// Nerva (N86): sends `peer_hello` on a connection this replica dialed.
+        /// Nerva (P102): sends `peer_hello` on a connection this replica dialed.
         fn handshake_dial(bus: *MessageBus, connection: *Connection) void {
             const auth = &bus.peer_auth.?;
             assert(connection.state == .connected);
@@ -1453,7 +1453,7 @@ pub fn MessageBusType(comptime IO: type) type {
 
         const HandshakeAction = enum { deliver, consumed, close };
 
-        /// Nerva (N86): what to do with a message on a bus with cluster keys. The handshake's
+        /// Nerva (P102): what to do with a message on a bus with cluster keys. The handshake's
         /// own messages are consumed here. Before it completes, a connection may send only
         /// what a client sends; after, a replica may not claim to be another.
         fn handshake_recv(
@@ -1586,7 +1586,7 @@ pub fn MessageBusType(comptime IO: type) type {
             }
         }
 
-        /// Nerva (N86): answers `peer_hello` on an accepted connection with `peer_challenge`.
+        /// Nerva (P102): answers `peer_hello` on an accepted connection with `peer_challenge`.
         fn handshake_accept(
             bus: *MessageBus,
             connection: *Connection,
@@ -1647,7 +1647,7 @@ pub fn MessageBusType(comptime IO: type) type {
             return .close;
         }
 
-        /// Nerva (N86): sends one handshake message, or holds it until the one being sent is.
+        /// Nerva (P102): sends one handshake message, or holds it until the one being sent is.
         fn handshake_send(bus: *MessageBus, connection: *Connection, header: *const Header) void {
             assert(connection.state == .connected);
             assert(header.size == @sizeOf(Header));

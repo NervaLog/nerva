@@ -10,7 +10,7 @@
 //!      identification,
 //!    - replica nodes occasionally send ping_clients, to test peer misidentification handling.
 //!
-//! Nerva (N86): in half the runs, replicas authenticate each other with a cluster key; in half
+//! Nerva (P102): in half the runs, replicas authenticate each other with a cluster key; in half
 //! of those, replica 2 holds another key, and no replica message may pass between it and the
 //! others in either direction.
 const std = @import("std");
@@ -389,7 +389,7 @@ const Node = struct {
     messages_pending: *std.AutoArrayHashMapUnmanaged(u128, MessagePending),
     message_bus: MessageBus,
     id: u8,
-    /// Nerva (N86): the replica with another cluster key, if any.
+    /// Nerva (P102): the replica with another cluster key, if any.
     rogue: ?u8,
 
     fn send_message(node: *Node, target: u8, message: *Message) void {
@@ -406,7 +406,7 @@ const Node = struct {
         while (buffer.next_header()) |header| {
             assert(header.valid_checksum());
 
-            // Nerva (N86): only clients send requests and ping_clients; every other message
+            // Nerva (P102): only clients send requests and ping_clients; every other message
             // names the replica that sent it. None passes between the replica with another key
             // and the others.
             if (node.rogue) |rogue| {

@@ -27,7 +27,7 @@
 (def replica-port 3000)
 
 (def cluster-key
-  "The key replicas authenticate each other with (N86): at least 32 bytes."
+  "The key replicas authenticate each other with (P102): at least 32 bytes."
   "jepsen-cluster-key-0123456789abcdefghij")
 
 (def healthy-timeout-s

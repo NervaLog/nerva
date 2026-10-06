@@ -10,7 +10,7 @@ const VoprLog = enum { short, full };
 
 // Nerva has no client releases yet; every build is "the" release.
 // 0.0.5: data files record the export they were imported from, and pings and pongs carry it
-// (N84). Clients are unchanged, so 0.0.4's are still accepted.
+// (P90). Clients are unchanged, so 0.0.4's are still accepted.
 const release = "0.0.5";
 const release_client_min = "0.0.4";
 // Only `zig build test:release` builds this release, to run a cluster of two releases (N61).
@@ -358,7 +358,7 @@ pub fn build(b: *std.Build) !void {
         .mode = mode,
     });
     // `origins.py` also runs a client of the oldest release this build accepts: the same code
-    // under `release_client_min` (N84).
+    // under `release_client_min` (P90).
     const vsr_options_client = b.addOptions();
     vsr_options_client.addOption(?[40]u8, "git_commit", options.git_commit[0..40].*);
     vsr_options_client.addOption(bool, "config_verify", options.config_verify);
@@ -371,7 +371,7 @@ pub fn build(b: *std.Build) !void {
         .mode = mode,
     });
     // Then an upgrade: an export from `nerva`, imported by the other release (N80); then
-    // replicas imported from different exports (N84). One after the other: each runs a cluster.
+    // replicas imported from different exports (P90). One after the other: each runs a cluster.
     var release_previous: ?*std.Build.Step = null;
     for ([_][]const u8{ "mixed.py", "upgrade.py", "origins.py" }) |script| {
         const run_release_test = b.addSystemCommand(&.{
