@@ -115,11 +115,12 @@ const CLIArgs = union(enum) {
         \\  start    Run a replica from the data file at <path>.
         \\
         \\  view     Follow the cluster's change feed and serve declared views. The key is
-        \\           read from NERVA_KEY.
+        \\           read from NERVA_KEY (and, during a rotation, NERVA_KEY_NEXT).
         \\
         \\  api      Serve the cluster as JSON over HTTP: rows, transactions, the feed,
         \\           history, layouts, views, ledgers and documents. The key is read from the
-        \\           NERVA_KEY environment variable.
+        \\           NERVA_KEY environment variable; during a rotation, NERVA_KEY_NEXT is
+        \\           accepted too.
         \\
         \\  export   Write the cluster's changes up to an op, its views and ledgers, and
         \\           checks, to a new file at --output, for `import` of another release.

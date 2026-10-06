@@ -28,13 +28,17 @@ Runs one replica and two API gateways, then:
   where it was (#31), and the largest valid `documents/get` (256 keys of 64 KiB) to answer 200
   (#60);
 - `--trace` to stop at `--trace-size-max` with the replica still serving (#30);
-- 401 without the key, 404 and 405.
+- 401 without the key, 404 and 405;
+- a gateway given `NERVA_KEY` and `NERVA_KEY_NEXT` accepts either and answers 401 to any other
+  key; a `NERVA_KEY_NEXT` that is empty or equals `NERVA_KEY` is refused at start, without
+  printing a key (N85).
 
 Usage: api.py <path to nerva> [--seed=N] [--steps=N]
 """
 import http.client, json, os, random, shutil, signal, socket, subprocess, sys, tempfile, threading, time
 
 KEY = "api-test-key"
+KEY_NEXT = "api-test-key-next"
 TABLES = (1, 2)
 IDS = 12
 
@@ -71,9 +75,10 @@ class Cluster:
         self.processes.append(process)
         return process
 
-    def gateway(self):
+    def gateway(self, env=None):
+        env = env if env is not None else {"NERVA_KEY": KEY}
         process = self.spawn([self.nerva, "api", "--cluster=0", f"--addresses={self.address}",
-                              "--listen=127.0.0.1:0"], env={**os.environ, "NERVA_KEY": KEY})
+                              "--listen=127.0.0.1:0"], env={**os.environ, **env})
         return int(process.stdout.readline())
 
     def close(self):
@@ -536,6 +541,31 @@ def check_trace_bounded(nerva, tmp):
         os.remove(data_file)
 
 
+def check_key_rotation(cluster):
+    # During a key rotation a gateway accepts both keys, and nothing else (N85).
+    port = cluster.gateway({"NERVA_KEY": KEY, "NERVA_KEY_NEXT": KEY_NEXT})
+    lookup = {"rows": [{"table": 1, "id": "0"}]}
+    assert request(port, "POST", "/v1/lookup", lookup, key=KEY)[0] == 200
+    assert request(port, "POST", "/v1/lookup", lookup, key=KEY_NEXT)[0] == 200
+    for key in (None, "wrong", KEY + "x", KEY_NEXT[:-1], KEY_NEXT.upper()):
+        status, body = request(port, "POST", "/v1/lookup", lookup, key=key)
+        assert status == 401 and body == {"error": "invalid key"}, (key, status, body)
+    # The current key alone: the next one is refused.
+    assert request(cluster.ports[0], "POST", "/v1/lookup", lookup, key=KEY_NEXT)[0] == 401
+
+    # Keys that cannot be used stop the gateway before it listens, and it never prints them.
+    for env, reason in (({"NERVA_KEY": KEY, "NERVA_KEY_NEXT": KEY}, "equals NERVA_KEY"),
+                        ({"NERVA_KEY": KEY, "NERVA_KEY_NEXT": ""}, "set but empty"),
+                        ({"NERVA_KEY": "", "NERVA_KEY_NEXT": KEY_NEXT}, "set NERVA_KEY")):
+        result = subprocess.run([cluster.nerva, "api", "--cluster=0",
+                                 f"--addresses={cluster.address}", "--listen=127.0.0.1:0"],
+                                env={**os.environ, **env}, capture_output=True, text=True,
+                                timeout=60)
+        assert result.returncode != 0 and result.stdout == "", (env, result)
+        assert reason in result.stderr, (env, result.stderr)
+        assert KEY not in result.stderr and KEY_NEXT not in result.stderr, result.stderr
+
+
 def check_stall_recovery(cluster, port):
     # A cluster stall past the client's timeout (30 s) breaks the gateway's client; the gateway
     # replaces it once the cluster is back, and /healthz says so meanwhile (#27). It recovers
@@ -617,13 +647,15 @@ def main():
 
         assert request(ports[0], "POST", "/v1/lookup", {"rows": []}, key=None)[0] == 401
         assert request(ports[0], "POST", "/v1/lookup", {"rows": []}, key="wrong")[0] == 401
+        check_key_rotation(cluster)
         assert request(ports[0], "GET", "/v1/nothing")[0] == 404
         assert request(ports[0], "GET", "/v1/commit")[0] == 405
 
         print(f"api: PASSED ({steps} steps: {counts}; feed of {len(feed)} changes; "
               f"{len(keys)} histories; {as_of_reads} as-of reads; counter race with "
               f"{conflicts} conflicts retried; gateway RSS {rss[0]} MiB, {rss[1]} MiB after "
-              f"4 MiB nested bodies; trace stopped at {trace_size} bytes; seed {seed})")
+              f"4 MiB nested bodies; trace stopped at {trace_size} bytes; NERVA_KEY_NEXT "
+              f"accepted; seed {seed})")
     finally:
         cluster.close()
 
