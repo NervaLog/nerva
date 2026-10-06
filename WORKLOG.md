@@ -914,16 +914,3 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
 - Verified: `check`, `test:unit` (all but the sandbox's `benchmark.perf: usage example`),
   `test:fmt`, `test:api` (with `tests/api/documents.py`: a 512 KiB value under a 1024-byte key,
   one byte more refused, the `get` cap at its edge).
-
-## 2026-10-06 — `--listen` takes `[<ipv6>]:<port>` (INF-1)
-
-- Requested by INF-1 (Nerva on Fly, whose private network is IPv6 only; it ran gateways behind
-  socat). `cli.zig` `listen_parse` takes `[<ipv6>]:<port>` as `--addresses` does, as well as
-  `<ipv4>:<port>`, for `nerva api` and `nerva view`; names and zone ids are still refused.
-- Tests: `listen_parse` unit cases (loopback, a Fly 6PN address, `[::]`, and the malformed
-  forms); `tests/api/ipv6.py` (in `test:api`) runs three replicas and a gateway on `[::1]` and
-  commits and reads a row over IPv6, or says why it skipped on a host without IPv6 (this
-  sandbox: no `/proc/net/if_inet6`). Without IPv6, a gateway told to listen on `[::1]` exits 1
-  naming `AddressFamilyNotSupported`.
-- README: the `--listen` forms.
-
