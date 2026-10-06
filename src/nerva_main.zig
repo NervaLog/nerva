@@ -14,6 +14,7 @@ const cli = @import("nerva/cli.zig");
 const Client = @import("nerva/client.zig").Client;
 const view_server = @import("nerva/view/server.zig");
 const api_server = @import("nerva/api/server.zig");
+const http_connection = @import("nerva/http_connection.zig");
 const export_file = @import("nerva/export_file.zig");
 const export_ = @import("nerva/export.zig");
 const import_ = @import("nerva/import.zig");
@@ -448,8 +449,7 @@ fn command_start(
 }
 
 fn command_view(gpa: std.mem.Allocator, args: *const cli.Command.View) !void {
-    const key = std.posix.getenv("NERVA_KEY") orelse "";
-    if (key.len == 0) vsr.fatal(.cli, "view: set NERVA_KEY", .{});
+    const keys = gateway_keys("view");
 
     var client: Client = undefined;
     try client.init(gpa, .{
@@ -461,14 +461,13 @@ fn command_view(gpa: std.mem.Allocator, args: *const cli.Command.View) !void {
 
     try view_server.serve(gpa, &client, .{
         .listen = args.listen,
-        .key = key,
+        .keys = keys,
         .on_listening = on_listening,
     });
 }
 
 fn command_api(gpa: std.mem.Allocator, args: *const cli.Command.Api) !void {
-    const key = std.posix.getenv("NERVA_KEY") orelse "";
-    if (key.len == 0) vsr.fatal(.cli, "api: set NERVA_KEY", .{});
+    const keys = gateway_keys("api");
 
     var client: Client = undefined;
     try client.init(gpa, .{
@@ -480,9 +479,21 @@ fn command_api(gpa: std.mem.Allocator, args: *const cli.Command.Api) !void {
 
     try api_server.serve(gpa, &client, .{
         .listen = args.listen,
-        .key = key,
+        .keys = keys,
         .on_listening = on_listening,
     });
+}
+
+/// `NERVA_KEY` and, during a rotation, `NERVA_KEY_NEXT` (P96). Exits if they cannot be used; the
+/// message never names a key.
+fn gateway_keys(comptime command: []const u8) http_connection.Keys {
+    const current = std.posix.getenv("NERVA_KEY") orelse "";
+    const next = std.posix.getenv("NERVA_KEY_NEXT");
+    if (http_connection.Keys.invalid(current, next)) |reason| {
+        vsr.fatal(.cli, command ++ ": {s}", .{reason});
+    }
+    if (next != null) log.info(command ++ ": accepting NERVA_KEY and NERVA_KEY_NEXT", .{});
+    return .{ .current = current, .next = next };
 }
 
 /// For `--listen=…:0`: print the bound port, alone, so a parent process can learn it.

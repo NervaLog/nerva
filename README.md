@@ -431,6 +431,50 @@ two hashes side by side.
 maintained views (latest and as of past ops, with `min` and `max`, whole and in pages) against
 `nerva view`, byte for byte.
 
+## Limits
+
+Every limit a caller can hit, in one place. Each is a constant in the code, asserted where it is
+used; the sections above say why.
+
+**Gateways** (`nerva api`, `nerva view`):
+- A request body is at most 4 MiB; a larger `Content-Length` answers
+  `400 {"error":"body too large"}` before the body is read.
+- A `nerva api` request may allocate at most 128 MiB once parsed; more answers
+  `413 {"error":"request too complex"}`. Between requests the gateway keeps at most 8 MiB.
+- 16 connections are read at once. With all 16 busy, a new connection displaces the oldest one
+  still sending its request.
+- A request must arrive whole within 10 s of connecting, and its reply is written within another
+  10 s. One request per connection (`Connection: close`).
+- Every request but `GET /healthz` needs `X-Nerva-Key`, equal to `NERVA_KEY` or, during a
+  rotation, `NERVA_KEY_NEXT`; anything else answers `401`.
+- A gateway's cluster session times out a request after 30 s; the gateway then answers `503`
+  until it has reconnected.
+
+**Documents:** a value is at most 512 KiB, under a key of at most 1024 bytes of UTF-8. A commit
+carries about 600 KB of keys and values. A `get` takes at most 256 keys, and reads at most as
+many chunks as 256 documents of 64 KiB; more answers `413`.
+
+**Views:** one op touches at most about 4,000 distinct groups and 8,000 `min` and `max` members.
+A transaction that exceeds them alone answers `413 views_too_large` (split it); one that only
+fails to fit after earlier transactions of the same request answers `503 views_busy` (retry).
+A view of more than 10,000 groups is read in pages. A table's views have at most four `min` and
+`max` aggregates between them.
+
+**Client sessions:** a cluster holds 64 client sessions. Every gateway, `nerva view` and Zig
+client takes one; a 65th evicts the session that committed least recently, whose next request
+fails (gateways reconnect on their own).
+
+**Network.** Gateways authenticate their callers with `X-Nerva-Key`, but send it, and every
+reply, in plain HTTP: put them behind TLS (a load balancer or proxy) when callers are not on a
+private network. Replicas do not yet authenticate each other: anyone who can reach a replica's
+port can act as a replica or a client. Run replicas on a private network that only the cluster
+and its gateways can reach.
+
+To rotate a gateway key without downtime: restart every gateway with the new key as
+`NERVA_KEY_NEXT` (it accepts both); move every caller to the new key; then restart every gateway
+with the new key as `NERVA_KEY` and no `NERVA_KEY_NEXT`. Each set key must be non-empty, and the
+two must differ; a gateway refuses to start otherwise, without printing either key (P96).
+
 ## Demos
 
 [demo/](./demo/README.md) holds public demos built only on the pieces above: a seat race (512
