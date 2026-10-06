@@ -52,7 +52,6 @@ curl -H 'X-Nerva-Key: secret' http://127.0.0.1:8080/v1/commit -d '{"entries": [
   written.
 - **`GET /v1/views/<name>/groups` names its replicated hash `view_hash`, as the whole view
   does; it was `hash`** (#66). `hash` on `nerva api` now always means `nerva view`'s.
-- A view declared over a ledger's field is refused with `409`, and nothing is written.
 
 ### New: upgrades keep the data
 
@@ -122,6 +121,7 @@ chunks as 256 documents of 64 KiB, and answers `413` past that: ask for fewer ke
   stops on a v0.3.0 data file. Load your data again.
 - **Upgrade clients and gateways too.** v0.4.0 replicas refuse clients older than v0.4.0.
 - `GET /v1/views/<name>` now answers the view; read the declaration at `/definition`.
+- `GET /v1/views/<name>/groups` sends the replicated hash as `view_hash`; it was `hash`.
 - v0.3.0 has no `nerva export`: this upgrade still means loading your data again. From
   v0.4.0 on, run the old release's `nerva export` and the new release's `nerva import`.
 - Zig client users: new operations `declare_ledger` and `get_ledger` (by id, or by `slot` to
