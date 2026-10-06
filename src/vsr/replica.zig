@@ -7,6 +7,7 @@ const SourceLocation = std.builtin.SourceLocation;
 const constants = @import("../constants.zig");
 const nerva = @import("../nerva.zig");
 const release_peers = @import("../nerva/release_peers.zig");
+const peer_auth = @import("../nerva/peer_auth.zig");
 const internal_operations = @import("../nerva/internal_operations.zig");
 
 const stdx = @import("stdx");
@@ -664,6 +665,8 @@ pub fn ReplicaType(
             release_client_min: vsr.Release,
             multiversion: Multiversion,
             release_peers_strict: bool = false,
+            /// Nerva: the cluster keys this replica authenticates its peers with (N86).
+            peer_keys: ?peer_auth.Keys = null,
             test_context: ?*anyopaque = null,
             timeout_prepare_ticks: ?u64 = null,
             timeout_grid_repair_message_ticks: ?u64 = null,
@@ -734,6 +737,22 @@ pub fn ReplicaType(
 
             self.test_context = options.test_context;
 
+            // Nerva: a replica given cluster keys authenticates its peers, and its proofs bind its
+            // origin (N84, N86).
+            var message_bus_options = options.message_bus_options;
+            if (comptime @hasDecl(MessageBus, "PeerAuth")) {
+                if (options.peer_keys) |keys| {
+                    message_bus_options.peer_auth = .{
+                        .keys = keys,
+                        .cluster = self.superblock.working.cluster,
+                        .release = options.release,
+                        .origin = self.superblock.working.vsr_state.origin,
+                    };
+                }
+            } else {
+                assert(options.peer_keys == null);
+            }
+
             // Initialize the replica:
             try self.init(
                 allocator,
@@ -750,7 +769,7 @@ pub fn ReplicaType(
                     .aof_recovery = options.aof_recovery,
                     .random_nonce = options.random_nonce,
                     .state_machine_options = options.state_machine_options,
-                    .message_bus_options = options.message_bus_options,
+                    .message_bus_options = message_bus_options,
                     .grid_cache_blocks_count = options.grid_cache_blocks_count,
                     .release = options.release,
                     .release_client_min = options.release_client_min,
@@ -1867,7 +1886,8 @@ pub fn ReplicaType(
                 .get_blocks => |m| self.on_get_blocks(m),
                 .block => |m| self.on_block(m),
                 // A replica should never handle misdirected messages intended for a client:
-                .pong_client, .eviction => {
+                // Nerva: a bus with cluster keys consumes the handshake itself (N86).
+                .pong_client, .eviction, .peer_hello, .peer_challenge, .peer_proof => {
                     log.warn("{}: on_message: misdirected message ({s})", .{
                         self.log_prefix(),
                         @tagName(message.header.command),
@@ -9244,6 +9264,10 @@ pub fn ReplicaType(
                 .deprecated_21,
                 .deprecated_22,
                 .deprecated_23,
+                // Nerva: only the message bus sends the handshake (N86).
+                .peer_hello,
+                .peer_challenge,
+                .peer_proof,
 
                 .request,
                 .prepare,
@@ -9367,6 +9391,10 @@ pub fn ReplicaType(
                 .deprecated_21,
                 .deprecated_22,
                 .deprecated_23,
+                // Nerva: only the message bus sends the handshake (N86).
+                .peer_hello,
+                .peer_challenge,
+                .peer_proof,
                 => unreachable,
 
                 .request => {

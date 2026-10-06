@@ -936,3 +936,21 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
   `test:fmt`; `test:release` (mixed, upgrade, origins); `test:integration`; VOPR in ReleaseSafe,
   seeds 1, 2, 5, 7270286294366828260, 6604808796972244986, 6787702322491963533 and
   4693188925445828544.
+
+## 2026-10-06 — Replicas authenticate each other (N86, NV-3 part B)
+
+- `src/nerva/peer_auth.zig`: cluster keys (`NERVA_CLUSTER_KEY`, `NERVA_CLUSTER_KEY_NEXT`, at
+  least 32 bytes, never printed), HMAC-SHA256 proofs over the cluster, both replicas, both
+  nonces and both origins, verified under either key in constant time; `keys_resolve` (the
+  public development key only with `--development` and loopback addresses).
+- Vendored: `vsr.zig` and `message_header.zig` (`peer_hello`, `peer_challenge`, `peer_proof`),
+  `message_bus.zig` (the handshake, the refusals, the 5 s timeout, held messages bounded by the
+  send queue, backoff for a wrong key), `replica.zig` (`peer_keys`), `message_bus_fuzz.zig`
+  (keys, a replica with another key). UPSTREAM.md.
+- `nerva start` loads the keys and refuses to run without them; the integration test, the
+  Python harnesses, Jepsen and `perf/` set real keys. The integration test keeps each replica's
+  log and prints it when a scenario fails.
+- README: "Replicas authenticate each other" (keys, rotation, the handshake, what it does not
+  cover: a private network that encrypts, such as WireGuard or Fly's 6PN); 0.0.4 and 0.0.5
+  replicas must never mix.
+- Botpike deploys must set `NERVA_CLUSTER_KEY` before any 0.0.5 replica (Botpike/app#73).

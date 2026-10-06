@@ -26,6 +26,10 @@
 
 (def replica-port 3000)
 
+(def cluster-key
+  "The key replicas authenticate each other with (N86): at least 32 bytes."
+  "jepsen-cluster-key-0123456789abcdefghij")
+
 (def healthy-timeout-s
   "How long a fresh cluster may take until every gateway has a session."
   120)
@@ -51,7 +55,8 @@
   (cu/start-daemon! {:logfile           replica-log
                      :pidfile           replica-pidfile
                      :chdir             dir
-                     :match-executable? false}
+                     :match-executable? false
+                     :env               {:NERVA_CLUSTER_KEY cluster-key}}
                     binary :start (str "--addresses=" (addresses test)) :--development
                     data-file))
 

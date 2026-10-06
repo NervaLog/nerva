@@ -18,6 +18,7 @@ const export_file = @import("nerva/export_file.zig");
 const export_ = @import("nerva/export.zig");
 const import_ = @import("nerva/import.zig");
 const release_peers = @import("nerva/release_peers.zig");
+const peer_auth = @import("nerva/peer_auth.zig");
 
 const IO = @import("io.zig").IO;
 const Tracer = @import("trace.zig").Tracer;
@@ -358,6 +359,8 @@ fn command_start(
     storage: *Storage,
     args: *const cli.Command.Start,
 ) !void {
+    const peer_keys = cluster_keys(args);
+
     var counting_allocator = vsr.CountingAllocator.init(base_allocator);
     const gpa = counting_allocator.allocator();
 
@@ -376,6 +379,8 @@ fn command_start(
         .multiversion = .single_release(config.process.release),
         // Nerva bundles only its own release: peers of another release are ignored (N61, #34).
         .release_peers_strict = true,
+        // Replicas prove to each other that they hold the cluster key (N86).
+        .peer_keys = peer_keys,
         .pipeline_requests_limit = args.pipeline_requests_limit,
         .storage_size_limit = args.storage_size_limit,
         .aof = null,
@@ -445,6 +450,26 @@ fn command_start(
         replica.tick();
         try io.run_for_ns(constants.tick_ms * std.time.ns_per_ms);
     }
+}
+
+/// The cluster keys replicas authenticate each other with (N86), from `NERVA_CLUSTER_KEY` and
+/// `NERVA_CLUSTER_KEY_NEXT`. Exits, naming the variable and never a key, when they cannot be used.
+fn cluster_keys(args: *const cli.Command.Start) peer_auth.Keys {
+    const resolved = peer_auth.keys_resolve(
+        std.posix.getenv("NERVA_CLUSTER_KEY"),
+        std.posix.getenv("NERVA_CLUSTER_KEY_NEXT"),
+        args.development,
+        args.addresses.slice(),
+    );
+    return switch (resolved) {
+        .keys => |keys| keys,
+        .development => keys: {
+            log.warn("NERVA_CLUSTER_KEY is unset: replicas authenticate each other with the " ++
+                "public development key (--development, loopback addresses only)", .{});
+            break :keys .{ .current = peer_auth.development_key };
+        },
+        .refused => |reason| vsr.fatal(.cli, "start: {s}", .{reason}),
+    };
 }
 
 fn command_view(gpa: std.mem.Allocator, args: *const cli.Command.View) !void {

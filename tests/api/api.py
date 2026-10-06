@@ -34,6 +34,9 @@ Usage: api.py <path to nerva> [--seed=N] [--steps=N]
 """
 import http.client, json, os, random, shutil, signal, socket, subprocess, sys, tempfile, threading, time
 
+# Replicas authenticate each other with a real cluster key, never the development key (N86).
+os.environ["NERVA_CLUSTER_KEY"] = os.urandom(32).hex()
+
 KEY = "api-test-key"
 TABLES = (1, 2)
 IDS = 12

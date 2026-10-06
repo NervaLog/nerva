@@ -31,6 +31,9 @@ import sys
 import tempfile
 import time
 
+# Replicas authenticate each other with a real cluster key, never the development key (N86).
+os.environ["NERVA_CLUSTER_KEY"] = os.urandom(32).hex()
+
 KEY = "upgrade-test-key"
 SEATS = 5        # A layout; the early view and the late view.
 COUNTERS = 6     # No layout: raw values and adds.
