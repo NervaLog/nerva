@@ -98,7 +98,7 @@ pub fn layout_parse(arena: std.mem.Allocator, json: []const u8) Error!Layout {
     const fields = try arena.alloc(Field, declaration.fields.len);
     var offset: usize = 0;
     for (fields, declaration.fields, 0..) |*field, declared, index| {
-        try name_validate(declared.name);
+        try name_validate(declared.name, "field");
         for (declaration.fields[0..index]) |earlier| {
             if (std.mem.eql(u8, earlier.name, declared.name)) return invalid("duplicate field");
         }
@@ -124,13 +124,14 @@ pub fn layout_parse(arena: std.mem.Allocator, json: []const u8) Error!Layout {
     return .{ .name = declaration.name, .fields = fields };
 }
 
-fn name_validate(name: []const u8) error{Invalid}!void {
+/// `what` names the name in the refusal: "field" or "view" (#77).
+fn name_validate(name: []const u8, comptime what: []const u8) error{Invalid}!void {
     if (name.len == 0 or name.len > name_size_max) {
-        return invalid("a field name is 1 to 32 bytes");
+        return invalid("a " ++ what ++ " name is 1 to 32 bytes");
     }
     for (name, 0..) |c, index| {
         const ok = c == '_' or (c >= 'a' and c <= 'z') or (index > 0 and c >= '0' and c <= '9');
-        if (!ok) return invalid("a field name is lowercase letters, digits and _");
+        if (!ok) return invalid("a " ++ what ++ " name is lowercase letters, digits and _");
     }
 }
 
@@ -263,7 +264,7 @@ pub const View = struct {
 };
 
 pub fn view_name_validate(name: []const u8) error{Invalid}!void {
-    return name_validate(name);
+    return name_validate(name, "view");
 }
 
 /// Parses a declaration: `{"table": 5, "where": [{"field", "op", "value"}], "group_by": […],
@@ -566,6 +567,14 @@ test "catalog: invalid layouts and fields are refused" {
     , .{});
     const value = try fields_encode(&layout, negative);
     try testing.expectEqual(@as(?i128, -5), field_integer(layout.field("c").?, &value));
+}
+
+test "catalog: a bad view name is refused as a view name (#77)" {
+    try testing.expectError(error.Invalid, view_name_validate("Revenue"));
+    try testing.expectEqualStrings("a view name is lowercase letters, digits and _", invalid_reason);
+    try testing.expectError(error.Invalid, view_name_validate("a" ** (name_size_max + 1)));
+    try testing.expectEqualStrings("a view name is 1 to 32 bytes", invalid_reason);
+    try view_name_validate("revenue_2");
 }
 
 test "catalog: a view resolves to the state machine's definition through its layout" {

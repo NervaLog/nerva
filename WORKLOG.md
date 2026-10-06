@@ -780,3 +780,19 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
 - Verified: `check`, `test:fmt`, `test:unit` 359/360 (the sandbox-denied perf test),
   `test:api`, `test:views`, `test:integration`, `test:release` (mixed releases, then the
   upgrade), `fuzz -- smoke`, VOPR seeds 1, 2 and 5 in ReleaseSafe.
+
+## 2026-10-06 — v0.4.0 release preparation: docs and CLI messages (#77)
+
+- CHANGELOG v0.4.0, from the release-readiness audit: a request's budget is 128 MiB (it said
+  64); the #62 entry is gone (a bug no release had); a view that filters or groups by a ledger's
+  field is refused (summing one is allowed); the export caveats (op numbers jump to the next
+  checkpoint, Zig-client-only views are refused, both releases need export and import); the
+  `documents/get` 413; the Zig client's new names.
+- README: `declare_ledger` and `get_ledger` in the operations table, the client's operations,
+  the export caveats, `400` for a view of more than 10,000 groups, a stale roadmap line.
+  UPSTREAM.md: the golden checksum also held for `0.0.4`.
+- `src/nerva/catalog.zig`: a bad view name says "a view name" (#77), with a unit test.
+  `src/nerva_main.zig`: `export` explains a timeout and an `--as-of` past the cluster; `import`
+  refuses an existing data file before reading the export. `src/nerva/cli.zig`: the help lists
+  `--trace-size-max` and what `api` serves.
+- Verified: `check`, `test:unit -- "catalog:"`.

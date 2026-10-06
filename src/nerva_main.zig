@@ -81,11 +81,27 @@ pub fn main() !void {
             log_level_runtime = if (args.log_debug) .debug else .info;
             command_export(gpa, args) catch |err| {
                 std.fs.cwd().deleteFile(args.output) catch {};
-                vsr.fatal(.cli, "export: {s}", .{@errorName(err)});
+                switch (err) {
+                    error.Timeout => vsr.fatal(
+                        .cli,
+                        "export: no reply from the cluster: check --cluster and --addresses",
+                        .{},
+                    ),
+                    error.AsOfAhead => vsr.fatal(
+                        .cli,
+                        "export: --as-of is past the cluster's latest op",
+                        .{},
+                    ),
+                    else => vsr.fatal(.cli, "export: {s}", .{@errorName(err)}),
+                }
             };
         },
         .import => |*args| {
             log_level_runtime = if (args.log_debug) .debug else .info;
+            // Before reading the export, which may be large: the data file must be new.
+            if (std.fs.cwd().access(args.path, .{})) {
+                vsr.fatal(.cli, "import: {s} exists; give a new file", .{args.path});
+            } else |_| {}
             // Pass 1, before the data file exists: the whole export is checked.
             var arena = std.heap.ArenaAllocator.init(gpa);
             defer arena.deinit();
@@ -96,9 +112,6 @@ pub fn main() !void {
                 }),
                 else => vsr.fatal(.cli, "import: {s}: {s}", .{ args.input, @errorName(err) }),
             };
-            if (std.fs.cwd().access(args.path, .{})) {
-                vsr.fatal(.cli, "import: {s} exists; give a new file", .{args.path});
-            } else |_| {}
             // Pass 2. Any failure removes the data file, which the import created.
             command_import(gpa, args, &plan) catch |err| {
                 std.fs.cwd().deleteFile(args.path) catch {};
