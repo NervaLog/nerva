@@ -868,3 +868,7 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
 - Found in the suite itself: a connection refused by a killed gateway was `:info`, though
   nothing was sent (now a failure: 860 unknown transfers became 1); and the refusal check then
   counted those failures as refusals (now only Nerva's statuses are).
+
+## 2026-10-06 — GOALS-1.0: documents hold 512 KiB
+
+- `docs/GOALS-1.0.md`: G7's status said documents hold up to 64 KiB; N76 raised that to 512 KiB.
