@@ -504,9 +504,11 @@ fails (gateways reconnect on their own).
 
 **Network.** Gateways authenticate their callers with `X-Nerva-Key`, but send it, and every
 reply, in plain HTTP: put them behind TLS (a load balancer or proxy) when callers are not on a
-private network. Replicas do not yet authenticate each other: anyone who can reach a replica's
-port can act as a replica or a client. Run replicas on a private network that only the cluster
-and its gateways can reach.
+private network. Replicas authenticate each other with the cluster key (P102, "Replicas
+authenticate each other" above), but their traffic is neither encrypted nor signed after the
+handshake, and anyone who can reach a replica's port can still act as a client. Run replicas on a
+private network that encrypts (WireGuard, or Fly.io's 6PN) and that only the cluster and its
+gateways can reach.
 
 To rotate a gateway key without downtime: restart every gateway with the new key as
 `NERVA_KEY_NEXT` (it accepts both); move every caller to the new key; then restart every gateway
