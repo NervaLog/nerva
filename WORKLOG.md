@@ -741,6 +741,14 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
   (11511081922386736357) pass; seeds 1, 2, 5 and 30 random in ReleaseSafe pass; `check`,
   `test:fmt`, `test:unit` (the sandbox-denied perf test aside).
 
+## 2026-10-05 — CI removes other repositories' workspaces when the disk is still short (N79)
+
+- `.github/scripts/free_disk.sh`: after emptying the Zig caches, if either filesystem is still
+  below `FREE_MIN_GIB`, removes the other directories in the runner's work directory but its own
+  workspace and the runner's `_*` directories, only under Actions.
+- Verified: in a simulated `_work` (this workspace, another repository's, `_temp`, `_actions`,
+  `_tool`), the other workspace is removed and the rest kept; outside Actions nothing is.
+
 ## 2026-10-05 — `/groups` names its replicated hash `view_hash` (#66)
 
 - `src/nerva/api/api.zig`: `GET /v1/views/<name>/groups` sends `view_hash`, not `hash`, as the
