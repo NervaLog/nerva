@@ -14,8 +14,9 @@ journal (#81). Now each data file records its export, and:
 - replicas 0 and 1 from A commit past a checkpoint, then replica 2, imported from A and never
   started before, starts: it joins, and counts toward the quorum once replica 1 stops;
 - a `nerva api` of `release_client_min` (the second binary) commits and reads against them;
-- through that older client, the primary dies with commits in flight and both others restart:
-  they repair its prepares from each other and commit again.
+- through that older client, the next view's primary X stops while the primary and the other
+  backup Y commit on; then those two die, and X and Y restart: X becomes the primary only once it
+  repairs the dead primary's prepares from Y (it wedged on a gate that refused them).
 Nothing panics.
 """
 import http.client
@@ -28,7 +29,6 @@ import socket
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 
 KEY = "origins-test-key"
@@ -281,10 +281,10 @@ def main():
         late.close()
         clusters.remove(late)
 
-        # 5. Through an older client, the primary dies with commits in flight and both others
-        # restart: the cluster commits again (P90; the review of #90). A liveness check: it does
-        # not force the survivors to repair the dead primary's prepares from each other, the case
-        # the review found (release_peers' unit test pins the gate's decision for it).
+        # 5. Through an older client, the backup X that is the next view's primary stops; the
+        # primary P and the other backup Y commit on at quorum 2; P and Y die, and X and Y
+        # restart. Neither can hear from P again, and X lacks ops P made: to become the next
+        # view's primary it must repair P's prepares from Y (P90; the review of #90).
         def format_(index, path):
             subprocess.run([nerva, "format", "--cluster=0", f"--replica={index}",
                             "--replica-count=3", "--development", path], check=True,
@@ -296,36 +296,29 @@ def main():
         for _ in range(30):
             put(port, next_id)
             next_id += 1
-        primary = max(range(3), key=lambda index: max(
-            [int(m) for m in re.findall(r"transition_to_normal\w*: view=(\d+) primary",
-                                       restart.log(index))] or [-1]))
-        survivors = [index for index in range(3) if index != primary]
-        in_flight = {"next": 1_000_000, "stop": False}
-
-        def load():  # Commits in flight while the replicas go down, so their logs differ.
-            while not in_flight["stop"]:
-                try:
-                    request(port, "POST", "/v1/commit", {"entries": [
-                        {"kind": "put", "table": TABLE, "id": str(in_flight["next"]),
-                         "value_hex": "ab"}]}, timeout=5)
-                except (TimeoutError, ConnectionError, http.client.HTTPException, OSError):
-                    pass
-                in_flight["next"] += 1
-
-        loader = threading.Thread(target=load)
-        loader.start()
-        time.sleep(1)
+        view = max(int(m) for index in range(3) for m in re.findall(
+            r"transition_to_normal\w*: view=(?:\d+\.\.)?(\d+) ", restart.log(index)))
+        primary = view % 3
+        lagging, other = (primary + 1) % 3, (primary + 2) % 3
+        restart.stop(lagging)
+        op_lagging = put(port, next_id)
+        next_id += 1
+        for _ in range(20):
+            op = put(port, next_id)
+            next_id += 1
+        assert op >= op_lagging + 20, (op_lagging, op)
         restart.stop(primary)
-        time.sleep(0.5)
-        for index in survivors:
-            restart.stop(index)
-        in_flight["stop"] = True
-        loader.join()
+        restart.stop(other)
+        log_restarted = len(restart.log(lagging))
+        survivors = [lagging, other]
         for index in survivors:
             restart.start(index)
         for _ in range(20):
             put(port, next_id)
             next_id += 1
+        assert re.search(r"transition_to_normal_from_view_change_status: view=\d+\.\.\d+ primary",
+                         restart.log(lagging)[log_restarted:]), \
+            restart.log(lagging)[log_restarted:][-3000:]
         restart.check_running(survivors)
         restart.close()
         clusters.remove(restart)
@@ -335,8 +328,8 @@ def main():
               f"exit; a "
               f"replica imported from the same export and started later joins past a "
               f"checkpoint; a client of "
-              f"release_client_min commits, and commits again after its primary dies and the "
-              f"others restart; {time.monotonic() - started:.0f} s)")
+              f"release_client_min commits, and commits again after a restarted replica "
+              f"repairs the dead primary's prepares; {time.monotonic() - started:.0f} s)")
     finally:
         for cluster in clusters:
             cluster.close()
