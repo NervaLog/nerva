@@ -68,6 +68,9 @@ pub fn MessageBusType(comptime IO: type) type {
         /// The number of outgoing `connect()` attempts for a given replica:
         /// Reset to zero after a successful `on_connect()`.
         replicas_connect_attempts: []u64,
+        /// Nerva: whether the latest dial of each replica could not open its socket, already
+        /// logged; cleared when one opens (#92).
+        replicas_unopened: []bool,
 
         /// Map from client id to the currently active connection for that client.
         /// This is used to make lookup of client connections when sending messages
@@ -152,6 +155,10 @@ pub fn MessageBusType(comptime IO: type) type {
             errdefer allocator.free(replicas_connect_attempts);
             @memset(replicas_connect_attempts, 0);
 
+            const replicas_unopened = try allocator.alloc(bool, options.configuration.len);
+            errdefer allocator.free(replicas_unopened);
+            @memset(replicas_unopened, false);
+
             const prng_seed = switch (process_id) {
                 .replica => |replica| replica,
                 .client => |client| @as(u64, @truncate(client)),
@@ -172,6 +179,7 @@ pub fn MessageBusType(comptime IO: type) type {
                 .replicas = replicas,
                 .replicas_addresses = replicas_addresses,
                 .replicas_connect_attempts = replicas_connect_attempts,
+                .replicas_unopened = replicas_unopened,
                 .prng = stdx.PRNG.from_seed(prng_seed),
                 .trace = options.trace,
             };
@@ -250,6 +258,7 @@ pub fn MessageBusType(comptime IO: type) type {
             assert(bus.send_queue_buffer.ptr + bus.send_queue_buffer.len ==
                 send_queue_buffer_previous.?.ptr + send_queue_buffer_previous.?.len);
 
+            allocator.free(bus.replicas_unopened);
             allocator.free(bus.replicas_connect_attempts);
             allocator.free(bus.replicas_addresses);
             allocator.free(bus.replicas);
@@ -518,9 +527,9 @@ pub fn MessageBusType(comptime IO: type) type {
 
             const family = bus.replicas_addresses[replica].ip.family();
             connection.fd = init_tcp(bus.io, bus.process, family) catch |err| {
-                // Nerva: retried every tick, so said once until the replica is reached (#92).
-                const attempts = &bus.replicas_connect_attempts[replica];
-                if (attempts.* == 0) {
+                // Nerva: retried every tick, so said once until a socket opens (#92). The dial
+                // backoff (`replicas_connect_attempts`) is for dials that reached the network.
+                if (!bus.replicas_unopened[replica]) {
                     log.err("{}: connect_to_replica: init_tcp error={s} to={} " ++
                         "(retrying; said once)", .{ bus.id, @errorName(err), replica });
                 } else {
@@ -530,9 +539,10 @@ pub fn MessageBusType(comptime IO: type) type {
                         replica,
                     });
                 }
-                attempts.* +|= 1;
+                bus.replicas_unopened[replica] = true;
                 return;
             };
+            bus.replicas_unopened[replica] = false;
             connection.peer = .{ .replica = replica };
             connection.state = .connecting;
             bus.connections_used += 1;
