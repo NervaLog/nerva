@@ -164,7 +164,9 @@ curl http://127.0.0.1:8080/healthz
 ```
 
 The gateway reads its shared secret from `NERVA_KEY`, and every request must carry it in
-`X-Nerva-Key`. Define a short helper for the rest of the tutorial:
+`X-Nerva-Key`. To change the secret without refusing anyone, restart the gateway with the new
+one in `NERVA_KEY_NEXT` as well (it then accepts either), move clients to it, and restart again
+with it as `NERVA_KEY` alone. Define a short helper for the rest of the tutorial:
 
 ```bash
 n() { curl -s -H 'X-Nerva-Key: secret' "$@"; echo; }
@@ -1325,8 +1327,8 @@ result.
 nerva format --cluster=<id> --replica=<i> --replica-count=<n> [--development] <file>
 nerva start  --addresses=<a0,a1,…> [--development] [--cache-grid=…] [--cache-rows=…]
              [--statsd=<host:port>] [--trace=<new file>] [--trace-size-max=…] <file>
-NERVA_KEY=… nerva api  --cluster=<id> --addresses=<…> --listen=<host:port>
-NERVA_KEY=… nerva view --cluster=<id> --addresses=<…> --listen=<host:port>
+NERVA_KEY=… [NERVA_KEY_NEXT=…] nerva api  --cluster=<id> --addresses=<…> --listen=<host:port>
+NERVA_KEY=… [NERVA_KEY_NEXT=…] nerva view --cluster=<id> --addresses=<…> --listen=<host:port>
 nerva export --cluster=<id> --addresses=<…> [--as-of=<op>] --output=<new file>
 nerva import --cluster=<id> --replica=<i> --replica-count=<n> --input=<export> [--development] <file>
 ```

@@ -314,8 +314,9 @@ pub fn build(b: *std.Build) !void {
     steps.test_integration.dependOn(&run_integration_tests.step);
 
     // zig build test:api: the JSON API, its documents, adds, then ledgers, against models, then a
-    // cluster and gateway over IPv6 (skipped without it), then a gateway given an address it
-    // cannot open (#92); one after the other: each runs a cluster.
+    // cluster and gateway over IPv6 (skipped without it), a gateway given an address it cannot
+    // open (#92), then key rotation through both gateways (NERVA_KEY_NEXT); one after the other:
+    // each runs a cluster.
     var api_previous: ?*std.Build.Step = null;
     for ([_][]const u8{
         "api.py",
@@ -324,6 +325,7 @@ pub fn build(b: *std.Build) !void {
         "ledgers.py",
         "ipv6.py",
         "addresses.py",
+        "keys.py",
     }) |script| {
         const run_api_test = b.addSystemCommand(&.{ "python3", b.fmt("tests/api/{s}", .{script}) });
         run_api_test.addFileArg(nerva.getEmittedBin());
