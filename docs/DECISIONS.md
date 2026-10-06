@@ -1443,3 +1443,30 @@ choice over a separate repository.
   Docker as root), not on the Hetzner fuzzing fleet: a few hours a night bills by the second.
 - **Not replayable.** A run has no seed; a failure is reproduced as a VOPR seed or unit test
   before it is fixed, so it stays covered.
+
+**N83. A benchmark's size is fixed, not a limit's; the documents benchmark measures 64 KiB.**
+The nightly of 2026-10-06 (#88) failed `documents.encode_ns_per_document` and
+`decode_ns_per_document` by about 8x, and `declared_views.latest_ns` by 39%, at `4a8aef3` against
+`ef2eaad`. Bisected (a 4-CPU sandbox, ReleaseSafe, one value size throughout): at 64 KiB,
+`ef2eaad`, `b64f7a0~1` (before #85), `b64f7a0` (#85) and `4a8aef3` all encode a document in
+630–670 µs and decode it in 18–19 µs. Nothing slowed down: the benchmark took
+`documents.value_size_max` as its size, so when N76 raised that from 64 KiB to 512 KiB the
+benchmark started timing documents 8 times larger, and encoding and decoding are linear in the
+size. The benchmark is back at 64 KiB, the size its metrics have always reported, so the series
+stays comparable; `value_size=524288` times the largest. A benchmark's default size is now chosen
+for itself, never derived from a limit that may move.
+- **Encoding hashed the key once per chunk.** Every write path called `chunk_id(namespace, key,
+  chunk)` for each chunk, and each call hashes the key (up to 1 KiB) before the tail's own
+  SHA-256. Now `row_id` is taken once per document and `chunk_id_from(id0, chunk)` names each
+  chunk: the same ids (a unit test compares both over the largest document, every chunk), and
+  encoding about 2.8 times faster (64 KiB: 635 µs to 225 µs; 512 KiB: 5.47 ms to 1.96 ms).
+- **`declared_views.latest_ns` (assumed: not reproduced).** On Fly the candidate's `latest` was
+  about 141 ms in all three rounds against about 100 ms, while `as_of_middle_ns` did not move. In
+  the sandbox both builds take 134–153 ms, with the 512 KiB documents benchmark before it in the
+  same process or without it; the one change to that path in the range, sorting `Group`s instead
+  of the hash map's entries (N66), is the same speed. `latest` walks a map of a million rows
+  built on the process's heap, after the documents benchmark has run in it; `as_of` builds its
+  own map in a fresh arena. So the likely cause is the heap the 512 KiB benchmark leaves behind
+  (layout, huge pages; the sandbox's transparent huge pages are `madvise`, so it cannot show
+  this), and restoring the 64 KiB benchmark restores the heap it ran after. The next night
+  confirms it or reopens #88.

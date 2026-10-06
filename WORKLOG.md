@@ -895,3 +895,18 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
 ## 2026-10-06 — GOALS-1.0: documents hold 512 KiB
 
 - `docs/GOALS-1.0.md`: G7's status said documents hold up to 64 KiB; N76 raised that to 512 KiB.
+
+## 2026-10-06 — Documents benchmark at 64 KiB; chunk 0's id once per document (N83, #88)
+
+- #88 (nightly at `4a8aef3`): documents encode and decode about 8x slower, `declared_views.latest_ns`
+  +39%. Bisected at one value size: no commit in `ef2eaad..4a8aef3` changed their speed; the
+  benchmark sized itself from `value_size_max`, which N76 raised from 64 KiB to 512 KiB.
+- `documents_benchmark.zig` measures 64 KiB again (`value_size=524288` for the largest).
+- `documents.chunk_id_from(id0, chunk)`: the write paths (`nerva api`'s commit, the Zig
+  transaction's get and put) take chunk 0's id once per document instead of hashing the key for
+  every chunk. Encoding at 64 KiB: 635 µs on `main`, 225 µs now; 512 KiB: 5.47 ms to 1.96 ms.
+- `declared_views.latest_ns` does not reproduce outside Fly (134–153 ms for both builds, with
+  or without the 512 KiB documents benchmark before it); recorded in N83 as the heap the larger
+  documents benchmark left, to be confirmed by the next night.
+- Verified: `check`, `test:unit` (all but the sandbox's `benchmark.perf: usage example`),
+  `test:fmt`.
