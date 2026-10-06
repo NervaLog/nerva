@@ -349,6 +349,8 @@ fn listen_parse(text: []const u8) ?std.net.Address {
     const host = text[0..colon];
     if (host.len > 0 and host[0] == '[') {
         if (host.len < 3 or host[host.len - 1] != ']') return null;
+        // No zone ids: `parseIp6` takes a numeric one (`fe80::1%2`), which a gateway never needs.
+        if (std.mem.indexOfScalar(u8, host, '%') != null) return null;
         return std.net.Address.parseIp6(host[1 .. host.len - 1], port) catch null;
     }
     return std.net.Address.parseIp4(host, port) catch null;
@@ -378,6 +380,8 @@ test listen_parse {
     try std.testing.expect(listen_parse("[localhost]:8090") == null);
     try std.testing.expect(listen_parse("[127.0.0.1]:8090") == null);
     try std.testing.expect(listen_parse("[::1]:99999") == null);
+    try std.testing.expect(listen_parse("[fe80::1%2]:8090") == null);
+    try std.testing.expect(listen_parse("[fe80::1%eth0]:8090") == null);
 }
 
 const Error = error{

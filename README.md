@@ -263,6 +263,8 @@ curl -H 'X-Nerva-Key: secret' -d '{"entries":[{"kind":"put","table":1,"id":"5","
 
 `--listen` (for `nerva api` and `nerva view`) takes `<ipv4>:<port>` or `[<ipv6>]:<port>`, as
 `--addresses` does: `--listen=[::]:8080` serves every IPv6 address, as on an IPv6-only network.
+On Linux, `[::]` accepts IPv4 connections too unless `net.ipv6.bindv6only` is set (it is not by
+default). Zone ids (`[fe80::1%2]`) are refused.
 
 | Route | Does |
 |---|---|

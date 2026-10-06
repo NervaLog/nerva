@@ -76,10 +76,15 @@ def main():
                 stderr=open(path + ".log", "w")))
         gateway = subprocess.Popen(
             [nerva, "api", "--cluster=0", f"--addresses={addresses}", "--listen=[::1]:0"],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            env={**os.environ, "NERVA_KEY": KEY}, text=True)
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=open(os.path.join(tmp, "api.log"), "w"), env={**os.environ, "NERVA_KEY": KEY},
+            text=True)
         processes.append(gateway)
-        port = int(gateway.stdout.readline())
+        line = gateway.stdout.readline()
+        if not line:
+            with open(os.path.join(tmp, "api.log"), errors="replace") as f:
+                raise AssertionError(f"the gateway exited before listening: {f.read()[-3000:]}")
+        port = int(line)
 
         status, reply = request(port, "POST", "/v1/commit", {"entries": [
             {"kind": "put", "table": 1, "id": "7", "value_hex": "c0ffee"}]})
