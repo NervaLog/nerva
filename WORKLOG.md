@@ -909,4 +909,5 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
   or without the 512 KiB documents benchmark before it); recorded in N83 as the heap the larger
   documents benchmark left, to be confirmed by the next night.
 - Verified: `check`, `test:unit` (all but the sandbox's `benchmark.perf: usage example`),
-  `test:fmt`.
+  `test:fmt`, `test:api` (with `tests/api/documents.py`: a 512 KiB value under a 1024-byte key,
+  one byte more refused, the `get` cap at its edge).
