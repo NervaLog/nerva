@@ -1496,3 +1496,7 @@ use, with a message that names the variable and never the key.
   (body and memory per request, connections, deadlines, documents, views' per-op budgets,
   client sessions), each checked against the constant in the code, and says that the replicas'
   network must be private: replicas do not yet authenticate each other (NV-3).
+- **An oversized body stays `400`.** A `Content-Length` over 4 MiB answers
+  `400 {"error":"body too large"}`, as it has since the gateway's start, rather than `413`: the
+  owner chose not to change what callers already handle. `413` remains the answer for a request
+  that is too complex or too large to commit, which a caller can split.
