@@ -9,7 +9,8 @@ replicas imported from two of them met at that checkpoint and the odd one panick
 journal (#81). Now each data file records its export, and:
 - replicas 1 and 2 from A, replica 0 (the first view's primary) from B: replica 0 exits with
   status 8 (`origin_mismatch`), naming both exports; replicas 1 and 2 ignore it and commit;
-- each replica from another export: all three exit with status 8;
+- each replica from another export: at least two exit with status 8 (the last may have heard
+  only one peer before they stopped, and stays up alone);
 - replicas 0 and 1 from A commit past a checkpoint, then replica 2 is imported from A and
   started: it joins, and counts toward the quorum once replica 1 stops;
 - a `nerva api` of `release_client_min` (the second binary) commits and reads against them.
@@ -214,13 +215,25 @@ def main():
         split.close()
         clusters.remove(split)
 
-        # 2. Three exports: no replica can reach a quorum, and each says so.
+        # 2. Three exports: no replica can reach a quorum. A replica stops once it has heard two
+        # peers of other exports; the last may have heard only one before they stopped, and
+        # then stays up alone, ignoring them, and commits nothing.
         apart = Cluster(tmp, "apart", nerva, importer(lambda index: index))
         clusters.append(apart)
-        for index in range(3):
-            status = apart.exit_status(index)
-            assert status == STATUS_ORIGIN_MISMATCH, (index, status, apart.log(index)[-3000:])
-            apart.replicas[index] = None
+        deadline = time.monotonic() + 60
+        while sum(r.poll() is not None for r in apart.replicas) < 2:
+            assert time.monotonic() < deadline, [apart.log(i)[-2000:] for i in range(3)]
+            time.sleep(0.2)
+        time.sleep(5)
+        exited = 0
+        for index, replica in enumerate(apart.replicas):
+            status = replica.poll()
+            if status is None:
+                assert "was imported from export" in apart.log(index), apart.log(index)[-3000:]
+            else:
+                assert status == STATUS_ORIGIN_MISMATCH, (index, status, apart.log(index)[-3000:])
+                exited += 1
+        assert exited >= 2
         apart.check_no_panic()
         apart.close()
         clusters.remove(apart)
@@ -255,7 +268,8 @@ def main():
         clusters.remove(late)
 
         print(f"origins: PASSED (replicas of another export exit with status "
-              f"{STATUS_ORIGIN_MISMATCH} and the rest commit on; three exports all exit; a "
+              f"{STATUS_ORIGIN_MISMATCH} and the rest commit on; of three exports, {exited} "
+              f"exit; a "
               f"replica imported later from the same export joins past a checkpoint; a client of "
               f"release_client_min commits; {time.monotonic() - started:.0f} s)")
     finally:
