@@ -851,6 +851,24 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
 - The release carries #72, #73, #75 and #83, merged here after the release-candidate
   hardening (N81). Known and deferred: #81.
 
+## 2026-10-06 — A Jepsen suite, first workload `bank` (N82)
+
+- `tests/jepsen/`: Leiningen project (Jepsen 0.3.14); `run.sh` starts five Docker nodes
+  (`node/Dockerfile`) and runs `lein run`; `db.clj` installs and runs a replica and a gateway
+  per node; `http.clj` maps replies to Jepsen outcomes; `bank.clj`, conservation in a declared
+  ledger; `core.clj`, the CLI and faults (kill, pause, partition); `README.md`.
+- `test/jepsen/nerva/bank_test.clj`: every checker fails on the history it exists to catch
+  (lost value, a field below its floor, a missing row, a moved source, a wrong view total, an
+  unexpected refusal) and passes a correct one; replies map to outcomes.
+- Verified: `lein test` 10 tests, 27 assertions. Against `main`'s ReleaseSafe build (v0.4.0),
+  all valid: 60 s without faults (340 transfers, 432 reads, 389 view reads, 63 refused
+  `out_of_bounds`); 240 s of kills and partitions (20 kills, 26 partitions; 707 reads and 697
+  view reads all at the funded total); 150 s of kills, pauses and partitions (8 kills, 14
+  pauses, 16 partitions; 294 reads, 279 view reads).
+- Found in the suite itself: a connection refused by a killed gateway was `:info`, though
+  nothing was sent (now a failure: 860 unknown transfers became 1); and the refusal check then
+  counted those failures as refusals (now only Nerva's statuses are).
+
 ## 2026-10-06 — Tutorial for v0.4.0
 
 - `docs/TUTORIAL.md` updated for the released v0.4.0 (`0.0.4`):
@@ -865,7 +883,8 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
     what carries over (N80, N81).
   - Clients must match the replicas' release (N62). The bill of materials (N63). CI (N68,
     N74). Zig client: ledger calls, `get_ledger_slot`, eviction. Code map, decisions N1–N81,
-    cheat sheet. Part 8 keeps #65's 512 KiB documents.
+    cheat sheet, the Jepsen suite in the test ladder (N82). Part 8 keeps #65's 512 KiB
+    documents.
   - The request-id example in Part 9 moves to table 9, clear of the ledger's tables.
 - Verified: every reply is from one scripted run against a fresh one-replica cluster at v0.4.0
   (`549159e` plus this branch's docs), identical to the earlier runs through Part 6's budget.

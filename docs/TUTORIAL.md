@@ -1170,7 +1170,7 @@ never `deinit`.
 Read this part before changing Nerva itself. Then read, in order: [CLAUDE.md](../CLAUDE.md)
 (the working protocol, which applies to people too), [docs/TIGER_STYLE.md](./TIGER_STYLE.md)
 (the coding style, which is mandatory), [docs/DECISIONS.md](./DECISIONS.md) (why things are
-the way they are, numbered N1…N81) and [UPSTREAM.md](../UPSTREAM.md) (what is vendored and
+the way they are, numbered N1…N82) and [UPSTREAM.md](../UPSTREAM.md) (what is vendored and
 patched).
 
 ### Where things are
@@ -1263,6 +1263,7 @@ check it.
 | `./zig/zig build test:views` | Declared and maintained views against models | ~2 min |
 | `./zig/zig build test:release` | A cluster of two releases (the odd replica is ignored), and an upgrade by export and import | ~1 min |
 | `./zig/zig build test:demo` | Both demos under random crashes | ~3 min |
+| `tests/jepsen/run.sh zig-out/bin/nerva test --nemesis kill,partition` | Jepsen: five real nodes in Docker, clients through `nerva api`, kills, pauses and partitions; the history is checked against what the docs promise (a ledger's conservation, so far). Needs Docker, a JDK and Leiningen; by hand | longer |
 
 `benchmark.perf: usage example` fails in sandboxes that deny `perf_event_open`; that is the
 environment, not your change. Everything else must pass. CI runs all of it, as parallel jobs,
@@ -1287,6 +1288,12 @@ regression).
   request.
 - **Releases** are a `CHANGELOG.md` section plus a `VERSION` bump, in their own commit. Each
   release publishes binaries, `SHA256SUMS` and a bill of materials.
+
+The VOPR simulates replicas but not real processes, and it does not simulate the gateways at all.
+The Jepsen suite (`tests/jepsen/`, N82) covers that gap. Its checks are written from the
+documentation rather than the code, so they don't share the implementation's assumptions. A
+Jepsen run has no seed: a failure it finds is first reproduced as a VOPR seed or a unit test,
+then fixed.
 
 A good first exercise: read `src/nerva.zig` top to bottom, then follow one `commit` request
 through `state_machine.zig` (`input_valid` → `prepare` → `prefetch` → `commit`) and find
