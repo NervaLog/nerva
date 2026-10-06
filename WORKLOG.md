@@ -896,6 +896,12 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
 
 - `docs/GOALS-1.0.md`: G7's status said documents hold up to 64 KiB; N76 raised that to 512 KiB.
 
+## 2026-10-06 — Tutorial: what Nerva is for
+
+- `docs/TUTORIAL.md`, Part 0: "What Nerva is for", a paragraph framing Nerva as a system of
+  record for autonomous agency. It ties claims, ledgers, as-of reads and view hashes to the
+  auditor's questions of docs/GOALS-1.0.md, says Nerva stays general (N31, N39), and names what
+  is still to come (G5, G7).
 ## 2026-10-06 — Documents benchmark at 64 KiB; chunk 0's id once per document (N83, #88)
 
 - #88 (nightly at `4a8aef3`): documents encode and decode about 8x slower, `declared_views.latest_ns`
