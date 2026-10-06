@@ -997,7 +997,9 @@ they write, from replicated state, and `nerva view` stays as an independent reco
   `/definition`; before 1.0 anything may break): every group, sorted by key, rendered by the
   same code as `nerva view` (`declared.render`, shared), so the answer, and `hash`, the SHA-256
   of its `groups` JSON, are `nerva view`'s byte for byte. `view_hash` (the replicated hash, N52)
-  and `declared_op` come with it. `as_of` and `min_op` mean what they mean in `nerva view`, and
+  and `declared_op` come with it; `/groups` names the replicated hash `view_hash` too (it
+  said `hash` until #66, renamed before v0.4.0 shipped), so `hash` always means `nerva
+  view`'s. `as_of` and `min_op` mean what they mean in `nerva view`, and
   an op not yet committed answers 504 as there; a view still building or failed answers 503
   rather than part of an answer. `GET /v1/views` lists the views the state machine maintains;
   the `get_view` header now carries the view's name in `group_key` for it.
@@ -1198,9 +1200,9 @@ each with an optional floor. Generic: a ledger could conserve seats or stock as 
   after such a view, `DeclareStatus.ledger_field` (10) for a view declared after the ledger.
   `nerva api` now sends `declare_view` before writing the view's catalog document, after
   checking the catalog for a different declaration under the name as before, so a view refused
-  over a ledger's field answers 409 and leaves no document (owner's choice). Only views the state
-  machine maintains are checked (assumed): one it refused lives only in `nerva view`, which
-  recomputes it on read, so adds never touch it.
+  over a ledger's field answers 409 and leaves no document (owner's choice; N78 refines which
+  answers write one). Only views the state machine maintains are checked (assumed): one it
+  refused lives only in `nerva view`, which recomputes it on read, so adds never touch it.
 - **The invariant**: for every ledger, the sum of its fields over all rows equals the sum at its
   declaration's op, and no field moves down past its floor.
 - **Numbers.** The spec named `unpaired = 15` and `conserved_write = 16`; `views_too_large`
@@ -1254,6 +1256,22 @@ size at random, and its lanes on `main` (N74) hit this on four of four lanes acr
 more with `table_extremes_full`, as the VOPR's model does. Production is unchanged. Verified: the
 failing seeds now pass (the first refuses one declaration `table_extremes_full`), as do seeds 1,
 2, 5 and 30 random ones in ReleaseSafe.
+
+**N78. The state machine decides a view's name only while the catalog has no document for it.**
+Since N75, `PUT /v1/views/<name>` declares the view, then writes its catalog document. Two
+gateways could race in between (#70): A's definition declared, B's different one then answered
+`different` but cataloged anyway, leaving `/definition` describing B and `/groups` serving A for
+good. And a view cataloged unmaintained (its table's views full), whose field a ledger then took,
+answered 409 to the identical PUT that had been accepted. Now, with no document under the name,
+`different` and `ledger_field` answer 409 and write nothing, so the catalog only ever takes the
+definition the state machine holds or one it did not maintain for capacity; A's retry finds
+`exists` and writes its own. With the identical document already there, every answer is 200, the
+reason saying why it is not maintained, as before N75. A document written before this fix under a
+`different` declaration stays as it is (views are immutable; the reason says so). Rejected: writing
+the document first (a refused view would then need deleting, and a crash in between leaves it).
+Verified: a unit test of both orders against the fake catalog (it fails without the fix),
+`tests/api/ledgers.py`, and the hardening probe, which hit the window twice in 40 tries and each
+time left one definition.
 
 **N79. Still short of disk, CI removes other repositories' workspaces from the runner.**
 The runner volume is shared with other repositories' jobs (N65's warning showed it: after the Zig

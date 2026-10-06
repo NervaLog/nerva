@@ -50,6 +50,9 @@ curl -H 'X-Nerva-Key: secret' http://127.0.0.1:8080/v1/commit -d '{"entries": [
   10,000 groups is read in pages from `/groups`.
 - A view that filters or groups by a ledger's field is refused with `409`, and nothing is
   written.
+- **`GET /v1/views/<name>/groups` names its replicated hash `view_hash`, as the whole view
+  does; it was `hash`** (#66). `hash` on `nerva api` now always means `nerva view`'s.
+- A view declared over a ledger's field is refused with `409`, and nothing is written.
 
 ### New: upgrades keep the data
 

@@ -896,6 +896,7 @@ fn views(
             try catalog.view_check(&view, &layout);
             // A view declared differently is refused before the state machine sees it; one the
             // state machine refuses over a ledger's field is not written to the catalog (N75).
+            var cataloged = false;
             if (try layouts.view(arena, name)) |existing| {
                 const same = std.mem.eql(
                     u8,
@@ -907,14 +908,27 @@ fn views(
                     409,
                     "a view with this name is declared differently; views are immutable",
                 );
+                cataloged = true;
             }
             const definition = catalog.view_definition(name, &view, &layout);
             const declared = try client.declare_view(&definition);
-            if (declared.status == .ledger_field) return error_reply(
-                arena,
-                409,
-                "the view filters or groups by a field of a ledger",
-            );
+            // Not yet in the catalog: the state machine decides the name. Another gateway may
+            // have declared it, then stalled before writing its document; writing this one would
+            // leave two definitions under one name for good (#70). That gateway's retry finds
+            // `exists` and writes its document.
+            if (!cataloged) switch (declared.status) {
+                .ledger_field => return error_reply(
+                    arena,
+                    409,
+                    "the view filters or groups by a field of a ledger",
+                ),
+                .different => return error_reply(
+                    arena,
+                    409,
+                    "a view with this name is declared differently; views are immutable",
+                ),
+                else => {},
+            };
             switch (try layouts.view_put(arena, name, &view)) {
                 .different => return error_reply(
                     arena,
@@ -930,9 +944,11 @@ fn views(
                             "aggregates (at most 4)",
                         .views_full => "the cluster's views are full",
                         .table_views_full => "the table's views are full",
+                        // Only for a document already in the catalog: one written before the
+                        // state machine refused it, kept as it is (#70).
                         .different => "declared differently in the state machine",
+                        .ledger_field => "the view filters or groups by a field of a ledger",
                         .invalid, .table_invalid => "refused by the state machine",
-                        .ledger_field => unreachable, // Answered above.
                     };
                     try out.print("{{\"view\":\"{s}\",\"declared\":\"{s}\",\"maintained\":{}", .{
                         name,
@@ -1013,7 +1029,7 @@ fn view_groups(
         try out.raw(",\"as_of\":");
         try out.number(as_of);
     }
-    try out.raw(",\"hash\":");
+    try out.raw(",\"view_hash\":");
     try out.hex(&header.hash);
     try out.raw(",\"group_count\":");
     try out.number(header.group_count);
@@ -1342,6 +1358,9 @@ const FakeClient = struct {
     op: u64 = 0,
     rows: std.AutoArrayHashMapUnmanaged(u128, Version) = .{},
     allocator: std.mem.Allocator,
+    /// Answers `declare_view`, for the tests that set it; the rest are covered by
+    /// `tests/views/maintained.py`.
+    declared: ?nerva.DeclareStatus = null,
 
     const Version = struct { op: u64, exists: bool, value: [value_size]u8 };
 
@@ -1395,8 +1414,18 @@ const FakeClient = struct {
         unreachable; // Covered by `tests/api/api.py`.
     }
 
-    pub fn declare_view(_: *FakeClient, _: *const nerva.ViewDefinition) Error!nerva.DeclareResult {
-        unreachable; // Covered by `tests/views/maintained.py`.
+    pub fn declare_view(
+        fake: *FakeClient,
+        _: *const nerva.ViewDefinition,
+    ) Error!nerva.DeclareResult {
+        fake.op += 1;
+        const status = fake.declared.?;
+        const known = status == .created or status == .exists;
+        return .{
+            .status = status,
+            .view_id = @intFromBool(known),
+            .op = if (known) fake.op else 0,
+        };
     }
 
     pub fn get_view(_: *FakeClient, _: nerva.ViewQuery, _: []nerva.ViewRecord) Error!usize {
@@ -1418,6 +1447,7 @@ const FakeClient = struct {
 /// An in-memory catalog.
 const FakeLayouts = struct {
     map: std.AutoHashMapUnmanaged(u32, catalog.Layout) = .{},
+    views: std.StringHashMapUnmanaged(catalog.View) = .{},
     allocator: std.mem.Allocator,
 
     pub fn layout(fake: *FakeLayouts, _: std.mem.Allocator, table: u32) !?catalog.Layout {
@@ -1438,17 +1468,26 @@ const FakeLayouts = struct {
         return outcome;
     }
 
-    pub fn view(_: *FakeLayouts, _: std.mem.Allocator, _: []const u8) !?catalog.View {
-        unreachable; // Covered by `tests/api/api.py`.
+    pub fn view(fake: *FakeLayouts, _: std.mem.Allocator, name: []const u8) !?catalog.View {
+        return fake.views.get(name);
     }
 
     pub fn view_put(
-        _: *FakeLayouts,
-        _: std.mem.Allocator,
-        _: []const u8,
-        _: *const catalog.View,
+        fake: *FakeLayouts,
+        arena: std.mem.Allocator,
+        name: []const u8,
+        new: *const catalog.View,
     ) !ViewPut {
-        unreachable; // Covered by `tests/api/api.py`.
+        if (fake.views.get(name)) |old| {
+            const same = std.mem.eql(
+                u8,
+                try catalog.view_render(arena, &old),
+                try catalog.view_render(arena, new),
+            );
+            return if (same) .unchanged else .different;
+        }
+        try fake.views.put(fake.allocator, name, new.*);
+        return .created;
     }
 };
 
@@ -1520,6 +1559,54 @@ test "api: layouts give puts and reads named fields" {
         @as(u16, 400),
         (try handle(arena, &fake, &layouts, .put, "/v1/tables/4294901761", declare)).status,
     );
+}
+
+test "api: a view is cataloged only under the definition the state machine holds (#70)" {
+    var arena_instance = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_instance.deinit();
+    const arena = arena_instance.allocator();
+    var fake: FakeClient = .{ .allocator = arena };
+    var layouts: FakeLayouts = .{ .allocator = arena };
+    const table =
+        \\{"name":"t","fields":[{"name":"kind","type":"i64"},{"name":"amount","type":"i64"}]}
+    ;
+    const declared = try handle(arena, &fake, &layouts, .put, "/v1/tables/60", table);
+    try testing.expectEqual(@as(u16, 200), declared.status);
+    const by_kind =
+        \\{"table":60,"group_by":["kind"],"aggregates":[{"fn":"count"}]}
+    ;
+    const total =
+        \\{"table":60,"aggregates":[{"fn":"sum","field":"amount"}]}
+    ;
+
+    // Another gateway declared `v` as `by_kind` and has not yet written its document: this one,
+    // declaring `total`, is refused and writes nothing.
+    fake.declared = .different;
+    const refused = try handle(arena, &fake, &layouts, .put, "/v1/views/v", total);
+    try testing.expectEqual(@as(u16, 409), refused.status);
+    try testing.expect(layouts.views.get("v") == null);
+    // So is a view over a ledger's field.
+    fake.declared = .ledger_field;
+    const viewed = try handle(arena, &fake, &layouts, .put, "/v1/views/v", total);
+    try testing.expectEqual(@as(u16, 409), viewed.status);
+    try testing.expect(layouts.views.get("v") == null);
+    // The other gateway's retry finds its view in the state machine and writes the document.
+    fake.declared = .exists;
+    const written = try handle(arena, &fake, &layouts, .put, "/v1/views/v", by_kind);
+    try testing.expectEqual(@as(u16, 200), written.status);
+    try testing.expect(layouts.views.get("v") != null);
+
+    // A document cataloged while the table's views were full; a ledger then took its field. The
+    // same PUT again answers as before, with the state machine's reason.
+    fake.declared = .table_views_full;
+    const cataloged = try handle(arena, &fake, &layouts, .put, "/v1/views/w", by_kind);
+    try testing.expectEqual(@as(u16, 200), cataloged.status);
+    try testing.expect(std.mem.indexOf(u8, cataloged.body, "\"maintained\":false") != null);
+    fake.declared = .ledger_field;
+    const again = try handle(arena, &fake, &layouts, .put, "/v1/views/w", by_kind);
+    try testing.expectEqual(@as(u16, 200), again.status);
+    try testing.expect(std.mem.indexOf(u8, again.body, "\"maintained\":false") != null);
+    try testing.expect(std.mem.indexOf(u8, again.body, "a field of a ledger") != null);
 }
 
 test "api: lookup and commit translate to and from JSON" {
