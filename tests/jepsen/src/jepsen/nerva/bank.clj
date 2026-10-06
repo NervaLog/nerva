@@ -170,12 +170,14 @@
   #{:out_of_bounds})
 
 (defn refusal-checker
-  "Transfers are refused only for expected reasons."
+  "Nerva refuses transfers only for expected reasons. A refusal is a failed transfer whose
+  error is Nerva's status (a keyword); one that was never sent is not a refusal."
   []
   (reify checker/Checker
     (check [_ _test history _opts]
       (let [refused (->> history
-                         (filter #(and (= :fail (:type %)) (= :transfer (:f %)))))
+                         (filter #(and (= :fail (:type %)) (= :transfer (:f %))
+                                       (keyword? (:error %)))))
             bad     (remove (comp expected-refusals :error) refused)]
         {:valid?      (empty? bad)
          :refusals    (frequencies (map :error refused))

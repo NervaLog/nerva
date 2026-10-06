@@ -67,7 +67,11 @@
   (doseq [status [:unpaired :conserved_write :conflict]]
     (is (not (valid? (bank/refusal-checker)
                      (history (assoc good-transfer :type :fail, :error status))))
-        (name status))))
+        (name status)))
+  (is (valid? (bank/refusal-checker)
+              (history (assoc good-transfer :type :fail
+                              :error [:not-sent "java.net.ConnectException" nil])))
+      "a transfer never sent was not refused"))
 
 (deftest a-transfer-is-a-pair-of-adds
   (let [[first-half partner] (bank/transfer-entries
