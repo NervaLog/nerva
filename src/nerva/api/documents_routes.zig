@@ -284,9 +284,10 @@ pub fn commit(arena: std.mem.Allocator, client: anytype, body: []const u8) !Repl
         const value: ?[]const u8 =
             if (write.value_hex) |text| try value_parse(arena, text) else null;
         const chunks = try documents.chunks_encode(arena, namespace, write.key, value);
+        const id0 = documents.row_id(namespace, write.key);
         for (chunks, 0..) |*chunk, index| {
             try entries.append(arena, .{
-                .id = documents.chunk_id(namespace, write.key, @intCast(index)),
+                .id = documents.chunk_id_from(id0, @intCast(index)),
                 .table = table,
                 .kind = .put,
                 .op_seen = 0,

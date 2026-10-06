@@ -245,14 +245,15 @@ fn document_read(
     catalog_rows: *const CatalogRows,
     key: []const u8,
 ) !?[]const u8 {
-    const chunk0 = catalog_rows.get(documents.row_id(0, key)) orelse return null;
+    const id0 = documents.row_id(0, key);
+    const chunk0 = catalog_rows.get(id0) orelse return null;
     const count = documents.chunk0_count(&chunk0) catch return export_file.corrupt(
         "a catalog document's first chunk does not decode",
     );
     const chunks = try arena.alloc([nerva.value_size]u8, count);
     chunks[0] = chunk0;
     for (chunks[1..], 1..) |*chunk, index| {
-        chunk.* = catalog_rows.get(documents.chunk_id(0, key, @intCast(index))) orelse
+        chunk.* = catalog_rows.get(documents.tail_id(id0, @intCast(index))) orelse
             return export_file.corrupt("a catalog document's chunk is missing");
     }
     const decoded = documents.chunks_decode(arena, chunks) catch |err| switch (err) {
