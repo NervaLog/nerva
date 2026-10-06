@@ -1,4 +1,4 @@
-//! `nerva api`'s documents: values of up to 64 KiB under string keys, in namespaces, read and
+//! `nerva api`'s documents: values of up to 512 KiB under string keys, in namespaces, read and
 //! written in optimistic transactions (docs/DECISIONS.md N41). Stored as `documents.zig`
 //! documents in `catalog.table_documents`.
 //!
@@ -9,7 +9,8 @@
 //!                                            {"key": "b", "delete": true}]}
 //!     GET  /v1/documents/changes?namespace=7&cursor=<c>&limit=<n>
 //!
-//! - A key is 1–1024 bytes of UTF-8; a value up to 64 KiB, as hex (`value_hex`).
+//! - A key is 1–1024 bytes of UTF-8; a value up to 512 KiB, as hex (`value_hex`). A `get` reads
+//!   at most as many chunks as 256 documents of 64 KiB (about 16 MiB): more answers 413.
 //! - A document's `version` is the op of its last write (a put or a delete), or "0" if it was
 //!   never written. `get` answers each key's `exists`, `version` and `value_hex` ("" if absent),
 //!   as of one op: the latest, or `as_of` (which must already be committed).
@@ -28,6 +29,8 @@ const std = @import("std");
 const assert = std.debug.assert;
 
 const nerva = @import("../../nerva.zig");
+const config = @import("../../config.zig");
+const vsr = @import("../../vsr.zig");
 const catalog = @import("../catalog.zig");
 const documents = @import("../documents.zig");
 const api = @import("api.zig");
@@ -47,6 +50,21 @@ const table = catalog.table_documents;
 
 /// Keys per `get`, at most.
 pub const keys_max = 256;
+/// Chunks per `get`, at most: as many as `keys_max` documents of 64 KiB, the largest before
+/// documents grew to 512 KiB, so every `get` that answered then still does, and a reply stays
+/// well inside the request's memory budget (#25, #60).
+pub const get_chunks_max = keys_max * documents.chunk_count(documents.key_size_max, 64 * 1024);
+
+comptime {
+    // A document of the largest key and value fits one commit request of the production
+    // configuration, with room to spare: it is written atomically (#25). (Tests run with smaller
+    // messages.)
+    const message_size_max = config.configs.default_production.cluster.message_size_max;
+    const body_size_max = message_size_max - @sizeOf(vsr.Header);
+    const chunks = documents.chunk_count(documents.key_size_max, documents.value_size_max);
+    // A commit is one batch of entries, plus a multi-batch trailer well under 1024 entries.
+    assert((chunks + 1024) * @sizeOf(Entry) <= body_size_max);
+}
 /// Rows per lookup when reading documents' tail chunks.
 const tail_rows_max = 1024;
 /// An op's changes: at most one request's entries (`Operation.commit.event_max`), with room.
@@ -99,6 +117,18 @@ pub fn get(arena: std.mem.Allocator, client: anytype, body: []const u8) !Reply {
         chunk0.op = if (change) |c| c.op else 0;
         chunk0.flags.exists = if (change) |c| c.kind == .put else false;
         chunk0.value = if (change) |c| c.value else @splat(0);
+    }
+
+    var chunk_total: usize = 0;
+    for (chunk0s) |*chunk0| {
+        if (!chunk0.flags.exists) continue;
+        chunk_total += documents.chunk0_count(&chunk0.value) catch return error.Corrupt;
+    }
+    if (chunk_total > get_chunks_max) {
+        return .{
+            .status = 413,
+            .body = "{\"error\":\"documents too large for one get: ask for fewer keys\"}",
+        };
     }
 
     const found = try arena.alloc(Document, request.keys.len);
@@ -422,7 +452,7 @@ fn key_check(key: []const u8) error{BadRequest}!void {
 
 fn value_parse(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
     if (text.len % 2 != 0) return bad("value_hex is not hex");
-    if (text.len > documents.value_size_max * 2) return bad("a value is at most 64 KiB");
+    if (text.len > documents.value_size_max * 2) return bad("a value is at most 512 KiB");
     const value = try arena.alloc(u8, text.len / 2);
     _ = std.fmt.hexToBytes(value, text) catch return bad("value_hex is not hex");
     return value;

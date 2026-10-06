@@ -530,6 +530,14 @@ pub fn StateMachineType(comptime Storage: type) type {
         version_timestamp: u64 = 0,
         version_timestamp_max: u64 = 0,
 
+        // ---- Restore (N80) ----
+
+        /// Set from `restore_prefetch` to the end of the matching `restore_*` commit.
+        restoring: bool = false,
+        /// A view's restore: whether its table had any row (a tombstone counts) at its op.
+        restore_table_rows: ?bool = null,
+        restore_scan_callback: ?*const fn (*StateMachine, []const Row) void = null,
+
         pub fn init(
             self: *StateMachine,
             allocator: std.mem.Allocator,
@@ -1820,10 +1828,16 @@ pub fn StateMachineType(comptime Storage: type) type {
                 std.mem.bytesAsValue(Ledger, output_buffer[0..@sizeOf(Ledger)]),
             );
             result.* = std.mem.zeroes(Ledger);
-            if (query.id != 0 and stdx.zeroed(&query.reserved)) {
-                for (self.ledgers_op[0..self.ledger_count.?]) |*ledger| {
+            if (!stdx.zeroed(&query.reserved)) return @sizeOf(Ledger);
+            const ledgers_declared = self.ledgers_op[0..self.ledger_count.?];
+            if (query.id != 0 and query.slot == 0) {
+                for (ledgers_declared) |*ledger| {
                     if (ledger.definition.id == query.id) result.* = ledger.*;
                 }
+            }
+            if (query.id == 0 and query.slot != 0 and query.slot <= ledgers_declared.len) {
+                result.* = ledgers_declared[query.slot - 1];
+                assert(result.slot == query.slot);
             }
             return @sizeOf(Ledger);
         }
@@ -1847,7 +1861,11 @@ pub fn StateMachineType(comptime Storage: type) type {
             self.views_load();
             switch (self.prefetch_operation.?) {
                 .commit => self.prefetch_rows(Entry, self.prefetch_input.?),
-                .declare_view, .declare_ledger => self.prefetch_finish(),
+                .declare_view => if (self.restoring)
+                    self.prefetch_restore_table()
+                else
+                    self.prefetch_finish(),
+                .declare_ledger => self.prefetch_finish(),
                 .get_view => self.prefetch_view_groups(),
                 .pulse => self.prefetch_backfill_rows(),
                 else => unreachable,
@@ -2942,7 +2960,7 @@ pub fn StateMachineType(comptime Storage: type) type {
                 std.mem.bytesAsValue(DeclareResult, output_buffer[0..@sizeOf(DeclareResult)]),
             );
             self.versions_begin(.declare_view, timestamp - self.prepare_delta(.declare_view, &.{}));
-            result.* = self.view_declare(op, timestamp, definition);
+            result.* = self.view_declare(op, timestamp, definition, .building);
             if (result.status == .created) {
                 self.view_version_insert(&self.views_op[result.view_id - 1], op);
             }
@@ -2950,12 +2968,16 @@ pub fn StateMachineType(comptime Storage: type) type {
             return @sizeOf(DeclareResult);
         }
 
+        /// Declares a view in `state`: `building` (pulses add the rows already written, none
+        /// possibly), or `ready` when restoring one whose table has no rows (N80).
         fn view_declare(
             self: *StateMachine,
             op: u64,
             timestamp: u64,
             definition: *const ViewDefinition,
+            state: nerva.ViewState,
         ) DeclareResult {
+            assert(state == .building or (state == .ready and self.restoring));
             if (views.definition_validate(definition)) |status| {
                 return .{ .status = status, .view_id = 0, .op = 0 };
             }
@@ -2993,19 +3015,18 @@ pub fn StateMachineType(comptime Storage: type) type {
             if (table_views == nerva.views_per_table_max) {
                 return .{ .status = .table_views_full, .view_id = 0, .op = 0 };
             }
-            if (table_extremes > nerva.view_extremes_per_table_max) {
+            if (table_extremes > self.table_extremes_max()) {
                 return .{ .status = .table_extremes_full, .view_id = 0, .op = 0 };
             }
 
             const index = self.views_op_count;
-            // Every view starts building: pulses add the rows already written (none, possibly).
             const view: View = .{
                 .id = index + 1,
                 .timestamp = timestamp,
                 .declared_op = op,
                 .backfill_cursor = 0,
                 .group_count = 0,
-                .state = .building,
+                .state = state,
                 .hash = @splat(0),
                 .definition = definition.*,
             };
@@ -3019,6 +3040,13 @@ pub fn StateMachineType(comptime Storage: type) type {
 
         /// The rows one pulse adds to `view`: each may write a group and a member in each of the
         /// view's `min` and `max` slots, within the op's limits for both.
+        /// The `min` and `max` slots a table's views may hold between them: also no more than
+        /// one op's member budget, since a write takes a member in each slot (#68). Only
+        /// configurations with tiny requests (the VOPR's) are below `view_extremes_per_table_max`.
+        fn table_extremes_max(self: *const StateMachine) u32 {
+            return @min(nerva.view_extremes_per_table_max, self.member_writes_limit);
+        }
+
         fn backfill_rows_max(self: *const StateMachine, view: *const View) u32 {
             const extremes = @max(1, views.extreme_count(&view.definition));
             const rows = @min(self.group_writes_limit, @divFloor(self.member_writes_limit, extremes));
@@ -3068,6 +3096,303 @@ pub fn StateMachineType(comptime Storage: type) type {
             }
             self.views_finish_views(op);
             return 0;
+        }
+
+        // ---- Restore (N80) ----
+        //
+        // `nerva import` rebuilds a cluster's state from another release's export: every change
+        // at its recorded op and timestamp, and the declarations of views and ledgers at theirs.
+        // In process only: never an `Operation`, so no client can reach it. Everything derived
+        // (views' groups, members and versions; the ledger index) is recomputed by this code, as
+        // a commit computes it, while the rules a commit checks are not: the history being
+        // restored already passed them. Deterministic, so every replica's file is identical.
+
+        pub const RestoreError = error{
+            /// The op's changes touch more view groups or members than one op may.
+            ViewsBudget,
+            /// A delete of a row that is not there, or changes out of op or timestamp order.
+            HistoryInvalid,
+            /// A view or ledger this state machine does not declare as the history says.
+            DeclarationRefused,
+        };
+
+        /// The most changes one op may restore (one transaction's worth of entries).
+        pub fn restore_changes_max(self: *const StateMachine) u32 {
+            return Operation.commit.event_max(self.batch_size_limit);
+        }
+
+        /// Encodes one op's changes as the single batch of entries `restore_prefetch` reads.
+        /// Returns the body's size.
+        pub fn restore_entries(
+            self: *const StateMachine,
+            changes: []const Change,
+            body: []align(constants.cache_line_size) u8,
+        ) usize {
+            assert(changes.len > 0);
+            assert(changes.len <= self.restore_changes_max());
+            var encoder = MultiBatchEncoder.init(body, .{ .element_size = @sizeOf(Entry) });
+            const entries = stdx.bytes_as_slice(.inexact, Entry, encoder.writable().?);
+            assert(entries.len >= changes.len);
+            for (changes, entries[0..changes.len]) |*change, *entry| {
+                entry.* = restore_entry(change);
+            }
+            encoder.add(@intCast(changes.len * @sizeOf(Entry)));
+            const size = encoder.finish();
+            assert(size <= self.batch_size_limit);
+            return size;
+        }
+
+        /// The entry a commit would have taken to write `change`, as admission and prefetch see
+        /// it: an add was recorded as the put of its row's new value.
+        fn restore_entry(change: *const Change) Entry {
+            assert(change.kind == .put or change.kind == .delete);
+            assert(change.kind == .put or stdx.zeroed(&change.value));
+            return .{
+                .id = change.id,
+                .table = change.table,
+                .kind = if (change.kind == .put) .put else .delete,
+                .op_seen = 0,
+                .value = change.value,
+            };
+        }
+
+        /// Prefetches one op of a restore: `commit` with `restore_entries`' body, `declare_view`
+        /// or `declare_ledger` with the definition. Then call the matching `restore_*`.
+        pub fn restore_prefetch(
+            self: *StateMachine,
+            callback: *const fn (*StateMachine) void,
+            op: u64,
+            operation: Operation,
+            body: []align(constants.cache_line_size) const u8,
+        ) void {
+            assert(!self.restoring);
+            assert(operation == .commit or operation == .declare_view or
+                operation == .declare_ledger);
+            self.restoring = true;
+            self.prefetch(callback, op, op, operation, body);
+        }
+
+        /// Stage 3 of a view's restore: whether its table has a row yet.
+        fn prefetch_restore_table(self: *StateMachine) void {
+            assert(self.restoring);
+            assert(self.restore_table_rows == null);
+            const definition: *const ViewDefinition = @alignCast(std.mem.bytesAsValue(
+                ViewDefinition,
+                self.prefetch_input.?[0..@sizeOf(ViewDefinition)],
+            ));
+            if (definition.table == 0) {
+                self.restore_table_rows = false; // Refused by `view_declare`.
+                return self.prefetch_finish();
+            }
+            const rows = &self.forest.grooves.rows;
+            const scan = rows.scan_builder.scan_unique_key_range(
+                .key,
+                self.forest.scan_buffer_pool.acquire_assume_capacity(),
+                self.prefetch_snapshot.?,
+                nerva.row_key(definition.table, 0),
+                nerva.row_key(definition.table, std.math.maxInt(u64)),
+                .ascending,
+            );
+            self.rows_scan_lookup = RowsScanLookup.init(rows, scan);
+            self.rows_scan_lookup.read(self.backfill_rows[0..1], prefetch_restore_table_callback);
+        }
+
+        fn prefetch_restore_table_callback(
+            scan_lookup: *RowsScanLookup,
+            results: []const Row,
+        ) void {
+            const self: *StateMachine =
+                @alignCast(@fieldParentPtr("rows_scan_lookup", scan_lookup));
+            assert(results.len <= 1);
+            self.restore_table_rows = results.len > 0;
+            self.forest.scan_buffer_pool.reset();
+            self.forest.grooves.rows.scan_builder.reset();
+            self.prefetch_finish();
+        }
+
+        /// Writes one op's changes with their recorded timestamps, and keeps the views as a
+        /// commit does. `changes` are `restore_entries`' (prefetched), in timestamp order.
+        /// Versions take timestamps from `timestamp_next`, the importer's counter, which it
+        /// advances.
+        pub fn restore_changes(
+            self: *StateMachine,
+            op: u64,
+            changes: []const Change,
+            timestamp_next: *u64,
+        ) RestoreError!void {
+            assert(self.restoring);
+            defer self.restoring = false;
+            assert(changes.len > 0);
+            assert(self.groups_touched.items.len == 0);
+            assert(self.members_touched.items.len == 0);
+            // One batch: admission decided for all of it.
+            if (self.view_txn_busy.isSet(0)) {
+                assert(self.view_txn_too_large.isSet(0));
+                self.views_finish_abandon();
+                return error.ViewsBudget;
+            }
+            for (changes, 0..) |*change, index| {
+                if (change.op != op) return error.HistoryInvalid;
+                if (!TimestampRange.valid(change.timestamp + entry_timestamps - 1)) {
+                    return error.HistoryInvalid;
+                }
+                // Each change's block of timestamps holds the groups and members it creates.
+                if (index > 0 and
+                    change.timestamp < changes[index - 1].timestamp + entry_timestamps)
+                {
+                    return error.HistoryInvalid;
+                }
+                if (change.table == 0) return error.HistoryInvalid;
+                switch (change.kind) {
+                    .put => {},
+                    .delete => if (!stdx.zeroed(&change.value)) return error.HistoryInvalid,
+                    .end => return error.HistoryInvalid,
+                }
+            }
+
+            self.version_timestamp = timestamp_next.*;
+            self.version_timestamp_max = timestamp_next.* + self.versions_reserve(.commit) - 1;
+            assert(TimestampRange.valid(self.version_timestamp_max));
+            for (changes) |*change| {
+                const entry = restore_entry(change);
+                if (change.kind == .delete) {
+                    // Only a live row's delete is recorded. Checked as the op goes, since an
+                    // earlier change of the op may have written the row: an error here leaves
+                    // the op half applied, and the state machine must be discarded.
+                    const live = switch (self.forest.grooves.rows.get(
+                        nerva.row_key(change.table, change.id),
+                    )) {
+                        .found_object => |row| !row.flags.deleted,
+                        .not_found => false,
+                    };
+                    if (!live) return error.HistoryInvalid;
+                }
+                switch (change.kind) {
+                    .put => self.row_put(op, change.timestamp, &entry, &change.value),
+                    .delete => self.row_delete(op, change.timestamp, &entry),
+                    .end => unreachable,
+                }
+            }
+            self.views_finish(op);
+            timestamp_next.* = self.version_timestamp;
+        }
+
+        /// Forgets the scratch an op's prefetch left, when the op is not committed.
+        fn views_finish_abandon(self: *StateMachine) void {
+            assert(self.groups_touched.items.len == 0);
+            self.extreme_counted.clearRetainingCapacity();
+            self.extreme_scans.clearRetainingCapacity();
+            self.extreme_scan_index.clearRetainingCapacity();
+            self.extreme_scans_done = 0;
+            self.extreme_members_count = 0;
+        }
+
+        /// Declares a view at its recorded op with id `view_id`: `ready` if its table had no
+        /// rows (later changes keep it exact, as commits did), else `building`, for the new
+        /// cluster's pulses to backfill.
+        pub fn restore_view(
+            self: *StateMachine,
+            op: u64,
+            definition: *const ViewDefinition,
+            view_id: u64,
+            timestamp_next: *u64,
+        ) RestoreError!void {
+            assert(self.restoring);
+            defer self.restoring = false;
+            const table_rows = self.restore_table_rows.?;
+            self.restore_table_rows = null;
+
+            self.version_timestamp = timestamp_next.* + 1;
+            self.version_timestamp_max = timestamp_next.* + 1;
+            const result = self.view_declare(
+                op,
+                timestamp_next.*,
+                definition,
+                if (table_rows) .building else .ready,
+            );
+            if (result.status != .created or result.view_id != view_id) {
+                log.warn("restore: view {} at op {}: {s} (id {})", .{
+                    view_id,
+                    op,
+                    @tagName(result.status),
+                    result.view_id,
+                });
+                return error.DeclarationRefused;
+            }
+            self.view_version_insert(&self.views_op[view_id - 1], op);
+            self.views_store(op);
+            timestamp_next.* = self.version_timestamp;
+        }
+
+        /// Declares a ledger at its recorded op.
+        pub fn restore_ledger(
+            self: *StateMachine,
+            op: u64,
+            definition: *const LedgerDefinition,
+            timestamp_next: *u64,
+        ) RestoreError!void {
+            assert(self.restoring);
+            defer self.restoring = false;
+            const result = self.ledger_declare(op, timestamp_next.*, definition);
+            if (result.status != .created) {
+                log.warn("restore: ledger {} at op {}: {s}", .{
+                    definition.id,
+                    op,
+                    @tagName(result.status),
+                });
+                return error.DeclarationRefused;
+            }
+            timestamp_next.* += 1;
+        }
+
+        /// The views, as the last op restored left them.
+        pub fn restore_views(self: *const StateMachine) []const View {
+            return self.views_op[0..self.views_op_count];
+        }
+
+        /// The ledgers, in declaration order, as the last op restored left them.
+        pub fn restore_ledgers(self: *const StateMachine) []const Ledger {
+            return self.ledgers_op[0 .. self.ledger_count orelse 0];
+        }
+
+        /// The ledgers' conserved fields, for totals.
+        pub fn restore_ledger_index(self: *const StateMachine) *const ledgers.Index {
+            return &self.ledger_index;
+        }
+
+        /// Reads the rows with keys from `key_min`, tombstones included, in key order, up to
+        /// `rows.len` of them, as of `snapshot`: the importer's checks.
+        pub fn restore_scan_rows(
+            self: *StateMachine,
+            callback: *const fn (*StateMachine, []const Row) void,
+            snapshot: u64,
+            key_min: u128,
+            rows: []Row,
+        ) void {
+            assert(self.restore_scan_callback == null);
+            assert(rows.len > 0);
+            self.restore_scan_callback = callback;
+            const groove = &self.forest.grooves.rows;
+            const scan = groove.scan_builder.scan_unique_key_range(
+                .key,
+                self.forest.scan_buffer_pool.acquire_assume_capacity(),
+                snapshot,
+                key_min,
+                std.math.maxInt(u128),
+                .ascending,
+            );
+            self.rows_scan_lookup = RowsScanLookup.init(groove, scan);
+            self.rows_scan_lookup.read(rows, restore_scan_rows_callback);
+        }
+
+        fn restore_scan_rows_callback(scan_lookup: *RowsScanLookup, results: []const Row) void {
+            const self: *StateMachine =
+                @alignCast(@fieldParentPtr("rows_scan_lookup", scan_lookup));
+            self.forest.scan_buffer_pool.reset();
+            self.forest.grooves.rows.scan_builder.reset();
+            const callback = self.restore_scan_callback.?;
+            self.restore_scan_callback = null;
+            callback(self, results);
         }
 
         fn execute_get_changes(

@@ -1239,7 +1239,11 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                         nerva.LedgerQuery,
                         body[0..@sizeOf(nerva.LedgerQuery)],
                     ));
-                    query.* = .{ .id = prng.range_inclusive(u32, 1, 2) };
+                    // By id, or by slot (N80).
+                    query.* = if (prng.boolean())
+                        .{ .id = prng.range_inclusive(u32, 1, 2) }
+                    else
+                        .{ .id = 0, .slot = prng.range_inclusive(u64, 1, 2) };
                     return .{ .operation = .get_ledger, .size = @sizeOf(nerva.LedgerQuery) };
                 },
                 .probe => {
@@ -1470,7 +1474,11 @@ pub fn WorkloadType(comptime StateMachine: type) type {
             const result = &results[0];
             workload.ledger_reads += 1;
             for (workload.model_ledgers.items, 1..) |*ledger, slot| {
-                if (ledger.definition.id != query.id) continue;
+                if (query.id == 0) {
+                    if (query.slot != slot) continue;
+                } else {
+                    if (ledger.definition.id != query.id) continue;
+                }
                 assert(result.slot == slot);
                 assert(result.op == ledger.op);
                 assert(result.timestamp > 0);
@@ -1935,7 +1943,12 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                 }
                 if (workload.model_views.items.len == nerva.views_max) break :expected .views_full;
                 if (table_views == nerva.views_per_table_max) break :expected .table_views_full;
-                if (table_extremes > nerva.view_extremes_per_table_max) {
+                // As the state machine's `table_extremes_max` (#68).
+                const extremes_max = @min(
+                    nerva.view_extremes_per_table_max,
+                    workload.member_writes_limit(),
+                );
+                if (table_extremes > extremes_max) {
                     workload.table_extremes_full += 1;
                     break :expected .table_extremes_full;
                 }

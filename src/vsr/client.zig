@@ -204,7 +204,13 @@ pub fn ClientType(
 
         pub fn on_messages(message_bus: *MessageBus, buffer: *MessageBuffer) void {
             const self: *Client = @fieldParentPtr("message_bus", message_bus);
-            assert(!self.evicted);
+            // Nerva: an evicted client is deinit'ed after its eviction callback returns, not in
+            // it (#52, #74), and one IO pass can deliver another connection's messages after the
+            // eviction: they are dropped, and that connection closed.
+            if (self.evicted) {
+                buffer.invalidate(.evicted);
+                return;
+            }
 
             while (buffer.next_header()) |header| {
                 const message = buffer.consume_message(self.message_bus.pool, &header);

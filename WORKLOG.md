@@ -718,6 +718,139 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
   `test:views`, `test:integration`, `test:release`, `fuzz -- smoke`, VOPR seeds; four planted
   bugs, each caught.
 
+## 2026-10-05 — Documents of up to 512 KiB (N76; #25)
+
+- `src/nerva/documents.zig`: `value_size_max` 512 KiB. `src/nerva/api/documents_routes.zig`: a
+  compile-time check that the largest document fits one production commit with room; a `get`
+  reads at most as many chunks as 256 documents of 64 KiB (413 past that).
+- `tests/api/documents.py`: a 512 KiB value under a 1024-byte key, written and read back; one
+  byte more refused; the `get` cap at its edge (33 × 512 KiB: 413; 32: 200). `src/nerva/api/api.zig`:
+  the unit test's oversized value follows the limit. `src/fuzz_tests.zig`: the documents
+  fuzzer's smoke count is 25 (values are up to 8 times larger).
+- README and TUTORIAL: the limits, and content-addressed blobs with their hash in a document for
+  larger values.
+- Verified: `check`, `test:fmt`, `test:unit` 344/345 (the sandbox-denied perf test), `test:api`
+  (api, documents, adds), `fuzz -- smoke` (exit 0; the vendored `lsm_segmented_array` reports
+  17 s here, slower than smoke wants, unrelated).
+
+## 2026-10-05 — `min`/`max` slots bounded by the member budget (N77; #68)
+
+- `src/nerva/state_machine.zig`: `table_extremes_max`, `min(4, member_writes_limit)`, at
+  declaration. `src/nerva/workload.zig`: the VOPR model follows.
+- Verified: the seed that failed `main`'s lanes (17320319949900435868) and the other one
+  (11511081922386736357) pass; seeds 1, 2, 5 and 30 random in ReleaseSafe pass; `check`,
+  `test:fmt`, `test:unit` (the sandbox-denied perf test aside).
+
+## 2026-10-05 — CI removes other repositories' workspaces when the disk is still short (N79)
+
+- `.github/scripts/free_disk.sh`: after emptying the Zig caches, if either filesystem is still
+  below `FREE_MIN_GIB`, removes the other directories in the runner's work directory but its own
+  workspace and the runner's `_*` directories, only under Actions.
+- Verified: in a simulated `_work` (this workspace, another repository's, `_temp`, `_actions`,
+  `_tool`), the other workspace is removed and the rest kept; outside Actions nothing is.
+
+
+## 2026-10-05 — A new release keeps the data: `nerva export` and `nerva import` (N80, NV-2)
+
+- `src/nerva/export_file.zig`: the export file (`NERVAEXP`, version 1; framed records with a
+  CRC-32 each; sections in order; a summary; an `end` record with the SHA-256 of all before it),
+  its writer and its checking reader.
+- `src/nerva/export.zig`, `nerva export`: a client that writes every change up to `--as-of`,
+  the views (name, id, op) and ledgers (definition, op), and checks (view hashes as of the op,
+  ledger totals and per-table row hashes computed from the feed).
+- `src/nerva/import.zig`, `nerva import`: pass 1 checks the whole export and rebuilds views'
+  definitions from their catalog documents; pass 2 formats the data file and restores every op
+  at its number in process, compacting every op and checkpointing at every trigger, writes the
+  WAL and superblock a replica leaves at the last checkpoint (from the `nv2-proto` prototype,
+  generalised to WAL slots that wrap), and checks the restored forest; any failure removes the
+  file.
+- `src/nerva/state_machine.zig`: `restore_prefetch`, `restore_changes`, `restore_view`,
+  `restore_ledger` (in process only), the rows scan for checks, `view_declare` taking the
+  initial state; `get_ledger` by `slot`. `src/nerva.zig`: `LedgerQuery.slot` (from its
+  reserved bytes). `src/nerva/client.zig`: `get_ledger_slot`. `src/nerva/workload.zig`: the
+  VOPR queries ledgers by slot too.
+- `src/nerva/cli.zig`, `src/nerva_main.zig`: the two commands; `--as-of` parsing tested.
+- Tests: `state_machine_tests.zig` (a fixed history restored reads as committed; restore
+  bypasses a commit's rules and refuses impossible histories; `LedgerQuery` by slot);
+  `export_file.zig` (round trip, every corruption); format guards (`LedgerQuery`, a golden
+  export); `tests/release/upgrade.py` in `test:release`; `perf/upgrade.py` for measurement.
+- Docs: README "Upgrading a cluster"; DECISIONS N80; CHANGELOG v0.4.0.
+- Measured (`perf/upgrade.py`): 1,011,632 changes over 972,000 rows export in 5.8 s (365 MiB)
+  and import in 14.0 s (1,188 MiB); details in N80.
+- Verified: `check`, `test:fmt`, `test:unit` 359/360 (the sandbox-denied perf test),
+  `test:api`, `test:views`, `test:integration`, `test:release` (mixed releases, then the
+  upgrade), `fuzz -- smoke`, VOPR seeds 1, 2 and 5 in ReleaseSafe.
+
+## 2026-10-05 — `/groups` names its replicated hash `view_hash` (#66)
+
+- `src/nerva/api/api.zig`: `GET /v1/views/<name>/groups` sends `view_hash`, not `hash`, as the
+  whole view and the README already say. `tests/views/maintained.py` and
+  `tests/release/upgrade.py` (#76) follow; CHANGELOG v0.4.0
+  (an incompatible change from v0.3.0) says so; DECISIONS N66 notes it. The tutorial is left
+  to #67, which rewrites the views part.
+- Verified: `check`, `test:fmt`, `test:views`.
+
+## 2026-10-05 — Messages after an eviction, in the same IO pass, are dropped (#74)
+
+- `src/vsr/client.zig` (vendored; UPSTREAM.md): `on_messages` drops a buffer received after the
+  eviction instead of asserting. `test:integration` aborted on it in CI: every replica evicts
+  the same session, and `IO.run_once` ran a second replica's receive after the first's
+  eviction. Since #52's fix (`46efdd7`), unreleased.
+- `src/nerva/client.zig`: the eviction comment says so; a unit test hands an evicted client a
+  buffer (it panics without the patch).
+- Verified: `check`, `test:fmt`, `test:unit`, `test:integration`, VOPR seed 1.
+
+## 2026-10-05 — A view is cataloged only under the state machine's definition (N78; #70)
+
+- `src/nerva/api/api.zig`: `PUT /v1/views/<name>` with no catalog document answers 409 to
+  `different` and `ledger_field` and writes nothing; with the identical document, 200 and the
+  reason. The fake client and catalog in its tests now declare and keep views; a unit test covers
+  the two-gateway race and the repeat PUT.
+- `tests/api/ledgers.py`: a view cataloged while its table's views were full, a ledger over its
+  field, then the same view again (200, unmaintained).
+- Verified: the hardening probes (a gateway stopped between declaring and cataloging: two hits in
+  40 tries, each left one definition; the repeat PUT: 200), `check`, `test:fmt`, `test:unit`,
+  `test:api`, `test:views`.
+
+## 2026-10-06 — v0.4.0 release preparation: docs and CLI messages (#77)
+
+- CHANGELOG v0.4.0, from the release-readiness audit: a request's budget is 128 MiB (it said
+  64); the #62 entry is gone (a bug no release had); a view that filters or groups by a ledger's
+  field is refused (summing one is allowed); the export caveats (op numbers jump to the next
+  checkpoint, Zig-client-only views are refused, both releases need export and import); the
+  `documents/get` 413; the Zig client's new names.
+- README: `declare_ledger` and `get_ledger` in the operations table, the client's operations,
+  the export caveats, `400` for a view of more than 10,000 groups, a stale roadmap line.
+  UPSTREAM.md: the golden checksum also held for `0.0.4`.
+- `src/nerva/catalog.zig`: a bad view name says "a view name" (#77), with a unit test.
+  `src/nerva_main.zig`: `export` explains a timeout and an `--as-of` past the cluster; `import`
+  refuses an existing data file before reading the export. `src/nerva/cli.zig`: the help lists
+  `--trace-size-max` and what `api` serves.
+- Verified: `check`, `test:unit -- "catalog:"`.
+
+## 2026-10-06 — Export and import hardened (N81; #78, #79, #80, #82)
+
+- `src/nerva_main.zig`, `src/nerva/import.zig`: import writes `<path>.importing`, flushes on
+  any error, and links the file to `<path>` only after its checks pass, then syncs the
+  directory (#78). Pass 1 refuses check ids out of order, timestamps past 2^62 and ops past
+  2^48 (#80); progress every 2^20 ops; the catalog limit counts rows, not writes.
+- `src/nerva/export.zig`: export runs `import.view_definition` on each view and the catalog
+  limit before finishing (#79); `nerva_main.zig` names these errors and `TooManyTables`.
+- `demo/seats/server.py`: the sales and remaining views are read at the seat map's op (#82).
+- README, CHANGELOG v0.4.0, DECISIONS N80 and N81. Deferred: #81 (replicas from different
+  exports).
+- Verified: the hardening probes (every crafted case refuses cleanly or imports; a failed check
+  exits 1 and leaves no file; a killed import leaves only `.importing`), the declaration-window
+  sweep, `check`, `test:fmt`, `test:unit`, `test:release`, `test:demo`.
+
+## 2026-10-06 — Release v0.4.0
+
+- `VERSION` 0.4.0: `release.yml` publishes `v0.4.0` once CI passes, with CHANGELOG.md's v0.4.0
+  section as its notes, the binaries, the CycloneDX bill of materials and `SHA256SUMS`.
+  Binaries report `0.0.4+<commit>` (`build.zig`, unchanged).
+- The release carries #72, #73, #75 and #83, merged here after the release-candidate
+  hardening (N81). Known and deferred: #81.
+
 ## 2026-10-05 — Tutorial for v0.4.0
 
 - `docs/TUTORIAL.md` updated for v0.4.0 (`0.0.4`):

@@ -889,7 +889,7 @@ into the same few sections is fine.
 
 ## Part 8: Documents: larger values by key
 
-Rows are 80 bytes with numeric ids. **Documents** hold up to 64 KiB under a string key (up to
+Rows are 80 bytes with numeric ids. **Documents** hold up to 512 KiB under a string key (up to
 1024 bytes of UTF-8), in a numeric `namespace`. Nerva splits them over rows of a reserved table
 for you. They follow the same optimistic model: a read names the `version` you saw, and `"0"`
 means "must not exist".
@@ -910,8 +910,17 @@ n -d '{"namespace":"7","reads":[{"key":"cart/alice","version":"0"}],"writes":[{"
 # {"status":"conflict","key":"cart/alice","version":"271"}     (409)
 ```
 
-`documents/get` takes up to 256 keys and an optional `"as_of"`. A commit carries up to about
-600 KB of keys and values. Each namespace has its own feed:
+`documents/get` takes up to 256 keys and an optional `"as_of"`, and reads at most about 16 MiB of
+documents at once (more answers `413`: ask for fewer keys). A commit carries up to about 600 KB
+of keys and values, so one 512 KiB document is written atomically with room to spare.
+
+**Values larger than 512 KiB** (uploaded files, long model outputs) belong outside Nerva: put the
+bytes in a blob store under their SHA-256, then commit a small document holding the hash (and
+size, type, whatever you read it by). The document is ordered, versioned and conflict-checked
+like any other; the blob store only ever adds immutable objects, so it needs no transactions, and
+a blob with no document pointing at it is garbage you can collect later.
+
+Each namespace has its own feed:
 
 ```bash
 n "$A/v1/documents/changes?namespace=7&limit=1000"

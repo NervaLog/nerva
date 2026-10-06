@@ -16,6 +16,7 @@ const nerva = @import("../nerva.zig");
 const IO = @import("../io.zig").IO;
 const MessageBus = @import("../message_bus.zig").MessageBusType(IO);
 const MessagePool = @import("../message_pool.zig").MessagePool;
+const MessageBuffer = @import("../message_buffer.zig").MessageBuffer;
 const Message = MessagePool.Message;
 const MultiBatchDecoder = vsr.multi_batch.MultiBatchDecoder;
 const MultiBatchEncoder = vsr.multi_batch.MultiBatchEncoder;
@@ -262,8 +263,18 @@ pub const Client = struct {
 
     /// A ledger's declaration and the op it was declared at; all zero if `id` is not declared.
     pub fn get_ledger(client: *Client, id: u32) Error!nerva.Ledger {
+        assert(id != 0);
+        return client.get_ledger_query(.{ .id = id });
+    }
+
+    /// The ledger declared `slot`th (from 1); all zero if fewer were declared (N80).
+    pub fn get_ledger_slot(client: *Client, slot: u64) Error!nerva.Ledger {
+        assert(slot != 0);
+        return client.get_ledger_query(.{ .id = 0, .slot = slot });
+    }
+
+    fn get_ledger_query(client: *Client, query: nerva.LedgerQuery) Error!nerva.Ledger {
         try client.ensure_idle();
-        const query: nerva.LedgerQuery = .{ .id = id };
         const body = std.mem.asBytes(&query);
         stdx.copy_disjoint(.exact, u8, client.request[0..body.len], body);
         client.send(.get_ledger, client.request[0..body.len]);
@@ -470,8 +481,9 @@ pub const Client = struct {
         log.warn("evicted: {s}", .{@tagName(eviction.header.reason)});
         // The VSR client's contract asks the callback to deinit it, but the callback runs inside
         // the message bus's receive path, which goes on to use the buffer `deinit` would free
-        // (#52). `Client.deinit` deinits it instead; the evicted VSR client processes no more
-        // messages because nothing drives its IO until then.
+        // (#52). `Client.deinit` deinits it instead. Nothing drives its IO after the call that
+        // received the eviction; messages other connections delivered in that same IO pass are
+        // dropped by the VSR client (a local patch, #74).
         client.state = .evicted;
     }
 
@@ -491,4 +503,16 @@ test "Client: a reply after the timeout is dropped (#42)" {
     Client.on_reply(@intFromPtr(&client), .register, 0, aligned);
     try std.testing.expectEqual(.timed_out, client.state);
     try std.testing.expectEqual(null, client.reply_size);
+}
+
+test "Client: a message after the eviction, in the same IO pass, is dropped (#74)" {
+    // Only the field `on_messages` reads before dropping the buffer is set.
+    var vsr_client: VSRClient = undefined;
+    vsr_client.evicted = true;
+    var pool = try MessagePool.init_capacity(std.testing.allocator, 1);
+    defer pool.deinit(std.testing.allocator);
+    var buffer = MessageBuffer.init(&pool);
+    defer buffer.deinit(&pool);
+    VSRClient.on_messages(&vsr_client.message_bus, &buffer);
+    try std.testing.expectEqual(.evicted, buffer.invalid.?);
 }

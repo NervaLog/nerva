@@ -72,6 +72,8 @@ stay exact. The operations:
 | `get_history` | `HistoryFilter` → `Change[]` | One row's writes, newest first, through an index on the change feed. With `op_max = N`, the first change returned is the row as of op `N` (`Client.row_as_of`). |
 | `declare_view` | `ViewDefinition` → `DeclareResult` | Declares a view maintained from then on by every commit, with its fields resolved to offsets (N52). |
 | `get_view` | `ViewQuery` → `ViewRecord[]` | A maintained view's state, hash and group count, and a page of its groups (N52). |
+| `declare_ledger` | `LedgerDefinition` → `DeclareLedgerResult` | Declares a ledger: conserved fields that only pairs of adds change (N75). |
+| `get_ledger` | `LedgerQuery` → `Ledger` | A ledger by id, or, when `id` is zero, the `slot`th declared (from 1), to list them (N80). |
 | `pulse` | — | Sent by the cluster to itself while a view is building: adds a bounded number of existing rows to it (N52). |
 
 Commits execute serially in op order, so validating each read's version at commit time gives
@@ -119,12 +121,12 @@ on runners brought up for it.
 
 Binaries report `<protocol>+<commit>`. The protocol release (`0.0.4` since views' `min`, `max`
 and `as_of`, N62) is what data files and clients check: a replica refuses a data file of another
-release, so upgrading means reformatting, and accepts clients of its own release only (a v0.3.0
+release, so upgrading means new data files, and accepts clients of its own release only (a v0.3.0
 `nerva api` is refused at registration). A replica ignores peers that
 run another release (N61): in a cluster mixing releases, only replicas of one release count
-toward each other's quorums, and each logs the others it ignores. Upgrade by stopping every
-replica, reformatting, and starting them all on the new release. `zig build test:release` runs a
-cluster of two releases.
+toward each other's quorums, and each logs the others it ignores. A cluster moves to a new
+release with its data by export and import (below, N80). `zig build test:release` runs a cluster
+of two releases, and an upgrade from this build to another release.
 
 ## Running a cluster
 
@@ -139,7 +141,51 @@ cluster of two releases.
 ```
 
 `--development` relaxes Direct IO and uses small caches. Clients use `src/nerva/client.zig`:
-`lookup_rows`, `commit` and `get_changes`, blocking, one request in flight per client.
+`lookup_rows`, `commit`, `get_changes`, `get_history`, views and ledgers, blocking, one
+request in flight per client.
+
+### Upgrading a cluster
+
+From v0.4.0 on (v0.3.0 has no `nerva export`), a new release keeps the data: the old release's
+`nerva export` writes what a client can read,
+and the new release's `nerva import` rebuilds each replica's data file from it, recomputing
+everything derived (views, versions, ledger indexes) with its own code (N80).
+
+```bash
+# 1. With the old release, while the cluster runs (stop writers first, or pass --as-of=<op>):
+nerva export --cluster=0 --addresses=3001,3002,3003 --output=cluster.nerva-export
+# 2. Stop every replica. With the new release, once per replica, on the same export:
+nerva import --cluster=0 --replica=0 --replica-count=3 --input=cluster.nerva-export 0_0.nerva
+nerva import --cluster=0 --replica=1 --replica-count=3 --input=cluster.nerva-export 0_1.nerva
+nerva import --cluster=0 --replica=2 --replica-count=3 --input=cluster.nerva-export 0_2.nerva
+# 3. Start the replicas on the new release, then clients and gateways of the new release.
+nerva start --addresses=3001,3002,3003 0_0.nerva   # and 0_1, 0_2
+```
+
+- The export holds every change up to its op (`--as-of`, by default the op it starts at), with
+  its op and timestamp, the views' names and ops, the ledgers' definitions and ops, and checks:
+  each view's hash, each ledger's total, and a hash of each table's rows. It is versioned,
+  checksummed record by record (CRC-32) and as a whole (SHA-256); `export` never overwrites a
+  file. It refuses an export `import` would refuse, such as one taken while a gateway was
+  between declaring a view and writing its catalog document (export again, or PUT the view
+  again if that gateway stopped), so nothing is stopped for an export that cannot be used (N81).
+- `import` checks the whole export before it creates the data file, restores every op at its
+  number, then compares its state with the checks. It writes `<path>.importing` and gives it its
+  name only once the checks pass: on a damaged export, a mismatch or a crash, no data file is
+  left to start (a killed import leaves `<path>.importing`; remove it and import again). Every
+  replica's file is identical.
+- What carries over: rows, versions (a client's `op_seen` still holds), history, `row?as_of`,
+  the change feed with its timestamps (a cursor from before continues), documents, layouts,
+  ledgers, and every view's answer and hash. A view declared over rows that already existed is
+  rebuilt by the new cluster after it starts (`"state": "building"` until then), and its as-of
+  history starts there; client sessions do not carry over.
+- Op numbers jump: the new cluster goes on from the first checkpoint at or after the export's
+  op. Versions and feed cursors from before stay valid.
+- A view declared only through the Zig client, with no catalog document, cannot be imported:
+  `import` refuses it. Declare views through `nerva api`.
+- Measured (`perf/upgrade.py`, a 4-CPU sandbox, `--development`): a million changes over
+  970,000 rows exported in 5.8 s (365 MiB at most) and imported in 14 s (1.2 GiB, the state
+  machine's fixed allocation, as a replica's); the export file is 121 bytes a change.
 
 ### Metrics and traces
 
@@ -242,9 +288,13 @@ allocate at most 128 MiB: a body that would take more once parsed (deeply nested
 JSON arrays) answers `413 {"error":"request too complex"}`. What a request took is given back as
 soon as its reply is written; the gateway keeps at most 8 MiB between requests (N69).
 
-**Documents** hold values larger than a row: up to 64 KiB under a string key (up to 1024 bytes
+**Documents** hold values larger than a row: up to 512 KiB under a string key (up to 1024 bytes
 of UTF-8) in a namespace (a `u64`, as a decimal string). Nerva chunks them over rows of a
-reserved table:
+reserved table; a document is written in one commit, so 512 KiB is the most that stays atomic.
+Keep larger values (files, model outputs) outside Nerva, content-addressed, and store their hash
+in a document: Nerva then orders and versions the reference, and the blob store never needs to
+be transactional (N76). A `get` reads at most as many chunks as 256 documents of 64 KiB (about
+16 MiB of values); more answers `413`:
 
 | Route | Does |
 |---|---|
@@ -335,7 +385,7 @@ process restarts.
   hash, the sum modulo 2^256 of the groups' digests, the same at every replica. `as_of=<op>`
   reads the view as that op left it (`404` before it was declared); `min_op=<n|latest>` asks for
   at least op `n`. Either answers `504` for an op not yet committed, and a view still building
-  answers `503`. A view of more than 10,000 groups is read in pages instead:
+  answers `503`. A view of more than 10,000 groups answers `400`; read it in pages instead:
 - `GET /v1/views/<name>/groups?cursor=&limit=&as_of=` pages through the groups in storage order,
   with the view's state, `view_hash` and group count.
 - `GET /v1/views` lists the views (name, id, state, `declared_op`, group count);
@@ -386,7 +436,8 @@ The 1.0 target is in [docs/GOALS-1.0.md](./docs/GOALS-1.0.md).
 3. **Server and client protocol** — `nerva format` / `nerva start`, a Zig client, and
    `nerva api` (JSON over HTTP). ✅
 4. **Declared views** — layouts and views as data in the log, a watermark, reads at a position,
-   a hash per answer. ✅ (v0 computes on read; incremental maintenance next.)
+   a hash per answer. ✅ (Maintained by the replicas in every commit, N52; `nerva view`
+   recomputes them as a check.)
 5. **Snapshots and subscriptions** — reads as of op `N` ✅ (`get_history`, `row?as_of=`, views
    `as_of`); change cursors ✅ (`get_changes`); view snapshots.
 6. **Object storage tiering**, external operators, effect sinks.

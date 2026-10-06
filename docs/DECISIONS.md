@@ -997,7 +997,9 @@ they write, from replicated state, and `nerva view` stays as an independent reco
   `/definition`; before 1.0 anything may break): every group, sorted by key, rendered by the
   same code as `nerva view` (`declared.render`, shared), so the answer, and `hash`, the SHA-256
   of its `groups` JSON, are `nerva view`'s byte for byte. `view_hash` (the replicated hash, N52)
-  and `declared_op` come with it. `as_of` and `min_op` mean what they mean in `nerva view`, and
+  and `declared_op` come with it; `/groups` names the replicated hash `view_hash` too (it
+  said `hash` until #66, renamed before v0.4.0 shipped), so `hash` always means `nerva
+  view`'s. `as_of` and `min_op` mean what they mean in `nerva view`, and
   an op not yet committed answers 504 as there; a view still building or failed answers 503
   rather than part of an answer. `GET /v1/views` lists the views the state machine maintains;
   the `get_view` header now carries the view's name in `group_key` for it.
@@ -1198,9 +1200,9 @@ each with an optional floor. Generic: a ledger could conserve seats or stock as 
   after such a view, `DeclareStatus.ledger_field` (10) for a view declared after the ledger.
   `nerva api` now sends `declare_view` before writing the view's catalog document, after
   checking the catalog for a different declaration under the name as before, so a view refused
-  over a ledger's field answers 409 and leaves no document (owner's choice). Only views the state
-  machine maintains are checked (assumed): one it refused lives only in `nerva view`, which
-  recomputes it on read, so adds never touch it.
+  over a ledger's field answers 409 and leaves no document (owner's choice; N78 refines which
+  answers write one). Only views the state machine maintains are checked (assumed): one it
+  refused lives only in `nerva view`, which recomputes it on read, so adds never touch it.
 - **The invariant**: for every ledger, the sum of its fields over all rows equals the sum at its
   declaration's op, and no field moves down past its floor.
 - **Numbers.** The spec named `unpaired = 15` and `conserved_write = 16`; `views_too_large`
@@ -1221,3 +1223,198 @@ each with an optional floor. Generic: a ledger could conserve seats or stock as 
   and tree ids, and the fixed script a ledger, a clamped pair and a refused put. Mutation-tested:
   floors not applied, puts and deletes not checked, straddling adds not checked, each fail the
   unit tests and the VOPR; `ledger_bounds` taking the lower bound fails the fuzzer.
+
+**N76. Documents hold up to 512 KiB, the most one commit writes atomically; larger values live
+outside, by hash.**
+Documents held at most 64 KiB (N39, N41), and applications storing model outputs, files or
+program state needed more (#25). A document is written in one commit request, so atomicity caps
+it: a request carries 8,190 entries in production, one per 80-byte chunk. `value_size_max` is
+now 512 KiB: with the longest key that is 6,567 chunks, leaving over 1,600 entries for the rest
+of the transaction (asserted at compile time against the production message size). Not larger:
+a document split across requests would no longer be written atomically, and a design for that
+(staged chunks, a commit record) is a 1.0-sized change. The chunk format and ids are unchanged, so
+existing documents read as before; a client older than this change refuses a larger document as
+corrupt, but v0.3.0 clients are refused by 0.0.4 clusters anyway (N62).
+- **A `get` reads at most as many chunks as 256 documents of 64 KiB** (about 16 MiB of values),
+  and answers `413` past that, before reading any tail chunk. Every `get` that answered before
+  still does, and a reply stays inside the request's 128 MiB budget (N69): 256 documents of
+  512 KiB would be 128 MiB of values alone.
+- **Larger values**: the documented pattern is content-addressed blobs outside Nerva, with their
+  hash in a document (README, TUTORIAL Part 8).
+Tests: `tests/api/documents.py` writes a 512 KiB value under a 1024-byte key in one transaction
+and reads it back, refuses one byte more, and checks the `get` cap at its edge (33 documents of
+512 KiB answer 413, 32 answer 200); the documents fuzzer draws values up to the new limit.
+
+**N77. A table's `min`/`max` slots also fit one op's member budget.**
+A pulse backfills at most `member_writes_limit / extremes` rows of a view (N62), and every write
+to its table takes a member in each of the table's `min`/`max` slots. With a member budget below a
+view's slots, the view could never backfill a row and no write to its table could ever be
+admitted; `backfill_rows_max` asserted. Production's budget is 8,189, but the VOPR draws its batch
+size at random, and its lanes on `main` (N74) hit this on four of four lanes across two pushes
+(#68; seed 17320319949900435868 at `28cbd79`). Declaration now allows a table's views at most
+`min(view_extremes_per_table_max, member_writes_limit)` slots (`table_extremes_max`) and refuses
+more with `table_extremes_full`, as the VOPR's model does. Production is unchanged. Verified: the
+failing seeds now pass (the first refuses one declaration `table_extremes_full`), as do seeds 1,
+2, 5 and 30 random ones in ReleaseSafe.
+
+**N78. The state machine decides a view's name only while the catalog has no document for it.**
+Since N75, `PUT /v1/views/<name>` declares the view, then writes its catalog document. Two
+gateways could race in between (#70): A's definition declared, B's different one then answered
+`different` but cataloged anyway, leaving `/definition` describing B and `/groups` serving A for
+good. And a view cataloged unmaintained (its table's views full), whose field a ledger then took,
+answered 409 to the identical PUT that had been accepted. Now, with no document under the name,
+`different` and `ledger_field` answer 409 and write nothing, so the catalog only ever takes the
+definition the state machine holds or one it did not maintain for capacity; A's retry finds
+`exists` and writes its own. With the identical document already there, every answer is 200, the
+reason saying why it is not maintained, as before N75. A document written before this fix under a
+`different` declaration stays as it is (views are immutable; the reason says so). Rejected: writing
+the document first (a refused view would then need deleting, and a crash in between leaves it).
+Verified: a unit test of both orders against the fake catalog (it fails without the fix),
+`tests/api/ledgers.py`, and the hardening probe, which hit the window twice in 40 tries and each
+time left one definition.
+
+**N79. Still short of disk, CI removes other repositories' workspaces from the runner.**
+The runner volume is shared with other repositories' jobs (N65's warning showed it: after the Zig
+caches were emptied, 2.7 GB of 9.8 GB was free, the rest other checkouts and their caches), so
+emptying Nerva's own caches no longer always reaches `FREE_MIN_GIB`. When it does not,
+`free_disk.sh` now removes every directory beside this job's workspace in the runner's work
+directory (`dirname $RUNNER_WORKSPACE`), except the runner's own (`_temp`, `_actions`, `_tool`,
+anything starting with `_`), logging each with its size. It is safe because a Machine runs one
+job at a time and every job checks out afresh; another repository's next job only clones again.
+It runs only under Actions (`GITHUB_ACTIONS=true`, `RUNNER_WORKSPACE` set), never on a
+developer's machine. Other repositories' caches under `$HOME` are left alone: they are theirs to
+prune. Chosen by the owner over raising the threshold or a larger volume.
+
+
+**N80. A new release keeps the data: `nerva export` from the old release, `nerva import` into
+the new one, which recomputes everything derived.**
+The owner's spec (NV-2, design approved before implementation). Until now an upgrade meant
+reformatting and loading the data again (N32, N61). Data files are the vendored LSM's and change
+with every release that touches a tree; the log is the source of truth, but a replica keeps only
+the last 1,024 prepares (the WAL is a ring), so a release cannot replay operations it no longer
+has. What every release can read is what a client reads, so that is what crosses the upgrade.
+- **What is exported** (`src/nerva/export.zig`, a client of the running cluster): every change
+  with `op <= as_of` (`--as-of=<op>`, or `latest`: the op of the export's first read), in feed
+  order, with its op, timestamp and value, the reserved tables' included (catalog documents,
+  documents); each maintained view's name, id and declaration op (`get_view` headers: the name
+  is in the header's `group_key`, as the view listing reads it); each ledger's definition and op
+  (`get_ledger` by slot, below); and checks: each view's state, hash and group count as of
+  `as_of`, each ledger's total, and per table the live rows' count and the SHA-256 of
+  `table, id, op, value` for each, in key order. The last two are computed from the feed, with
+  one entry per row ever written held in memory. No `ViewDefinition` crosses: the importer
+  rebuilds each view from its catalog document (`view.<name>`, JSON, in the feed) and its
+  table's layout with the new release's `catalog` code, at its original id. A view without a
+  catalog document (declared through the Zig client alone) is refused, assumed acceptable: every
+  view a gateway declares has one.
+- **The export file** (`export_file.zig`), release-independent: `NERVAEXP`, format version 1,
+  then records framed as size, kind, a fixed little-endian body and a CRC-32, in sections
+  (changes by timestamp, views by id, ledgers by op, view, ledger and table checks, a summary
+  with the counts and `as_of`), then an `end` record holding the SHA-256 of every byte before
+  it. The reader checks every CRC, the sections' order and contents and the counts, and acts on
+  nothing until the SHA-256 matched. A change is 121 bytes on disk. Guarded by a golden export
+  in `format_test.zig`; its format changes only with its version.
+- **The import** (`import.zig`, `nerva import`, once per replica): pass 1 reads and checks the
+  whole export and rebuilds the views' definitions before any file exists; pass 2 formats the
+  data file and drives the state machine in process on real storage, as the throwaway prototype
+  (`nv2-proto`, never merged) established a cluster needs: every op from 1 to the trigger of
+  C, the first checkpoint at or after `as_of`, at its number, with a compaction beat after each
+  and a forest, grid and superblock checkpoint at each trigger; then the WAL a replica leaves at
+  C (C's prepare and empty pulses up to `trigger(C) + pipeline_prepare_queue_max + 1`, chained
+  by parent, in both WAL zones, whole header sectors, wrapping the ring when C's slots do), and
+  a superblock whose `commit_max` is that head, with the head as the view headers, so that C is
+  durable and replicas repair nothing before C + 1. C's prepare carries the checkpoint id
+  replicas would have given it. No client sessions. The importer reads no clock: every
+  replica's file is the same. Then the checks run against the restored forest (a scan of every
+  row); on a mismatch, a damaged export or a refused declaration it exits non-zero and removes
+  the data file it created. An existing data file is refused, before anything is written
+  (N81 hardens this).
+- **Restore in the state machine** (`restore_prefetch`, `restore_changes`, `restore_view`,
+  `restore_ledger`): in process only, never an `Operation`, so unreachable by clients. One op's
+  changes become one batch of entries (an add was recorded as the put of its row's new value)
+  and take the commit's prefetch stages unchanged (ledgers, views, rows, admission of groups and
+  members, extreme scans), then are written by `row_put`/`row_delete` with their recorded
+  timestamps, and `views_finish` maintains every view as a commit does. Nothing a commit
+  validates is validated (ledger pairs, conserved writes, reads): the history already passed.
+  It does refuse a history no commit writes: changes of another op, timestamps closer than an
+  entry's block (`entry_timestamps`: the groups and members a change creates take the
+  timestamps after it), a delete of a row that is not live, and an op over the group or member
+  budget (the original op fit it; a release with smaller budgets refuses the import). Views,
+  ledgers and every version take timestamps from the importer's counter, which starts past the
+  export's last timestamp + `entry_timestamps`; C's prepare takes the counter plus one second.
+- **A view at its declaration op**: `ready` if its table has no row (a tombstone counts) then,
+  from a one-row scan in the restore's prefetch, and kept by every restored change after; else
+  `building`, and the new cluster's pulses build it after start. Assumed, as approved: the as-of
+  history of a view declared over existing rows does not survive (its versions start when the
+  pulses build it), and its check is not compared at import (the import logs it); nor is a
+  view's that was still building, or failed, in the export. A view declared before rows is
+  `ready` from its declaration, while the old cluster built it at its first pulse a few ops
+  later: as of an op in between, the old cluster answered `building` with fewer groups (writes
+  wait for the pulse) and the restored one `ready` with all of them. From the old cluster's
+  first pulse on, both answer alike (unit test).
+- **What survives**: rows, versions (`op_seen` compare-and-set across the upgrade), history,
+  `row?as_of`, the feed with its timestamps (a cursor taken before the upgrade continues),
+  documents and layouts, ledgers at their ops, every view's answer and hash, and the as-of
+  history of views declared before their table had rows. Not: client sessions (clients
+  register again); the timestamps of views and ledgers (`get_ledger` returns one; nothing
+  depends on it); the as-of history of views declared over existing rows. The new cluster's
+  first op is past C.
+- **`LedgerQuery.slot`** (from its reserved bytes, so that the exporter can list ledgers): a
+  query by `slot` when `id` is zero, by `id` when `slot` is zero, all zeros otherwise. Safe
+  because 0.0.4 has not shipped (the release string stays). The format guard's snapshot changed
+  for this one struct; the VOPR queries by slot too.
+- **Tests.** Unit (`state_machine_tests.zig`): a fixed history (a view with `min` and `max`
+  declared before rows, a ledger moved by pairs, puts, deletes, adds, several transactions and a
+  row written twice in one op, a view declared over existing rows) restored at its ops reads as
+  committed: the feed byte for byte with its timestamps, rows, versions and histories, the
+  ledger's total, the early view's hash latest and as of every op after the first pulse, the
+  late view's after the restored side's pulses build it, and both then commit alike; restore
+  writes a put of a conserved field that a commit refuses, and refuses a delete of an absent
+  row. `export_file.zig`: a round trip; every byte flipped, every truncation, a byte appended,
+  two records swapped, a record dropped, another version, each refused. `test:release`
+  (`tests/release/upgrade.py`): a fixed script on this build (1,100 commits: layouts, puts,
+  deletes, adds, reads, documents, a view before rows, a ledger with pairs, a view over existing
+  rows), exported, imported by the `0.0.200` build into three replicas: both views, the view
+  before rows as of past ops, the ledger and its total, every row's history and value, rows as
+  of past ops, the feed page by page with its cursors, and documents read the same; a version
+  read before commits, a cursor from before continues, the cluster commits on through a
+  replica's loss and return; an export with one byte changed is refused and leaves no file.
+  Both sides are builds of this commit: once a published release contains `nerva export`, the
+  test fetches the previous release's binary, as CI fetches releases, to export with it.
+- **Measured** (`perf/upgrade.py`: one `--development` replica loaded by `bench-load` c1, the
+  harness's load generator (N55); ReleaseSafe, a 4-CPU sandbox; wall time and the process's
+  peak RSS):
+
+  | load | changes | rows | export | export RSS | file | import | import RSS |
+  |---|---|---|---|---|---|---|---|
+  | 1,024 puts a request (1,121 requests) | 1,147,904 | 670,720 | 4.6 s | 196 MiB | 139 MB | 8.2 s | 1,188 MiB |
+  | 16 puts a request (63,227 requests) | 1,011,632 | 972,000 | 5.8 s | 365 MiB | 122 MB | 14.0 s | 1,188 MiB |
+
+  The export's memory is its map of rows (about 380 bytes a row with the hash map's slack); the
+  import's is the state machine and grid allocated up front, as a replica allocates them, the
+  same at any size. Import time grows with ops (a compaction beat each) as well as with changes.
+  Not measured: the nightly harness (N56) does not run it yet.
+
+**N81. Export refuses what import would refuse; import names its file only once its checks pass.**
+The v0.4.0 hardening of export and import (N80) found that a failed import could leave a data
+file `nerva start` runs, and that an export could succeed and then be refused by import, after
+the old cluster was stopped.
+- **Import:** pass 2 writes `<path>.importing`, and after its checks pass, flushes, links it to
+  `<path>` (`linkat`, which never replaces a file), removes the temporary name and syncs the
+  directory. On any error it flushes before tearing down (a failed check used to abort on
+  `Storage.deinit`'s `unflushed == 0`, leaving the file) and removes the temporary file. A
+  killed import leaves only `<path>.importing`, which the next import names and refuses (#78).
+  Rejected: withholding the final superblock until the checks pass, which needs a change to
+  vendored format code for the same result.
+- **Pass 1 refuses** what pass 2 would trip on: view and ledger checks that name another
+  declaration (they were asserted), a change timestamp past 2^62 (versions and checkpoints
+  after it must stay below `TimestampRange.timestamp_max`), and an export op past 2^48 (the loop
+  to the final checkpoint did not end at `maxInt(u64)`). Pass 2 logs progress every 2^20 ops;
+  it restores about 38,000 empty ops a second (#80).
+- **Export** runs import's own view-definition check against the catalog rows it exported, and
+  the same limit of 2^16 catalog rows, and refuses before writing its summary. The usual cause
+  is a gateway between declaring a view and writing its document (`api.zig`), so its message
+  says to export again, or to PUT the view again if that gateway stopped (#79). Import counts a
+  catalog row once however often it is written.
+- Not done, recorded for later: replicas imported from two different exports that reach the
+  same checkpoint stop on an assertion when they meet, not a message (#81).
+
