@@ -20,13 +20,13 @@ const connections_max = 16;
 
 pub const Options = struct {
     listen: std.net.Address,
-    /// Compared against `X-Nerva-Key`. Never empty.
-    key: []const u8,
+    /// `X-Nerva-Key` must be one of these (`http_connection.key_accepted`).
+    keys: http_connection.Keys,
     on_listening: ?*const fn (address: std.net.Address) void = null,
 };
 
 pub fn serve(gpa: std.mem.Allocator, client: *Client, options: Options) !noreturn {
-    assert(options.key.len > 0);
+    assert(http_connection.Keys.invalid(options.keys.current, options.keys.next) == null);
     var receiver = try http_connection.Receiver.init(gpa, options.listen, .{
         .connections_max = connections_max,
         .body_size_max = body_size_max,
@@ -99,7 +99,7 @@ fn serve_request(
         .put => .put,
         .other => return api.error_reply(arena, 405, "method not allowed"),
     };
-    if (!http_connection.key_matches(request.key, options.key)) {
+    if (!http_connection.key_accepted(options.keys, request.key)) {
         return api.error_reply(arena, 401, "invalid key");
     }
 

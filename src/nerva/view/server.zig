@@ -30,12 +30,13 @@ const Follower = FollowerType(DeclaredViews);
 
 pub const Options = struct {
     listen: std.net.Address,
-    key: []const u8,
+    /// `X-Nerva-Key` must be one of these (`http_connection.key_accepted`).
+    keys: http_connection.Keys,
     on_listening: ?*const fn (address: std.net.Address) void = null,
 };
 
 pub fn serve(gpa: std.mem.Allocator, client: *Client, options: Options) !noreturn {
-    assert(options.key.len > 0);
+    assert(http_connection.Keys.invalid(options.keys.current, options.keys.next) == null);
     var views = DeclaredViews.init(gpa);
     defer views.deinit();
     var follower = try Follower.init(gpa, client, &views);
@@ -114,7 +115,7 @@ fn serve_request(
         if (health.state != .ready) return unavailable_healthz;
         return .{ .status = 200, .body = "{\"ok\":true}" };
     }
-    if (!http_connection.key_matches(request.key, options.key)) {
+    if (!http_connection.key_accepted(options.keys, request.key)) {
         return .{ .status = 401, .body = "{\"error\":\"invalid key\"}" };
     }
 
