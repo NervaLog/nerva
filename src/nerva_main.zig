@@ -81,11 +81,52 @@ pub fn main() !void {
             log_level_runtime = if (args.log_debug) .debug else .info;
             command_export(gpa, args) catch |err| {
                 std.fs.cwd().deleteFile(args.output) catch {};
-                vsr.fatal(.cli, "export: {s}", .{@errorName(err)});
+                switch (err) {
+                    error.Timeout => vsr.fatal(
+                        .cli,
+                        "export: no reply from the cluster: check --cluster and --addresses",
+                        .{},
+                    ),
+                    error.AsOfAhead => vsr.fatal(
+                        .cli,
+                        "export: --as-of is past the cluster's latest op",
+                        .{},
+                    ),
+                    error.TooManyTables => vsr.fatal(
+                        .cli,
+                        "export: more than {} tables hold rows; an export checks at most that many",
+                        .{export_file.tables_max},
+                    ),
+                    error.TooManyCatalogRows, error.ViewRefused => vsr.fatal(
+                        .cli,
+                        "export: `nerva import` would refuse this export (see above)",
+                        .{},
+                    ),
+                    else => vsr.fatal(.cli, "export: {s}", .{@errorName(err)}),
+                }
             };
         },
         .import => |*args| {
             log_level_runtime = if (args.log_debug) .debug else .info;
+            // Before reading the export, which may be large: the data file must be new. The
+            // import writes `<path>.importing` and links it to `<path>` once its checks pass,
+            // so a failed or killed import never leaves a file a replica would start from (#78).
+            if (std.fs.cwd().access(args.path, .{})) {
+                vsr.fatal(.cli, "import: {s} exists; give a new file", .{args.path});
+            } else |_| {}
+            var path_importing_buffer: [std.fs.max_path_bytes]u8 = undefined;
+            const path_importing = std.fmt.bufPrint(
+                &path_importing_buffer,
+                "{s}.importing",
+                .{args.path},
+            ) catch vsr.fatal(.cli, "import: {s}: the path is too long", .{args.path});
+            if (std.fs.cwd().access(path_importing, .{})) {
+                vsr.fatal(
+                    .cli,
+                    "import: {s} is left from an import that did not finish; remove it",
+                    .{path_importing},
+                );
+            } else |_| {}
             // Pass 1, before the data file exists: the whole export is checked.
             var arena = std.heap.ArenaAllocator.init(gpa);
             defer arena.deinit();
@@ -96,12 +137,9 @@ pub fn main() !void {
                 }),
                 else => vsr.fatal(.cli, "import: {s}: {s}", .{ args.input, @errorName(err) }),
             };
-            if (std.fs.cwd().access(args.path, .{})) {
-                vsr.fatal(.cli, "import: {s} exists; give a new file", .{args.path});
-            } else |_| {}
             // Pass 2. Any failure removes the data file, which the import created.
-            command_import(gpa, args, &plan) catch |err| {
-                std.fs.cwd().deleteFile(args.path) catch {};
+            command_import(gpa, args, path_importing, &plan) catch |err| {
+                std.fs.cwd().deleteFile(path_importing) catch {};
                 switch (err) {
                     error.Corrupt => vsr.fatal(.cli, "import: {s}: {s}", .{
                         args.input,
@@ -109,6 +147,18 @@ pub fn main() !void {
                     }),
                     else => vsr.fatal(.cli, "import: {s}", .{@errorName(err)}),
                 }
+            };
+            // Every write is on disk: the data file is complete, and takes its name.
+            const cwd = std.posix.AT.FDCWD;
+            std.posix.linkat(cwd, path_importing, cwd, args.path, 0) catch |err| {
+                std.fs.cwd().deleteFile(path_importing) catch {};
+                vsr.fatal(.cli, "import: {s}: {s}", .{ args.path, @errorName(err) });
+            };
+            std.fs.cwd().deleteFile(path_importing) catch |err| {
+                vsr.fatal(.cli, "import: {s}: {s}", .{ path_importing, @errorName(err) });
+            };
+            directory_sync(args.path) catch |err| {
+                vsr.fatal(.cli, "import: {s}: {s}", .{ args.path, @errorName(err) });
             };
         },
         inline .format, .start => |*args, tag| {
@@ -197,10 +247,19 @@ fn command_format(
     });
 }
 
-/// Formats the data file, then restores the export into it (N80).
+/// Makes a new directory entry durable: the directory holding `path` is synced.
+fn directory_sync(path: []const u8) !void {
+    // Read-only, not `openDir`'s default `O_PATH`, which `fsync` refuses.
+    const fd = try std.posix.open(std.fs.path.dirname(path) orelse ".", .{ .DIRECTORY = true }, 0);
+    defer std.posix.close(fd);
+    try std.posix.fsync(fd);
+}
+
+/// Formats the data file at `path`, then restores the export into it (N80).
 fn command_import(
     gpa: std.mem.Allocator,
     args: *const cli.Command.Import,
+    path: []const u8,
     plan: *const import_.Plan,
 ) !void {
     var io = try IO.init(2048, 0);
@@ -211,7 +270,7 @@ fn command_import(
     defer tracer.deinit(gpa);
 
     var storage = try Storage.init(&io, &tracer, .{
-        .path = args.path,
+        .path = path,
         .size_min = data_file_size_min,
         .purpose = .format,
         .direct_io = if (!constants.direct_io)

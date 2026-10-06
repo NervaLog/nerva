@@ -781,6 +781,37 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
   `test:api`, `test:views`, `test:integration`, `test:release` (mixed releases, then the
   upgrade), `fuzz -- smoke`, VOPR seeds 1, 2 and 5 in ReleaseSafe.
 
+## 2026-10-06 — v0.4.0 release preparation: docs and CLI messages (#77)
+
+- CHANGELOG v0.4.0, from the release-readiness audit: a request's budget is 128 MiB (it said
+  64); the #62 entry is gone (a bug no release had); a view that filters or groups by a ledger's
+  field is refused (summing one is allowed); the export caveats (op numbers jump to the next
+  checkpoint, Zig-client-only views are refused, both releases need export and import); the
+  `documents/get` 413; the Zig client's new names.
+- README: `declare_ledger` and `get_ledger` in the operations table, the client's operations,
+  the export caveats, `400` for a view of more than 10,000 groups, a stale roadmap line.
+  UPSTREAM.md: the golden checksum also held for `0.0.4`.
+- `src/nerva/catalog.zig`: a bad view name says "a view name" (#77), with a unit test.
+  `src/nerva_main.zig`: `export` explains a timeout and an `--as-of` past the cluster; `import`
+  refuses an existing data file before reading the export. `src/nerva/cli.zig`: the help lists
+  `--trace-size-max` and what `api` serves.
+- Verified: `check`, `test:unit -- "catalog:"`.
+
+## 2026-10-06 — Export and import hardened (N81; #78, #79, #80, #82)
+
+- `src/nerva_main.zig`, `src/nerva/import.zig`: import writes `<path>.importing`, flushes on
+  any error, and links the file to `<path>` only after its checks pass, then syncs the
+  directory (#78). Pass 1 refuses check ids out of order, timestamps past 2^62 and ops past
+  2^48 (#80); progress every 2^20 ops; the catalog limit counts rows, not writes.
+- `src/nerva/export.zig`: export runs `import.view_definition` on each view and the catalog
+  limit before finishing (#79); `nerva_main.zig` names these errors and `TooManyTables`.
+- `demo/seats/server.py`: the sales and remaining views are read at the seat map's op (#82).
+- README, CHANGELOG v0.4.0, DECISIONS N80 and N81. Deferred: #81 (replicas from different
+  exports).
+- Verified: the hardening probes (every crafted case refuses cleanly or imports; a failed check
+  exits 1 and leaves no file; a killed import leaves only `.importing`), the declaration-window
+  sweep, `check`, `test:fmt`, `test:unit`, `test:release`, `test:demo`.
+
 ## 2026-10-05 — `/groups` names its replicated hash `view_hash` (#66)
 
 - `src/nerva/api/api.zig`: `GET /v1/views/<name>/groups` sends `view_hash`, not `hash`, as the

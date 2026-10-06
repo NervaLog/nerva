@@ -91,6 +91,7 @@ const CLIArgs = union(enum) {
         \\  nerva start --addresses=<addresses> [--cache-grid=<size><KiB|MiB|GiB>]
         \\              [--cache-rows=<size><KiB|MiB|GiB>]
         \\              [--statsd=<host:port>] [--trace=<path>]
+        \\              [--trace-size-max=<size><KiB|MiB|GiB>]
         \\              [--development] [--log-debug] <path>
         \\
         \\  nerva view --cluster=<integer> --addresses=<addresses> --listen=<host:port>
@@ -116,8 +117,9 @@ const CLIArgs = union(enum) {
         \\  view     Follow the cluster's change feed and serve declared views. The key is
         \\           read from NERVA_KEY.
         \\
-        \\  api      Serve the cluster's operations (lookup, commit, changes, history) as JSON
-        \\           over HTTP. The key is read from the NERVA_KEY environment variable.
+        \\  api      Serve the cluster as JSON over HTTP: rows, transactions, the feed,
+        \\           history, layouts, views, ledgers and documents. The key is read from the
+        \\           NERVA_KEY environment variable.
         \\
         \\  export   Write the cluster's changes up to an op, its views and ledgers, and
         \\           checks, to a new file at --output, for `import` of another release.

@@ -34,7 +34,16 @@ const data_file_size_min = @import("../vsr/superblock.zig").data_file_size_min;
 const StateMachineType = @import("state_machine.zig").StateMachineType;
 
 /// Catalog rows (`catalog.table_catalog`) an export may hold: layouts and view declarations.
-const catalog_rows_max = 1 << 16;
+pub const catalog_rows_max = 1 << 16;
+/// The latest change timestamp restored: far below `TimestampRange.timestamp_max`, so that the
+/// versions, views, ledgers and checkpoints after it never pass it (wall-clock nanoseconds
+/// reach it in 2116; #80).
+const timestamp_restore_max: u64 = 1 << 62;
+/// The latest op restored. Import restores every op up to the export's, about 38,000 a second
+/// when they are empty, so this is far past any cluster an import can carry.
+const as_of_max: u64 = 1 << 48;
+/// Ops between progress lines.
+const ops_progress: u64 = 1 << 20;
 /// Rows per read of the forest while checking.
 const check_rows_page = 1024;
 /// Between the importer's last timestamp and the checkpoint's prepare: more than any op takes.
@@ -75,7 +84,7 @@ pub const Plan = struct {
     }
 };
 
-const CatalogRows = std.AutoHashMapUnmanaged(u64, [nerva.value_size]u8);
+pub const CatalogRows = std.AutoHashMapUnmanaged(u64, [nerva.value_size]u8);
 
 /// Pass 1: reads and checks the whole export, and rebuilds the views' definitions. Allocates
 /// the plan's table checks from `arena`.
@@ -105,13 +114,22 @@ pub fn plan(arena: std.mem.Allocator, path: []const u8) !Plan {
     var op_changes: u64 = 0;
     while (try reader.next()) |record| switch (record) {
         .change => |*change| {
+            if (change.timestamp > timestamp_restore_max) {
+                log.err("a change's timestamp {} is past {}", .{
+                    change.timestamp,
+                    timestamp_restore_max,
+                });
+                return error.Refused;
+            }
             result.timestamp_max = change.timestamp;
             op_changes = if (change.op == op_last) op_changes + 1 else 1;
             op_last = change.op;
             result.op_changes_max = @max(result.op_changes_max, op_changes);
             if (change.table != catalog.table_catalog) continue;
             if (change.kind == .put) {
-                if (catalog_rows.count() == catalog_rows_max) {
+                if (catalog_rows.count() == catalog_rows_max and
+                    !catalog_rows.contains(change.id))
+                {
                     log.err("the catalog has more than {} rows", .{catalog_rows_max});
                     return error.Refused;
                 }
@@ -145,6 +163,10 @@ pub fn plan(arena: std.mem.Allocator, path: []const u8) !Plan {
     result.checks_table = checks_table.items;
 
     if (result.summary.as_of == 0) return export_file.corrupt("the export's op is zero");
+    if (result.summary.as_of > as_of_max) {
+        log.err("the export's op {} is past {}", .{ result.summary.as_of, as_of_max });
+        return error.Refused;
+    }
     var declared_op_last: u64 = 0;
     for (result.views[0..result.summary.view_count]) |*view| {
         if (view.record.declared_op <= declared_op_last or
@@ -160,11 +182,23 @@ pub fn plan(arena: std.mem.Allocator, path: []const u8) !Plan {
         }
         view.definition = try view_definition(arena, &catalog_rows, &view.record);
     }
+    // The checks name what they check, in the declarations' order; pass 2 asserts it (#78).
+    for (result.view_slice(), result.checks_view[0..check_view_count], 1..) |*view, *check, id| {
+        if (view.record.id != id or check.id != id) {
+            return export_file.corrupt("a view's id or its check's is out of order");
+        }
+    }
+    for (result.ledger_slice(), result.checks_ledger[0..check_ledger_count]) |*ledger, *check| {
+        if (check.id != ledger.definition.id) {
+            return export_file.corrupt("a ledger's check names another ledger");
+        }
+    }
     return result;
 }
 
-/// A view's definition, from its catalog document and its table's layout.
-fn view_definition(
+/// A view's definition, from its catalog document and its table's layout. `nerva export` runs
+/// it too, so that it refuses an export this would refuse.
+pub fn view_definition(
     arena: std.mem.Allocator,
     catalog_rows: *const CatalogRows,
     view: *const export_file.View,
@@ -324,6 +358,9 @@ pub fn ImporterType(comptime Storage: type) type {
             };
             defer gpa.free(restore.body);
             defer gpa.free(restore.changes);
+            // Registered last, so it runs first on an error (#78): the writes in flight land before
+            // the grid's and state machine's buffers are freed and the file is closed.
+            errdefer flush(storage);
             try restore.ops(gpa);
             try restore.checks(gpa);
             flush(storage);
@@ -450,6 +487,13 @@ pub fn ImporterType(comptime Storage: type) type {
                         }
                     }
 
+                    if (op % ops_progress == 0) {
+                        log.info("op {} of {}: {} ops restored", .{
+                            op,
+                            trigger_final,
+                            ops_restored,
+                        });
+                    }
                     Wait.pending = true;
                     restore.state_machine.compact(Wait.state_machine_done, op);
                     Wait.run(restore.storage);

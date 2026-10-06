@@ -5,7 +5,7 @@ publishes a version's section as its GitHub release notes, and refuses to releas
 without one. Design reasons are in [docs/DECISIONS.md](./docs/DECISIONS.md); the full log of
 work is [WORKLOG.md](./WORKLOG.md).
 
-## v0.4.0 — 2026-10-05
+## v0.4.0 — 2026-10-06
 
 Declared ledgers, so that the cluster itself conserves balances; views with `min` and `max`,
 read as of any op and served whole by `nerva api`; and a round of fixes that keep replicas and
@@ -48,6 +48,8 @@ curl -H 'X-Nerva-Key: secret' http://127.0.0.1:8080/v1/commit -d '{"entries": [
   `declared_op`. **It used to return the declaration, which moved to
   `GET /v1/views/<name>/definition`.** `GET /v1/views` lists the views. A view of more than
   10,000 groups is read in pages from `/groups`.
+- A view that filters or groups by a ledger's field is refused with `409`, and nothing is
+  written.
 - **`GET /v1/views/<name>/groups` names its replicated hash `view_hash`, as the whole view
   does; it was `hash`** (#66). `hash` on `nerva api` now always means `nerva view`'s.
 - A view declared over a ledger's field is refused with `409`, and nothing is written.
@@ -69,7 +71,17 @@ nerva start --addresses=3001,3002,3003 1_0.nerva
 
 - Rows, versions, history, `row?as_of`, the change feed and its cursors, documents, layouts,
   ledgers and every view's answer carry over. A view declared over rows that already existed is
-  rebuilt after the new cluster starts; client sessions start again.
+  rebuilt after the new cluster starts, and its as-of history starts again; client sessions
+  start again.
+- Op numbers jump: the new cluster goes on from the first checkpoint at or after the export's
+  op. Versions (`op_seen`) and feed cursors from before stay valid.
+- Export and import work between two releases that both have them: from v0.4.0 on, the old
+  release's `nerva export` and the new release's `nerva import`.
+- A view declared only through the Zig client, without a catalog document, cannot be imported:
+  `nerva import` refuses it. Declare views through `nerva api`.
+- `nerva export` refuses an export that `nerva import` would refuse, before anything is
+  stopped. `nerva import` writes `<path>.importing` and names it `<path>` only once its checks
+  pass, so a failed or interrupted import leaves no data file to start.
 - `--as-of=<op>` exports the cluster as of an op; by default, as of the export's start.
 - See README, "Upgrading a cluster".
 
@@ -80,7 +92,8 @@ Each release has a CycloneDX 1.5 software bill of materials next to its binaries
 ### New: larger documents
 
 A document holds up to 512 KiB (it was 64 KiB), the most one commit writes atomically. Larger
-values belong outside Nerva, stored by their hash. (#25)
+values belong outside Nerva, stored by their hash. One `documents/get` reads at most as many
+chunks as 256 documents of 64 KiB, and answers `413` past that: ask for fewer keys. (#25)
 
 ### Fixed
 
@@ -94,13 +107,13 @@ values belong outside Nerva, stored by their hash. (#25)
 - A transaction that touched more view groups than any op allows got `503 views_busy`, and
   retrying never helped. It now gets `413 views_too_large`: split it. (#32)
 - A large JSON body kept up to 0.8 GB allocated in `nerva api`. A request may use at most
-  64 MiB (`413 request too complex` past that), and the gateway keeps at most 8 MiB between
+  128 MiB (`413 request too complex` past that), and the gateway keeps at most 8 MiB between
   requests. (#31, #60)
 - With `--trace`, a full or failing trace disk panicked the replica, and the trace grew
   without bound. Trace writes are buffered and bounded now, and a write error stops tracing,
   not the replica. (#30)
-- One transaction moving the holders of many groups' `min` or `max` to new groups (about 1,600
-  rows) panicked every replica, again on restart. (#62)
+- A bad view name was refused with a message about field names. It now says "a view name".
+  (#77)
 
 ### Upgrading from v0.3.0
 
@@ -109,12 +122,14 @@ values belong outside Nerva, stored by their hash. (#25)
   stops on a v0.3.0 data file. Load your data again.
 - **Upgrade clients and gateways too.** v0.4.0 replicas refuse clients older than v0.4.0.
 - `GET /v1/views/<name>` now answers the view; read the declaration at `/definition`.
-- v0.3.0 has no `nerva export`: this upgrade still means loading your data again. The next
-  one will not.
+- v0.3.0 has no `nerva export`: this upgrade still means loading your data again. From
+  v0.4.0 on, run the old release's `nerva export` and the new release's `nerva import`.
 - Zig client users: new operations `declare_ledger` and `get_ledger` (by id, or by `slot` to
   list them: `Client.get_ledger_slot`), `AddFlags.pair`, new
-  statuses `views_too_large` (15), `unpaired` (16) and `conserved_write` (17), and
-  `DeclareStatus.ledger_field`. Existing values keep their numbers.
+  statuses `views_too_large` (15), `unpaired` (16) and `conserved_write` (17),
+  `DeclareStatus.ledger_field` (10) and `table_extremes_full` (9), `DeclareLedgerStatus`,
+  `min` and `max` in `AggregateFunction`, and `ViewQuery.as_of`. Existing values keep their
+  numbers.
 
 ## v0.3.0 — 2026-10-05
 
