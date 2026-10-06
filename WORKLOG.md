@@ -781,6 +781,37 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
   `test:api`, `test:views`, `test:integration`, `test:release` (mixed releases, then the
   upgrade), `fuzz -- smoke`, VOPR seeds 1, 2 and 5 in ReleaseSafe.
 
+## 2026-10-05 — `/groups` names its replicated hash `view_hash` (#66)
+
+- `src/nerva/api/api.zig`: `GET /v1/views/<name>/groups` sends `view_hash`, not `hash`, as the
+  whole view and the README already say. `tests/views/maintained.py` and
+  `tests/release/upgrade.py` (#76) follow; CHANGELOG v0.4.0
+  (an incompatible change from v0.3.0) says so; DECISIONS N66 notes it. The tutorial is left
+  to #67, which rewrites the views part.
+- Verified: `check`, `test:fmt`, `test:views`.
+
+## 2026-10-05 — Messages after an eviction, in the same IO pass, are dropped (#74)
+
+- `src/vsr/client.zig` (vendored; UPSTREAM.md): `on_messages` drops a buffer received after the
+  eviction instead of asserting. `test:integration` aborted on it in CI: every replica evicts
+  the same session, and `IO.run_once` ran a second replica's receive after the first's
+  eviction. Since #52's fix (`46efdd7`), unreleased.
+- `src/nerva/client.zig`: the eviction comment says so; a unit test hands an evicted client a
+  buffer (it panics without the patch).
+- Verified: `check`, `test:fmt`, `test:unit`, `test:integration`, VOPR seed 1.
+
+## 2026-10-05 — A view is cataloged only under the state machine's definition (N78; #70)
+
+- `src/nerva/api/api.zig`: `PUT /v1/views/<name>` with no catalog document answers 409 to
+  `different` and `ledger_field` and writes nothing; with the identical document, 200 and the
+  reason. The fake client and catalog in its tests now declare and keep views; a unit test covers
+  the two-gateway race and the repeat PUT.
+- `tests/api/ledgers.py`: a view cataloged while its table's views were full, a ledger over its
+  field, then the same view again (200, unmaintained).
+- Verified: the hardening probes (a gateway stopped between declaring and cataloging: two hits in
+  40 tries, each left one definition; the repeat PUT: 200), `check`, `test:fmt`, `test:unit`,
+  `test:api`, `test:views`.
+
 ## 2026-10-06 — v0.4.0 release preparation: docs and CLI messages (#77)
 
 - CHANGELOG v0.4.0, from the release-readiness audit: a request's budget is 128 MiB (it said
@@ -812,16 +843,31 @@ is preserved on branch `kotlin-archive` (commit `641a882`).
   exits 1 and leaves no file; a killed import leaves only `.importing`), the declaration-window
   sweep, `check`, `test:fmt`, `test:unit`, `test:release`, `test:demo`.
 
-## 2026-10-05 — `/groups` names its replicated hash `view_hash` (#66)
+## 2026-10-06 — Release v0.4.0
 
-- `src/nerva/api/api.zig`: `GET /v1/views/<name>/groups` sends `view_hash`, not `hash`, as the
-  whole view and the README already say. `tests/views/maintained.py` and
-  `tests/release/upgrade.py` (#76) follow; CHANGELOG v0.4.0
-  (an incompatible change from v0.3.0) says so; DECISIONS N66 notes it. The tutorial is left
-  to #67, which rewrites the views part.
-- Verified: `check`, `test:fmt`, `test:views`.
+- `VERSION` 0.4.0: `release.yml` publishes `v0.4.0` once CI passes, with CHANGELOG.md's v0.4.0
+  section as its notes, the binaries, the CycloneDX bill of materials and `SHA256SUMS`.
+  Binaries report `0.0.4+<commit>` (`build.zig`, unchanged).
+- The release carries #72, #73, #75 and #83, merged here after the release-candidate
+  hardening (N81). Known and deferred: #81.
 
-## 2026-10-05 — Messages after an eviction, in the same IO pass, are dropped (#74)
+## 2026-10-06 — A Jepsen suite, first workload `bank` (N82)
+
+- `tests/jepsen/`: Leiningen project (Jepsen 0.3.14); `run.sh` starts five Docker nodes
+  (`node/Dockerfile`) and runs `lein run`; `db.clj` installs and runs a replica and a gateway
+  per node; `http.clj` maps replies to Jepsen outcomes; `bank.clj`, conservation in a declared
+  ledger; `core.clj`, the CLI and faults (kill, pause, partition); `README.md`.
+- `test/jepsen/nerva/bank_test.clj`: every checker fails on the history it exists to catch
+  (lost value, a field below its floor, a missing row, a moved source, a wrong view total, an
+  unexpected refusal) and passes a correct one; replies map to outcomes.
+- Verified: `lein test` 10 tests, 27 assertions. Against `main`'s ReleaseSafe build (v0.4.0),
+  all valid: 60 s without faults (340 transfers, 432 reads, 389 view reads, 63 refused
+  `out_of_bounds`); 240 s of kills and partitions (20 kills, 26 partitions; 707 reads and 697
+  view reads all at the funded total); 150 s of kills, pauses and partitions (8 kills, 14
+  pauses, 16 partitions; 294 reads, 279 view reads).
+- Found in the suite itself: a connection refused by a killed gateway was `:info`, though
+  nothing was sent (now a failure: 860 unknown transfers became 1); and the refusal check then
+  counted those failures as refusals (now only Nerva's statuses are).
 
 - `src/vsr/client.zig` (vendored; UPSTREAM.md): `on_messages` drops a buffer received after the
   eviction instead of asserting. `test:integration` aborted on it in CI: every replica evicts

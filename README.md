@@ -117,7 +117,9 @@ materials, `nerva-v<VERSION>.cdx.json` (CycloneDX 1.5, N63): Nerva, the vendored
 commit, and the Zig standard library and compiler, read from the repository's pins and covered
 by `SHA256SUMS`. A separate workflow,
 `fuzz.yml`, runs every fuzzer and the VOPR on random seeds for a time budget; it is started by hand
-on runners brought up for it.
+on runners brought up for it. [tests/jepsen](./tests/jepsen/README.md) is a Jepsen suite: five
+real nodes, clients through `nerva api`, kills, pauses and partitions, and a history checked
+against what Nerva promises (a declared ledger's conservation, so far); it runs by hand (N82).
 
 Binaries report `<protocol>+<commit>`. The protocol release (`0.0.4` since views' `min`, `max`
 and `as_of`, N62) is what data files and clients check: a replica refuses a data file of another
