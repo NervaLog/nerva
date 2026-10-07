@@ -103,7 +103,7 @@ Before this release, a bot that did none of its work reviewed it adversarially (
 - **#116:** the nightly showed contended (`c3`) p99 latency 39% above v0.4.0's. Throughput and
   p50 held, and the baseline's own spread is nearly as wide. Being watched.
 - **#109, downstream:** deployments must set `NERVA_CLUSTER_KEY` before starting a v0.5.0
-  replica. Botpike's own deploy tracks this in Botpike/app#73.
+  replica. Botpike's own deploy tracks this in Botpike/app#93.
 - **CI and benchmarks:** #107 (the Jepsen suite doesn't fit the CI runner's memory; it passes
   where it has room), #101 (CI runners short of disk), and #91 (benchmarks in one process move
   each other's numbers).
