@@ -5,6 +5,129 @@ publishes a version's section as its GitHub release notes, and refuses to releas
 without one. Design reasons are in [docs/DECISIONS.md](./docs/DECISIONS.md); the full log of
 work is [WORKLOG.md](./WORKLOG.md).
 
+## v0.5.0 — 2026-10-07
+
+Replicas now prove to each other that they hold a cluster key, and refuse replicas imported
+from a different export. Gateways rotate their key without downtime and listen on IPv6. Several
+crashes are now refusals that name their cause. **A replica no longer starts without
+`NERVA_CLUSTER_KEY`, its data files must be imported again, and its replicas must never run in
+one cluster with v0.4.0 replicas:** see "Upgrading from v0.4.0" below. v0.4.0 clients and
+gateways keep working.
+
+### New: replicas authenticate each other
+
+Before any replica message flows on a connection between two replicas, each proves that it holds
+the cluster key, `NERVA_CLUSTER_KEY`: an HMAC-SHA256 over fresh nonces from both sides. A
+process without the key cannot join the cluster, pose as a replica or vote. Clients and gateways
+don't hold the key and aren't affected. (P102)
+
+```bash
+export NERVA_CLUSTER_KEY="$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"  # the same on every replica
+nerva start --addresses=3001,3002,3003 1_0.nerva
+```
+
+- **The key:** at least 32 bytes and secret. `nerva start` refuses to run without it and never
+  prints it. With `--development`, a public development key is used, with a warning, but only
+  when every address is a loopback address.
+- **Rotating it, with no downtime:**
+  1. restart every replica with the new key as `NERVA_CLUSTER_KEY_NEXT`;
+  2. restart every replica with the new key as `NERVA_CLUSTER_KEY` and the old one as
+     `NERVA_CLUSTER_KEY_NEXT`;
+  3. restart every replica without `NERVA_CLUSTER_KEY_NEXT`.
+- **What it doesn't cover:** the key authenticates who opened a connection, not the traffic
+  after it. Replicas still need a private network that encrypts (WireGuard; Fly.io's 6PN).
+
+### New: replicas imported from different exports refuse each other
+
+A data file now records the export it was imported from: the export's SHA-256. `nerva export`
+prints it, and `nerva import` and `nerva start` log it. Replicas announce it to each other. A
+replica that can never reach a quorum with replicas of its own export exits with **status 8**
+(`origin_mismatch`), naming both exports and telling you to import it again. The others log
+that they ignore it and keep running. Before, replicas imported from two exports that reached
+the same checkpoint crashed in the journal. (P90, #81)
+
+- **Replacing a lost replica is a whole-cluster operation:** export the cluster again and import
+  every replica. Importing one replica alone joins and catches up, but it has forgotten the
+  prepares the lost replica acknowledged, so a later failure could lose a committed op. A safe
+  single-replica replacement is future work (#94).
+
+### New: gateways rotate their key, and listen on IPv6
+
+- **`NERVA_KEY_NEXT`:** `nerva api` and `nerva view` also accept `X-Nerva-Key` equal to
+  `NERVA_KEY_NEXT` when it is set. Rotate in three restarts:
+  1. give every gateway the new key as `NERVA_KEY_NEXT`;
+  2. move callers to the new key;
+  3. make it `NERVA_KEY` and unset `NERVA_KEY_NEXT`.
+
+  A gateway refuses to start with an empty `NERVA_KEY_NEXT`, or one equal to `NERVA_KEY`. Both
+  keys are compared in constant time on every request. (P96)
+- **`--listen=[<ipv6>]:<port>`**, as `--addresses` already took, for example `--listen=[::]:8080`
+  on an IPv6-only network such as Fly.io's. Zone ids (`[fe80::1%2]`) are refused. On Linux,
+  `[::]` also accepts IPv4 unless `net.ipv6.bindv6only` is set. (#99, #104)
+- **README "Limits"** gathers every limit a caller can hit, each checked against the code. (#96,
+  #110)
+
+### Fixed
+
+- Replicas imported from different exports crashed instead of refusing each other. They now
+  exit with status 8. (#81)
+- **A client older than its replicas couldn't commit to a cluster of more than one replica:**
+  backups dropped every prepare that carried an older accepted client's release, including its
+  registration. This has been so since v0.3.0, which accepted v0.2.x clients that then timed
+  out. It now works, so v0.4.0 clients and gateways work against v0.5.0 clusters. (#93)
+- A gateway, the Zig client or a replica given an address its kernel can't open a socket for
+  (`[::1]` without IPv6) aborted on an assertion. It now logs the error once and keeps retrying.
+  (#92)
+- The nightly benchmark reported documents encoding and decoding 8 times slower. The benchmark
+  had grown with the document limit; the code hadn't changed. Writing a document now computes
+  its chunk ids' prefix once, and encoding takes about a third of the time it did. (#88)
+- A `413` reply had no reason phrase in its status line. It now reads `413 Content Too Large`.
+  (#110)
+
+### Release review
+
+Before this release, a bot that did none of its work reviewed it adversarially (P105).
+- **Fixed:** #108 (the nightly benchmark couldn't start its cluster without the key), #110 (the
+  README Limits wording) and #111 (P115: a v0.4.0 replica dialed by a v0.5.0 one exits with
+  `unknown_vsr_command`, status 7; it doesn't just close the connection).
+- **Answered by these notes:** #109 (the key is now mandatory).
+- **Carried to 0.6.0:** #112.
+
+### Known issues, carried to 0.6.0
+
+- **#112:** gateways listen with `SO_REUSEPORT`, so two gateways can silently share a port.
+- **#95:** a replica given another release's data file stops on a panic (`multiversion
+  unsupported`) rather than a message.
+- **#94:** no safe way yet to replace one lost replica. Replace by exporting and importing the
+  whole cluster.
+- **#116:** the nightly showed contended (`c3`) p99 latency 39% above v0.4.0's. Throughput and
+  p50 held, and the baseline's own spread is nearly as wide. Being watched.
+- **#109, downstream:** deployments must set `NERVA_CLUSTER_KEY` before starting a v0.5.0
+  replica. Botpike's own deploy tracks this in Botpike/app#73.
+- **CI and benchmarks:** #107 (the Jepsen suite doesn't fit the CI runner's memory; it passes
+  where it has room), #101 (CI runners short of disk), and #91 (benchmarks in one process move
+  each other's numbers).
+- Divergence alerts (replica metrics and a view check) move to 0.6.0.
+
+### Upgrading from v0.4.0
+
+1. **Choose a cluster key and give it to every replica**, as `NERVA_CLUSTER_KEY`: at least 32
+   bytes, the same everywhere, secret (for example a Fly secret). A v0.5.0 replica refuses to
+   start without it. `--development` falls back to its public key only when every address is a
+   loopback address. (#109)
+2. **Export with v0.4.0, then stop every replica.** Run
+   `nerva export --cluster=<id> --addresses=<…> --output=cluster.nerva-export`.
+3. **Import every replica with v0.5.0**, from that one export, before any of them starts:
+   `nerva import --cluster=<id> --replica=<i> --replica-count=<n> --input=cluster.nerva-export <file>`.
+   Then `nerva start` each replica with the key set. Binaries report `0.0.5+<commit>`. A v0.5.0
+   replica refuses a v0.4.0 data file.
+4. **Never run v0.4.0 and v0.5.0 replicas in one cluster.** They can't authenticate each other,
+   and a v0.4.0 replica that a v0.5.0 one dials exits at once (status 7, P115).
+5. Clients and gateways may stay on v0.4.0 for now: v0.5.0 replicas accept clients from v0.4.0
+   on.
+6. **Going back** to v0.4.0 means exporting with v0.5.0 and importing with v0.4.0, which reads
+   v0.5.0's exports. A v0.4.0 replica given a v0.5.0 data file stops without writing to it.
+
 ## v0.4.0 — 2026-10-06
 
 Declared ledgers, so that the cluster itself conserves balances; views with `min` and `max`,
