@@ -148,6 +148,7 @@ jobs:
             PATH="$shim:$PATH"
           fi
           docker info --format 'Docker {{.ServerVersion}}, {{.NCPU}} CPUs, {{.MemTotal}} bytes'
+          free -m
 
       - name: Fetch the suite's dependencies
         working-directory: tests/jepsen
@@ -186,6 +187,10 @@ jobs:
               echo "### ❌ Jepsen \`bank\`, nemesis \`$spec\`: exit $status"
               echo
               echo "Exit 1 is an invalid history, 2 an unknown one, anything else a crash of the test."
+              if (( status == 137 )); then
+                echo "Exit 137 is SIGKILL: on a runner, usually the kernel's OOM killer (five replicas"
+                echo "take about 1.3 GiB each, the JVM up to 4 GiB)."
+              fi
               if [[ -n "$run_dir" && -d "$run_dir" ]]; then
                 rel="store/${run_dir#*/tests/jepsen/store/}"
                 echo "History: \`$rel/history.txt\` (and \`history.edn\`) in the run's \`jepsen-store\` artifact"
