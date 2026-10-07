@@ -27,7 +27,12 @@ had no workflow, so neither searched unless someone remembered to start it.
 - **Cluster key (P102):** the job generates a fresh random `NERVA_CLUSTER_KEY` per run (32
   random bytes, hex), masked in the log; never a repository secret. The suite now passes the
   control node's `$NERVA_CLUSTER_KEY` to replicas, or a fresh random key when it is unset; the
-  constant key that `db.clj` held is gone.
+  constant key that `db.clj` held is gone. Each node gets the key over stdin into a `600` file
+  that the replica's start command reads: Jepsen's `start-daemon!` writes the daemon's
+  environment into its log, which is in `store/` and so in the artifact, and P102's key is never
+  logged.
+- **gnuplot** is installed in the job: without it Jepsen's perf graphs are `:unknown`, and so
+  would be every night's result.
 - **Schedules:** fuzzing (01:17, about 65 to 95 minutes) and Jepsen (03:23, about an hour by
   default) finish before perf-nightly (06:47), which shares the runner pool.
 - **Issues:** a failed or timed-out job makes a `report` job (the only one with

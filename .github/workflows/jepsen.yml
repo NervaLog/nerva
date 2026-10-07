@@ -123,10 +123,17 @@ jobs:
 
       # Jobs run as `runner`, with sudo: Docker is used directly if `runner` may, else through
       # sudo (a `docker` on PATH that calls it), and started if it is not running. run.sh needs
-      # ssh-keygen for the nodes' key; Jepsen's SSH client is in the JVM.
-      - name: Docker
+      # ssh-keygen for the nodes' key (Jepsen's SSH client is in the JVM), and Jepsen's perf
+      # checker gnuplot: without it the graphs, and so the whole result, are `:unknown`.
+      - name: Docker, ssh-keygen and gnuplot
         run: |
-          command -v ssh-keygen > /dev/null || { sudo -n apt-get update -q && sudo -n apt-get install -y -q openssh-client; }
+          missing=()
+          command -v ssh-keygen > /dev/null || missing+=(openssh-client)
+          command -v gnuplot > /dev/null || missing+=(gnuplot-nox)
+          if (( ${#missing[@]} )); then
+            sudo -n apt-get update -q
+            sudo -n apt-get install -y -q --no-install-recommends "${missing[@]}"
+          fi
           if ! docker info > /dev/null 2>&1; then
             if ! sudo -n docker info > /dev/null 2>&1; then
               # shellcheck disable=SC2024 # the log is the runner's, not root's
@@ -159,12 +166,15 @@ jobs:
           failed=0
           for spec in "${specs[@]}"; do
             echo "::group::Jepsen bank, nemesis $spec, $TIME_LIMIT s"
+            before=$(readlink -f tests/jepsen/store/latest 2> /dev/null || true)
             status=0
             tests/jepsen/run.sh candidate/zig-out/bin/nerva test --workload bank \
               --nemesis "$spec" --time-limit "$TIME_LIMIT" || status=$?
             echo "::endgroup::"
-            # Jepsen exits 0 valid, 1 invalid, 2 unknown, 255 on a crash; `latest` is this test's.
+            # Jepsen exits 0 valid, 1 invalid, 2 unknown, 255 on a crash. `latest` is this test's
+            # directory if it moved: a test that crashed before starting made none.
             run_dir=$(readlink -f tests/jepsen/store/latest 2> /dev/null || true)
+            [[ "$run_dir" != "$before" ]] || run_dir=
             if (( status == 0 )); then
               echo "Jepsen \`$spec\`: valid" >> "$GITHUB_STEP_SUMMARY"
               continue
@@ -194,7 +204,7 @@ jobs:
           done
           exit "$failed"
 
-      - name: Upload Jepsen's store
+      - name: Pack Jepsen's store
         if: always()
         run: |
           if [ -d tests/jepsen/store ]; then

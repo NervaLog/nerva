@@ -9,7 +9,8 @@ or a unit test before it is fixed.
 
 ## Running it
 
-Needs Docker (with privileged containers, for iptables), `ssh-keygen`, a JDK (21) and
+Needs Docker (with privileged containers, for iptables), `ssh-keygen`, gnuplot (for the perf
+graphs: without it a result is `:unknown`), a JDK (21) and
 [Leiningen](https://leiningen.org) (CI pins Temurin 21.0.12.1 and Leiningen 2.12.0).
 
 ```bash

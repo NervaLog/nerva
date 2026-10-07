@@ -19,6 +19,7 @@
 (def api-log (str dir "/api.log"))
 (def replica-pidfile (str dir "/replica.pid"))
 (def api-pidfile (str dir "/api.pid"))
+(def cluster-key-file (str dir "/cluster.key"))
 
 (def cluster
   "The cluster id (0 is reserved for testing)."
@@ -73,7 +74,9 @@
                      :pidfile           replica-pidfile
                      :chdir             dir
                      :match-executable? false
-                     :env               {:NERVA_CLUSTER_KEY @cluster-key}}
+                     ;; Read from the node's key file by the shell that starts the replica:
+                     ;; start-daemon! writes its env into the log, and P102's key is never logged.
+                     :env               (str "NERVA_CLUSTER_KEY=\"$(cat " cluster-key-file ")\"")}
                     binary :start (str "--addresses=" (addresses test)) :--development
                     data-file))
 
@@ -105,6 +108,9 @@
         (c/exec :mkdir :-p dir)
         (c/upload (:nerva-binary test) binary)
         (c/exec :chmod "+x" binary)
+        ;; Over stdin, so the key is in no command line.
+        (cu/write-file! @cluster-key cluster-key-file)
+        (c/exec :chmod "600" cluster-key-file)
         (c/exec binary :format (str "--cluster=" cluster)
                 (str "--replica=" (replica-index test node))
                 (str "--replica-count=" (count (:nodes test)))
