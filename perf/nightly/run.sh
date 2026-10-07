@@ -18,6 +18,9 @@ data=${PERF_DATA:-/data}
 bin=${PERF_BIN:-/opt/perf}
 development=()
 [ "${PERF_DEVELOPMENT:-0}" = 1 ] && development=(--development)
+# Replicas authenticate each other with the cluster key (P102): one random key per run unless
+# one is given, never printed. Builds from before P102 ignore it.
+export NERVA_CLUSTER_KEY=${NERVA_CLUSTER_KEY:-$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')}
 # workload:batch pairs; the key in the results is "<workload>/b<batch>".
 workloads=${PERF_WORKLOADS:-"c1:1 c1:64 c2:1 c3:1 c3_adds:1 c4:1 c4:64 c5:1024 c7:1"}
 
@@ -63,6 +66,20 @@ load() { # role round
     "$bin/$role/nerva" start --addresses=$addresses "${development[@]}" "$dir/$r.nerva" \
       > "$dir/replica-$r.log" 2>&1 &
     pids+=($!)
+  done
+  # A replica that cannot start (a missing key, a bad flag) exits at once: record that, rather
+  # than workloads against a cluster that is not there.
+  sleep 2
+  for r in 0 1 2; do
+    if ! kill -0 "${pids[$r]}" 2>/dev/null; then
+      echo "replica $r exited at start"; tail -5 "$dir/replica-$r.log"
+      for pair in $workloads; do
+        emit "$role" "$round" error "{\"key\":\"${pair%%:*}/b${pair##*:}\",\"error\":\"replica $r exited at start\"}"
+      done
+      kill "${pids[@]}" 2>/dev/null; wait "${pids[@]}" 2>/dev/null
+      rm -rf "$dir"
+      return 1
+    fi
   done
   for pair in $workloads; do
     local workload=${pair%%:*} batch=${pair##*:} out
