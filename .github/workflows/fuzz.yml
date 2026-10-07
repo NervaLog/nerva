@@ -1,4 +1,4 @@
-# Long fuzzing (N59, amended by P<pr>): every fuzzer and the VOPR on random seeds for a time
+# Long fuzzing (N59, amended by P106): every fuzzer and the VOPR on random seeds for a time
 # budget, every night and by hand. Smoke (ci.yml) runs each fuzzer once at a fixed seed: a
 # regression check. This searches. Every job below runs at once if there are enough Fly runners
 # (Botpike/ci-runners), else they queue; the night runs at 01:17 UTC, well clear of perf-nightly

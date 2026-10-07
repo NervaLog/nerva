@@ -1,4 +1,4 @@
-# Jepsen (N82, amended by P<pr>): the suite in tests/jepsen/ against a ReleaseSafe `nerva`, every
+# Jepsen (N82, amended by P106): the suite in tests/jepsen/ against a ReleaseSafe `nerva`, every
 # night at 03:23 UTC (after the long fuzzing, before perf-nightly at 06:47: the Fly runner pool is
 # shared) and by hand. One test per nemesis spec, one after another on one runner, five Docker
 # containers each (run.sh). Results (`store/`) are an artifact; a failure files one issue

@@ -9,8 +9,8 @@ or a unit test before it is fixed.
 
 ## Running it
 
-Needs Docker (with privileged containers, for iptables), a JDK (21) and
-[Leiningen](https://leiningen.org).
+Needs Docker (with privileged containers, for iptables), `ssh-keygen`, a JDK (21) and
+[Leiningen](https://leiningen.org) (CI pins Temurin 21.0.12.1 and Leiningen 2.12.0).
 
 ```bash
 ./zig/zig build -Drelease                       # zig-out/bin/nerva, the build under test
@@ -20,6 +20,12 @@ cd tests/jepsen
 lein test                                        # the checkers, against hand-written histories
 lein run serve                                   # browse store/ at http://localhost:8080
 ```
+
+Replicas authenticate each other with `NERVA_CLUSTER_KEY` (P102): the suite passes the
+control node's `$NERVA_CLUSTER_KEY` to every replica, or, if it is unset, a fresh random key for
+the run. `.github/workflows/jepsen.yml` runs the suite nightly and on dispatch (P106): it builds
+the candidate in ReleaseSafe, runs `bank` once per nemesis (`kill`, `pause`, `partition` by
+default), uploads `store/`, and files a `jepsen` issue on a failure.
 
 `run.sh` starts five Debian containers at `10.77.0.11` to `10.77.0.15` (`node/Dockerfile`),
 each with sshd and nothing else; the test uploads the given `nerva`, formats a replica and
