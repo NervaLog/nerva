@@ -128,8 +128,9 @@ a data file of another release, so upgrading means new data files, and accepts c
 run another release (N61): in a cluster mixing releases, only replicas of one release count
 toward each other's quorums, and each logs the others it ignores. From `0.0.5`, replicas also
 authenticate each other before anything else (P102, below), which `0.0.4` replicas cannot do: a
-`0.0.4` replica and a `0.0.5` replica close every connection between them, so **never run them in
-one cluster**. A cluster moves to a new
+`0.0.5` replica closes a connection from a `0.0.4` one, and a `0.0.4` replica that a `0.0.5` one
+dials exits at once (`unknown_vsr_command`, status 7, on the handshake's first message), so
+**never run them in one cluster**. A cluster moves to a new
 release with its data by export and import (below, N80). `zig build test:release` runs a cluster
 of two releases, an upgrade from this build to another release, and replicas imported from
 different exports.
@@ -477,8 +478,9 @@ Every limit a caller can hit, in one place. Each is a constant in the code, asse
 used; the sections above say why.
 
 **Gateways** (`nerva api`, `nerva view`):
-- A request body is at most 4 MiB; a larger `Content-Length` answers
-  `400 {"error":"body too large"}` before the body is read.
+- A `nerva api` request body is at most 4 MiB; a larger `Content-Length` answers
+  `400 {"error":"body too large"}` before the body is read. `nerva view` takes no body: it answers
+  `GET` only, and any body answers that same `400`.
 - A `nerva api` request may allocate at most 128 MiB once parsed; more answers
   `413 {"error":"request too complex"}`. Between requests the gateway keeps at most 8 MiB.
 - 16 connections are read at once. With all 16 busy, a new connection displaces the oldest one
@@ -486,13 +488,15 @@ used; the sections above say why.
 - A request must arrive whole within 10 s of connecting, and its reply is written within another
   10 s. One request per connection (`Connection: close`).
 - Every request but `GET /healthz` needs `X-Nerva-Key`, equal to `NERVA_KEY` or, during a
-  rotation, `NERVA_KEY_NEXT`; anything else answers `401`.
+  rotation, `NERVA_KEY_NEXT`; a missing or other key answers `401`. A method the gateway never
+  takes (for `nerva api` anything but `GET`, `POST` and `PUT`; for `nerva view` anything but `GET`)
+  answers `405` before the key is checked.
 - A gateway's cluster session times out a request after 30 s; the gateway then answers `503`
   until it has reconnected.
 
 **Documents:** a value is at most 512 KiB, under a key of at most 1024 bytes of UTF-8. A commit
-carries about 600 KB of keys and values. A `get` takes at most 256 keys, and reads at most as
-many chunks as 256 documents of 64 KiB; more answers `413`.
+carries about 600 KB of keys and values. A `get` takes at most 256 keys (more answers `400`), and
+reads at most as many chunks as 256 documents of 64 KiB (more answers `413`: ask for fewer keys).
 
 **Views:** one op touches at most about 4,000 distinct groups and 8,000 `min` and `max` members.
 A transaction that exceeds them alone answers `413 views_too_large` (split it); one that only
