@@ -8,7 +8,8 @@
 #
 # Environment: PERF_ROUNDS (3), PERF_SECONDS (20 per workload), PERF_CLIENTS (8),
 # PERF_WORKLOADS (all), PERF_DEVELOPMENT=1 (start replicas with --development, for dry runs
-# on machines without Direct IO), PERF_DATA (/data), PERF_BIN (/opt/perf), PERF_IDLE (1).
+# on machines without Direct IO), PERF_DATA (/data), PERF_BIN (/opt/perf), PERF_IDLE (1),
+# NERVA_CLUSTER_KEY (a throwaway per-run key is generated if unset; see below).
 set -u
 
 rounds=${PERF_ROUNDS:-3}
@@ -16,6 +17,11 @@ seconds=${PERF_SECONDS:-20}
 clients=${PERF_CLIENTS:-8}
 data=${PERF_DATA:-/data}
 bin=${PERF_BIN:-/opt/perf}
+# From protocol release 0.0.5 (P102) `nerva start` requires NERVA_CLUSTER_KEY in production mode.
+# The perf cluster is single-host and loopback (127.0.0.1:3001..3003), never shared, so a throwaway
+# per-run key is correct. 0.4.0 ignores it, 0.5.0 needs it, so exporting it suits baseline and
+# candidate alike. We do NOT use --development here: production mode (real Direct IO) is the point.
+export NERVA_CLUSTER_KEY="${NERVA_CLUSTER_KEY:-$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')}"
 development=()
 [ "${PERF_DEVELOPMENT:-0}" = 1 ] && development=(--development)
 # workload:batch pairs; the key in the results is "<workload>/b<batch>".
