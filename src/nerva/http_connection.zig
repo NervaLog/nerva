@@ -542,6 +542,7 @@ fn reason_phrase(status: u16) []const u8 {
         404 => "Not Found",
         405 => "Method Not Allowed",
         409 => "Conflict",
+        413 => "Content Too Large",
         500 => "Internal Server Error",
         503 => "Service Unavailable",
         504 => "Gateway Timeout",
@@ -550,6 +551,14 @@ fn reason_phrase(status: u16) []const u8 {
 }
 
 const testing = std.testing;
+
+test reason_phrase {
+    // Every status the gateways answer has its phrase (RFC 9110), so no status line goes bare.
+    for ([_]u16{ 200, 400, 401, 404, 405, 409, 413, 500, 503, 504 }) |status| {
+        try testing.expect(reason_phrase(status).len > 0);
+    }
+    try testing.expectEqualStrings("Content Too Large", reason_phrase(413));
+}
 
 test head_parse {
     const valid = head_parse("POST /v1/commit HTTP/1.1\r\nHost: x\r\n" ++
