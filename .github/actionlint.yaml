@@ -1,0 +1,4 @@
+self-hosted-runner:
+  # Botpike/ci-runners: Fly Machines started per job.
+  labels:
+    - fly

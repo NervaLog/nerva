@@ -35,10 +35,13 @@ cleanup
 
 docker build -q -t "$image" "$here/node" > /dev/null
 docker network create --subnet "$subnet" "$network" > /dev/null
+# The public key is copied in, not mounted: a mounted file keeps its owner on the host (`runner`
+# in CI), and sshd refuses root an authorized_keys file another user owns.
 for i in "${!nodes[@]}"; do
   docker run -d --name "nerva-jepsen-n$((i + 1))" --hostname "n$((i + 1))" \
-    --network "$network" --ip "${nodes[$i]}" --privileged \
-    -v "$key.pub:/root/.ssh/authorized_keys:ro" "$image" > /dev/null
+    --network "$network" --ip "${nodes[$i]}" --privileged "$image" > /dev/null
+  docker exec -i "nerva-jepsen-n$((i + 1))" \
+    sh -c 'cat > /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys' < "$key.pub"
 done
 
 # sshd is up once its port answers.

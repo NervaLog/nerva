@@ -26,9 +26,26 @@
 
 (def replica-port 3000)
 
+(def cluster-key-bytes-min
+  "P102: a cluster key has at least 32 bytes."
+  32)
+
+(defn random-cluster-key
+  "64 hex digits from a SecureRandom: 32 random bytes."
+  []
+  (let [bytes (byte-array 32)]
+    (.nextBytes (java.security.SecureRandom.) bytes)
+    (apply str (map #(format "%02x" %) bytes))))
+
 (def cluster-key
-  "The key replicas authenticate each other with (P102): at least 32 bytes."
-  "jepsen-cluster-key-0123456789abcdefghij")
+  "The key replicas authenticate each other with (P102): $NERVA_CLUSTER_KEY on the control node
+  (jepsen.yml sets a fresh one per run), else a fresh random one for this process. Never a
+  constant, so a suite run never uses a key that anything else knows."
+  (delay
+    (let [key (or (not-empty (System/getenv "NERVA_CLUSTER_KEY")) (random-cluster-key))]
+      (assert (<= cluster-key-bytes-min (count (.getBytes ^String key "UTF-8")))
+              (str "NERVA_CLUSTER_KEY needs at least " cluster-key-bytes-min " bytes"))
+      key)))
 
 (def healthy-timeout-s
   "How long a fresh cluster may take until every gateway has a session."
@@ -56,7 +73,7 @@
                      :pidfile           replica-pidfile
                      :chdir             dir
                      :match-executable? false
-                     :env               {:NERVA_CLUSTER_KEY cluster-key}}
+                     :env               {:NERVA_CLUSTER_KEY @cluster-key}}
                     binary :start (str "--addresses=" (addresses test)) :--development
                     data-file))
 
