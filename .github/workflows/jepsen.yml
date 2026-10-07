@@ -8,6 +8,9 @@
 name: Jepsen
 
 on:
+  # TEMPORARY (PR #106 validation, reverted before review): dispatch needs the file on main.
+  push:
+    branches: [claude/nightly-jepsen-fuzz]
   schedule:
     - cron: '23 3 * * *'
   workflow_dispatch:
@@ -33,8 +36,8 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  CANDIDATE: ${{ inputs.candidate || 'main' }}
-  TIME_LIMIT: ${{ inputs.time-limit || '600' }}
+  CANDIDATE: ${{ inputs.candidate || (github.event_name == 'push' && github.sha) || 'main' }}
+  TIME_LIMIT: ${{ inputs.time-limit || (github.event_name == 'push' && '60') || '600' }}
   NEMESES: ${{ inputs.nemesis || 'kill pause partition' }}
   # Pinned tools, checked against these SHA-256 sums before use. Temurin's from
   # api.adoptium.net; Leiningen's computed from its GitHub release.
