@@ -1,27 +1,33 @@
 #!/usr/bin/env python3
 """Files, updates and closes `perf-regression` issues for one nightly run (N56; the dedup is
-docs/decisions/P121).
+docs/decisions/P121, amended by P122).
 
 One regression gets one issue, however many nights it lasts. Each failing metric has a
 fingerprint, `<metric>:<baseline commit, 12 hex>`, which the issue body (or a later comment)
 carries as `<!-- nerva-perf:fingerprint=... -->`. The baseline names the regression because it
-does not move while nights fail: the workflow advances it only after a night that did not fail.
+does not move while a regression lasts: the workflow advances it only after a night that passed,
+or one that did not fail while no fingerprinted issue is open (`advance_baseline`, written to
+`--github-output`). An open issue is also found by the metric alone, whatever baseline its
+fingerprints name.
 
-  * a failing night whose fingerprints no issue carries     -> open one issue with all of them
-  * a failing night sharing a fingerprint with an issue     -> comment with the night's numbers
-                                                               (reopening the issue if closed)
+  * a failing night whose metrics no open issue carries,    -> open one issue with all of them
+    and whose fingerprints no closed issue carries
+  * a failing night sharing a metric with an open issue,    -> comment with the night's numbers
+    or a fingerprint with a closed one                         (reopening the issue if closed)
   * a passing night                                         -> comment "recovered" on every open
-                                                               perf-regression issue and close it
+                                                               issue with a fingerprint and close
+                                                               it (hand-filed ones are left alone)
   * a warn or no-comparison night                           -> change nothing
 
 Every comment carries `<!-- nerva-perf:run=<run id> -->`, so running this twice for one run
 (a re-run of the job) changes nothing the second time. Usage:
 
     file_issue.py --verdict verdict.json --summary summary.md --run-id ID --run-url URL \
-        [--overall fail|pass] [--repo owner/name] [--dry-run]
+        [--overall fail|pass] [--repo owner/name] [--dry-run] [--github-output FILE]
 
 `--overall` replaces the verdict's (the workflow's forced runs); `--dry-run` reads the existing
-issues, prints what it would do and the text it would post, and changes nothing. It needs the
+issues, prints what it would do and the text it would post, and changes nothing;
+`--github-output` appends `advance_baseline=true|false` to FILE (the step's $GITHUB_OUTPUT). It needs the
 `gh` CLI, authenticated (GH_TOKEN), for anything but a dry run with no issues to read.
 """
 
@@ -57,6 +63,12 @@ def fingerprints(verdict):
     if not names:
         names.append("overall")
     return [f"{name}:{baseline}" for name in names]
+
+
+def metric(fingerprint):
+    """`load-c4-b1-ops-s:bbbbbbbbbbbb` -> `load-c4-b1-ops-s`. Slugs hold no ':', so the metric is
+    everything before the last one; a fingerprint with no ':' is all metric."""
+    return fingerprint.rsplit(":", 1)[0]
 
 
 def markers(issue):
@@ -113,6 +125,31 @@ class Gh:
         self.run(["issue", "close", str(number), "--reason", "completed"])
 
 
+def is_open(issue):
+    return issue["state"].lower() == "open"
+
+
+def matches(issue, prints):
+    """An open issue is the night's regression if it carries any of the night's metrics, whatever
+    baseline its fingerprints name (P122); a closed one only if it carries one of its fingerprints."""
+    carried = markers(issue)[0]
+    if is_open(issue):
+        return bool({metric(fp) for fp in carried} & {metric(fp) for fp in prints})
+    return bool(carried & set(prints))
+
+
+def advance_baseline(measured, open_after):
+    """Whether the night's candidate becomes the next baseline. `measured` is the verdict's own
+    overall (a forced verdict changes the issues, not the baseline); `open_after` is whether an
+    issue with a fingerprint is open once the night is filed. A failing night never advances it;
+    a passing night always does; a warn or no-comparison night only when no regression is open,
+    so that a warn night in the middle of a regression neither absorbs it into the baseline nor
+    changes the fingerprints of the nights after it (P122)."""
+    if measured == "fail":
+        return False
+    return measured == "pass" or not open_after
+
+
 def short(verdict, role):
     return (verdict.get("commits", {}).get(role) or "?")[:12]
 
@@ -155,12 +192,14 @@ def recovered_comment(verdict, run_id, run_url):
 
 
 def sync(verdict, summary, gh, run_id, run_url, overall=None, dry_run=False, say=print):
-    """Returns a list of (action, issue number or None)."""
+    """Returns (a list of (action, issue number or None), whether an issue with a fingerprint is
+    open afterwards). On a dry run, the second is what it would be."""
     overall = overall or verdict["overall"]
+    issues = gh.issues()
+    open_now = {issue["number"] for issue in issues if is_open(issue) and markers(issue)[0]}
     if overall not in ("fail", "pass"):
         say(f"overall {overall}: no issue changes")
-        return []
-    issues = gh.issues()
+        return [], bool(open_now)
     results = []
 
     def act(action, number, text=None):
@@ -171,8 +210,9 @@ def sync(verdict, summary, gh, run_id, run_url, overall=None, dry_run=False, say
             say("  " + text.rstrip().replace("\n", "\n  "))
 
     if overall == "pass":
+        # Only issues this script filed (they carry a fingerprint); hand-filed ones stay open.
         for issue in sorted(issues, key=lambda issue: issue["number"]):
-            if issue["state"].lower() != "open":
+            if issue["number"] not in open_now:
                 continue
             if run_id in markers(issue)[1]:
                 act("unchanged", issue["number"])
@@ -183,11 +223,13 @@ def sync(verdict, summary, gh, run_id, run_url, overall=None, dry_run=False, say
                 gh.close(issue["number"])
             act("closed", issue["number"], text)
         if not results:
-            say("passed, and no perf-regression issue is open")
-        return results
+            say("passed, and no perf-regression issue with a fingerprint is open")
+        # A re-run of a night that already closed an issue finds it closed, so none is left open
+        # except one this run marked but could not close (left for the next pass).
+        return results, any(action == "unchanged" for action, _ in results)
 
     prints = fingerprints(verdict)
-    matching = [issue for issue in issues if markers(issue)[0] & set(prints)]
+    matching = [issue for issue in issues if matches(issue, prints)]
     if not matching:
         title = f"Performance regression at {short(verdict, 'candidate')}"
         text = new_body(verdict, summary, prints, run_id, run_url)
@@ -196,14 +238,14 @@ def sync(verdict, summary, gh, run_id, run_url, overall=None, dry_run=False, say
             gh.ensure_label()
             number = gh.create(title, text)
         act("created", number, f"{title}\n\n{text}")
-        return results
+        return results, True
 
     # An open issue over a closed one; then the newest, the likeliest to be about this regression.
     issue = max(matching, key=lambda issue: (issue["state"].lower() == "open", issue["number"]))
     number = issue["number"]
     if run_id in markers(issue)[1]:
         act("unchanged", number)
-        return results
+        return results, True
     reopened = issue["state"].lower() != "open"
     text = fail_comment(verdict, summary, prints, run_id, run_url, reopened)
     if not dry_run:
@@ -211,7 +253,7 @@ def sync(verdict, summary, gh, run_id, run_url, overall=None, dry_run=False, say
             gh.reopen(number)
         gh.comment(number, text)
     act("reopened" if reopened else "commented", number, text)
-    return results
+    return results, True
 
 
 def main(argv=None):
@@ -223,6 +265,7 @@ def main(argv=None):
     parser.add_argument("--overall", choices=("fail", "pass"), help="replace the verdict's overall")
     parser.add_argument("--repo", help="owner/name (default: gh's, from the checkout or GH_REPO)")
     parser.add_argument("--dry-run", action="store_true", help="read the issues, print what would change, change nothing")
+    parser.add_argument("--github-output", help="append advance_baseline=true|false to this file ($GITHUB_OUTPUT)")
     args = parser.parse_args(argv)
     if not re.fullmatch(r"[A-Za-z0-9._-]+", args.run_id):
         parser.error("--run-id may hold only letters, digits, '.', '_' and '-'")
@@ -230,7 +273,13 @@ def main(argv=None):
         verdict = json.load(file)
     with open(args.summary) as file:
         summary = file.read()
-    sync(verdict, summary, Gh(args.repo), args.run_id, args.run_url, args.overall, args.dry_run)
+    _, open_after = sync(verdict, summary, Gh(args.repo), args.run_id, args.run_url, args.overall, args.dry_run)
+    advance = advance_baseline(verdict["overall"], open_after)
+    print(f"advance_baseline={str(advance).lower()} (measured {verdict['overall']}, "
+          f"{'a' if open_after else 'no'} fingerprinted issue open)")
+    if args.github_output:
+        with open(args.github_output, "a") as file:
+            file.write(f"advance_baseline={str(advance).lower()}\n")
 
 
 if __name__ == "__main__":

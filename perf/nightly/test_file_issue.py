@@ -26,11 +26,13 @@ def line(role, round_, kind, result, commit=None):
     return json.dumps({"role": role, "commit": commit, "round": round_, "kind": kind, "result": result})
 
 
-def night(ops=1000, p99=5000, encode=100, base=BASE, error=False):
-    """A verdict from compare.py: the baseline at 1000 ops/s, p99 5000 µs, encode 100 ns."""
+def night(ops=1000, p99=5000, encode=100, base=BASE, error=False, ops_round3=None):
+    """A verdict from compare.py: the baseline at 1000 ops/s, p99 5000 µs, encode 100 ns.
+    `ops_round3` replaces the candidate's ops/s in the third round only."""
     lines = []
     for r in (1, 2, 3):
-        for role, (o, p, e) in (("baseline", (1000, 5000, 100)), ("candidate", (ops, p99, encode))):
+        o3 = ops if r < 3 or ops_round3 is None else ops_round3
+        for role, (o, p, e) in (("baseline", (1000, 5000, 100)), ("candidate", (o3, p99, encode))):
             commit = base if role == "baseline" else CAND
             lines.append(line(role, r, "load", {"key": "c4/b1", "operations_per_s": o,
                                                 "latency_us": {"p50": 1000, "p99": p}}, commit))
@@ -85,7 +87,7 @@ def sync(gh, verdict_summary, run_id, **kwargs):
     verdict, summary = verdict_summary
     out = io.StringIO()
     with redirect_stdout(out):
-        results = file_issue.sync(verdict, summary, gh, run_id, URL + run_id, **kwargs)
+        results, gh.open_after = file_issue.sync(verdict, summary, gh, run_id, URL + run_id, **kwargs)
     return results, out.getvalue()
 
 
@@ -178,32 +180,70 @@ class Sync(unittest.TestCase):
         results, _ = sync(gh, night(ops=800), "3")
         self.assertEqual(results, [("commented", 90)])
 
-    def test_another_baseline_is_another_regression(self):
+    def test_a_closed_issue_against_another_baseline_is_another_regression(self):
         gh = FakeGh()
         sync(gh, night(ops=800), "1")
+        gh.find(101)["state"] = "CLOSED"
         results, _ = sync(gh, night(ops=800, base="d" * 40), "2")
         self.assertEqual(results, [("created", 102)])
 
-    def test_a_passing_night_closes_every_open_issue_as_recovered(self):
+    def test_an_open_issue_is_found_by_its_metric_whatever_the_baseline(self):
+        gh = FakeGh()
+        sync(gh, night(ops=800), "1")
+        results, _ = sync(gh, night(ops=800, base="d" * 40), "2")
+        self.assertEqual(results, [("commented", 101)])
+        self.assertIn("load-c4-b1-ops-s:" + "d" * 12, file_issue.markers(gh.find(101))[0])
+
+    def test_an_old_format_fingerprint_still_matches(self):
+        # Filed under P121, against a baseline the workflow has since moved past.
+        old = {"number": 50, "state": "OPEN", "title": "Performance regression at old", "comments": [],
+               "body": "<!-- nerva-perf:fingerprint=load-c4-b1-ops-s:0123456789ab -->\n"
+                       "<!-- nerva-perf:run=1 -->\nold table"}
+        gh = FakeGh([old])
+        results, _ = sync(gh, night(ops=800), "2")
+        self.assertEqual(results, [("commented", 50)])
+        self.assertEqual(len(gh.store), 1)
+        self.assertEqual(file_issue.metric("load-c4-b1-ops-s:0123456789ab"), "load-c4-b1-ops-s")
+        # A closed one is still reopened by the exact fingerprint it carries.
+        gh = FakeGh([dict(old, state="CLOSED")])
+        verdict, summary = night(ops=800)
+        verdict["commits"]["baseline"] = "0123456789ab" + "0" * 28
+        results, _ = sync(gh, (verdict, summary), "3")
+        self.assertEqual(results, [("reopened", 50)])
+
+    def test_a_passing_night_closes_every_open_fingerprinted_issue_as_recovered(self):
         gh = FakeGh([
-            {"number": 7, "state": "OPEN", "title": "Performance regression at old", "body": "no marker"},
             {"number": 8, "state": "CLOSED", "title": "closed", "body": ""},
         ])
         sync(gh, night(ops=800), "1")
-        results, _ = sync(gh, night(), "2")
-        self.assertEqual(results, [("closed", 7), ("closed", 101)])
-        self.assertEqual(gh.writes()[-4:], [("comment", 7), ("close", 7), ("comment", 101), ("close", 101)])
+        sync(gh, night(p99=8000, base="d" * 40), "2")  # another metric, so another issue: 102
+        results, _ = sync(gh, night(), "3")
+        self.assertEqual(results, [("closed", 101), ("closed", 102)])
+        self.assertEqual(gh.writes()[-4:], [("comment", 101), ("close", 101), ("comment", 102), ("close", 102)])
         recovered = gh.find(101)["comments"][-1]["body"]
         self.assertIn("Recovered", recovered)
-        self.assertIn(URL + "2", recovered)
+        self.assertIn(URL + "3", recovered)
         self.assertEqual(gh.find(8)["comments"], [])
+        self.assertFalse(gh.open_after)
+
+    def test_a_passing_night_leaves_a_hand_filed_issue_open(self):
+        gh = FakeGh([{"number": 7, "state": "OPEN", "title": "Encode looks slow", "body": "filed by hand"}])
+        sync(gh, night(ops=800), "1")
+        results, _ = sync(gh, night(), "2")
+        self.assertEqual(results, [("closed", 101)])
+        self.assertEqual(gh.find(7)["state"], "OPEN")
+        self.assertEqual(gh.find(7)["comments"], [])
+        self.assertFalse(gh.open_after)  # a hand-filed issue does not hold the baseline
+        results, out = sync(gh, night(), "3")
+        self.assertEqual(results, [])
+        self.assertIn("no perf-regression issue with a fingerprint is open", out)
 
     def test_a_passing_night_with_nothing_open_changes_nothing(self):
         gh = FakeGh([{"number": 8, "state": "CLOSED", "title": "closed", "body": ""}])
         results, out = sync(gh, night(), "1")
         self.assertEqual(results, [])
         self.assertEqual(gh.writes(), [])
-        self.assertIn("no perf-regression issue is open", out)
+        self.assertIn("no perf-regression issue with a fingerprint is open", out)
 
     def test_warn_and_no_comparison_leave_issues_alone(self):
         gh = FakeGh([{"number": 7, "state": "OPEN", "title": "open", "body": ""}])
@@ -211,7 +251,8 @@ class Sync(unittest.TestCase):
         for overall in ("warn", "no-comparison"):
             results, _ = sync(gh, (dict(verdict, overall=overall), summary), "1")
             self.assertEqual(results, [])
-        self.assertEqual(gh.calls, [])
+            self.assertFalse(gh.open_after)  # issue 7 has no fingerprint
+        self.assertEqual(gh.writes(), [])
 
     def test_forced_fail_on_a_clean_night_files_an_overall_issue_then_comments(self):
         gh = FakeGh()
@@ -227,11 +268,82 @@ class Sync(unittest.TestCase):
         self.assertEqual(gh.writes(), [])
         self.assertIn("would be created", out)
         self.assertIn("<!-- nerva-perf:fingerprint=load-c4-b1-ops-s:" + BASE[:12] + " -->", out)
-        gh = FakeGh([{"number": 7, "state": "OPEN", "title": "open", "body": ""}])
+        gh = FakeGh([{"number": 7, "state": "OPEN", "title": "open",
+                      "body": "<!-- nerva-perf:fingerprint=overall:" + BASE[:12] + " -->"}])
         results, out = sync(gh, night(), "2", dry_run=True)
         self.assertEqual(results, [("closed", 7)])
         self.assertEqual(gh.writes(), [])
         self.assertIn("would be closed", out)
+
+
+def warn_night(base=BASE):
+    """A night that warns: ops/s 20% worse in two rounds of three (compare.py fails a metric only
+    when every round is past its threshold, and warns when the median is)."""
+    verdict, summary = night(ops=800, ops_round3=1000, base=base)
+    assert verdict["overall"] == "warn", verdict["overall"]
+    return verdict, summary
+
+
+class Baseline(unittest.TestCase):
+    """fail -> warn -> fail is one regression, and the warn night does not move the baseline."""
+
+    def test_advance_baseline(self):
+        self.assertFalse(file_issue.advance_baseline("fail", False))
+        self.assertFalse(file_issue.advance_baseline("fail", True))
+        self.assertTrue(file_issue.advance_baseline("pass", True))
+        self.assertTrue(file_issue.advance_baseline("pass", False))
+        for overall in ("warn", "no-comparison"):
+            self.assertTrue(file_issue.advance_baseline(overall, False))
+            self.assertFalse(file_issue.advance_baseline(overall, True))
+
+    def test_fail_warn_fail_makes_one_issue_and_keeps_the_baseline(self):
+        gh = FakeGh()
+        baseline = BASE  # what perf-results/baseline holds; a night is measured against it
+        nights = [("1", lambda base: night(ops=800, base=base), "c" * 40),
+                  ("2", warn_night, "e" * 40),
+                  ("3", lambda base: night(ops=800, base=base), "f" * 40)]
+        for run_id, make, candidate in nights:
+            verdict, summary = make(baseline)
+            sync(gh, (verdict, summary), run_id)
+            if file_issue.advance_baseline(verdict["overall"], gh.open_after):
+                baseline = candidate
+        self.assertEqual(baseline, BASE)
+        self.assertEqual(len(gh.store), 1)
+        self.assertEqual([call[0] for call in gh.writes()], ["label", "create", "comment"])
+        self.assertEqual(file_issue.markers(gh.find(101))[0], {"load-c4-b1-ops-s:" + BASE[:12]})
+
+    def test_a_warn_night_with_no_regression_open_moves_the_baseline(self):
+        gh = FakeGh()
+        verdict, summary = warn_night()
+        sync(gh, (verdict, summary), "1")
+        self.assertFalse(gh.open_after)
+        self.assertTrue(file_issue.advance_baseline(verdict["overall"], gh.open_after))
+
+    def test_a_forced_pass_closes_and_lets_a_warn_night_move_the_baseline(self):
+        gh = FakeGh()
+        sync(gh, night(ops=800), "1")
+        verdict, summary = warn_night()
+        sync(gh, (verdict, summary), "2", overall="pass")
+        self.assertEqual(gh.find(101)["state"], "CLOSED")
+        self.assertTrue(file_issue.advance_baseline(verdict["overall"], gh.open_after))
+
+    def test_the_workflow_moves_the_baseline_as_file_issue_says(self):
+        workflow = os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, os.pardir,
+                                ".github", "workflows", "perf-nightly.yml")
+        with open(workflow) as file:
+            text = file.read()
+        # The issue step runs first and its output reaches the record step.
+        self.assertLess(text.index("id: issue"), text.index("name: Record on the perf-results branch"))
+        self.assertIn("--github-output \"$GITHUB_OUTPUT\"", text)
+        self.assertIn("ADVANCE: ${{ steps.issue.outputs.advance_baseline }}", text)
+        condition = next(line.strip() for line in text.splitlines() if line.strip().startswith('if [ "$ADVANCE"'))
+        script = condition + " echo moved; fi"
+        for advance, overall, moved in (("true", "warn", True), ("false", "warn", False),
+                                        ("false", "pass", False), ("", "pass", True),
+                                        ("", "warn", False), ("", "fail", False)):
+            result = subprocess.run(["bash", "-c", script], env={"ADVANCE": advance, "OVERALL": overall},
+                                    capture_output=True, text=True, check=True)
+            self.assertEqual(result.stdout.strip() == "moved", moved, (advance, overall))
 
 
 class RealGh(unittest.TestCase):
@@ -297,6 +409,24 @@ class Main(unittest.TestCase):
                                  "--run-id", "42", "--run-url", URL + "42", "--dry-run"])
         self.assertEqual(fake.writes(), [])
         self.assertIn("would be created", out.getvalue())
+
+    def test_main_writes_advance_baseline_to_the_github_output(self):
+        fake = FakeGh()
+        with tempfile.TemporaryDirectory() as directory:
+            output = os.path.join(directory, "output")
+            for run_id, (verdict, summary), expected in (("1", night(ops=800), "false"),
+                                                         ("2", warn_night(), "false"),
+                                                         ("3", night(), "true")):
+                paths = {}
+                for name, content in (("verdict.json", json.dumps(verdict)), ("summary.md", summary)):
+                    paths[name] = os.path.join(directory, name)
+                    with open(paths[name], "w") as file:
+                        file.write(content)
+                with mock.patch.object(file_issue, "Gh", return_value=fake), redirect_stdout(io.StringIO()):
+                    file_issue.main(["--verdict", paths["verdict.json"], "--summary", paths["summary.md"],
+                                     "--run-id", run_id, "--run-url", URL + run_id, "--github-output", output])
+                with open(output) as file:
+                    self.assertEqual(file.read().splitlines()[-1], "advance_baseline=" + expected)
 
     def test_main_refuses_a_run_id_the_marker_cannot_hold(self):
         with self.assertRaises(SystemExit), redirect_stdout(io.StringIO()), \
