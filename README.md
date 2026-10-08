@@ -298,13 +298,16 @@ compares the rounds pairwise: a metric that is worse than its threshold in every
 night and files a `perf-regression` issue; it never blocks a release. Results go to the
 `perf-results` branch. The job needs the repository secret `FLY_API_TOKEN_PERF`.
 
-One regression is one issue, however many nights it lasts (`perf/nightly/file_issue.py`, P121).
-Each failing metric has a fingerprint, `<metric>:<baseline commit>` (for example
+One regression is one issue, however many nights it lasts (`perf/nightly/file_issue.py`, P121,
+P122). Each failing metric has a fingerprint, `<metric>:<baseline commit>` (for example
 `load-c4-b1-ops-s:4a8aef30a882`), which the issue carries as
-`<!-- nerva-perf:fingerprint=... -->`. A failing night that shares a fingerprint with an issue
-adds a comment with its numbers, reopening the issue if it was closed; otherwise it opens one. The
-next night that passes comments "recovered" on every open `perf-regression` issue and closes it;
-a night that only warns changes nothing. To try the issue step, run the workflow by hand with
+`<!-- nerva-perf:fingerprint=... -->`. A failing night that shares a metric with an open issue,
+or a fingerprint with a closed one, adds a comment with its numbers, reopening the issue if it
+was closed; otherwise it opens one. The next night that passes comments "recovered" on every
+open issue with a fingerprint and closes it (hand-filed `perf-regression` issues are left
+alone); a night that only warns changes no issue. The baseline moves to the candidate after a
+night that passes, or one that only warns while no fingerprinted issue is open: a warn night in
+the middle of a regression does not absorb it. To try the issue step, run the workflow by hand with
 `force_verdict` set to `fail` or `pass`; to see what it would do without changing anything:
 
 ```bash
