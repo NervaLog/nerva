@@ -9,7 +9,7 @@ tour of the code for people who want to change Nerva itself.
 It assumes you are comfortable with a shell, `curl` and JSON, and know roughly what a database
 transaction is. You do not need to know Zig until the last two parts.
 
-Every reply shown below is real output from a run of these exact commands against v0.4.0.
+Every reply shown below is real output from a run of these exact commands against v0.5.0.
 **Your op numbers will differ**: see "Ops move on their own" in Part 2.
 
 > Nerva is a research database (see the [README](../README.md)). Do not put data in it that you
@@ -115,17 +115,18 @@ cd nerva-ledger
 ./zig/download.sh      # installs Zig 0.14.1 into ./zig
 ./zig/zig build        # builds zig-out/bin/nerva (a few minutes the first time)
 ./zig-out/bin/nerva version
-# Nerva version 0.0.4+549159e
+# Nerva version 0.0.5+a15fb8a
 ```
 
-The version is `<protocol release>+<commit>`: `0.0.4` is the protocol release of v0.4.0. It
+The version is `<protocol release>+<commit>`: `0.0.5` is the protocol release of v0.5.0. It
 decides which replicas, data files and clients work together (see "One release per cluster"
 below).
 
-Or skip the build: v0.4.0 binaries for Linux and macOS (x86_64, aarch64) are on the
+Or skip the build: v0.5.0 binaries for Linux and macOS (x86_64, aarch64) are on the
 [releases page](https://github.com/Botpike/nerva-ledger/releases), each with a bill of
-materials (`nerva-v0.4.0.cdx.json`) listing exactly what went into it. This tutorial matches
-v0.4.0; [CHANGELOG.md](../CHANGELOG.md) lists what each release changed.
+materials (`nerva-v0.5.0.cdx.json`) listing exactly what went into it. This tutorial matches
+v0.5.0; [CHANGELOG.md](../CHANGELOG.md) lists what each release changed, and the README's
+[Limits](../README.md#limits) section lists every limit a caller can hit.
 
 ### Start one replica
 
@@ -151,7 +152,17 @@ $NERVA start --addresses=3001 --development 1_0.nerva > replica.log 2>&1 &
   lack) and with small caches. Use it on a laptop, never in production.
 
 A replica takes 10–15 seconds to open its data file. `replica.log` says
-`listening on … port = 3001` when it is ready.
+`listening on … port = 3001` when it is ready. It also starts with a warning:
+
+```
+warning(main): NERVA_CLUSTER_KEY is unset: replicas authenticate each other with the public development key (--development, loopback addresses only)
+```
+
+Replicas prove to each other that they hold a shared secret, the **cluster key** (see "The
+cluster key" below). On a laptop, with `--development` and only loopback addresses, a missing
+key falls back to a public development key, which is fine for this tutorial and protects
+nothing. Without `--development`, or with any other address, `nerva start` refuses to run
+without a key.
 
 ### Start the JSON gateway
 
@@ -178,10 +189,11 @@ a newline could be refused with `400 malformed request`: if you see that, upgrad
 
 ### A three-replica cluster
 
-When you want the real thing, format one file per replica and give every replica every
-address:
+When you want the real thing, format one file per replica, choose a cluster key, and give
+every replica every address and the same key:
 
 ```bash
+export NERVA_CLUSTER_KEY="$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
 for i in 0 1 2; do
   $NERVA format --cluster=1 --replica=$i --replica-count=3 --development 1_$i.nerva
 done
@@ -194,21 +206,37 @@ $NERVA api --cluster=1 --addresses=3001,3002,3003 --listen=127.0.0.1:8080 &
 Everything below works identically against it. With three replicas, any one can crash and the
 cluster keeps committing.
 
+### The cluster key
+
+Before any replica message flows between two replicas, each proves that it holds
+`NERVA_CLUSTER_KEY`: an HMAC-SHA256 over fresh nonces from both sides. A process without the key
+cannot join the cluster, pose as a replica or vote. Clients and gateways don't need the key.
+
+- The key is at least 32 bytes, the same on every replica, and secret (a deployment secret, not
+  a file in the repository). `nerva start` never prints it.
+- To rotate it with no downtime, restart every replica three times: first with the new key as
+  `NERVA_CLUSTER_KEY_NEXT`; then with the new key as `NERVA_CLUSTER_KEY` and the old one as
+  `NERVA_CLUSTER_KEY_NEXT`; then without `NERVA_CLUSTER_KEY_NEXT`.
+- The key proves who opened a connection, but the traffic after that is neither encrypted nor
+  signed. Run replicas on a private network that encrypts (WireGuard, or Fly.io's 6PN), and put
+  the gateways behind TLS for any caller off that network. The README's
+  [Limits](../README.md#limits) section says what is and isn't protected.
+
 ### One release per cluster
 
 Every replica of a cluster must run the same release (the part of `nerva version` before the
-`+`). A replica ignores peers that run another release, and says so in its log:
+`+`). A replica ignores peers that run another release and says so in its log (`replica 2 runs
+release …, this replica runs 0.0.5: ignoring it (a cluster must run one release)`). Ignored
+peers count toward nobody's quorum, so a cluster with mixed releases may stop committing. A
+v0.4.0 replica can't even take part in the v0.5.0 handshake: when a v0.5.0 replica dials it, it
+exits with status 7.
 
-```
-error(replica): … replica 2 runs release 0.0.3, this replica runs 0.0.4: ignoring it (a cluster must run one release)
-```
+Data files are tied to a release too: a replica refuses a file formatted by another one. So a
+cluster moves to a new release all at once, with its data carried over by `nerva export` and
+`nerva import` ("Moving to a new release" in Part 9).
 
-Ignored peers count toward nobody's quorum, so a cluster with mixed releases may stop
-committing. Data files are tied to a release too: a replica refuses a file formatted by
-another one. So a cluster moves to a new release all at once, with its data carried over by
-`nerva export` and `nerva import` ("Moving to a new release" in Part 9). Clients follow the
-same rule: a v0.4.0 replica refuses clients of older releases when they register, so upgrade
-`nerva api`, `nerva view` and any Zig client together with the cluster.
+Clients may trail by one release: v0.5.0 replicas accept clients from v0.4.0 on, so you can
+upgrade the cluster first and `nerva api`, `nerva view` and any Zig client after it.
 
 ---
 
@@ -873,7 +901,7 @@ n -X PUT $A/v1/views/by_available -d '{"table":7,"group_by":["available"],"aggre
 n -X PUT $A/v1/views/total_held -d '{"table":7,"group_by":[],"aggregates":[{"fn":"sum","field":"held"}]}'
 # {"view":"total_held","declared":"created","maintained":true}
 n $A/v1/views/total_held
-# {"view":"total_held","op":"256",…,"declared_op":"248","groups":[{"sum_held":"75"}]}
+# {"view":"total_held","op":"256",…,"declared_op":"247","groups":[{"sum_held":"75"}]}
 ```
 
 ### Large transactions: `views_too_large`
@@ -977,7 +1005,7 @@ From then on, requests answer `503` at once instead of each waiting 30 seconds, 
 $NERVA start --addresses=3001 --development 1_0.nerva >> replica.log 2>&1 &
 # …about ten seconds later:
 n -d '{"rows":[{"table":6,"id":"1"}]}' $A/v1/lookup
-# {"op":"280","rows":[{"table":6,"id":"1","exists":true,"op":"55",…,"fields":{"available":"0","held":"50"}}]}
+# {"op":"275","rows":[{"table":6,"id":"1","exists":true,"op":"55",…,"fields":{"available":"0","held":"50"}}]}
 curl -s $A/healthz
 # {"ok":true}
 ```
@@ -1012,8 +1040,8 @@ writes safe to retry:
     {"kind":"read","table":9,"id":"9001","op_seen":"0"},
     {"kind":"put","table":9,"id":"9001","value_hex":"01"},
     {"kind":"add","table":6,"id":"1","field":"held","delta":"-10","min":"0"}]}' $A/v1/commit
-  # first:  {"status":"committed","op":"286","adds":[{"index":2,"applied":"-10","value":"40"}]}
-  # again:  {"status":"conflict","index":0,"op":"286"}     ← already applied, at op 286
+  # first:  {"status":"committed","op":"283","adds":[{"index":2,"applied":"-10","value":"40"}]}
+  # again:  {"status":"conflict","index":0,"op":"283"}     ← already applied, at op 283
   ```
 
   The conflict's `op` even tells you which op the first attempt committed at. Ledger pairs
@@ -1034,62 +1062,75 @@ You can rehearse the whole procedure with one release. Note a feed cursor first,
 check that it survives:
 
 ```bash
-n "$A/v1/changes?limit=1000"          # … "more":false,"cursor":"1791265301982935903" …
+n "$A/v1/changes?limit=1000"          # … "more":false,"cursor":"1791379930311661242" …
 
 $NERVA export --cluster=1 --addresses=3001 --output=cluster.nerva-export
-# info(export_): exporting as of op 317 (the cluster is at op 317)
-# info(main): exported to cluster.nerva-export: op 317, 52 changes, 4 views, 1 ledgers, 8 tables
+# info(export_): exporting as of op 314 (the cluster is at op 314)
+# info(main): exported to cluster.nerva-export: op 314, 52 changes, 4 views, 1 ledgers, 8 tables, export 6059f66084f7206ba2107db035fdd0f48facb69f3b1e9398c74c18bb3e8a4933
 ```
 
 The export is taken while the cluster runs, as of the op it started at (`--as-of=<op>` picks
 another). Stop writers first, or everything committed after that op is not in it. It never
 overwrites a file (`export: cluster.nerva-export exists; give a new file`), and it refuses up
-front an export that `import` would refuse, before you have stopped anything.
+front an export that `import` would refuse, before you have stopped anything. The long hex
+string at the end is the export's SHA-256: its identity, which follows the data from here on.
 
 Now stop every replica, and with the new binary import once per replica, each into a **new**
-data file:
+data file. Keep the replicas' `NERVA_CLUSTER_KEY` set as before:
 
 ```bash
 kill <pid of nerva start>            # every replica
 $NERVA import --cluster=1 --replica=0 --replica-count=1 --input=cluster.nerva-export \
     --development 1_0.new.nerva
-# info(import_): view 3: building here, ready in the export: not compared
 # info(import_): view 4: building here, ready in the export: not compared
 # info(import_): checks passed: 4 views, 1 ledgers, 8 tables
-# info(main): 0: imported cluster.nerva-export: cluster=1 replica_count=1 op=317
+# warning(main): 0: start this replica only with every replica imported from cluster.nerva-export, before the cluster runs; to replace a replica of a running cluster, export it again and import every replica
+# info(main): 0: imported cluster.nerva-export: cluster=1 replica_count=1 op=314 export=6059f660…4933
 
 $NERVA start --addresses=3001 --development 1_0.new.nerva >> replica.log 2>&1 &
+# replica.log: … listening on … port = 3001 }; data file from export 6059f660…4933
 ```
 
 `import` writes `1_0.new.nerva.importing` and renames it only once every check has passed, so
 a damaged export, a mismatch or a crash never leaves a data file you could start by mistake.
-The gateways reconnect by themselves (in a real upgrade, restart them on the new release). What
-came across:
+Like `export`, it never overwrites a file. The gateways reconnect by themselves (in a real
+upgrade, restart them on the new release when you choose). What came across:
 
 ```bash
 n -d '{"rows":[{"table":1,"id":"42"},{"table":6,"id":"1"}]}' $A/v1/lookup
-# {"op":"1042","rows":[{"table":1,"id":"42","exists":true,"op":"10",…},{"table":6,"id":"1","exists":true,"op":"286",…,"fields":{"available":"0","held":"40"}}]}
+# {"op":"1041","rows":[{"table":1,"id":"42","exists":true,"op":"10",…},{"table":6,"id":"1","exists":true,"op":"283",…,"fields":{"available":"0","held":"40"}}]}
 n $A/v1/views/revenue
 # {"view":"revenue","op":"1050","hash":"590cfdb8…",…,"declared_op":"129","groups":[{"section":1,"count":"2","sum_price":"200"},{"section":2,"count":"2","sum_price":"450"}]}
-n "$A/v1/changes?cursor=1791265301982935903&limit=10"
-# {"changes":[],"more":false,"cursor":"1791265301982935903","op":"1057"}
+n "$A/v1/changes?cursor=1791379930311661242&limit=10"
+# {"changes":[],"more":false,"cursor":"1791379930311661242","op":"1056"}
 ```
 
 - **Versions survive.** Row 42 still says version `10`, so a client holding `op_seen: "10"`
   can still compare-and-set against it.
 - **Op numbers jump.** The new cluster continues from the first checkpoint at or after the
-  export's op (op 317 became op 1042 here). Never assume ops are consecutive.
+  export's op (op 314 became op 1041 here). Never assume ops are consecutive.
 - **Cursors survive.** The cursor taken before the export reads on: nothing new yet, and after
   one more write, exactly that write.
 - **Views, ledgers, documents and layouts survive**, with each view's answer and both of its
-  hashes. Views 3 and 4 above were declared over rows that already existed, so the new cluster
-  rebuilds them after it starts (`building`, then `ready`), and their as-of history starts
-  again from there. Client sessions start again too.
+  hashes. A view that the new cluster still has to rebuild from rows that existed before it
+  was declared (view 4 above) isn't compared at import. It reports `building` until it is
+  `ready`, and its as-of history starts again from there. Client sessions start again too.
 - A view declared only through the Zig client has no catalog document, and `import` refuses
   it. Declare views through `nerva api`.
 
-v0.3.0 has no `nerva export`, so moving from v0.3.0 to v0.4.0 still means loading your data
-again. From v0.4.0 on, every upgrade works as above.
+**Every replica comes from the same export.** Each data file records the export it was
+imported from, and replicas compare it when they connect. A replica that can never reach a
+quorum with replicas of its own export exits with **status 8** (`origin_mismatch`), naming both
+exports. The others log that they ignore it and keep running. This has a consequence for
+repairs: **replacing one lost replica is a whole-cluster operation.** Export the cluster again
+and import every replica. Importing one replica alone would join and catch up, but it would
+have forgotten the prepares the lost replica had acknowledged, so a later failure could lose a
+committed op. A safe single-replica replacement is future work
+([#94](https://github.com/Botpike/nerva-ledger/issues/94)).
+
+From v0.4.0 on, every upgrade works as above: the old release's `export`, the new release's
+`import`. (v0.3.0 had no `nerva export`.) To go back from v0.5.0 to v0.4.0, export with
+v0.5.0 and import with v0.4.0, which reads v0.5.0's exports.
 
 ### Watching a replica
 
@@ -1186,9 +1227,10 @@ never `deinit`.
 
 Read this part before changing Nerva itself. Then read, in order: [CLAUDE.md](../CLAUDE.md)
 (the working protocol, which applies to people too), [docs/TIGER_STYLE.md](./TIGER_STYLE.md)
-(the coding style, which is mandatory), [docs/DECISIONS.md](./DECISIONS.md) (why things are
-the way they are, numbered N1…N82) and [UPSTREAM.md](../UPSTREAM.md) (what is vendored and
-patched).
+(the coding style, which is mandatory), the decision log (why things are the way they are:
+[docs/DECISIONS.md](./DECISIONS.md), N1 to N83, frozen, then one file per decision in
+[docs/decisions/](./decisions/), named after its pull request, such as `P102`) and
+[UPSTREAM.md](../UPSTREAM.md) (what is vendored and patched).
 
 ### Where things are
 
@@ -1206,7 +1248,9 @@ patched).
 | `src/nerva/view/` | `nerva view`: the feed follower and declared views computed in memory. |
 | `src/nerva/http_connection.zig` | The gateways' strict, bounded HTTP/1.1 receiver. |
 | `src/nerva/cli.zig`, `src/nerva_main.zig` | The `nerva` binary's commands and flags. |
-| `src/nerva/release_peers.zig` | Which peers a replica listens to: only those running its own release (N61). |
+| `src/nerva/release_peers.zig` | Which peers a replica listens to: only those running its own release (N61) and imported from the same export (P90). |
+| `src/nerva/peer_auth.zig` | The replicas' handshake: proving the cluster key (P102). |
+| `src/nerva/export.zig`, `export_file.zig`, `import.zig` | `nerva export`, the export file, and `nerva import` (N80, N81). |
 | `src/nerva/internal_operations.zig` | Operations only the cluster may send itself, such as `pulse` (N67). |
 | `src/nerva/trace_file.zig` | The buffered, bounded writer behind `--trace` (N71). |
 | `src/nerva/workload.zig` | The VOPR workload: random traffic checked against a model. |
@@ -1278,7 +1322,7 @@ check it.
 | `./zig/zig build test:integration` | Three real replicas and the Zig client | ~20 s, 3.5 GiB disk |
 | `./zig/zig build test:api` | Every JSON route against a model; write races | ~3 min |
 | `./zig/zig build test:views` | Declared and maintained views against models | ~2 min |
-| `./zig/zig build test:release` | A cluster of two releases (the odd replica is ignored), and an upgrade by export and import | ~1 min |
+| `./zig/zig build test:release` | A cluster of two releases (the odd replica is ignored), and an upgrade by export and import | ~2.5 min |
 | `./zig/zig build test:demo` | Both demos under random crashes | ~3 min |
 | `tests/jepsen/run.sh zig-out/bin/nerva test --nemesis kill,partition` | Jepsen: five real nodes in Docker, clients through `nerva api`, kills, pauses and partitions; the history is checked against what the docs promise (a ledger's conservation, so far). Needs Docker, a JDK and Leiningen; by hand | longer |
 
@@ -1293,18 +1337,33 @@ regression).
 
 ### How changes are made here
 
-- **Design first.** New types, wire or disk formats and function signatures are agreed before
-  they are implemented, along with the tests that will prove them. Larger changes go through a
-  written design step (CLAUDE.md, "DEEP WORK").
-- **Record decisions.** Add an entry to `docs/DECISIONS.md` when you decide something, and to
-  `WORKLOG.md` when you finish something.
+- **Open the pull request first**, as a draft, so you have its number: decisions and notes are
+  named after it.
+- **Design first.** When a change is larger than one file or its requirements are fuzzy, write
+  the design (types, wire and disk formats, signatures, test strategy) at the top of the pull
+  request description, then build it in small steps, running `check` and the relevant tests
+  between them.
+- **Record decisions** in `docs/decisions/P<number>-<slug>.md`, one file per decision, with a
+  short header (`id`, `date`, `area`, and `amends` or `supersedes` when it changes an earlier
+  one). `docs/DECISIONS.md` is frozen, and no one edits another pull request's decision file.
+- **Note the work** in `worklog/<number>.md`: the date, the pull request, and what was done.
+  `WORKLOG.md` is frozen too. Separate files per pull request mean no two pull requests ever
+  edit the same log.
+- **Know when to stop.** A change to a persisted format, a vendored file, a golden value you
+  can't explain, an exception to an invariant, or the toolchain stops the work: push what
+  compiles, open the pull request as a draft with a `**Question:**`, and wait for the owner.
+- **Every pull request description states** the formats it changes, the vendored files it
+  touches, and what was not verified (each may be `none` or `nothing`).
 - **Vendored code.** Prefer adding code under `src/nerva/`. If a vendored file must change,
   keep the patch minimal and list it in UPSTREAM.md in the same commit.
 - **Golden values** (snapshots, checksums) change only with an explanation of why.
 - **Pre-existing bugs** you find get a GitHub issue, even if you fix them in the same pull
   request.
 - **Releases** are a `CHANGELOG.md` section plus a `VERSION` bump, in their own commit. Each
-  release publishes binaries, `SHA256SUMS` and a bill of materials.
+  release publishes binaries, `SHA256SUMS` and a bill of materials. Before the `VERSION` commit,
+  a separate bot that did none of the release's work reviews the candidate adversarially: it
+  tries to break it, files each finding as a `release-review` issue, and the release waits until
+  every blocker is fixed or waived by the owner (P105).
 
 The VOPR simulates replicas but not real processes, and it does not simulate the gateways at all.
 The Jepsen suite (`tests/jepsen/`, N82) covers that gap. Its checks are written from the
@@ -1325,10 +1384,12 @@ result.
 
 ```bash
 nerva format --cluster=<id> --replica=<i> --replica-count=<n> [--development] <file>
+NERVA_CLUSTER_KEY=… [NERVA_CLUSTER_KEY_NEXT=…] \
 nerva start  --addresses=<a0,a1,…> [--development] [--cache-grid=…] [--cache-rows=…]
              [--statsd=<host:port>] [--trace=<new file>] [--trace-size-max=…] <file>
 NERVA_KEY=… [NERVA_KEY_NEXT=…] nerva api  --cluster=<id> --addresses=<…> --listen=<host:port>
 NERVA_KEY=… [NERVA_KEY_NEXT=…] nerva view --cluster=<id> --addresses=<…> --listen=<host:port>
+                                          # --listen=[::]:8080 for IPv6
 nerva export --cluster=<id> --addresses=<…> [--as-of=<op>] --output=<new file>
 nerva import --cluster=<id> --replica=<i> --replica-count=<n> --input=<export> [--development] <file>
 ```
@@ -1378,5 +1439,7 @@ nerva import --cluster=<id> --replica=<i> --replica-count=<n> --input=<export> [
 - 64-bit numbers are strings.
 - Follow cursors until `more` is false.
 - Never blindly retry a commit.
-- Every replica and client of a cluster runs the same release; upgrade by export and import.
+- Every replica of a cluster runs the same release and holds the same cluster key; clients may
+  trail by one release. Upgrade, or replace a lost replica, by exporting and importing the whole
+  cluster.
 - Balances that must add up belong in a ledger.
