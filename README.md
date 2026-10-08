@@ -298,6 +298,21 @@ compares the rounds pairwise: a metric that is worse than its threshold in every
 night and files a `perf-regression` issue; it never blocks a release. Results go to the
 `perf-results` branch. The job needs the repository secret `FLY_API_TOKEN_PERF`.
 
+One regression is one issue, however many nights it lasts (`perf/nightly/file_issue.py`, P121).
+Each failing metric has a fingerprint, `<metric>:<baseline commit>` (for example
+`load-c4-b1-ops-s:4a8aef30a882`), which the issue carries as
+`<!-- nerva-perf:fingerprint=... -->`. A failing night that shares a fingerprint with an issue
+adds a comment with its numbers, reopening the issue if it was closed; otherwise it opens one. The
+next night that passes comments "recovered" on every open `perf-regression` issue and closes it;
+a night that only warns changes nothing. To try the issue step, run the workflow by hand with
+`force_verdict` set to `fail` or `pass`; to see what it would do without changing anything:
+
+```bash
+python3 perf/nightly/file_issue.py --verdict verdict.json --summary summary.md \
+    --run-id 1 --run-url <url> --repo Botpike/nerva-ledger --dry-run
+python3 perf/nightly/test_file_issue.py   # its tests, offline (CI runs them)
+```
+
 ## JSON API
 
 `nerva api` serves the core operations as JSON over HTTP, for any language:
