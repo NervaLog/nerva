@@ -1,7 +1,8 @@
 # Nightly performance comparison (docs/DECISIONS.md N56): builds the candidate (main) and the
 # baseline (the last night that passed), runs both on one dedicated Fly Machine in interleaved
-# rounds (perf/nightly/), and reports. A regression files a `perf-regression` issue; it never
-# blocks a release.
+# rounds (perf/nightly/), and reports. A regression files a `perf-regression` issue, one per
+# regression however many nights it lasts (perf/nightly/file_issue.py), and the next night that
+# passes closes it; it never blocks a release.
 name: Perf nightly
 
 on:
@@ -21,6 +22,11 @@ on:
       seconds:
         description: 'Seconds per load workload'
         default: '20'
+      force_verdict:
+        description: 'File or close issues as if the night had this verdict (tests the issue step; the results are recorded as measured)'
+        type: choice
+        options: ['none', 'fail', 'pass']
+        default: 'none'
 
 permissions:
   contents: write # the perf-results branch
@@ -129,20 +135,15 @@ jobs:
             commit -qm "Nightly $(date -u +%Y-%m-%d): ${CANDIDATE_SHA:0:12} $OVERALL"
           git -C "$results" push origin perf-results
 
-      - name: File a perf-regression issue
-        if: steps.compare.outputs.overall == 'fail'
+      # One issue per regression: a failing night comments on the issue that carries one of its
+      # fingerprints (reopening it if closed) or opens one; a passing night closes them.
+      - name: File, update or close the perf-regression issue
+        if: always() && steps.compare.outcome == 'success'
         env:
           GH_TOKEN: ${{ github.token }}
-          CANDIDATE_SHA: ${{ steps.commits.outputs.candidate }}
+          FORCE_VERDICT: ${{ inputs.force_verdict != 'none' && inputs.force_verdict || '' }}
         run: |
-          gh label create perf-regression --color B60205 --description "Nightly performance regression" --force
-          {
-            cat "$RUNNER_TEMP/summary.md"
-            echo
-            echo "Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
-            echo
-            echo "Reproduce with the workflow's manual run (candidate and baseline as above), or locally:"
-            echo '`./zig/zig build -Drelease bench:load -- --local --workload=<workload> --batch=<batch>`'
-          } > "$RUNNER_TEMP/issue.md"
-          gh issue create --title "Performance regression at ${CANDIDATE_SHA:0:12}" \
-            --label perf-regression --body-file "$RUNNER_TEMP/issue.md"
+          python3 perf/nightly/file_issue.py --verdict "$RUNNER_TEMP/verdict.json" \
+            --summary "$RUNNER_TEMP/summary.md" --repo "$GITHUB_REPOSITORY" --run-id "$GITHUB_RUN_ID" \
+            --run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            ${FORCE_VERDICT:+--overall "$FORCE_VERDICT"}
