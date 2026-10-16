@@ -2,14 +2,15 @@
 
 This tutorial takes you from an empty directory to a running Nerva cluster, then through every
 capability it has today: rows and versions, transactions, the change feed and time travel, typed
-layouts, conflict-free counters, conserved ledgers, declared views, documents, and surviving a
-crash. It ends with a
+layouts, conflict-free counters, conserved ledgers, declared views, documents, commit keys,
+records and indexes, and surviving a crash. It ends with a
 tour of the code for people who want to change Nerva itself.
 
 It assumes you are comfortable with a shell, `curl` and JSON, and know roughly what a database
 transaction is. You do not need to know Zig until the last two parts.
 
-Every reply shown below is real output from a run of these exact commands against v0.5.0.
+Every reply shown below is real output from a run of these exact commands: Part 9 and the
+version in Part 1 against v0.6.0, the rest against v0.5.0 (nothing they show changed since).
 **Your op numbers will differ**: see "Ops move on their own" in Part 2.
 
 > Nerva is a research database (see the [README](../README.md)). Do not put data in it that you
@@ -26,9 +27,10 @@ Every reply shown below is real output from a run of these exact commands agains
 - [Part 6: Adds and ledgers: counters and balances](#part-6-adds-and-ledgers-counters-and-balances)
 - [Part 7: Declared views](#part-7-declared-views)
 - [Part 8: Documents: larger values by key](#part-8-documents-larger-values-by-key)
-- [Part 9: Crashes, retries and upgrades](#part-9-crashes-retries-and-upgrades)
-- [Part 10: The Zig client](#part-10-the-zig-client)
-- [Part 11: Inside Nerva, for contributors](#part-11-inside-nerva-for-contributors)
+- [Part 9: Facts beside money: commit keys, records and indexes](#part-9-facts-beside-money-commit-keys-records-and-indexes)
+- [Part 10: Crashes, retries and upgrades](#part-10-crashes-retries-and-upgrades)
+- [Part 11: The Zig client](#part-11-the-zig-client)
+- [Part 12: Inside Nerva, for contributors](#part-12-inside-nerva-for-contributors)
 - [Cheat sheet](#cheat-sheet)
 
 ---
@@ -115,17 +117,17 @@ cd nerva-ledger
 ./zig/download.sh      # installs Zig 0.14.1 into ./zig
 ./zig/zig build        # builds zig-out/bin/nerva (a few minutes the first time)
 ./zig-out/bin/nerva version
-# Nerva version 0.0.5+a15fb8a
+# Nerva version 0.0.6+0d8d13a
 ```
 
-The version is `<protocol release>+<commit>`: `0.0.5` is the protocol release of v0.5.0. It
+The version is `<protocol release>+<commit>`: `0.0.6` is the protocol release of v0.6.0. It
 decides which replicas, data files and clients work together (see "One release per cluster"
 below).
 
-Or skip the build: v0.5.0 binaries for Linux and macOS (x86_64, aarch64) are on the
+Or skip the build: v0.6.0 binaries for Linux and macOS (x86_64, aarch64) are on the
 [releases page](https://github.com/Botpike/nerva-ledger/releases), each with a bill of
-materials (`nerva-v0.5.0.cdx.json`) listing exactly what went into it. This tutorial matches
-v0.5.0; [CHANGELOG.md](../CHANGELOG.md) lists what each release changed, and the README's
+materials (`nerva-v0.6.0.cdx.json`) listing exactly what went into it. This tutorial matches
+v0.6.0; [CHANGELOG.md](../CHANGELOG.md) lists what each release changed, and the README's
 [Limits](../README.md#limits) section lists every limit a caller can hit.
 
 ### Start one replica
@@ -226,17 +228,18 @@ cannot join the cluster, pose as a replica or vote. Clients and gateways don't n
 
 Every replica of a cluster must run the same release (the part of `nerva version` before the
 `+`). A replica ignores peers that run another release and says so in its log (`replica 2 runs
-release …, this replica runs 0.0.5: ignoring it (a cluster must run one release)`). Ignored
+release …, this replica runs 0.0.6: ignoring it (a cluster must run one release)`). Ignored
 peers count toward nobody's quorum, so a cluster with mixed releases may stop committing. A
 v0.4.0 replica can't even take part in the v0.5.0 handshake: when a v0.5.0 replica dials it, it
 exits with status 7.
 
 Data files are tied to a release too: a replica refuses a file formatted by another one. So a
 cluster moves to a new release all at once, with its data carried over by `nerva export` and
-`nerva import` ("Moving to a new release" in Part 9).
+`nerva import` ("Moving to a new release" in Part 10).
 
-Clients may trail by one release: v0.5.0 replicas accept clients from v0.4.0 on, so you can
-upgrade the cluster first and `nerva api`, `nerva view` and any Zig client after it.
+Clients may trail: v0.6.0 replicas accept clients from v0.4.0 on, so you can upgrade the
+cluster first and `nerva api`, `nerva view` and any Zig client after it. (An older client
+cannot write records: `commit` refuses an entry in a record table.)
 
 ---
 
@@ -362,7 +365,7 @@ n -d '{"entries":[{"kind":"read","table":2,"id":"1001","op_seen":"0"},{"kind":"p
 ```
 
 Exactly one wins, however the two requests interleave, through crashes and network faults.
-This "receipt race" is the scenario Nerva's simulator checks on every CI run (Part 11).
+This "receipt race" is the scenario Nerva's simulator checks on every CI run (Part 12).
 
 ### All or nothing
 
@@ -979,7 +982,147 @@ going", not "done". Always loop until `more` is false.
 
 ---
 
-## Part 9: Crashes, retries and upgrades
+## Part 9: Facts beside money: commit keys, records and indexes
+
+Parts 6 and 7 moved money and summed it. A real application also keeps **facts** about each
+move: which agent reserved it, for what, and whether it settled. Nerva keeps those in the same
+log as the money, written in the same transaction, so there is nothing to reconcile (goal G1 in
+[GOALS-1.0](GOALS-1.0.md)). Three pieces make that work: commit keys, records and indexes.
+
+These examples ran on a fresh cluster, with Part 6's budget layout and 100 deposited into budget
+`1` (`{"kind":"add","table":6,"id":"1","field":"available","delta":"100","create":true}`).
+Continuing from Part 8, your amounts will differ as well as your ops.
+
+### Commit keys: send it again, it commits once
+
+A commit whose reply never arrived may or may not have applied ("The one rule about retries" in
+Part 10). A **commit key** makes the answer certain. Start the transaction with `"key"`, 16
+bytes as 32 hex digits, one per logical operation (a UUID is fine). This reserves 30 under a
+key, then sends exactly the same request again:
+
+```bash
+R='{"key":"0190f1c2a7e47b3c9d2e5f6a7b8c9d0e","entries":[
+  {"kind":"add","table":6,"id":"1","field":"available","delta":"-30","min":"0","clamp":true},
+  {"kind":"add","table":6,"id":"1","field":"held","delta_from":0}]}'
+n -d "$R" $A/v1/commit
+# {"status":"committed","op":"10","adds":[{"index":0,"applied":"-30","value":"70"},{"index":1,"applied":"30","value":"30"}]}
+n -d "$R" $A/v1/commit
+# {"status":"committed","op":"10","replayed":true}
+```
+
+The second reply names the op the first committed at, and nothing moved twice. Other entries
+under the same key are refused, because a key names one operation:
+
+```bash
+n -d '{"key":"0190f1c2a7e47b3c9d2e5f6a7b8c9d0e","entries":[…"delta":"-31"…]}' $A/v1/commit
+# {"status":"key_reused","op":"10"}                        (409)
+```
+
+A transaction that did *not* commit (a conflict, a bound) keeps no key, so its resend runs
+again. A replayed reply carries no `adds`: read the rows as of its op if you need the amounts.
+
+### Records: facts with 128-bit ids
+
+Tables from `2147483648` (`0x80000000`) up hold **records**: a 128-bit id (32 hex digits, a UUID
+say) and a 448-byte value, room for most facts. Layouts work as for rows, with bytes fields of up
+to 255:
+
+```bash
+n -X PUT $A/v1/tables/2147483649 -d '{"name":"executions","fields":[{"name":"agent","type":"bytes","size":16},{"name":"status","type":"u8"},{"name":"created","type":"u64"},{"name":"amount","type":"u64"}]}'
+# {"table":2147483649,"layout":"created"}
+```
+
+One transaction reserves the money and writes the fact, under a key:
+
+```bash
+n -d '{"key":"0190f1c2a7e47b3c9d2e5f6a7b8c9d11","entries":[
+  {"kind":"add","table":6,"id":"1","field":"available","delta":"-10","min":"0"},
+  {"kind":"add","table":6,"id":"1","field":"held","delta_from":0},
+  {"kind":"put","table":2147483649,"id":"0190f1c2a7e47b3c9d2e5f6a7b8c9e01",
+   "fields":{"agent":"a6e70000000000000000000000000001","status":1,"created":"1001","amount":"10"}}]}' $A/v1/commit
+# {"status":"committed","op":"26","adds":[{"index":0,"applied":"-10","value":"60"},{"index":1,"applied":"10","value":"40"}]}
+```
+
+(We ran it twice more, for executions `…e02` and `…e03`, created at 1002 and 1003.) If the money
+cannot move, the fact is not written either:
+
+```bash
+n -d '{"entries":[{"kind":"add",…"delta":"-1000","min":"0"},{…"delta_from":0},
+  {"kind":"put","table":2147483649,"id":"0190f1c2a7e47b3c9d2e5f6a7b8c9e09",…}]}' $A/v1/commit
+# {"status":"out_of_bounds","index":0,"value":"40"}        (409)
+n -d '{"rows":[{"table":2147483649,"id":"0190f1c2a7e47b3c9d2e5f6a7b8c9e09"}]}' $A/v1/lookup
+# {"op":"45","rows":[{"table":2147483649,"id":"0190f1c2a7e47b3c9d2e5f6a7b8c9e09","exists":false,"op":"0",…}]}
+```
+
+Reading a record is a lookup, as for rows; one lookup reads rows or records, not both:
+
+```bash
+n -d '{"rows":[{"table":2147483649,"id":"0190f1c2a7e47b3c9d2e5f6a7b8c9e01"}]}' $A/v1/lookup
+# {"op":"37","rows":[{"table":2147483649,"id":"0190f1c2a7e47b3c9d2e5f6a7b8c9e01","exists":true,"op":"26","value_hex":"…","fields":{"agent":"a6e70000000000000000000000000001","status":1,"created":"1001","amount":"10"}}]}
+```
+
+Records are written whole: an add to one answers `{"error":"records take no adds"}`. Keep
+counters and balances in rows, beside them. Their writes join the same change feed
+(`/v1/changes`), and `/v1/history` and `/v1/row?as_of` read them as they read rows.
+
+### Indexes: find facts by their fields
+
+A record is found by its id. To find "every reserved execution, oldest first" (what a reaper
+asks every minute), declare an **index**: a table, up to three `eq` fields, an `order` field
+(or, without one, the op of the last write), and an optional `where`:
+
+```bash
+n -X PUT $A/v1/indexes/reserved -d '{"table":2147483649,"order":"created","where":[{"field":"status","op":"eq","value":1}]}'
+# {"index":"reserved","id":1,"declared":"created","op":"48"}
+n -d '{"limit":2}' $A/v1/indexes/reserved/scan
+# {"index":"reserved","op":"53","records":[{"id":"…e01","op":"26","order":"1001",…},{"id":"…e02","op":"31","order":"1002",…}],"next":"1002.1792177367900271537"}
+```
+
+A scan returns the records themselves, read at the op it names, a page at a time: send `next`
+back as `"after"` for the page after. The index was declared over records that already existed;
+Nerva added them in the background, and until it is done a scan answers `503`. From then on,
+every commit keeps it exact. Settle the first execution (release what it held, mark it settled),
+and it leaves the index in the same op:
+
+```bash
+n -d '{"entries":[
+  {"kind":"add","table":6,"id":"1","field":"held","delta":"-10","min":"0"},
+  {"kind":"put","table":2147483649,"id":"0190f1c2a7e47b3c9d2e5f6a7b8c9e01",
+   "fields":{"agent":"a6e70000000000000000000000000001","status":2,"created":"1001","amount":"10"}}]}' $A/v1/commit
+# {"status":"committed","op":"58","adds":[{"index":0,"applied":"-10","value":"50"}]}
+n -d '{"max":"1002"}' $A/v1/indexes/reserved/scan
+# {"index":"reserved","op":"62","records":[{"id":"…e02","op":"31","order":"1002",…}],"next":null}
+```
+
+`eq` fields pick one key's records; `min`, `max` and `descending` bound and turn the order:
+
+```bash
+n -X PUT $A/v1/indexes/by_agent -d '{"table":2147483649,"eq":["agent"],"order":"created"}'
+n -d '{"eq":{"agent":"a6e70000000000000000000000000001"},"descending":true,"limit":5}' $A/v1/indexes/by_agent/scan
+# {"index":"by_agent","op":"71","records":[{"id":"…e03","order":"1003",…},{"id":"…e02","order":"1002",…},{"id":"…e01","op":"58","order":"1001",…,"status":2,…}],"next":null}
+n $A/v1/indexes
+# {"indexes":[{"name":"reserved","id":1,"table":2147483649,"state":"ready","declared_op":"48","record_count":"2"},{"name":"by_agent","id":2,"table":2147483649,"state":"ready","declared_op":"65","record_count":"3"}]}
+```
+
+Records that tie on the order (two executions created at the same moment) come back in the
+order they were first written. An index reads the latest state; to read the past, use history.
+
+### Views over records
+
+Part 7's views work over records too, with `count` and `sum`:
+
+```bash
+n -X PUT $A/v1/views/spend -d '{"table":2147483649,"group_by":["status"],"aggregates":[{"fn":"count"},{"fn":"sum","field":"amount"}]}'
+n $A/v1/views/spend
+# {"view":"spend","op":"86",…,"groups":[{"status":1,"count":"2","sum_amount":"20"},{"status":2,"count":"1","sum_amount":"10"}]}
+```
+
+`min` and `max` over records are refused (`{"error":"a view over records takes count and sum
+only"}`), and `nerva view` does not compute views over records: read them from `nerva api`.
+
+---
+
+## Part 10: Crashes, retries and upgrades
 
 Kill the replica the hard way, as in a power cut:
 
@@ -1027,6 +1170,11 @@ If a commit answers 503, or the connection drops, **you do not know whether it c
 may have reached the log just before the failure. Never blindly resend a write. Instead, make
 writes safe to retry:
 
+- **Commit keys** (Part 9) are the direct answer: send the same request, under the same key,
+  until you get a reply. It commits at most once, and a resend of one that did commit answers
+  `"replayed": true` with its op. The rest of this list is how it was done before keys, and
+  still works.
+
 - **Compare-and-set** writes are naturally idempotent: if the first attempt committed, the
   retry's `read` is stale and answers `conflict`. Then look the row up to see whether it holds
   your value.
@@ -1047,7 +1195,8 @@ writes safe to retry:
   The conflict's `op` even tells you which op the first attempt committed at. Ledger pairs
   are adds too: make them safe to retry the same way.
 
-The demos' client (`demo/nerva_http.py`) never retries a commit for this reason.
+The demos' client (`demo/nerva_http.py`) never retries a commit for this reason; with a key, it
+could.
 
 ### Moving to a new release
 
@@ -1129,8 +1278,14 @@ committed op. A safe single-replica replacement is future work
 ([#94](https://github.com/Botpike/nerva-ledger/issues/94)).
 
 From v0.4.0 on, every upgrade works as above: the old release's `export`, the new release's
-`import`. (v0.3.0 had no `nerva export`.) To go back from v0.5.0 to v0.4.0, export with
-v0.5.0 and import with v0.4.0, which reads v0.5.0's exports.
+`import`. (v0.3.0 had no `nerva export`.) Two things to know for v0.6.0, which the
+[CHANGELOG](../CHANGELOG.md)'s upgrade steps cover:
+
+- v0.6.0 made tables from `2147483648` up record tables. `nerva import` refuses an export with
+  rows there, naming the table: move them to lower tables with the old release first.
+- An export of a cluster that holds records or indexes is format version 2, which v0.5.0
+  cannot read. To go back to v0.5.0, export before the first record or index; once there are
+  any, there is no way back.
 
 ### Watching a replica
 
@@ -1173,7 +1328,7 @@ See [demo/README.md](../demo/README.md).
 
 ---
 
-## Part 10: The Zig client
+## Part 11: The Zig client
 
 `nerva api` exists so any language can use Nerva. Zig programs can talk to the replicas
 directly with the blocking client in `src/nerva/client.zig`, which speaks the binary protocol
@@ -1212,7 +1367,10 @@ const change: ?nerva.Change = try client.row_as_of(1, 42, op);
 ```
 
 Also available: `get_changes`, `get_history`, `declare_view`, `get_view`, `declare_ledger`,
-`get_ledger` and `get_ledger_slot` (to list the ledgers). A ledger pair is two `add` entries whose `Add` parameters set `flags.pair` on
+`get_ledger` and `get_ledger_slot` (to list the ledgers); and for Part 9, `commit_wide` (512-byte
+`WideEntry`s, rows and records in one transaction; a commit key is a first entry made by
+`nerva.commit_key_entry(key)`, widened with `WideEntry.from_entry` for `commit_wide`), `lookup_records`, `get_record_changes`, `get_record_history`,
+`declare_index`, `scan_index` and `get_index`. A ledger pair is two `add` entries whose `Add` parameters set `flags.pair` on
 the first and `flags.delta_from` on the second; the statuses `unpaired`, `conserved_write` and
 `views_too_large` come back in `EntryResult.status` like any other. When a call returns
 `error.Timeout` (the request may still have committed) or `error.Evicted` (the cluster dropped
@@ -1223,7 +1381,7 @@ never `deinit`.
 
 ---
 
-## Part 11: Inside Nerva, for contributors
+## Part 12: Inside Nerva, for contributors
 
 Read this part before changing Nerva itself. Then read, in order: [CLAUDE.md](../CLAUDE.md)
 (the working protocol, which applies to people too), [docs/TIGER_STYLE.md](./TIGER_STYLE.md)
@@ -1236,9 +1394,10 @@ Read this part before changing Nerva itself. Then read, in order: [CLAUDE.md](..
 
 | Path | What it is |
 |---|---|
-| `src/nerva.zig` | Public wire and storage types: `Row`, `Entry`, `EntryResult`, `Add`, `Change`, view types, `Operation`, `tree_ids`. Start here. |
+| `src/nerva.zig` | Public wire and storage types: `Row`, `Entry`, `WideEntry`, `Record`, `EntryResult`, `Add`, `Change`, view and index types, `Operation`, `tree_ids`. Start here. |
 | `src/nerva/state_machine.zig` | The commit core: `prefetch` and `commit` for every operation. |
 | `src/nerva/views.zig` | The pure parts of maintained views: validation, group keys, digests. |
+| `src/nerva/indexes.zig` | The pure parts of declared indexes: validation, an entry's place, position prefixes (P123c). |
 | `src/nerva/ledgers.zig` | Ledgers: a declaration's checks, and the index that finds conserved fields (N75). |
 | `src/nerva/catalog.zig` | Layouts and view declarations as data; field packing. |
 | `src/nerva/documents.zig` | Chunking documents over rows. |
@@ -1320,9 +1479,9 @@ check it.
 | `./zig/zig build fuzz -- smoke` | Every fuzzer, briefly | minutes |
 | `./zig/zig build vopr -- <seed>` | Simulated cluster under faults | ~5 min |
 | `./zig/zig build test:integration` | Three real replicas and the Zig client | ~20 s, 3.5 GiB disk |
-| `./zig/zig build test:api` | Every JSON route against a model; write races | ~3 min |
+| `./zig/zig build test:api` | Every JSON route against a model (records and indexes included); write races; commit-key resends | ~3 min |
 | `./zig/zig build test:views` | Declared and maintained views against models | ~2 min |
-| `./zig/zig build test:release` | A cluster of two releases (the odd replica is ignored), and an upgrade by export and import | ~2.5 min |
+| `./zig/zig build test:release` | A cluster of two releases (the odd replica is ignored), and an upgrade by export and import, without and with records | ~4 min |
 | `./zig/zig build test:demo` | Both demos under random crashes | ~3 min |
 | `tests/jepsen/run.sh zig-out/bin/nerva test --nemesis kill,partition` | Jepsen: five real nodes in Docker, clients through `nerva api`, kills, pauses and partitions; the history is checked against what the docs promise (a ledger's conservation, so far). Needs Docker, a JDK and Leiningen; by hand | longer |
 

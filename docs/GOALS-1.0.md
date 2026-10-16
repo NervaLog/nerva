@@ -33,6 +33,10 @@ that follow are the goals below.
 **G1. One log, no dual truth.** A reservation and the record of its attempt, a settlement and
 its receipt, commit in the same transaction. There is nothing to reconcile because there is only
 one history.
+*Delivered in the engine* (v0.6.0): facts are records with 128-bit ids, written by `commit_wide`
+in the transaction that moves their money (P123b); declared indexes find them by their fields
+(P123c); a commit key makes a resent transaction commit at most once (P123). The first
+application still keeps its facts in PostgreSQL until it moves them (Milestone 7).
 
 **G2. Every read names its position.** Every reply is stamped with the op it reflects. A reader
 can demand "at least op M" (read-your-writes on any view) or "as of op N". Freshness is a
@@ -111,3 +115,9 @@ balances kept in a dedicated ledger, with Nerva holding facts, receipts and view
      declared ledgers (N75) refuse any move that is not a balanced pair within floors.
 7. **First production use**: the dog-fooding service's facts, receipts and views on Nerva
    through the generic API, balances in declared ledgers (G8, N75).
+   - The engine side is in v0.6.0: commit keys (P123), records (P123b), declared indexes
+     (P123c) and views over records (P123d), from the inventory in
+     `docs/design/phase-b-storage.md`. Not yet: `group_by` on `bytes` fields, index reads as of
+     a past op, and retention of keys and facts.
+   - The application side is next: its ledger on commit keys, then its facts as records, step
+     by step (`docs/test-plan-0.6.0.md` items 1 to 3).

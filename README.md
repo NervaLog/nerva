@@ -248,7 +248,9 @@ nerva start --addresses=3001,3002,3003 0_0.nerva   # and 0_1, 0_2
   replica's file is identical.
 - What carries over: rows, versions (a client's `op_seen` still holds), history, `row?as_of`,
   the change feed with its timestamps (a cursor from before continues), documents, layouts,
-  ledgers, and every view's answer and hash. A view declared over rows that already existed is
+  ledgers, commit keys, records and their history, and every view's answer and hash. Indexes
+  are declared again at their ops and rebuilt by the new cluster's pulses; a scan's order and
+  cursors are the same as before (P123c). A view declared over rows that already existed is
   rebuilt by the new cluster after it starts (`"state": "building"` until then), and its as-of
   history starts there; client sessions do not carry over.
 - Op numbers jump: the new cluster goes on from the first checkpoint at or after the export's
@@ -266,6 +268,13 @@ nerva start --addresses=3001,3002,3003 0_0.nerva   # and 0_1, 0_2
   (P90). A formatted replica cannot join an imported cluster either: its origin is none.
 - A view declared only through the Zig client, with no catalog document, cannot be imported:
   `import` refuses it. Declare views through `nerva api`.
+- **Format versions.** An export of a cluster with records or indexes is version 2 (P123b);
+  any other is version 1, which every release since v0.4.0 reads. A release reads both. From
+  v0.5.0 to v0.6.0, rows in tables from `2147483648` up must move below it first: those tables
+  now hold records, and `import` refuses such rows by name (P123e).
+- **Memory.** v0.6.0's replica takes about 0.5 GiB more than v0.5.0's (3.0 GB at startup with
+  the defaults, from 2.5 GB); `--cache-grid=512MiB` brings it back, at the cost of more reads
+  from disk (#127).
 - Measured (`perf/upgrade.py`, a 4-CPU sandbox, `--development`): a million changes over
   970,000 rows exported in 5.8 s (365 MiB at most) and imported in 14 s (1.2 GiB, the state
   machine's fixed allocation, as a replica's); the export file is 121 bytes a change.
