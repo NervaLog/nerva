@@ -49,6 +49,7 @@ const views = @import("views.zig");
 const ledgers = @import("ledgers.zig");
 const RowKey = nerva.RowKey;
 const RowValue = nerva.RowValue;
+const CommitKey = nerva.CommitKey;
 const Change = nerva.Change;
 const ChangesFilter = nerva.ChangesFilter;
 const HistoryFilter = nerva.HistoryFilter;
@@ -990,6 +991,10 @@ pub fn StateMachineType(comptime Storage: type) type {
             const rows = &self.forest.grooves.rows;
             rows.prefetch_setup(self.prefetch_snapshot.?);
             for (events) |*event| {
+                if (Event == Entry and event.kind == .key) {
+                    rows.prefetch_enqueue(.{ .key = commit_key_row(event) });
+                    continue;
+                }
                 if (event.table == 0) continue;
                 rows.prefetch_enqueue(.{ .key = nerva.row_key(event.table, event.id) });
             }
@@ -1324,6 +1329,7 @@ pub fn StateMachineType(comptime Storage: type) type {
                     assert(result.status == .ok);
                     switch (entry.kind) {
                         .read => {},
+                        .key => self.commit_key_put(op, entry_timestamp, entries),
                         .put => self.row_put(op, entry_timestamp, entry, &entry.value),
                         .delete => self.row_delete(op, entry_timestamp, entry),
                         .add => self.row_add(op, entry_timestamp, entry, result),
@@ -1336,7 +1342,8 @@ pub fn StateMachineType(comptime Storage: type) type {
         }
 
         /// The first reason the transaction cannot commit, or null.
-        /// The views budget comes first (prefetch decided it: `views_busy`, `views_too_large`),
+        /// A key already committed comes first: a resend must report it, whatever else changed
+        /// since. Then the views budget (prefetch decided it: `views_busy`, `views_too_large`),
         /// then static checks (per entry, then pairs: N75), then duplicate writes, then read
         /// conflicts.
         fn commit_failure(
@@ -1344,6 +1351,7 @@ pub fn StateMachineType(comptime Storage: type) type {
             entries: []const Entry,
             admission: views.Admission,
         ) ?Failure {
+            if (self.commit_key_failure(entries)) |failure| return failure;
             if (admission != .fits) {
                 const index = for (entries, 0..) |*entry, index| {
                     if (self.entry_viewed(entry)) break index;
@@ -1355,6 +1363,9 @@ pub fn StateMachineType(comptime Storage: type) type {
                 };
             }
             for (entries, 0..) |*entry, index| {
+                if (entry.kind == .key and index > 0) {
+                    return .{ .index = @intCast(index), .status = .key_misplaced, .op = 0 };
+                }
                 if (nerva.entry_validate(entry)) |status| {
                     return .{ .index = @intCast(index), .status = status, .op = 0 };
                 }
@@ -1472,7 +1483,8 @@ pub fn StateMachineType(comptime Storage: type) type {
         fn write_duplicate(self: *StateMachine, entries: []const Entry) ?u32 {
             var count: u32 = 0;
             for (entries, 0..) |*entry, index| {
-                if (entry.kind == .read) continue;
+                // A key's row is written only when no row is there (`commit_key_failure`).
+                if (entry.kind == .read or entry.kind == .key) continue;
                 self.write_keys[count] = .{
                     .key = nerva.row_key(entry.table, entry.id),
                     .index = @intCast(index),
@@ -1496,6 +1508,74 @@ pub fn StateMachineType(comptime Storage: type) type {
                 duplicate = @min(duplicate orelse b.index, b.index);
             }
             return duplicate;
+        }
+
+        /// The LSM key of the row a `key` entry's key is kept in.
+        fn commit_key_row(entry: *const Entry) u128 {
+            assert(entry.kind == .key);
+            return nerva.row_key(
+                nerva.table_commit_keys,
+                nerva.commit_key_id(CommitKey.entry_key(entry)),
+            );
+        }
+
+        /// The checksum a key's row keeps of the transaction's entries after its key entry.
+        fn commit_key_checksum(entries: []const Entry) u128 {
+            assert(entries[0].kind == .key);
+            return vsr.checksum(std.mem.sliceAsBytes(entries[1..]));
+        }
+
+        /// Why a transaction that starts with a valid key cannot commit because the key's row
+        /// exists, or null. The row is the key's own (`committed_before` if it holds these
+        /// entries, else `key_reused`) or another key's (`key_collision`); each reports the op
+        /// that wrote the row. Rows of `table_commit_keys` are written only by
+        /// `commit_key_put`, once each, so the row's op is the op its transaction committed at.
+        fn commit_key_failure(self: *StateMachine, entries: []const Entry) ?Failure {
+            if (entries.len == 0 or entries[0].kind != .key) return null;
+            // An invalid key entry is reported by the static checks.
+            if (nerva.entry_validate(&entries[0]) != null) return null;
+            const row = switch (self.forest.grooves.rows.get(commit_key_row(&entries[0]))) {
+                .found_object => |row| row,
+                .not_found => return null,
+            };
+            assert(!row.flags.deleted);
+            assert(row.op > 0);
+            const stored = std.mem.bytesToValue(CommitKey, &row.value);
+            assert(stored.key != 0);
+            assert(stdx.zeroed(&stored.reserved));
+            const status: EntryStatus = if (stored.key != CommitKey.entry_key(&entries[0]))
+                .key_collision
+            else if (stored.entry_count == entries.len - 1 and
+                stored.checksum == commit_key_checksum(entries))
+                .committed_before
+            else
+                .key_reused;
+            return .{ .index = 0, .status = status, .op = row.op };
+        }
+
+        /// Writes the key's row of a transaction that commits under a key (it is the first
+        /// entry). The row was absent: `commit_key_failure` found none.
+        fn commit_key_put(
+            self: *StateMachine,
+            op: u64,
+            timestamp: u64,
+            entries: []const Entry,
+        ) void {
+            const key = CommitKey.entry_key(&entries[0]);
+            const stored: CommitKey = .{
+                .key = key,
+                .checksum = commit_key_checksum(entries),
+                .entry_count = @intCast(entries.len - 1),
+            };
+            const entry: Entry = .{
+                .id = nerva.commit_key_id(key),
+                .table = nerva.table_commit_keys,
+                .kind = .put,
+                .op_seen = 0,
+                .value = std.mem.toBytes(stored),
+            };
+            assert(self.row_version(commit_key_row(&entries[0])) == 0);
+            self.row_put(op, timestamp, &entry, &entry.value);
         }
 
         /// The row's version: the op of its last write, or zero if it has never existed.
@@ -1922,6 +2002,12 @@ pub fn StateMachineType(comptime Storage: type) type {
         fn view_txn_admit(self: *StateMachine, entries: []const Entry) views.Admission {
             self.view_txn_keys.clearRetainingCapacity();
             self.view_txn_members.clearRetainingCapacity();
+            // A transaction whose key's row exists writes nothing (`commit_key_failure`).
+            if (entries.len > 0 and entries[0].kind == .key and
+                self.forest.grooves.rows.get(commit_key_row(&entries[0])) == .found_object)
+            {
+                return .fits;
+            }
             const admission: views.Admission = admission: {
                 for (entries) |*entry| {
                     if (!self.entry_viewed(entry)) continue;

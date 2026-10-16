@@ -103,6 +103,9 @@ pub const EntryKind = enum(u8) {
     delete = 3,
     /// Adds a delta to one field of the row, inside the commit; parameters in `value` (`Add`).
     add = 4,
+    /// The transaction's commit key (`CommitKey`): only as its first entry, with `table` and
+    /// `id` zero and the key in `value`'s first 16 bytes.
+    key = 5,
     _,
 };
 
@@ -167,13 +170,77 @@ pub const EntryStatus = enum(u32) {
     /// changes its bytes, a delete of a row where it is not zero, or an add that overlaps it
     /// without matching it.
     conserved_write = 17,
+    /// The transaction's key was committed before, by these same entries, at `op`: nothing
+    /// applied now. A resend of a transaction whose reply was lost (`CommitKey`).
+    committed_before = 18,
+    /// Other entries committed under this key, at `op`: nothing applied, and these entries can
+    /// never commit under it.
+    key_reused = 19,
+    /// Another key holds this key's row (their row ids collide): nothing applied, and nothing
+    /// ever committed under this key. Commit under another key.
+    key_collision = 20,
+    /// A `key` entry that is not the transaction's first entry.
+    key_misplaced = 21,
+    /// A `key` entry whose key is zero, or whose `table`, `id` or rest of `value` is not zero.
+    key_invalid = 22,
 };
+
+/// Commit keys make a resent transaction commit at most once (docs/decisions, P<n>). A
+/// transaction may start with a `key` entry naming a 128-bit key the client chose. When the
+/// transaction commits, the state machine also writes the key's row: a row of
+/// `table_commit_keys`, at `commit_key_id(key)`, holding a `CommitKey`. The row is written once
+/// and never changed. A later transaction under the same key commits nothing: it reports
+/// `committed_before` (the same entries, at the original op), `key_reused` (other entries) or
+/// `key_collision` (another key's row) on its key entry, and `aborted` on the rest. A
+/// transaction that did not commit writes no key, so resending it executes it again.
+pub const table_commit_keys: u32 = 0xFFFF_0003;
+
+/// A key row's value.
+pub const CommitKey = extern struct {
+    key: u128,
+    /// `vsr.checksum` of the transaction's entries after its key entry.
+    checksum: u128,
+    /// The transaction's entries after its key entry.
+    entry_count: u32,
+    reserved: [44]u8 = @splat(0),
+
+    comptime {
+        assert(@sizeOf(CommitKey) == value_size);
+        assert(stdx.no_padding(CommitKey));
+    }
+
+    /// The key a `key` entry names.
+    pub fn entry_key(entry: *const Entry) u128 {
+        assert(entry.kind == .key);
+        return std.mem.readInt(u128, entry.value[0..16], .little);
+    }
+};
+
+/// The `key` entry that starts a transaction committed under `key`.
+pub fn commit_key_entry(key: u128) Entry {
+    assert(key != 0);
+    var entry: Entry = .{ .id = 0, .table = 0, .kind = .key, .op_seen = 0, .value = @splat(0) };
+    std.mem.writeInt(u128, entry.value[0..16], key, .little);
+    return entry;
+}
+
+/// The id of `key`'s row in `table_commit_keys`: the first 8 bytes of SHA-256, little-endian.
+/// Persisted: never change the derivation.
+pub fn commit_key_id(key: u128) u64 {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("nerva.commit_key.v1");
+    hash.update(std.mem.asBytes(&std.mem.nativeToLittle(u128, key)));
+    var digest: [32]u8 = undefined;
+    hash.final(&digest);
+    return std.mem.readInt(u64, digest[0..8], .little);
+}
 
 /// The `commit` result, one per entry.
 pub const EntryResult = extern struct {
     status: EntryStatus,
     reserved_a: u32 = 0,
     /// `ok`: the op the transaction committed at. `conflict`: the row's current version.
+    /// `committed_before`, `key_reused`, `key_collision`: the op the key's row was written at.
     /// Otherwise zero.
     op: u64,
     /// `add`, when `ok`: the amount added, after clamping. Otherwise zero.
@@ -951,7 +1018,17 @@ pub const Operation = enum(u8) {
 
 /// Static checks on one entry, independent of state. Returns null if the entry is valid.
 pub fn entry_validate(entry: *const Entry) ?EntryStatus {
-    if (entry.table == 0) return .table_invalid;
+    if (entry.kind == .key) {
+        if (entry.table != 0 or entry.id != 0 or entry.op_seen != 0 or
+            !stdx.zeroed(entry.value[16..]) or CommitKey.entry_key(entry) == 0)
+        {
+            return .key_invalid;
+        }
+    } else {
+        if (entry.table == 0) return .table_invalid;
+        // Only the state machine writes key rows, for `key` entries.
+        if (entry.table == table_commit_keys) return .table_invalid;
+    }
     if (!stdx.zeroed(&entry.reserved_a) or entry.reserved_b != 0 or
         !stdx.zeroed(&entry.reserved_c))
     {
@@ -972,6 +1049,7 @@ pub fn entry_validate(entry: *const Entry) ?EntryStatus {
             if (entry.op_seen != 0) return .op_seen_not_zero;
             return add_validate(&Add.from_entry(entry));
         },
+        .key => {},
         _ => return .kind_invalid,
     }
     return null;

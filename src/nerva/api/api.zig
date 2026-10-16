@@ -290,10 +290,12 @@ fn lookup(arena: std.mem.Allocator, client: anytype, layouts: anytype, body: []c
 
 fn commit(arena: std.mem.Allocator, client: anytype, layouts: anytype, body: []const u8) !Reply {
     const Request = struct {
+        key: ?[]const u8 = null,
         entries: []const EntryRequest,
     };
     const request = try json_parse(Request, arena, body);
     if (request.entries.len == 0) return bad("entries must not be empty");
+    const key: ?u128 = if (request.key) |text| try key_parse(text) else null;
 
     const entries = try arena.alloc(Entry, request.entries.len);
     // Per entry: an add's field type, for rendering its value.
@@ -357,10 +359,49 @@ fn commit(arena: std.mem.Allocator, client: anytype, layouts: anytype, body: []c
         assert(nerva.entry_validate(entry) == null);
     }
 
-    const results = try arena.alloc(EntryResult, entries.len);
-    try client.commit(entries, results);
+    // Under a key, the transaction starts with its key entry, so every index moves by one.
+    const sent: []const Entry = if (key) |k| sent: {
+        const sent = try arena.alloc(Entry, entries.len + 1);
+        sent[0] = nerva.commit_key_entry(k);
+        for (sent[1..], entries) |*entry_sent, entry| {
+            entry_sent.* = entry;
+            if (entry.kind != .add) continue;
+            var add = nerva.Add.from_entry(&entry);
+            if (!add.flags.delta_from) continue;
+            add.delta_from += 1;
+            entry_sent.value = add.value();
+        }
+        break :sent sent;
+    } else entries;
+    const results_sent = try arena.alloc(EntryResult, sent.len);
+    try client.commit(sent, results_sent);
 
     var out = Writer.init(arena);
+    if (key != null) {
+        const result = results_sent[0];
+        switch (result.status) {
+            .ok, .aborted => {},
+            // A resend of a transaction that committed: nothing applied now. Its adds' amounts
+            // are not kept: read the rows as of `op`.
+            .committed_before => {
+                try out.raw("{\"status\":\"committed\",\"op\":");
+                try out.number(result.op);
+                try out.raw(",\"replayed\":true}");
+                return .{ .status = 200, .body = out.items() };
+            },
+            .key_reused, .key_collision => {
+                try out.print("{{\"status\":\"{s}\",\"op\":", .{@tagName(result.status)});
+                try out.number(result.op);
+                try out.raw("}");
+                return .{ .status = 409, .body = out.items() };
+            },
+            else => std.debug.panic("api: commit rejected key: {s}", .{
+                @tagName(result.status),
+            }),
+        }
+    }
+    const results = results_sent[@intFromBool(key != null)..];
+    assert(results.len == entries.len);
     for (results, 0..) |result, index| {
         switch (result.status) {
             .ok, .aborted => continue,
@@ -1262,6 +1303,17 @@ pub fn limit_parse(text: ?[]const u8) error{BadRequest}!u32 {
     return @intCast(@min(value, page_limit_max));
 }
 
+/// A commit key: 16 bytes as 32 hex digits, not all zero. The bytes are the key's row value's
+/// first 16 (`nerva.CommitKey`), so the key is them read little-endian.
+fn key_parse(text: []const u8) error{BadRequest}!u128 {
+    if (text.len != 32) return bad("key must be 16 bytes of hex");
+    var bytes: [16]u8 = undefined;
+    _ = std.fmt.hexToBytes(&bytes, text) catch return bad("key is not hex");
+    const key = std.mem.readInt(u128, &bytes, .little);
+    if (key == 0) return bad("key must not be zero");
+    return key;
+}
+
 fn value_parse(text: []const u8) error{BadRequest}![value_size]u8 {
     if (text.len % 2 != 0 or text.len > value_size * 2) {
         return bad("value_hex must be at most 80 bytes of hex");
@@ -1357,6 +1409,8 @@ const testing = std.testing;
 const FakeClient = struct {
     op: u64 = 0,
     rows: std.AutoArrayHashMapUnmanaged(u128, Version) = .{},
+    /// Commit keys: the op and a hash of the entries each committed.
+    keys: std.AutoArrayHashMapUnmanaged(u128, struct { op: u64, hash: u64 }) = .{},
     allocator: std.mem.Allocator,
     /// Answers `declare_view`, for the tests that set it; the rest are covered by
     /// `tests/views/maintained.py`.
@@ -1383,6 +1437,18 @@ const FakeClient = struct {
 
     pub fn commit(fake: *FakeClient, entries: []const Entry, results: []EntryResult) Error!void {
         fake.op += 1;
+        const keyed = entries[0].kind == .key;
+        const hash = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(entries[1..]));
+        if (keyed) {
+            if (fake.keys.get(nerva.CommitKey.entry_key(&entries[0]))) |committed| {
+                results[0] = .{
+                    .status = if (committed.hash == hash) .committed_before else .key_reused,
+                    .op = committed.op,
+                };
+                @memset(results[1..], .{ .status = .aborted, .op = 0 });
+                return;
+            }
+        }
         for (entries, 0..) |entry, index| {
             if (entry.kind != .read) continue;
             const found = fake.rows.get(nerva.row_key(entry.table, entry.id));
@@ -1395,8 +1461,14 @@ const FakeClient = struct {
                 return;
             }
         }
+        if (keyed) {
+            try fake.keys.put(fake.allocator, nerva.CommitKey.entry_key(&entries[0]), .{
+                .op = fake.op,
+                .hash = hash,
+            });
+        }
         for (entries) |entry| {
-            if (entry.kind == .read) continue;
+            if (entry.kind == .read or entry.kind == .key) continue;
             try fake.rows.put(fake.allocator, nerva.row_key(entry.table, entry.id), .{
                 .op = fake.op,
                 .exists = entry.kind == .put,
@@ -1651,6 +1723,66 @@ test "api: lookup and commit translate to and from JSON" {
     try testing.expectEqualStrings(
         \\{"status":"conflict","index":1,"op":"2"}
     , stale.body);
+}
+
+test "api: a commit under a key commits once" {
+    var arena_instance = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_instance.deinit();
+    const arena = arena_instance.allocator();
+    var fake: FakeClient = .{ .allocator = arena };
+    const put =
+        \\{"key":"0123456789abcdef0123456789abcdef",
+        \\ "entries":[{"kind":"read","table":1,"id":"5","op_seen":"0"},
+        \\            {"kind":"put","table":1,"id":"5","value_hex":"c0ffee"}]}
+    ;
+
+    const first = try handle(arena, &fake, no_layouts, .post, "/v1/commit", put);
+    try testing.expectEqual(@as(u16, 200), first.status);
+    try testing.expectEqualStrings(
+        \\{"status":"committed","op":"1"}
+    , first.body);
+
+    // Its resend applies nothing, and answers the op it committed at.
+    const resend = try handle(arena, &fake, no_layouts, .post, "/v1/commit", put);
+    try testing.expectEqual(@as(u16, 200), resend.status);
+    try testing.expectEqualStrings(
+        \\{"status":"committed","op":"1","replayed":true}
+    , resend.body);
+
+    // Other entries under the same key never commit.
+    const reused = try handle(arena, &fake, no_layouts, .post, "/v1/commit",
+        \\{"key":"0123456789abcdef0123456789abcdef",
+        \\ "entries":[{"kind":"read","table":1,"id":"5","op_seen":"1"},
+        \\            {"kind":"put","table":1,"id":"5","value_hex":"c0ffee"}]}
+    );
+    try testing.expectEqual(@as(u16, 409), reused.status);
+    try testing.expectEqualStrings(
+        \\{"status":"key_reused","op":"1"}
+    , reused.body);
+
+    // Under another key, indices are the request's: the key entry is not counted.
+    const stale = try handle(arena, &fake, no_layouts, .post, "/v1/commit",
+        \\{"key":"00000000000000000000000000000001",
+        \\ "entries":[{"kind":"read","table":1,"id":"5","op_seen":"0"}]}
+    );
+    try testing.expectEqual(@as(u16, 409), stale.status);
+    try testing.expectEqualStrings(
+        \\{"status":"conflict","index":0,"op":"1"}
+    , stale.body);
+
+    const keys_bad = [_][]const u8{
+        "00000000000000000000000000000000",
+        "0123456789abcdef",
+        "0123456789abcdef0123456789abcdef00",
+        "0123456789abcdef0123456789abcdeg",
+    };
+    for (keys_bad) |key| {
+        const body = try std.fmt.allocPrint(arena,
+            \\{{"key":"{s}","entries":[{{"kind":"read","table":1,"id":"5","op_seen":"1"}}]}}
+        , .{key});
+        const reply = try handle(arena, &fake, no_layouts, .post, "/v1/commit", body);
+        try testing.expectEqual(@as(u16, 400), reply.status);
+    }
 }
 
 test "api: bad requests are refused before reaching the cluster" {

@@ -124,6 +124,8 @@ test "format: wire and storage layouts" {
         nerva.DeclareLedgerResult,
         nerva.LedgerQuery,
         nerva.Ledger,
+        // Commit keys (P<n>): a key's row value in `table_commit_keys`.
+        nerva.CommitKey,
     }) |T| try layout_render(writer, T);
 
     // Tree ids name the LSM trees in the data file: never renumber them (CLAUDE.md).
@@ -160,6 +162,7 @@ test "format: wire and storage layouts" {
         \\  put = 2
         \\  delete = 3
         \\  add = 4
+        \\  key = 5
         \\nerva.EntryResult: extern struct, size 32
         \\  status: offset 0, size 4, nerva.EntryStatus
         \\  reserved_a: offset 4, size 4, u32
@@ -185,6 +188,11 @@ test "format: wire and storage layouts" {
         \\  views_too_large = 15
         \\  unpaired = 16
         \\  conserved_write = 17
+        \\  committed_before = 18
+        \\  key_reused = 19
+        \\  key_collision = 20
+        \\  key_misplaced = 21
+        \\  key_invalid = 22
         \\nerva.Add: extern struct, size 80
         \\  delta: offset 0, size 8, i64
         \\  min: offset 8, size 8, u64
@@ -448,6 +456,11 @@ test "format: wire and storage layouts" {
         \\  reserved_a: offset 24, size 8, u64
         \\  definition: offset 32, size 264, nerva.LedgerDefinition
         \\  reserved_b: offset 296, size 216, [216]u8
+        \\nerva.CommitKey: extern struct, size 80
+        \\  key: offset 0, size 16, u128
+        \\  checksum: offset 16, size 16, u128
+        \\  entry_count: offset 32, size 4, u32
+        \\  reserved: offset 36, size 44, [44]u8
         \\tree_ids:
         \\  Row.timestamp = 1
         \\  Row.key = 2
@@ -488,6 +501,13 @@ test "format: persisted derivations" {
     try testing.expectEqual(@as(u64, 14508685050127223560), id0);
     try testing.expectEqual(@as(u64, 4613465043632273798), documents.tail_id(id0, 1));
     try testing.expectEqual(@as(u64, 4590579942568114901), documents.tail_id(id0, 2));
+
+    // Commit keys' row ids (P<n>), computed apart from this code (Python's hashlib).
+    try testing.expectEqual(@as(u64, 10562569181977696665), nerva.commit_key_id(1));
+    try testing.expectEqual(
+        @as(u64, 6225441356227291988),
+        nerva.commit_key_id(0x0123_4567_89ab_cdef_0123_4567_89ab_cdef),
+    );
 
     // Views' members and versions (N62), computed apart from this code (Python's hashlib and
     // integers): the members tree's keys and the order prefix, and both versions' keys.

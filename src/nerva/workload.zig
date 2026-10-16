@@ -15,6 +15,10 @@
 //! all fail. The checker asserts, independently of the row model, that the ledger's total stays
 //! what it was at its declaration (zero), and that no floored field goes below its floor.
 //!
+//! And commit keys (P<n>): some transactions start with a key, and some are sent again, as
+//! sent or with other entries. The model keeps each committed key's entries, so a resend must
+//! report `committed_before` at the op its transaction committed at, and apply nothing.
+//!
 //! The simulator delivers replies in op order, so the workload checks each reply against an
 //! in-memory model of the committed state at that op: every status, version, value and change
 //! must match exactly. This checks strict serializability of commits and the change feed.
@@ -211,11 +215,20 @@ fn timestamp_invalid(prng: *stdx.PRNG) u64 {
 fn entry_status_check(entry: *const Entry, status: ?EntryStatus) void {
     var broken = std.EnumSet(EntryStatus).initEmpty();
     const kind_known = switch (entry.kind) {
-        .read, .put, .delete, .add => true,
+        .read, .put, .delete, .add, .key => true,
         _ => false,
     };
     if (!kind_known) broken.insert(.kind_invalid);
-    if (entry.table == 0) broken.insert(.table_invalid);
+    if (entry.kind == .key) {
+        // A key names no row: the state machine derives its row from the key.
+        if (entry.table != 0 or entry.id != 0 or entry.op_seen != 0 or
+            !stdx.zeroed(entry.value[16..]) or stdx.zeroed(entry.value[0..16]))
+        {
+            broken.insert(.key_invalid);
+        }
+    } else if (entry.table == 0 or entry.table == nerva.table_commit_keys) {
+        broken.insert(.table_invalid);
+    }
     if (!stdx.zeroed(&entry.reserved_a) or entry.reserved_b != 0 or
         !stdx.zeroed(&entry.reserved_c))
     {
@@ -281,6 +294,7 @@ pub fn WorkloadType(comptime StateMachine: type) type {
         /// An add's expected result.
         const Expected = struct { applied: i64 = 0, value: u64 = 0 };
         const transaction_entries_max = 64;
+        const keyed_sent_max = 16;
 
         /// Per hot budget, from the adds' results alone: what was funded, and where it is.
         const Budget = struct { funded: u64 = 0, available: u64 = 0, held: u64 = 0 };
@@ -353,6 +367,14 @@ pub fn WorkloadType(comptime StateMachine: type) type {
         ledger_reads: u64 = 0,
         adds_applied: u64 = 0,
         adds_clamped: u64 = 0,
+        /// Commit keys (P<n>): each committed key's entries after its key entry, to tell a resend
+        /// (`committed_before`) from other entries under the key (`key_reused`).
+        committed_keys: std.AutoHashMapUnmanaged(u128, []const Entry) = .{},
+        /// Transactions sent under a key, to send again; at most `keyed_sent_max`.
+        keyed_sent: std.ArrayListUnmanaged([]const Entry) = .{},
+        keyed_committed: u64 = 0,
+        keyed_resent: u64 = 0,
+        key_refused: std.EnumArray(EntryStatus, u64) = .initFill(0),
         /// Scratch: the expected results of the transaction being checked (any size, up to a full
         /// batch).
         expected: []Expected,
@@ -503,6 +525,20 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                 workload.ledger_refused.get(.row_absent),
                 workload.ledger_reads,
             });
+            log.info("commit keys committed={} resent={} committed_before={} key_reused={} " ++
+                "key_misplaced={} key_invalid={}", .{
+                workload.keyed_committed,
+                workload.keyed_resent,
+                workload.key_refused.get(.committed_before),
+                workload.key_refused.get(.key_reused),
+                workload.key_refused.get(.key_misplaced),
+                workload.key_refused.get(.key_invalid),
+            });
+            var committed_keys = workload.committed_keys.valueIterator();
+            while (committed_keys.next()) |entries| allocator.free(entries.*);
+            workload.committed_keys.deinit(allocator);
+            for (workload.keyed_sent.items) |entries| allocator.free(entries);
+            workload.keyed_sent.deinit(allocator);
             workload.model_ledgers.deinit(allocator);
             workload.ledger_values.deinit(allocator);
             allocator.free(workload.expected);
@@ -646,6 +682,10 @@ pub fn WorkloadType(comptime StateMachine: type) type {
             for (0..batch_count) |_| {
                 const writable = encoder.writable() orelse break;
                 const entries_free = stdx.bytes_as_slice(.inexact, Entry, writable);
+                if (workload.build_resend(entries_free)) |count| {
+                    encoder.add(@intCast(count * @sizeOf(Entry)));
+                    continue;
+                }
                 // Rarely, one transaction as large as the request allows (N49): prefetch and the
                 // state machine's scratch space at capacity.
                 const full = workload.prng.chance(stdx.PRNG.ratio(1, 100));
@@ -654,11 +694,51 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                     @min(entries_free.len, workload.options.entries_per_transaction_max),
                 )];
                 if (full) workload.full_batches += 1;
-                workload.build_transaction(entries);
+                if (entries.len > 0 and workload.prng.chance(stdx.PRNG.ratio(1, 6))) {
+                    entries[0] = nerva.commit_key_entry(workload.prng.range_inclusive(
+                        u128,
+                        1,
+                        std.math.maxInt(u128),
+                    ));
+                    workload.build_transaction(entries[1..]);
+                    workload.keyed_remember(entries);
+                } else {
+                    workload.build_transaction(entries);
+                }
                 encoder.add(@intCast(entries.len * @sizeOf(Entry)));
                 if (full) break;
             }
             return encoder.finish();
+        }
+
+        /// Sometimes, a transaction sent under a key before, into `entries_free`: as it was sent
+        /// (a resend after a lost reply), or with other entries under the same key. Returns its
+        /// entry count.
+        fn build_resend(workload: *Workload, entries_free: []Entry) ?usize {
+            const prng = workload.prng;
+            const sent_all = workload.keyed_sent.items;
+            if (sent_all.len == 0 or !prng.chance(stdx.PRNG.ratio(1, 10))) return null;
+            const sent = sent_all[prng.index(sent_all)];
+            if (sent.len > entries_free.len) return null;
+            const entries = entries_free[0..sent.len];
+            stdx.copy_disjoint(.exact, Entry, entries, sent);
+            if (prng.chance(stdx.PRNG.ratio(1, 4))) workload.build_transaction(entries[1..]);
+            workload.keyed_resent += 1;
+            return entries.len;
+        }
+
+        /// Keeps a copy of a transaction sent under a key, to send again.
+        fn keyed_remember(workload: *Workload, entries: []const Entry) void {
+            assert(entries[0].kind == .key);
+            if (entries.len > transaction_entries_max) return;
+            const copy = workload.allocator.dupe(Entry, entries) catch @panic("OOM");
+            if (workload.keyed_sent.items.len < keyed_sent_max) {
+                workload.keyed_sent.append(workload.allocator, copy) catch @panic("OOM");
+            } else {
+                const slot = &workload.keyed_sent.items[workload.prng.index(workload.keyed_sent.items)];
+                workload.allocator.free(slot.*);
+                slot.* = copy;
+            }
         }
 
         /// One claim per batch, against what this client last knew of the receipt. Claims from
@@ -775,6 +855,7 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                         .value = 1,
                         .kind = 1,
                         .kind_zero = 1,
+                        .kind_key = 1,
                         .op_seen = 1,
                     })) {
                         .table => entry.table = 0,
@@ -782,8 +863,10 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                         .reserved_b => entry.reserved_b = 1,
                         .reserved_c => entry.reserved_c[prng.index(&entry.reserved_c)] = 1,
                         .value => entry.value[prng.index(&entry.value)] = 1,
-                        .kind => entry.kind = @enumFromInt(prng.range_inclusive(u8, 5, 255)),
+                        .kind => entry.kind = @enumFromInt(prng.range_inclusive(u8, 6, 255)),
                         .kind_zero => entry.kind = @enumFromInt(0),
+                        // Misplaced, or invalid as a key.
+                        .kind_key => entry.kind = .key,
                         // Valid for a read (a version, maybe stale); invalid for any write.
                         .op_seen => entry.op_seen = prng.range_inclusive(u64, 1, 1 << 40),
                     }
@@ -1109,6 +1192,7 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                     assert(!budget);
                     workload.transactions_failed += 1;
                     if (ledger) workload.ledger_refused.getPtr(failure.status).* += 1;
+                    workload.key_refused.getPtr(failure.status).* += 1;
                     if (claim) {
                         // Claims are always well-formed: they lose only to another claim.
                         assert(failure.status == .conflict);
@@ -1150,7 +1234,12 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                 for (entries, results, 0..) |*entry, *result, index| {
                     const entry_timestamp =
                         batch_timestamp - entries.len * block + index * block + 1;
-                    workload.apply(op, entry_timestamp, entry, result);
+                    if (entry.kind == .key) {
+                        assert(index == 0);
+                        workload.apply_key(op, entry_timestamp, entries);
+                    } else {
+                        workload.apply(op, entry_timestamp, entry, result);
+                    }
                 }
             }
             assert(reply.pop() == null);
@@ -1648,7 +1737,9 @@ pub fn WorkloadType(comptime StateMachine: type) type {
             admission: views.Admission,
         ) ?Failure {
             assert(entries.len <= workload.expected.len);
-            // Admission comes first (`views_admit`).
+            // A key already committed comes first, whatever else changed since.
+            if (workload.key_failure(entries)) |failure| return failure;
+            // Then admission (`views_admit`).
             if (admission != .fits) {
                 if (admission == .too_large) workload.views_too_large += 1;
                 workload.views_busy += 1;
@@ -1662,6 +1753,9 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                 };
             }
             for (entries, 0..) |*entry, index| {
+                if (entry.kind == .key and index > 0) {
+                    return .{ .index = index, .status = .key_misplaced, .op = 0 };
+                }
                 const status = nerva.entry_validate(entry);
                 entry_status_check(entry, status);
                 if (status) |status_| {
@@ -1693,9 +1787,10 @@ pub fn WorkloadType(comptime StateMachine: type) type {
             }
             // The earliest write whose row an earlier write already wrote (adds may share one).
             for (entries, 0..) |*entry, index| {
-                if (entry.kind == .read) continue;
+                if (entry.kind == .read or entry.kind == .key) continue;
                 for (entries[0..index]) |*previous| {
-                    if (previous.kind != .read and previous.table == entry.table and
+                    if (previous.kind != .read and previous.kind != .key and
+                        previous.table == entry.table and
                         previous.id == entry.id and
                         !(previous.kind == .add and entry.kind == .add))
                     {
@@ -1755,6 +1850,56 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                 std.mem.writeInt(u64, row[add.offset..][0..8], expected[index].value, .little);
             }
             return null;
+        }
+
+        /// The model's key row for a transaction that starts with a key (valid or not).
+        fn key_row(entries: []const Entry) ?u128 {
+            if (entries.len == 0 or entries[0].kind != .key) return null;
+            const key = std.mem.readInt(u128, entries[0].value[0..16], .little);
+            return nerva.row_key(nerva.table_commit_keys, nerva.commit_key_id(key));
+        }
+
+        /// Why a transaction under a valid key whose row exists commits nothing: its own entries
+        /// again (`committed_before`), other entries (`key_reused`), or the row of another key
+        /// (`key_collision`), at the op that wrote the row.
+        fn key_failure(workload: *Workload, entries: []const Entry) ?Failure {
+            const row = key_row(entries) orelse return null;
+            if (nerva.entry_validate(&entries[0]) != null) return null;
+            const version = workload.row_version(row);
+            if (!version.exists) return null;
+            const key = std.mem.readInt(u128, entries[0].value[0..16], .little);
+            const committed = workload.committed_keys.get(key) orelse
+                return .{ .index = 0, .status = .key_collision, .op = version.op };
+            const same = committed.len == entries.len - 1 and
+                std.mem.eql(u8, std.mem.sliceAsBytes(committed), std.mem.sliceAsBytes(entries[1..]));
+            return .{
+                .index = 0,
+                .status = if (same) .committed_before else .key_reused,
+                .op = version.op,
+            };
+        }
+
+        /// A transaction committed under a key: its key's row, and the entries it committed.
+        fn apply_key(workload: *Workload, op: u64, timestamp: u64, entries: []const Entry) void {
+            const key = std.mem.readInt(u128, entries[0].value[0..16], .little);
+            assert(!workload.row_version(key_row(entries).?).exists);
+            const stored: nerva.CommitKey = .{
+                .key = key,
+                .checksum = vsr.checksum(std.mem.sliceAsBytes(entries[1..])),
+                .entry_count = @intCast(entries.len - 1),
+            };
+            const entry: Entry = .{
+                .id = nerva.commit_key_id(key),
+                .table = nerva.table_commit_keys,
+                .kind = .put,
+                .op_seen = 0,
+                .value = std.mem.toBytes(stored),
+            };
+            workload.apply(op, timestamp, &entry, &.{ .status = .ok, .op = op });
+            const copy = workload.allocator.dupe(Entry, entries[1..]) catch @panic("OOM");
+            workload.committed_keys.putNoClobber(workload.allocator, key, copy) catch
+                @panic("OOM");
+            workload.keyed_committed += 1;
         }
 
         /// The row as the adds `entries[..=last]` to its row left it (`expected` filled in for
@@ -1843,6 +1988,13 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                 const entries = stdx.bytes_as_slice(.exact, Entry, batch);
                 workload.view_txn_keys.clearRetainingCapacity();
                 workload.view_txn_members.clearRetainingCapacity();
+                // One whose key's row exists writes nothing (`key_failure`).
+                if (key_row(entries)) |row| {
+                    if (workload.row_version(row).exists) {
+                        workload.view_txn_admission.append(allocator, .fits) catch @panic("OOM");
+                        continue;
+                    }
+                }
                 const admission: views.Admission = admit: for (entries) |*entry| {
                     if (!workload.entry_viewed(entry)) continue;
                     const version = workload.row_version(nerva.row_key(entry.table, entry.id));

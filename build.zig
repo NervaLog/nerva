@@ -11,7 +11,9 @@ const VoprLog = enum { short, full };
 // Nerva has no client releases yet; every build is "the" release.
 // 0.0.5: data files record the export they were imported from, and pings and pongs carry it
 // (P90). Clients are unchanged, so 0.0.4's are still accepted.
-const release = "0.0.5";
+// 0.0.6: a commit may start with a `key` entry, and writes its key's row (P<n>), so 0.0.5 and
+// 0.0.6 replicas would diverge on it. Clients only gained an entry kind: 0.0.4's still work.
+const release = "0.0.6";
 const release_client_min = "0.0.4";
 // Only `zig build test:release` builds this release, to run a cluster of two releases (N61).
 const release_test_other = "0.0.200";

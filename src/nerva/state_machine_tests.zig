@@ -568,6 +568,128 @@ test "commit: invalid entries abort the transaction" {
     try testing.expectEqual(@as(usize, 1), (try context.changes(0, 10)).len); // Just `end`.
 }
 
+test "commit key: a resent transaction commits once, at its first op" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const context = try context_init(&arena);
+
+    const key: u128 = 0x0123_4567_89ab_cdef_0123_4567_89ab_cdef;
+    const reserve = [_]Entry{
+        nerva.commit_key_entry(key),
+        read(1, 2, 0),
+        put(1, 2, 7),
+        add(1, 1, 0, 5, .{ .create = true }),
+    };
+    const first = try context.commit(&.{&reserve});
+    try expect_statuses(first[0], &.{ .ok, .ok, .ok, .ok });
+    const op_first = first[0][0].op;
+    try testing.expectEqual(@as(u64, 5), field(try context.lookup(1, 1), 0));
+
+    // Resent, alone or twice in one request: nothing applies, though its read is now stale,
+    // and each copy reports the op the transaction committed at.
+    const resent = try context.commit(&.{ &reserve, &reserve });
+    for (resent) |results| {
+        try expect_statuses(results, &.{ .committed_before, .aborted, .aborted, .aborted });
+        try testing.expectEqual(op_first, results[0].op);
+    }
+    try testing.expectEqual(@as(u64, 5), field(try context.lookup(1, 1), 0));
+    try testing.expectEqual(op_first, (try context.lookup(1, 2)).op);
+
+    // A request whose first copy commits: the second reports the same op.
+    const other_key = [_]Entry{ nerva.commit_key_entry(key + 1), add(1, 1, 0, 1, .{}) };
+    const twice = try context.commit(&.{ &other_key, &other_key });
+    try expect_statuses(twice[0], &.{ .ok, .ok });
+    try expect_statuses(twice[1], &.{ .committed_before, .aborted });
+    try testing.expectEqual(twice[0][0].op, twice[1][0].op);
+    try testing.expectEqual(@as(u64, 6), field(try context.lookup(1, 1), 0));
+
+    // The key's row: written once, at the op its transaction committed at.
+    const row = try context.lookup(nerva.table_commit_keys, nerva.commit_key_id(key));
+    try testing.expect(row.flags.exists);
+    try testing.expectEqual(op_first, row.op);
+    const stored = std.mem.bytesToValue(nerva.CommitKey, &row.value);
+    try testing.expectEqual(key, stored.key);
+    try testing.expectEqual(@as(u32, 3), stored.entry_count);
+}
+
+test "commit key: other entries never commit under a committed key, nor misplaced keys" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const context = try context_init(&arena);
+
+    const key: u128 = 42;
+    const op_first = (try context.commit(&.{&.{ nerva.commit_key_entry(key), put(1, 1, 1) }}))[0][0].op;
+    const reused = try context.commit(&.{&.{ nerva.commit_key_entry(key), put(1, 1, 2) }});
+    try expect_statuses(reused[0], &.{ .key_reused, .aborted });
+    try testing.expectEqual(op_first, reused[0][0].op);
+    try testing.expectEqual(value(1), (try context.lookup(1, 1)).value);
+
+    // A transaction that does not commit leaves its key free: the next one under it commits.
+    const stale = try context.commit(&.{&.{ nerva.commit_key_entry(43), read(1, 1, 0) }});
+    try expect_statuses(stale[0], &.{ .aborted, .conflict });
+    const retried = try context.commit(&.{&.{ nerva.commit_key_entry(43), read(1, 1, op_first) }});
+    try expect_statuses(retried[0], &.{ .ok, .ok });
+
+    try expect_statuses(
+        (try context.commit(&.{&.{ put(1, 3, 3), nerva.commit_key_entry(44) }}))[0],
+        &.{ .aborted, .key_misplaced },
+    );
+    try expect_statuses(
+        (try context.commit(&.{&.{ nerva.commit_key_entry(44), nerva.commit_key_entry(45) }}))[0],
+        &.{ .aborted, .key_misplaced },
+    );
+    var key_zero = nerva.commit_key_entry(1);
+    key_zero.value[0] = 0;
+    var key_table = nerva.commit_key_entry(1);
+    key_table.table = 1;
+    var key_value = nerva.commit_key_entry(1);
+    key_value.value[16] = 1;
+    for ([_]Entry{ key_zero, key_table, key_value }) |invalid| {
+        try expect_statuses(
+            (try context.commit(&.{&.{ invalid, put(1, 3, 3) }}))[0],
+            &.{ .key_invalid, .aborted },
+        );
+    }
+    // Only the state machine writes key rows.
+    try expect_statuses(
+        (try context.commit(&.{&.{ read(nerva.table_commit_keys, 1, 0) }}))[0],
+        &.{.table_invalid},
+    );
+    try expect_statuses(
+        (try context.commit(&.{&.{put(nerva.table_commit_keys, nerva.commit_key_id(46), 1)}}))[0],
+        &.{.table_invalid},
+    );
+    try testing.expect(!(try context.lookup(1, 3)).flags.exists);
+}
+
+test "commit key: a key whose row another key holds never commits" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const context = try context_init(&arena);
+
+    // Two keys whose row ids collide are not to be found by search: restore a row of another
+    // key at this key's id, as an import would.
+    const key: u128 = 7;
+    const other: nerva.CommitKey = .{ .key = 8, .checksum = 0, .entry_count = 1 };
+    var timestamp_next: u64 = 1 << 32;
+    const change: Change = .{
+        .id = nerva.commit_key_id(key),
+        .table = nerva.table_commit_keys,
+        .kind = .put,
+        .flags = .{},
+        .op = 1,
+        .timestamp = timestamp_next,
+        .value = std.mem.toBytes(other),
+    };
+    timestamp_next += StateMachine.entry_timestamps;
+    try restore_op(context, 1, &.{change}, null, &timestamp_next);
+
+    const results = try context.commit(&.{&.{ nerva.commit_key_entry(key), put(1, 1, 1) }});
+    try expect_statuses(results[0], &.{ .key_collision, .aborted });
+    try testing.expectEqual(@as(u64, 1), results[0][0].op);
+    try testing.expect(!(try context.lookup(1, 1)).flags.exists);
+}
+
 test "get_changes: committed writes in op order, paged by cursor" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -2330,6 +2452,9 @@ test "restore: a history restored at its ops reads as it was committed" {
     try testing.expectEqual(nerva.DeclareStatus.created, late.status);
     _ = original.pulse_until_ready();
     _ = try original.commit(&.{&.{ seat(1, 0, 3, true), delete(5, 2) }});
+    // A transaction under a commit key: its key's row is restored too.
+    const keyed = [_]Entry{ nerva.commit_key_entry(0xfeed), put(1, 30, 7) };
+    const keyed_op = (try original.commit(&.{&keyed}))[0][0].op;
     const as_of = original.op - 1;
 
     // The export, as `nerva export` reads it: the feed, the declarations and their ops.
@@ -2428,6 +2553,11 @@ test "restore: a history restored at its ops reads as it was committed" {
         try view_sections(original, late.view_id),
         try view_sections(restored, late.view_id),
     );
+
+    // Resent to the restored cluster, the keyed transaction commits nothing.
+    const resent = try restored.commit(&.{&keyed});
+    try expect_statuses(resent[0], &.{ .committed_before, .aborted });
+    try testing.expectEqual(keyed_op, resent[0][0].op);
 
     // The restored cluster commits on: a read of a restored version, and the view follows.
     const version = (try restored.lookup(5, 1)).op;
