@@ -17,7 +17,7 @@ const nerva = @import("../nerva.zig");
 const value_size = nerva.value_size;
 
 /// Tables at or above this are Nerva's own; the API refuses to read or write them directly.
-pub const tables_reserved_min: u32 = 0xFFFF_0000;
+pub const tables_reserved_min: u32 = nerva.tables_reserved_min;
 /// Catalog documents (`documents.zig`, namespace 0), keyed `table.<id>` and `view.<name>`.
 pub const table_catalog: u32 = 0xFFFF_0001;
 /// Applications' documents (`documents.zig`, any namespace), through `/v1/documents/*` (N41).

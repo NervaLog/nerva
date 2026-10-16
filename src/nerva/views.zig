@@ -31,7 +31,9 @@ pub fn definition_validate(definition: *const ViewDefinition) ?DeclareStatus {
     }
     // Zero padding only after the name.
     if (!stdx.zeroed(definition.name[name.len..])) return .invalid;
-    if (definition.table == 0 or definition.table >= catalog.tables_reserved_min) {
+    if (definition.table == 0 or definition.table >= catalog.tables_reserved_min or
+        nerva.table_is_record(definition.table))
+    {
         return .table_invalid;
     }
     if (definition.reserved_a != 0 or !stdx.zeroed(&definition.reserved_b)) return .invalid;
@@ -283,12 +285,12 @@ pub fn hash_update(hash: *[32]u8, digest: *const [32]u8, sign: enum { add, remov
 /// row's value, and a put's new value or a creating add's empty row (a superset: an add keeps
 /// its row in its group, `view_key_field`).
 pub fn entry_values(
-    entry: *const nerva.Entry,
+    entry: anytype,
     value_old: ?[value_size]u8,
 ) [2]?[value_size]u8 {
     var values: [2]?[value_size]u8 = .{ value_old, null };
     switch (entry.kind) {
-        .put => values[1] = entry.value,
+        .put => values[1] = entry.value[0..value_size].*,
         .add => if (nerva.Add.from_entry(entry).flags.create) {
             values[1] = @as([value_size]u8, @splat(0));
         },

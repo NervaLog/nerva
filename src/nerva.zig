@@ -19,6 +19,21 @@ const constants = @import("constants.zig");
 /// Size of a row's payload, in bytes. Fixed for v0.1.
 pub const value_size = 80;
 
+/// Size of a record's payload, in bytes (P123b).
+pub const record_value_size = 448;
+
+/// Tables from here up are Nerva's own (the catalog, documents, commit keys).
+pub const tables_reserved_min: u32 = 0xFFFF_0000;
+
+/// Tables from here up to `tables_reserved_min` hold records (P123b): 128-bit ids and
+/// `record_value_size`-byte values. Tables below hold rows.
+pub const record_tables_min: u32 = 0x8000_0000;
+
+/// Whether `table` holds records.
+pub fn table_is_record(table: u32) bool {
+    return table >= record_tables_min and table < tables_reserved_min;
+}
+
 /// Stable, forest-unique LSM tree identifiers. Never reuse or renumber: they are persisted.
 pub const tree_ids = struct {
     pub const Row = .{
@@ -129,6 +144,53 @@ pub const Entry = extern struct {
     }
 };
 
+/// The `commit_wide` event (P123b): an entry for a row or a record. Every commit runs on these:
+/// `commit`'s entries are widened (`from_entry`) and checked by the same rules.
+///
+/// For a row (a table below `record_tables_min`), `id` fits 64 bits and `value` past
+/// `value_size` is zero. For a record, `id` is any 128 bits and `value` is all of it; a record
+/// takes `read`, `put` and `delete`, not `add`.
+pub const WideEntry = extern struct {
+    id: u128,
+    /// Zero is invalid.
+    table: u32,
+    kind: EntryKind,
+    reserved_a: [3]u8 = @splat(0),
+    /// Reads only: the version observed. Zero means the row has never existed.
+    op_seen: u64,
+    reserved_b: [32]u8 = @splat(0),
+    /// Puts: the new value. Adds: the `Add` parameters. Zero for reads and deletes.
+    value: [record_value_size]u8,
+
+    comptime {
+        assert(@sizeOf(WideEntry) == 512);
+        assert(stdx.no_padding(WideEntry));
+    }
+
+    /// `commit`'s entry as `commit_wide` would carry it: its reserved fields in `reserved_b`, so
+    /// that the same rules refuse the same entries.
+    pub fn from_entry(entry: *const Entry) WideEntry {
+        var wide: WideEntry = .{
+            .id = entry.id,
+            .table = entry.table,
+            .kind = entry.kind,
+            .reserved_a = entry.reserved_a,
+            .op_seen = entry.op_seen,
+            .value = @splat(0),
+        };
+        wide.reserved_b[0..8].* = std.mem.toBytes(entry.reserved_b);
+        wide.reserved_b[8..24].* = entry.reserved_c;
+        wide.value[0..value_size].* = entry.value;
+        return wide;
+    }
+
+    /// A row's 80 bytes of value.
+    pub fn row_value(entry: *const WideEntry) *const [value_size]u8 {
+        assert(!table_is_record(entry.table));
+        return entry.value[0..value_size];
+    }
+};
+
 pub const EntryStatus = enum(u32) {
     ok = 0,
     /// A read's `op_seen` no longer matches the row's version.
@@ -138,7 +200,8 @@ pub const EntryStatus = enum(u32) {
     kind_invalid = 3,
     table_invalid = 4,
     reserved_not_zero = 5,
-    /// A read or delete carries a value.
+    /// A read or delete carries a value, or a row's put or add carries bytes past `value_size`
+    /// (P123b).
     value_not_zero = 6,
     /// A put or delete carries `op_seen`.
     op_seen_not_zero = 7,
@@ -149,7 +212,7 @@ pub const EntryStatus = enum(u32) {
     out_of_bounds = 9,
     /// An add to a row that does not exist, without `create`.
     row_absent = 10,
-    /// An add's field, bounds or delta are invalid.
+    /// An add's field, bounds or delta are invalid, or an add names a record (P123b).
     field_invalid = 11,
     /// An add's `delta_from` does not name an earlier add of the same transaction.
     delta_from_invalid = 12,
@@ -183,6 +246,8 @@ pub const EntryStatus = enum(u32) {
     key_misplaced = 21,
     /// A `key` entry whose key is zero, or whose `table`, `id` or rest of `value` is not zero.
     key_invalid = 22,
+    /// A row's id that does not fit 64 bits (`commit_wide`, P123b).
+    id_invalid = 23,
 };
 
 /// Commit keys make a resent transaction commit at most once (P123). A transaction may start
@@ -198,7 +263,7 @@ pub const table_commit_keys: u32 = 0xFFFF_0003;
 /// A key row's value.
 pub const CommitKey = extern struct {
     key: u128,
-    /// `vsr.checksum` of the transaction's entries after its key entry.
+    /// `vsr.checksum` of the transaction's entries after its key entry, as `WideEntry`s (P123b).
     checksum: u128,
     /// The transaction's entries after its key entry.
     entry_count: u32,
@@ -209,8 +274,8 @@ pub const CommitKey = extern struct {
         assert(stdx.no_padding(CommitKey));
     }
 
-    /// The key a `key` entry names.
-    pub fn entry_key(entry: *const Entry) u128 {
+    /// The key a `key` entry (an `Entry` or a `WideEntry`) names.
+    pub fn entry_key(entry: anytype) u128 {
         assert(entry.kind == .key);
         return std.mem.readInt(u128, entry.value[0..16], .little);
     }
@@ -302,9 +367,10 @@ pub const Add = extern struct {
         assert(stdx.no_padding(Add));
     }
 
-    pub fn from_entry(entry: *const Entry) Add {
+    /// An add's parameters, from an `Entry` or a row's `WideEntry`.
+    pub fn from_entry(entry: anytype) Add {
         assert(entry.kind == .add);
-        return std.mem.bytesToValue(Add, &entry.value);
+        return std.mem.bytesToValue(Add, entry.value[0..value_size]);
     }
 
     pub fn value(add: *const Add) [value_size]u8 {
@@ -1015,6 +1081,50 @@ pub const Operation = enum(u8) {
         return vsr.Operation.from(Operation, operation);
     }
 };
+
+/// Static checks on one `commit_wide` entry, independent of state, by `entry_validate`'s rules,
+/// and for records' and rows' ids and values (P123b). Returns null if the entry is valid.
+pub fn wide_entry_validate(entry: *const WideEntry) ?EntryStatus {
+    const record = table_is_record(entry.table);
+    if (entry.kind == .key) {
+        if (entry.table != 0 or entry.id != 0 or entry.op_seen != 0 or
+            !stdx.zeroed(entry.value[16..]) or CommitKey.entry_key(entry) == 0)
+        {
+            return .key_invalid;
+        }
+    } else {
+        if (entry.table == 0) return .table_invalid;
+        // Only the state machine writes key rows, for `key` entries.
+        if (entry.table == table_commit_keys) return .table_invalid;
+        if (!record and entry.id > std.math.maxInt(u64)) return .id_invalid;
+    }
+    if (!stdx.zeroed(&entry.reserved_a) or !stdx.zeroed(&entry.reserved_b)) {
+        return .reserved_not_zero;
+    }
+    switch (entry.kind) {
+        .read => {
+            if (!stdx.zeroed(&entry.value)) return .value_not_zero;
+        },
+        .put => {
+            if (entry.op_seen != 0) return .op_seen_not_zero;
+            if (!record and !stdx.zeroed(entry.value[value_size..])) return .value_not_zero;
+        },
+        .delete => {
+            if (!stdx.zeroed(&entry.value)) return .value_not_zero;
+            if (entry.op_seen != 0) return .op_seen_not_zero;
+        },
+        .add => {
+            if (entry.op_seen != 0) return .op_seen_not_zero;
+            // Records take no adds: their fields are written whole.
+            if (record) return .field_invalid;
+            if (!stdx.zeroed(entry.value[value_size..])) return .value_not_zero;
+            return add_validate(&Add.from_entry(entry));
+        },
+        .key => {},
+        _ => return .kind_invalid,
+    }
+    return null;
+}
 
 /// Static checks on one entry, independent of state. Returns null if the entry is valid.
 pub fn entry_validate(entry: *const Entry) ?EntryStatus {

@@ -1883,9 +1883,16 @@ pub fn WorkloadType(comptime StateMachine: type) type {
         fn apply_key(workload: *Workload, op: u64, timestamp: u64, entries: []const Entry) void {
             const key = std.mem.readInt(u128, entries[0].value[0..16], .little);
             assert(!workload.row_version(key_row(entries).?).exists);
+            // The state machine checksums the entries as `commit_wide` would carry them.
+            const wide = workload.allocator.alloc(nerva.WideEntry, entries.len - 1) catch
+                @panic("OOM");
+            defer workload.allocator.free(wide);
+            for (entries[1..], wide) |*entry, *entry_wide| {
+                entry_wide.* = nerva.WideEntry.from_entry(entry);
+            }
             const stored: nerva.CommitKey = .{
                 .key = key,
-                .checksum = vsr.checksum(std.mem.sliceAsBytes(entries[1..])),
+                .checksum = vsr.checksum(std.mem.sliceAsBytes(wide)),
                 .entry_count = @intCast(entries.len - 1),
             };
             const entry: Entry = .{

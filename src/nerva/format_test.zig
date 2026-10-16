@@ -193,6 +193,7 @@ test "format: wire and storage layouts" {
         \\  key_collision = 20
         \\  key_misplaced = 21
         \\  key_invalid = 22
+        \\  id_invalid = 23
         \\nerva.Add: extern struct, size 80
         \\  delta: offset 0, size 8, i64
         \\  min: offset 8, size 8, u64

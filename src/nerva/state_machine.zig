@@ -29,6 +29,7 @@ const MultiBatchEncoder = vsr.multi_batch.MultiBatchEncoder;
 
 const Row = nerva.Row;
 const Entry = nerva.Entry;
+const WideEntry = nerva.WideEntry;
 const EntryResult = nerva.EntryResult;
 const EntryStatus = nerva.EntryStatus;
 const Add = nerva.Add;
@@ -437,6 +438,8 @@ pub fn StateMachineType(comptime Storage: type) type {
 
         /// Scratch space for duplicate-write detection.
         write_keys: []WriteKey,
+        /// One `commit` batch, widened (`batch_entries`).
+        wide_entries: []WideEntry,
         /// Scratch space for resolving one transaction's adds: each added row's value so far.
         /// Looked up by key only, never iterated (determinism).
         add_rows: std.AutoHashMapUnmanaged(u128, [nerva.value_size]u8) = .{},
@@ -565,6 +568,7 @@ pub fn StateMachineType(comptime Storage: type) type {
                 .forest = undefined,
                 .changes_scan_buffer = undefined,
                 .write_keys = undefined,
+                .wide_entries = undefined,
                 .backfill_rows = undefined,
                 .view_groups = undefined,
                 .extreme_members = undefined,
@@ -668,6 +672,9 @@ pub fn StateMachineType(comptime Storage: type) type {
             self.write_keys = try allocator.alloc(WriteKey, commit_entries_limit);
             errdefer allocator.free(self.write_keys);
 
+            self.wide_entries = try allocator.alloc(WideEntry, commit_entries_limit);
+            errdefer allocator.free(self.wide_entries);
+
             try self.add_rows.ensureTotalCapacity(allocator, commit_entries_limit);
             errdefer self.add_rows.deinit(allocator);
 
@@ -741,6 +748,7 @@ pub fn StateMachineType(comptime Storage: type) type {
             allocator.free(self.view_groups);
             allocator.free(self.backfill_rows);
             self.add_rows.deinit(allocator);
+            allocator.free(self.wide_entries);
             allocator.free(self.write_keys);
             allocator.free(self.changes_scan_buffer);
             self.forest.deinit(allocator);
@@ -754,6 +762,7 @@ pub fn StateMachineType(comptime Storage: type) type {
                 .forest = self.forest,
                 .changes_scan_buffer = self.changes_scan_buffer,
                 .write_keys = self.write_keys,
+                .wide_entries = self.wide_entries,
                 .add_rows = self.add_rows,
                 .backfill_rows = self.backfill_rows,
                 .view_groups = self.view_groups,
@@ -991,14 +1000,60 @@ pub fn StateMachineType(comptime Storage: type) type {
             const rows = &self.forest.grooves.rows;
             rows.prefetch_setup(self.prefetch_snapshot.?);
             for (events) |*event| {
-                if (Event == Entry and event.kind == .key) {
-                    rows.prefetch_enqueue(.{ .key = commit_key_row(event) });
-                    continue;
-                }
                 if (event.table == 0) continue;
                 rows.prefetch_enqueue(.{ .key = nerva.row_key(event.table, event.id) });
             }
             rows.prefetch(prefetch_rows_callback, &self.rows_prefetch_context);
+        }
+
+        /// Prefetches the row of every entry across all transactions, and the key row of every
+        /// `key` entry. Entries with an invalid table are skipped: they are rejected at commit
+        /// without being looked up.
+        fn prefetch_commit_rows(self: *StateMachine) void {
+            const operation = self.prefetch_operation.?;
+            var decoder = MultiBatchDecoder.init(self.prefetch_input.?, .{
+                .element_size = operation.event_size(),
+            }) catch unreachable; // Already validated by `input_valid()`.
+            const rows = &self.forest.grooves.rows;
+            rows.prefetch_setup(self.prefetch_snapshot.?);
+            while (decoder.pop()) |batch| {
+                for (self.batch_entries(operation, batch)) |*entry| {
+                    if (entry.kind == .key) {
+                        rows.prefetch_enqueue(.{ .key = commit_key_row(entry) });
+                        continue;
+                    }
+                    if (entry.table == 0 or nerva.table_is_record(entry.table)) continue;
+                    rows.prefetch_enqueue(.{ .key = entry_row_key(entry) });
+                }
+            }
+            rows.prefetch(prefetch_rows_callback, &self.rows_prefetch_context);
+        }
+
+        /// One batch of `commit` or `commit_wide` as wide entries: `commit_wide`'s as sent,
+        /// `commit`'s widened into `wide_entries`, which holds one batch at a time.
+        fn batch_entries(
+            self: *StateMachine,
+            operation: Operation,
+            batch: []const u8,
+        ) []const WideEntry {
+            switch (operation) {
+                .commit => {
+                    const entries = stdx.bytes_as_slice(.exact, Entry, batch);
+                    const wide = self.wide_entries[0..entries.len];
+                    for (entries, wide) |*entry, *entry_wide| {
+                        entry_wide.* = WideEntry.from_entry(entry);
+                    }
+                    return wide;
+                },
+                else => unreachable,
+            }
+        }
+
+        /// The LSM key of a row entry's row, before the entry is validated: an id past 64 bits
+        /// (`id_invalid`) is truncated, harmlessly, since nothing is written for it.
+        fn entry_row_key(entry: *const WideEntry) u128 {
+            assert(!nerva.table_is_record(entry.table));
+            return nerva.row_key(entry.table, @truncate(entry.id));
         }
 
         fn prefetch_rows_callback(context: *RowsGroove.PrefetchContext) void {
@@ -1238,7 +1293,8 @@ pub fn StateMachineType(comptime Storage: type) type {
                     .commit => self.execute_commit(
                         op,
                         batch_timestamp,
-                        batch,
+                        self.batch_entries(operation, batch),
+                        operation == .commit,
                         if (self.view_txn_too_large.isSet(batch_index))
                             .too_large
                         else if (self.view_txn_busy.isSet(batch_index))
@@ -1298,21 +1354,22 @@ pub fn StateMachineType(comptime Storage: type) type {
             return keys.len * @sizeOf(RowValue);
         }
 
-        /// Executes one transaction. `timestamp` is the timestamp of its last entry.
+        /// Executes one transaction. `timestamp` is the timestamp of its last entry. `narrow`:
+        /// sent by `commit`, which writes rows only.
         fn execute_commit(
             self: *StateMachine,
             op: u64,
             timestamp: u64,
-            batch: []const u8,
+            entries: []const WideEntry,
+            narrow: bool,
             admission: views.Admission,
             output: []u8,
         ) usize {
-            const entries = stdx.bytes_as_slice(.exact, Entry, batch);
             const results = stdx.bytes_as_slice(.inexact, EntryResult, output)[0..entries.len];
             assert(entries.len <= self.write_keys.len);
 
             // Resolving the adds fills in each add's result (`applied`, `value`).
-            const failure = self.commit_failure(entries, admission) orelse
+            const failure = self.commit_failure(entries, narrow, admission) orelse
                 self.adds_resolve(entries, results);
             if (failure) |f| {
                 for (results, 0..) |*result, index| {
@@ -1330,7 +1387,7 @@ pub fn StateMachineType(comptime Storage: type) type {
                     switch (entry.kind) {
                         .read => {},
                         .key => self.commit_key_put(op, entry_timestamp, entries),
-                        .put => self.row_put(op, entry_timestamp, entry, &entry.value),
+                        .put => self.row_put(op, entry_timestamp, entry, entry.row_value()),
                         .delete => self.row_delete(op, entry_timestamp, entry),
                         .add => self.row_add(op, entry_timestamp, entry, result),
                         _ => unreachable, // Rejected by `entry_validate()`.
@@ -1348,7 +1405,8 @@ pub fn StateMachineType(comptime Storage: type) type {
         /// conflicts.
         fn commit_failure(
             self: *StateMachine,
-            entries: []const Entry,
+            entries: []const WideEntry,
+            narrow: bool,
             admission: views.Admission,
         ) ?Failure {
             if (self.commit_key_failure(entries)) |failure| return failure;
@@ -1366,7 +1424,11 @@ pub fn StateMachineType(comptime Storage: type) type {
                 if (entry.kind == .key and index > 0) {
                     return .{ .index = @intCast(index), .status = .key_misplaced, .op = 0 };
                 }
-                if (nerva.entry_validate(entry)) |status| {
+                // `commit` writes rows only (P123b).
+                if (narrow and nerva.table_is_record(entry.table)) {
+                    return .{ .index = @intCast(index), .status = .table_invalid, .op = 0 };
+                }
+                if (nerva.wide_entry_validate(entry)) |status| {
                     return .{ .index = @intCast(index), .status = status, .op = 0 };
                 }
                 if (entry.kind == .add) {
@@ -1416,7 +1478,7 @@ pub fn StateMachineType(comptime Storage: type) type {
             }
             for (entries, 0..) |*entry, index| {
                 if (entry.kind != .read) continue;
-                const version = self.row_version(nerva.row_key(entry.table, entry.id));
+                const version = self.row_version(entry_row_key(entry));
                 if (version != entry.op_seen) {
                     return .{ .index = @intCast(index), .status = .conflict, .op = version };
                 }
@@ -1430,7 +1492,7 @@ pub fn StateMachineType(comptime Storage: type) type {
         /// other add may name a first half. Needs only the entries and the ledgers: every add
         /// has passed `entry_validate`, its `delta_from` names an earlier add, and a conserved
         /// add is an `i64`.
-        fn unpaired(self: *const StateMachine, entries: []const Entry) ?u32 {
+        fn unpaired(self: *const StateMachine, entries: []const WideEntry) ?u32 {
             var index: u32 = 0;
             while (index < entries.len) {
                 const entry = &entries[index];
@@ -1480,13 +1542,13 @@ pub fn StateMachineType(comptime Storage: type) type {
 
         /// The index of the earliest write whose row an earlier write in the same transaction
         /// already wrote, or null. Sorts in scratch space: O(n log n), no allocation.
-        fn write_duplicate(self: *StateMachine, entries: []const Entry) ?u32 {
+        fn write_duplicate(self: *StateMachine, entries: []const WideEntry) ?u32 {
             var count: u32 = 0;
             for (entries, 0..) |*entry, index| {
                 // A key's row is written only when no row is there (`commit_key_failure`).
                 if (entry.kind == .read or entry.kind == .key) continue;
                 self.write_keys[count] = .{
-                    .key = nerva.row_key(entry.table, entry.id),
+                    .key = entry_row_key(entry),
                     .index = @intCast(index),
                 };
                 count += 1;
@@ -1511,7 +1573,7 @@ pub fn StateMachineType(comptime Storage: type) type {
         }
 
         /// The LSM key of the row a `key` entry's key is kept in.
-        fn commit_key_row(entry: *const Entry) u128 {
+        fn commit_key_row(entry: *const WideEntry) u128 {
             assert(entry.kind == .key);
             return nerva.row_key(
                 nerva.table_commit_keys,
@@ -1520,7 +1582,7 @@ pub fn StateMachineType(comptime Storage: type) type {
         }
 
         /// The checksum a key's row keeps of the transaction's entries after its key entry.
-        fn commit_key_checksum(entries: []const Entry) u128 {
+        fn commit_key_checksum(entries: []const WideEntry) u128 {
             assert(entries[0].kind == .key);
             return vsr.checksum(std.mem.sliceAsBytes(entries[1..]));
         }
@@ -1530,10 +1592,10 @@ pub fn StateMachineType(comptime Storage: type) type {
         /// entries, else `key_reused`) or another key's (`key_collision`); each reports the op
         /// that wrote the row. Rows of `table_commit_keys` are written only by
         /// `commit_key_put`, once each, so the row's op is the op its transaction committed at.
-        fn commit_key_failure(self: *StateMachine, entries: []const Entry) ?Failure {
+        fn commit_key_failure(self: *StateMachine, entries: []const WideEntry) ?Failure {
             if (entries.len == 0 or entries[0].kind != .key) return null;
             // An invalid key entry is reported by the static checks.
-            if (nerva.entry_validate(&entries[0]) != null) return null;
+            if (nerva.wide_entry_validate(&entries[0]) != null) return null;
             const row = switch (self.forest.grooves.rows.get(commit_key_row(&entries[0]))) {
                 .found_object => |row| row,
                 .not_found => return null,
@@ -1559,7 +1621,7 @@ pub fn StateMachineType(comptime Storage: type) type {
             self: *StateMachine,
             op: u64,
             timestamp: u64,
-            entries: []const Entry,
+            entries: []const WideEntry,
         ) void {
             const key = CommitKey.entry_key(&entries[0]);
             const stored: CommitKey = .{
@@ -1567,15 +1629,16 @@ pub fn StateMachineType(comptime Storage: type) type {
                 .checksum = commit_key_checksum(entries),
                 .entry_count = @intCast(entries.len - 1),
             };
-            const entry: Entry = .{
+            var entry: WideEntry = .{
                 .id = nerva.commit_key_id(key),
                 .table = nerva.table_commit_keys,
                 .kind = .put,
                 .op_seen = 0,
-                .value = std.mem.toBytes(stored),
+                .value = @splat(0),
             };
+            entry.value[0..nerva.value_size].* = std.mem.toBytes(stored);
             assert(self.row_version(commit_key_row(&entries[0])) == 0);
-            self.row_put(op, timestamp, &entry, &entry.value);
+            self.row_put(op, timestamp, &entry, entry.row_value());
         }
 
         /// The row's version: the op of its last write, or zero if it has never existed.
@@ -1590,19 +1653,20 @@ pub fn StateMachineType(comptime Storage: type) type {
             self: *StateMachine,
             op: u64,
             timestamp: u64,
-            entry: *const Entry,
+            entry: *const WideEntry,
             value: *const [nerva.value_size]u8,
         ) void {
             assert(entry.kind == .put or entry.kind == .add);
+            assert(entry.id <= std.math.maxInt(u64));
             const rows = &self.forest.grooves.rows;
-            const key = nerva.row_key(entry.table, entry.id);
+            const key = entry_row_key(entry);
             const value_old: ?[nerva.value_size]u8 = switch (rows.get(key)) {
                 .found_object => |row| if (row.flags.deleted) null else row.value,
                 .not_found => null,
             };
             self.views_row_changed(
                 entry.table,
-                entry.id,
+                @intCast(entry.id),
                 if (value_old) |*old| old else null,
                 value,
                 timestamp,
@@ -1638,12 +1702,12 @@ pub fn StateMachineType(comptime Storage: type) type {
             self: *StateMachine,
             op: u64,
             timestamp: u64,
-            entry: *const Entry,
+            entry: *const WideEntry,
             result: *const EntryResult,
         ) void {
             const add = Add.from_entry(entry);
             var value: [nerva.value_size]u8 = switch (self.forest.grooves.rows.get(
-                nerva.row_key(entry.table, entry.id),
+                entry_row_key(entry),
             )) {
                 .found_object => |row| if (row.flags.deleted) @splat(0) else row.value,
                 .not_found => @splat(0),
@@ -1660,7 +1724,7 @@ pub fn StateMachineType(comptime Storage: type) type {
         /// every result `ok` and each add's `applied` and `value` filled in.
         fn adds_resolve(
             self: *StateMachine,
-            entries: []const Entry,
+            entries: []const WideEntry,
             results: []EntryResult,
         ) ?Failure {
             assert(entries.len == results.len);
@@ -1682,7 +1746,7 @@ pub fn StateMachineType(comptime Storage: type) type {
                 else
                     Add.from_entry(entry);
 
-                const key = nerva.row_key(entry.table, entry.id);
+                const key = entry_row_key(entry);
                 const row = self.add_rows.getOrPutAssumeCapacity(key);
                 if (!row.found_existing) {
                     const rows = &self.forest.grooves.rows;
@@ -1720,16 +1784,17 @@ pub fn StateMachineType(comptime Storage: type) type {
         /// must not change their bytes, and a delete needs them all zero. A row that does not
         /// exist holds zeros. A put or delete is the only write to its row in its transaction
         /// (`write_duplicate`), so the stored row is the one it changes.
-        fn conserved_unchanged(self: *StateMachine, entry: *const Entry) bool {
+        fn conserved_unchanged(self: *StateMachine, entry: *const WideEntry) bool {
             assert(entry.kind == .put or entry.kind == .delete);
             const fields = self.ledger_index.table_fields(entry.table);
             if (fields.len == 0) return true;
             const current: [nerva.value_size]u8 =
-                switch (self.forest.grooves.rows.get(nerva.row_key(entry.table, entry.id))) {
+                switch (self.forest.grooves.rows.get(entry_row_key(entry))) {
                     .found_object => |row| if (row.flags.deleted) @splat(0) else row.value,
                     .not_found => @splat(0),
                 };
-            const new: [nerva.value_size]u8 = if (entry.kind == .put) entry.value else @splat(0);
+            const new: [nerva.value_size]u8 =
+                if (entry.kind == .put) entry.row_value().* else @splat(0);
             for (fields) |*field| {
                 if (!std.mem.eql(
                     u8,
@@ -1741,14 +1806,21 @@ pub fn StateMachineType(comptime Storage: type) type {
         }
 
         /// Deleting a row that does not exist (or is already deleted) is a no-op.
-        fn row_delete(self: *StateMachine, op: u64, timestamp: u64, entry: *const Entry) void {
+        fn row_delete(self: *StateMachine, op: u64, timestamp: u64, entry: *const WideEntry) void {
             assert(entry.kind == .delete);
+            assert(entry.id <= std.math.maxInt(u64));
             const rows = &self.forest.grooves.rows;
-            switch (rows.get(nerva.row_key(entry.table, entry.id))) {
+            switch (rows.get(entry_row_key(entry))) {
                 .found_object => |row_old| {
                     if (row_old.flags.deleted) return;
                     assert(row_old.op <= op);
-                    self.views_row_changed(entry.table, entry.id, &row_old.value, null, timestamp);
+                    self.views_row_changed(
+                        entry.table,
+                        @intCast(entry.id),
+                        &row_old.value,
+                        null,
+                        timestamp,
+                    );
                     var row_new = row_old;
                     row_new.value = @splat(0);
                     row_new.op = op;
@@ -1764,14 +1836,14 @@ pub fn StateMachineType(comptime Storage: type) type {
             self: *StateMachine,
             op: u64,
             timestamp: u64,
-            entry: *const Entry,
+            entry: *const WideEntry,
             kind: nerva.ChangeKind,
             value: *const [nerva.value_size]u8,
         ) void {
             assert(kind == .put or kind == .delete);
             assert(kind == .put or stdx.zeroed(value));
             self.forest.grooves.changes.insert(&.{
-                .id = entry.id,
+                .id = @intCast(entry.id),
                 .table = entry.table,
                 .kind = kind,
                 .flags = .{},
@@ -1940,7 +2012,7 @@ pub fn StateMachineType(comptime Storage: type) type {
             );
             self.views_load();
             switch (self.prefetch_operation.?) {
-                .commit => self.prefetch_rows(Entry, self.prefetch_input.?),
+                .commit => self.prefetch_commit_rows(),
                 .declare_view => if (self.restoring)
                     self.prefetch_restore_table()
                 else
@@ -1959,8 +2031,9 @@ pub fn StateMachineType(comptime Storage: type) type {
         /// as they are before the op: for every write, in every view of its table, the old row's
         /// group and the put's (or a creating add's empty row's) group.
         fn prefetch_commit_groups(self: *StateMachine) void {
+            const operation = self.prefetch_operation.?;
             var decoder = MultiBatchDecoder.init(self.prefetch_input.?, .{
-                .element_size = @sizeOf(Entry),
+                .element_size = operation.event_size(),
             }) catch unreachable; // Already validated by `input_valid()`.
 
             const groups = &self.forest.grooves.groups;
@@ -1974,7 +2047,7 @@ pub fn StateMachineType(comptime Storage: type) type {
             self.view_op_members.clearRetainingCapacity();
             var batch_index: u32 = 0;
             while (decoder.pop()) |batch| : (batch_index += 1) {
-                const entries = stdx.bytes_as_slice(.exact, Entry, batch);
+                const entries = self.batch_entries(operation, batch);
                 switch (self.view_txn_admit(entries)) {
                     .fits => {},
                     .busy => {
@@ -1999,7 +2072,7 @@ pub fn StateMachineType(comptime Storage: type) type {
         /// and `view_txn_members` hold those it added). Otherwise leaves the op's as they were.
         /// A write counts, in each view of its table, the groups of its old and new values that
         /// pass the view's filter, and if either does, its member in each `min` or `max` slot.
-        fn view_txn_admit(self: *StateMachine, entries: []const Entry) views.Admission {
+        fn view_txn_admit(self: *StateMachine, entries: []const WideEntry) views.Admission {
             self.view_txn_keys.clearRetainingCapacity();
             self.view_txn_members.clearRetainingCapacity();
             // A transaction whose key's row exists writes nothing (`commit_key_failure`).
@@ -2013,7 +2086,7 @@ pub fn StateMachineType(comptime Storage: type) type {
                     if (!self.entry_viewed(entry)) continue;
                     const rows = &self.forest.grooves.rows;
                     const value_old: ?[nerva.value_size]u8 =
-                        switch (rows.get(nerva.row_key(entry.table, entry.id))) {
+                        switch (rows.get(entry_row_key(entry))) {
                             .found_object => |row| if (row.flags.deleted) null else row.value,
                             .not_found => null,
                         };
@@ -2039,7 +2112,7 @@ pub fn StateMachineType(comptime Storage: type) type {
                         const aggregates = definition.aggregates[0..definition.aggregate_count];
                         for (aggregates, 0..) |*aggregate, slot| {
                             if (!views.extreme(aggregate.function)) continue;
-                            const key = nerva.member_key(view.id, @intCast(slot), entry.id);
+                            const key = nerva.member_key(view.id, @intCast(slot), @truncate(entry.id));
                             const op_keys = &self.view_op_members;
                             const txn_keys = &self.view_txn_members;
                             if (!admit(op_keys, txn_keys, key, self.member_writes_limit)) {
@@ -2078,7 +2151,7 @@ pub fn StateMachineType(comptime Storage: type) type {
         }
 
         /// Whether the entry writes a table with a view (in any state).
-        fn entry_viewed(self: *const StateMachine, entry: *const Entry) bool {
+        fn entry_viewed(self: *const StateMachine, entry: *const WideEntry) bool {
             if (entry.table == 0) return false;
             switch (entry.kind) {
                 .put, .delete, .add => {},
@@ -2151,25 +2224,25 @@ pub fn StateMachineType(comptime Storage: type) type {
         fn prefetch_extreme_scans(self: *StateMachine) void {
             assert(self.extreme_scans.items.len == 0);
             assert(self.extreme_scan_index.count() == 0);
+            const operation = self.prefetch_operation.?;
             var decoder = MultiBatchDecoder.init(self.prefetch_input.?, .{
-                .element_size = @sizeOf(Entry),
+                .element_size = operation.event_size(),
             }) catch unreachable; // Already validated by `input_valid()`.
             var batch_index: u32 = 0;
             while (decoder.pop()) |batch| : (batch_index += 1) {
                 if (self.view_txn_busy.isSet(batch_index)) continue;
-                for (stdx.bytes_as_slice(.exact, Entry, batch)) |*entry| {
+                for (self.batch_entries(operation, batch)) |*entry| {
                     if (!self.entry_viewed(entry)) continue;
-                    const old = switch (self.forest.grooves.rows.get(
-                        nerva.row_key(entry.table, entry.id),
-                    )) {
+                    const old = switch (self.forest.grooves.rows.get(entry_row_key(entry))) {
                         .found_object => |row| if (row.flags.deleted) continue else row.value,
                         .not_found => continue,
                     };
+                    const id: u64 = @truncate(entry.id);
                     for (self.views_op[0..self.views_op_count]) |*view| {
                         if (!view_maintained(view, entry.table)) continue;
-                        if (view.state == .building and entry.id >= view.backfill_cursor) continue;
+                        if (view.state == .building and id >= view.backfill_cursor) continue;
                         if (!views.row_matches(&view.definition, &old)) continue;
-                        self.extreme_scans_count(view, entry.id, &old);
+                        self.extreme_scans_count(view, id, &old);
                     }
                 }
             }
@@ -3349,7 +3422,7 @@ pub fn StateMachineType(comptime Storage: type) type {
             self.version_timestamp_max = timestamp_next.* + self.versions_reserve(.commit) - 1;
             assert(TimestampRange.valid(self.version_timestamp_max));
             for (changes) |*change| {
-                const entry = restore_entry(change);
+                const entry = WideEntry.from_entry(&restore_entry(change));
                 if (change.kind == .delete) {
                     // Only a live row's delete is recorded. Checked as the op goes, since an
                     // earlier change of the op may have written the row: an error here leaves
