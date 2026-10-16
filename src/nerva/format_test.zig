@@ -126,6 +126,15 @@ test "format: wire and storage layouts" {
         nerva.Ledger,
         // Commit keys (P123): a key's row value in `table_commit_keys`.
         nerva.CommitKey,
+        // Records (P123b): `commit_wide`'s entries, stored records and their changes, and
+        // the lookups and history over them.
+        nerva.WideEntry,
+        nerva.Record,
+        nerva.RecordKey,
+        nerva.RecordValue,
+        @FieldType(nerva.RecordValue, "flags"),
+        nerva.RecordChange,
+        nerva.RecordHistoryFilter,
     }) |T| try layout_render(writer, T);
 
     // Tree ids name the LSM trees in the data file: never renumber them (CLAUDE.md).
@@ -194,6 +203,7 @@ test "format: wire and storage layouts" {
         \\  key_misplaced = 21
         \\  key_invalid = 22
         \\  id_invalid = 23
+        \\  id_collision = 24
         \\nerva.Add: extern struct, size 80
         \\  delta: offset 0, size 8, i64
         \\  min: offset 8, size 8, u64
@@ -268,6 +278,10 @@ test "format: wire and storage layouts" {
         \\  pulse = 134
         \\  declare_ledger = 135
         \\  get_ledger = 136
+        \\  commit_wide = 137
+        \\  lookup_records = 138
+        \\  get_record_changes = 139
+        \\  get_record_history = 140
         \\nerva.documents.Header: extern struct, size 24
         \\  namespace: offset 0, size 8, u64
         \\  reserved_a: offset 8, size 8, u64
@@ -462,6 +476,56 @@ test "format: wire and storage layouts" {
         \\  checksum: offset 16, size 16, u128
         \\  entry_count: offset 32, size 4, u32
         \\  reserved: offset 36, size 44, [44]u8
+        \\nerva.WideEntry: extern struct, size 512
+        \\  id: offset 0, size 16, u128
+        \\  table: offset 16, size 4, u32
+        \\  kind: offset 20, size 1, nerva.EntryKind
+        \\  reserved_a: offset 21, size 3, [3]u8
+        \\  op_seen: offset 24, size 8, u64
+        \\  reserved_b: offset 32, size 32, [32]u8
+        \\  value: offset 64, size 448, [448]u8
+        \\nerva.Record: extern struct, size 512
+        \\  key: offset 0, size 16, u128
+        \\  id: offset 16, size 16, u128
+        \\  table: offset 32, size 4, u32
+        \\  flags: offset 36, size 4, nerva.Row.RowFlags
+        \\  op: offset 40, size 8, u64
+        \\  timestamp: offset 48, size 8, u64
+        \\  reserved: offset 56, size 8, [8]u8
+        \\  value: offset 64, size 448, [448]u8
+        \\nerva.RecordKey: extern struct, size 32
+        \\  id: offset 0, size 16, u128
+        \\  table: offset 16, size 4, u32
+        \\  reserved: offset 20, size 12, [12]u8
+        \\nerva.RecordValue: extern struct, size 512
+        \\  id: offset 0, size 16, u128
+        \\  table: offset 16, size 4, u32
+        \\  flags: offset 20, size 4, nerva.RecordValue.RecordValueFlags
+        \\  op: offset 24, size 8, u64
+        \\  op_read: offset 32, size 8, u64
+        \\  reserved: offset 40, size 24, [24]u8
+        \\  value: offset 64, size 448, [448]u8
+        \\nerva.RecordValue.RecordValueFlags: packed struct, size 4
+        \\  exists: bit 0, 1 bits, bool
+        \\  collision: bit 1, 1 bits, bool
+        \\  padding: bit 2, 30 bits, u30
+        \\nerva.RecordChange: extern struct, size 512
+        \\  id: offset 0, size 16, u128
+        \\  table: offset 16, size 4, u32
+        \\  kind: offset 20, size 1, nerva.ChangeKind
+        \\  flags: offset 21, size 1, nerva.Change.ChangeFlags
+        \\  reserved_a: offset 22, size 2, [2]u8
+        \\  op: offset 24, size 8, u64
+        \\  timestamp: offset 32, size 8, u64
+        \\  reserved_b: offset 40, size 24, [24]u8
+        \\  value: offset 64, size 448, [448]u8
+        \\nerva.RecordHistoryFilter: extern struct, size 64
+        \\  id: offset 0, size 16, u128
+        \\  table: offset 16, size 4, u32
+        \\  limit: offset 20, size 4, u32
+        \\  op_max: offset 24, size 8, u64
+        \\  timestamp_max: offset 32, size 8, u64
+        \\  reserved: offset 40, size 24, [24]u8
         \\tree_ids:
         \\  Row.timestamp = 1
         \\  Row.key = 2
@@ -480,6 +544,10 @@ test "format: wire and storage layouts" {
         \\  ViewVersion.version = 15
         \\  Ledger.timestamp = 16
         \\  Ledger.slot = 17
+        \\  Record.timestamp = 18
+        \\  Record.key = 19
+        \\  RecordChange.timestamp = 20
+        \\  RecordChange.record_key = 21
         \\
     ).diff(out.items);
 }
@@ -508,6 +576,12 @@ test "format: persisted derivations" {
     try testing.expectEqual(
         @as(u64, 6225441356227291988),
         nerva.commit_key_id(0x0123_4567_89ab_cdef_0123_4567_89ab_cdef),
+    );
+
+    // Records' keys (P123b), computed apart from this code (Python's hashlib).
+    try testing.expectEqual(
+        @as(u128, 170141183601885234047750166926088000722),
+        nerva.record_key(0x8000_0001, 0xfedc_ba98_7654_3210_0123_4567_89ab_cdef),
     );
 
     // Views' members and versions (N62), computed apart from this code (Python's hashlib and

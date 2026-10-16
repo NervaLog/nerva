@@ -21,6 +21,7 @@ const MultiBatchEncoder = vsr.multi_batch.MultiBatchEncoder;
 
 const Operation = nerva.Operation;
 const Entry = nerva.Entry;
+const WideEntry = nerva.WideEntry;
 const EntryResult = nerva.EntryResult;
 const RowValue = nerva.RowValue;
 const Change = nerva.Change;
@@ -331,6 +332,39 @@ const Context = struct {
 
     fn history(context: *Context, filter: nerva.HistoryFilter) ![]const Change {
         const results = try context.execute(.get_history, &.{&.{filter}});
+        return results[0];
+    }
+
+    /// Commits each transaction of wide entries as its own batch, in one request (P123b).
+    fn commit_wide(
+        context: *Context,
+        transactions: []const []const WideEntry,
+    ) ![]const []const EntryResult {
+        return context.execute(.commit_wide, transactions);
+    }
+
+    fn lookup_record(context: *Context, table: u32, id: u128) !nerva.RecordValue {
+        const results = try context.execute(.lookup_records, &.{&.{.{ .id = id, .table = table }}});
+        return results[0][0];
+    }
+
+    fn record_changes(
+        context: *Context,
+        timestamp_min: u64,
+        limit: u32,
+    ) ![]const nerva.RecordChange {
+        const results = try context.execute(
+            .get_record_changes,
+            &.{&.{.{ .timestamp_min = timestamp_min, .limit = limit }}},
+        );
+        return results[0];
+    }
+
+    fn record_history(
+        context: *Context,
+        filter: nerva.RecordHistoryFilter,
+    ) ![]const nerva.RecordChange {
+        const results = try context.execute(.get_record_history, &.{&.{filter}});
         return results[0];
     }
 };
@@ -705,6 +739,227 @@ test "commit key: a key whose row another key holds never commits" {
             restore_op(context, context.op, &.{refused}, null, &timestamp_next),
         );
     }
+}
+
+// ---- Records (P123b) ----
+
+const records_table: u32 = nerva.record_tables_min + 1;
+
+fn record_value(byte: u8) [nerva.record_value_size]u8 {
+    return @splat(byte);
+}
+
+fn record_put(id: u128, byte: u8) WideEntry {
+    return .{
+        .id = id,
+        .table = records_table,
+        .kind = .put,
+        .op_seen = 0,
+        .value = record_value(byte),
+    };
+}
+
+fn record_read(id: u128, op_seen: u64) WideEntry {
+    return .{ .id = id, .table = records_table, .kind = .read, .op_seen = op_seen, .value = @splat(0) };
+}
+
+fn record_delete(id: u128) WideEntry {
+    return .{ .id = id, .table = records_table, .kind = .delete, .op_seen = 0, .value = @splat(0) };
+}
+
+fn wide(entry: Entry) WideEntry {
+    return WideEntry.from_entry(&entry);
+}
+
+/// An id that needs all 128 bits.
+const id_wide: u128 = 0xfedc_ba98_7654_3210_0123_4567_89ab_cdef;
+
+test "records: put, lookup, a read at the version seen, and a delete's tombstone" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const context = try context_init(&arena);
+
+    try testing.expect(!(try context.lookup_record(records_table, id_wide)).flags.exists);
+    const inserted = try context.commit_wide(&.{&.{ record_read(id_wide, 0), record_put(id_wide, 7) }});
+    try expect_statuses(inserted[0], &.{ .ok, .ok });
+    const op_put = inserted[0][0].op;
+
+    const found = try context.lookup_record(records_table, id_wide);
+    try testing.expect(found.flags.exists);
+    try testing.expect(!found.flags.collision);
+    try testing.expectEqual(id_wide, found.id);
+    try testing.expectEqual(op_put, found.op);
+    try testing.expectEqual(record_value(7), found.value);
+    // Another id of the same table, and the same id in another table, are other records.
+    try testing.expect(!(try context.lookup_record(records_table, id_wide + 1)).flags.exists);
+    try testing.expect(!(try context.lookup_record(records_table + 1, id_wide)).flags.exists);
+    // A lookup outside the record tables answers absent.
+    try testing.expect(!(try context.lookup_record(5, 1)).flags.exists);
+
+    // A stale read conflicts with the record's version; nothing applies.
+    const stale = try context.commit_wide(&.{&.{ record_read(id_wide, 0), record_put(id_wide, 8) }});
+    try expect_statuses(stale[0], &.{ .conflict, .aborted });
+    try testing.expectEqual(op_put, stale[0][0].op);
+    try testing.expectEqual(record_value(7), (try context.lookup_record(records_table, id_wide)).value);
+
+    const deleted = try context.commit_wide(&.{&.{ record_read(id_wide, op_put), record_delete(id_wide) }});
+    try expect_statuses(deleted[0], &.{ .ok, .ok });
+    const gone = try context.lookup_record(records_table, id_wide);
+    try testing.expect(!gone.flags.exists);
+    try testing.expectEqual(deleted[0][0].op, gone.op);
+    // Two writes to one record in a transaction: refused.
+    try expect_statuses(
+        (try context.commit_wide(&.{&.{ record_put(1, 1), record_delete(1) }}))[0],
+        &.{ .aborted, .write_duplicate },
+    );
+}
+
+test "records: a record and a ledger's pair commit together, or neither does" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const context = try context_init(&arena);
+    try ledger_funded(context, 50);
+
+    // Reserve 30 and record the execution, in one transaction (G1).
+    const reserved = try context.commit_wide(&.{&.{
+        wide(move(accounts, 1, 0, -30, .{ .pair = true })),
+        wide(partner(accounts, 1, 8, 0)),
+        record_put(id_wide, 30),
+    }});
+    try expect_statuses(reserved[0], &.{ .ok, .ok, .ok });
+    try testing.expectEqual(@as(i64, 20), signed(try context.lookup(accounts, 1), 0));
+    try testing.expect((try context.lookup_record(records_table, id_wide)).flags.exists);
+
+    // The next reservation would cross the floor: its record is not written either.
+    const refused = try context.commit_wide(&.{&.{
+        record_put(id_wide + 1, 40),
+        wide(move(accounts, 1, 0, -40, .{ .pair = true })),
+        wide(partner(accounts, 1, 8, 1)),
+    }});
+    try expect_statuses(refused[0], &.{ .aborted, .out_of_bounds, .aborted });
+    try testing.expect(!(try context.lookup_record(records_table, id_wide + 1)).flags.exists);
+    try testing.expectEqual(@as(i64, 20), signed(try context.lookup(accounts, 1), 0));
+    try testing.expectEqual(@as(i64, 0), try ledger_total(context));
+}
+
+test "records: commit writes rows only; commit_wide checks ids, values and adds by table" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const context = try context_init(&arena);
+
+    try expect_statuses(
+        (try context.commit(&.{&.{ put(1, 1, 1), put(records_table, 1, 1) }}))[0],
+        &.{ .aborted, .table_invalid },
+    );
+    var row_wide_id = wide(put(1, 1, 1));
+    row_wide_id.id = @as(u128, 1) << 64;
+    var row_wide_value = wide(put(1, 1, 1));
+    row_wide_value.value[nerva.value_size] = 1;
+    var record_add = wide(add(1, 1, 0, 1, .{ .create = true }));
+    record_add.table = records_table;
+    var reserved_wide = record_put(2, 2);
+    reserved_wide.reserved_b[31] = 1;
+    const cases = [_]struct { entry: WideEntry, status: nerva.EntryStatus }{
+        .{ .entry = row_wide_id, .status = .id_invalid },
+        .{ .entry = row_wide_value, .status = .value_not_zero },
+        .{ .entry = record_add, .status = .field_invalid },
+        .{ .entry = reserved_wide, .status = .reserved_not_zero },
+    };
+    for (cases) |case| {
+        try expect_statuses(
+            (try context.commit_wide(&.{&.{ record_put(3, 3), case.entry }}))[0],
+            &.{ .aborted, case.status },
+        );
+    }
+    // A row through commit_wide is the row commit writes.
+    const row = try context.commit_wide(&.{&.{wide(put(1, 9, 9))}});
+    try expect_statuses(row[0], &.{.ok});
+    try testing.expectEqual(value(9), (try context.lookup(1, 9)).value);
+    try testing.expect(!(try context.lookup_record(records_table, 3)).flags.exists);
+}
+
+test "records: their feed in commit order, and a record's history as of any op" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const context = try context_init(&arena);
+
+    var ops: [4]u64 = undefined;
+    for (&ops, 0..) |*op, round| {
+        const results = try context.commit_wide(&.{&.{
+            record_put(id_wide, @intCast(round + 1)),
+            record_put(@intCast(round + 100), 1),
+            // Rows go to the rows' feed, not this one.
+            wide(put(1, round, 1)),
+        }});
+        try expect_statuses(results[0], &.{ .ok, .ok, .ok });
+        op.* = results[0][0].op;
+    }
+    const deleted = try context.commit_wide(&.{&.{record_delete(id_wide)}});
+    try expect_statuses(deleted[0], &.{.ok});
+
+    // The feed, three at a time, by cursor: nine changes, then the end.
+    var collected: std.ArrayListUnmanaged(nerva.RecordChange) = .{};
+    var cursor: u64 = 0;
+    while (true) {
+        const page = try context.record_changes(cursor, 3);
+        const end = page[page.len - 1];
+        try testing.expectEqual(nerva.ChangeKind.end, end.kind);
+        try collected.appendSlice(arena.allocator(), page[0 .. page.len - 1]);
+        cursor = end.timestamp;
+        if (!end.flags.more) break;
+    }
+    try testing.expectEqual(@as(usize, 9), collected.items.len);
+    for (collected.items[1..], collected.items[0 .. collected.items.len - 1]) |b, a| {
+        try testing.expect(a.timestamp < b.timestamp);
+        try testing.expectEqual(records_table, b.table);
+    }
+    try testing.expectEqual(nerva.ChangeKind.delete, collected.items[8].kind);
+
+    // The record as of op 2 of its four: the second put.
+    const as_of = try context.record_history(.{
+        .id = id_wide,
+        .table = records_table,
+        .limit = 10,
+        .op_max = ops[1],
+        .timestamp_max = 0,
+    });
+    try testing.expectEqual(@as(usize, 3), as_of.len); // Two puts, then the end.
+    try testing.expectEqual(record_value(2), as_of[0].value);
+    try testing.expectEqual(ops[1], as_of[0].op);
+    const newest = try context.record_history(.{
+        .id = id_wide,
+        .table = records_table,
+        .limit = 2,
+        .op_max = std.math.maxInt(u64),
+        .timestamp_max = 0,
+    });
+    try testing.expectEqual(nerva.ChangeKind.delete, newest[0].kind);
+    try testing.expect(newest[2].flags.more);
+    // A filter for a row table is invalid: an empty reply.
+    try testing.expectEqual(@as(usize, 0), (try context.record_history(.{
+        .id = 1,
+        .table = 1,
+        .limit = 2,
+        .op_max = 1,
+        .timestamp_max = 0,
+    })).len);
+}
+
+test "records: a resent commit_wide under a key commits once" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const context = try context_init(&arena);
+
+    const transaction = [_]WideEntry{
+        wide(nerva.commit_key_entry(9)),
+        record_read(id_wide, 0),
+        record_put(id_wide, 1),
+    };
+    const first = try context.commit_wide(&.{&transaction});
+    try expect_statuses(first[0], &.{ .ok, .ok, .ok });
+    const again = try context.commit_wide(&.{&transaction});
+    try expect_statuses(again[0], &.{ .committed_before, .aborted, .aborted });
+    try testing.expectEqual(first[0][0].op, again[0][0].op);
 }
 
 test "get_changes: committed writes in op order, paged by cursor" {

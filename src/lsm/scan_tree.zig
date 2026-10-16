@@ -918,9 +918,9 @@ fn ScanTreeLevelType(comptime ScanTree: type, comptime Storage: type) type {
                 self.scan.tree.grid.block_unref(self.buffer.value_block);
                 self.buffer.value_block = self.scan.tree.grid.block_ref(value_block);
 
-                // Found values that match the range query.
-                const block_values =
-                    std.mem.bytesAsSlice(Value, self.buffer.value_block[@sizeOf(vsr.Header)..]);
+                // Found values that match the range query. Nerva: the block's used values, as
+                // `values` above, so that objects need not divide the block's payload (P123b).
+                const block_values = Table.value_block_values_used(self.buffer.value_block);
                 self.values = .{ .buffered = block_values[range.start..][0..range.count] };
             } else {
                 // The `value_block` *might* contain the key range,

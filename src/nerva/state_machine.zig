@@ -50,6 +50,11 @@ const views = @import("views.zig");
 const ledgers = @import("ledgers.zig");
 const RowKey = nerva.RowKey;
 const RowValue = nerva.RowValue;
+const Record = nerva.Record;
+const RecordKey = nerva.RecordKey;
+const RecordValue = nerva.RecordValue;
+const RecordChange = nerva.RecordChange;
+const RecordHistoryFilter = nerva.RecordHistoryFilter;
 const CommitKey = nerva.CommitKey;
 const Change = nerva.Change;
 const ChangesFilter = nerva.ChangesFilter;
@@ -71,6 +76,14 @@ pub fn StateMachineType(comptime Storage: type) type {
         /// -1 for the `end` record.
         pub const changes_limit_max =
             Operation.get_changes.result_max(constants.message_body_size_max) - 1;
+        /// Records (P123b): the most one op writes, looks up, or returns as changes.
+        pub const commit_wide_entries_max =
+            Operation.commit_wide.event_max(constants.message_body_size_max);
+        pub const lookup_records_max =
+            Operation.lookup_records.event_max(constants.message_body_size_max);
+        /// -1 for the `end` record.
+        pub const record_changes_limit_max =
+            Operation.get_record_changes.result_max(constants.message_body_size_max) - 1;
 
         /// Timestamps a commit entry takes: its change, then one per view of its table, for a
         /// group the entry creates (N52), then one per `min` or `max` slot of its table, for a
@@ -98,6 +111,10 @@ pub fn StateMachineType(comptime Storage: type) type {
             assert(commit_entries_max > 0);
             assert(lookup_rows_max > 0);
             assert(changes_limit_max > 0);
+            assert(commit_wide_entries_max > 0);
+            assert(commit_wide_entries_max <= commit_entries_max);
+            assert(lookup_records_max > 0);
+            assert(record_changes_limit_max > 0);
             assert(view_groups_limit_max > 0);
             assert(view_as_of_scans_max > 0);
         }
@@ -110,6 +127,8 @@ pub fn StateMachineType(comptime Storage: type) type {
             cache_entries_groups: u32 = GroupsGroove.ObjectsCache.Cache.value_count_max_multiple,
             cache_entries_members: u32 =
                 MembersGroove.ObjectsCache.Cache.value_count_max_multiple,
+            cache_entries_records: u32 =
+                RecordsGroove.ObjectsCache.Cache.value_count_max_multiple,
         };
 
         /// The row cache holds a multiple of this many rows (its set size), and at least one.
@@ -329,6 +348,67 @@ pub fn StateMachineType(comptime Storage: type) type {
             },
         );
 
+        const RecordsGroove = GrooveType(
+            Storage,
+            Record,
+            .{
+                .ids = tree_ids.Record,
+                .batch_value_count_max = .{
+                    .timestamp = commit_wide_entries_max,
+                    .key = commit_wide_entries_max,
+                },
+                .primary_key = "key",
+                .primary_key_orphaned = false,
+                .unique_keys = &[_][:0]const u8{"key"},
+                .ignored = &[_][:0]const u8{
+                    "id",
+                    "table",
+                    "flags",
+                    "op",
+                    "reserved",
+                    "value",
+                },
+                .optional = &[_][:0]const u8{},
+                .derived = .{},
+                .objects_cache = true,
+            },
+        );
+
+        const RecordChangesGroove = GrooveType(
+            Storage,
+            RecordChange,
+            .{
+                .ids = tree_ids.RecordChange,
+                .batch_value_count_max = .{
+                    .timestamp = commit_wide_entries_max,
+                    .record_key = commit_wide_entries_max,
+                },
+                .primary_key = "timestamp",
+                .primary_key_orphaned = false,
+                .unique_keys = &[_][:0]const u8{},
+                .ignored = &[_][:0]const u8{
+                    "id",
+                    "table",
+                    "kind",
+                    "flags",
+                    "reserved_a",
+                    "op",
+                    "reserved_b",
+                    "value",
+                },
+                .optional = &[_][:0]const u8{},
+                .derived = .{
+                    .record_key = struct {
+                        fn record_key(change: *const RecordChange) ?u128 {
+                            return nerva.record_key(change.table, change.id);
+                        }
+                    }.record_key,
+                },
+                // Append only, like changes.
+                .objects_cache = false,
+            },
+        );
+
         pub const Forest = ForestType(Storage, .{
             .rows = RowsGroove,
             .changes = ChangesGroove,
@@ -338,6 +418,8 @@ pub fn StateMachineType(comptime Storage: type) type {
             .group_versions = GroupVersionsGroove,
             .view_versions = ViewVersionsGroove,
             .ledgers = LedgersGroove,
+            .records = RecordsGroove,
+            .record_changes = RecordChangesGroove,
         });
 
         const RowsScanLookup = ScanLookupType(
@@ -367,6 +449,12 @@ pub fn StateMachineType(comptime Storage: type) type {
         );
 
         const ChangesScanTree = ScanTreeType(void, ChangesGroove.ObjectTree, Storage);
+        const RecordChangesScanTree = ScanTreeType(void, RecordChangesGroove.ObjectTree, Storage);
+        const RecordHistoryScanLookup = ScanLookupType(
+            RecordChangesGroove,
+            RecordChangesGroove.ScanBuilder.Scan,
+            Storage,
+        );
         const HistoryScanLookup = ScanLookupType(
             ChangesGroove,
             ChangesGroove.ScanBuilder.Scan,
@@ -435,6 +523,12 @@ pub fn StateMachineType(comptime Storage: type) type {
         changes_scan_buffer: []Change,
         /// The number of changes scanned, or null if the filter was invalid.
         changes_scan_count: ?u32 = null,
+        records_prefetch_context: RecordsGroove.PrefetchContext = undefined,
+        record_changes_scan_tree: RecordChangesScanTree = undefined,
+        record_history_scan_lookup: RecordHistoryScanLookup = undefined,
+        /// Results of the last `get_record_changes` or `get_record_history` prefetch.
+        record_changes_scan_buffer: []RecordChange,
+        record_changes_scan_count: ?u32 = null,
 
         /// Scratch space for duplicate-write detection.
         write_keys: []WriteKey,
@@ -553,6 +647,11 @@ pub fn StateMachineType(comptime Storage: type) type {
             assert(options.batch_size_limit <= constants.message_body_size_max);
 
             const commit_entries_limit = Operation.commit.event_max(options.batch_size_limit);
+            const commit_wide_entries_limit =
+                Operation.commit_wide.event_max(options.batch_size_limit);
+            assert(commit_wide_entries_limit <= commit_wide_entries_max);
+            const lookup_records_limit =
+                Operation.lookup_records.event_max(options.batch_size_limit);
             const groups_limit: u32 = @max(1, @divFloor(commit_entries_limit, 2));
             assert(groups_limit <= groups_per_op_max);
             const lookup_rows_limit = Operation.lookup_rows.event_max(options.batch_size_limit);
@@ -567,6 +666,7 @@ pub fn StateMachineType(comptime Storage: type) type {
                 .member_writes_limit = members_limit,
                 .forest = undefined,
                 .changes_scan_buffer = undefined,
+                .record_changes_scan_buffer = undefined,
                 .write_keys = undefined,
                 .wide_entries = undefined,
                 .backfill_rows = undefined,
@@ -651,6 +751,30 @@ pub fn StateMachineType(comptime Storage: type) type {
                             .version = .{ .batch_value_count_limit = nerva.views_max },
                         },
                     },
+                    .records = .{
+                        .cache_entries_max = options.cache_entries_records,
+                        .prefetch_entries_for_read_max = lookup_records_limit,
+                        .prefetch_entries_for_update_max = commit_wide_entries_limit,
+                        .tree_options_object = .{
+                            .batch_value_count_limit = commit_wide_entries_limit,
+                        },
+                        .tree_options_index = .{
+                            .key = .{ .batch_value_count_limit = commit_wide_entries_limit },
+                        },
+                    },
+                    .record_changes = .{
+                        .cache_entries_max = 0,
+                        .prefetch_entries_for_read_max = 0,
+                        .prefetch_entries_for_update_max = 0,
+                        .tree_options_object = .{
+                            .batch_value_count_limit = commit_wide_entries_limit,
+                        },
+                        .tree_options_index = .{
+                            .record_key = .{
+                                .batch_value_count_limit = commit_wide_entries_limit,
+                            },
+                        },
+                    },
                     .ledgers = .{
                         .cache_entries_max = LedgersGroove.ObjectsCache.Cache
                             .value_count_max_multiple,
@@ -668,6 +792,10 @@ pub fn StateMachineType(comptime Storage: type) type {
 
             self.changes_scan_buffer = try allocator.alloc(Change, changes_limit_max);
             errdefer allocator.free(self.changes_scan_buffer);
+
+            self.record_changes_scan_buffer =
+                try allocator.alloc(RecordChange, record_changes_limit_max);
+            errdefer allocator.free(self.record_changes_scan_buffer);
 
             self.write_keys = try allocator.alloc(WriteKey, commit_entries_limit);
             errdefer allocator.free(self.write_keys);
@@ -750,6 +878,7 @@ pub fn StateMachineType(comptime Storage: type) type {
             self.add_rows.deinit(allocator);
             allocator.free(self.wide_entries);
             allocator.free(self.write_keys);
+            allocator.free(self.record_changes_scan_buffer);
             allocator.free(self.changes_scan_buffer);
             self.forest.deinit(allocator);
         }
@@ -761,6 +890,7 @@ pub fn StateMachineType(comptime Storage: type) type {
                 .group_writes_limit = self.group_writes_limit,
                 .forest = self.forest,
                 .changes_scan_buffer = self.changes_scan_buffer,
+                .record_changes_scan_buffer = self.record_changes_scan_buffer,
                 .write_keys = self.write_keys,
                 .wide_entries = self.wide_entries,
                 .add_rows = self.add_rows,
@@ -893,7 +1023,7 @@ pub fn StateMachineType(comptime Storage: type) type {
         ) void {
             assert(message_body_used.len <= self.batch_size_limit);
             const payload: []const u8 = switch (operation) {
-                .lookup_rows, .commit => payload: {
+                .lookup_rows, .commit, .commit_wide, .lookup_records => payload: {
                     const body_decoder = MultiBatchDecoder.init(message_body_used, .{
                         .element_size = operation.event_size(),
                     }) catch unreachable; // Already validated by `input_valid()`.
@@ -906,6 +1036,8 @@ pub fn StateMachineType(comptime Storage: type) type {
                 .pulse,
                 .declare_ledger,
                 .get_ledger,
+                .get_record_changes,
+                .get_record_history,
                 => message_body_used,
             };
             self.prepare_timestamp +=
@@ -915,10 +1047,19 @@ pub fn StateMachineType(comptime Storage: type) type {
         fn prepare_delta(self: *const StateMachine, operation: Operation, events: []const u8) u64 {
             return switch (operation) {
                 .commit => @divExact(events.len, @sizeOf(Entry)) * entry_timestamps,
+                .commit_wide => @divExact(events.len, @sizeOf(WideEntry)) * entry_timestamps,
                 .declare_view, .declare_ledger => 1,
                 // Each row a pulse may add takes an entry's block.
                 .pulse => self.group_writes_limit * entry_timestamps,
-                .lookup_rows, .get_changes, .get_history, .get_view, .get_ledger => 0,
+                .lookup_rows,
+                .get_changes,
+                .get_history,
+                .get_view,
+                .get_ledger,
+                .lookup_records,
+                .get_record_changes,
+                .get_record_history,
+                => 0,
             };
         }
 
@@ -926,7 +1067,7 @@ pub fn StateMachineType(comptime Storage: type) type {
         /// views it changes (N62).
         fn versions_reserve(self: *const StateMachine, operation: Operation) u64 {
             return switch (operation) {
-                .commit, .pulse => self.group_writes_limit + nerva.views_max,
+                .commit, .commit_wide, .pulse => self.group_writes_limit + nerva.views_max,
                 .declare_view => 1,
                 .lookup_rows,
                 .get_changes,
@@ -934,6 +1075,9 @@ pub fn StateMachineType(comptime Storage: type) type {
                 .get_view,
                 .declare_ledger,
                 .get_ledger,
+                .lookup_records,
+                .get_record_changes,
+                .get_record_history,
                 => 0,
             };
         }
@@ -978,7 +1122,15 @@ pub fn StateMachineType(comptime Storage: type) type {
 
             switch (operation) {
                 .lookup_rows => self.prefetch_rows(RowKey, message_body_used),
-                .commit, .declare_view, .declare_ledger, .get_ledger => self.prefetch_ledgers(),
+                .commit,
+                .commit_wide,
+                .declare_view,
+                .declare_ledger,
+                .get_ledger,
+                => self.prefetch_ledgers(),
+                .lookup_records => self.prefetch_records_lookup(message_body_used),
+                .get_record_changes => self.prefetch_record_changes(message_body_used),
+                .get_record_history => self.prefetch_record_history(message_body_used),
                 .get_changes => self.prefetch_changes(message_body_used),
                 .get_history => self.prefetch_history(message_body_used),
                 .get_view, .pulse => self.prefetch_views(),
@@ -1029,6 +1181,62 @@ pub fn StateMachineType(comptime Storage: type) type {
             rows.prefetch(prefetch_rows_callback, &self.rows_prefetch_context);
         }
 
+        /// Stage 2 of a commit (P123b): the record of every record entry.
+        fn prefetch_commit_records(self: *StateMachine) void {
+            const operation = self.prefetch_operation.?;
+            const records = &self.forest.grooves.records;
+            records.prefetch_setup(self.prefetch_snapshot.?);
+            // `commit` writes rows only.
+            if (operation == .commit_wide) {
+                var decoder = MultiBatchDecoder.init(self.prefetch_input.?, .{
+                    .element_size = operation.event_size(),
+                }) catch unreachable; // Already validated by `input_valid()`.
+                while (decoder.pop()) |batch| {
+                    for (self.batch_entries(operation, batch)) |*entry| {
+                        if (entry.kind == .key or !nerva.table_is_record(entry.table)) continue;
+                        records.prefetch_enqueue(.{
+                            .key = nerva.record_key(entry.table, entry.id),
+                        });
+                    }
+                }
+            }
+            records.prefetch(prefetch_records_callback, &self.records_prefetch_context);
+        }
+
+        /// The record of every key of a `lookup_records` request (P123b). Keys outside the
+        /// record tables, or with reserved bytes set, are answered absent without a lookup.
+        fn prefetch_records_lookup(
+            self: *StateMachine,
+            body: []align(constants.cache_line_size) const u8,
+        ) void {
+            const body_decoder = MultiBatchDecoder.init(body, .{
+                .element_size = @sizeOf(RecordKey),
+            }) catch unreachable; // Already validated by `input_valid()`.
+            const keys = stdx.bytes_as_slice(.exact, RecordKey, body_decoder.payload);
+            const records = &self.forest.grooves.records;
+            records.prefetch_setup(self.prefetch_snapshot.?);
+            for (keys) |*key| {
+                if (!record_key_valid(key)) continue;
+                records.prefetch_enqueue(.{ .key = nerva.record_key(key.table, key.id) });
+            }
+            records.prefetch(prefetch_records_callback, &self.records_prefetch_context);
+        }
+
+        fn record_key_valid(key: *const RecordKey) bool {
+            return nerva.table_is_record(key.table) and stdx.zeroed(&key.reserved);
+        }
+
+        fn prefetch_records_callback(context: *RecordsGroove.PrefetchContext) void {
+            const self: *StateMachine = @alignCast(
+                @fieldParentPtr("records_prefetch_context", context),
+            );
+            switch (self.prefetch_operation.?) {
+                .commit, .commit_wide => self.prefetch_commit_groups(),
+                .lookup_records => self.prefetch_finish(),
+                else => unreachable,
+            }
+        }
+
         /// One batch of `commit` or `commit_wide` as wide entries: `commit_wide`'s as sent,
         /// `commit`'s widened into `wide_entries`, which holds one batch at a time.
         fn batch_entries(
@@ -1037,6 +1245,7 @@ pub fn StateMachineType(comptime Storage: type) type {
             batch: []const u8,
         ) []const WideEntry {
             switch (operation) {
+                .commit_wide => return stdx.bytes_as_slice(.exact, WideEntry, batch),
                 .commit => {
                     const entries = stdx.bytes_as_slice(.exact, Entry, batch);
                     const wide = self.wide_entries[0..entries.len];
@@ -1061,7 +1270,7 @@ pub fn StateMachineType(comptime Storage: type) type {
                 @fieldParentPtr("rows_prefetch_context", context),
             );
             switch (self.prefetch_operation.?) {
-                .commit => self.prefetch_commit_groups(),
+                .commit, .commit_wide => self.prefetch_commit_records(),
                 .lookup_rows => self.prefetch_finish(),
                 else => unreachable,
             }
@@ -1208,6 +1417,137 @@ pub fn StateMachineType(comptime Storage: type) type {
             return @min(filter.limit, changes_limit_max);
         }
 
+        // ---- Records' changes and history (P123b): as `get_changes` and `get_history` ----
+
+        fn prefetch_record_changes(
+            self: *StateMachine,
+            body: []align(constants.cache_line_size) const u8,
+        ) void {
+            assert(self.record_changes_scan_count == null);
+            const filter = changes_filter(body);
+            const limit = record_changes_limit(filter) orelse {
+                log.debug("get_record_changes: invalid filter {}", .{filter});
+                return self.prefetch_finish();
+            };
+            assert(limit > 0);
+
+            self.record_changes_scan_count = 0;
+            self.record_changes_scan_tree.init(
+                &self.forest.grooves.record_changes.objects,
+                self.forest.scan_buffer_pool.acquire_assume_capacity(),
+                self.prefetch_snapshot.?,
+                if (filter.timestamp_min == 0)
+                    TimestampRange.timestamp_min
+                else
+                    filter.timestamp_min,
+                TimestampRange.timestamp_max,
+                .ascending,
+            );
+            self.record_changes_scan_read();
+        }
+
+        fn record_changes_scan_read(self: *StateMachine) void {
+            self.record_changes_scan_tree.read({}, record_changes_scan_read_callback);
+        }
+
+        fn record_changes_scan_read_callback(_: void, scan_tree: *RecordChangesScanTree) void {
+            const self: *StateMachine = @fieldParentPtr("record_changes_scan_tree", scan_tree);
+            const filter = changes_filter(self.prefetch_input.?);
+            const limit = record_changes_limit(filter).?;
+
+            while (self.record_changes_scan_count.? < limit) {
+                const change = scan_tree.next() catch |err| switch (err) {
+                    error.Pending => return self.record_changes_scan_read(),
+                } orelse break;
+                assert(change.kind == .put or change.kind == .delete);
+                assert(change.timestamp >= filter.timestamp_min);
+                self.record_changes_scan_buffer[self.record_changes_scan_count.?] = change;
+                self.record_changes_scan_count.? += 1;
+            }
+
+            self.forest.scan_buffer_pool.reset();
+            self.prefetch_finish();
+        }
+
+        fn record_changes_limit(filter: *const nerva.ChangesFilter) ?u32 {
+            const limit = changes_limit(filter) orelse return null;
+            return @min(limit, record_changes_limit_max);
+        }
+
+        fn prefetch_record_history(
+            self: *StateMachine,
+            body: []align(constants.cache_line_size) const u8,
+        ) void {
+            assert(self.record_changes_scan_count == null);
+            const filter = record_history_filter(body);
+            const limit = record_history_limit(filter) orelse {
+                log.debug("get_record_history: invalid filter {}", .{filter});
+                return self.prefetch_finish();
+            };
+            assert(limit > 0);
+
+            const changes = &self.forest.grooves.record_changes;
+            const scan = changes.scan_builder.scan_prefix(
+                .record_key,
+                self.forest.scan_buffer_pool.acquire_assume_capacity(),
+                self.prefetch_snapshot.?,
+                nerva.record_key(filter.table, filter.id),
+                .{
+                    .min = TimestampRange.timestamp_min,
+                    .max = if (filter.timestamp_max == 0)
+                        TimestampRange.timestamp_max
+                    else
+                        filter.timestamp_max,
+                },
+                .descending,
+            );
+            self.record_changes_scan_count = 0;
+            self.record_history_scan_lookup = RecordHistoryScanLookup.init(changes, scan);
+            self.record_history_scan_lookup.read(
+                self.record_changes_scan_buffer[0..limit],
+                prefetch_record_history_callback,
+            );
+        }
+
+        fn prefetch_record_history_callback(
+            scan_lookup: *RecordHistoryScanLookup,
+            results: []const RecordChange,
+        ) void {
+            const self: *StateMachine =
+                @alignCast(@fieldParentPtr("record_history_scan_lookup", scan_lookup));
+            assert(self.record_changes_scan_count.? == 0);
+            assert(results.len <=
+                record_history_limit(record_history_filter(self.prefetch_input.?)).?);
+            assert(results.len == 0 or results.ptr == self.record_changes_scan_buffer.ptr);
+
+            self.record_changes_scan_count = @intCast(results.len);
+            self.forest.scan_buffer_pool.reset();
+            self.forest.grooves.record_changes.scan_builder.reset();
+            self.prefetch_finish();
+        }
+
+        fn record_history_filter(
+            body: []align(constants.cache_line_size) const u8,
+        ) *const RecordHistoryFilter {
+            assert(body.len == @sizeOf(RecordHistoryFilter));
+            return @alignCast(std.mem.bytesAsValue(
+                RecordHistoryFilter,
+                body[0..@sizeOf(RecordHistoryFilter)],
+            ));
+        }
+
+        /// The effective limit of a valid filter, or null if the filter is invalid.
+        fn record_history_limit(filter: *const RecordHistoryFilter) ?u32 {
+            if (!nerva.table_is_record(filter.table)) return null;
+            if (filter.limit == 0) return null;
+            if (filter.op_max == 0) return null;
+            if (!stdx.zeroed(&filter.reserved)) return null;
+            if (filter.timestamp_max != 0 and !TimestampRange.valid(filter.timestamp_max)) {
+                return null;
+            }
+            return @min(filter.limit, record_changes_limit_max);
+        }
+
         fn prefetch_finish(self: *StateMachine) void {
             assert(self.prefetch_operation != null);
             assert(self.prefetch_input != null);
@@ -1234,7 +1574,11 @@ pub fn StateMachineType(comptime Storage: type) type {
             assert(message_body_used.len <= self.batch_size_limit);
 
             return switch (operation) {
-                inline .lookup_rows, .commit => |operation_comptime| self.execute_multi_batch(
+                inline .lookup_rows,
+                .commit,
+                .commit_wide,
+                .lookup_records,
+                => |operation_comptime| self.execute_multi_batch(
                     operation_comptime,
                     op,
                     timestamp,
@@ -1258,6 +1602,16 @@ pub fn StateMachineType(comptime Storage: type) type {
                     output_buffer,
                 ),
                 .get_ledger => self.execute_get_ledger(message_body_used, output_buffer),
+                .get_record_changes => self.execute_get_record_changes(
+                    op,
+                    message_body_used,
+                    output_buffer,
+                ),
+                .get_record_history => self.execute_get_record_history(
+                    op,
+                    message_body_used,
+                    output_buffer,
+                ),
             };
         }
 
@@ -1280,7 +1634,8 @@ pub fn StateMachineType(comptime Storage: type) type {
 
             // Each batch's writes take the timestamps just below its share of the prepare's.
             var batch_timestamp = timestamp - self.prepare_delta(operation, body_decoder.payload);
-            if (operation == .commit) self.versions_begin(.commit, batch_timestamp);
+            const committing = operation == .commit or operation == .commit_wide;
+            if (committing) self.versions_begin(operation, batch_timestamp);
             var batch_index: u32 = 0;
             while (body_decoder.pop()) |batch| : (batch_index += 1) {
                 batch_timestamp += self.prepare_delta(operation, batch);
@@ -1290,7 +1645,12 @@ pub fn StateMachineType(comptime Storage: type) type {
                         batch,
                         reply_encoder.writable().?,
                     ),
-                    .commit => self.execute_commit(
+                    .lookup_records => self.execute_lookup_records(
+                        op,
+                        batch,
+                        reply_encoder.writable().?,
+                    ),
+                    .commit, .commit_wide => self.execute_commit(
                         op,
                         batch_timestamp,
                         self.batch_entries(operation, batch),
@@ -1310,13 +1670,15 @@ pub fn StateMachineType(comptime Storage: type) type {
                     .pulse,
                     .declare_ledger,
                     .get_ledger,
+                    .get_record_changes,
+                    .get_record_history,
                     => comptime unreachable,
                 };
                 reply_encoder.add(@intCast(bytes_written));
             }
             assert(batch_timestamp == timestamp);
             assert(body_decoder.batch_count() == reply_encoder.batch_count);
-            if (operation == .commit) self.views_finish(op);
+            if (committing) self.views_finish(op);
             return reply_encoder.finish();
         }
 
@@ -1354,6 +1716,42 @@ pub fn StateMachineType(comptime Storage: type) type {
             return keys.len * @sizeOf(RowValue);
         }
 
+        fn execute_lookup_records(
+            self: *StateMachine,
+            op: u64,
+            batch: []const u8,
+            output: []u8,
+        ) usize {
+            const keys = stdx.bytes_as_slice(.exact, RecordKey, batch);
+            const results = stdx.bytes_as_slice(.inexact, RecordValue, output)[0..keys.len];
+            for (keys, results) |*key, *result| {
+                result.* = .{
+                    .id = key.id,
+                    .table = key.table,
+                    .flags = .{},
+                    .op = 0,
+                    .op_read = op,
+                    .value = @splat(0),
+                };
+                if (!record_key_valid(key)) continue;
+                switch (self.forest.grooves.records.get(nerva.record_key(key.table, key.id))) {
+                    .found_object => |record| {
+                        if (record.id != key.id) {
+                            result.flags.collision = true;
+                            continue;
+                        }
+                        result.op = record.op;
+                        if (!record.flags.deleted) {
+                            result.flags.exists = true;
+                            result.value = record.value;
+                        }
+                    },
+                    .not_found => {},
+                }
+            }
+            return keys.len * @sizeOf(RecordValue);
+        }
+
         /// Executes one transaction. `timestamp` is the timestamp of its last entry. `narrow`:
         /// sent by `commit`, which writes rows only.
         fn execute_commit(
@@ -1387,8 +1785,14 @@ pub fn StateMachineType(comptime Storage: type) type {
                     switch (entry.kind) {
                         .read => {},
                         .key => self.commit_key_put(op, entry_timestamp, entries),
-                        .put => self.row_put(op, entry_timestamp, entry, entry.row_value()),
-                        .delete => self.row_delete(op, entry_timestamp, entry),
+                        .put => if (nerva.table_is_record(entry.table))
+                            self.record_put(op, entry_timestamp, entry)
+                        else
+                            self.row_put(op, entry_timestamp, entry, entry.row_value()),
+                        .delete => if (nerva.table_is_record(entry.table))
+                            self.record_delete(op, entry_timestamp, entry)
+                        else
+                            self.row_delete(op, entry_timestamp, entry),
                         .add => self.row_add(op, entry_timestamp, entry, result),
                         _ => unreachable, // Rejected by `entry_validate()`.
                     }
@@ -1477,8 +1881,17 @@ pub fn StateMachineType(comptime Storage: type) type {
                 return .{ .index = index, .status = .write_duplicate, .op = 0 };
             }
             for (entries, 0..) |*entry, index| {
+                if (entry.kind == .key or !nerva.table_is_record(entry.table)) continue;
+                _ = self.record_stored(entry) catch {
+                    return .{ .index = @intCast(index), .status = .id_collision, .op = 0 };
+                };
+            }
+            for (entries, 0..) |*entry, index| {
                 if (entry.kind != .read) continue;
-                const version = self.row_version(entry_row_key(entry));
+                const version = if (nerva.table_is_record(entry.table))
+                    if (self.record_stored(entry) catch unreachable) |record| record.op else 0
+                else
+                    self.row_version(entry_row_key(entry));
                 if (version != entry.op_seen) {
                     return .{ .index = @intCast(index), .status = .conflict, .op = version };
                 }
@@ -1548,7 +1961,10 @@ pub fn StateMachineType(comptime Storage: type) type {
                 // A key's row is written only when no row is there (`commit_key_failure`).
                 if (entry.kind == .read or entry.kind == .key) continue;
                 self.write_keys[count] = .{
-                    .key = entry_row_key(entry),
+                    .key = if (nerva.table_is_record(entry.table))
+                        nerva.record_key(entry.table, entry.id)
+                    else
+                        entry_row_key(entry),
                     .index = @intCast(index),
                 };
                 count += 1;
@@ -1641,6 +2057,91 @@ pub fn StateMachineType(comptime Storage: type) type {
             self.row_put(op, timestamp, &entry, entry.row_value());
         }
 
+        /// A record entry's record as stored (a tombstone included), null if its key holds
+        /// nothing, or `error.Collision` if it holds another id (P123b).
+        fn record_stored(self: *StateMachine, entry: *const WideEntry) error{Collision}!?Record {
+            assert(nerva.table_is_record(entry.table));
+            return switch (self.forest.grooves.records.get(
+                nerva.record_key(entry.table, entry.id),
+            )) {
+                .found_object => |record| found: {
+                    assert(record.table == entry.table);
+                    if (record.id != entry.id) return error.Collision;
+                    break :found record;
+                },
+                .not_found => null,
+            };
+        }
+
+        fn record_put(self: *StateMachine, op: u64, timestamp: u64, entry: *const WideEntry) void {
+            assert(entry.kind == .put);
+            const records = &self.forest.grooves.records;
+            const stored = self.record_stored(entry) catch unreachable;
+            if (stored) |record_old| {
+                // Equal when an earlier transaction in the same request wrote the record.
+                assert(record_old.op <= op);
+                var record_new = record_old;
+                record_new.value = entry.value;
+                record_new.op = op;
+                record_new.flags.deleted = false;
+                // Unchanged when an earlier write in the same op left the same bytes.
+                if (!stdx.equal_bytes(Record, &record_old, &record_new)) {
+                    records.update(.{ .old = &record_old, .new = &record_new });
+                }
+            } else {
+                records.insert(&.{
+                    .key = nerva.record_key(entry.table, entry.id),
+                    .id = entry.id,
+                    .table = entry.table,
+                    .flags = .{},
+                    .op = op,
+                    .timestamp = timestamp,
+                    .value = entry.value,
+                });
+            }
+            self.record_change_insert(op, timestamp, entry, .put, &entry.value);
+        }
+
+        /// Deleting a record that does not exist (or is already deleted) is a no-op.
+        fn record_delete(
+            self: *StateMachine,
+            op: u64,
+            timestamp: u64,
+            entry: *const WideEntry,
+        ) void {
+            assert(entry.kind == .delete);
+            const record_old = (self.record_stored(entry) catch unreachable) orelse return;
+            if (record_old.flags.deleted) return;
+            assert(record_old.op <= op);
+            var record_new = record_old;
+            record_new.value = @splat(0);
+            record_new.op = op;
+            record_new.flags.deleted = true;
+            self.forest.grooves.records.update(.{ .old = &record_old, .new = &record_new });
+            self.record_change_insert(op, timestamp, entry, .delete, &@splat(0));
+        }
+
+        fn record_change_insert(
+            self: *StateMachine,
+            op: u64,
+            timestamp: u64,
+            entry: *const WideEntry,
+            kind: nerva.ChangeKind,
+            value: *const [nerva.record_value_size]u8,
+        ) void {
+            assert(kind == .put or kind == .delete);
+            assert(kind == .put or stdx.zeroed(value));
+            self.forest.grooves.record_changes.insert(&.{
+                .id = entry.id,
+                .table = entry.table,
+                .kind = kind,
+                .flags = .{},
+                .op = op,
+                .timestamp = timestamp,
+                .value = value.*,
+            });
+        }
+
         /// The row's version: the op of its last write, or zero if it has never existed.
         fn row_version(self: *StateMachine, key: u128) u64 {
             return switch (self.forest.grooves.rows.get(key)) {
@@ -1731,7 +2232,9 @@ pub fn StateMachineType(comptime Storage: type) type {
             self.add_rows.clearRetainingCapacity();
             for (entries, results, 0..) |*entry, *result, index| {
                 result.* = .{ .status = .ok, .op = 0 };
-                if (entry.kind == .put or entry.kind == .delete) {
+                if ((entry.kind == .put or entry.kind == .delete) and
+                    !nerva.table_is_record(entry.table))
+                {
                     if (!self.conserved_unchanged(entry)) return .{
                         .index = @intCast(index),
                         .status = .conserved_write,
@@ -1872,7 +2375,7 @@ pub fn StateMachineType(comptime Storage: type) type {
             );
             self.ledgers_load();
             switch (self.prefetch_operation.?) {
-                .commit, .declare_view, .declare_ledger => self.prefetch_views(),
+                .commit, .commit_wide, .declare_view, .declare_ledger => self.prefetch_views(),
                 .get_ledger => self.prefetch_finish(),
                 else => unreachable,
             }
@@ -2012,7 +2515,7 @@ pub fn StateMachineType(comptime Storage: type) type {
             );
             self.views_load();
             switch (self.prefetch_operation.?) {
-                .commit => self.prefetch_commit_rows(),
+                .commit, .commit_wide => self.prefetch_commit_rows(),
                 .declare_view => if (self.restoring)
                     self.prefetch_restore_table()
                 else
@@ -2168,7 +2671,7 @@ pub fn StateMachineType(comptime Storage: type) type {
                 @fieldParentPtr("groups_prefetch_context", context),
             );
             switch (self.prefetch_operation.?) {
-                .commit => self.prefetch_commit_members(),
+                .commit, .commit_wide => self.prefetch_commit_members(),
                 .pulse => self.prefetch_backfill_members(),
                 else => unreachable,
             }
@@ -2211,7 +2714,7 @@ pub fn StateMachineType(comptime Storage: type) type {
                 @fieldParentPtr("members_prefetch_context", context),
             );
             switch (self.prefetch_operation.?) {
-                .commit => self.prefetch_extreme_scans(),
+                .commit, .commit_wide => self.prefetch_extreme_scans(),
                 .pulse => self.prefetch_finish(),
                 else => unreachable,
             }
@@ -3656,6 +4159,97 @@ pub fn StateMachineType(comptime Storage: type) type {
                 .value = @splat(0),
             };
             return (returned + 1) * @sizeOf(Change);
+        }
+
+        fn execute_get_record_changes(
+            self: *StateMachine,
+            op: u64,
+            message_body_used: []align(constants.cache_line_size) const u8,
+            output_buffer: *align(constants.cache_line_size) [constants.message_body_size_max]u8,
+        ) usize {
+            defer self.record_changes_scan_count = null;
+            const filter = changes_filter(message_body_used);
+            const limit = record_changes_limit(filter) orelse {
+                assert(self.record_changes_scan_count == null);
+                return 0;
+            };
+            const count = self.record_changes_scan_count.?;
+            assert(count <= limit);
+
+            const results =
+                stdx.bytes_as_slice(.inexact, RecordChange, output_buffer)[0 .. count + 1];
+            stdx.copy_disjoint(
+                .exact,
+                RecordChange,
+                results[0..count],
+                self.record_changes_scan_buffer[0..count],
+            );
+
+            const more = count == limit;
+            results[count] = .{
+                .id = 0,
+                .table = 0,
+                .kind = .end,
+                .flags = .{ .more = more },
+                .op = if (more) 0 else op,
+                .timestamp = if (count == 0)
+                    filter.timestamp_min
+                else
+                    results[count - 1].timestamp + 1,
+                .value = @splat(0),
+            };
+            return (count + 1) * @sizeOf(RecordChange);
+        }
+
+        fn execute_get_record_history(
+            self: *StateMachine,
+            op: u64,
+            message_body_used: []align(constants.cache_line_size) const u8,
+            output_buffer: *align(constants.cache_line_size) [constants.message_body_size_max]u8,
+        ) usize {
+            defer self.record_changes_scan_count = null;
+            const filter = record_history_filter(message_body_used);
+            const limit = record_history_limit(filter) orelse {
+                assert(self.record_changes_scan_count == null);
+                return 0;
+            };
+            const count = self.record_changes_scan_count.?;
+            assert(count <= limit);
+            const scanned = self.record_changes_scan_buffer[0..count];
+
+            const results =
+                stdx.bytes_as_slice(.inexact, RecordChange, output_buffer)[0 .. count + 1];
+            var returned: u32 = 0;
+            for (scanned, 0..) |*change, index| {
+                assert(change.table == filter.table);
+                assert(change.kind == .put or change.kind == .delete);
+                assert(change.op < op);
+                if (filter.timestamp_max != 0) assert(change.timestamp <= filter.timestamp_max);
+                if (index > 0) {
+                    assert(change.timestamp < scanned[index - 1].timestamp);
+                    assert(change.op <= scanned[index - 1].op);
+                }
+                // The key's history: another id whose key collides never wrote it (refused).
+                assert(change.id == filter.id);
+                if (change.op > filter.op_max) {
+                    assert(returned == 0);
+                    continue;
+                }
+                results[returned] = change.*;
+                returned += 1;
+            }
+
+            const more = count == limit;
+            results[returned] = .{
+                .id = 0,
+                .table = 0,
+                .kind = .end,
+                .flags = .{ .more = more },
+                .op = if (more) 0 else op,
+                .timestamp = if (more) scanned[count - 1].timestamp - 1 else 0,
+                .value = @splat(0),
+            };
+            return (returned + 1) * @sizeOf(RecordChange);
         }
     };
 }

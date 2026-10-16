@@ -80,6 +80,17 @@ pub const tree_ids = struct {
         .timestamp = 16,
         .slot = 17,
     };
+
+    pub const Record = .{
+        .timestamp = 18,
+        .key = 19,
+    };
+
+    pub const RecordChange = .{
+        .timestamp = 20,
+        // `record_key(table, id)`: a record's history, in timestamp order (P123b).
+        .record_key = 21,
+    };
 };
 
 /// The LSM key of a row: `table` in the high 64 bits, `id` in the low 64 bits.
@@ -108,6 +119,44 @@ pub const Row = extern struct {
     comptime {
         assert(@sizeOf(Row) == 128);
         assert(stdx.no_padding(Row));
+    }
+};
+
+/// The LSM key of a record (P123b): `table` in the high 32 bits, then the first 96 bits of
+/// SHA-256 of the table and the id, little-endian. A table's records are adjacent (a view or an
+/// index backfills them in key order). Two ids of one table that share a key are refused
+/// (`id_collision`), never merged. Persisted: never change the derivation.
+pub fn record_key(table: u32, id: u128) u128 {
+    assert(table_is_record(table));
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("nerva.record.v1");
+    hash.update(std.mem.asBytes(&std.mem.nativeToLittle(u32, table)));
+    hash.update(std.mem.asBytes(&std.mem.nativeToLittle(u128, id)));
+    var digest: [32]u8 = undefined;
+    hash.final(&digest);
+    var low: [16]u8 = @splat(0);
+    low[0..12].* = digest[0..12].*;
+    return @as(u128, table) << 96 | std.mem.readInt(u128, &low, .little);
+}
+
+/// A record as stored in the forest (P123b): a row with a 128-bit id and a 448-byte value. A
+/// delete leaves a tombstone, as for rows.
+pub const Record = extern struct {
+    /// `record_key(table, id)`.
+    key: u128,
+    id: u128,
+    table: u32,
+    flags: Row.RowFlags,
+    /// The op of the last write (put or delete). Never zero.
+    op: u64,
+    /// Assigned when the record is first inserted; fixed for its lifetime.
+    timestamp: u64,
+    reserved: [8]u8 = @splat(0),
+    value: [record_value_size]u8,
+
+    comptime {
+        assert(@sizeOf(Record) == 512);
+        assert(stdx.no_padding(Record));
     }
 };
 
@@ -248,6 +297,9 @@ pub const EntryStatus = enum(u32) {
     key_invalid = 22,
     /// A row's id that does not fit 64 bits (`commit_wide`, P123b).
     id_invalid = 23,
+    /// Another id of the record's table holds its key (`record_key`): nothing applied. The
+    /// record can never be written under this id.
+    id_collision = 24,
 };
 
 /// Commit keys make a resent transaction commit at most once (P123). A transaction may start
@@ -412,6 +464,83 @@ pub const RowValue = extern struct {
     comptime {
         assert(@sizeOf(RowValue) == 128);
         assert(stdx.no_padding(RowValue));
+    }
+};
+
+/// The `lookup_records` event (P123b).
+pub const RecordKey = extern struct {
+    id: u128,
+    table: u32,
+    reserved: [12]u8 = @splat(0),
+
+    comptime {
+        assert(@sizeOf(RecordKey) == 32);
+        assert(stdx.no_padding(RecordKey));
+    }
+};
+
+/// The `lookup_records` result, one per event.
+pub const RecordValue = extern struct {
+    id: u128,
+    table: u32,
+    flags: RecordValueFlags,
+    /// The record's version: zero if it has never existed, else the op of its last write
+    /// (including a delete). Use it as `WideEntry.op_seen`.
+    op: u64,
+    /// The op at which this lookup executed.
+    op_read: u64,
+    reserved: [24]u8 = @splat(0),
+    /// Zero unless `flags.exists`.
+    value: [record_value_size]u8,
+
+    pub const RecordValueFlags = packed struct(u32) {
+        exists: bool = false,
+        /// Another id holds this record's key (`id_collision`): it can never be written.
+        collision: bool = false,
+        padding: u30 = 0,
+    };
+
+    comptime {
+        assert(@sizeOf(RecordValue) == 512);
+        assert(stdx.no_padding(RecordValue));
+    }
+};
+
+/// A committed write of a record, as stored and as `get_record_changes` and
+/// `get_record_history` return it (P123b). Replies end with an `end` record, as `Change`'s do.
+pub const RecordChange = extern struct {
+    id: u128,
+    table: u32,
+    kind: ChangeKind,
+    flags: Change.ChangeFlags,
+    reserved_a: [2]u8 = @splat(0),
+    op: u64,
+    timestamp: u64,
+    reserved_b: [24]u8 = @splat(0),
+    /// The new value for `put`; zero for `delete` and `end`.
+    value: [record_value_size]u8,
+
+    comptime {
+        assert(@sizeOf(RecordChange) == 512);
+        assert(stdx.no_padding(RecordChange));
+    }
+};
+
+/// The `get_record_history` event: one record's changes, newest first, as `HistoryFilter`.
+pub const RecordHistoryFilter = extern struct {
+    id: u128,
+    table: u32,
+    /// The maximum number of changes to scan, excluding the final `end` record.
+    limit: u32,
+    /// Return changes with `op <= op_max`: `maxInt(u64)` for the latest. Zero is invalid.
+    op_max: u64,
+    /// The cursor: scan changes with `timestamp <= timestamp_max`. Zero means from the newest.
+    timestamp_max: u64,
+    reserved: [24]u8 = @splat(0),
+
+    comptime {
+        assert(@sizeOf(RecordHistoryFilter) == 64);
+        assert(stdx.no_padding(RecordHistoryFilter));
     }
 };
 
@@ -960,6 +1089,11 @@ pub const Operation = enum(u8) {
     /// Declares a ledger: a set of conserved fields (N75).
     declare_ledger = constants.vsr_operations_reserved + 7,
     get_ledger = constants.vsr_operations_reserved + 8,
+    /// `commit` with wide entries: rows and records in one transaction (P123b).
+    commit_wide = constants.vsr_operations_reserved + 9,
+    lookup_records = constants.vsr_operations_reserved + 10,
+    get_record_changes = constants.vsr_operations_reserved + 11,
+    get_record_history = constants.vsr_operations_reserved + 12,
 
     pub fn EventType(comptime operation: Operation) type {
         return switch (operation) {
@@ -972,6 +1106,10 @@ pub const Operation = enum(u8) {
             .pulse => void,
             .declare_ledger => LedgerDefinition,
             .get_ledger => LedgerQuery,
+            .commit_wide => WideEntry,
+            .lookup_records => RecordKey,
+            .get_record_changes => ChangesFilter,
+            .get_record_history => RecordHistoryFilter,
         };
     }
 
@@ -985,6 +1123,9 @@ pub const Operation = enum(u8) {
             .pulse => void,
             .declare_ledger => DeclareLedgerResult,
             .get_ledger => Ledger,
+            .commit_wide => EntryResult,
+            .lookup_records => RecordValue,
+            .get_record_changes, .get_record_history => RecordChange,
         };
     }
 
@@ -1003,7 +1144,7 @@ pub const Operation = enum(u8) {
     /// Whether the operation takes multiple events per batch (one result per event).
     pub inline fn is_batchable(operation: Operation) bool {
         return switch (operation) {
-            .lookup_rows, .commit => true,
+            .lookup_rows, .commit, .commit_wide, .lookup_records => true,
             .get_changes,
             .get_history,
             .get_view,
@@ -1011,6 +1152,8 @@ pub const Operation = enum(u8) {
             .pulse,
             .declare_ledger,
             .get_ledger,
+            .get_record_changes,
+            .get_record_history,
             => false,
         };
     }
@@ -1018,7 +1161,7 @@ pub const Operation = enum(u8) {
     /// Whether the operation is multi-batch encoded.
     pub inline fn is_multi_batch(operation: Operation) bool {
         return switch (operation) {
-            .lookup_rows, .commit => true,
+            .lookup_rows, .commit, .commit_wide, .lookup_records => true,
             .get_changes,
             .get_history,
             .get_view,
@@ -1026,6 +1169,8 @@ pub const Operation = enum(u8) {
             .pulse,
             .declare_ledger,
             .get_ledger,
+            .get_record_changes,
+            .get_record_history,
             => false,
         };
     }
@@ -1044,11 +1189,19 @@ pub const Operation = enum(u8) {
     /// For multi-batch requests, this function expects a single, already decoded batch.
     pub inline fn result_count_expected(operation: Operation, batch: []const u8) u32 {
         return switch (operation) {
-            inline .lookup_rows, .commit => |operation_comptime| @intCast(@divExact(
+            inline .lookup_rows,
+            .commit,
+            .commit_wide,
+            .lookup_records,
+            => |operation_comptime| @intCast(@divExact(
                 batch.len,
                 @sizeOf(operation_comptime.EventType()),
             )),
-            inline .get_changes, .get_history => |operation_comptime| count: {
+            inline .get_changes,
+            .get_history,
+            .get_record_changes,
+            .get_record_history,
+            => |operation_comptime| count: {
                 const Filter = operation_comptime.EventType();
                 const filter = std.mem.bytesAsValue(Filter, batch[0..@sizeOf(Filter)]);
                 // +1 for the `end` record.
