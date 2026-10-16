@@ -92,7 +92,8 @@ pub fn StateMachineType(comptime Storage: type) type {
         pub const record_changes_limit_max =
             Operation.get_record_changes.result_max(constants.message_body_size_max) - 1;
         /// Index entries one op may write (P123c): every record write, in every index of its
-        /// table. A pulse's backfill writes fewer (`group_writes_limit`).
+        /// table, or a pulse's backfill of one index (`group_writes_limit` records), which is
+        /// fewer at this batch size but may be more at a small one (`init`).
         pub const index_entries_per_op_max: u32 =
             nerva.indexes_per_table_max * commit_wide_entries_max;
         /// -1 for the header.
@@ -776,6 +777,8 @@ pub fn StateMachineType(comptime Storage: type) type {
             assert(commit_wide_entries_limit <= commit_wide_entries_max);
             const lookup_records_limit =
                 Operation.lookup_records.event_max(options.batch_size_limit);
+            // Zero when a batch is too small for a wide entry; a tree takes at least one.
+            const record_writes_limit = @max(1, commit_wide_entries_limit);
             const groups_limit: u32 = @max(1, @divFloor(commit_entries_limit, 2));
             assert(groups_limit <= groups_per_op_max);
             const lookup_rows_limit = Operation.lookup_rows.event_max(options.batch_size_limit);
@@ -784,7 +787,13 @@ pub fn StateMachineType(comptime Storage: type) type {
             const members_limit = commit_entries_limit;
             assert(members_limit <= members_per_op_max);
 
-            const index_entries_limit = nerva.indexes_per_table_max * commit_wide_entries_limit;
+            // A commit's writes in every index of their table, or a pulse's backfill of one
+            // index (`groups_limit` records): whichever is more. A batch too small for one wide
+            // entry still lets pulses build indexes.
+            const index_entries_limit = @max(
+                nerva.indexes_per_table_max * commit_wide_entries_limit,
+                groups_limit,
+            );
             assert(index_entries_limit <= index_entries_per_op_max);
             assert(groups_limit <= index_entries_limit);
             self.* = .{
@@ -883,13 +892,17 @@ pub fn StateMachineType(comptime Storage: type) type {
                     },
                     .records = .{
                         .cache_entries_max = options.cache_entries_records,
-                        .prefetch_entries_for_read_max = lookup_records_limit,
+                        // A lookup's records, or a scan's (whatever the batch size).
+                        .prefetch_entries_for_read_max = @max(
+                            lookup_records_limit,
+                            index_hits_max + 1,
+                        ),
                         .prefetch_entries_for_update_max = commit_wide_entries_limit,
                         .tree_options_object = .{
-                            .batch_value_count_limit = commit_wide_entries_limit,
+                            .batch_value_count_limit = record_writes_limit,
                         },
                         .tree_options_index = .{
-                            .key = .{ .batch_value_count_limit = commit_wide_entries_limit },
+                            .key = .{ .batch_value_count_limit = record_writes_limit },
                         },
                     },
                     .record_changes = .{
@@ -897,11 +910,11 @@ pub fn StateMachineType(comptime Storage: type) type {
                         .prefetch_entries_for_read_max = 0,
                         .prefetch_entries_for_update_max = 0,
                         .tree_options_object = .{
-                            .batch_value_count_limit = commit_wide_entries_limit,
+                            .batch_value_count_limit = record_writes_limit,
                         },
                         .tree_options_index = .{
                             .record_key = .{
-                                .batch_value_count_limit = commit_wide_entries_limit,
+                                .batch_value_count_limit = record_writes_limit,
                             },
                         },
                     },
