@@ -1,8 +1,11 @@
 # Phase B storage: what Nerva needs so facts can leave Postgres
 
-Status: **proposal, for the owner to decide** (2026-10-16, pull request #123). Nothing here is
-built or decided. Each part becomes its own pull request and decision once agreed, and each
-changes a persisted format, so each needs the owner's yes (CLAUDE.md, "Stop" 1).
+Status: **decided and built in part** (2026-10-16, pull request #123). The owner answered the
+questions at the end in session: records as proposed; indexes without `as_of` at first; "Nerva
+holds money only" (Botpike/app P95) is for now, and the facts move to Nerva too. Built in the
+same pull request: records (P123b), declared indexes (P123c) and views over records (P123d).
+Not built: `group_by` on `bytes` fields (step 3), index reads as of a past op, and retention.
+The text below is the proposal as it was written.
 
 ## Why
 
