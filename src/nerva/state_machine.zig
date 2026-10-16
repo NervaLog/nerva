@@ -1686,10 +1686,11 @@ pub fn StateMachineType(comptime Storage: type) type {
         }
 
         /// Keeps every index over `table` exact after one record changed from `old` to `new`
-        /// (null: absent or deleted) at `op`. `timestamp` is the entry's (`entry_timestamps`):
-        /// an entry it creates in the table's `n`th index takes
-        /// `timestamp + 1 + views_per_table_max + n`, the timestamps a row's `min` and `max`
-        /// members take, which records never have.
+        /// (null: absent or deleted) at `op`. `timestamp` is the entry's (`entry_timestamps`).
+        /// An entry in the table's `n`th index takes `index_entry_timestamp(record, n)`, from the
+        /// record's own timestamp (`timestamp` for a record this entry creates): fixed for the
+        /// record's life, so an index's order among equal positions, and its scan cursors, are
+        /// the same whether a commit or a pulse wrote the entry, before or after an import.
         fn indexes_record_changed(
             self: *StateMachine,
             table: u32,
@@ -1718,9 +1719,19 @@ pub fn StateMachineType(comptime Storage: type) type {
                     id,
                     if (value_old) |value| indexes.place(&index.definition, value, old.?.op) else null,
                     if (new) |value| indexes.place(&index.definition, value, op) else null,
-                    timestamp + 1 + nerva.views_per_table_max + slot,
+                    index_entry_timestamp(if (old) |record| record.timestamp else timestamp, slot),
                 );
             }
+        }
+
+        /// The timestamp of a record's entry in its table's `slot`th index: in the record's
+        /// block of `entry_timestamps`, where a row's `min` and `max` members would be, which
+        /// records never have.
+        fn index_entry_timestamp(record_timestamp: u64, slot: u64) u64 {
+            assert(slot < nerva.indexes_per_table_max);
+            comptime assert(1 + nerva.views_per_table_max + nerva.indexes_per_table_max <=
+                entry_timestamps);
+            return record_timestamp + 1 + nerva.views_per_table_max + slot;
         }
 
         /// One index's part of `indexes_record_changed`, and a pulse's (with `old` null).
@@ -2287,7 +2298,7 @@ pub fn StateMachineType(comptime Storage: type) type {
         }
 
         /// Adds the records the pulse scanned to the building index. Replies nothing.
-        fn execute_pulse_index(self: *StateMachine, timestamp: u64) usize {
+        fn execute_pulse_index(self: *StateMachine) usize {
             defer {
                 self.backfill_index = null;
                 self.backfill_records_count = null;
@@ -2300,25 +2311,22 @@ pub fn StateMachineType(comptime Storage: type) type {
             assert(index.state == .building);
             const scanned = self.backfill_records[0..self.backfill_records_count.?];
             const count = @min(scanned.len, self.group_writes_limit);
-            // Each record takes an entry's block of timestamps, as a commit's entry does; its
-            // index's slot among its table's indexes picks the block's timestamp.
-            const timestamp_base = timestamp - self.prepare_delta(.pulse, &.{});
+            // Each entry takes its record's timestamp, as a commit's would.
             var table_slot: u64 = 0;
             for (self.indexes_op[0..slot]) |*other| {
                 if (other.definition.table == index.definition.table) table_slot += 1;
             }
-            for (scanned[0..count], 0..) |*record, k| {
+            for (scanned[0..count]) |*record| {
                 assert(record.table == index.definition.table);
                 assert(record.key & std.math.maxInt(u96) >= index.backfill_cursor);
                 if (record.flags.deleted) continue;
-                const block = timestamp_base + k * entry_timestamps;
                 self.index_record_changed(
                     index,
                     record.key,
                     record.id,
                     null,
                     indexes.place(&index.definition, &record.value, record.op),
-                    block + 1 + nerva.views_per_table_max + table_slot,
+                    index_entry_timestamp(record.timestamp, table_slot),
                 );
             }
             if (scanned.len > count) {
@@ -4730,7 +4738,7 @@ pub fn StateMachineType(comptime Storage: type) type {
             }
             const index = self.backfill_view orelse {
                 assert(self.view_building == false);
-                return self.execute_pulse_index(timestamp);
+                return self.execute_pulse_index();
             };
             const view = &self.views_op[index];
             assert(view.state == .building);

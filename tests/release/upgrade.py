@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
 """A cluster upgraded to another release keeps its data (docs/DECISIONS.md N80, NV-2).
 
-Usage: upgrade.py <nerva> <nerva of another release>
+Usage: upgrade.py <nerva> <nerva of another release> [--records]
+
+With `--records` (P123b, P123c), the script also writes records (128-bit ids, 448-byte values)
+in the same commits as rows, and deletes some; declares an index before them and one after them
+(built by pulses, before and after the import), and a view over them. Their lookups, histories,
+`row?as_of`, index scans and view are recorded and compared too, and the export is format
+version 2. Without it, the cluster holds no records and the export is version 1.
 
 On `nerva` (this build) three replicas run a fixed script through `nerva api`: layouts, puts,
 deletes, adds, reads, documents, a view declared before its table has rows, a ledger moved by
@@ -54,6 +60,20 @@ LEDGER = {"fields": [{"table": ACCOUNTS, "field": "available", "floor": "0"},
                      {"table": ACCOUNTS, "field": "held", "floor": "0"},
                      {"table": SOURCES, "field": "balance", "floor": None}]}
 ROUNDS = 1100    # Past the first checkpoint (op 959): the import checkpoints more than once.
+RECORDS = "--records" in sys.argv[3:]
+FACTS = 0x8000_0001   # A record table (P123b).
+FACTS_LAYOUT = {"name": "facts", "fields": [{"name": "agent", "type": "bytes", "size": 16},
+                                            {"name": "status", "type": "u8"},
+                                            {"name": "created", "type": "u64"},
+                                            {"name": "amount", "type": "u64"},
+                                            {"name": "memo", "type": "bytes", "size": 255}]}
+# Declared before any record, and after (built by pulses on both sides of the import).
+EARLY_INDEX = {"table": FACTS, "eq": ["agent"], "order": "created"}
+LATE_INDEX = {"table": FACTS, "order": "created",
+              "where": [{"field": "status", "op": "eq", "value": 1}]}
+FACTS_VIEW = {"table": FACTS, "group_by": ["status"],
+              "aggregates": [{"fn": "count"}, {"fn": "sum", "field": "amount"}]}
+AGENTS = ["%032x" % (0xA6E7 << 100 | n) for n in range(3)]
 
 
 def free_ports(count):
@@ -160,6 +180,22 @@ def commit(port, entries):
     return int(ok(port, "POST", "/v1/commit", {"entries": entries})["op"])
 
 
+def fact_id(n):
+    return "%032x" % (0xFAC7 << 112 | n * 0x9E3779B97F4A7C15)
+
+
+def fact(round):
+    return {"kind": "put", "table": FACTS, "id": fact_id(round % 61), "fields": {
+        "agent": AGENTS[round % 3], "status": round % 3 + 1, "created": str(round % 23),
+        "amount": str(round * 7), "memo": f"{round:08x}" * (round % 32 + 1)}}
+
+
+def index_ready(port, name, body):
+    status, reply = request(port, "POST", f"/v1/indexes/{name}/scan", body)
+    assert status in (200, 503), (status, reply)
+    return status == 200
+
+
 def script(port):
     """The fixed script; returns the ops of interest."""
     for table, layout in ((SEATS, SEATS_LAYOUT), (ACCOUNTS, ACCOUNTS_LAYOUT),
@@ -167,6 +203,9 @@ def script(port):
         ok(port, "PUT", f"/v1/tables/{table}", layout)
     early = ok(port, "PUT", "/v1/views/early", EARLY)
     assert early["maintained"], early
+    if RECORDS:
+        ok(port, "PUT", f"/v1/tables/{FACTS}", FACTS_LAYOUT)
+        assert ok(port, "PUT", "/v1/indexes/by_agent", EARLY_INDEX)["declared"] == "created"
     ledger = ok(port, "PUT", "/v1/ledgers/1", LEDGER)
     assert ledger["declared"] == "created", ledger
     commit(port, [move(SOURCES, 1, "balance", delta=-100000, pair=True, create=True),
@@ -187,6 +226,10 @@ def script(port):
             entries = [move(ACCOUNTS, 1, "available", delta=-(round % 40 + 1), pair=True,
                             clamp=True),
                        move(ACCOUNTS, 1, "held", delta_from=0)]
+        if RECORDS and round % 3 == 0:
+            entries.append(fact(round))
+        if RECORDS and round % 19 == 0:
+            entries.append({"kind": "delete", "table": FACTS, "id": fact_id((round + 30) % 61)})
         ops.append(commit(port, entries))
         if round % 50 == 0:
             ok(port, "POST", "/v1/lookup", {"rows": [{"table": SEATS, "id": str(id)}]})
@@ -200,13 +243,42 @@ def script(port):
     while ok(port, "GET", "/v1/views/late/groups?limit=1")["state"] != "ready":
         assert time.monotonic() < deadline, "the late view never became ready"
         time.sleep(0.1)
+    if RECORDS:
+        assert ok(port, "PUT", "/v1/indexes/reserved", LATE_INDEX)["declared"] == "created"
+        assert ok(port, "PUT", "/v1/views/facts", FACTS_VIEW)["maintained"]
+        wait_records_ready(port)
     ops.append(commit(port, [seat(1, 2, 1, True), {"kind": "delete", "table": SEATS, "id": "2"}]))
     return ops
+
+
+def wait_records_ready(port):
+    deadline = time.monotonic() + 120
+    while not (index_ready(port, "reserved", {}) and
+               index_ready(port, "by_agent", {"eq": {"agent": AGENTS[0]}}) and
+               ok(port, "GET", "/v1/views/facts/groups?limit=1")["state"] == "ready"):
+        assert time.monotonic() < deadline, "the records' indexes and view never became ready"
+        time.sleep(0.1)
 
 
 def keys():
     return ([(SEATS, id) for id in range(97)] + [(COUNTERS, id) for id in range(11)] +
             [(COUNTERS, 1000), (ACCOUNTS, 1), (SOURCES, 1)])
+
+
+def fact_keys():
+    return [(FACTS, fact_id(n)) for n in range(61)] if RECORDS else []
+
+
+def scan(port, name, body):
+    """Every record of an index scan, page by page."""
+    records, after = [], None
+    while True:
+        page = dict(body, limit=7, **({"after": after} if after else {}))
+        reply = ok(port, "POST", f"/v1/indexes/{name}/scan", page)
+        records += reply["records"]
+        after = reply["next"]
+        if after is None:
+            return records
 
 
 def view_groups(port, name, as_of=None):
@@ -270,6 +342,25 @@ def record(port, ops):
         "documents": ok(port, "POST", "/v1/documents/get", {
             "namespace": "7", "keys": [f"doc/{r}" for r in range(0, ROUNDS, 100)]})["documents"],
     }
+    if RECORDS:
+        seen["records"] = ok(port, "POST", "/v1/lookup",
+                             {"rows": [{"table": t, "id": i} for t, i in fact_keys()]})["rows"]
+        for row in seen["records"]:
+            row.pop("op_read", None)
+        assert sum(r["exists"] for r in seen["records"]) > 30, seen["records"]
+        seen["record_history"] = {i: history(port, t, i) for t, i in fact_keys()}
+        seen["record_as_of"] = {
+            f"{i}/{op}": ok(port, "GET", f"/v1/row?table={t}&id={i}&as_of={op}")
+            for t, i in fact_keys()[::5] for op in as_of_ops}
+        seen["indexes"] = ok(port, "GET", "/v1/indexes")
+        seen["scans"] = {
+            "reserved": scan(port, "reserved", {}),
+            "reserved_down": scan(port, "reserved", {"descending": True, "min": "3", "max": "17"}),
+            **{agent: scan(port, "by_agent", {"eq": {"agent": agent}}) for agent in AGENTS}}
+        assert seen["scans"]["reserved"], seen["scans"]
+        seen["facts"] = view_groups(port, "facts")
+        assert seen["facts"][0]["state"] == "ready", seen["facts"][0]
+        assert any(c["table"] == FACTS for c in seen["feed"][0]), "no record in the feed"
     for row in seen["rows"]:
         row.pop("op_read", None)
     account = next(r for r in seen["rows"] if r["table"] == ACCOUNTS)
@@ -340,6 +431,8 @@ def main():
         while ok(port, "GET", "/v1/views/late/groups?limit=1")["state"] != "ready":
             assert time.monotonic() < deadline, "the late view never became ready after import"
             time.sleep(0.1)
+        if RECORDS:
+            wait_records_ready(port)
         after = record(port, ops)
         compare(before, after)
         new.check_running()
@@ -380,7 +473,9 @@ def main():
         assert "does not match" in failed.stderr, failed.stderr[-2000:]
         assert not os.path.exists(target)
 
-        print(f"upgrade: PASSED ({len(before['history'])} rows' histories, "
+        records = (f"{len(before['record_history'])} records' histories, index scans, a view "
+                   f"over records, export version 2; " if RECORDS else "")
+        print(f"upgrade: PASSED ({records}{len(before['history'])} rows' histories, "
               f"{len(before['as_of'])} rows as of past ops, {len(before['feed'][0])} changes in "
               f"{len(before['feed'][1])} feed pages, views, the ledger and documents read the same "
               f"after export and import into release 0.0.200; a damaged export refused; "

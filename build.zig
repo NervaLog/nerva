@@ -384,10 +384,17 @@ pub fn build(b: *std.Build) !void {
         .target = target,
         .mode = mode,
     });
-    // Then an upgrade: an export from `nerva`, imported by the other release (N80); then
-    // replicas imported from different exports (P90). One after the other: each runs a cluster.
+    // Then an upgrade: an export from `nerva`, imported by the other release (N80), without
+    // records (export version 1) and with them (version 2, P123b); then replicas imported from
+    // different exports (P90). One after the other: each runs a cluster.
     var release_previous: ?*std.Build.Step = null;
-    for ([_][]const u8{ "mixed.py", "upgrade.py", "origins.py" }) |script| {
+    for ([_][2][]const u8{
+        .{ "mixed.py", "" },
+        .{ "upgrade.py", "" },
+        .{ "upgrade.py", "--records" },
+        .{ "origins.py", "" },
+    }) |release_test| {
+        const script = release_test[0];
         const run_release_test = b.addSystemCommand(&.{
             "python3",
             b.fmt("tests/release/{s}", .{script}),
@@ -398,6 +405,7 @@ pub fn build(b: *std.Build) !void {
         else
             nerva_other;
         run_release_test.addFileArg(nerva_second.getEmittedBin());
+        if (release_test[1].len > 0) run_release_test.addArg(release_test[1]);
         if (b.args) |args| run_release_test.addArgs(args);
         run_release_test.setCwd(b.path("."));
         run_release_test.has_side_effects = true;

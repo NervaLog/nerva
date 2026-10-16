@@ -1129,6 +1129,65 @@ test "indexes: without an order field, by the op of the last write; ties page by
     try testing.expectEqual(@as(u128, 1), moved[moved.len - 1]);
 }
 
+test "indexes: ties order by the record's own timestamp, however the entry was written" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const context = try context_init(&arena);
+    try testing.expectEqual(
+        nerva.DeclareIndexStatus.created,
+        (try context.declare_index(executions_by_status("early", true))).status,
+    );
+    _ = context.pulse_until_ready();
+
+    // Thirty records over three `created` values, written by commits into `early`; ten start
+    // settled and enter it later, when they become reserved.
+    for (0..15) |i| {
+        const results = try context.commit_wide(&.{&.{
+            execution(1000 - i, if (i % 3 == 0) 2 else 1, i % 3, 0),
+            execution(2000 + i * 7, if (i % 3 == 1) 2 else 1, (i + 1) % 3, 0),
+        }});
+        try expect_statuses(results[0], &.{ .ok, .ok });
+    }
+    for (0..15) |i| {
+        if (i % 3 == 0) try expect_statuses(
+            (try context.commit_wide(&.{&.{execution(1000 - i, 1, i % 3, 0)}}))[0],
+            &.{.ok},
+        );
+    }
+    // The same index declared now: every entry written by pulses, in the records' key order.
+    const late = try context.declare_index(executions_by_status("late", true));
+    try testing.expectEqual(nerva.DeclareIndexStatus.created, late.status);
+    try testing.expect(context.pulse_until_ready() > 0);
+
+    for ([_]bool{ false, true }) |descending| {
+        var query_early = status_query(1, 4, .{ .descending = descending });
+        var query_late = query_early;
+        query_late.index_id = late.index_id;
+        var count: usize = 0;
+        while (true) {
+            // Page by page: the same records, at the same cursors.
+            const page_early = try context.scan_index(query_early);
+            const page_late = try context.scan_index(query_late);
+            try testing.expectEqual(page_early.len, page_late.len);
+            for (page_early[1..], page_late[1..]) |early_record, late_record| {
+                try testing.expectEqual(early_record.id, late_record.id);
+                try testing.expectEqual(early_record.order, late_record.order);
+            }
+            count += page_early.len - 1;
+            try testing.expectEqual(page_early[0].flags.more, page_late[0].flags.more);
+            if (!page_early[0].flags.more) break;
+            try testing.expectEqual(page_early[0].order, page_late[0].order);
+            // The cursor's timestamp is the record's, in the index's slot of the table (P123c).
+            try testing.expectEqual(page_early[0].timestamp + 1, page_late[0].timestamp);
+            query_early.cursor_order = page_early[0].order;
+            query_early.cursor_timestamp = page_early[0].timestamp;
+            query_late.cursor_order = page_late[0].order;
+            query_late.cursor_timestamp = page_late[0].timestamp;
+        }
+        try testing.expectEqual(@as(usize, 25), count);
+    }
+}
+
 test "indexes: where filters, declarations, and queries the state machine refuses" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
