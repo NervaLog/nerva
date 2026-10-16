@@ -56,12 +56,15 @@
 const std = @import("std");
 const assert = std.debug.assert;
 
+const stdx = @import("stdx");
+
 const nerva = @import("../../nerva.zig");
 const catalog = @import("../catalog.zig");
 const declared_views = @import("../view/declared.zig");
 const documents = @import("../documents.zig");
 const documents_routes = @import("documents_routes.zig");
 const ledgers_static = @import("../ledgers.zig");
+const view_fields = @import("../views.zig");
 
 const Change = nerva.Change;
 const Entry = nerva.Entry;
@@ -96,6 +99,9 @@ const Route = enum {
     view_definition,
     view_list,
     ledgers,
+    index_list,
+    indexes,
+    index_scan,
 };
 
 const routes = [_]struct { path: []const u8, route: Route, method: Method }{
@@ -112,6 +118,8 @@ const routes = [_]struct { path: []const u8, route: Route, method: Method }{
 const tables_prefix = "/v1/tables/";
 const views_prefix = "/v1/views/";
 const ledgers_prefix = "/v1/ledgers/";
+const indexes_prefix = "/v1/indexes/";
+const index_scan_suffix = "/scan";
 const views_groups_suffix = "/groups";
 const views_definition_suffix = "/definition";
 /// The most groups `GET /v1/views/<name>` answers with at once (N66); larger views are read in
@@ -142,7 +150,23 @@ pub fn handle(
     const path = target[0..question];
     const query = if (question < target.len) target[question + 1 ..] else "";
 
-    const route: Route = if (std.mem.startsWith(u8, path, ledgers_prefix)) route: {
+    const route: Route = if (std.mem.eql(u8, path, "/v1/indexes")) route: {
+        if (method != .get) return error_reply(arena, 405, "method not allowed");
+        if (query.len > 0) return error_reply(arena, 400, "unexpected query");
+        break :route .index_list;
+    } else if (std.mem.startsWith(u8, path, indexes_prefix)) route: {
+        if (query.len > 0) return error_reply(arena, 400, "unexpected query");
+        const scan = std.mem.endsWith(u8, path, index_scan_suffix) and
+            path.len > indexes_prefix.len + index_scan_suffix.len;
+        if (scan) {
+            if (method != .post) return error_reply(arena, 405, "method not allowed");
+            break :route .index_scan;
+        }
+        if (method != .get and method != .put) {
+            return error_reply(arena, 405, "method not allowed");
+        }
+        break :route .indexes;
+    } else if (std.mem.startsWith(u8, path, ledgers_prefix)) route: {
         if (method != .get and method != .put) {
             return error_reply(arena, 405, "method not allowed");
         }
@@ -209,6 +233,15 @@ pub fn handle(
         ),
         .view_list => view_list(arena, client),
         .ledgers => ledgers(arena, client, layouts, method, path[ledgers_prefix.len..], body),
+        .index_list => index_list(arena, client),
+        .indexes => indexes_route(arena, client, layouts, method, path[indexes_prefix.len..], body),
+        .index_scan => index_scan(
+            arena,
+            client,
+            &cache,
+            path[indexes_prefix.len .. path.len - index_scan_suffix.len],
+            body,
+        ),
         .view_groups => view_groups(
             arena,
             client,
@@ -261,6 +294,14 @@ fn lookup(arena: std.mem.Allocator, client: anytype, layouts: anytype, body: []c
     const Request = struct { rows: []const struct { table: u32, id: []const u8 } };
     const request = try json_parse(Request, arena, body);
     if (request.rows.len == 0) return bad("rows must not be empty");
+    // One lookup reads at one op: rows, or records (P123b), not both.
+    const records = nerva.table_is_record(request.rows[0].table);
+    for (request.rows) |row_request| {
+        if (nerva.table_is_record(row_request.table) != records) {
+            return bad("a lookup reads rows or records, not both: send two");
+        }
+    }
+    if (records) return lookup_records(arena, client, layouts, request.rows);
 
     const keys = try arena.alloc(RowKey, request.rows.len);
     for (keys, request.rows) |*key, row_request| {
@@ -292,6 +333,41 @@ fn lookup(arena: std.mem.Allocator, client: anytype, layouts: anytype, body: []c
     return .{ .status = 200, .body = out.items() };
 }
 
+fn lookup_records(
+    arena: std.mem.Allocator,
+    client: anytype,
+    layouts: anytype,
+    rows: anytype,
+) !Reply {
+    const keys = try arena.alloc(nerva.RecordKey, rows.len);
+    for (keys, rows) |*key, row_request| {
+        try table_check(row_request.table);
+        key.* = .{ .table = row_request.table, .id = try id_parse(row_request.table, row_request.id) };
+    }
+    const results = try arena.alloc(nerva.RecordValue, keys.len);
+    try client.lookup_records(keys, results);
+
+    var out = Writer.init(arena);
+    try out.raw("{\"op\":");
+    try out.number(results[0].op_read);
+    try out.raw(",\"rows\":[");
+    for (results, 0..) |*result, index| {
+        assert(result.op_read == results[0].op_read);
+        if (index > 0) try out.raw(",");
+        try out.print("{{\"table\":{},\"id\":", .{result.table});
+        try out.id(result.table, result.id);
+        try out.print(",\"exists\":{},\"op\":", .{result.flags.exists});
+        try out.number(result.op);
+        if (result.flags.collision) try out.raw(",\"collision\":true");
+        try out.raw(",\"value_hex\":");
+        try out.hex(&result.value);
+        if (result.flags.exists) try out.fields(try layouts.get(result.table), &result.value);
+        try out.raw("}");
+    }
+    try out.raw("]}");
+    return .{ .status = 200, .body = out.items() };
+}
+
 fn commit(arena: std.mem.Allocator, client: anytype, layouts: anytype, body: []const u8) !Reply {
     const Request = struct {
         key: ?[]const u8 = null,
@@ -301,11 +377,16 @@ fn commit(arena: std.mem.Allocator, client: anytype, layouts: anytype, body: []c
     if (request.entries.len == 0) return bad("entries must not be empty");
     const key: ?u128 = if (request.key) |text| try key_parse(text) else null;
 
-    const entries = try arena.alloc(Entry, request.entries.len);
+    // Every entry as `commit_wide` carries it; sent as `commit` when it writes rows only.
+    const entries = try arena.alloc(nerva.WideEntry, request.entries.len);
+    var records = false;
     // Per entry: an add's field type, for rendering its value.
     const add_fields = try arena.alloc(?nerva.Add.AddField, request.entries.len);
     for (entries, request.entries, add_fields, 0..) |*entry, entry_request, *add_field, index| {
         try table_check(entry_request.table);
+        const record = nerva.table_is_record(entry_request.table);
+        records = records or record;
+        if (record and entry_request.kind == .add) return bad("records take no adds");
         if (entry_request.kind != .put and entry_request.fields != null) {
             return bad("only a put has fields");
         }
@@ -315,7 +396,7 @@ fn commit(arena: std.mem.Allocator, client: anytype, layouts: anytype, body: []c
         }
         add_field.* = null;
         entry.* = .{
-            .id = try u64_parse(entry_request.id, "id"),
+            .id = try id_parse(entry_request.table, entry_request.id),
             .table = entry_request.table,
             .kind = switch (entry_request.kind) {
                 .read => .read,
@@ -345,7 +426,10 @@ fn commit(arena: std.mem.Allocator, client: anytype, layouts: anytype, body: []c
                 } else {
                     const value_hex = entry_request.value_hex orelse
                         return bad("a put needs value_hex or fields");
-                    entry.value = try value_parse(value_hex);
+                    entry.value = try value_parse_sized(
+                        value_hex,
+                        nerva.table_value_size(entry_request.table),
+                    );
                 }
             },
             .delete => {
@@ -356,29 +440,36 @@ fn commit(arena: std.mem.Allocator, client: anytype, layouts: anytype, body: []c
                 if (entry_request.op_seen != null) return bad("an add has no op_seen");
                 if (entry_request.value_hex != null) return bad("an add has no value_hex");
                 const add = try add_parse(layouts, &entry_request, entries[0..index]);
-                entry.value = add.value();
+                entry.value[0..value_size].* = add.value();
                 add_field.* = add.field;
             },
         }
-        assert(nerva.entry_validate(entry) == null);
+        assert(nerva.wide_entry_validate(entry) == null);
     }
 
     // Under a key, the transaction starts with its key entry, so every index moves by one.
-    const sent: []const Entry = if (key) |k| sent: {
-        const sent = try arena.alloc(Entry, entries.len + 1);
-        sent[0] = nerva.commit_key_entry(k);
+    const sent: []const nerva.WideEntry = if (key) |k| sent: {
+        const sent = try arena.alloc(nerva.WideEntry, entries.len + 1);
+        sent[0] = nerva.WideEntry.from_entry(&nerva.commit_key_entry(k));
         for (sent[1..], entries) |*entry_sent, entry| {
             entry_sent.* = entry;
             if (entry.kind != .add) continue;
             var add = nerva.Add.from_entry(&entry);
             if (!add.flags.delta_from) continue;
             add.delta_from += 1;
-            entry_sent.value = add.value();
+            entry_sent.value[0..value_size].* = add.value();
         }
         break :sent sent;
     } else entries;
     const results_sent = try arena.alloc(EntryResult, sent.len);
-    try client.commit(sent, results_sent);
+    if (records) {
+        try client.commit_wide(sent, results_sent);
+    } else {
+        // Rows alone: `commit`, which every release since 0.1 takes.
+        const narrow = try arena.alloc(Entry, sent.len);
+        for (narrow, sent) |*entry, *wide| entry.* = narrow_entry(wide);
+        try client.commit(narrow, results_sent);
+    }
 
     var out = Writer.init(arena);
     if (key != null) {
@@ -413,6 +504,13 @@ fn commit(arena: std.mem.Allocator, client: anytype, layouts: anytype, body: []c
                 try out.print("{{\"status\":\"conflict\",\"index\":{},\"op\":", .{index});
                 try out.number(result.op);
                 try out.raw("}");
+                return .{ .status = 409, .body = out.items() };
+            },
+            .id_collision => {
+                try out.print(
+                    "{{\"status\":\"id_collision\",\"index\":{}}}",
+                    .{index},
+                );
                 return .{ .status = 409, .body = out.items() };
             },
             .write_duplicate => {
@@ -508,7 +606,11 @@ const EntryRequest = struct {
 
 /// An add's parameters, checked as the state machine would (`entry_validate`, and `delta_from`
 /// against the entries before it).
-fn add_parse(layouts: anytype, request: *const EntryRequest, previous: []const Entry) !nerva.Add {
+fn add_parse(
+    layouts: anytype,
+    request: *const EntryRequest,
+    previous: []const nerva.WideEntry,
+) !nerva.Add {
     var add: nerva.Add = .{
         .delta = 0,
         .min = 0,
@@ -525,7 +627,8 @@ fn add_parse(layouts: anytype, request: *const EntryRequest, previous: []const E
         const layout = try layouts.get(request.table) orelse
             return bad("field needs a layout for the table (PUT /v1/tables/<t>)");
         const field = layout.field(name) orelse return bad("no such field");
-        add.offset = field.offset;
+        // A row's field: within 80 bytes.
+        add.offset = @intCast(field.offset);
         add.field = switch (field.type) {
             .u64 => .u64,
             .i64 => .i64,
@@ -685,7 +788,7 @@ fn ledger_parse(
                 return bad("field needs a layout for the table (PUT /v1/tables/<t>)");
             const named = layout.field(name) orelse return bad("no such field");
             if (named.type != .i64) return bad("a ledger's fields must be i64");
-            break :offset named.offset;
+            break :offset @intCast(named.offset);
         } else field.offset orelse return bad("a ledger field needs field or offset");
         if (offset % 8 != 0 or offset > value_size - 8) {
             return bad("a ledger field's offset must be a multiple of 8, at most 72");
@@ -736,10 +839,74 @@ fn changes(arena: std.mem.Allocator, client: anytype, layouts: anytype, query: [
     const limit = try limit_parse(parameters.get("limit"));
     const cursor = if (parameters.get("cursor")) |text| try u64_parse(text, "cursor") else 0;
 
-    const page = try arena.alloc(Change, limit + 1);
-    const count = try client.get_changes(.{ .timestamp_min = cursor, .limit = limit }, page);
-    if (count == 0) return bad("invalid cursor");
-    return page_reply(arena, layouts, page[0..count], .ascending);
+    // Rows' feed and records' (P123b), merged by timestamp: one cursor reads both.
+    const rows_page = try arena.alloc(Change, limit + 1);
+    const rows_count =
+        try client.get_changes(.{ .timestamp_min = cursor, .limit = limit }, rows_page);
+    if (rows_count == 0) return bad("invalid cursor");
+    const records_page = try arena.alloc(nerva.RecordChange, limit + 1);
+    const records_count =
+        try client.get_record_changes(.{ .timestamp_min = cursor, .limit = limit }, records_page);
+    assert(records_count > 0);
+    const rows_end = rows_page[rows_count - 1];
+    const records_end = records_page[records_count - 1];
+    const rows_ = rows_page[0 .. rows_count - 1];
+    const records_ = records_page[0 .. records_count - 1];
+    // A feed with more may hold changes past its page's last but before the other's: take
+    // nothing past the earlier of the two pages' last, when its feed has more.
+    var bound: u64 = std.math.maxInt(u64);
+    if (rows_end.flags.more) bound = @min(bound, rows_[rows_.len - 1].timestamp);
+    if (records_end.flags.more) bound = @min(bound, records_[records_.len - 1].timestamp);
+
+    const merged = try arena.alloc(nerva.RecordChange, limit + 1);
+    var count: usize = 0;
+    var row_index: usize = 0;
+    var record_index: usize = 0;
+    while (count < limit) {
+        const row_next = if (row_index < rows_.len) &rows_[row_index] else null;
+        const record_next = if (record_index < records_.len) &records_[record_index] else null;
+        const take_row = if (row_next) |row_change|
+            record_next == null or row_change.timestamp < record_next.?.timestamp
+        else if (record_next != null) false else break;
+        const timestamp = if (take_row) row_next.?.timestamp else record_next.?.timestamp;
+        if (timestamp > bound) break;
+        if (take_row) {
+            merged[count] = change_wide(row_next.?);
+            row_index += 1;
+        } else {
+            merged[count] = record_next.?.*;
+            record_index += 1;
+        }
+        count += 1;
+    }
+    const more = row_index < rows_.len or record_index < records_.len or
+        rows_end.flags.more or records_end.flags.more;
+    merged[count] = .{
+        .id = 0,
+        .table = 0,
+        .kind = .end,
+        .flags = .{ .more = more },
+        // Complete through the earlier of the two reads.
+        .op = if (more) 0 else @min(rows_end.op, records_end.op),
+        .timestamp = if (count == 0) cursor else merged[count - 1].timestamp + 1,
+        .value = @splat(0),
+    };
+    return page_reply(arena, layouts, merged[0 .. count + 1], .ascending);
+}
+
+/// A row's change as a record's (P123b): its id and value widened.
+fn change_wide(change: *const Change) nerva.RecordChange {
+    var wide: nerva.RecordChange = .{
+        .id = change.id,
+        .table = change.table,
+        .kind = change.kind,
+        .flags = change.flags,
+        .op = change.op,
+        .timestamp = change.timestamp,
+        .value = @splat(0),
+    };
+    wide.value[0..value_size].* = change.value;
+    return wide;
 }
 
 fn history(arena: std.mem.Allocator, client: anytype, layouts: anytype, query: []const u8) !Reply {
@@ -749,7 +916,7 @@ fn history(arena: std.mem.Allocator, client: anytype, layouts: anytype, query: [
         &.{ "table", "id", "op_max", "cursor", "limit" },
     );
     const table = try table_parse(parameters.get("table"));
-    const id = try u64_parse(parameters.get("id") orelse return bad("id is required"), "id");
+    const id = try id_parse(table, parameters.get("id") orelse return bad("id is required"));
     const op_max: u64 = if (parameters.get("op_max")) |text|
         if (std.mem.eql(u8, text, "latest")) std.math.maxInt(u64) else try u64_parse(text, "op_max")
     else
@@ -758,14 +925,27 @@ fn history(arena: std.mem.Allocator, client: anytype, layouts: anytype, query: [
     const limit = try limit_parse(parameters.get("limit"));
     const cursor = if (parameters.get("cursor")) |text| try u64_parse(text, "cursor") else 0;
 
-    const page = try arena.alloc(Change, limit + 1);
-    const count = try client.get_history(.{
-        .table = table,
-        .id = id,
-        .limit = limit,
-        .op_max = op_max,
-        .timestamp_max = cursor,
-    }, page);
+    const page = try arena.alloc(nerva.RecordChange, limit + 1);
+    const count = if (nerva.table_is_record(table))
+        try client.get_record_history(.{
+            .table = table,
+            .id = id,
+            .limit = limit,
+            .op_max = op_max,
+            .timestamp_max = cursor,
+        }, page)
+    else count: {
+        const rows_page = try arena.alloc(Change, limit + 1);
+        const count = try client.get_history(.{
+            .table = table,
+            .id = @intCast(id),
+            .limit = limit,
+            .op_max = op_max,
+            .timestamp_max = cursor,
+        }, rows_page);
+        for (rows_page[0..count], page[0..count]) |*change, *wide| wide.* = change_wide(change);
+        break :count count;
+    };
     if (count == 0) return bad("invalid cursor");
     return page_reply(arena, layouts, page[0..count], .descending);
 }
@@ -775,22 +955,30 @@ fn history(arena: std.mem.Allocator, client: anytype, layouts: anytype, query: [
 fn row(arena: std.mem.Allocator, client: anytype, layouts: anytype, query: []const u8) !Reply {
     const parameters = try query_parse(arena, query, &.{ "table", "id", "as_of" });
     const table = try table_parse(parameters.get("table"));
-    const id = try u64_parse(parameters.get("id") orelse return bad("id is required"), "id");
+    const id = try id_parse(table, parameters.get("id") orelse return bad("id is required"));
     const as_of_text = parameters.get("as_of") orelse return bad("as_of is required");
     const as_of = try u64_parse(as_of_text, "as_of");
     if (as_of == 0) return bad("as_of must be positive");
 
     // A lookup's own op is newer than every committed op: anything at or after it may not have
     // happened yet, so its answer could still change.
-    var current: [1]RowValue = undefined;
-    try client.lookup_rows(&.{.{ .table = table, .id = id }}, &current);
-    if (as_of >= current[0].op_read) return bad("as_of is not yet committed");
-
-    const found = try change_as_of(client, table, id, as_of);
+    const found = if (nerva.table_is_record(table)) found: {
+        var current: [1]nerva.RecordValue = undefined;
+        try client.lookup_records(&.{.{ .table = table, .id = id }}, &current);
+        if (as_of >= current[0].op_read) return bad("as_of is not yet committed");
+        break :found try record_as_of(client, table, id, as_of);
+    } else found: {
+        var current: [1]RowValue = undefined;
+        try client.lookup_rows(&.{.{ .table = table, .id = @intCast(id) }}, &current);
+        if (as_of >= current[0].op_read) return bad("as_of is not yet committed");
+        const change = try change_as_of(client, table, @intCast(id), as_of) orelse break :found null;
+        break :found change_wide(&change);
+    };
+    const size = nerva.table_value_size(table);
 
     var out = Writer.init(arena);
     try out.print("{{\"table\":{},\"id\":", .{table});
-    try out.number(id);
+    try out.id(table, id);
     try out.raw(",\"as_of\":");
     try out.number(as_of);
     if (found) |change| {
@@ -798,11 +986,11 @@ fn row(arena: std.mem.Allocator, client: anytype, layouts: anytype, query: []con
         try out.print(",\"exists\":{},\"op\":", .{change.kind == .put});
         try out.number(change.op);
         try out.raw(",\"value_hex\":");
-        try out.hex(&change.value);
-        if (change.kind == .put) try out.fields(try layouts.get(table), &change.value);
+        try out.hex(change.value[0..size]);
+        if (change.kind == .put) try out.fields(try layouts.get(table), change.value[0..size]);
     } else {
         try out.raw(",\"exists\":false,\"op\":\"0\",\"value_hex\":");
-        try out.hex(&@as([value_size]u8, @splat(0)));
+        try out.hex(@as([nerva.record_value_size]u8, @splat(0))[0..size]);
     }
     try out.raw("}");
     return .{ .status = 200, .body = out.items() };
@@ -836,10 +1024,36 @@ pub fn change_as_of(client: anytype, table: u32, id: u64, op: u64) !?Change {
     }
 }
 
+/// The record's last change at or before `op`, or null if it had none (P123b).
+fn record_as_of(client: anytype, table: u32, id: u128, op: u64) !?nerva.RecordChange {
+    assert(op != 0);
+    var page: [9]nerva.RecordChange = undefined;
+    var cursor: u64 = 0;
+    while (true) {
+        const count = try client.get_record_history(.{
+            .table = table,
+            .id = id,
+            .limit = page.len - 1,
+            .op_max = op,
+            .timestamp_max = cursor,
+        }, &page);
+        assert(count >= 1);
+        const end = page[count - 1];
+        assert(end.kind == .end);
+        if (count > 1) {
+            assert(page[0].op <= op);
+            return page[0];
+        }
+        if (!end.flags.more) return null;
+        cursor = end.timestamp;
+    }
+}
+
+/// Rows' and records' changes, a row's as `change_wide` widens it.
 fn page_reply(
     arena: std.mem.Allocator,
     layouts: anytype,
-    page: []const Change,
+    page: []const nerva.RecordChange,
     direction: enum { ascending, descending },
 ) !Reply {
     assert(page.len >= 1);
@@ -859,13 +1073,14 @@ fn page_reply(
             @tagName(change.kind),
             change.table,
         });
-        try out.number(change.id);
+        try out.id(change.table, change.id);
         try out.raw(",\"op\":");
         try out.number(change.op);
         if (change.kind == .put) {
+            const value = change.value[0..nerva.table_value_size(change.table)];
             try out.raw(",\"value_hex\":");
-            try out.hex(&change.value);
-            try out.fields(try layouts.get(change.table), &change.value);
+            try out.hex(value);
+            try out.fields(try layouts.get(change.table), value);
         }
         try out.raw("}");
     }
@@ -881,6 +1096,247 @@ fn page_reply(
     if (end.flags.more) try out.raw("null") else try out.number(end.op);
     try out.raw("}");
     return .{ .status = 200, .body = out.items() };
+}
+
+// ---- Indexes (P123c) ----
+
+/// The index named `name` (one `get_index` per declared index until it is found), or null.
+fn index_find(client: anytype, name: []const u8) !?nerva.Index {
+    var id: u64 = 1;
+    while (id <= nerva.indexes_max) : (id += 1) {
+        const index = try client.get_index(id);
+        if (index.id == 0) return null;
+        const declared = std.mem.sliceTo(&index.definition.name, 0);
+        if (std.mem.eql(u8, declared, name)) return index;
+    }
+    return null;
+}
+
+fn index_list(arena: std.mem.Allocator, client: anytype) !Reply {
+    var out = Writer.init(arena);
+    try out.raw("{\"indexes\":[");
+    var id: u64 = 1;
+    while (id <= nerva.indexes_max) : (id += 1) {
+        const index = try client.get_index(id);
+        if (index.id == 0) break;
+        if (id > 1) try out.raw(",");
+        try index_render(&out, &index);
+    }
+    try out.raw("]}");
+    return .{ .status = 200, .body = out.items() };
+}
+
+fn index_render(out: *Writer, index: *const nerva.Index) !void {
+    try out.raw("{\"name\":");
+    try std.json.stringify(std.mem.sliceTo(&index.definition.name, 0), .{}, out.list.writer());
+    try out.print(",\"id\":{},\"table\":{},\"state\":\"{s}\",\"declared_op\":", .{
+        index.id,
+        index.definition.table,
+        @tagName(index.state),
+    });
+    try out.number(index.declared_op);
+    try out.raw(",\"record_count\":");
+    try out.number(index.entry_count);
+    try out.raw("}");
+}
+
+const IndexDeclaration = struct {
+    table: u32,
+    eq: []const []const u8 = &.{},
+    order: ?[]const u8 = null,
+    where: []const struct { field: []const u8, op: catalog.Comparison, value: std.json.Value } = &.{},
+};
+
+fn indexes_route(
+    arena: std.mem.Allocator,
+    client: anytype,
+    layouts: anytype,
+    method: Method,
+    name: []const u8,
+    body: []const u8,
+) !Reply {
+    catalog.view_name_validate(name) catch return bad("an index name is 1 to 32 of a-z, 0-9, _");
+    if (method == .get) {
+        if (body.len > 0) return bad("unexpected body");
+        const index = try index_find(client, name) orelse
+            return error_reply(arena, 404, "no such index");
+        var out = Writer.init(arena);
+        try index_render(&out, &index);
+        return .{ .status = 200, .body = out.items() };
+    }
+    assert(method == .put);
+    const declaration = try json_parse(IndexDeclaration, arena, body);
+    try table_check(declaration.table);
+    if (!nerva.table_is_record(declaration.table)) return bad("an index is over a record table");
+    const layout = try layouts.layout(arena, declaration.table) orelse
+        return bad("an index needs a layout for its table (PUT /v1/tables/<t>)");
+    if (declaration.eq.len > nerva.index_eq_max) return bad("an index has at most 3 eq fields");
+    if (declaration.where.len > nerva.index_where_max) return bad("at most 4 where clauses");
+
+    var definition = std.mem.zeroes(nerva.IndexDefinition);
+    @memcpy(definition.name[0..name.len], name);
+    definition.table = declaration.table;
+    definition.eq_count = @intCast(declaration.eq.len);
+    for (declaration.eq, 0..) |field_name, slot| {
+        const field = layout.field(field_name) orelse return bad("unknown field in eq");
+        definition.eq[slot] = catalog.field_ref(field);
+    }
+    if (declaration.order) |field_name| {
+        const field = layout.field(field_name) orelse return bad("unknown order field");
+        if (field.type == .bytes) return bad("an index orders by a number or a bool");
+        definition.flags.order = true;
+        definition.order = catalog.field_ref(field);
+    }
+    definition.where_count = @intCast(declaration.where.len);
+    for (declaration.where, 0..) |clause, slot| {
+        const field = layout.field(clause.field) orelse return bad("unknown field in where");
+        if (field.type == .bytes) return bad("where compares numbers and bools only");
+        const value: i128 = switch (clause.value) {
+            .integer => |n| n,
+            .bool => |b| @intFromBool(b),
+            .string, .number_string => |text| std.fmt.parseInt(i128, text, 10) catch
+                return bad("a where value is a number"),
+            else => return bad("a where value is a number"),
+        };
+        definition.where[slot] = .{
+            .field = catalog.field_ref(field),
+            .comparison = switch (clause.op) {
+                inline else => |comparison| @field(nerva.Comparison, @tagName(comparison)),
+            },
+            .value = std.mem.toBytes(std.mem.nativeToLittle(i128, value)),
+        };
+    }
+
+    const result = try client.declare_index(&definition);
+    var out = Writer.init(arena);
+    switch (result.status) {
+        .created, .exists => {
+            try out.print("{{\"index\":\"{s}\",\"id\":{},\"declared\":\"{s}\",\"op\":", .{
+                name,
+                result.index_id,
+                @tagName(result.status),
+            });
+            try out.number(result.op);
+            try out.raw("}");
+            return .{ .status = 200, .body = out.items() };
+        },
+        .different, .indexes_full, .table_indexes_full => {
+            try out.print("{{\"status\":\"{s}\"}}", .{@tagName(result.status)});
+            return .{ .status = 409, .body = out.items() };
+        },
+        .invalid => return bad("the index breaks a rule (an eq key is at most 64 bytes)"),
+        .table_invalid => return bad("an index is over a record table"),
+    }
+}
+
+/// A page of an index's records with one `eq` key: `{"eq": {field: value}, "min", "max",
+/// "descending", "limit", "after"}`. `min` and `max` bound the order field's value (or the op,
+/// for an index without one); `after` is the `next` of the page before.
+fn index_scan(
+    arena: std.mem.Allocator,
+    client: anytype,
+    layouts: anytype,
+    name: []const u8,
+    body: []const u8,
+) !Reply {
+    const Request = struct {
+        eq: ?std.json.Value = null,
+        min: ?[]const u8 = null,
+        max: ?[]const u8 = null,
+        descending: bool = false,
+        limit: u32 = 100,
+        after: ?[]const u8 = null,
+    };
+    const request = try json_parse(Request, arena, body);
+    if (request.limit == 0) return bad("limit must be positive");
+    const index = try index_find(client, name) orelse
+        return error_reply(arena, 404, "no such index");
+    const definition = &index.definition;
+    const layout = try layouts.get(definition.table) orelse
+        return bad("the index's table has no layout");
+
+    var query = std.mem.zeroes(nerva.IndexQuery);
+    query.index_id = index.id;
+    query.limit = @min(request.limit, page_limit_max);
+    query.flags.descending = request.descending;
+    // The eq key: the eq fields' values, encoded as the table's layout encodes them.
+    if (request.eq) |eq| {
+        if (eq != .object) return bad("eq is an object of the index's eq fields");
+        if (eq.object.count() != definition.eq_count) return bad("eq names every eq field");
+        const value = try catalog.fields_encode(layout, eq);
+        query.eq_key = view_fields.fields_key(definition.eq[0..definition.eq_count], &value);
+        for (eq.object.keys()) |field_name| {
+            const field = layout.field(field_name).?;
+            const ref = catalog.field_ref(field);
+            for (definition.eq[0..definition.eq_count]) |slot| {
+                if (slot.offset_of() == ref.offset_of()) break;
+            } else return bad("eq names a field the index does not have");
+        }
+    } else if (definition.eq_count > 0) return bad("eq is required");
+    const order_kind: nerva.FieldKind = if (definition.flags.order) definition.order.kind else .unsigned;
+    query.order_min = if (request.min) |text| try order_parse(order_kind, text) else 0;
+    query.order_max = if (request.max) |text|
+        try order_parse(order_kind, text)
+    else
+        std.math.maxInt(u64);
+    if (query.order_min > query.order_max) return bad("min is above max");
+    if (request.after) |text| {
+        const dot = std.mem.indexOfScalar(u8, text, '.') orelse return bad("after is malformed");
+        query.cursor_order = std.fmt.parseInt(u64, text[0..dot], 10) catch
+            return bad("after is malformed");
+        query.cursor_timestamp = std.fmt.parseInt(u64, text[dot + 1 ..], 10) catch
+            return bad("after is malformed");
+        if (query.cursor_timestamp == 0) return bad("after is malformed");
+    }
+
+    const results = try arena.alloc(nerva.IndexRecord, query.limit + 1);
+    const count = try client.scan_index(query, results);
+    if (count == 0) return bad("the scan is malformed");
+    const header = results[0];
+    assert(header.kind == .header);
+    switch (header.state) {
+        .ready => {},
+        .building => return error_reply(arena, 503, "index building"),
+        .missing => return error_reply(arena, 404, "no such index"),
+    }
+    var out = Writer.init(arena);
+    try out.raw("{\"index\":");
+    try std.json.stringify(name, .{}, out.list.writer());
+    try out.raw(",\"op\":");
+    try out.number(header.op);
+    try out.raw(",\"records\":[");
+    for (results[1..count], 0..) |*record, position| {
+        assert(record.kind == .record);
+        if (position > 0) try out.raw(",");
+        try out.raw("{\"id\":");
+        try out.id(record.table, record.id);
+        try out.raw(",\"op\":");
+        try out.number(record.op);
+        try out.print(",\"order\":\"{}\"", .{view_fields.integer_from_ordered(order_kind, record.order)});
+        try out.raw(",\"value_hex\":");
+        try out.hex(&record.value);
+        try out.fields(layout, &record.value);
+        try out.raw("}");
+    }
+    try out.raw("],\"next\":");
+    if (header.flags.more) {
+        try out.print("\"{}.{}\"", .{ header.order, header.timestamp });
+    } else {
+        try out.raw("null");
+    }
+    try out.raw("}");
+    return .{ .status = 200, .body = out.items() };
+}
+
+/// An order bound as the order field's type gives it, encoded to order as the field does.
+fn order_parse(kind: nerva.FieldKind, text: []const u8) error{BadRequest}!u64 {
+    return switch (kind) {
+        .signed => view_fields.integer_ordered(
+            .signed,
+            std.fmt.parseInt(i64, text, 10) catch return bad("min and max are numbers"),
+        ),
+        else => std.fmt.parseInt(u64, text, 10) catch return bad("min and max are numbers"),
+    };
 }
 
 fn tables(
@@ -900,7 +1356,7 @@ fn tables(
             return .{ .status = 200, .body = out.items() };
         },
         .put => {
-            const layout = try catalog.layout_parse(arena, body);
+            const layout = try catalog.layout_parse(arena, body, table);
             switch (try layouts.layout_put(arena, table, &layout)) {
                 .incompatible => return error_reply(
                     arena,
@@ -1084,7 +1540,7 @@ fn view_groups(
         if (index > 0) try out.raw(",");
         try out.raw("{");
         // The group key's fields, placed back at their offsets, render as the layout says.
-        var value: [value_size]u8 = @splat(0);
+        var value: [nerva.record_value_size]u8 = @splat(0);
         var key_offset: usize = 0;
         for (view.group_by) |field_name| {
             const field = layout.field(field_name).?;
@@ -1319,12 +1775,47 @@ fn key_parse(text: []const u8) error{BadRequest}!u128 {
 }
 
 fn value_parse(text: []const u8) error{BadRequest}![value_size]u8 {
-    if (text.len % 2 != 0 or text.len > value_size * 2) {
-        return bad("value_hex must be at most 80 bytes of hex");
+    return (try value_parse_sized(text, value_size))[0..value_size].*;
+}
+
+/// A row's value (`size` 80) or a record's (448, P123b), zero-padded.
+fn value_parse_sized(
+    text: []const u8,
+    size: u16,
+) error{BadRequest}![nerva.record_value_size]u8 {
+    if (text.len % 2 != 0 or text.len > @as(usize, size) * 2) {
+        return bad(if (size == value_size)
+            "value_hex must be at most 80 bytes of hex"
+        else
+            "value_hex must be at most 448 bytes of hex");
     }
-    var value: [value_size]u8 = @splat(0);
+    var value: [nerva.record_value_size]u8 = @splat(0);
     _ = std.fmt.hexToBytes(value[0 .. text.len / 2], text) catch return bad("value_hex is not hex");
     return value;
+}
+
+/// A row's id, a decimal string; or a record's (P123b), 16 bytes as 32 hex digits, read
+/// little-endian (so that `Writer.id` writes the same digits back).
+pub fn id_parse(table: u32, text: []const u8) error{BadRequest}!u128 {
+    if (!nerva.table_is_record(table)) return try u64_parse(text, "id");
+    if (text.len != 32) return bad("a record's id is 16 bytes of hex");
+    var bytes: [16]u8 = undefined;
+    _ = std.fmt.hexToBytes(&bytes, text) catch return bad("a record's id is not hex");
+    return std.mem.readInt(u128, &bytes, .little);
+}
+
+/// `commit`'s form of a row's entry (P123b).
+fn narrow_entry(wide: *const nerva.WideEntry) Entry {
+    assert(!nerva.table_is_record(wide.table));
+    assert(wide.id <= std.math.maxInt(u64));
+    assert(stdx.zeroed(&wide.reserved_b));
+    return .{
+        .id = @intCast(wide.id),
+        .table = wide.table,
+        .kind = wide.kind,
+        .op_seen = wide.op_seen,
+        .value = wide.value[0..value_size].*,
+    };
 }
 
 /// Query parameters; each at most once, and only those listed.
@@ -1392,12 +1883,23 @@ pub const Writer = struct {
         }
     }
 
+    /// A row's id as a decimal string, a record's as 32 hex digits (`id_parse`).
+    pub fn id(writer: *Writer, table: u32, value: u128) !void {
+        if (nerva.table_is_record(table)) {
+            var bytes: [16]u8 = undefined;
+            std.mem.writeInt(u128, &bytes, value, .little);
+            try writer.hex(&bytes);
+        } else {
+            try writer.number(@intCast(value));
+        }
+    }
+
     pub fn hex(writer: *Writer, bytes: []const u8) !void {
         try writer.print("\"{s}\"", .{std.fmt.fmtSliceHexLower(bytes)});
     }
 
     /// `,"fields":{…}` if the table has a layout.
-    fn fields(writer: *Writer, layout: ?*const catalog.Layout, value: *const [value_size]u8) !void {
+    fn fields(writer: *Writer, layout: ?*const catalog.Layout, value: []const u8) !void {
         const layout_ = layout orelse return;
         try writer.raw(",\"fields\":");
         try catalog.fields_render(writer.list.writer(), layout_, value);
@@ -1413,6 +1915,7 @@ const testing = std.testing;
 const FakeClient = struct {
     op: u64 = 0,
     rows: std.AutoArrayHashMapUnmanaged(u128, Version) = .{},
+    records: std.AutoArrayHashMapUnmanaged(u128, RecordVersion) = .{},
     /// Commit keys: the op and a hash of the entries each committed.
     keys: std.AutoArrayHashMapUnmanaged(u128, struct { op: u64, hash: u64 }) = .{},
     allocator: std.mem.Allocator,
@@ -1421,6 +1924,7 @@ const FakeClient = struct {
     declared: ?nerva.DeclareStatus = null,
 
     const Version = struct { op: u64, exists: bool, value: [value_size]u8 };
+    const RecordVersion = struct { op: u64, exists: bool, value: [nerva.record_value_size]u8 };
 
     pub const Error = error{ TooManyEvents, OutOfMemory };
 
@@ -1482,8 +1986,126 @@ const FakeClient = struct {
         @memset(results, .{ .status = .ok, .op = fake.op });
     }
 
+    pub fn commit_wide(
+        fake: *FakeClient,
+        entries: []const nerva.WideEntry,
+        results: []EntryResult,
+    ) Error!void {
+        fake.op += 1;
+        const keyed = entries[0].kind == .key;
+        const hash = std.hash.Wyhash.hash(1, std.mem.sliceAsBytes(entries[1..]));
+        if (keyed) {
+            if (fake.keys.get(std.mem.readInt(u128, entries[0].value[0..16], .little))) |committed| {
+                results[0] = .{
+                    .status = if (committed.hash == hash) .committed_before else .key_reused,
+                    .op = committed.op,
+                };
+                @memset(results[1..], .{ .status = .aborted, .op = 0 });
+                return;
+            }
+        }
+        for (entries, 0..) |*entry, index| {
+            if (entry.kind != .read) continue;
+            const version = if (fake.written(entry)) |found| found.op else 0;
+            if (version != entry.op_seen) {
+                for (results, 0..) |*result, i| result.* = if (i == index)
+                    .{ .status = .conflict, .op = version }
+                else
+                    .{ .status = .aborted, .op = 0 };
+                return;
+            }
+        }
+        if (keyed) {
+            try fake.keys.put(
+                fake.allocator,
+                std.mem.readInt(u128, entries[0].value[0..16], .little),
+                .{ .op = fake.op, .hash = hash },
+            );
+        }
+        for (entries) |*entry| {
+            if (entry.kind == .read or entry.kind == .key) continue;
+            assert(entry.kind == .put or entry.kind == .delete);
+            if (nerva.table_is_record(entry.table)) {
+                try fake.records.put(fake.allocator, nerva.record_key(entry.table, entry.id), .{
+                    .op = fake.op,
+                    .exists = entry.kind == .put,
+                    .value = entry.value,
+                });
+            } else {
+                try fake.rows.put(fake.allocator, nerva.row_key(entry.table, @intCast(entry.id)), .{
+                    .op = fake.op,
+                    .exists = entry.kind == .put,
+                    .value = entry.value[0..value_size].*,
+                });
+            }
+        }
+        @memset(results, .{ .status = .ok, .op = fake.op });
+    }
+
+    fn written(fake: *FakeClient, entry: *const nerva.WideEntry) ?struct { op: u64 } {
+        if (nerva.table_is_record(entry.table)) {
+            const found = fake.records.get(nerva.record_key(entry.table, entry.id)) orelse
+                return null;
+            return .{ .op = found.op };
+        }
+        const found = fake.rows.get(nerva.row_key(entry.table, @intCast(entry.id))) orelse
+            return null;
+        return .{ .op = found.op };
+    }
+
+    pub fn lookup_records(
+        fake: *FakeClient,
+        keys: []const nerva.RecordKey,
+        results: []nerva.RecordValue,
+    ) Error!void {
+        fake.op += 1;
+        for (keys, results) |key, *result| {
+            const found = fake.records.get(nerva.record_key(key.table, key.id));
+            result.* = .{
+                .id = key.id,
+                .table = key.table,
+                .flags = .{ .exists = if (found) |f| f.exists else false },
+                .op = if (found) |f| f.op else 0,
+                .op_read = fake.op,
+                .value = if (found) |f| f.value else @splat(0),
+            };
+        }
+    }
+
     pub fn get_changes(_: *FakeClient, _: nerva.ChangesFilter, _: []Change) Error!usize {
         unreachable; // Covered by `tests/api/api.py`.
+    }
+
+    pub fn get_record_changes(
+        _: *FakeClient,
+        _: nerva.ChangesFilter,
+        _: []nerva.RecordChange,
+    ) Error!usize {
+        unreachable; // Covered by `tests/api/records.py`.
+    }
+
+    pub fn get_record_history(
+        _: *FakeClient,
+        _: nerva.RecordHistoryFilter,
+        _: []nerva.RecordChange,
+    ) Error!usize {
+        unreachable; // Covered by `tests/api/records.py`.
+    }
+
+    pub fn declare_index(
+        _: *FakeClient,
+        _: *const nerva.IndexDefinition,
+    ) Error!nerva.DeclareIndexResult {
+        unreachable; // Covered by `tests/api/records.py`.
+    }
+
+    pub fn scan_index(_: *FakeClient, _: nerva.IndexQuery, _: []nerva.IndexRecord) Error!usize {
+        unreachable; // Covered by `tests/api/records.py`.
+    }
+
+    /// No index is declared.
+    pub fn get_index(_: *FakeClient, _: u64) Error!nerva.Index {
+        return std.mem.zeroes(nerva.Index);
     }
 
     pub fn get_history(_: *FakeClient, _: nerva.HistoryFilter, _: []Change) Error!usize {
@@ -1727,6 +2349,70 @@ test "api: lookup and commit translate to and from JSON" {
     try testing.expectEqualStrings(
         \\{"status":"conflict","index":1,"op":"2"}
     , stale.body);
+}
+
+test "api: records are committed and read by 128-bit id, beside rows (P123b)" {
+    var arena_instance = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_instance.deinit();
+    const arena = arena_instance.allocator();
+    var fake: FakeClient = .{ .allocator = arena };
+    var layouts: FakeLayouts = .{ .allocator = arena };
+
+    const declared = try handle(arena, &fake, &layouts, .put, "/v1/tables/2147483649",
+        \\{"name":"facts","fields":[{"name":"status","type":"u8"},{"name":"note","type":"bytes","size":200}]}
+    );
+    try testing.expectEqual(@as(u16, 200), declared.status);
+
+    // One transaction writes a row and a record: `commit_wide`.
+    const put = try handle(arena, &fake, &layouts, .post, "/v1/commit",
+        \\{"entries":[{"kind":"put","table":1,"id":"5","value_hex":"01"},
+        \\  {"kind":"put","table":2147483649,"id":"0123456789abcdef0123456789abcdef",
+        \\   "fields":{"status":2,"note":"68656c6c6f"}}]}
+    );
+    try testing.expectEqualStrings(
+        \\{"status":"committed","op":"1"}
+    , put.body);
+    try testing.expectEqual(@as(usize, 1), fake.records.count());
+    try testing.expectEqual(@as(usize, 1), fake.rows.count());
+
+    const found = try handle(arena, &fake, &layouts, .post, "/v1/lookup",
+        \\{"rows":[{"table":2147483649,"id":"0123456789abcdef0123456789abcdef"}]}
+    );
+    try testing.expectEqual(@as(u16, 200), found.status);
+    try testing.expect(std.mem.indexOf(u8, found.body,
+        \\"id":"0123456789abcdef0123456789abcdef","exists":true,"op":"1"
+    ) != null);
+    try testing.expect(std.mem.indexOf(u8, found.body,
+        \\"fields":{"status":2,
+    ) != null);
+
+    // A record's id is exactly 32 hex digits; a row's is a decimal u64.
+    const refused = [_][]const u8{
+        \\{"rows":[{"table":2147483649,"id":"5"}]}
+        ,
+        \\{"rows":[{"table":2147483649,"id":"0123456789abcdef0123456789abcdeg"}]}
+        ,
+        \\{"rows":[{"table":1,"id":"0123456789abcdef0123456789abcdef"}]}
+        ,
+    };
+    for (refused) |body| {
+        const reply = try handle(arena, &fake, &layouts, .post, "/v1/lookup", body);
+        try testing.expectEqual(@as(u16, 400), reply.status);
+    }
+
+    // Adds are refused on record tables before reaching the cluster.
+    const add = try handle(arena, &fake, &layouts, .post, "/v1/commit",
+        \\{"entries":[{"kind":"add","table":2147483649,"id":"0123456789abcdef0123456789abcdef","field":"status","delta":"1"}]}
+    );
+    try testing.expect(add.status == 400 or add.status == 409);
+
+    // No index is declared: the list is empty and a scan is 404.
+    const list = try handle(arena, &fake, &layouts, .get, "/v1/indexes", "");
+    try testing.expectEqualStrings(
+        \\{"indexes":[]}
+    , list.body);
+    const scan = try handle(arena, &fake, &layouts, .post, "/v1/indexes/open/scan", "{}");
+    try testing.expectEqual(@as(u16, 404), scan.status);
 }
 
 test "api: a commit under a key commits once" {

@@ -730,7 +730,7 @@ test "format: persisted derivations" {
         \\  {"name":"sold","type":"bool"},{"name":"delta","type":"i64"},
         \\  {"name":"holder","type":"bytes","size":5},{"name":"row","type":"u16"},
         \\  {"name":"seat","type":"u32"}]}
-    );
+    , 5);
     const view = try catalog.view_parse(arena,
         \\{"table":5,"where":[{"field":"sold","op":"eq","value":true},
         \\  {"field":"price","op":"ge","value":"100"}],"group_by":["section","row"],
@@ -741,7 +741,7 @@ test "format: persisted derivations" {
         \\{"section":3,"price":"18446744073709551615","sold":true,"delta":"-2",
         \\  "holder":"6162630000","row":513,"seat":4294967295}
     , .{});
-    const row = try catalog.fields_encode(&layout, object);
+    const row = (try catalog.fields_encode(&layout, object))[0..nerva.value_size];
 
     try snap(@src(),
         \\layout: {"name":"seats","fields":[{"name":"section","type":"u8"},{"name":"price","type":"u64"},{"name":"sold","type":"bool"},{"name":"delta","type":"i64"},{"name":"holder","type":"bytes","size":5},{"name":"row","type":"u16"},{"name":"seat","type":"u32"}]}
@@ -751,7 +751,7 @@ test "format: persisted derivations" {
     ).diff_fmt("layout: {s}\nview: {s}\nrow: {s}\n", .{
         try catalog.layout_render(arena, &layout),
         try catalog.view_render(arena, &view),
-        std.fmt.fmtSliceHexLower(&row),
+        std.fmt.fmtSliceHexLower(row),
     });
 }
 

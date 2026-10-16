@@ -280,7 +280,7 @@ pub fn view_definition(
         log.err("view {s}: no layout for table {}", .{ name, declaration.table });
         return error.Refused;
     };
-    const layout = catalog.layout_parse(arena, layout_document) catch |err| {
+    const layout = catalog.layout_parse(arena, layout_document, declaration.table) catch |err| {
         log.err("view {s}: layout: {s}: {s}", .{ name, @errorName(err), catalog.invalid_reason });
         return error.Refused;
     };
