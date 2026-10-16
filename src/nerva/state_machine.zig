@@ -48,6 +48,13 @@ const LedgerDefinition = nerva.LedgerDefinition;
 const LedgerQuery = nerva.LedgerQuery;
 const views = @import("views.zig");
 const ledgers = @import("ledgers.zig");
+const indexes = @import("indexes.zig");
+const Index = nerva.Index;
+const IndexEntry = nerva.IndexEntry;
+const IndexDefinition = nerva.IndexDefinition;
+const IndexQuery = nerva.IndexQuery;
+const IndexRecord = nerva.IndexRecord;
+const DeclareIndexResult = nerva.DeclareIndexResult;
 const RowKey = nerva.RowKey;
 const RowValue = nerva.RowValue;
 const Record = nerva.Record;
@@ -84,6 +91,12 @@ pub fn StateMachineType(comptime Storage: type) type {
         /// -1 for the `end` record.
         pub const record_changes_limit_max =
             Operation.get_record_changes.result_max(constants.message_body_size_max) - 1;
+        /// Index entries one op may write (P123c): every record write, in every index of its
+        /// table. A pulse's backfill writes fewer (`group_writes_limit`).
+        pub const index_entries_per_op_max: u32 =
+            nerva.indexes_per_table_max * commit_wide_entries_max;
+        /// -1 for the header.
+        pub const index_hits_max = Operation.scan_index.result_max(constants.message_body_size_max) - 1;
 
         /// Timestamps a commit entry takes: its change, then one per view of its table, for a
         /// group the entry creates (N52), then one per `min` or `max` slot of its table, for a
@@ -115,6 +128,8 @@ pub fn StateMachineType(comptime Storage: type) type {
             assert(commit_wide_entries_max <= commit_entries_max);
             assert(lookup_records_max > 0);
             assert(record_changes_limit_max > 0);
+            assert(index_hits_max > 0);
+            assert(groups_per_op_max <= index_entries_per_op_max);
             assert(view_groups_limit_max > 0);
             assert(view_as_of_scans_max > 0);
         }
@@ -129,6 +144,8 @@ pub fn StateMachineType(comptime Storage: type) type {
                 MembersGroove.ObjectsCache.Cache.value_count_max_multiple,
             cache_entries_records: u32 =
                 RecordsGroove.ObjectsCache.Cache.value_count_max_multiple,
+            cache_entries_index_entries: u32 =
+                IndexEntriesGroove.ObjectsCache.Cache.value_count_max_multiple,
         };
 
         /// The row cache holds a multiple of this many rows (its set size), and at least one.
@@ -409,6 +426,67 @@ pub fn StateMachineType(comptime Storage: type) type {
             },
         );
 
+        const IndexesGroove = GrooveType(
+            Storage,
+            Index,
+            .{
+                .ids = tree_ids.Index,
+                .batch_value_count_max = .{
+                    .timestamp = nerva.indexes_max,
+                    .id = nerva.indexes_max,
+                },
+                .primary_key = "id",
+                .primary_key_orphaned = false,
+                .unique_keys = &[_][:0]const u8{"id"},
+                .ignored = &[_][:0]const u8{
+                    "backfill_cursor",
+                    "declared_op",
+                    "entry_count",
+                    "state",
+                    "reserved_a",
+                    "definition",
+                    "reserved_b",
+                },
+                .optional = &[_][:0]const u8{},
+                .derived = .{},
+                .objects_cache = true,
+            },
+        );
+
+        const IndexEntriesGroove = GrooveType(
+            Storage,
+            IndexEntry,
+            .{
+                .ids = tree_ids.IndexEntry,
+                .batch_value_count_max = .{
+                    .timestamp = index_entries_per_op_max,
+                    .key = index_entries_per_op_max,
+                    // An update moves an entry: out of its old position, into its new one.
+                    .order = 2 * index_entries_per_op_max,
+                },
+                .primary_key = "key",
+                .primary_key_orphaned = false,
+                .unique_keys = &[_][:0]const u8{"key"},
+                .ignored = &[_][:0]const u8{
+                    "position",
+                    "id",
+                    "index_id",
+                    "flags",
+                    "reserved",
+                    "eq_key",
+                },
+                .optional = &[_][:0]const u8{},
+                .derived = .{
+                    .order = struct {
+                        fn order(entry: *const IndexEntry) ?u128 {
+                            return if (entry.flags.present) entry.position else null;
+                        }
+                    }.order,
+                },
+                .objects_cache = true,
+            },
+        );
+
         pub const Forest = ForestType(Storage, .{
             .rows = RowsGroove,
             .changes = ChangesGroove,
@@ -420,6 +498,8 @@ pub fn StateMachineType(comptime Storage: type) type {
             .ledgers = LedgersGroove,
             .records = RecordsGroove,
             .record_changes = RecordChangesGroove,
+            .indexes = IndexesGroove,
+            .index_entries = IndexEntriesGroove,
         });
 
         const RowsScanLookup = ScanLookupType(
@@ -450,6 +530,17 @@ pub fn StateMachineType(comptime Storage: type) type {
 
         const ChangesScanTree = ScanTreeType(void, ChangesGroove.ObjectTree, Storage);
         const RecordChangesScanTree = ScanTreeType(void, RecordChangesGroove.ObjectTree, Storage);
+        const RecordsScanLookup = ScanLookupType(
+            RecordsGroove,
+            RecordsGroove.ScanBuilder.Scan,
+            Storage,
+        );
+        const IndexEntriesScanLookup = ScanLookupType(
+            IndexEntriesGroove,
+            IndexEntriesGroove.ScanBuilder.Scan,
+            Storage,
+        );
+        const IndexEntryScratch = struct { entry: IndexEntry, stored: ?IndexEntry };
         const RecordHistoryScanLookup = ScanLookupType(
             RecordChangesGroove,
             RecordChangesGroove.ScanBuilder.Scan,
@@ -628,6 +719,37 @@ pub fn StateMachineType(comptime Storage: type) type {
         version_timestamp: u64 = 0,
         version_timestamp_max: u64 = 0,
 
+        // ---- Declared indexes (P123c) ----
+
+        /// The number of indexes declared, once known (null after a reset: every id is probed).
+        index_count: ?u32 = null,
+        /// Whether an index is building, once known (null after a reset: a pulse finds out).
+        index_building: ?bool = null,
+        indexes_prefetch_context: IndexesGroove.PrefetchContext = undefined,
+        index_entries_prefetch_context: IndexEntriesGroove.PrefetchContext = undefined,
+        /// The indexes as this op found them, and as it leaves them.
+        indexes_op: [nerva.indexes_max]Index = undefined,
+        indexes_stored: [nerva.indexes_max]Index = undefined,
+        indexes_op_count: u32 = 0,
+        /// `index_entries_per_op_max` for this `batch_size_limit`.
+        index_entry_writes_limit: u32,
+        /// The entries this op changed, in the order first touched, and their state now and as
+        /// stored: written back once each at the end of the op.
+        index_entries_touched: std.ArrayListUnmanaged(u128) = .{},
+        index_entries_scratch: std.AutoHashMapUnmanaged(u128, IndexEntryScratch) = .{},
+        /// A `scan_index`: the index (an index into `indexes_op`), the entries scanned (one more
+        /// than the page, to know whether there are more), and its scan.
+        index_scan: ?u32 = null,
+        index_scan_entries: []IndexEntry,
+        index_scan_count: u32 = 0,
+        index_entries_scan_lookup: IndexEntriesScanLookup = undefined,
+        /// The building index a pulse backfills (an index into `indexes_op`), and the records it
+        /// scanned (one more than it adds).
+        backfill_index: ?u32 = null,
+        backfill_records: []Record,
+        backfill_records_count: ?u32 = null,
+        records_scan_lookup: RecordsScanLookup = undefined,
+
         // ---- Restore (N80) ----
 
         /// Set from `restore_prefetch` to the end of the matching `restore_*` commit.
@@ -660,10 +782,16 @@ pub fn StateMachineType(comptime Storage: type) type {
             const members_limit = commit_entries_limit;
             assert(members_limit <= members_per_op_max);
 
+            const index_entries_limit = nerva.indexes_per_table_max * commit_wide_entries_limit;
+            assert(index_entries_limit <= index_entries_per_op_max);
+            assert(groups_limit <= index_entries_limit);
             self.* = .{
                 .batch_size_limit = options.batch_size_limit,
                 .group_writes_limit = groups_limit,
                 .member_writes_limit = members_limit,
+                .index_entry_writes_limit = index_entries_limit,
+                .index_scan_entries = undefined,
+                .backfill_records = undefined,
                 .forest = undefined,
                 .changes_scan_buffer = undefined,
                 .record_changes_scan_buffer = undefined,
@@ -775,6 +903,26 @@ pub fn StateMachineType(comptime Storage: type) type {
                             },
                         },
                     },
+                    .indexes = .{
+                        .cache_entries_max = IndexesGroove.ObjectsCache.Cache
+                            .value_count_max_multiple,
+                        .prefetch_entries_for_read_max = nerva.indexes_max,
+                        .prefetch_entries_for_update_max = nerva.indexes_max,
+                        .tree_options_object = .{ .batch_value_count_limit = nerva.indexes_max },
+                        .tree_options_index = .{
+                            .id = .{ .batch_value_count_limit = nerva.indexes_max },
+                        },
+                    },
+                    .index_entries = .{
+                        .cache_entries_max = options.cache_entries_index_entries,
+                        .prefetch_entries_for_read_max = 0,
+                        .prefetch_entries_for_update_max = index_entries_limit,
+                        .tree_options_object = .{ .batch_value_count_limit = index_entries_limit },
+                        .tree_options_index = .{
+                            .key = .{ .batch_value_count_limit = index_entries_limit },
+                            .order = .{ .batch_value_count_limit = 2 * index_entries_limit },
+                        },
+                    },
                     .ledgers = .{
                         .cache_entries_max = LedgersGroove.ObjectsCache.Cache
                             .value_count_max_multiple,
@@ -854,9 +1002,22 @@ pub fn StateMachineType(comptime Storage: type) type {
             errdefer allocator.free(self.extreme_members);
             self.group_versions = try allocator.alloc(?GroupVersion, view_groups_limit_max);
             errdefer allocator.free(self.group_versions);
+
+            try self.index_entries_touched.ensureTotalCapacity(allocator, index_entries_limit);
+            errdefer self.index_entries_touched.deinit(allocator);
+            try self.index_entries_scratch.ensureTotalCapacity(allocator, index_entries_limit);
+            errdefer self.index_entries_scratch.deinit(allocator);
+            self.index_scan_entries = try allocator.alloc(IndexEntry, index_hits_max + 1);
+            errdefer allocator.free(self.index_scan_entries);
+            self.backfill_records = try allocator.alloc(Record, groups_limit + 1);
+            errdefer allocator.free(self.backfill_records);
         }
 
         pub fn deinit(self: *StateMachine, allocator: std.mem.Allocator) void {
+            allocator.free(self.backfill_records);
+            allocator.free(self.index_scan_entries);
+            self.index_entries_scratch.deinit(allocator);
+            self.index_entries_touched.deinit(allocator);
             allocator.free(self.group_versions);
             allocator.free(self.extreme_members);
             self.view_txn_members.deinit(allocator);
@@ -913,7 +1074,14 @@ pub fn StateMachineType(comptime Storage: type) type {
                 .view_txn_members = self.view_txn_members,
                 .extreme_members = self.extreme_members,
                 .group_versions = self.group_versions,
+                .index_entry_writes_limit = self.index_entry_writes_limit,
+                .index_entries_touched = self.index_entries_touched,
+                .index_entries_scratch = self.index_entries_scratch,
+                .index_scan_entries = self.index_scan_entries,
+                .backfill_records = self.backfill_records,
             };
+            self.index_entries_touched.clearRetainingCapacity();
+            self.index_entries_scratch.clearRetainingCapacity();
             self.members_touched.clearRetainingCapacity();
             self.members_scratch.clearRetainingCapacity();
             self.extremes_scratch.clearRetainingCapacity();
@@ -963,7 +1131,7 @@ pub fn StateMachineType(comptime Storage: type) type {
         /// Pulses backfill building views (N52). Unknown after a reset: one pulse finds out.
         pub fn pulse_needed(self: *const StateMachine, timestamp: u64) bool {
             _ = timestamp;
-            return self.view_building orelse true;
+            return (self.view_building orelse true) or (self.index_building orelse true);
         }
 
         pub fn input_valid(
@@ -1038,6 +1206,8 @@ pub fn StateMachineType(comptime Storage: type) type {
                 .get_ledger,
                 .get_record_changes,
                 .get_record_history,
+                .declare_index,
+                .scan_index,
                 => message_body_used,
             };
             self.prepare_timestamp +=
@@ -1048,7 +1218,7 @@ pub fn StateMachineType(comptime Storage: type) type {
             return switch (operation) {
                 .commit => @divExact(events.len, @sizeOf(Entry)) * entry_timestamps,
                 .commit_wide => @divExact(events.len, @sizeOf(WideEntry)) * entry_timestamps,
-                .declare_view, .declare_ledger => 1,
+                .declare_view, .declare_ledger, .declare_index => 1,
                 // Each row a pulse may add takes an entry's block.
                 .pulse => self.group_writes_limit * entry_timestamps,
                 .lookup_rows,
@@ -1059,6 +1229,7 @@ pub fn StateMachineType(comptime Storage: type) type {
                 .lookup_records,
                 .get_record_changes,
                 .get_record_history,
+                .scan_index,
                 => 0,
             };
         }
@@ -1078,6 +1249,8 @@ pub fn StateMachineType(comptime Storage: type) type {
                 .lookup_records,
                 .get_record_changes,
                 .get_record_history,
+                .declare_index,
+                .scan_index,
                 => 0,
             };
         }
@@ -1131,6 +1304,7 @@ pub fn StateMachineType(comptime Storage: type) type {
                 .lookup_records => self.prefetch_records_lookup(message_body_used),
                 .get_record_changes => self.prefetch_record_changes(message_body_used),
                 .get_record_history => self.prefetch_record_history(message_body_used),
+                .declare_index, .scan_index => self.prefetch_indexes(),
                 .get_changes => self.prefetch_changes(message_body_used),
                 .get_history => self.prefetch_history(message_body_used),
                 .get_view, .pulse => self.prefetch_views(),
@@ -1231,8 +1405,8 @@ pub fn StateMachineType(comptime Storage: type) type {
                 @fieldParentPtr("records_prefetch_context", context),
             );
             switch (self.prefetch_operation.?) {
-                .commit, .commit_wide => self.prefetch_commit_groups(),
-                .lookup_records => self.prefetch_finish(),
+                .commit, .commit_wide => self.prefetch_commit_index_entries(),
+                .lookup_records, .scan_index => self.prefetch_finish(),
                 else => unreachable,
             }
         }
@@ -1415,6 +1589,643 @@ pub fn StateMachineType(comptime Storage: type) type {
                 return null;
             }
             return @min(filter.limit, changes_limit_max);
+        }
+
+        // ---- Declared indexes (P123c) ----
+
+        /// Prefetches every declared index, then loads them.
+        fn prefetch_indexes(self: *StateMachine) void {
+            const groove = &self.forest.grooves.indexes;
+            groove.prefetch_setup(self.prefetch_snapshot.?);
+            const count = self.index_count orelse nerva.indexes_max;
+            for (1..count + 1) |id| groove.prefetch_enqueue(.{ .id = id });
+            groove.prefetch(prefetch_indexes_callback, &self.indexes_prefetch_context);
+        }
+
+        fn prefetch_indexes_callback(context: *IndexesGroove.PrefetchContext) void {
+            const self: *StateMachine = @alignCast(
+                @fieldParentPtr("indexes_prefetch_context", context),
+            );
+            self.indexes_load();
+            switch (self.prefetch_operation.?) {
+                .commit, .commit_wide => self.prefetch_commit_rows(),
+                .pulse => self.prefetch_backfill_rows(),
+                .declare_index => self.prefetch_finish(),
+                .scan_index => self.prefetch_index_scan(),
+                else => unreachable,
+            }
+        }
+
+        /// Loads the indexes prefetched for this op into `indexes_op` and `indexes_stored`.
+        fn indexes_load(self: *StateMachine) void {
+            const groove = &self.forest.grooves.indexes;
+            const count = self.index_count orelse nerva.indexes_max;
+            var loaded: u32 = 0;
+            var building = false;
+            for (1..count + 1) |id| {
+                switch (groove.get(id)) {
+                    .found_object => |index| {
+                        // Ids are dense: 1, 2, … in declaration order.
+                        assert(index.id == loaded + 1);
+                        self.indexes_op[loaded] = index;
+                        self.indexes_stored[loaded] = index;
+                        loaded += 1;
+                        building = building or index.state == .building;
+                    },
+                    .not_found => break,
+                }
+            }
+            if (self.index_count) |known| assert(known == loaded);
+            self.index_count = loaded;
+            self.index_building = building;
+            self.indexes_op_count = loaded;
+            assert(self.index_entries_touched.items.len == 0);
+            assert(self.index_entries_scratch.count() == 0);
+        }
+
+        /// Stage 3 of a commit: the entry of every record write in every index of its table.
+        fn prefetch_commit_index_entries(self: *StateMachine) void {
+            const operation = self.prefetch_operation.?;
+            const entries = &self.forest.grooves.index_entries;
+            entries.prefetch_setup(self.prefetch_snapshot.?);
+            if (operation == .commit_wide and self.indexes_op_count > 0) {
+                var decoder = MultiBatchDecoder.init(self.prefetch_input.?, .{
+                    .element_size = operation.event_size(),
+                }) catch unreachable; // Already validated by `input_valid()`.
+                while (decoder.pop()) |batch| {
+                    for (self.batch_entries(operation, batch)) |*entry| {
+                        if (entry.kind != .put and entry.kind != .delete) continue;
+                        if (!nerva.table_is_record(entry.table)) continue;
+                        const key = nerva.record_key(entry.table, entry.id);
+                        for (self.indexes_op[0..self.indexes_op_count]) |*index| {
+                            if (index.definition.table != entry.table) continue;
+                            entries.prefetch_enqueue(.{
+                                .key = nerva.index_entry_key(index.id, key),
+                            });
+                        }
+                    }
+                }
+            }
+            entries.prefetch(prefetch_index_entries_callback, &self.index_entries_prefetch_context);
+        }
+
+        fn prefetch_index_entries_callback(context: *IndexEntriesGroove.PrefetchContext) void {
+            const self: *StateMachine = @alignCast(
+                @fieldParentPtr("index_entries_prefetch_context", context),
+            );
+            switch (self.prefetch_operation.?) {
+                .commit, .commit_wide => self.prefetch_commit_groups(),
+                .pulse => self.prefetch_finish(),
+                else => unreachable,
+            }
+        }
+
+        /// Keeps every index over `table` exact after one record changed from `old` to `new`
+        /// (null: absent or deleted) at `op`. `timestamp` is the entry's (`entry_timestamps`):
+        /// an entry it creates in the table's `n`th index takes
+        /// `timestamp + 1 + views_per_table_max + n`, the timestamps a row's `min` and `max`
+        /// members take, which records never have.
+        fn indexes_record_changed(
+            self: *StateMachine,
+            table: u32,
+            id: u128,
+            old: ?*const Record,
+            new: ?*const [nerva.record_value_size]u8,
+            op: u64,
+            timestamp: u64,
+        ) void {
+            const key = nerva.record_key(table, id);
+            var slot: u64 = 0;
+            for (self.indexes_op[0..self.indexes_op_count]) |*index| {
+                if (index.definition.table != table) continue;
+                defer slot += 1;
+                assert(slot < nerva.indexes_per_table_max);
+                // A building index adds records from its cursor on when the pulse reaches them.
+                if (index.state == .building and
+                    key & std.math.maxInt(u96) >= index.backfill_cursor) continue;
+                const value_old: ?*const [nerva.record_value_size]u8 = if (old) |record|
+                    if (record.flags.deleted) null else &record.value
+                else
+                    null;
+                self.index_record_changed(
+                    index,
+                    key,
+                    id,
+                    if (value_old) |value| indexes.place(&index.definition, value, old.?.op) else null,
+                    if (new) |value| indexes.place(&index.definition, value, op) else null,
+                    timestamp + 1 + nerva.views_per_table_max + slot,
+                );
+            }
+        }
+
+        /// One index's part of `indexes_record_changed`, and a pulse's (with `old` null).
+        fn index_record_changed(
+            self: *StateMachine,
+            index: *Index,
+            key: u128,
+            id: u128,
+            old: ?indexes.Place,
+            new: ?indexes.Place,
+            timestamp: u64,
+        ) void {
+            if (old == null and new == null) return;
+            const scratch = self.index_entry_scratch(index.id, key, id);
+            const entry = &scratch.entry;
+            // An entry is present exactly while its record passes the index's `where`.
+            assert(entry.flags.present == (old != null));
+            assert(entry.id == id);
+            if (new) |place| {
+                if (entry.timestamp == 0) {
+                    assert(TimestampRange.valid(timestamp));
+                    entry.timestamp = timestamp;
+                }
+                if (old == null) index.entry_count += 1;
+                entry.flags.present = true;
+                entry.eq_key = place.eq_key;
+                entry.position = nerva.index_position(
+                    indexes.position_prefix(index.id, &place.eq_key),
+                    place.order,
+                );
+            } else {
+                assert(index.entry_count > 0);
+                index.entry_count -= 1;
+                entry.flags.present = false;
+                entry.eq_key = @splat(0);
+                entry.position = 0;
+            }
+        }
+
+        /// The entry's state in this op, from the groove the first time.
+        fn index_entry_scratch(
+            self: *StateMachine,
+            index_id: u64,
+            key: u128,
+            id: u128,
+        ) *IndexEntryScratch {
+            const entry_key = nerva.index_entry_key(index_id, key);
+            const slot = self.index_entries_scratch.getOrPutAssumeCapacity(entry_key);
+            if (!slot.found_existing) {
+                const stored: ?IndexEntry =
+                    switch (self.forest.grooves.index_entries.get(entry_key)) {
+                        .found_object => |entry| entry,
+                        .not_found => null,
+                    };
+                slot.value_ptr.* = .{
+                    .entry = stored orelse .{
+                        .key = entry_key,
+                        .position = 0,
+                        .id = id,
+                        .timestamp = 0, // Assigned when the record first enters the index.
+                        .index_id = @intCast(index_id),
+                        .flags = .{},
+                        .eq_key = @splat(0),
+                    },
+                    .stored = stored,
+                };
+                self.index_entries_touched.appendAssumeCapacity(entry_key);
+            }
+            return slot.value_ptr;
+        }
+
+        /// Ends an op that may have changed indexes (commit, pulse): writes back each entry it
+        /// touched, once, in the order first touched, then the indexes it changed.
+        fn indexes_finish(self: *StateMachine) void {
+            const entries = &self.forest.grooves.index_entries;
+            assert(self.index_entries_touched.items.len <= self.index_entry_writes_limit);
+            for (self.index_entries_touched.items) |key| {
+                const scratch = self.index_entries_scratch.getPtr(key).?;
+                if (scratch.stored) |*stored| {
+                    if (!stdx.equal_bytes(IndexEntry, stored, &scratch.entry)) {
+                        entries.update(.{ .old = stored, .new = &scratch.entry });
+                    }
+                } else if (scratch.entry.timestamp != 0) {
+                    entries.insert(&scratch.entry);
+                }
+            }
+            self.index_entries_touched.clearRetainingCapacity();
+            self.index_entries_scratch.clearRetainingCapacity();
+            self.indexes_store();
+        }
+
+        fn indexes_store(self: *StateMachine) void {
+            const groove = &self.forest.grooves.indexes;
+            var building = false;
+            for (
+                self.indexes_op[0..self.indexes_op_count],
+                self.indexes_stored[0..self.indexes_op_count],
+            ) |*index, *stored| {
+                building = building or index.state == .building;
+                if (stdx.equal_bytes(Index, index, stored)) continue;
+                groove.update(.{ .old = stored, .new = index });
+                stored.* = index.*;
+            }
+            self.index_building = building;
+        }
+
+        fn execute_declare_index(
+            self: *StateMachine,
+            op: u64,
+            timestamp: u64,
+            message_body_used: []align(constants.cache_line_size) const u8,
+            output_buffer: *align(constants.cache_line_size) [constants.message_body_size_max]u8,
+        ) usize {
+            assert(message_body_used.len == @sizeOf(IndexDefinition));
+            const definition: *const IndexDefinition = @alignCast(std.mem.bytesAsValue(
+                IndexDefinition,
+                message_body_used[0..@sizeOf(IndexDefinition)],
+            ));
+            const result: *DeclareIndexResult = @alignCast(std.mem.bytesAsValue(
+                DeclareIndexResult,
+                output_buffer[0..@sizeOf(DeclareIndexResult)],
+            ));
+            result.* = self.index_declare(op, timestamp, definition);
+            self.indexes_store();
+            return @sizeOf(DeclareIndexResult);
+        }
+
+        /// Declares an index, building: pulses add the records already written, none possibly.
+        fn index_declare(
+            self: *StateMachine,
+            op: u64,
+            timestamp: u64,
+            definition: *const IndexDefinition,
+        ) DeclareIndexResult {
+            if (indexes.definition_validate(definition)) |status| {
+                return .{ .status = status, .index_id = 0, .op = 0 };
+            }
+            const name = indexes.definition_name(definition);
+            var table_indexes: u32 = 0;
+            for (self.indexes_op[0..self.indexes_op_count]) |*index| {
+                if (std.mem.eql(u8, indexes.definition_name(&index.definition), name)) {
+                    if (stdx.equal_bytes(IndexDefinition, &index.definition, definition)) {
+                        return .{
+                            .status = .exists,
+                            .index_id = index.id,
+                            .op = index.declared_op,
+                        };
+                    }
+                    return .{ .status = .different, .index_id = 0, .op = 0 };
+                }
+                if (index.definition.table == definition.table) table_indexes += 1;
+            }
+            if (self.indexes_op_count == nerva.indexes_max) {
+                return .{ .status = .indexes_full, .index_id = 0, .op = 0 };
+            }
+            if (table_indexes == nerva.indexes_per_table_max) {
+                return .{ .status = .table_indexes_full, .index_id = 0, .op = 0 };
+            }
+            const slot = self.indexes_op_count;
+            const index: Index = .{
+                .id = slot + 1,
+                .timestamp = timestamp,
+                .backfill_cursor = 0,
+                .declared_op = op,
+                .entry_count = 0,
+                .state = .building,
+                .definition = definition.*,
+            };
+            self.forest.grooves.indexes.insert(&index);
+            self.indexes_op[slot] = index;
+            self.indexes_stored[slot] = index;
+            self.indexes_op_count += 1;
+            self.index_count = self.indexes_op_count;
+            return .{ .status = .created, .index_id = index.id, .op = op };
+        }
+
+        fn index_query(body: []align(constants.cache_line_size) const u8) *const IndexQuery {
+            assert(body.len == @sizeOf(IndexQuery));
+            return @alignCast(std.mem.bytesAsValue(IndexQuery, body[0..@sizeOf(IndexQuery)]));
+        }
+
+        /// The query's page size, or null if it is malformed.
+        fn index_query_limit(query: *const IndexQuery) ?u32 {
+            if (query.limit == 0) return null;
+            if (query.flags.padding != 0) return null;
+            if (!stdx.zeroed(&query.reserved_a) or !stdx.zeroed(&query.reserved_b)) return null;
+            if (query.order_min > query.order_max) return null;
+            if (query.index_id == 0 and query.name[0] == 0) return null;
+            if (query.index_id != 0 and !stdx.zeroed(&query.name)) return null;
+            return @min(query.limit, index_hits_max);
+        }
+
+        /// The index the query names (an index into `indexes_op`), if declared.
+        fn index_query_slot(self: *const StateMachine, query: *const IndexQuery) ?u32 {
+            if (query.index_id != 0) {
+                if (query.index_id > self.indexes_op_count) return null;
+                return @intCast(query.index_id - 1);
+            }
+            const name = std.mem.sliceTo(&query.name, 0);
+            for (self.indexes_op[0..self.indexes_op_count], 0..) |*index, slot| {
+                if (std.mem.eql(u8, indexes.definition_name(&index.definition), name)) {
+                    return @intCast(slot);
+                }
+            }
+            return null;
+        }
+
+        /// Stage 1 of `scan_index`: the entries after the cursor at the cursor's own order (an
+        /// exact position, later timestamps), then stage 2.
+        fn prefetch_index_scan(self: *StateMachine) void {
+            assert(self.index_scan == null);
+            assert(self.index_scan_count == 0);
+            const query = index_query(self.prefetch_input.?);
+            const limit = index_query_limit(query) orelse return self.prefetch_finish();
+            const slot = self.index_query_slot(query) orelse return self.prefetch_finish();
+            const index = &self.indexes_op[slot];
+            if (index.state != .ready) return self.prefetch_finish();
+            if (!indexes.eq_key_valid(&index.definition, &query.eq_key)) {
+                return self.prefetch_finish();
+            }
+            self.index_scan = slot;
+
+            const cursor = query.cursor_timestamp != 0 and
+                query.cursor_order >= query.order_min and query.cursor_order <= query.order_max;
+            if (!cursor) return self.prefetch_index_scan_range();
+            const entries = &self.forest.grooves.index_entries;
+            const prefix = indexes.position_prefix(index.id, &query.eq_key);
+            const scan = entries.scan_builder.scan_prefix(
+                .order,
+                self.forest.scan_buffer_pool.acquire_assume_capacity(),
+                self.prefetch_snapshot.?,
+                nerva.index_position(prefix, query.cursor_order),
+                if (query.flags.descending) .{
+                    .min = TimestampRange.timestamp_min,
+                    .max = @max(TimestampRange.timestamp_min, query.cursor_timestamp - 1),
+                } else .{
+                    .min = @min(query.cursor_timestamp + 1, TimestampRange.timestamp_max),
+                    .max = TimestampRange.timestamp_max,
+                },
+                if (query.flags.descending) .descending else .ascending,
+            );
+            self.index_entries_scan_lookup = IndexEntriesScanLookup.init(entries, scan);
+            self.index_entries_scan_lookup.read(
+                self.index_scan_entries[0 .. limit + 1],
+                prefetch_index_scan_exact_callback,
+            );
+        }
+
+        fn prefetch_index_scan_exact_callback(
+            scan_lookup: *IndexEntriesScanLookup,
+            results: []const IndexEntry,
+        ) void {
+            const self: *StateMachine =
+                @alignCast(@fieldParentPtr("index_entries_scan_lookup", scan_lookup));
+            const query = index_query(self.prefetch_input.?);
+            assert(results.len == 0 or results.ptr == self.index_scan_entries.ptr);
+            // A timestamp bound at the cursor's own excludes the cursor's entry.
+            var count: u32 = 0;
+            for (results) |*entry| {
+                if (entry.timestamp == query.cursor_timestamp) continue;
+                self.index_scan_entries[count] = entry.*;
+                count += 1;
+            }
+            self.index_scan_count = count;
+            self.forest.scan_buffer_pool.reset();
+            self.forest.grooves.index_entries.scan_builder.reset();
+            self.prefetch_index_scan_range();
+        }
+
+        /// Stage 2: the positions strictly past the cursor's order (or the whole range), until
+        /// the page and one more are found.
+        fn prefetch_index_scan_range(self: *StateMachine) void {
+            const query = index_query(self.prefetch_input.?);
+            const limit = index_query_limit(query).?;
+            const index = &self.indexes_op[self.index_scan.?];
+            const wanted = limit + 1 - self.index_scan_count;
+            const cursor = query.cursor_timestamp != 0 and
+                query.cursor_order >= query.order_min and query.cursor_order <= query.order_max;
+            var order_min = query.order_min;
+            var order_max = query.order_max;
+            if (cursor) {
+                if (query.flags.descending) {
+                    if (query.cursor_order == order_min) return self.prefetch_index_records();
+                    order_max = query.cursor_order - 1;
+                } else {
+                    if (query.cursor_order == order_max) return self.prefetch_index_records();
+                    order_min = query.cursor_order + 1;
+                }
+            }
+            if (wanted == 0) return self.prefetch_index_records();
+            const entries = &self.forest.grooves.index_entries;
+            const prefix = indexes.position_prefix(index.id, &query.eq_key);
+            const scan = entries.scan_builder.scan_prefix_range(
+                .order,
+                self.forest.scan_buffer_pool.acquire_assume_capacity(),
+                self.prefetch_snapshot.?,
+                nerva.index_position(prefix, order_min),
+                nerva.index_position(prefix, order_max),
+                if (query.flags.descending) .descending else .ascending,
+            );
+            self.index_entries_scan_lookup = IndexEntriesScanLookup.init(entries, scan);
+            self.index_entries_scan_lookup.read(
+                self.index_scan_entries[self.index_scan_count..][0..wanted],
+                prefetch_index_scan_range_callback,
+            );
+        }
+
+        fn prefetch_index_scan_range_callback(
+            scan_lookup: *IndexEntriesScanLookup,
+            results: []const IndexEntry,
+        ) void {
+            const self: *StateMachine =
+                @alignCast(@fieldParentPtr("index_entries_scan_lookup", scan_lookup));
+            assert(results.len == 0 or
+                results.ptr == self.index_scan_entries[self.index_scan_count..].ptr);
+            self.index_scan_count += @intCast(results.len);
+            self.forest.scan_buffer_pool.reset();
+            self.forest.grooves.index_entries.scan_builder.reset();
+            self.prefetch_index_records();
+        }
+
+        /// Stage 3: the records the page lists.
+        fn prefetch_index_records(self: *StateMachine) void {
+            const index = &self.indexes_op[self.index_scan.?];
+            const records = &self.forest.grooves.records;
+            records.prefetch_setup(self.prefetch_snapshot.?);
+            for (self.index_scan_entries[0..self.index_scan_count]) |*entry| {
+                records.prefetch_enqueue(.{ .key = index_record_key(index, entry) });
+            }
+            records.prefetch(prefetch_records_callback, &self.records_prefetch_context);
+        }
+
+        /// The key of the record an entry of `index` names.
+        fn index_record_key(index: *const Index, entry: *const IndexEntry) u128 {
+            assert(entry.index_id == index.id);
+            return @as(u128, index.definition.table) << 96 | (entry.key & std.math.maxInt(u96));
+        }
+
+        fn execute_scan_index(
+            self: *StateMachine,
+            op: u64,
+            message_body_used: []align(constants.cache_line_size) const u8,
+            output_buffer: *align(constants.cache_line_size) [constants.message_body_size_max]u8,
+        ) usize {
+            defer {
+                self.index_scan = null;
+                self.index_scan_count = 0;
+            }
+            const query = index_query(message_body_used);
+            const limit = index_query_limit(query) orelse {
+                assert(self.index_scan == null);
+                return 0;
+            };
+            const results = stdx.bytes_as_slice(.inexact, IndexRecord, output_buffer);
+            const header = &results[0];
+            header.* = std.mem.zeroes(IndexRecord);
+            header.kind = .header;
+            header.op = op;
+            header.state = .missing;
+            const slot = self.index_query_slot(query) orelse {
+                assert(self.index_scan == null);
+                return @sizeOf(IndexRecord);
+            };
+            const index = &self.indexes_op[slot];
+            header.index_id = index.id;
+            header.table = index.definition.table;
+            header.state = index.state;
+            if (self.index_scan == null) return @sizeOf(IndexRecord); // Building, or a bad key.
+
+            const scanned = self.index_scan_entries[0..self.index_scan_count];
+            assert(scanned.len <= limit + 1);
+            const listed = @min(scanned.len, limit);
+            var count: u32 = 0;
+            for (scanned[0..listed], 0..) |*entry, position| {
+                assert(entry.flags.present);
+                if (position > 0) {
+                    const previous = &scanned[position - 1];
+                    if (query.flags.descending) {
+                        assert(previous.position >= entry.position);
+                    } else {
+                        assert(previous.position <= entry.position);
+                    }
+                }
+                // Another `eq` key whose prefix is the same: skipped.
+                if (!stdx.equal_bytes([nerva.group_key_size_max]u8, &entry.eq_key, &query.eq_key)) {
+                    continue;
+                }
+                const record = switch (self.forest.grooves.records.get(index_record_key(index, entry))) {
+                    .found_object => |record| record,
+                    .not_found => unreachable, // An entry is present only for a record.
+                };
+                assert(record.id == entry.id);
+                assert(!record.flags.deleted);
+                const place = indexes.place(&index.definition, &record.value, record.op).?;
+                assert(stdx.equal_bytes([nerva.group_key_size_max]u8, &place.eq_key, &entry.eq_key));
+                assert(place.order == @as(u64, @truncate(entry.position)));
+                results[1 + count] = .{
+                    .id = record.id,
+                    .table = record.table,
+                    .kind = .record,
+                    .flags = .{},
+                    .state = .missing,
+                    .op = record.op,
+                    .order = place.order,
+                    .timestamp = entry.timestamp,
+                    .index_id = index.id,
+                    .value = record.value,
+                };
+                count += 1;
+            }
+            if (scanned.len > listed) {
+                assert(listed > 0);
+                header.flags.more = true;
+                header.order = @truncate(scanned[listed - 1].position);
+                header.timestamp = scanned[listed - 1].timestamp;
+            }
+            return (1 + count) * @sizeOf(IndexRecord);
+        }
+
+        /// A pulse with no view building: the next records of the first building index (P123c),
+        /// then their entries (none exist yet; prefetched so that the commit can tell).
+        fn prefetch_backfill_records(self: *StateMachine) void {
+            assert(self.backfill_index == null);
+            assert(self.backfill_records_count == null);
+            const slot = for (self.indexes_op[0..self.indexes_op_count], 0..) |*index, slot| {
+                if (index.state == .building) break slot;
+            } else return self.prefetch_finish();
+            self.backfill_index = @intCast(slot);
+            const index = &self.indexes_op[slot];
+            const table: u128 = index.definition.table;
+
+            const records = &self.forest.grooves.records;
+            const scan = records.scan_builder.scan_unique_key_range(
+                .key,
+                self.forest.scan_buffer_pool.acquire_assume_capacity(),
+                self.prefetch_snapshot.?,
+                table << 96 | index.backfill_cursor,
+                table << 96 | std.math.maxInt(u96),
+                .ascending,
+            );
+            self.records_scan_lookup = RecordsScanLookup.init(records, scan);
+            self.records_scan_lookup.read(
+                self.backfill_records[0 .. self.group_writes_limit + 1],
+                prefetch_backfill_records_callback,
+            );
+        }
+
+        fn prefetch_backfill_records_callback(
+            scan_lookup: *RecordsScanLookup,
+            results: []const Record,
+        ) void {
+            const self: *StateMachine =
+                @alignCast(@fieldParentPtr("records_scan_lookup", scan_lookup));
+            assert(results.len == 0 or results.ptr == self.backfill_records.ptr);
+            self.backfill_records_count = @intCast(results.len);
+            self.forest.scan_buffer_pool.reset();
+            self.forest.grooves.records.scan_builder.reset();
+
+            const index = &self.indexes_op[self.backfill_index.?];
+            const entries = &self.forest.grooves.index_entries;
+            entries.prefetch_setup(self.prefetch_snapshot.?);
+            const count = @min(results.len, self.group_writes_limit);
+            for (results[0..count]) |*record| {
+                entries.prefetch_enqueue(.{ .key = nerva.index_entry_key(index.id, record.key) });
+            }
+            entries.prefetch(prefetch_index_entries_callback, &self.index_entries_prefetch_context);
+        }
+
+        /// Adds the records the pulse scanned to the building index. Replies nothing.
+        fn execute_pulse_index(self: *StateMachine, timestamp: u64) usize {
+            defer {
+                self.backfill_index = null;
+                self.backfill_records_count = null;
+            }
+            const slot = self.backfill_index orelse {
+                assert(self.index_building == false);
+                return 0;
+            };
+            const index = &self.indexes_op[slot];
+            assert(index.state == .building);
+            const scanned = self.backfill_records[0..self.backfill_records_count.?];
+            const count = @min(scanned.len, self.group_writes_limit);
+            // Each record takes an entry's block of timestamps, as a commit's entry does; its
+            // index's slot among its table's indexes picks the block's timestamp.
+            const timestamp_base = timestamp - self.prepare_delta(.pulse, &.{});
+            var table_slot: u64 = 0;
+            for (self.indexes_op[0..slot]) |*other| {
+                if (other.definition.table == index.definition.table) table_slot += 1;
+            }
+            for (scanned[0..count], 0..) |*record, k| {
+                assert(record.table == index.definition.table);
+                assert(record.key & std.math.maxInt(u96) >= index.backfill_cursor);
+                if (record.flags.deleted) continue;
+                const block = timestamp_base + k * entry_timestamps;
+                self.index_record_changed(
+                    index,
+                    record.key,
+                    record.id,
+                    null,
+                    indexes.place(&index.definition, &record.value, record.op),
+                    block + 1 + nerva.views_per_table_max + table_slot,
+                );
+            }
+            if (scanned.len > count) {
+                index.backfill_cursor = scanned[count].key & std.math.maxInt(u96);
+            } else {
+                index.state = .ready;
+            }
+            self.indexes_finish();
+            return 0;
         }
 
         // ---- Records' changes and history (P123b): as `get_changes` and `get_history` ----
@@ -1612,6 +2423,13 @@ pub fn StateMachineType(comptime Storage: type) type {
                     message_body_used,
                     output_buffer,
                 ),
+                .declare_index => self.execute_declare_index(
+                    op,
+                    timestamp,
+                    message_body_used,
+                    output_buffer,
+                ),
+                .scan_index => self.execute_scan_index(op, message_body_used, output_buffer),
             };
         }
 
@@ -1672,13 +2490,18 @@ pub fn StateMachineType(comptime Storage: type) type {
                     .get_ledger,
                     .get_record_changes,
                     .get_record_history,
+                    .declare_index,
+                    .scan_index,
                     => comptime unreachable,
                 };
                 reply_encoder.add(@intCast(bytes_written));
             }
             assert(batch_timestamp == timestamp);
             assert(body_decoder.batch_count() == reply_encoder.batch_count);
-            if (committing) self.views_finish(op);
+            if (committing) {
+                self.views_finish(op);
+                self.indexes_finish();
+            }
             return reply_encoder.finish();
         }
 
@@ -2077,6 +2900,14 @@ pub fn StateMachineType(comptime Storage: type) type {
             assert(entry.kind == .put);
             const records = &self.forest.grooves.records;
             const stored = self.record_stored(entry) catch unreachable;
+            self.indexes_record_changed(
+                entry.table,
+                entry.id,
+                if (stored) |*record| record else null,
+                &entry.value,
+                op,
+                timestamp,
+            );
             if (stored) |record_old| {
                 // Equal when an earlier transaction in the same request wrote the record.
                 assert(record_old.op <= op);
@@ -2113,6 +2944,7 @@ pub fn StateMachineType(comptime Storage: type) type {
             const record_old = (self.record_stored(entry) catch unreachable) orelse return;
             if (record_old.flags.deleted) return;
             assert(record_old.op <= op);
+            self.indexes_record_changed(entry.table, entry.id, &record_old, null, op, timestamp);
             var record_new = record_old;
             record_new.value = @splat(0);
             record_new.op = op;
@@ -2515,14 +3347,13 @@ pub fn StateMachineType(comptime Storage: type) type {
             );
             self.views_load();
             switch (self.prefetch_operation.?) {
-                .commit, .commit_wide => self.prefetch_commit_rows(),
+                .commit, .commit_wide, .pulse => self.prefetch_indexes(),
                 .declare_view => if (self.restoring)
                     self.prefetch_restore_table()
                 else
                     self.prefetch_finish(),
                 .declare_ledger => self.prefetch_finish(),
                 .get_view => self.prefetch_view_groups(),
-                .pulse => self.prefetch_backfill_rows(),
                 else => unreachable,
             }
         }
@@ -3472,7 +4303,7 @@ pub fn StateMachineType(comptime Storage: type) type {
             assert(self.backfill_view == null);
             const index = for (self.views_op[0..self.views_op_count], 0..) |*view, index| {
                 if (view.state == .building) break index;
-            } else return self.prefetch_finish();
+            } else return self.prefetch_backfill_records();
             self.backfill_view = @intCast(index);
             const view = &self.views_op[index];
 
@@ -3724,7 +4555,7 @@ pub fn StateMachineType(comptime Storage: type) type {
             }
             const index = self.backfill_view orelse {
                 assert(self.view_building == false);
-                return 0;
+                return self.execute_pulse_index(timestamp);
             };
             const view = &self.views_op[index];
             assert(view.state == .building);

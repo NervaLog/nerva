@@ -91,6 +91,19 @@ pub const tree_ids = struct {
         // `record_key(table, id)`: a record's history, in timestamp order (P123b).
         .record_key = 21,
     };
+
+    pub const Index = .{
+        .timestamp = 22,
+        .id = 23,
+    };
+
+    pub const IndexEntry = .{
+        .timestamp = 24,
+        .key = 25,
+        // `IndexEntry.position` while present: an index's records, by `eq` key then order
+        // (P123c).
+        .order = 26,
+    };
 };
 
 /// The LSM key of a row: `table` in the high 64 bits, `id` in the low 64 bits.
@@ -575,18 +588,39 @@ pub const FieldKind = enum(u8) {
     _,
 };
 
-/// A field of a row's value, resolved from the table's layout by the gateway.
+/// A field of a row's or record's value, resolved from the table's layout by the gateway.
 pub const FieldRef = extern struct {
+    /// The offset's low byte (`offset_of`).
     offset: u8,
     size: u8,
     kind: FieldKind,
-    reserved: u8 = 0,
+    /// The offset's high byte: zero for a row's field, up to 1 for a record's (P123b). It was a
+    /// reserved byte, always zero, before records.
+    offset_high: u8 = 0,
 
     comptime {
         assert(@sizeOf(FieldRef) == 4);
         assert(stdx.no_padding(FieldRef));
     }
+
+    pub fn offset_of(field: FieldRef) u16 {
+        return @as(u16, field.offset_high) << 8 | field.offset;
+    }
+
+    pub fn at(offset: u16, size: u8, kind: FieldKind) FieldRef {
+        return .{
+            .offset = @truncate(offset),
+            .size = size,
+            .kind = kind,
+            .offset_high = @intCast(offset >> 8),
+        };
+    }
 };
+
+/// The size of a value of `table`: a record's or a row's.
+pub fn table_value_size(table: u32) u16 {
+    return if (table_is_record(table)) record_value_size else value_size;
+}
 
 pub const Comparison = enum(u8) { eq = 1, ne = 2, lt = 3, le = 4, gt = 5, ge = 6, _ };
 
@@ -969,6 +1003,217 @@ pub const Change = extern struct {
     }
 };
 
+// ---- Declared indexes (P123c) ----
+
+/// Indexes, cluster-wide. Index ids are 1..indexes_max, in declaration order.
+pub const indexes_max = 64;
+/// Indexes over one table: each takes one of a record's `min`/`max` timestamps, which records
+/// do not use (`StateMachine.entry_timestamps`).
+pub const indexes_per_table_max = view_extremes_per_table_max;
+pub const index_eq_max = 3;
+pub const index_where_max = 4;
+
+/// The `declare_index` event: an index over a record table, immutable once declared. It lists
+/// the table's records whose value passes `where`, by the bytes of their `eq` fields (scanned
+/// for one `eq` key at a time), then by their `order` field (or, without one, the op of their
+/// last write), then by when they entered the index.
+pub const IndexDefinition = extern struct {
+    /// The catalog name rules (`catalog.zig`), zero-padded.
+    name: [32]u8,
+    /// A record table.
+    table: u32,
+    eq_count: u8,
+    where_count: u8,
+    flags: Flags,
+    reserved_a: u8 = 0,
+    /// Any kind; at most `group_key_size_max` bytes between them. Unused slots are zero.
+    eq: [index_eq_max]FieldRef,
+    /// An unsigned, signed or boolean field when `flags.order`; zero otherwise.
+    order: FieldRef,
+    where: [index_where_max]Where,
+    reserved_b: [72]u8 = @splat(0),
+
+    pub const Flags = packed struct(u8) {
+        order: bool = false,
+        padding: u7 = 0,
+    };
+
+    comptime {
+        assert(@sizeOf(IndexDefinition) == 256);
+        assert(stdx.no_padding(IndexDefinition));
+    }
+};
+
+pub const DeclareIndexStatus = enum(u32) {
+    /// Declared now; it builds (pulses add the records already written) before it answers.
+    created = 1,
+    /// Already declared with this definition (the result names it).
+    exists = 2,
+    /// The name is declared with another definition.
+    different = 3,
+    /// The definition breaks a static rule (`indexes.definition_validate`).
+    invalid = 4,
+    /// The table is not a record table.
+    table_invalid = 5,
+    indexes_full = 6,
+    table_indexes_full = 7,
+};
+
+/// The `declare_index` result.
+pub const DeclareIndexResult = extern struct {
+    status: DeclareIndexStatus,
+    reserved_a: u32 = 0,
+    /// `created` and `exists`: the index's id. Otherwise zero.
+    index_id: u64,
+    /// `created`: this op. `exists`: the op it was declared at. Otherwise zero.
+    op: u64,
+    reserved_b: u64 = 0,
+
+    comptime {
+        assert(@sizeOf(DeclareIndexResult) == 32);
+        assert(stdx.no_padding(DeclareIndexResult));
+    }
+};
+
+pub const IndexState = enum(u8) {
+    /// Answers for a query of an id or name never declared.
+    missing = 0,
+    /// Records written before the declaration are still being added (by pulses).
+    building = 1,
+    ready = 2,
+};
+
+/// An index as the forest stores it.
+pub const Index = extern struct {
+    id: u64,
+    timestamp: u64,
+    /// While building: the table's records whose key's low 96 bits are below are indexed.
+    backfill_cursor: u128,
+    declared_op: u64,
+    /// The records in the index.
+    entry_count: u64,
+    state: IndexState,
+    reserved_a: [15]u8 = @splat(0),
+    definition: IndexDefinition,
+    reserved_b: [192]u8 = @splat(0),
+
+    comptime {
+        assert(@sizeOf(Index) == 512);
+        assert(stdx.no_padding(Index));
+    }
+};
+
+/// A record's place in one index (P123c): one per index and record the index has seen. Never
+/// removed: a record that leaves the index is kept, absent (out of `order`).
+pub const IndexEntry = extern struct {
+    /// `index_entry_key(index_id, record key)`.
+    key: u128,
+    /// While present, `index_position(prefix, order)`, indexed as `order`. Zero while absent.
+    position: u128,
+    /// The record's id.
+    id: u128,
+    timestamp: u64,
+    index_id: u32,
+    flags: Flags,
+    reserved: [3]u8 = @splat(0),
+    /// While present, the `eq` fields' bytes, then zeros: compared when the index is read (a
+    /// prefix collision is skipped). Zero while absent.
+    eq_key: [group_key_size_max]u8,
+
+    pub const Flags = packed struct(u8) {
+        present: bool = false,
+        padding: u7 = 0,
+    };
+
+    comptime {
+        assert(@sizeOf(IndexEntry) == 128);
+        assert(stdx.no_padding(IndexEntry));
+    }
+};
+
+/// An entry's place in the entries tree: unique per index and record (a record's key is its
+/// table, which the index names, and 96 bits).
+pub fn index_entry_key(index_id: u64, record_key_: u128) u128 {
+    assert(index_id >= 1 and index_id <= indexes_max);
+    return @as(u128, index_id) << 96 | (record_key_ & std.math.maxInt(u96));
+}
+
+/// An entry's place in its index's order: the `eq` key's prefix, then the order value.
+pub fn index_position(prefix: u64, order: u64) u128 {
+    return @as(u128, prefix) << 64 | order;
+}
+
+/// The `scan_index` event: a page of one index's records with one `eq` key, by order, within
+/// `[order_min, order_max]` (order values as `views.integer_ordered` encodes them).
+pub const IndexQuery = extern struct {
+    /// Zero to name the index by `name`.
+    index_id: u64,
+    /// The `eq` fields' bytes, one after another, then zeros.
+    eq_key: [group_key_size_max]u8,
+    order_min: u64,
+    order_max: u64,
+    /// Continue after the record at this order and timestamp (a reply's header names them).
+    /// Zero timestamp: from the start of the range.
+    cursor_order: u64,
+    cursor_timestamp: u64,
+    /// The most records to return.
+    limit: u32,
+    flags: Flags,
+    reserved_a: [3]u8 = @splat(0),
+    /// When `index_id` is zero.
+    name: [32]u8,
+    reserved_b: [48]u8 = @splat(0),
+
+    pub const Flags = packed struct(u8) {
+        descending: bool = false,
+        padding: u7 = 0,
+    };
+
+    comptime {
+        assert(@sizeOf(IndexQuery) == 192);
+        assert(stdx.no_padding(IndexQuery));
+    }
+};
+
+/// The `scan_index` result: a header, then one record per entry found.
+pub const IndexRecord = extern struct {
+    /// `record`: the record's id.
+    id: u128,
+    /// `record`: its table. `header`: the index's table.
+    table: u32,
+    kind: Kind,
+    flags: Flags,
+    /// `header`: the index's state.
+    state: IndexState,
+    reserved_a: u8 = 0,
+    /// `header`: the op the scan read at. `record`: the record's version.
+    op: u64,
+    /// `record`: its order value. `header`, with `flags.more`: the next query's
+    /// `cursor_order`.
+    order: u64,
+    /// `record`: when it entered the index. `header`, with `flags.more`: the next query's
+    /// `cursor_timestamp`.
+    timestamp: u64,
+    /// `header`: the index's id (zero if missing).
+    index_id: u64,
+    reserved_b: [8]u8 = @splat(0),
+    /// `record`: its value.
+    value: [record_value_size]u8,
+
+    pub const Kind = enum(u8) { header = 1, record = 2 };
+
+    pub const Flags = packed struct(u8) {
+        /// `header`: the range holds more records after this page.
+        more: bool = false,
+        padding: u7 = 0,
+    };
+
+    comptime {
+        assert(@sizeOf(IndexRecord) == 512);
+        assert(stdx.no_padding(IndexRecord));
+    }
+};
+
 /// Operations exported by Nerva.
 // ---- Ledgers: conserved fields (docs/DECISIONS.md N75) ----
 
@@ -1094,6 +1339,9 @@ pub const Operation = enum(u8) {
     lookup_records = constants.vsr_operations_reserved + 10,
     get_record_changes = constants.vsr_operations_reserved + 11,
     get_record_history = constants.vsr_operations_reserved + 12,
+    /// Declares an index over a record table, maintained from then on (P123c).
+    declare_index = constants.vsr_operations_reserved + 13,
+    scan_index = constants.vsr_operations_reserved + 14,
 
     pub fn EventType(comptime operation: Operation) type {
         return switch (operation) {
@@ -1110,6 +1358,8 @@ pub const Operation = enum(u8) {
             .lookup_records => RecordKey,
             .get_record_changes => ChangesFilter,
             .get_record_history => RecordHistoryFilter,
+            .declare_index => IndexDefinition,
+            .scan_index => IndexQuery,
         };
     }
 
@@ -1126,6 +1376,8 @@ pub const Operation = enum(u8) {
             .commit_wide => EntryResult,
             .lookup_records => RecordValue,
             .get_record_changes, .get_record_history => RecordChange,
+            .declare_index => DeclareIndexResult,
+            .scan_index => IndexRecord,
         };
     }
 
@@ -1154,6 +1406,8 @@ pub const Operation = enum(u8) {
             .get_ledger,
             .get_record_changes,
             .get_record_history,
+            .declare_index,
+            .scan_index,
             => false,
         };
     }
@@ -1171,6 +1425,8 @@ pub const Operation = enum(u8) {
             .get_ledger,
             .get_record_changes,
             .get_record_history,
+            .declare_index,
+            .scan_index,
             => false,
         };
     }
@@ -1218,7 +1474,15 @@ pub const Operation = enum(u8) {
                     operation.result_max(constants.message_body_size_max),
                 );
             },
-            .declare_view, .declare_ledger, .get_ledger => 1,
+            .scan_index => count: {
+                const query = std.mem.bytesAsValue(IndexQuery, batch[0..@sizeOf(IndexQuery)]);
+                // +1 for the header.
+                break :count @min(
+                    query.limit +| 1,
+                    operation.result_max(constants.message_body_size_max),
+                );
+            },
+            .declare_view, .declare_ledger, .get_ledger, .declare_index => 1,
             .pulse => 0,
         };
     }

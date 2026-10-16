@@ -367,6 +367,21 @@ const Context = struct {
         const results = try context.execute(.get_record_history, &.{&.{filter}});
         return results[0];
     }
+
+    fn declare_index(
+        context: *Context,
+        definition: nerva.IndexDefinition,
+    ) !nerva.DeclareIndexResult {
+        const results = try context.execute(.declare_index, &.{&.{definition}});
+        assert(results[0].len == 1);
+        return results[0][0];
+    }
+
+    /// The header, then the page's records.
+    fn scan_index(context: *Context, query: nerva.IndexQuery) ![]const nerva.IndexRecord {
+        const results = try context.execute(.scan_index, &.{&.{query}});
+        return results[0];
+    }
 };
 
 fn value(byte: u8) [nerva.value_size]u8 {
@@ -960,6 +975,232 @@ test "records: a resent commit_wide under a key commits once" {
     const again = try context.commit_wide(&.{&transaction});
     try expect_statuses(again[0], &.{ .committed_before, .aborted, .aborted });
     try testing.expectEqual(first[0][0].op, again[0][0].op);
+}
+
+// ---- Declared indexes (P123c) ----
+
+/// Executions: `status` u8 at 0, `created` u64 at 8, `amount` i64 at 400.
+fn execution(id: u128, status: u8, created: u64, amount: i64) WideEntry {
+    var entry = record_put(id, 0);
+    entry.value = @splat(0);
+    entry.value[0] = status;
+    std.mem.writeInt(u64, entry.value[8..16], created, .little);
+    std.mem.writeInt(i64, entry.value[400..408], amount, .little);
+    return entry;
+}
+
+fn executions_by_status(name: []const u8, order: bool) nerva.IndexDefinition {
+    var definition = std.mem.zeroes(nerva.IndexDefinition);
+    @memcpy(definition.name[0..name.len], name);
+    definition.table = records_table;
+    definition.eq_count = 1;
+    definition.eq[0] = nerva.FieldRef.at(0, 1, .unsigned);
+    if (order) {
+        definition.flags.order = true;
+        definition.order = nerva.FieldRef.at(8, 8, .unsigned);
+    }
+    return definition;
+}
+
+fn status_query(status: u8, limit: u32, options: struct {
+    descending: bool = false,
+    cursor_order: u64 = 0,
+    cursor_timestamp: u64 = 0,
+    order_min: u64 = 0,
+    order_max: u64 = std.math.maxInt(u64),
+}) nerva.IndexQuery {
+    var query = std.mem.zeroes(nerva.IndexQuery);
+    query.index_id = 1;
+    query.eq_key[0] = status;
+    query.order_min = options.order_min;
+    query.order_max = options.order_max;
+    query.cursor_order = options.cursor_order;
+    query.cursor_timestamp = options.cursor_timestamp;
+    query.limit = limit;
+    query.flags.descending = options.descending;
+    return query;
+}
+
+/// Every record the query's range holds, page by page: their ids in order.
+fn scan_all(context: *Context, query_first: nerva.IndexQuery) ![]const u128 {
+    var ids: std.ArrayListUnmanaged(u128) = .{};
+    var query = query_first;
+    while (true) {
+        const page = try context.scan_index(query);
+        try testing.expectEqual(nerva.IndexRecord.Kind.header, page[0].kind);
+        try testing.expectEqual(nerva.IndexState.ready, page[0].state);
+        for (page[1..]) |record| try ids.append(context.arena, record.id);
+        if (!page[0].flags.more) break;
+        query.cursor_order = page[0].order;
+        query.cursor_timestamp = page[0].timestamp;
+    }
+    return ids.items;
+}
+
+test "indexes: built over existing records by pulses, then kept exact by every write" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const context = try context_init(&arena);
+
+    // Twenty executions, half reserved (1), half settled (2), created out of order.
+    for (0..20) |i| {
+        const results = try context.commit_wide(&.{&.{
+            execution(id_wide + i, @intCast(1 + i % 2), 1000 - i * 7, @intCast(i)),
+        }});
+        try expect_statuses(results[0], &.{.ok});
+    }
+    const declared = try context.declare_index(executions_by_status("by_status", true));
+    try testing.expectEqual(nerva.DeclareIndexStatus.created, declared.status);
+    // Building: a scan answers with the state, and no records.
+    const building = try context.scan_index(status_query(1, 5, .{}));
+    try testing.expectEqual(nerva.IndexState.building, building[0].state);
+    try testing.expectEqual(@as(usize, 1), building.len);
+    try testing.expect(context.pulse_until_ready() > 0);
+
+    // Reserved ones, by created: the even i, from the latest created.
+    const reserved = try scan_all(context, status_query(1, 3, .{}));
+    try testing.expectEqual(@as(usize, 10), reserved.len);
+    for (reserved, 0..) |id, k| try testing.expectEqual(id_wide + 18 - 2 * k, id);
+    // Descending, in pages of 4.
+    const reserved_down = try scan_all(context, status_query(1, 4, .{ .descending = true }));
+    for (reserved_down, 0..) |id, k| try testing.expectEqual(reserved[reserved.len - 1 - k], id);
+    // A range of created.
+    const ranged = try scan_all(context, status_query(1, 10, .{ .order_min = 900, .order_max = 950 }));
+    for (ranged) |id| {
+        const i: u64 = @intCast(id - id_wide);
+        try testing.expect(1000 - i * 7 >= 900 and 1000 - i * 7 <= 950);
+    }
+
+    // Settle one, delete one: they leave status 1; the settled one joins status 2.
+    const changed = try context.commit_wide(&.{&.{
+        execution(id_wide + 0, 2, 1000, 0),
+        record_delete(id_wide + 2),
+    }});
+    try expect_statuses(changed[0], &.{ .ok, .ok });
+    try testing.expectEqual(@as(usize, 8), (try scan_all(context, status_query(1, 3, .{}))).len);
+    const settled = try scan_all(context, status_query(2, 100, .{}));
+    try testing.expectEqual(@as(usize, 11), settled.len);
+    try testing.expectEqual(id_wide + 0, settled[settled.len - 1]); // The latest created.
+
+    // A page's records carry their values, versions and order.
+    const page = try context.scan_index(status_query(2, 1, .{ .descending = true }));
+    try testing.expectEqual(@as(usize, 2), page.len);
+    try testing.expectEqual(id_wide, page[1].id);
+    try testing.expectEqual(@as(u64, 1000), page[1].order);
+    try testing.expectEqual(changed[0][0].op, page[1].op);
+    try testing.expectEqual(@as(u8, 2), page[1].value[0]);
+    try testing.expect(page[0].flags.more);
+}
+
+test "indexes: without an order field, by the op of the last write; ties page by timestamp" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const context = try context_init(&arena);
+    try testing.expectEqual(
+        nerva.DeclareIndexStatus.created,
+        (try context.declare_index(executions_by_status("by_op", false))).status,
+    );
+    try testing.expectEqual(@as(u32, 1), context.pulse_until_ready());
+
+    // Five records in one op (three transactions) tie on the op: they page in the order they
+    // entered.
+    const tied = try context.commit_wide(&.{
+        &.{ execution(1, 1, 0, 0), execution(2, 1, 0, 0) },
+        &.{ execution(3, 1, 0, 0), execution(4, 1, 0, 0) },
+        &.{execution(5, 1, 0, 0)},
+    });
+    for (tied) |results| for (results) |result| try testing.expectEqual(.ok, result.status);
+    const later = try context.commit_wide(&.{&.{execution(100, 1, 0, 0)}});
+    try expect_statuses(later[0], &.{.ok});
+
+    const ids = try scan_all(context, status_query(1, 2, .{}));
+    try testing.expectEqual(@as(usize, 6), ids.len);
+    for (ids[0..5], 1..) |id, expected| try testing.expectEqual(@as(u128, expected), id);
+    try testing.expectEqual(@as(u128, 100), ids[5]);
+    const ids_down = try scan_all(context, status_query(1, 3, .{ .descending = true }));
+    for (ids_down, 0..) |id, k| try testing.expectEqual(ids[ids.len - 1 - k], id);
+
+    // Rewriting a record moves it to its new op.
+    try expect_statuses(
+        (try context.commit_wide(&.{&.{execution(1, 1, 0, 0)}}))[0],
+        &.{.ok},
+    );
+    const moved = try scan_all(context, status_query(1, 100, .{}));
+    try testing.expectEqual(@as(u128, 1), moved[moved.len - 1]);
+}
+
+test "indexes: where filters, declarations, and queries the state machine refuses" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const context = try context_init(&arena);
+
+    var positive = executions_by_status("positive", true);
+    positive.where_count = 1;
+    positive.where[0] = .{
+        .field = nerva.FieldRef.at(400, 8, .signed),
+        .comparison = .gt,
+        .value = std.mem.toBytes(std.mem.nativeToLittle(i128, 0)),
+    };
+    try testing.expectEqual(
+        nerva.DeclareIndexStatus.created,
+        (try context.declare_index(positive)).status,
+    );
+    _ = context.pulse_until_ready();
+    try expect_statuses((try context.commit_wide(&.{&.{
+        execution(1, 1, 10, 5),
+        execution(2, 1, 20, -5),
+        execution(3, 1, 30, 0),
+    }}))[0], &.{ .ok, .ok, .ok });
+    try testing.expectEqualSlices(u128, &.{1}, try scan_all(context, status_query(1, 10, .{})));
+    // Crossing the where clause moves a record in or out.
+    try expect_statuses(
+        (try context.commit_wide(&.{&.{ execution(1, 1, 10, -1), execution(2, 1, 20, 1) }}))[0],
+        &.{ .ok, .ok },
+    );
+    try testing.expectEqualSlices(u128, &.{2}, try scan_all(context, status_query(1, 10, .{})));
+
+    try testing.expectEqual(
+        nerva.DeclareIndexStatus.exists,
+        (try context.declare_index(positive)).status,
+    );
+    try testing.expectEqual(
+        nerva.DeclareIndexStatus.different,
+        (try context.declare_index(executions_by_status("positive", false))).status,
+    );
+    var on_rows = executions_by_status("rows", true);
+    on_rows.table = 1;
+    try testing.expectEqual(
+        nerva.DeclareIndexStatus.table_invalid,
+        (try context.declare_index(on_rows)).status,
+    );
+    for (0..3) |i| {
+        var name = [_]u8{ 'i', 'x', '0' + @as(u8, @intCast(i)) };
+        try testing.expectEqual(
+            nerva.DeclareIndexStatus.created,
+            (try context.declare_index(executions_by_status(&name, true))).status,
+        );
+    }
+    try testing.expectEqual(
+        nerva.DeclareIndexStatus.table_indexes_full,
+        (try context.declare_index(executions_by_status("one_more", true))).status,
+    );
+
+    // By name; a missing name; a key with bytes past the eq fields: header only.
+    var by_name = status_query(1, 10, .{});
+    by_name.index_id = 0;
+    @memcpy(by_name.name[0..8], "positive");
+    try testing.expectEqual(@as(usize, 2), (try context.scan_index(by_name)).len);
+    by_name.name[0] = 'x';
+    const missing = try context.scan_index(by_name);
+    try testing.expectEqual(nerva.IndexState.missing, missing[0].state);
+    var key_long = status_query(1, 10, .{});
+    key_long.eq_key[1] = 1;
+    try testing.expectEqual(@as(usize, 1), (try context.scan_index(key_long)).len);
+    // Malformed: an empty reply.
+    var reversed = status_query(1, 10, .{ .order_min = 5, .order_max = 4 });
+    try testing.expectEqual(@as(usize, 0), (try context.scan_index(reversed)).len);
+    reversed.limit = 0;
+    try testing.expectEqual(@as(usize, 0), (try context.scan_index(reversed)).len);
 }
 
 test "get_changes: committed writes in op order, paged by cursor" {

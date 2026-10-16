@@ -21,6 +21,7 @@ const snap = Snap.snap_fn("src");
 
 const nerva = @import("../nerva.zig");
 const views = @import("views.zig");
+const indexes = @import("indexes.zig");
 const documents = @import("documents.zig");
 const catalog = @import("catalog.zig");
 const export_file = @import("export_file.zig");
@@ -135,6 +136,21 @@ test "format: wire and storage layouts" {
         @FieldType(nerva.RecordValue, "flags"),
         nerva.RecordChange,
         nerva.RecordHistoryFilter,
+        // Declared indexes (P123c): declared and queried over the wire, stored in the indexes
+        // and index entries trees.
+        nerva.IndexDefinition,
+        @FieldType(nerva.IndexDefinition, "flags"),
+        nerva.DeclareIndexStatus,
+        nerva.DeclareIndexResult,
+        nerva.IndexState,
+        nerva.Index,
+        nerva.IndexEntry,
+        @FieldType(nerva.IndexEntry, "flags"),
+        nerva.IndexQuery,
+        @FieldType(nerva.IndexQuery, "flags"),
+        nerva.IndexRecord,
+        nerva.IndexRecord.Kind,
+        @FieldType(nerva.IndexRecord, "flags"),
     }) |T| try layout_render(writer, T);
 
     // Tree ids name the LSM trees in the data file: never renumber them (CLAUDE.md).
@@ -282,6 +298,8 @@ test "format: wire and storage layouts" {
         \\  lookup_records = 138
         \\  get_record_changes = 139
         \\  get_record_history = 140
+        \\  declare_index = 141
+        \\  scan_index = 142
         \\nerva.documents.Header: extern struct, size 24
         \\  namespace: offset 0, size 8, u64
         \\  reserved_a: offset 8, size 8, u64
@@ -300,7 +318,7 @@ test "format: wire and storage layouts" {
         \\  offset: offset 0, size 1, u8
         \\  size: offset 1, size 1, u8
         \\  kind: offset 2, size 1, nerva.FieldKind
-        \\  reserved: offset 3, size 1, u8
+        \\  offset_high: offset 3, size 1, u8
         \\nerva.Comparison: enum(u8), non-exhaustive
         \\  eq = 1
         \\  ne = 2
@@ -526,6 +544,94 @@ test "format: wire and storage layouts" {
         \\  op_max: offset 24, size 8, u64
         \\  timestamp_max: offset 32, size 8, u64
         \\  reserved: offset 40, size 24, [24]u8
+        \\nerva.IndexDefinition: extern struct, size 256
+        \\  name: offset 0, size 32, [32]u8
+        \\  table: offset 32, size 4, u32
+        \\  eq_count: offset 36, size 1, u8
+        \\  where_count: offset 37, size 1, u8
+        \\  flags: offset 38, size 1, nerva.IndexDefinition.Flags
+        \\  reserved_a: offset 39, size 1, u8
+        \\  eq: offset 40, size 12, [3]nerva.FieldRef
+        \\  order: offset 52, size 4, nerva.FieldRef
+        \\  where: offset 56, size 128, [4]nerva.Where
+        \\  reserved_b: offset 184, size 72, [72]u8
+        \\nerva.IndexDefinition.Flags: packed struct, size 1
+        \\  order: bit 0, 1 bits, bool
+        \\  padding: bit 1, 7 bits, u7
+        \\nerva.DeclareIndexStatus: enum(u32)
+        \\  created = 1
+        \\  exists = 2
+        \\  different = 3
+        \\  invalid = 4
+        \\  table_invalid = 5
+        \\  indexes_full = 6
+        \\  table_indexes_full = 7
+        \\nerva.DeclareIndexResult: extern struct, size 32
+        \\  status: offset 0, size 4, nerva.DeclareIndexStatus
+        \\  reserved_a: offset 4, size 4, u32
+        \\  index_id: offset 8, size 8, u64
+        \\  op: offset 16, size 8, u64
+        \\  reserved_b: offset 24, size 8, u64
+        \\nerva.IndexState: enum(u8)
+        \\  missing = 0
+        \\  building = 1
+        \\  ready = 2
+        \\nerva.Index: extern struct, size 512
+        \\  id: offset 0, size 8, u64
+        \\  timestamp: offset 8, size 8, u64
+        \\  backfill_cursor: offset 16, size 16, u128
+        \\  declared_op: offset 32, size 8, u64
+        \\  entry_count: offset 40, size 8, u64
+        \\  state: offset 48, size 1, nerva.IndexState
+        \\  reserved_a: offset 49, size 15, [15]u8
+        \\  definition: offset 64, size 256, nerva.IndexDefinition
+        \\  reserved_b: offset 320, size 192, [192]u8
+        \\nerva.IndexEntry: extern struct, size 128
+        \\  key: offset 0, size 16, u128
+        \\  position: offset 16, size 16, u128
+        \\  id: offset 32, size 16, u128
+        \\  timestamp: offset 48, size 8, u64
+        \\  index_id: offset 56, size 4, u32
+        \\  flags: offset 60, size 1, nerva.IndexEntry.Flags
+        \\  reserved: offset 61, size 3, [3]u8
+        \\  eq_key: offset 64, size 64, [64]u8
+        \\nerva.IndexEntry.Flags: packed struct, size 1
+        \\  present: bit 0, 1 bits, bool
+        \\  padding: bit 1, 7 bits, u7
+        \\nerva.IndexQuery: extern struct, size 192
+        \\  index_id: offset 0, size 8, u64
+        \\  eq_key: offset 8, size 64, [64]u8
+        \\  order_min: offset 72, size 8, u64
+        \\  order_max: offset 80, size 8, u64
+        \\  cursor_order: offset 88, size 8, u64
+        \\  cursor_timestamp: offset 96, size 8, u64
+        \\  limit: offset 104, size 4, u32
+        \\  flags: offset 108, size 1, nerva.IndexQuery.Flags
+        \\  reserved_a: offset 109, size 3, [3]u8
+        \\  name: offset 112, size 32, [32]u8
+        \\  reserved_b: offset 144, size 48, [48]u8
+        \\nerva.IndexQuery.Flags: packed struct, size 1
+        \\  descending: bit 0, 1 bits, bool
+        \\  padding: bit 1, 7 bits, u7
+        \\nerva.IndexRecord: extern struct, size 512
+        \\  id: offset 0, size 16, u128
+        \\  table: offset 16, size 4, u32
+        \\  kind: offset 20, size 1, nerva.IndexRecord.Kind
+        \\  flags: offset 21, size 1, nerva.IndexRecord.Flags
+        \\  state: offset 22, size 1, nerva.IndexState
+        \\  reserved_a: offset 23, size 1, u8
+        \\  op: offset 24, size 8, u64
+        \\  order: offset 32, size 8, u64
+        \\  timestamp: offset 40, size 8, u64
+        \\  index_id: offset 48, size 8, u64
+        \\  reserved_b: offset 56, size 8, [8]u8
+        \\  value: offset 64, size 448, [448]u8
+        \\nerva.IndexRecord.Kind: enum(u8)
+        \\  header = 1
+        \\  record = 2
+        \\nerva.IndexRecord.Flags: packed struct, size 1
+        \\  more: bit 0, 1 bits, bool
+        \\  padding: bit 1, 7 bits, u7
         \\tree_ids:
         \\  Row.timestamp = 1
         \\  Row.key = 2
@@ -548,6 +654,11 @@ test "format: wire and storage layouts" {
         \\  Record.key = 19
         \\  RecordChange.timestamp = 20
         \\  RecordChange.record_key = 21
+        \\  Index.timestamp = 22
+        \\  Index.id = 23
+        \\  IndexEntry.timestamp = 24
+        \\  IndexEntry.key = 25
+        \\  IndexEntry.order = 26
         \\
     ).diff(out.items);
 }
@@ -582,6 +693,16 @@ test "format: persisted derivations" {
     try testing.expectEqual(
         @as(u128, 170141183601885234047750166926088000722),
         nerva.record_key(0x8000_0001, 0xfedc_ba98_7654_3210_0123_4567_89ab_cdef),
+    );
+
+    // Indexes' entry keys and positions (P123c), computed apart from this code (Python's
+    // hashlib and integers).
+    var eq_key: [nerva.group_key_size_max]u8 = @splat(0);
+    eq_key[0] = 2;
+    try testing.expectEqual(@as(u64, 16297427750713542426), indexes.position_prefix(3, &eq_key));
+    try testing.expectEqual(
+        @as(u128, 237684487542793012780631851013),
+        nerva.index_entry_key(3, 0x8000_0001_0000_0000_0000_0000_0000_0005),
     );
 
     // Views' members and versions (N62), computed apart from this code (Python's hashlib and
