@@ -34,6 +34,8 @@ pub fn definition_validate(definition: *const ViewDefinition) ?DeclareStatus {
     if (definition.table == 0 or definition.table >= catalog.tables_reserved_min) {
         return .table_invalid;
     }
+    // A record's value is wider than a row's (P123b).
+    const value_size_max = nerva.table_value_size(definition.table);
     if (definition.reserved_a != 0 or !stdx.zeroed(&definition.reserved_b)) return .invalid;
     if (definition.where_count > nerva.view_where_max) return .invalid;
     if (definition.group_by_count > nerva.view_group_by_max) return .invalid;
@@ -45,7 +47,7 @@ pub fn definition_validate(definition: *const ViewDefinition) ?DeclareStatus {
             if (!stdx.zeroed(std.mem.asBytes(clause))) return .invalid;
             continue;
         }
-        if (!field_valid(clause.field) or clause.field.kind == .bytes) return .invalid;
+        if (!field_valid(clause.field, value_size_max) or clause.field.kind == .bytes) return .invalid;
         switch (clause.comparison) {
             .eq, .ne, .lt, .le, .gt, .ge => {},
             _ => return .invalid,
@@ -59,7 +61,7 @@ pub fn definition_validate(definition: *const ViewDefinition) ?DeclareStatus {
             if (!stdx.zeroed(std.mem.asBytes(&field))) return .invalid;
             continue;
         }
-        if (!field_valid(field)) return .invalid;
+        if (!field_valid(field, value_size_max)) return .invalid;
         key_size += field.size;
     }
     if (key_size > group_key_size_max) return .invalid;
@@ -73,8 +75,11 @@ pub fn definition_validate(definition: *const ViewDefinition) ?DeclareStatus {
         switch (aggregate.function) {
             .count => if (!stdx.zeroed(std.mem.asBytes(&aggregate.field))) return .invalid,
             .sum, .min, .max => {
-                if (!field_valid(aggregate.field) or aggregate.field.kind == .bytes) {
+                if (!field_valid(aggregate.field, value_size_max) or aggregate.field.kind == .bytes) {
                     return .invalid;
+                }
+                if (extreme(aggregate.function) and nerva.table_is_record(definition.table)) {
+                    return .unsupported;
                 }
             },
             _ => return .invalid,
@@ -105,8 +110,8 @@ pub fn extreme(function: nerva.AggregateFunction) bool {
     return function == .min or function == .max;
 }
 
-fn field_valid(field: FieldRef) bool {
-    if (field.reserved != 0) return false;
+/// Whether `field` is a field of a `value_size_max`-byte value (a row's or a record's).
+pub fn field_valid(field: FieldRef, value_size_max: u16) bool {
     const size_ok = switch (field.kind) {
         .unsigned => field.size == 1 or field.size == 2 or field.size == 4 or field.size == 8,
         .signed => field.size == 8,
@@ -114,7 +119,7 @@ fn field_valid(field: FieldRef) bool {
         .bytes => field.size >= 1,
         _ => false,
     };
-    return size_ok and @as(usize, field.offset) + field.size <= value_size;
+    return size_ok and @as(usize, field.offset_of()) + field.size <= value_size_max;
 }
 
 /// The definition's name, without its zero padding.
@@ -124,9 +129,9 @@ pub fn definition_name(definition: *const ViewDefinition) []const u8 {
 }
 
 /// A field's value as an integer (unsigned, signed or boolean fields).
-pub fn field_integer(field: FieldRef, value: *const [value_size]u8) i128 {
-    assert(@as(usize, field.offset) + field.size <= value_size);
-    const bytes = value[field.offset..][0..field.size];
+pub fn field_integer(field: FieldRef, value: []const u8) i128 {
+    assert(@as(usize, field.offset_of()) + field.size <= value.len);
+    const bytes = value[field.offset_of()..][0..field.size];
     return switch (field.kind) {
         .unsigned, .boolean => std.mem.readVarInt(u64, bytes, .little),
         .signed => std.mem.readInt(i64, bytes[0..8], .little),
@@ -136,7 +141,7 @@ pub fn field_integer(field: FieldRef, value: *const [value_size]u8) i128 {
 
 /// A field's value as a u64 that orders as the field does (N62): unsigned and boolean fields as
 /// they are, signed fields with the sign bit flipped.
-pub fn field_ordered(field: FieldRef, value: *const [value_size]u8) u64 {
+pub fn field_ordered(field: FieldRef, value: []const u8) u64 {
     return integer_ordered(field.kind, field_integer(field, value));
 }
 
@@ -175,8 +180,13 @@ pub fn member_order_prefix(
 }
 
 /// Whether the row passes every where clause.
-pub fn row_matches(definition: *const ViewDefinition, value: *const [value_size]u8) bool {
-    for (definition.where[0..definition.where_count]) |*clause| {
+pub fn row_matches(definition: *const ViewDefinition, value: []const u8) bool {
+    return where_matches(definition.where[0..definition.where_count], value);
+}
+
+/// Whether the value passes every clause (views' and indexes' `where`).
+pub fn where_matches(clauses: []const nerva.Where, value: []const u8) bool {
+    for (clauses) |*clause| {
         const actual = field_integer(clause.field, value);
         const expected = std.mem.readInt(i128, &clause.value, .little);
         const keep = switch (clause.comparison) {
@@ -196,12 +206,17 @@ pub fn row_matches(definition: *const ViewDefinition, value: *const [value_size]
 /// The row's group key: its group_by fields' bytes, then zeros.
 pub fn group_key(
     definition: *const ViewDefinition,
-    value: *const [value_size]u8,
+    value: []const u8,
 ) [group_key_size_max]u8 {
+    return fields_key(definition.group_by[0..definition.group_by_count], value);
+}
+
+/// The fields' bytes, one after another, then zeros (a group's key, an index's `eq` key).
+pub fn fields_key(fields: []const FieldRef, value: []const u8) [group_key_size_max]u8 {
     var key: [group_key_size_max]u8 = @splat(0);
     var size: usize = 0;
-    for (definition.group_by[0..definition.group_by_count]) |field| {
-        @memcpy(key[size..][0..field.size], value[field.offset..][0..field.size]);
+    for (fields) |field| {
+        @memcpy(key[size..][0..field.size], value[field.offset_of()..][0..field.size]);
         size += field.size;
     }
     assert(size <= group_key_size_max);
@@ -226,7 +241,7 @@ pub fn group_tree_key(view_id: u64, key: *const [group_key_size_max]u8) u128 {
 pub fn group_apply(
     definition: *const ViewDefinition,
     group: *Group,
-    value: *const [value_size]u8,
+    value: []const u8,
     sign: enum { add, remove },
 ) void {
     switch (sign) {
@@ -281,16 +296,18 @@ pub fn hash_update(hash: *[32]u8, digest: *const [32]u8, sign: enum { add, remov
 
 /// The row values a write may leave behind or start from, for the groups it may touch: the old
 /// row's value, and a put's new value or a creating add's empty row (a superset: an add keeps
-/// its row in its group, `view_key_field`).
+/// its row in its group, `view_key_field`). `Value` is a row's or a record's value array.
 pub fn entry_values(
-    entry: *const nerva.Entry,
-    value_old: ?[value_size]u8,
-) [2]?[value_size]u8 {
-    var values: [2]?[value_size]u8 = .{ value_old, null };
+    comptime Value: type,
+    entry: anytype,
+    value_old: ?Value,
+) [2]?Value {
+    const size = @typeInfo(Value).array.len;
+    var values: [2]?Value = .{ value_old, null };
     switch (entry.kind) {
-        .put => values[1] = entry.value,
+        .put => values[1] = entry.value[0..size].*,
         .add => if (nerva.Add.from_entry(entry).flags.create) {
-            values[1] = @as([value_size]u8, @splat(0));
+            values[1] = @as(Value, @splat(0));
         },
         else => {},
     }
@@ -311,7 +328,7 @@ pub fn add_touches_key(definition: *const ViewDefinition, offset: u8) bool {
 }
 
 fn overlap(field: FieldRef, offset: u8) bool {
-    const start: usize = field.offset;
+    const start: usize = field.offset_of();
     const end: usize = start + field.size;
     return offset < end and start < @as(usize, offset) + 8;
 }

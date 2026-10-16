@@ -17,11 +17,13 @@ const nerva = @import("../nerva.zig");
 const value_size = nerva.value_size;
 
 /// Tables at or above this are Nerva's own; the API refuses to read or write them directly.
-pub const tables_reserved_min: u32 = 0xFFFF_0000;
+pub const tables_reserved_min: u32 = nerva.tables_reserved_min;
 /// Catalog documents (`documents.zig`, namespace 0), keyed `table.<id>` and `view.<name>`.
 pub const table_catalog: u32 = 0xFFFF_0001;
 /// Applications' documents (`documents.zig`, any namespace), through `/v1/documents/*` (N41).
 pub const table_documents: u32 = 0xFFFF_0002;
+// 0xFFFF_0003 is `nerva.table_commit_keys` (P123): commit keys' rows, written only by the state
+// machine.
 
 pub const fields_max = 16;
 pub const name_size_max = 32;
@@ -33,7 +35,7 @@ pub const FieldType = enum {
     u64,
     i64,
     bool,
-    /// Fixed-size raw bytes (`size`, 1..80), as hex in JSON.
+    /// Fixed-size raw bytes (`size`, 1..80; for a record's, 1..255), as hex in JSON.
     bytes,
 
     fn size(field_type: FieldType) ?u8 {
@@ -51,7 +53,8 @@ pub const Field = struct {
     name: []const u8,
     type: FieldType,
     size: u8,
-    offset: u8,
+    /// Within a row's 80 bytes, or a record's 448 (P123b).
+    offset: u16,
 };
 
 pub const Layout = struct {
@@ -78,8 +81,13 @@ fn invalid(reason: []const u8) error{Invalid} {
 }
 
 /// Parses a declaration, `{"name": "...", "fields": [{"name": "...", "type": "u64"}, …]}` (a
-/// `bytes` field also has `"size"`), and computes offsets.
-pub fn layout_parse(arena: std.mem.Allocator, json: []const u8) Error!Layout {
+/// `bytes` field also has `"size"`), and computes offsets, within the value of a row of `table`
+/// (80 bytes) or a record (448, P123b).
+pub fn layout_parse(arena: std.mem.Allocator, json: []const u8, table: u32) Error!Layout {
+    return layout_parse_sized(arena, json, nerva.table_value_size(table));
+}
+
+fn layout_parse_sized(arena: std.mem.Allocator, json: []const u8, size_max: usize) Error!Layout {
     const Declaration = struct {
         name: []const u8,
         fields: []const struct { name: []const u8, type: FieldType, size: ?u8 = null },
@@ -107,12 +115,16 @@ pub fn layout_parse(arena: std.mem.Allocator, json: []const u8) Error!Layout {
             break :size size;
         } else size: {
             const size = declared.size orelse return invalid("a bytes field needs a size");
-            if (size == 0 or size > value_size) return invalid("a bytes field is 1 to 80 bytes");
+            if (size == 0 or size > size_max) {
+                return invalid("a bytes field is 1 to 80 bytes, or 255 in a record");
+            }
             break :size size;
         };
         const alignment: usize = if (declared.type == .bytes) 1 else size;
         offset = std.mem.alignForward(usize, offset, alignment);
-        if (offset + size > value_size) return invalid("the fields do not fit in 80 bytes");
+        if (offset + size > size_max) {
+            return invalid("the fields do not fit in 80 bytes, or 448 in a record");
+        }
         field.* = .{
             .name = declared.name,
             .type = declared.type,
@@ -167,9 +179,13 @@ pub fn layout_extends(old: *const Layout, new: *const Layout) bool {
 
 /// Encodes a JSON object of fields. Absent fields are zero; unknown fields are refused.
 /// 64-bit integers may be numbers or decimal strings; bytes are hex.
-pub fn fields_encode(layout: *const Layout, object: std.json.Value) error{Invalid}![value_size]u8 {
+/// A record's size: a row's value is its first `value_size` bytes (the rest is zero).
+pub fn fields_encode(
+    layout: *const Layout,
+    object: std.json.Value,
+) error{Invalid}![nerva.record_value_size]u8 {
     if (object != .object) return invalid("fields must be an object");
-    var value: [value_size]u8 = @splat(0);
+    var value: [nerva.record_value_size]u8 = @splat(0);
     var iterator = object.object.iterator();
     while (iterator.next()) |entry| {
         const field = layout.field(entry.key_ptr.*) orelse return invalid("unknown field");
@@ -221,7 +237,7 @@ fn integer_parse(comptime Int: type, json: std.json.Value) error{Invalid}!Int {
 }
 
 /// Writes the fields of `value` as a JSON object. 64-bit integers are decimal strings (N33).
-pub fn fields_render(writer: anytype, layout: *const Layout, value: *const [value_size]u8) !void {
+pub fn fields_render(writer: anytype, layout: *const Layout, value: []const u8) !void {
     try writer.writeAll("{");
     for (layout.fields, 0..) |*field, index| {
         if (index > 0) try writer.writeAll(",");
@@ -232,7 +248,7 @@ pub fn fields_render(writer: anytype, layout: *const Layout, value: *const [valu
 }
 
 /// Writes one field's value as JSON.
-pub fn field_render(writer: anytype, field: *const Field, value: *const [value_size]u8) !void {
+pub fn field_render(writer: anytype, field: *const Field, value: []const u8) !void {
     const slot = value[field.offset..][0..field.size];
     switch (field.type) {
         .bool => try writer.writeAll(if (slot[0] != 0) "true" else "false"),
@@ -355,6 +371,12 @@ pub fn view_check(view: *const View, layout: *const Layout) error{Invalid}!void 
         const field = layout.field(name) orelse return invalid("unknown field in aggregates");
         if (field.type == .bytes) return invalid("sum, min and max take numbers only");
     }
+    // A view over records takes count and sum only (P123b): no `members` tree for records.
+    if (nerva.table_is_record(view.table)) for (view.aggregates) |aggregate| {
+        if (aggregate.function == .min or aggregate.function == .max) {
+            return invalid("a view over records takes count and sum only");
+        }
+    };
 }
 
 /// The view as stored: canonical JSON.
@@ -388,7 +410,7 @@ pub fn view_render(arena: std.mem.Allocator, view: *const View) Error![]const u8
 
 /// A field's value as a signed 128-bit integer, for views to compare and sum. Bytes fields have
 /// no numeric value.
-pub fn field_integer(field: *const Field, value: *const [value_size]u8) ?i128 {
+pub fn field_integer(field: *const Field, value: []const u8) ?i128 {
     const slot = value[field.offset..][0..field.size];
     return switch (field.type) {
         .bool, .u8 => slot[0],
@@ -401,6 +423,10 @@ pub fn field_integer(field: *const Field, value: *const [value_size]u8) ?i128 {
 }
 
 const testing = std.testing;
+
+fn test_layout_parse(arena: std.mem.Allocator, json: []const u8) Error!Layout {
+    return layout_parse(arena, json, 5);
+}
 
 /// The view as the state machine maintains it (N52): its fields resolved to offsets through the
 /// table's layout. `view_check` must have passed.
@@ -442,17 +468,13 @@ pub fn view_definition(
     return definition;
 }
 
-fn field_ref(field: *const Field) nerva.FieldRef {
-    return .{
-        .offset = field.offset,
-        .size = field.size,
-        .kind = switch (field.type) {
-            .u8, .u16, .u32, .u64 => .unsigned,
-            .i64 => .signed,
-            .bool => .boolean,
-            .bytes => .bytes,
-        },
-    };
+pub fn field_ref(field: *const Field) nerva.FieldRef {
+    return nerva.FieldRef.at(field.offset, field.size, switch (field.type) {
+        .u8, .u16, .u32, .u64 => .unsigned,
+        .i64 => .signed,
+        .bool => .boolean,
+        .bytes => .bytes,
+    });
 }
 
 test "catalog: layouts pack, align, extend and round-trip" {
@@ -460,7 +482,7 @@ test "catalog: layouts pack, align, extend and round-trip" {
     defer arena_instance.deinit();
     const arena = arena_instance.allocator();
 
-    const seats = try layout_parse(arena,
+    const seats = try test_layout_parse(arena,
         \\{"name":"seats","fields":[{"name":"section","type":"u8"},{"name":"price","type":"u64"},
         \\  {"name":"sold","type":"bool"},{"name":"holder","type":"bytes","size":16}]}
     );
@@ -471,18 +493,18 @@ test "catalog: layouts pack, align, extend and round-trip" {
 
     // Stored canonically, and the stored form parses to the same layout.
     const stored = try layout_render(arena, &seats);
-    const again = try layout_parse(arena, stored);
+    const again = try test_layout_parse(arena, stored);
     try testing.expectEqualStrings(stored, try layout_render(arena, &again));
 
     // Appending is an extension; anything else is not.
-    const more = try layout_parse(arena,
+    const more = try test_layout_parse(arena,
         \\{"name":"seats","fields":[{"name":"section","type":"u8"},{"name":"price","type":"u64"},
         \\  {"name":"sold","type":"bool"},{"name":"holder","type":"bytes","size":16},
         \\  {"name":"row","type":"u16"}]}
     );
     try testing.expect(layout_extends(&seats, &more));
     try testing.expect(!layout_extends(&more, &seats));
-    const changed = try layout_parse(arena,
+    const changed = try test_layout_parse(arena,
         \\{"name":"seats","fields":[{"name":"section","type":"u16"}]}
     );
     try testing.expect(!layout_extends(&seats, &changed));
@@ -530,10 +552,10 @@ test "catalog: invalid layouts and fields are refused" {
         \\{"name":"t","fields":[{"name":"a","type":"u8"}],"x":1}
     };
     for (layouts) |json| {
-        try testing.expectError(error.Invalid, layout_parse(arena, json));
+        try testing.expectError(error.Invalid, test_layout_parse(arena, json));
     }
 
-    const layout = try layout_parse(arena,
+    const layout = try test_layout_parse(arena,
         \\{"name":"t","fields":[{"name":"a","type":"u8"},{"name":"b","type":"bytes","size":2},
         \\  {"name":"c","type":"i64"},{"name":"d","type":"bool"}]}
     );
@@ -582,7 +604,7 @@ test "catalog: a view resolves to the state machine's definition through its lay
     defer arena_instance.deinit();
     const arena = arena_instance.allocator();
 
-    const layout = try layout_parse(arena,
+    const layout = try test_layout_parse(arena,
         \\{"name":"seats","fields":[{"name":"section","type":"u8"},{"name":"price","type":"u64"},
         \\{"name":"sold","type":"bool"},{"name":"balance","type":"i64"}]}
     );
@@ -606,4 +628,29 @@ test "catalog: a view resolves to the state machine's definition through its lay
     try testing.expectEqual(@as(u8, 8), definition.aggregates[1].field.offset);
     // The state machine accepts what the catalog accepted.
     try testing.expectEqual(null, @import("views.zig").definition_validate(&definition));
+}
+
+test "catalog: a view over records takes count and sum only (P123b)" {
+    var arena_instance = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_instance.deinit();
+    const arena = arena_instance.allocator();
+
+    const layout = try layout_parse(arena,
+        \\{"name":"facts","fields":[{"name":"status","type":"u8"},{"name":"amount","type":"u64"},
+        \\{"name":"memo","type":"bytes","size":255},{"name":"tail","type":"u64"}]}
+    , nerva.record_tables_min);
+    // Offsets past a byte: the tail ends at 280 of 448.
+    try testing.expectEqual(@as(u16, 16), layout.field("memo").?.offset);
+    try testing.expectEqual(@as(u16, 272), layout.field("tail").?.offset);
+    const summed = try view_parse(arena,
+        \\{"table":2147483648,"group_by":["status"],
+        \\"aggregates":[{"fn":"count"},{"fn":"sum","field":"amount"}]}
+    );
+    try view_check(&summed, &layout);
+    for ([_][]const u8{ "min", "max" }) |function| {
+        const view = try view_parse(arena, try std.fmt.allocPrint(arena,
+            \\{{"table":2147483648,"aggregates":[{{"fn":"count"}},{{"fn":"{s}","field":"amount"}}]}}
+        , .{function}));
+        try testing.expectError(error.Invalid, view_check(&view, &layout));
+    }
 }

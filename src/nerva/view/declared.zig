@@ -132,7 +132,7 @@ pub const DeclaredViews = struct {
 
         if (std.mem.startsWith(u8, decoded.key, "table.")) {
             const table = std.fmt.parseInt(u32, decoded.key["table.".len..], 10) catch return;
-            const layout = catalog.layout_parse(arena, value) catch |err| switch (err) {
+            const layout = catalog.layout_parse(arena, value, table) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.Invalid => return log.warn("{s}: invalid layout", .{decoded.key}),
             };
@@ -163,6 +163,9 @@ pub const DeclaredViews = struct {
         as_of: ?u64,
     ) ComputeError!Result {
         const view = views.views.getPtr(name) orelse return error.NoSuchView;
+        // Records' views (P123b): this process follows rows' feed only; `nerva api` answers
+        // them from the groups the state machine keeps.
+        if (nerva.table_is_record(view.table)) return error.NoSuchView;
         const layout = views.layouts.getPtr(view.table) orelse return error.NoLayout;
         try catalog.view_check(view, layout);
 
@@ -198,16 +201,17 @@ pub const DeclaredViews = struct {
     }
 };
 
-/// Tables a declared view may read: any but Nerva's own.
+/// Tables a declared view may read here: rows' (records' are `nerva api`'s), not Nerva's own.
 fn table_viewable(table: u32) bool {
-    return table < catalog.tables_reserved_min;
+    return table < catalog.tables_reserved_min and !nerva.table_is_record(table);
 }
 
 /// A group of a view's answer, however it was computed: here from rows, or by `nerva api` from
 /// the groups the state machine maintains (N66).
 pub const Group = struct {
-    /// A row of the group: its key fields are the group's key.
-    sample: [value_size]u8,
+    /// A row of the group: its key fields are the group's key. A record's size, so that
+    /// `nerva api` renders a record view's groups the same way (P123b).
+    sample: [nerva.record_value_size]u8,
     count: u64,
     /// Per aggregate: the running sum, min or max (count uses `count`).
     values: [catalog.aggregates_max]i128,
@@ -247,7 +251,8 @@ fn aggregate(
         const entry = try groups.getOrPut(arena, key_buffer[0..key_size]);
         if (!entry.found_existing) {
             entry.key_ptr.* = try arena.dupe(u8, key_buffer[0..key_size]);
-            entry.value_ptr.* = .{ .sample = value.*, .count = 0, .values = @splat(0) };
+            entry.value_ptr.* = .{ .sample = @splat(0), .count = 0, .values = @splat(0) };
+            entry.value_ptr.sample[0..value_size].* = value.*;
         }
         const group = entry.value_ptr;
         group.count += 1;
@@ -349,7 +354,7 @@ test "declared views: group, filter, aggregate, as of, catalog from chunked rows
         \\{"table":5,"where":[{"field":"sold","op":"eq","value":true}],"group_by":["section"],
         \\ "aggregates":[{"fn":"count"},{"fn":"sum","field":"price"},{"fn":"max","field":"price"}]}
     ;
-    const layout = try catalog.layout_parse(arena, layout_json);
+    const layout = try catalog.layout_parse(arena, layout_json, 5);
 
     var op: u64 = 1;
     var timestamp: u64 = 1;
@@ -398,7 +403,7 @@ test "declared views: group, filter, aggregate, as of, catalog from chunked rows
                 .flags = .{},
                 .op = op_,
                 .timestamp = ts,
-                .value = try catalog.fields_encode(layout_, object),
+                .value = (try catalog.fields_encode(layout_, object))[0..nerva.value_size].*,
             };
         }
     }.change;
@@ -450,7 +455,7 @@ test "declared views: invalid declarations are refused" {
     const arena = arena_instance.allocator();
     const layout = try catalog.layout_parse(arena,
         \\{"name":"t","fields":[{"name":"a","type":"u8"},{"name":"b","type":"bytes","size":4}]}
-    );
+    , 5);
     const refused_at_parse = [_][]const u8{
         \\{"table":0,"aggregates":[{"fn":"count"}]}
         ,

@@ -5,6 +5,109 @@ publishes a version's section as its GitHub release notes, and refuses to releas
 without one. Design reasons are in [docs/DECISIONS.md](./docs/DECISIONS.md); the full log of
 work is [WORKLOG.md](./WORKLOG.md).
 
+## v0.6.0 — 2026-10-16
+
+Facts can now live beside the money they record. A transaction may carry a **commit key**, so a
+client that lost its reply resends it and it commits at most once. **Records** hold facts of
+448 bytes under 128-bit ids, written in the same transaction as rows. **Declared indexes** find
+records by their fields, kept exact in every commit. **Data files must be exported with v0.5.0
+and imported with v0.6.0, a replica needs about 0.5 GiB more memory, and v0.6.0 replicas must
+never share a cluster with older ones:** see "Upgrading from v0.5.0" below. v0.4.0 and v0.5.0
+clients and gateways keep working; they cannot use records or indexes.
+
+### New: commit keys, so a resent transaction commits once
+
+Start a transaction with a key (16 bytes you choose, one per logical operation). When it
+commits, Nerva keeps the key, in the same op. Sent again, it commits nothing and answers with
+the op it committed at; sent with other entries, `key_reused`. A transaction that did not
+commit (a conflict, a bound) keeps no key, and its resend runs again. (P123)
+
+```bash
+curl -H 'X-Nerva-Key: secret' http://127.0.0.1:8080/v1/commit -d '{"key":"0190f1c2a7e47b3c9d2e5f6a7b8c9d0e",
+  "entries":[{"kind":"add","table":7,"id":"1","field":"available","delta":"-30","min":"0"}]}'
+# {"status":"committed","op":"812","adds":[…]}; the same request again:
+# {"status":"committed","op":"812","replayed":true}
+```
+
+- A resend's reply has no adds' amounts: read the rows as of its op.
+- Keys are kept forever, one 80-byte row each. `/v1/documents/commit` takes no key yet.
+
+### New: records, 128-bit ids and 448-byte values
+
+Tables `2147483648` (`0x80000000`) to `4294901759` hold records: `(table, id)` with a 128-bit id
+(a UUID, as 32 hex digits) and a 448-byte value, with layouts of up to 448 bytes (a bytes field
+up to 255). One transaction may read, put and delete rows and records together, so a fact
+commits in the op that moves its money. (P123b)
+
+```bash
+curl -X PUT -H 'X-Nerva-Key: secret' http://127.0.0.1:8080/v1/tables/2147483649 -d '{"name":"executions",
+  "fields":[{"name":"agent","type":"bytes","size":16},{"name":"status","type":"u8"},
+            {"name":"created","type":"u64"},{"name":"amount","type":"u64"}]}'
+curl -H 'X-Nerva-Key: secret' http://127.0.0.1:8080/v1/commit -d '{"entries":[
+  {"kind":"add","table":7,"id":"1","field":"available","delta":"-30","min":"0"},
+  {"kind":"put","table":2147483649,"id":"0190f1c2a7e47b3c9d2e5f6a7b8c9d0e",
+   "fields":{"agent":"…","status":1,"created":"1760600000","amount":"30"}}]}'
+```
+
+- `/v1/lookup`, `/v1/history` and `/v1/row?as_of` take record ids; one lookup reads rows or
+  records, not both. `/v1/changes` serves both feeds in one order under one cursor.
+- Records are written whole: they take no adds. Keep counters and balances in rows.
+- The Zig client has `commit_wide`, `lookup_records`, `get_record_changes` and
+  `get_record_history`.
+
+### New: declared indexes
+
+An index lists a record table's records by up to three `eq` fields, then an `order` field (or
+the op of the last write), optionally only those matching `where`. Nerva keeps it exact in every
+commit; scan one `eq` key a page at a time, ascending or descending, between bounds. Records
+that tie on order list in the order they were first written, the same after an export and
+import. (P123c)
+
+```bash
+curl -X PUT -H 'X-Nerva-Key: secret' http://127.0.0.1:8080/v1/indexes/by_agent -d '{"table":2147483649,
+  "eq":["agent"],"order":"created"}'
+curl -H 'X-Nerva-Key: secret' http://127.0.0.1:8080/v1/indexes/by_agent/scan -d '{"eq":{"agent":"…"},
+  "min":"1760000000","limit":100}'
+# {"index":"by_agent","op":"…","records":[{"id":"…","op":"…","order":"…","fields":{…}},…],"next":"…"}
+```
+
+- Declared over records that exist, an index builds in the background (`503` until it is ready).
+- Indexes read the latest state; read the past through `/v1/history` and `/v1/row?as_of`.
+- At most 64 indexes, 4 per table. `GET /v1/indexes` lists them.
+
+### New: views over records
+
+A maintained view may group and filter a record table's fields, with `count` and `sum`
+(`min` and `max` are refused). It is served by `nerva api`, not `nerva view`. (P123d)
+
+### Upgrading from v0.5.0
+
+1. **Give each replica about 0.5 GiB more memory, or a smaller grid cache.** At the default
+   settings, a replica took 2.5 GB resident at startup with v0.5.0, and takes 3.0 GB with
+   v0.6.0: the in-memory tables of the new trees (with `--development`, 1.33 and 1.83 GB). The
+   grid cache is 1 GiB by default; `nerva start --cache-grid=512MiB` brings v0.6.0 back to
+   2.5 GB, at the cost of more reads from disk. (#127)
+2. **Move rows out of tables `2147483648` to `4294901759` first.** v0.5.0 allowed rows there;
+   those tables now hold records. `nerva import` refuses an export with rows or views in them,
+   naming the table (#126): with v0.5.0, copy them to tables below `2147483648`, and export
+   again.
+3. **Export, then import every replica**, as for v0.5.0 (N80): with v0.5.0, `nerva export`; stop
+   every replica; with v0.6.0, `nerva import` once per replica from the same export; start the
+   replicas, then the gateways. v0.6.0 reads v0.5.0's exports (format version 1). Its own
+   exports are version 2 once the cluster holds a record or an index, and v0.5.0 cannot read
+   them: a downgrade is possible only before the first record or index.
+4. **Never run v0.5.0 and v0.6.0 replicas in one cluster.** They ignore each other (N61).
+5. v0.4.0 and v0.5.0 clients and gateways keep working against v0.6.0 replicas. They cannot
+   write records: `commit` refuses an entry in a record table (`table_invalid`).
+
+The adversarial release review found six issues, all fixed before this release:
+[#124](https://github.com/Botpike/nerva-ledger/issues/124),
+[#125](https://github.com/Botpike/nerva-ledger/issues/125),
+[#126](https://github.com/Botpike/nerva-ledger/issues/126),
+[#127](https://github.com/Botpike/nerva-ledger/issues/127),
+[#128](https://github.com/Botpike/nerva-ledger/issues/128),
+[#129](https://github.com/Botpike/nerva-ledger/issues/129).
+
 ## v0.5.0 — 2026-10-07
 
 Replicas now prove to each other that they hold a cluster key, and refuse replicas imported

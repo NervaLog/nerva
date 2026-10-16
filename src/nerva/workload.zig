@@ -15,6 +15,18 @@
 //! all fail. The checker asserts, independently of the row model, that the ledger's total stays
 //! what it was at its declaration (zero), and that no floored field goes below its floor.
 //!
+//! And commit keys (P123): some transactions start with a key, and some are sent again, as
+//! sent or with other entries. The model keeps each committed key's entries, so a resend must
+//! report `committed_before` at the op its transaction committed at, and apply nothing.
+//!
+//! And records and indexes (P123b, P123c): transactions of records (128-bit ids, 448-byte
+//! values) read, put and delete a small set of records; others move money by ledger pairs and
+//! write a new fact record in the same transaction, which must commit exactly when the money
+//! moves. Four indexes are declared at random times, so pulses build them over records already
+//! written. Lookups, the records' feed and histories, and every index scan (pages, cursors, both
+//! directions, as the index orders ties) and index count are checked against a model of the
+//! records.
+//!
 //! The simulator delivers replies in op order, so the workload checks each reply against an
 //! in-memory model of the committed state at that op: every status, version, value and change
 //! must match exactly. This checks strict serializability of commits and the change feed.
@@ -46,6 +58,9 @@ const ViewRecord = nerva.ViewRecord;
 const DeclareResult = nerva.DeclareResult;
 const views = @import("views.zig");
 const ledgers = @import("ledgers.zig");
+const indexes = @import("indexes.zig");
+const WideEntry = nerva.WideEntry;
+const record_value_size = nerva.record_value_size;
 
 /// The table holding receipts. Random transactions never touch it.
 pub const receipts_table: u32 = 100;
@@ -211,11 +226,20 @@ fn timestamp_invalid(prng: *stdx.PRNG) u64 {
 fn entry_status_check(entry: *const Entry, status: ?EntryStatus) void {
     var broken = std.EnumSet(EntryStatus).initEmpty();
     const kind_known = switch (entry.kind) {
-        .read, .put, .delete, .add => true,
+        .read, .put, .delete, .add, .key => true,
         _ => false,
     };
     if (!kind_known) broken.insert(.kind_invalid);
-    if (entry.table == 0) broken.insert(.table_invalid);
+    if (entry.kind == .key) {
+        // A key names no row: the state machine derives its row from the key.
+        if (entry.table != 0 or entry.id != 0 or entry.op_seen != 0 or
+            !stdx.zeroed(entry.value[16..]) or stdx.zeroed(entry.value[0..16]))
+        {
+            broken.insert(.key_invalid);
+        }
+    } else if (entry.table == 0 or entry.table == nerva.table_commit_keys) {
+        broken.insert(.table_invalid);
+    }
     if (!stdx.zeroed(&entry.reserved_a) or entry.reserved_b != 0 or
         !stdx.zeroed(&entry.reserved_c))
     {
@@ -264,6 +288,91 @@ fn receipt_claim_is(entries: []const Entry) bool {
         entries[0].id == entries[1].id;
 }
 
+/// Records of the workload (P123b): a small set, read, put and deleted at random.
+pub const records_table: u32 = nerva.record_tables_min + 1;
+/// Facts: each written once by a ledger transaction (and sometimes rewritten or deleted).
+pub const facts_table: u32 = nerva.record_tables_min + 2;
+
+/// The `n`th record's id: all 128 bits in use.
+fn record_id(n: u64) u128 {
+    return (@as(u128, n) + 1) *% 0x9E3779B97F4A7C15F39CC0605CEDC835;
+}
+
+fn fact_id(n: u64) u128 {
+    return @as(u128, 0xFAC7) << 112 | n;
+}
+
+const record_agents = 3;
+const record_created_max = 15;
+
+/// A record's value: a status (byte 0, 0 to 3), when it was created (bytes 8..16, a small
+/// number, so that indexes tie), an agent (bytes 16..32), then random bytes.
+fn record_value(prng: *stdx.PRNG) [record_value_size]u8 {
+    var value: [record_value_size]u8 = @splat(0);
+    value[0] = prng.int_inclusive(u8, 3);
+    std.mem.writeInt(u64, value[8..16], prng.int_inclusive(u64, record_created_max), .little);
+    value[16..32].* = @splat(0xA0 | prng.int_inclusive(u8, record_agents - 1));
+    prng.fill(value[32..][0..prng.int_inclusive(usize, record_value_size - 32)]);
+    return value;
+}
+
+const index_definitions = 4;
+
+/// The workload's indexes (P123c): by status and when created; reserved records (status 1) by
+/// op; by agent and when created; facts by agent, by op.
+fn index_definition(which: u8) nerva.IndexDefinition {
+    var definition = std.mem.zeroes(nerva.IndexDefinition);
+    const name: []const u8 = switch (which) {
+        0 => "by_status",
+        1 => "open",
+        2 => "by_agent",
+        3 => "facts",
+        else => unreachable,
+    };
+    @memcpy(definition.name[0..name.len], name);
+    definition.table = if (which == 3) facts_table else records_table;
+    switch (which) {
+        0, 2 => {
+            definition.eq_count = 1;
+            definition.eq[0] = if (which == 0)
+                nerva.FieldRef.at(0, 1, .unsigned)
+            else
+                nerva.FieldRef.at(16, 16, .bytes);
+            definition.flags.order = true;
+            definition.order = nerva.FieldRef.at(8, 8, .unsigned);
+        },
+        1 => {
+            definition.where_count = 1;
+            definition.where[0] = .{
+                .field = nerva.FieldRef.at(0, 1, .unsigned),
+                .comparison = .eq,
+                .value = std.mem.toBytes(std.mem.nativeToLittle(i128, 1)),
+            };
+        },
+        3 => {
+            definition.eq_count = 1;
+            definition.eq[0] = nerva.FieldRef.at(16, 16, .bytes);
+        },
+        else => unreachable,
+    }
+    return definition;
+}
+
+/// A row's wide entry as `commit` carries it.
+fn entry_narrow(wide: *const WideEntry) Entry {
+    assert(!nerva.table_is_record(wide.table));
+    assert(stdx.zeroed(&wide.reserved_b));
+    assert(stdx.zeroed(wide.value[value_size..]));
+    return .{
+        .id = @intCast(wide.id),
+        .table = wide.table,
+        .kind = wide.kind,
+        .reserved_a = wide.reserved_a,
+        .op_seen = wide.op_seen,
+        .value = wide.value[0..value_size].*,
+    };
+}
+
 pub fn WorkloadType(comptime StateMachine: type) type {
     return struct {
         const Workload = @This();
@@ -276,11 +385,40 @@ pub fn WorkloadType(comptime StateMachine: type) type {
             value: [value_size]u8,
         };
 
+        const RecordVersion = struct {
+            id: u128,
+            table: u32,
+            /// The op of the last write (a delete included); zero if never written.
+            op: u64,
+            exists: bool,
+            /// When the record was first written: it orders the record among equal positions
+            /// in an index.
+            timestamp: u64,
+            value: [record_value_size]u8,
+        };
+        const record_absent: RecordVersion = .{
+            .id = 0,
+            .table = 0,
+            .op = 0,
+            .exists = false,
+            .timestamp = 0,
+            .value = @splat(0),
+        };
+        const ModelIndex = struct {
+            id: u64,
+            declared_op: u64,
+            definition: nerva.IndexDefinition,
+            /// The first op a reply found the index ready at: ready as of every op since.
+            ready_op: ?u64,
+        };
+        const fact_ids_max = 256;
+
         const Request = struct { operation: Operation, size: usize };
         const Failure = struct { index: usize, status: EntryStatus, op: u64, value: u64 = 0 };
         /// An add's expected result.
         const Expected = struct { applied: i64 = 0, value: u64 = 0 };
         const transaction_entries_max = 64;
+        const keyed_sent_max = 16;
 
         /// Per hot budget, from the adds' results alone: what was funded, and where it is.
         const Budget = struct { funded: u64 = 0, available: u64 = 0, held: u64 = 0 };
@@ -353,6 +491,41 @@ pub fn WorkloadType(comptime StateMachine: type) type {
         ledger_reads: u64 = 0,
         adds_applied: u64 = 0,
         adds_clamped: u64 = 0,
+        /// Commit keys (P123): each committed key's entries after its key entry, to tell a resend
+        /// (`committed_before`) from other entries under the key (`key_reused`).
+        committed_keys: std.AutoHashMapUnmanaged(u128, []const Entry) = .{},
+        /// Transactions sent under a key, to send again; at most `keyed_sent_max`.
+        keyed_sent: std.ArrayListUnmanaged([]const Entry) = .{},
+        keyed_committed: u64 = 0,
+        keyed_resent: u64 = 0,
+        key_refused: std.EnumArray(EntryStatus, u64) = .initFill(0),
+        /// Records (P123b), by `record_key`, as of the last reply checked; their feed.
+        records: std.AutoHashMapUnmanaged(u128, RecordVersion) = .{},
+        record_changes: std.ArrayListUnmanaged(nerva.RecordChange) = .{},
+        /// Indexes declared (P123c), in id order.
+        model_indexes: std.ArrayListUnmanaged(ModelIndex) = .{},
+        /// Facts committed, to read and rewrite; at most `fact_ids_max`.
+        fact_ids: std.ArrayListUnmanaged(u128) = .{},
+        facts_sent: u64 = 0,
+        facts_committed: u64 = 0,
+        facts_failed: u64 = 0,
+        record_transactions_committed: u64 = 0,
+        records_refused: std.EnumArray(EntryStatus, u64) = .initFill(0),
+        record_reads: u64 = 0,
+        record_changes_returned: u64 = 0,
+        record_history_returned: u64 = 0,
+        record_changes_cursor: ?u64 = null,
+        record_history_cursor: ?struct { table: u32, id: u128, timestamp_max: u64 } = null,
+        index_declared: std.EnumArray(nerva.DeclareIndexStatus, u64) = .initFill(0),
+        index_scans_ready: u64 = 0,
+        index_scans_building: u64 = 0,
+        index_records_checked: u64 = 0,
+        index_counts_checked: u64 = 0,
+        scans_continued: u64 = 0,
+        /// The query for the page after the last incomplete scan.
+        scan_cursor: ?nerva.IndexQuery = null,
+        /// Scratch: a facts request's ledger pairs as `commit` would carry them.
+        narrow_body: []align(constants.cache_line_size) u8,
         /// Scratch: the expected results of the transaction being checked (any size, up to a full
         /// batch).
         expected: []Expected,
@@ -386,6 +559,8 @@ pub fn WorkloadType(comptime StateMachine: type) type {
             budget_count: u64,
             /// Accounts of the ledger (N75).
             ledger_account_count: u64,
+            /// Records are drawn from this many ids (P123b).
+            record_id_count: u64,
 
             pub fn generate(prng: *stdx.PRNG, options: struct {
                 batch_size_limit: u32,
@@ -404,6 +579,7 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                     .receipt_count = prng.range_inclusive(u64, 1, 4),
                     .budget_count = prng.range_inclusive(u64, 1, 3),
                     .ledger_account_count = prng.range_inclusive(u64, 2, 5),
+                    .record_id_count = prng.range_inclusive(u64, 1, 48),
                 };
             }
         };
@@ -439,12 +615,20 @@ pub fn WorkloadType(comptime StateMachine: type) type {
             assert(options.ledger_account_count >= 2);
             assert(options.entries_per_transaction_max <= transaction_entries_max);
             assert(options.table_count < receipts_table);
+            assert(options.record_id_count > 0);
             const expected = try allocator.alloc(Expected, StateMachine.commit_entries_max);
             errdefer allocator.free(expected);
+            const narrow_body = try allocator.alignedAlloc(
+                u8,
+                constants.cache_line_size,
+                constants.message_body_size_max,
+            );
+            errdefer allocator.free(narrow_body);
             return .{
                 .allocator = allocator,
                 .prng = prng,
                 .options = options,
+                .narrow_body = narrow_body,
                 .expected = expected,
             };
         }
@@ -503,6 +687,48 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                 workload.ledger_refused.get(.row_absent),
                 workload.ledger_reads,
             });
+            log.info("commit keys committed={} resent={} committed_before={} key_reused={} " ++
+                "key_misplaced={} key_invalid={}", .{
+                workload.keyed_committed,
+                workload.keyed_resent,
+                workload.key_refused.get(.committed_before),
+                workload.key_refused.get(.key_reused),
+                workload.key_refused.get(.key_misplaced),
+                workload.key_refused.get(.key_invalid),
+            });
+            log.info("records committed={} refused conflict={} write_duplicate={} " ++
+                "invalid={} reads={} changes={} history={}", .{
+                workload.record_transactions_committed,
+                workload.records_refused.get(.conflict),
+                workload.records_refused.get(.write_duplicate),
+                workload.invalid_entries,
+                workload.record_reads,
+                workload.record_changes_returned,
+                workload.record_history_returned,
+            });
+            log.info("facts committed={} failed={} indexes created={} exists={} different={} " ++
+                "scans ready={} building={} records checked={} counts checked={} continued={}", .{
+                workload.facts_committed,
+                workload.facts_failed,
+                workload.index_declared.get(.created),
+                workload.index_declared.get(.exists),
+                workload.index_declared.get(.different),
+                workload.index_scans_ready,
+                workload.index_scans_building,
+                workload.index_records_checked,
+                workload.index_counts_checked,
+                workload.scans_continued,
+            });
+            workload.records.deinit(allocator);
+            workload.record_changes.deinit(allocator);
+            workload.model_indexes.deinit(allocator);
+            workload.fact_ids.deinit(allocator);
+            allocator.free(workload.narrow_body);
+            var committed_keys = workload.committed_keys.valueIterator();
+            while (committed_keys.next()) |entries| allocator.free(entries.*);
+            workload.committed_keys.deinit(allocator);
+            for (workload.keyed_sent.items) |entries| allocator.free(entries);
+            workload.keyed_sent.deinit(allocator);
             workload.model_ledgers.deinit(allocator);
             workload.ledger_values.deinit(allocator);
             allocator.free(workload.expected);
@@ -534,6 +760,14 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                 .declare_view = 1,
                 .get_view = 6,
                 .ledger = 4,
+                .records = 5,
+                .facts = 2,
+                .lookup_records = 2,
+                .get_record_changes = 1,
+                .get_record_history = 1,
+                .declare_index = 1,
+                .scan_index = 4,
+                .get_index = 1,
             })) {
                 .commit => .{ .operation = .commit, .size = workload.build_commit(body_limited) },
                 .claim => .{
@@ -565,6 +799,42 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                     .size = workload.build_get_view(body),
                 },
                 .ledger => workload.build_ledger(body_limited),
+                .records => .{
+                    .operation = .commit_wide,
+                    .size = workload.build_records(body_limited),
+                },
+                // Facts move money: once the ledger is declared.
+                .facts => .{
+                    .operation = .commit_wide,
+                    .size = if (workload.ledger_declared)
+                        workload.build_facts(body_limited)
+                    else
+                        workload.build_records(body_limited),
+                },
+                .lookup_records => .{
+                    .operation = .lookup_records,
+                    .size = workload.build_lookup_records(body_limited),
+                },
+                .get_record_changes => .{
+                    .operation = .get_record_changes,
+                    .size = workload.build_get_record_changes(body),
+                },
+                .get_record_history => .{
+                    .operation = .get_record_history,
+                    .size = workload.build_get_record_history(body),
+                },
+                .declare_index => .{
+                    .operation = .declare_index,
+                    .size = workload.build_declare_index(body),
+                },
+                .scan_index => .{
+                    .operation = .scan_index,
+                    .size = workload.build_scan_index(body),
+                },
+                .get_index => .{
+                    .operation = .get_index,
+                    .size = workload.build_get_index(body),
+                },
             };
         }
 
@@ -646,6 +916,10 @@ pub fn WorkloadType(comptime StateMachine: type) type {
             for (0..batch_count) |_| {
                 const writable = encoder.writable() orelse break;
                 const entries_free = stdx.bytes_as_slice(.inexact, Entry, writable);
+                if (workload.build_resend(entries_free)) |count| {
+                    encoder.add(@intCast(count * @sizeOf(Entry)));
+                    continue;
+                }
                 // Rarely, one transaction as large as the request allows (N49): prefetch and the
                 // state machine's scratch space at capacity.
                 const full = workload.prng.chance(stdx.PRNG.ratio(1, 100));
@@ -654,11 +928,51 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                     @min(entries_free.len, workload.options.entries_per_transaction_max),
                 )];
                 if (full) workload.full_batches += 1;
-                workload.build_transaction(entries);
+                if (entries.len > 0 and workload.prng.chance(stdx.PRNG.ratio(1, 6))) {
+                    entries[0] = nerva.commit_key_entry(workload.prng.range_inclusive(
+                        u128,
+                        1,
+                        std.math.maxInt(u128),
+                    ));
+                    workload.build_transaction(entries[1..]);
+                    workload.keyed_remember(entries);
+                } else {
+                    workload.build_transaction(entries);
+                }
                 encoder.add(@intCast(entries.len * @sizeOf(Entry)));
                 if (full) break;
             }
             return encoder.finish();
+        }
+
+        /// Sometimes, a transaction sent under a key before, into `entries_free`: as it was sent
+        /// (a resend after a lost reply), or with other entries under the same key. Returns its
+        /// entry count.
+        fn build_resend(workload: *Workload, entries_free: []Entry) ?usize {
+            const prng = workload.prng;
+            const sent_all = workload.keyed_sent.items;
+            if (sent_all.len == 0 or !prng.chance(stdx.PRNG.ratio(1, 10))) return null;
+            const sent = sent_all[prng.index(sent_all)];
+            if (sent.len > entries_free.len) return null;
+            const entries = entries_free[0..sent.len];
+            stdx.copy_disjoint(.exact, Entry, entries, sent);
+            if (prng.chance(stdx.PRNG.ratio(1, 4))) workload.build_transaction(entries[1..]);
+            workload.keyed_resent += 1;
+            return entries.len;
+        }
+
+        /// Keeps a copy of a transaction sent under a key, to send again.
+        fn keyed_remember(workload: *Workload, entries: []const Entry) void {
+            assert(entries[0].kind == .key);
+            if (entries.len > transaction_entries_max) return;
+            const copy = workload.allocator.dupe(Entry, entries) catch @panic("OOM");
+            if (workload.keyed_sent.items.len < keyed_sent_max) {
+                workload.keyed_sent.append(workload.allocator, copy) catch @panic("OOM");
+            } else {
+                const slot = &workload.keyed_sent.items[workload.prng.index(workload.keyed_sent.items)];
+                workload.allocator.free(slot.*);
+                slot.* = copy;
+            }
         }
 
         /// One claim per batch, against what this client last knew of the receipt. Claims from
@@ -775,6 +1089,7 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                         .value = 1,
                         .kind = 1,
                         .kind_zero = 1,
+                        .kind_key = 1,
                         .op_seen = 1,
                     })) {
                         .table => entry.table = 0,
@@ -782,8 +1097,10 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                         .reserved_b => entry.reserved_b = 1,
                         .reserved_c => entry.reserved_c[prng.index(&entry.reserved_c)] = 1,
                         .value => entry.value[prng.index(&entry.value)] = 1,
-                        .kind => entry.kind = @enumFromInt(prng.range_inclusive(u8, 5, 255)),
+                        .kind => entry.kind = @enumFromInt(prng.range_inclusive(u8, 6, 255)),
                         .kind_zero => entry.kind = @enumFromInt(0),
+                        // Misplaced, or invalid as a key.
+                        .kind_key => entry.kind = .key,
                         // Valid for a read (a version, maybe stale); invalid for any write.
                         .op_seen => entry.op_seen = prng.range_inclusive(u64, 1, 1 << 40),
                     }
@@ -1061,6 +1378,13 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                 .pulse => unreachable, // Sent by the replica, reported to `on_pulse`.
                 .declare_ledger => workload.check_declare_ledger(op, request_body, reply_body),
                 .get_ledger => workload.check_get_ledger(request_body, reply_body),
+                .commit_wide => workload.check_commit_wide(op, timestamp, request_body, reply_body),
+                .lookup_records => workload.check_lookup_records(op, request_body, reply_body),
+                .get_record_changes => workload.check_get_record_changes(op, request_body, reply_body),
+                .get_record_history => workload.check_get_record_history(op, request_body, reply_body),
+                .declare_index => workload.check_declare_index(op, request_body, reply_body),
+                .scan_index => workload.check_scan_index(op, request_body, reply_body),
+                .get_index => workload.check_get_index(op, request_body, reply_body),
             }
         }
 
@@ -1109,6 +1433,7 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                     assert(!budget);
                     workload.transactions_failed += 1;
                     if (ledger) workload.ledger_refused.getPtr(failure.status).* += 1;
+                    workload.key_refused.getPtr(failure.status).* += 1;
                     if (claim) {
                         // Claims are always well-formed: they lose only to another claim.
                         assert(failure.status == .conflict);
@@ -1150,7 +1475,12 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                 for (entries, results, 0..) |*entry, *result, index| {
                     const entry_timestamp =
                         batch_timestamp - entries.len * block + index * block + 1;
-                    workload.apply(op, entry_timestamp, entry, result);
+                    if (entry.kind == .key) {
+                        assert(index == 0);
+                        workload.apply_key(op, entry_timestamp, entries);
+                    } else {
+                        workload.apply(op, entry_timestamp, entry, result);
+                    }
                 }
             }
             assert(reply.pop() == null);
@@ -1648,7 +1978,9 @@ pub fn WorkloadType(comptime StateMachine: type) type {
             admission: views.Admission,
         ) ?Failure {
             assert(entries.len <= workload.expected.len);
-            // Admission comes first (`views_admit`).
+            // A key already committed comes first, whatever else changed since.
+            if (workload.key_failure(entries)) |failure| return failure;
+            // Then admission (`views_admit`).
             if (admission != .fits) {
                 if (admission == .too_large) workload.views_too_large += 1;
                 workload.views_busy += 1;
@@ -1662,6 +1994,9 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                 };
             }
             for (entries, 0..) |*entry, index| {
+                if (entry.kind == .key and index > 0) {
+                    return .{ .index = index, .status = .key_misplaced, .op = 0 };
+                }
                 const status = nerva.entry_validate(entry);
                 entry_status_check(entry, status);
                 if (status) |status_| {
@@ -1693,9 +2028,10 @@ pub fn WorkloadType(comptime StateMachine: type) type {
             }
             // The earliest write whose row an earlier write already wrote (adds may share one).
             for (entries, 0..) |*entry, index| {
-                if (entry.kind == .read) continue;
+                if (entry.kind == .read or entry.kind == .key) continue;
                 for (entries[0..index]) |*previous| {
-                    if (previous.kind != .read and previous.table == entry.table and
+                    if (previous.kind != .read and previous.kind != .key and
+                        previous.table == entry.table and
                         previous.id == entry.id and
                         !(previous.kind == .add and entry.kind == .add))
                     {
@@ -1757,6 +2093,63 @@ pub fn WorkloadType(comptime StateMachine: type) type {
             return null;
         }
 
+        /// The model's key row for a transaction that starts with a key (valid or not).
+        fn key_row(entries: []const Entry) ?u128 {
+            if (entries.len == 0 or entries[0].kind != .key) return null;
+            const key = std.mem.readInt(u128, entries[0].value[0..16], .little);
+            return nerva.row_key(nerva.table_commit_keys, nerva.commit_key_id(key));
+        }
+
+        /// Why a transaction under a valid key whose row exists commits nothing: its own entries
+        /// again (`committed_before`), other entries (`key_reused`), or the row of another key
+        /// (`key_collision`), at the op that wrote the row.
+        fn key_failure(workload: *Workload, entries: []const Entry) ?Failure {
+            const row = key_row(entries) orelse return null;
+            if (nerva.entry_validate(&entries[0]) != null) return null;
+            const version = workload.row_version(row);
+            if (!version.exists) return null;
+            const key = std.mem.readInt(u128, entries[0].value[0..16], .little);
+            const committed = workload.committed_keys.get(key) orelse
+                return .{ .index = 0, .status = .key_collision, .op = version.op };
+            const same = committed.len == entries.len - 1 and
+                std.mem.eql(u8, std.mem.sliceAsBytes(committed), std.mem.sliceAsBytes(entries[1..]));
+            return .{
+                .index = 0,
+                .status = if (same) .committed_before else .key_reused,
+                .op = version.op,
+            };
+        }
+
+        /// A transaction committed under a key: its key's row, and the entries it committed.
+        fn apply_key(workload: *Workload, op: u64, timestamp: u64, entries: []const Entry) void {
+            const key = std.mem.readInt(u128, entries[0].value[0..16], .little);
+            assert(!workload.row_version(key_row(entries).?).exists);
+            // The state machine checksums the entries as `commit_wide` would carry them.
+            const wide = workload.allocator.alloc(nerva.WideEntry, entries.len - 1) catch
+                @panic("OOM");
+            defer workload.allocator.free(wide);
+            for (entries[1..], wide) |*entry, *entry_wide| {
+                entry_wide.* = nerva.WideEntry.from_entry(entry);
+            }
+            const stored: nerva.CommitKey = .{
+                .key = key,
+                .checksum = vsr.checksum(std.mem.sliceAsBytes(wide)),
+                .entry_count = @intCast(entries.len - 1),
+            };
+            const entry: Entry = .{
+                .id = nerva.commit_key_id(key),
+                .table = nerva.table_commit_keys,
+                .kind = .put,
+                .op_seen = 0,
+                .value = std.mem.toBytes(stored),
+            };
+            workload.apply(op, timestamp, &entry, &.{ .status = .ok, .op = op });
+            const copy = workload.allocator.dupe(Entry, entries[1..]) catch @panic("OOM");
+            workload.committed_keys.putNoClobber(workload.allocator, key, copy) catch
+                @panic("OOM");
+            workload.keyed_committed += 1;
+        }
+
         /// The row as the adds `entries[..=last]` to its row left it (`expected` filled in for
         /// them), starting from the model.
         fn add_row(workload: *Workload, entries: []const Entry, last: usize) [value_size]u8 {
@@ -1787,6 +2180,7 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                     if (!workload.row_version(key).exists) return; // No-op.
                     break :kind .delete;
                 },
+                .key => unreachable, // A key's row is `apply_key`'s.
                 _ => unreachable,
             };
             const value: [value_size]u8 = switch (entry.kind) {
@@ -1843,6 +2237,13 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                 const entries = stdx.bytes_as_slice(.exact, Entry, batch);
                 workload.view_txn_keys.clearRetainingCapacity();
                 workload.view_txn_members.clearRetainingCapacity();
+                // One whose key's row exists writes nothing (`key_failure`).
+                if (key_row(entries)) |row| {
+                    if (workload.row_version(row).exists) {
+                        workload.view_txn_admission.append(allocator, .fits) catch @panic("OOM");
+                        continue;
+                    }
+                }
                 const admission: views.Admission = admit: for (entries) |*entry| {
                     if (!workload.entry_viewed(entry)) continue;
                     const version = workload.row_version(nerva.row_key(entry.table, entry.id));
@@ -1850,7 +2251,7 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                     for (workload.model_views.items) |*view| {
                         if (view.definition.table != entry.table) continue;
                         var matched = false;
-                        for (views.entry_values(entry, value_old)) |candidate| {
+                        for (views.entry_values([value_size]u8, entry, value_old)) |candidate| {
                             const value = candidate orelse continue;
                             if (!views.row_matches(&view.definition, &value)) continue;
                             matched = true;
@@ -2280,6 +2681,940 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                 assert(end.op == op_executed);
                 assert(end.timestamp == 0);
                 workload.op_max = end.op;
+            }
+        }
+
+        // ---- Records and indexes (P123b, P123c) ----
+
+        /// Records-only transactions over the records table (and sometimes a fact), one per
+        /// batch: reads at the version seen (or stale, or ahead), puts and deletes; rarely
+        /// invalid entries.
+        fn build_records(workload: *Workload, body: []align(constants.cache_line_size) u8) usize {
+            var encoder = MultiBatchEncoder.init(body, .{ .element_size = @sizeOf(WideEntry) });
+            const batch_count = workload.prng.range_inclusive(
+                u32,
+                1,
+                workload.options.multi_batch_per_request_limit,
+            );
+            for (0..batch_count) |_| {
+                const writable = encoder.writable() orelse break;
+                const entries_free = stdx.bytes_as_slice(.inexact, WideEntry, writable);
+                const entries = entries_free[0..workload.prng.int_inclusive(
+                    usize,
+                    @min(entries_free.len, workload.options.entries_per_transaction_max),
+                )];
+                workload.build_record_transaction(entries);
+                encoder.add(@intCast(entries.len * @sizeOf(WideEntry)));
+            }
+            return encoder.finish();
+        }
+
+        fn build_record_transaction(workload: *Workload, entries: []WideEntry) void {
+            const prng = workload.prng;
+            for (entries, 0..) |*entry, index| {
+                const fact = workload.fact_ids.items.len > 0 and prng.chance(stdx.PRNG.ratio(1, 8));
+                const table = if (fact) facts_table else records_table;
+                const id = if (fact)
+                    workload.fact_ids.items[prng.index(workload.fact_ids.items)]
+                else
+                    record_id(prng.int_inclusive(u64, workload.options.record_id_count - 1));
+                const kind: nerva.EntryKind = switch (prng.chances(.{
+                    .read = 4,
+                    .put = 4,
+                    .delete = 2,
+                })) {
+                    .read => .read,
+                    .put => .put,
+                    .delete => .delete,
+                };
+                const duplicate = kind != .read and for (entries[0..index]) |*previous| {
+                    if (previous.kind != .read and previous.table == table and previous.id == id) {
+                        break true;
+                    }
+                } else false;
+                // Keep duplicate writes rare: they abort the whole transaction.
+                entry.* = if (kind == .read or (duplicate and !prng.chance(stdx.PRNG.ratio(1, 50))))
+                    workload.record_read(table, id)
+                else
+                    .{
+                        .id = id,
+                        .table = table,
+                        .kind = kind,
+                        .op_seen = 0,
+                        .value = if (kind == .put) record_value(prng) else @splat(0),
+                    };
+
+                if (prng.chance(workload.options.invalid_entry_probability)) {
+                    workload.invalid_entries += 1;
+                    switch (prng.chances(.{
+                        .table = 1,
+                        .reserved_a = 1,
+                        .reserved_b = 1,
+                        .value = 1,
+                        .kind = 1,
+                        .add = 1,
+                        .key = 1,
+                        .op_seen = 1,
+                    })) {
+                        .table => entry.table = 0,
+                        .reserved_a => entry.reserved_a[prng.index(&entry.reserved_a)] = 1,
+                        .reserved_b => entry.reserved_b[prng.index(&entry.reserved_b)] = 1,
+                        // Invalid for a read or a delete; a put's value is any bytes.
+                        .value => entry.value[prng.index(&entry.value)] = 1,
+                        .kind => entry.kind = @enumFromInt(prng.range_inclusive(u8, 6, 255)),
+                        // Records take no adds (`field_invalid`).
+                        .add => entry.kind = .add,
+                        // Misplaced, or invalid as a key.
+                        .key => entry.kind = .key,
+                        .op_seen => entry.op_seen = prng.range_inclusive(u64, 1, 1 << 40),
+                    }
+                }
+            }
+        }
+
+        fn record_read(workload: *Workload, table: u32, id: u128) WideEntry {
+            const prng = workload.prng;
+            const version = workload.record_version(nerva.record_key(table, id));
+            const op_seen = if (prng.chance(workload.options.stale_read_probability))
+                switch (prng.chances(.{ .stale = 4, .future = 1 })) {
+                    .stale => prng.int_inclusive(u64, workload.op_max),
+                    .future => future: {
+                        workload.future_reads += 1;
+                        break :future workload.op_max + prng.range_inclusive(u64, 1, 100);
+                    },
+                }
+            else
+                version.op;
+            return .{ .id = id, .table = table, .kind = .read, .op_seen = op_seen, .value = @splat(0) };
+        }
+
+        /// Money with its fact (the first application's case, G1): one transaction per batch of
+        /// ledger pairs (which may fail, `out_of_bounds`), then the put of a new record of the
+        /// facts table. The fact commits exactly when the money moves.
+        fn build_facts(workload: *Workload, body: []align(constants.cache_line_size) u8) usize {
+            var encoder = MultiBatchEncoder.init(body, .{ .element_size = @sizeOf(WideEntry) });
+            const batch_count = workload.prng.range_inclusive(
+                u32,
+                1,
+                workload.options.multi_batch_per_request_limit,
+            );
+            for (0..batch_count) |_| {
+                const writable = encoder.writable() orelse break;
+                const entries_free = stdx.bytes_as_slice(.inexact, WideEntry, writable);
+                if (entries_free.len < 3) {
+                    encoder.add(0);
+                    break;
+                }
+                var moves: [6]Entry = undefined;
+                const count = workload.build_ledger_moves(moves[0..@min(6, entries_free.len - 1)]);
+                assert(count >= 2);
+                for (moves[0..count], entries_free[0..count]) |*entry, *wide| {
+                    wide.* = WideEntry.from_entry(entry);
+                }
+                entries_free[count] = .{
+                    .id = fact_id(workload.facts_sent),
+                    .table = facts_table,
+                    .kind = .put,
+                    .op_seen = 0,
+                    .value = record_value(workload.prng),
+                };
+                workload.facts_sent += 1;
+                encoder.add(@intCast((count + 1) * @sizeOf(WideEntry)));
+            }
+            return encoder.finish();
+        }
+
+        /// A `commit_wide` request is facts (ledger pairs then a fact) when it writes a row.
+        fn wide_request_facts(request_body: []align(constants.cache_line_size) const u8) bool {
+            var request = MultiBatchDecoder.init(request_body, .{
+                .element_size = @sizeOf(WideEntry),
+            }) catch unreachable;
+            while (request.pop()) |batch| {
+                for (stdx.bytes_as_slice(.exact, WideEntry, batch)) |*entry| {
+                    if (entry.table == ledger_accounts_table or entry.table == ledger_sources_table) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+
+        fn check_commit_wide(
+            workload: *Workload,
+            op_executed: u64,
+            timestamp: u64,
+            request_body: []align(constants.cache_line_size) const u8,
+            reply_body: []align(constants.cache_line_size) const u8,
+        ) void {
+            const facts = wide_request_facts(request_body);
+            var request = MultiBatchDecoder.init(request_body, .{
+                .element_size = @sizeOf(WideEntry),
+            }) catch unreachable;
+            var reply = MultiBatchDecoder.init(reply_body, .{
+                .element_size = @sizeOf(EntryResult),
+            }) catch unreachable;
+            assert(request.batch_count() == reply.batch_count());
+            // Facts: the ledger pairs' admission (N52), as `commit` would admit them.
+            if (facts) workload.views_admit(workload.facts_narrow(request_body));
+
+            var op_request: ?u64 = null;
+            var batch_index: usize = 0;
+            const block = StateMachine.entry_timestamps;
+            var batch_timestamp =
+                timestamp - @divExact(request.payload.len, @sizeOf(WideEntry)) * block;
+            while (request.pop()) |batch| : (batch_index += 1) {
+                const entries = stdx.bytes_as_slice(.exact, WideEntry, batch);
+                const results = stdx.bytes_as_slice(.exact, EntryResult, reply.pop().?);
+                assert(results.len == entries.len);
+                batch_timestamp += entries.len * block;
+                if (entries.len == 0) continue;
+
+                var narrow: [6]Entry = undefined;
+                const moves = narrow[0..if (facts) entries.len - 1 else 0];
+                if (facts) {
+                    assert(entries[entries.len - 1].table == facts_table);
+                    for (entries[0..moves.len], moves) |*wide, *entry| entry.* = entry_narrow(wide);
+                }
+                const failure = if (facts)
+                    workload.commit_failure(moves, workload.view_txn_admission.items[batch_index])
+                else
+                    workload.record_failure(entries);
+                if (failure) |f| {
+                    workload.transactions_failed += 1;
+                    if (facts) {
+                        workload.facts_failed += 1;
+                        workload.ledger_refused.getPtr(f.status).* += 1;
+                    } else {
+                        workload.records_refused.getPtr(f.status).* += 1;
+                    }
+                    for (results, 0..) |result, index| {
+                        if (index == f.index) {
+                            assert(result.status == f.status);
+                            assert(result.op == f.op);
+                            assert(result.value == f.value);
+                        } else {
+                            assert(result.status == .aborted);
+                            assert(result.op == 0);
+                            assert(result.value == 0);
+                        }
+                        assert(result.applied == 0);
+                    }
+                    continue;
+                }
+
+                workload.transactions_committed += 1;
+                const op = results[0].op;
+                assert(op == op_executed);
+                assert(op > workload.op_max);
+                if (op_request) |op_request_| assert(op == op_request_);
+                op_request = op;
+                for (results, 0..) |result, index| {
+                    assert(result.status == .ok);
+                    assert(result.op == op);
+                    const expected: Expected = if (index < moves.len) workload.expected[index] else .{};
+                    assert(result.applied == expected.applied);
+                    assert(result.value == expected.value);
+                }
+                if (facts) {
+                    workload.check_ledger(moves, results[0..moves.len]);
+                    workload.facts_committed += 1;
+                } else {
+                    workload.record_transactions_committed += 1;
+                }
+                for (entries, results, 0..) |*entry, *result, index| {
+                    const entry_timestamp =
+                        batch_timestamp - entries.len * block + index * block + 1;
+                    if (index < moves.len) {
+                        workload.apply(op, entry_timestamp, &moves[index], result);
+                    } else {
+                        workload.record_apply(op, entry_timestamp, entry);
+                    }
+                }
+            }
+            assert(reply.pop() == null);
+            assert(batch_timestamp == timestamp);
+            if (op_request) |op| workload.op_max = op;
+        }
+
+        /// The facts request's ledger pairs, as `commit` would carry them, for `views_admit`.
+        fn facts_narrow(
+            workload: *Workload,
+            request_body: []align(constants.cache_line_size) const u8,
+        ) []align(constants.cache_line_size) const u8 {
+            var request = MultiBatchDecoder.init(request_body, .{
+                .element_size = @sizeOf(WideEntry),
+            }) catch unreachable;
+            var encoder = MultiBatchEncoder.init(workload.narrow_body, .{
+                .element_size = @sizeOf(Entry),
+            });
+            while (request.pop()) |batch| {
+                const entries = stdx.bytes_as_slice(.exact, WideEntry, batch);
+                const writable = encoder.writable().?;
+                const count = if (entries.len == 0) 0 else entries.len - 1;
+                const narrow = stdx.bytes_as_slice(.inexact, Entry, writable)[0..count];
+                for (entries[0..count], narrow) |*wide, *entry| entry.* = entry_narrow(wide);
+                encoder.add(@intCast(count * @sizeOf(Entry)));
+            }
+            return workload.narrow_body[0..encoder.finish()];
+        }
+
+        /// Why a records-only transaction cannot commit, in the state machine's order: static
+        /// checks, duplicate writes, then stale reads (`commit_failure`, P123b). No key, add or
+        /// view applies to a record here.
+        fn record_failure(workload: *Workload, entries: []const WideEntry) ?Failure {
+            for (entries, 0..) |*entry, index| {
+                if (entry.kind == .key and index > 0) {
+                    return .{ .index = index, .status = .key_misplaced, .op = 0 };
+                }
+                if (nerva.wide_entry_validate(entry)) |status| {
+                    return .{ .index = index, .status = status, .op = 0 };
+                }
+                // A valid entry here is a record's read, put or delete.
+                assert(entry.kind != .key and entry.kind != .add);
+            }
+            for (entries, 0..) |*entry, index| {
+                if (entry.kind == .read) continue;
+                for (entries[0..index]) |*previous| {
+                    if (previous.kind != .read and previous.table == entry.table and
+                        previous.id == entry.id)
+                    {
+                        return .{ .index = index, .status = .write_duplicate, .op = 0 };
+                    }
+                }
+            }
+            for (entries, 0..) |*entry, index| {
+                if (entry.kind != .read) continue;
+                const version = workload.record_version(nerva.record_key(entry.table, entry.id));
+                if (version.op != entry.op_seen) {
+                    return .{ .index = index, .status = .conflict, .op = version.op };
+                }
+            }
+            @memset(workload.expected[0..entries.len], .{});
+            return null;
+        }
+
+        fn record_apply(workload: *Workload, op: u64, timestamp: u64, entry: *const WideEntry) void {
+            assert(nerva.table_is_record(entry.table));
+            const key = nerva.record_key(entry.table, entry.id);
+            const stored = workload.records.get(key);
+            const kind: nerva.ChangeKind = switch (entry.kind) {
+                .read => return,
+                .put => .put,
+                // Deleting an absent or deleted record is a no-op.
+                .delete => if (stored != null and stored.?.exists) .delete else return,
+                else => unreachable,
+            };
+            const value: [record_value_size]u8 = if (kind == .put) entry.value else @splat(0);
+            workload.records.put(workload.allocator, key, .{
+                .id = entry.id,
+                .table = entry.table,
+                .op = op,
+                .exists = kind == .put,
+                .value = value,
+                // Fixed when the record is first written, and kept by its tombstone.
+                .timestamp = if (stored) |record| record.timestamp else timestamp,
+            }) catch @panic("OOM");
+            const changes = workload.record_changes.items;
+            if (changes.len > 0) assert(changes[changes.len - 1].timestamp < timestamp);
+            workload.record_changes.append(workload.allocator, .{
+                .id = entry.id,
+                .table = entry.table,
+                .kind = kind,
+                .flags = .{},
+                .op = op,
+                .timestamp = timestamp,
+                .value = value,
+            }) catch @panic("OOM");
+            if (entry.table == facts_table and stored == null) {
+                if (workload.fact_ids.items.len < fact_ids_max) {
+                    workload.fact_ids.append(workload.allocator, entry.id) catch @panic("OOM");
+                } else {
+                    workload.fact_ids.items[workload.prng.index(workload.fact_ids.items)] = entry.id;
+                }
+            }
+        }
+
+        fn record_version(workload: *const Workload, key: u128) RecordVersion {
+            return workload.records.get(key) orelse record_absent;
+        }
+
+        /// A record's id for a read: one the workload writes, a fact, or one never written.
+        fn record_id_random(workload: *Workload) struct { table: u32, id: u128 } {
+            const prng = workload.prng;
+            return switch (prng.chances(.{ .record = 6, .fact = 2, .row_table = 1 })) {
+                .record => .{
+                    .table = records_table,
+                    .id = record_id(prng.int_inclusive(u64, workload.options.record_id_count)),
+                },
+                .fact => .{
+                    .table = facts_table,
+                    .id = if (workload.fact_ids.items.len == 0)
+                        fact_id(0)
+                    else
+                        workload.fact_ids.items[prng.index(workload.fact_ids.items)],
+                },
+                // Not a record table: must come back as nothing.
+                .row_table => .{ .table = 1, .id = record_id(0) },
+            };
+        }
+
+        fn build_lookup_records(
+            workload: *Workload,
+            body: []align(constants.cache_line_size) u8,
+        ) usize {
+            const prng = workload.prng;
+            var encoder = MultiBatchEncoder.init(body, .{ .element_size = @sizeOf(nerva.RecordKey) });
+            const batch_count = prng.range_inclusive(
+                u32,
+                1,
+                workload.options.multi_batch_per_request_limit,
+            );
+            // Each 32-byte key produces a 512-byte result: budget every batch against the reply.
+            var keys_total: usize = 0;
+            for (0..batch_count) |batch_index| {
+                const writable = encoder.writable() orelse break;
+                const keys_free = stdx.bytes_as_slice(.inexact, nerva.RecordKey, writable);
+                const reply_trailer_size = vsr.multi_batch.trailer_total_size(.{
+                    .element_size = @sizeOf(nerva.RecordValue),
+                    .batch_count = @intCast(batch_index + 1),
+                });
+                const reply_keys_free = @divFloor(
+                    constants.message_body_size_max - reply_trailer_size,
+                    @sizeOf(nerva.RecordValue),
+                ) -| keys_total;
+                const keys_max = @min(keys_free.len, reply_keys_free);
+                const keys = keys_free[0..prng.int_inclusive(usize, @min(keys_max, 8))];
+                keys_total += keys.len;
+                for (keys) |*key| {
+                    const random = workload.record_id_random();
+                    key.* = .{ .id = random.id, .table = random.table };
+                    // Reserved bytes set: not found.
+                    if (prng.chance(stdx.PRNG.ratio(1, 50))) key.reserved[prng.index(&key.reserved)] = 1;
+                }
+                encoder.add(@intCast(keys.len * @sizeOf(nerva.RecordKey)));
+            }
+            return encoder.finish();
+        }
+
+        fn check_lookup_records(
+            workload: *Workload,
+            op_executed: u64,
+            request_body: []align(constants.cache_line_size) const u8,
+            reply_body: []align(constants.cache_line_size) const u8,
+        ) void {
+            var request = MultiBatchDecoder.init(request_body, .{
+                .element_size = @sizeOf(nerva.RecordKey),
+            }) catch unreachable;
+            var reply = MultiBatchDecoder.init(reply_body, .{
+                .element_size = @sizeOf(nerva.RecordValue),
+            }) catch unreachable;
+            assert(op_executed > workload.op_max);
+            while (request.pop()) |batch| {
+                const keys = stdx.bytes_as_slice(.exact, nerva.RecordKey, batch);
+                const results = stdx.bytes_as_slice(.exact, nerva.RecordValue, reply.pop().?);
+                assert(results.len == keys.len);
+                for (keys, results) |*key, *result| {
+                    assert(result.id == key.id);
+                    assert(result.table == key.table);
+                    assert(result.op_read == op_executed);
+                    assert(stdx.zeroed(&result.reserved));
+                    assert(!result.flags.collision);
+                    const valid = nerva.table_is_record(key.table) and stdx.zeroed(&key.reserved);
+                    const expected = if (valid)
+                        workload.record_version(nerva.record_key(key.table, key.id))
+                    else
+                        record_absent;
+                    assert(result.op == expected.op);
+                    assert(result.flags.exists == expected.exists);
+                    assert(stdx.equal_bytes([record_value_size]u8, &result.value, &expected.value));
+                    workload.record_reads += 1;
+                }
+            }
+            assert(reply.pop() == null);
+            workload.op_max = op_executed;
+        }
+
+        fn build_get_record_changes(
+            workload: *Workload,
+            body: []align(constants.cache_line_size) u8,
+        ) usize {
+            const prng = workload.prng;
+            const changes = workload.record_changes.items;
+            const filter: *ChangesFilter = @alignCast(
+                std.mem.bytesAsValue(ChangesFilter, body[0..@sizeOf(ChangesFilter)]),
+            );
+            filter.* = .{
+                .timestamp_min = switch (prng.chances(.{
+                    .start = 1,
+                    .known = 3,
+                    .after = 1,
+                    .cursor = 2,
+                    .invalid = 1,
+                })) {
+                    .start => 0,
+                    .known => if (changes.len == 0) 0 else changes[prng.index(changes)].timestamp,
+                    .after => if (changes.len == 0) 0 else changes[changes.len - 1].timestamp + 1,
+                    .cursor => workload.record_changes_cursor orelse 0,
+                    .invalid => if (prng.chance(stdx.PRNG.ratio(1, 4))) timestamp_invalid(prng) else 0,
+                },
+                .limit = limit_random(prng, 16, StateMachine.record_changes_limit_max),
+            };
+            if (prng.chance(stdx.PRNG.ratio(1, 50))) {
+                filter.reserved[prng.index(&filter.reserved)] = 1;
+            }
+            return @sizeOf(ChangesFilter);
+        }
+
+        fn check_get_record_changes(
+            workload: *Workload,
+            op_executed: u64,
+            request_body: []align(constants.cache_line_size) const u8,
+            reply_body: []align(constants.cache_line_size) const u8,
+        ) void {
+            const filter: *const ChangesFilter = @alignCast(
+                std.mem.bytesAsValue(ChangesFilter, request_body[0..@sizeOf(ChangesFilter)]),
+            );
+            const results = stdx.bytes_as_slice(.exact, nerva.RecordChange, reply_body);
+            if (filter.limit == 0 or !stdx.zeroed(&filter.reserved) or
+                filter.timestamp_min > TimestampRange.timestamp_max)
+            {
+                assert(results.len == 0);
+                return;
+            }
+            const limit = @min(filter.limit, StateMachine.record_changes_limit_max);
+            const changes = workload.record_changes.items;
+            var start: usize = 0;
+            while (start < changes.len and changes[start].timestamp < filter.timestamp_min) {
+                start += 1;
+            }
+            const count = @min(limit, changes.len - start);
+            assert(results.len == count + 1);
+            for (results[0..count], changes[start..][0..count]) |*actual, *expected| {
+                assert(stdx.equal_bytes(nerva.RecordChange, actual, expected));
+            }
+            const end = results[count];
+            assert(end.kind == .end);
+            assert(end.id == 0 and end.table == 0);
+            assert(stdx.zeroed(&end.value));
+            assert(end.flags.more == (count == limit));
+            if (end.flags.more) {
+                assert(end.op == 0);
+                workload.record_changes_cursor = end.timestamp;
+            } else {
+                assert(end.op > workload.op_max);
+                assert(end.op == op_executed);
+                workload.op_max = end.op;
+            }
+            assert(end.timestamp == if (count == 0)
+                filter.timestamp_min
+            else
+                results[count - 1].timestamp + 1);
+            workload.record_changes_returned += count;
+        }
+
+        fn build_get_record_history(
+            workload: *Workload,
+            body: []align(constants.cache_line_size) u8,
+        ) usize {
+            const prng = workload.prng;
+            const changes = workload.record_changes.items;
+            const filter: *nerva.RecordHistoryFilter = @alignCast(std.mem.bytesAsValue(
+                nerva.RecordHistoryFilter,
+                body[0..@sizeOf(nerva.RecordHistoryFilter)],
+            ));
+            const random = workload.record_id_random();
+            const known: ?*const nerva.RecordChange =
+                if (changes.len == 0) null else &changes[prng.index(changes)];
+            filter.* = .{
+                .table = random.table,
+                .id = random.id,
+                .limit = limit_random(prng, 8, StateMachine.record_changes_limit_max),
+                .op_max = switch (prng.chances(.{ .latest = 2, .past = 4, .invalid = 1 })) {
+                    .latest => std.math.maxInt(u64),
+                    .past => prng.range_inclusive(u64, 1, @max(1, workload.op_max)),
+                    .invalid => 0,
+                },
+                .timestamp_max = switch (prng.chances(.{ .newest = 3, .known = 2, .invalid = 1 })) {
+                    .newest => 0,
+                    .known => if (known) |change| change.timestamp else 0,
+                    .invalid => if (prng.chance(stdx.PRNG.ratio(1, 4))) timestamp_invalid(prng) else 0,
+                },
+            };
+            if (known != null and prng.chance(stdx.PRNG.ratio(1, 2))) {
+                filter.table = known.?.table;
+                filter.id = known.?.id;
+            }
+            if (workload.record_history_cursor) |cursor| {
+                if (prng.chance(stdx.PRNG.ratio(1, 4))) {
+                    filter.table = cursor.table;
+                    filter.id = cursor.id;
+                    filter.timestamp_max = cursor.timestamp_max;
+                }
+            }
+            if (prng.chance(stdx.PRNG.ratio(1, 50))) {
+                filter.reserved[prng.index(&filter.reserved)] = 1;
+            }
+            return @sizeOf(nerva.RecordHistoryFilter);
+        }
+
+        /// As `check_get_history`, for a record (P123b).
+        fn check_get_record_history(
+            workload: *Workload,
+            op_executed: u64,
+            request_body: []align(constants.cache_line_size) const u8,
+            reply_body: []align(constants.cache_line_size) const u8,
+        ) void {
+            const filter: *const nerva.RecordHistoryFilter = @alignCast(std.mem.bytesAsValue(
+                nerva.RecordHistoryFilter,
+                request_body[0..@sizeOf(nerva.RecordHistoryFilter)],
+            ));
+            const results = stdx.bytes_as_slice(.exact, nerva.RecordChange, reply_body);
+            if (!nerva.table_is_record(filter.table) or filter.limit == 0 or filter.op_max == 0 or
+                !stdx.zeroed(&filter.reserved) or
+                filter.timestamp_max > TimestampRange.timestamp_max)
+            {
+                assert(results.len == 0);
+                return;
+            }
+            const limit = @min(filter.limit, StateMachine.record_changes_limit_max);
+            assert(results.len >= 1);
+
+            var scanned: u32 = 0;
+            var returned: usize = 0;
+            var timestamp_last: u64 = 0;
+            var index = workload.record_changes.items.len;
+            while (index > 0 and scanned < limit) {
+                index -= 1;
+                const expected = &workload.record_changes.items[index];
+                if (expected.table != filter.table or expected.id != filter.id) continue;
+                if (filter.timestamp_max != 0 and expected.timestamp > filter.timestamp_max) {
+                    continue;
+                }
+                scanned += 1;
+                timestamp_last = expected.timestamp;
+                if (expected.op > filter.op_max) continue;
+                assert(returned < results.len - 1);
+                assert(stdx.equal_bytes(nerva.RecordChange, &results[returned], expected));
+                returned += 1;
+            }
+            assert(results.len == returned + 1);
+            workload.record_history_returned += returned;
+
+            const end = results[returned];
+            assert(end.kind == .end);
+            assert(end.id == 0 and end.table == 0);
+            assert(stdx.zeroed(&end.value));
+            assert(end.flags.more == (scanned == limit));
+            if (end.flags.more) {
+                assert(end.op == 0);
+                assert(end.timestamp == timestamp_last - 1);
+                workload.record_history_cursor = .{
+                    .table = filter.table,
+                    .id = filter.id,
+                    .timestamp_max = end.timestamp,
+                };
+            } else {
+                assert(end.op > workload.op_max);
+                assert(end.op == op_executed);
+                assert(end.timestamp == 0);
+                workload.op_max = end.op;
+            }
+        }
+
+        /// One of the workload's indexes, or one under a declared name with another definition
+        /// (`different`), or one the state machine refuses.
+        fn build_declare_index(
+            workload: *Workload,
+            body: []align(constants.cache_line_size) u8,
+        ) usize {
+            const prng = workload.prng;
+            const definition: *nerva.IndexDefinition = @alignCast(std.mem.bytesAsValue(
+                nerva.IndexDefinition,
+                body[0..@sizeOf(nerva.IndexDefinition)],
+            ));
+            definition.* = index_definition(prng.int_inclusive(u8, index_definitions - 1));
+            switch (prng.chances(.{ .valid = 12, .different = 1, .row_table = 1, .name = 1 })) {
+                .valid => {},
+                .different => definition.where_count = 0,
+                .row_table => definition.table = 1,
+                .name => definition.name[0] = 'A',
+            }
+            if (definition.where_count == 0) definition.where = std.mem.zeroes(@TypeOf(definition.where));
+            return @sizeOf(nerva.IndexDefinition);
+        }
+
+        fn check_declare_index(
+            workload: *Workload,
+            op_executed: u64,
+            request_body: []align(constants.cache_line_size) const u8,
+            reply_body: []align(constants.cache_line_size) const u8,
+        ) void {
+            const definition = std.mem.bytesToValue(
+                nerva.IndexDefinition,
+                request_body[0..@sizeOf(nerva.IndexDefinition)],
+            );
+            const result = std.mem.bytesToValue(nerva.DeclareIndexResult, reply_body);
+            assert(reply_body.len == @sizeOf(nerva.DeclareIndexResult));
+            const expected: nerva.DeclareIndexResult = expected: {
+                if (indexes.definition_validate(&definition)) |status| {
+                    break :expected .{ .status = status, .index_id = 0, .op = 0 };
+                }
+                const name = indexes.definition_name(&definition);
+                for (workload.model_indexes.items) |*index| {
+                    if (!std.mem.eql(u8, indexes.definition_name(&index.definition), name)) continue;
+                    break :expected if (stdx.equal_bytes(nerva.IndexDefinition, &index.definition, &definition))
+                        .{ .status = .exists, .index_id = index.id, .op = index.declared_op }
+                    else
+                        .{ .status = .different, .index_id = 0, .op = 0 };
+                }
+                // At most `index_definitions` names: never full.
+                assert(workload.model_indexes.items.len < nerva.indexes_max);
+                const id = workload.model_indexes.items.len + 1;
+                workload.model_indexes.append(workload.allocator, .{
+                    .id = id,
+                    .declared_op = op_executed,
+                    .definition = definition,
+                    .ready_op = null,
+                }) catch @panic("OOM");
+                break :expected .{ .status = .created, .index_id = id, .op = op_executed };
+            };
+            assert(result.status == expected.status);
+            assert(result.index_id == expected.index_id);
+            assert(result.op == expected.op);
+            assert(op_executed > workload.op_max);
+            workload.op_max = op_executed;
+            workload.index_declared.getPtr(result.status).* += 1;
+        }
+
+        /// The index's state at `op`, from a reply: once ready, ready ever after.
+        fn index_state_seen(index: *ModelIndex, op: u64, state: nerva.IndexState) void {
+            if (index.ready_op != null) {
+                assert(state == .ready);
+            } else if (state == .ready) {
+                index.ready_op = op;
+            } else {
+                assert(state == .building);
+            }
+        }
+
+        fn build_get_index(workload: *Workload, body: []align(constants.cache_line_size) u8) usize {
+            const prng = workload.prng;
+            const query: *nerva.IndexGet = @alignCast(
+                std.mem.bytesAsValue(nerva.IndexGet, body[0..@sizeOf(nerva.IndexGet)]),
+            );
+            query.* = .{ .id = prng.int_inclusive(u64, workload.model_indexes.items.len + 1) };
+            if (prng.chance(stdx.PRNG.ratio(1, 20))) query.reserved[prng.index(&query.reserved)] = 1;
+            return @sizeOf(nerva.IndexGet);
+        }
+
+        fn check_get_index(
+            workload: *Workload,
+            op_executed: u64,
+            request_body: []align(constants.cache_line_size) const u8,
+            reply_body: []align(constants.cache_line_size) const u8,
+        ) void {
+            const query = std.mem.bytesToValue(nerva.IndexGet, request_body[0..@sizeOf(nerva.IndexGet)]);
+            const result = std.mem.bytesToValue(nerva.Index, reply_body);
+            assert(reply_body.len == @sizeOf(nerva.Index));
+            const indexes_ = workload.model_indexes.items;
+            if (!stdx.zeroed(&query.reserved) or query.id == 0 or query.id > indexes_.len) {
+                assert(stdx.zeroed(std.mem.asBytes(&result)));
+                return;
+            }
+            const index = &indexes_[query.id - 1];
+            assert(result.id == index.id);
+            assert(result.declared_op == index.declared_op);
+            assert(stdx.equal_bytes(nerva.IndexDefinition, &result.definition, &index.definition));
+            index_state_seen(index, op_executed, result.state);
+            if (result.state == .ready) {
+                // Every record that passes `where`, and no other.
+                var count: u64 = 0;
+                var records = workload.records.valueIterator();
+                while (records.next()) |record| {
+                    if (!record.exists or record.table != index.definition.table) continue;
+                    if (indexes.place(&index.definition, &record.value, record.op) != null) {
+                        count += 1;
+                    }
+                }
+                assert(result.entry_count == count);
+                workload.index_counts_checked += 1;
+            }
+        }
+
+        /// A page of one index: an `eq` key the index's records have (or might), an order
+        /// range, either direction; often the next page of the last incomplete one.
+        fn build_scan_index(workload: *Workload, body: []align(constants.cache_line_size) u8) usize {
+            const prng = workload.prng;
+            const query: *nerva.IndexQuery = @alignCast(
+                std.mem.bytesAsValue(nerva.IndexQuery, body[0..@sizeOf(nerva.IndexQuery)]),
+            );
+            if (workload.scan_cursor) |cursor| {
+                if (prng.chance(stdx.PRNG.ratio(3, 4))) {
+                    query.* = cursor;
+                    workload.scans_continued += 1;
+                    return @sizeOf(nerva.IndexQuery);
+                }
+            }
+            query.* = std.mem.zeroes(nerva.IndexQuery);
+            const indexes_ = workload.model_indexes.items;
+            query.index_id = prng.int_inclusive(u64, indexes_.len) + 1; // The last: missing.
+            const definition: ?*const nerva.IndexDefinition = if (query.index_id <= indexes_.len)
+                &indexes_[query.index_id - 1].definition
+            else
+                null;
+            if (definition) |known| {
+                // By name, sometimes.
+                if (prng.chance(stdx.PRNG.ratio(1, 8))) {
+                    query.index_id = 0;
+                    query.name = known.name;
+                }
+                var value = record_value(prng);
+                query.eq_key = views.fields_key(known.eq[0..known.eq_count], &value);
+                if (prng.chance(stdx.PRNG.ratio(1, 30))) {
+                    query.eq_key[nerva.group_key_size_max - 1] = 1; // No record has it.
+                }
+            }
+            query.order_max = std.math.maxInt(u64);
+            if (prng.chance(stdx.PRNG.ratio(1, 3))) {
+                const range_max: u64 = if (definition != null and definition.?.flags.order)
+                    record_created_max
+                else
+                    @max(1, workload.op_max);
+                query.order_min = prng.int_inclusive(u64, range_max);
+                query.order_max = query.order_min + prng.int_inclusive(u64, range_max);
+            }
+            // Mostly small pages, so that scans continue from their cursors (#129).
+            query.limit = limit_random(prng, 3, StateMachine.index_hits_max);
+            query.flags.descending = prng.boolean();
+            if (prng.chance(stdx.PRNG.ratio(1, 50))) {
+                switch (prng.chances(.{ .reserved = 1, .range = 1, .padding = 1, .cursor = 1 })) {
+                    .reserved => query.reserved_b[prng.index(&query.reserved_b)] = 1,
+                    .range => query.order_min = query.order_max +| 1,
+                    .padding => query.flags.padding = 1,
+                    // Past every timestamp (#124).
+                    .cursor => {
+                        query.cursor_order = query.order_min;
+                        query.cursor_timestamp = timestamp_invalid(prng);
+                    },
+                }
+            }
+            return @sizeOf(nerva.IndexQuery);
+        }
+
+        fn check_scan_index(
+            workload: *Workload,
+            op_executed: u64,
+            request_body: []align(constants.cache_line_size) const u8,
+            reply_body: []align(constants.cache_line_size) const u8,
+        ) void {
+            const query = std.mem.bytesToValue(nerva.IndexQuery, request_body[0..@sizeOf(nerva.IndexQuery)]);
+            const results = stdx.bytes_as_slice(.exact, nerva.IndexRecord, reply_body);
+            // Malformed: no reply.
+            if (query.limit == 0 or query.flags.padding != 0 or
+                !stdx.zeroed(&query.reserved_a) or !stdx.zeroed(&query.reserved_b) or
+                query.order_min > query.order_max or
+                (query.cursor_timestamp != 0 and !TimestampRange.valid(query.cursor_timestamp)) or
+                (query.index_id == 0 and query.name[0] == 0) or
+                (query.index_id != 0 and !stdx.zeroed(&query.name)))
+            {
+                assert(results.len == 0);
+                return;
+            }
+            const limit = @min(query.limit, StateMachine.index_hits_max);
+            assert(results.len >= 1);
+            const header = &results[0];
+            assert(header.kind == .header);
+            assert(header.op == op_executed);
+            assert(op_executed > workload.op_max);
+            workload.op_max = op_executed;
+
+            const index: *ModelIndex = for (workload.model_indexes.items) |*index| {
+                if (query.index_id == index.id) break index;
+                if (query.index_id == 0 and stdx.equal_bytes([32]u8, &query.name, &index.definition.name)) {
+                    break index;
+                }
+            } else {
+                assert(header.state == .missing);
+                assert(header.index_id == 0);
+                assert(results.len == 1);
+                return;
+            };
+            assert(header.index_id == index.id);
+            assert(header.table == index.definition.table);
+            index_state_seen(index, op_executed, header.state);
+            if (header.state == .building or
+                !indexes.eq_key_valid(&index.definition, &query.eq_key))
+            {
+                assert(results.len == 1);
+                assert(!header.flags.more);
+                workload.index_scans_building += @intFromBool(header.state == .building);
+                return;
+            }
+
+            // The model's entries for this key and range, in the index's order.
+            var slot: u64 = 0;
+            for (workload.model_indexes.items[0 .. index.id - 1]) |*other| {
+                if (other.definition.table == index.definition.table) slot += 1;
+            }
+            const Hit = struct { order: u64, timestamp: u64, record: *const RecordVersion };
+            var hits: std.ArrayListUnmanaged(Hit) = .{};
+            defer hits.deinit(workload.allocator);
+            var records = workload.records.valueIterator();
+            while (records.next()) |record| {
+                if (!record.exists or record.table != index.definition.table) continue;
+                const place = indexes.place(&index.definition, &record.value, record.op) orelse continue;
+                if (!stdx.equal_bytes([nerva.group_key_size_max]u8, &place.eq_key, &query.eq_key)) continue;
+                if (place.order < query.order_min or place.order > query.order_max) continue;
+                const timestamp = record.timestamp + 1 + nerva.views_per_table_max + slot;
+                const descending = query.flags.descending;
+                if (query.cursor_timestamp != 0 and query.cursor_order >= query.order_min and
+                    query.cursor_order <= query.order_max)
+                {
+                    const after = if (place.order != query.cursor_order)
+                        (place.order > query.cursor_order) != descending
+                    else
+                        (timestamp > query.cursor_timestamp) != descending and
+                            timestamp != query.cursor_timestamp;
+                    if (!after) continue;
+                }
+                hits.append(workload.allocator, .{
+                    .order = place.order,
+                    .timestamp = timestamp,
+                    .record = record,
+                }) catch @panic("OOM");
+            }
+            std.mem.sortUnstable(Hit, hits.items, query.flags.descending, struct {
+                fn less_than(descending: bool, a: Hit, b: Hit) bool {
+                    // Timestamps are distinct: no two hits are equal.
+                    const less = if (a.order != b.order) a.order < b.order else a.timestamp < b.timestamp;
+                    return less != descending;
+                }
+            }.less_than);
+            const listed = @min(hits.items.len, limit);
+            assert(results.len == 1 + listed);
+            for (results[1..], hits.items[0..listed]) |*actual, *hit| {
+                assert(actual.kind == .record);
+                assert(actual.id == hit.record.id);
+                assert(actual.table == index.definition.table);
+                assert(actual.op == hit.record.op);
+                assert(actual.order == hit.order);
+                assert(actual.timestamp == hit.timestamp);
+                assert(actual.index_id == index.id);
+                assert(stdx.equal_bytes([record_value_size]u8, &actual.value, &hit.record.value));
+            }
+            workload.index_records_checked += listed;
+            workload.index_scans_ready += 1;
+            assert(header.flags.more == (hits.items.len > listed));
+            if (header.flags.more) {
+                assert(header.order == hits.items[listed - 1].order);
+                assert(header.timestamp == hits.items[listed - 1].timestamp);
+                var next = query;
+                next.cursor_order = header.order;
+                next.cursor_timestamp = header.timestamp;
+                workload.scan_cursor = next;
+            } else {
+                assert(header.order == 0 and header.timestamp == 0);
+                workload.scan_cursor = null;
             }
         }
     };

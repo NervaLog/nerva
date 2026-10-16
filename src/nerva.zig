@@ -19,6 +19,21 @@ const constants = @import("constants.zig");
 /// Size of a row's payload, in bytes. Fixed for v0.1.
 pub const value_size = 80;
 
+/// Size of a record's payload, in bytes (P123b).
+pub const record_value_size = 448;
+
+/// Tables from here up are Nerva's own (the catalog, documents, commit keys).
+pub const tables_reserved_min: u32 = 0xFFFF_0000;
+
+/// Tables from here up to `tables_reserved_min` hold records (P123b): 128-bit ids and
+/// `record_value_size`-byte values. Tables below hold rows.
+pub const record_tables_min: u32 = 0x8000_0000;
+
+/// Whether `table` holds records.
+pub fn table_is_record(table: u32) bool {
+    return table >= record_tables_min and table < tables_reserved_min;
+}
+
 /// Stable, forest-unique LSM tree identifiers. Never reuse or renumber: they are persisted.
 pub const tree_ids = struct {
     pub const Row = .{
@@ -65,6 +80,30 @@ pub const tree_ids = struct {
         .timestamp = 16,
         .slot = 17,
     };
+
+    pub const Record = .{
+        .timestamp = 18,
+        .key = 19,
+    };
+
+    pub const RecordChange = .{
+        .timestamp = 20,
+        // `record_key(table, id)`: a record's history, in timestamp order (P123b).
+        .record_key = 21,
+    };
+
+    pub const Index = .{
+        .timestamp = 22,
+        .id = 23,
+    };
+
+    pub const IndexEntry = .{
+        .timestamp = 24,
+        .key = 25,
+        // `IndexEntry.position` while present: an index's records, by `eq` key then order
+        // (P123c).
+        .order = 26,
+    };
 };
 
 /// The LSM key of a row: `table` in the high 64 bits, `id` in the low 64 bits.
@@ -96,6 +135,44 @@ pub const Row = extern struct {
     }
 };
 
+/// The LSM key of a record (P123b): `table` in the high 32 bits, then the first 96 bits of
+/// SHA-256 of the table and the id, little-endian. A table's records are adjacent (a view or an
+/// index backfills them in key order). Two ids of one table that share a key are refused
+/// (`id_collision`), never merged. Persisted: never change the derivation.
+pub fn record_key(table: u32, id: u128) u128 {
+    assert(table_is_record(table));
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("nerva.record.v1");
+    hash.update(std.mem.asBytes(&std.mem.nativeToLittle(u32, table)));
+    hash.update(std.mem.asBytes(&std.mem.nativeToLittle(u128, id)));
+    var digest: [32]u8 = undefined;
+    hash.final(&digest);
+    var low: [16]u8 = @splat(0);
+    low[0..12].* = digest[0..12].*;
+    return @as(u128, table) << 96 | std.mem.readInt(u128, &low, .little);
+}
+
+/// A record as stored in the forest (P123b): a row with a 128-bit id and a 448-byte value. A
+/// delete leaves a tombstone, as for rows.
+pub const Record = extern struct {
+    /// `record_key(table, id)`.
+    key: u128,
+    id: u128,
+    table: u32,
+    flags: Row.RowFlags,
+    /// The op of the last write (put or delete). Never zero.
+    op: u64,
+    /// Assigned when the record is first inserted; fixed for its lifetime.
+    timestamp: u64,
+    reserved: [8]u8 = @splat(0),
+    value: [record_value_size]u8,
+
+    comptime {
+        assert(@sizeOf(Record) == 512);
+        assert(stdx.no_padding(Record));
+    }
+};
+
 /// Non-exhaustive: entries arrive from the wire, and unknown kinds must be rejected, not trusted.
 pub const EntryKind = enum(u8) {
     read = 1,
@@ -103,6 +180,9 @@ pub const EntryKind = enum(u8) {
     delete = 3,
     /// Adds a delta to one field of the row, inside the commit; parameters in `value` (`Add`).
     add = 4,
+    /// The transaction's commit key (`CommitKey`): only as its first entry, with `table` and
+    /// `id` zero and the key in `value`'s first 16 bytes.
+    key = 5,
     _,
 };
 
@@ -126,6 +206,53 @@ pub const Entry = extern struct {
     }
 };
 
+/// The `commit_wide` event (P123b): an entry for a row or a record. Every commit runs on these:
+/// `commit`'s entries are widened (`from_entry`) and checked by the same rules.
+///
+/// For a row (a table below `record_tables_min`), `id` fits 64 bits and `value` past
+/// `value_size` is zero. For a record, `id` is any 128 bits and `value` is all of it; a record
+/// takes `read`, `put` and `delete`, not `add`.
+pub const WideEntry = extern struct {
+    id: u128,
+    /// Zero is invalid.
+    table: u32,
+    kind: EntryKind,
+    reserved_a: [3]u8 = @splat(0),
+    /// Reads only: the version observed. Zero means the row has never existed.
+    op_seen: u64,
+    reserved_b: [32]u8 = @splat(0),
+    /// Puts: the new value. Adds: the `Add` parameters. Zero for reads and deletes.
+    value: [record_value_size]u8,
+
+    comptime {
+        assert(@sizeOf(WideEntry) == 512);
+        assert(stdx.no_padding(WideEntry));
+    }
+
+    /// `commit`'s entry as `commit_wide` would carry it: its reserved fields in `reserved_b`, so
+    /// that the same rules refuse the same entries.
+    pub fn from_entry(entry: *const Entry) WideEntry {
+        var wide: WideEntry = .{
+            .id = entry.id,
+            .table = entry.table,
+            .kind = entry.kind,
+            .reserved_a = entry.reserved_a,
+            .op_seen = entry.op_seen,
+            .value = @splat(0),
+        };
+        wide.reserved_b[0..8].* = std.mem.toBytes(entry.reserved_b);
+        wide.reserved_b[8..24].* = entry.reserved_c;
+        wide.value[0..value_size].* = entry.value;
+        return wide;
+    }
+
+    /// A row's 80 bytes of value.
+    pub fn row_value(entry: *const WideEntry) *const [value_size]u8 {
+        assert(!table_is_record(entry.table));
+        return entry.value[0..value_size];
+    }
+};
+
 pub const EntryStatus = enum(u32) {
     ok = 0,
     /// A read's `op_seen` no longer matches the row's version.
@@ -135,7 +262,8 @@ pub const EntryStatus = enum(u32) {
     kind_invalid = 3,
     table_invalid = 4,
     reserved_not_zero = 5,
-    /// A read or delete carries a value.
+    /// A read or delete carries a value, or a row's put or add carries bytes past `value_size`
+    /// (P123b).
     value_not_zero = 6,
     /// A put or delete carries `op_seen`.
     op_seen_not_zero = 7,
@@ -146,7 +274,7 @@ pub const EntryStatus = enum(u32) {
     out_of_bounds = 9,
     /// An add to a row that does not exist, without `create`.
     row_absent = 10,
-    /// An add's field, bounds or delta are invalid.
+    /// An add's field, bounds or delta are invalid, or an add names a record (P123b).
     field_invalid = 11,
     /// An add's `delta_from` does not name an earlier add of the same transaction.
     delta_from_invalid = 12,
@@ -167,13 +295,82 @@ pub const EntryStatus = enum(u32) {
     /// changes its bytes, a delete of a row where it is not zero, or an add that overlaps it
     /// without matching it.
     conserved_write = 17,
+    /// The transaction's key was committed before, by these same entries, at `op`: nothing
+    /// applied now. A resend of a transaction whose reply was lost (`CommitKey`).
+    committed_before = 18,
+    /// Other entries committed under this key, at `op`: nothing applied, and these entries can
+    /// never commit under it.
+    key_reused = 19,
+    /// Another key holds this key's row (their row ids collide): nothing applied, and nothing
+    /// ever committed under this key. Commit under another key.
+    key_collision = 20,
+    /// A `key` entry that is not the transaction's first entry.
+    key_misplaced = 21,
+    /// A `key` entry whose key is zero, or whose `table`, `id` or rest of `value` is not zero.
+    key_invalid = 22,
+    /// A row's id that does not fit 64 bits (`commit_wide`, P123b).
+    id_invalid = 23,
+    /// Another id of the record's table holds its key (`record_key`): nothing applied. The
+    /// record can never be written under this id.
+    id_collision = 24,
 };
+
+/// Commit keys make a resent transaction commit at most once (P123). A transaction may start
+/// with a `key` entry naming a 128-bit key the client chose. When the transaction commits, the
+/// state machine also writes the key's row: a row of `table_commit_keys`, at
+/// `commit_key_id(key)`, holding a `CommitKey`. The row is written once and never changed. A
+/// later transaction under the same key commits nothing: it reports `committed_before` (the
+/// same entries, at the original op), `key_reused` (other entries) or `key_collision` (another
+/// key's row) on its key entry, and `aborted` on the rest. A transaction that did not commit
+/// writes no key, so resending it executes it again.
+pub const table_commit_keys: u32 = 0xFFFF_0003;
+
+/// A key row's value.
+pub const CommitKey = extern struct {
+    key: u128,
+    /// `vsr.checksum` of the transaction's entries after its key entry, as `WideEntry`s (P123b).
+    checksum: u128,
+    /// The transaction's entries after its key entry.
+    entry_count: u32,
+    reserved: [44]u8 = @splat(0),
+
+    comptime {
+        assert(@sizeOf(CommitKey) == value_size);
+        assert(stdx.no_padding(CommitKey));
+    }
+
+    /// The key a `key` entry (an `Entry` or a `WideEntry`) names.
+    pub fn entry_key(entry: anytype) u128 {
+        assert(entry.kind == .key);
+        return std.mem.readInt(u128, entry.value[0..16], .little);
+    }
+};
+
+/// The `key` entry that starts a transaction committed under `key`.
+pub fn commit_key_entry(key: u128) Entry {
+    assert(key != 0);
+    var entry: Entry = .{ .id = 0, .table = 0, .kind = .key, .op_seen = 0, .value = @splat(0) };
+    std.mem.writeInt(u128, entry.value[0..16], key, .little);
+    return entry;
+}
+
+/// The id of `key`'s row in `table_commit_keys`: the first 8 bytes of SHA-256, little-endian.
+/// Persisted: never change the derivation.
+pub fn commit_key_id(key: u128) u64 {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("nerva.commit_key.v1");
+    hash.update(std.mem.asBytes(&std.mem.nativeToLittle(u128, key)));
+    var digest: [32]u8 = undefined;
+    hash.final(&digest);
+    return std.mem.readInt(u64, digest[0..8], .little);
+}
 
 /// The `commit` result, one per entry.
 pub const EntryResult = extern struct {
     status: EntryStatus,
     reserved_a: u32 = 0,
     /// `ok`: the op the transaction committed at. `conflict`: the row's current version.
+    /// `committed_before`, `key_reused`, `key_collision`: the op the key's row was written at.
     /// Otherwise zero.
     op: u64,
     /// `add`, when `ok`: the amount added, after clamping. Otherwise zero.
@@ -235,9 +432,10 @@ pub const Add = extern struct {
         assert(stdx.no_padding(Add));
     }
 
-    pub fn from_entry(entry: *const Entry) Add {
+    /// An add's parameters, from an `Entry` or a row's `WideEntry`.
+    pub fn from_entry(entry: anytype) Add {
         assert(entry.kind == .add);
-        return std.mem.bytesToValue(Add, &entry.value);
+        return std.mem.bytesToValue(Add, entry.value[0..value_size]);
     }
 
     pub fn value(add: *const Add) [value_size]u8 {
@@ -282,6 +480,83 @@ pub const RowValue = extern struct {
     }
 };
 
+/// The `lookup_records` event (P123b).
+pub const RecordKey = extern struct {
+    id: u128,
+    table: u32,
+    reserved: [12]u8 = @splat(0),
+
+    comptime {
+        assert(@sizeOf(RecordKey) == 32);
+        assert(stdx.no_padding(RecordKey));
+    }
+};
+
+/// The `lookup_records` result, one per event.
+pub const RecordValue = extern struct {
+    id: u128,
+    table: u32,
+    flags: RecordValueFlags,
+    /// The record's version: zero if it has never existed, else the op of its last write
+    /// (including a delete). Use it as `WideEntry.op_seen`.
+    op: u64,
+    /// The op at which this lookup executed.
+    op_read: u64,
+    reserved: [24]u8 = @splat(0),
+    /// Zero unless `flags.exists`.
+    value: [record_value_size]u8,
+
+    pub const RecordValueFlags = packed struct(u32) {
+        exists: bool = false,
+        /// Another id holds this record's key (`id_collision`): it can never be written.
+        collision: bool = false,
+        padding: u30 = 0,
+    };
+
+    comptime {
+        assert(@sizeOf(RecordValue) == 512);
+        assert(stdx.no_padding(RecordValue));
+    }
+};
+
+/// A committed write of a record, as stored and as `get_record_changes` and
+/// `get_record_history` return it (P123b). Replies end with an `end` record, as `Change`'s do.
+pub const RecordChange = extern struct {
+    id: u128,
+    table: u32,
+    kind: ChangeKind,
+    flags: Change.ChangeFlags,
+    reserved_a: [2]u8 = @splat(0),
+    op: u64,
+    timestamp: u64,
+    reserved_b: [24]u8 = @splat(0),
+    /// The new value for `put`; zero for `delete` and `end`.
+    value: [record_value_size]u8,
+
+    comptime {
+        assert(@sizeOf(RecordChange) == 512);
+        assert(stdx.no_padding(RecordChange));
+    }
+};
+
+/// The `get_record_history` event: one record's changes, newest first, as `HistoryFilter`.
+pub const RecordHistoryFilter = extern struct {
+    id: u128,
+    table: u32,
+    /// The maximum number of changes to scan, excluding the final `end` record.
+    limit: u32,
+    /// Return changes with `op <= op_max`: `maxInt(u64)` for the latest. Zero is invalid.
+    op_max: u64,
+    /// The cursor: scan changes with `timestamp <= timestamp_max`. Zero means from the newest.
+    timestamp_max: u64,
+    reserved: [24]u8 = @splat(0),
+
+    comptime {
+        assert(@sizeOf(RecordHistoryFilter) == 64);
+        assert(stdx.no_padding(RecordHistoryFilter));
+    }
+};
+
 // ---- Views maintained in the state machine (docs/DECISIONS.md N52) ----
 
 /// Views, cluster-wide. View ids are 1..views_max, in declaration order.
@@ -313,18 +588,39 @@ pub const FieldKind = enum(u8) {
     _,
 };
 
-/// A field of a row's value, resolved from the table's layout by the gateway.
+/// A field of a row's or record's value, resolved from the table's layout by the gateway.
 pub const FieldRef = extern struct {
+    /// The offset's low byte (`offset_of`).
     offset: u8,
     size: u8,
     kind: FieldKind,
-    reserved: u8 = 0,
+    /// The offset's high byte: zero for a row's field, up to 1 for a record's (P123b). It was a
+    /// reserved byte, always zero, before records.
+    offset_high: u8 = 0,
 
     comptime {
         assert(@sizeOf(FieldRef) == 4);
         assert(stdx.no_padding(FieldRef));
     }
+
+    pub fn offset_of(field: FieldRef) u16 {
+        return @as(u16, field.offset_high) << 8 | field.offset;
+    }
+
+    pub fn at(offset: u16, size: u8, kind: FieldKind) FieldRef {
+        return .{
+            .offset = @truncate(offset),
+            .size = size,
+            .kind = kind,
+            .offset_high = @intCast(offset >> 8),
+        };
+    }
 };
+
+/// The size of a value of `table`: a record's or a row's.
+pub fn table_value_size(table: u32) u16 {
+    return if (table_is_record(table)) record_value_size else value_size;
+}
 
 pub const Comparison = enum(u8) { eq = 1, ne = 2, lt = 3, le = 4, gt = 5, ge = 6, _ };
 
@@ -389,7 +685,8 @@ pub const DeclareStatus = enum(u32) {
     table_invalid = 5,
     views_full = 6,
     table_views_full = 7,
-    /// No longer returned: `min` and `max` are maintained since N62.
+    /// `min` or `max` over a record table (P123b): a record's member would need its 128-bit
+    /// id. (Over rows, maintained since N62.)
     unsupported = 8,
     /// The table's views would have more than `view_extremes_per_table_max` `min` and `max`
     /// aggregates.
@@ -429,7 +726,8 @@ pub const View = extern struct {
     id: u64,
     timestamp: u64,
     declared_op: u64,
-    /// While building: rows with a smaller id are already in the groups.
+    /// While building: rows with a smaller id are already in the groups. Over a record table
+    /// (P123b): the low 64 of the 96 bits of the record keys below which records are.
     backfill_cursor: u64,
     /// Groups with a count above zero.
     group_count: u64,
@@ -438,7 +736,9 @@ pub const View = extern struct {
     /// The sum, modulo 2^256 (little-endian), of the digests of the non-empty groups.
     hash: [32]u8,
     definition: ViewDefinition,
-    reserved_b: [176]u8 = @splat(0),
+    /// Over a record table, while building: the high 32 bits of the cursor (P123b).
+    backfill_cursor_high: u32 = 0,
+    reserved_b: [172]u8 = @splat(0),
 
     comptime {
         assert(@sizeOf(View) == 512);
@@ -707,6 +1007,229 @@ pub const Change = extern struct {
     }
 };
 
+// ---- Declared indexes (P123c) ----
+
+/// Indexes, cluster-wide. Index ids are 1..indexes_max, in declaration order.
+pub const indexes_max = 64;
+/// Indexes over one table: each takes one of a record's `min`/`max` timestamps, which records
+/// do not use (`StateMachine.entry_timestamps`).
+pub const indexes_per_table_max = view_extremes_per_table_max;
+pub const index_eq_max = 3;
+pub const index_where_max = 4;
+
+/// The `declare_index` event: an index over a record table, immutable once declared. It lists
+/// the table's records whose value passes `where`, by the bytes of their `eq` fields (scanned
+/// for one `eq` key at a time), then by their `order` field (or, without one, the op of their
+/// last write), then by when they entered the index.
+pub const IndexDefinition = extern struct {
+    /// The catalog name rules (`catalog.zig`), zero-padded.
+    name: [32]u8,
+    /// A record table.
+    table: u32,
+    eq_count: u8,
+    where_count: u8,
+    flags: Flags,
+    reserved_a: u8 = 0,
+    /// Any kind; at most `group_key_size_max` bytes between them. Unused slots are zero.
+    eq: [index_eq_max]FieldRef,
+    /// An unsigned, signed or boolean field when `flags.order`; zero otherwise.
+    order: FieldRef,
+    where: [index_where_max]Where,
+    reserved_b: [72]u8 = @splat(0),
+
+    pub const Flags = packed struct(u8) {
+        order: bool = false,
+        padding: u7 = 0,
+    };
+
+    comptime {
+        assert(@sizeOf(IndexDefinition) == 256);
+        assert(stdx.no_padding(IndexDefinition));
+    }
+};
+
+pub const DeclareIndexStatus = enum(u32) {
+    /// Declared now; it builds (pulses add the records already written) before it answers.
+    created = 1,
+    /// Already declared with this definition (the result names it).
+    exists = 2,
+    /// The name is declared with another definition.
+    different = 3,
+    /// The definition breaks a static rule (`indexes.definition_validate`).
+    invalid = 4,
+    /// The table is not a record table.
+    table_invalid = 5,
+    indexes_full = 6,
+    table_indexes_full = 7,
+};
+
+/// The `declare_index` result.
+pub const DeclareIndexResult = extern struct {
+    status: DeclareIndexStatus,
+    reserved_a: u32 = 0,
+    /// `created` and `exists`: the index's id. Otherwise zero.
+    index_id: u64,
+    /// `created`: this op. `exists`: the op it was declared at. Otherwise zero.
+    op: u64,
+    reserved_b: u64 = 0,
+
+    comptime {
+        assert(@sizeOf(DeclareIndexResult) == 32);
+        assert(stdx.no_padding(DeclareIndexResult));
+    }
+};
+
+pub const IndexState = enum(u8) {
+    /// Answers for a query of an id or name never declared.
+    missing = 0,
+    /// Records written before the declaration are still being added (by pulses).
+    building = 1,
+    ready = 2,
+};
+
+/// An index as the forest stores it.
+pub const Index = extern struct {
+    id: u64,
+    timestamp: u64,
+    /// While building: the table's records whose key's low 96 bits are below are indexed.
+    backfill_cursor: u128,
+    declared_op: u64,
+    /// The records in the index.
+    entry_count: u64,
+    state: IndexState,
+    reserved_a: [15]u8 = @splat(0),
+    definition: IndexDefinition,
+    reserved_b: [192]u8 = @splat(0),
+
+    comptime {
+        assert(@sizeOf(Index) == 512);
+        assert(stdx.no_padding(Index));
+    }
+};
+
+/// A record's place in one index (P123c): one per index and record the index has seen. Never
+/// removed: a record that leaves the index is kept, absent (out of `order`).
+pub const IndexEntry = extern struct {
+    /// `index_entry_key(index_id, record key)`.
+    key: u128,
+    /// While present, `index_position(prefix, order)`, indexed as `order`. Zero while absent.
+    position: u128,
+    /// The record's id.
+    id: u128,
+    timestamp: u64,
+    index_id: u32,
+    flags: Flags,
+    reserved: [3]u8 = @splat(0),
+    /// While present, the `eq` fields' bytes, then zeros: compared when the index is read (a
+    /// prefix collision is skipped). Zero while absent.
+    eq_key: [group_key_size_max]u8,
+
+    pub const Flags = packed struct(u8) {
+        present: bool = false,
+        padding: u7 = 0,
+    };
+
+    comptime {
+        assert(@sizeOf(IndexEntry) == 128);
+        assert(stdx.no_padding(IndexEntry));
+    }
+};
+
+/// An entry's place in the entries tree: unique per index and record (a record's key is its
+/// table, which the index names, and 96 bits).
+pub fn index_entry_key(index_id: u64, record_key_: u128) u128 {
+    assert(index_id >= 1 and index_id <= indexes_max);
+    return @as(u128, index_id) << 96 | (record_key_ & std.math.maxInt(u96));
+}
+
+/// An entry's place in its index's order: the `eq` key's prefix, then the order value.
+pub fn index_position(prefix: u64, order: u64) u128 {
+    return @as(u128, prefix) << 64 | order;
+}
+
+/// The `get_index` event: an index by id (P123c). The result is its `Index`, all zero (state
+/// `missing`) if no index has the id.
+pub const IndexGet = extern struct {
+    id: u64,
+    reserved: [24]u8 = @splat(0),
+
+    comptime {
+        assert(@sizeOf(IndexGet) == 32);
+        assert(stdx.no_padding(IndexGet));
+    }
+};
+
+/// The `scan_index` event: a page of one index's records with one `eq` key, by order, within
+/// `[order_min, order_max]` (order values as `views.integer_ordered` encodes them).
+pub const IndexQuery = extern struct {
+    /// Zero to name the index by `name`.
+    index_id: u64,
+    /// The `eq` fields' bytes, one after another, then zeros.
+    eq_key: [group_key_size_max]u8,
+    order_min: u64,
+    order_max: u64,
+    /// Continue after the record at this order and timestamp (a reply's header names them).
+    /// Zero timestamp: from the start of the range.
+    cursor_order: u64,
+    cursor_timestamp: u64,
+    /// The most records to return.
+    limit: u32,
+    flags: Flags,
+    reserved_a: [3]u8 = @splat(0),
+    /// When `index_id` is zero.
+    name: [32]u8,
+    reserved_b: [48]u8 = @splat(0),
+
+    pub const Flags = packed struct(u8) {
+        descending: bool = false,
+        padding: u7 = 0,
+    };
+
+    comptime {
+        assert(@sizeOf(IndexQuery) == 192);
+        assert(stdx.no_padding(IndexQuery));
+    }
+};
+
+/// The `scan_index` result: a header, then one record per entry found.
+pub const IndexRecord = extern struct {
+    /// `record`: the record's id.
+    id: u128,
+    /// `record`: its table. `header`: the index's table.
+    table: u32,
+    kind: Kind,
+    flags: Flags,
+    /// `header`: the index's state.
+    state: IndexState,
+    reserved_a: u8 = 0,
+    /// `header`: the op the scan read at. `record`: the record's version.
+    op: u64,
+    /// `record`: its order value. `header`, with `flags.more`: the next query's
+    /// `cursor_order`.
+    order: u64,
+    /// `record`: when it entered the index. `header`, with `flags.more`: the next query's
+    /// `cursor_timestamp`.
+    timestamp: u64,
+    /// `header`: the index's id (zero if missing).
+    index_id: u64,
+    reserved_b: [8]u8 = @splat(0),
+    /// `record`: its value.
+    value: [record_value_size]u8,
+
+    pub const Kind = enum(u8) { header = 1, record = 2 };
+
+    pub const Flags = packed struct(u8) {
+        /// `header`: the range holds more records after this page.
+        more: bool = false,
+        padding: u7 = 0,
+    };
+
+    comptime {
+        assert(@sizeOf(IndexRecord) == 512);
+        assert(stdx.no_padding(IndexRecord));
+    }
+};
+
 /// Operations exported by Nerva.
 // ---- Ledgers: conserved fields (docs/DECISIONS.md N75) ----
 
@@ -827,6 +1350,15 @@ pub const Operation = enum(u8) {
     /// Declares a ledger: a set of conserved fields (N75).
     declare_ledger = constants.vsr_operations_reserved + 7,
     get_ledger = constants.vsr_operations_reserved + 8,
+    /// `commit` with wide entries: rows and records in one transaction (P123b).
+    commit_wide = constants.vsr_operations_reserved + 9,
+    lookup_records = constants.vsr_operations_reserved + 10,
+    get_record_changes = constants.vsr_operations_reserved + 11,
+    get_record_history = constants.vsr_operations_reserved + 12,
+    /// Declares an index over a record table, maintained from then on (P123c).
+    declare_index = constants.vsr_operations_reserved + 13,
+    scan_index = constants.vsr_operations_reserved + 14,
+    get_index = constants.vsr_operations_reserved + 15,
 
     pub fn EventType(comptime operation: Operation) type {
         return switch (operation) {
@@ -839,6 +1371,13 @@ pub const Operation = enum(u8) {
             .pulse => void,
             .declare_ledger => LedgerDefinition,
             .get_ledger => LedgerQuery,
+            .commit_wide => WideEntry,
+            .lookup_records => RecordKey,
+            .get_record_changes => ChangesFilter,
+            .get_record_history => RecordHistoryFilter,
+            .declare_index => IndexDefinition,
+            .scan_index => IndexQuery,
+            .get_index => IndexGet,
         };
     }
 
@@ -852,6 +1391,12 @@ pub const Operation = enum(u8) {
             .pulse => void,
             .declare_ledger => DeclareLedgerResult,
             .get_ledger => Ledger,
+            .commit_wide => EntryResult,
+            .lookup_records => RecordValue,
+            .get_record_changes, .get_record_history => RecordChange,
+            .declare_index => DeclareIndexResult,
+            .scan_index => IndexRecord,
+            .get_index => Index,
         };
     }
 
@@ -870,7 +1415,7 @@ pub const Operation = enum(u8) {
     /// Whether the operation takes multiple events per batch (one result per event).
     pub inline fn is_batchable(operation: Operation) bool {
         return switch (operation) {
-            .lookup_rows, .commit => true,
+            .lookup_rows, .commit, .commit_wide, .lookup_records => true,
             .get_changes,
             .get_history,
             .get_view,
@@ -878,6 +1423,11 @@ pub const Operation = enum(u8) {
             .pulse,
             .declare_ledger,
             .get_ledger,
+            .get_record_changes,
+            .get_record_history,
+            .declare_index,
+            .scan_index,
+            .get_index,
             => false,
         };
     }
@@ -885,7 +1435,7 @@ pub const Operation = enum(u8) {
     /// Whether the operation is multi-batch encoded.
     pub inline fn is_multi_batch(operation: Operation) bool {
         return switch (operation) {
-            .lookup_rows, .commit => true,
+            .lookup_rows, .commit, .commit_wide, .lookup_records => true,
             .get_changes,
             .get_history,
             .get_view,
@@ -893,12 +1443,25 @@ pub const Operation = enum(u8) {
             .pulse,
             .declare_ledger,
             .get_ledger,
+            .get_record_changes,
+            .get_record_history,
+            .declare_index,
+            .scan_index,
+            .get_index,
             => false,
         };
     }
 
     /// The maximum number of events per batch.
     pub inline fn event_max(operation: Operation, batch_size_limit: u32) u32 {
+        // A batch no larger than one result's trailer holds no event of a multi-batch
+        // operation, which `vsr.multi_batch.event_max` asserts never happens: a
+        // `lookup_records` result is 512 bytes, as large as the largest event, and so as the
+        // smallest batch the simulator may choose (P123b).
+        if (operation.is_multi_batch() and batch_size_limit <= vsr.multi_batch.trailer_total_size(.{
+            .element_size = operation.result_size(),
+            .batch_count = 1,
+        })) return 0;
         return vsr.multi_batch.event_max(Operation, operation, batch_size_limit);
     }
 
@@ -911,11 +1474,19 @@ pub const Operation = enum(u8) {
     /// For multi-batch requests, this function expects a single, already decoded batch.
     pub inline fn result_count_expected(operation: Operation, batch: []const u8) u32 {
         return switch (operation) {
-            inline .lookup_rows, .commit => |operation_comptime| @intCast(@divExact(
+            inline .lookup_rows,
+            .commit,
+            .commit_wide,
+            .lookup_records,
+            => |operation_comptime| @intCast(@divExact(
                 batch.len,
                 @sizeOf(operation_comptime.EventType()),
             )),
-            inline .get_changes, .get_history => |operation_comptime| count: {
+            inline .get_changes,
+            .get_history,
+            .get_record_changes,
+            .get_record_history,
+            => |operation_comptime| count: {
                 const Filter = operation_comptime.EventType();
                 const filter = std.mem.bytesAsValue(Filter, batch[0..@sizeOf(Filter)]);
                 // +1 for the `end` record.
@@ -932,7 +1503,15 @@ pub const Operation = enum(u8) {
                     operation.result_max(constants.message_body_size_max),
                 );
             },
-            .declare_view, .declare_ledger, .get_ledger => 1,
+            .scan_index => count: {
+                const query = std.mem.bytesAsValue(IndexQuery, batch[0..@sizeOf(IndexQuery)]);
+                // +1 for the header.
+                break :count @min(
+                    query.limit +| 1,
+                    operation.result_max(constants.message_body_size_max),
+                );
+            },
+            .declare_view, .declare_ledger, .get_ledger, .declare_index, .get_index => 1,
             .pulse => 0,
         };
     }
@@ -949,9 +1528,63 @@ pub const Operation = enum(u8) {
     }
 };
 
+/// Static checks on one `commit_wide` entry, independent of state, by `entry_validate`'s rules,
+/// and for records' and rows' ids and values (P123b). Returns null if the entry is valid.
+pub fn wide_entry_validate(entry: *const WideEntry) ?EntryStatus {
+    const record = table_is_record(entry.table);
+    if (entry.kind == .key) {
+        if (entry.table != 0 or entry.id != 0 or entry.op_seen != 0 or
+            !stdx.zeroed(entry.value[16..]) or CommitKey.entry_key(entry) == 0)
+        {
+            return .key_invalid;
+        }
+    } else {
+        if (entry.table == 0) return .table_invalid;
+        // Only the state machine writes key rows, for `key` entries.
+        if (entry.table == table_commit_keys) return .table_invalid;
+        if (!record and entry.id > std.math.maxInt(u64)) return .id_invalid;
+    }
+    if (!stdx.zeroed(&entry.reserved_a) or !stdx.zeroed(&entry.reserved_b)) {
+        return .reserved_not_zero;
+    }
+    switch (entry.kind) {
+        .read => {
+            if (!stdx.zeroed(&entry.value)) return .value_not_zero;
+        },
+        .put => {
+            if (entry.op_seen != 0) return .op_seen_not_zero;
+            if (!record and !stdx.zeroed(entry.value[value_size..])) return .value_not_zero;
+        },
+        .delete => {
+            if (!stdx.zeroed(&entry.value)) return .value_not_zero;
+            if (entry.op_seen != 0) return .op_seen_not_zero;
+        },
+        .add => {
+            if (entry.op_seen != 0) return .op_seen_not_zero;
+            // Records take no adds: their fields are written whole.
+            if (record) return .field_invalid;
+            if (!stdx.zeroed(entry.value[value_size..])) return .value_not_zero;
+            return add_validate(&Add.from_entry(entry));
+        },
+        .key => {},
+        _ => return .kind_invalid,
+    }
+    return null;
+}
+
 /// Static checks on one entry, independent of state. Returns null if the entry is valid.
 pub fn entry_validate(entry: *const Entry) ?EntryStatus {
-    if (entry.table == 0) return .table_invalid;
+    if (entry.kind == .key) {
+        if (entry.table != 0 or entry.id != 0 or entry.op_seen != 0 or
+            !stdx.zeroed(entry.value[16..]) or CommitKey.entry_key(entry) == 0)
+        {
+            return .key_invalid;
+        }
+    } else {
+        if (entry.table == 0) return .table_invalid;
+        // Only the state machine writes key rows, for `key` entries.
+        if (entry.table == table_commit_keys) return .table_invalid;
+    }
     if (!stdx.zeroed(&entry.reserved_a) or entry.reserved_b != 0 or
         !stdx.zeroed(&entry.reserved_c))
     {
@@ -972,6 +1605,7 @@ pub fn entry_validate(entry: *const Entry) ?EntryStatus {
             if (entry.op_seen != 0) return .op_seen_not_zero;
             return add_validate(&Add.from_entry(entry));
         },
+        .key => {},
         _ => return .kind_invalid,
     }
     return null;

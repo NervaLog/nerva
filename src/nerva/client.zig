@@ -288,6 +288,105 @@ pub const Client = struct {
         return reply[0];
     }
 
+    // ---- Records and indexes (P123b, P123c) ----
+
+    /// Commits one transaction of rows and records. `results.len == entries.len`.
+    pub fn commit_wide(
+        client: *Client,
+        entries: []const nerva.WideEntry,
+        results: []EntryResult,
+    ) Error!void {
+        assert(results.len == entries.len);
+        const reply = try client.execute_multi_batch(.commit_wide, std.mem.sliceAsBytes(entries));
+        stdx.copy_disjoint(
+            .exact,
+            EntryResult,
+            results,
+            stdx.bytes_as_slice(.exact, EntryResult, reply),
+        );
+    }
+
+    /// Point reads of records. `results.len == keys.len`.
+    pub fn lookup_records(
+        client: *Client,
+        keys: []const nerva.RecordKey,
+        results: []nerva.RecordValue,
+    ) Error!void {
+        assert(results.len == keys.len);
+        const reply =
+            try client.execute_multi_batch(.lookup_records, std.mem.sliceAsBytes(keys));
+        stdx.copy_disjoint(
+            .exact,
+            nerva.RecordValue,
+            results,
+            stdx.bytes_as_slice(.exact, nerva.RecordValue, reply),
+        );
+    }
+
+    /// Reads records' change feed, as `get_changes` reads rows'.
+    pub fn get_record_changes(
+        client: *Client,
+        filter: ChangesFilter,
+        changes: []nerva.RecordChange,
+    ) Error!usize {
+        return client.execute_one(.get_record_changes, &filter, changes);
+    }
+
+    /// Reads one record's history, newest first, as `get_history` reads a row's.
+    pub fn get_record_history(
+        client: *Client,
+        filter: nerva.RecordHistoryFilter,
+        changes: []nerva.RecordChange,
+    ) Error!usize {
+        return client.execute_one(.get_record_history, &filter, changes);
+    }
+
+    pub fn declare_index(
+        client: *Client,
+        definition: *const nerva.IndexDefinition,
+    ) Error!nerva.DeclareIndexResult {
+        var result: [1]nerva.DeclareIndexResult = undefined;
+        assert(try client.execute_one(.declare_index, definition, &result) == 1);
+        return result[0];
+    }
+
+    /// A page of an index: the header record, then the records. `records.len` must hold
+    /// `query.limit` records plus the header. Returns the number written (zero if the query is
+    /// invalid).
+    pub fn scan_index(
+        client: *Client,
+        query: nerva.IndexQuery,
+        records: []nerva.IndexRecord,
+    ) Error!usize {
+        return client.execute_one(.scan_index, &query, records);
+    }
+
+    /// The index with this id; all zero if none.
+    pub fn get_index(client: *Client, id: u64) Error!nerva.Index {
+        var result: [1]nerva.Index = undefined;
+        assert(try client.execute_one(.get_index, &nerva.IndexGet{ .id = id }, &result) == 1);
+        return result[0];
+    }
+
+    /// Sends one event of a single-event operation; copies its results out.
+    fn execute_one(
+        client: *Client,
+        comptime operation: Operation,
+        event: *const operation.EventType(),
+        results: []operation.ResultType(),
+    ) Error!usize {
+        try client.ensure_idle();
+        const body = std.mem.asBytes(event);
+        stdx.copy_disjoint(.exact, u8, client.request[0..body.len], body);
+        client.send(operation, client.request[0..body.len]);
+        try client.run_until_reply();
+        const Result = operation.ResultType();
+        const reply = stdx.bytes_as_slice(.exact, Result, client.reply[0..client.reply_size.?]);
+        assert(reply.len <= results.len);
+        stdx.copy_disjoint(.exact, Result, results[0..reply.len], reply);
+        return reply.len;
+    }
+
     /// A view's latest state (the header record) and a page of its groups (N52). `records.len`
     /// must hold `query.limit` groups plus the header. Returns the number of records written
     /// (zero if the query is invalid).

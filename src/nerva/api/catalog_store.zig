@@ -114,7 +114,7 @@ fn layout_read(
     assert(table != 0 and table < catalog.tables_reserved_min);
     const document = try transaction.get(try layout_key(arena, table)) orelse return null;
     // Written by `layout_put`, from a layout that parsed: anything else is corruption.
-    return catalog.layout_parse(arena, document) catch |err| switch (err) {
+    return catalog.layout_parse(arena, document, table) catch |err| switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         error.Invalid => error.Corrupt,
     };

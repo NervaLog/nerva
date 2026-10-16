@@ -35,7 +35,7 @@ test "benchmark: declared views" {
     const view_json =
         \\{"table":5,"group_by":["group"],"aggregates":[{"fn":"count"},{"fn":"sum","field":"price"}]}
     ;
-    const layout = try catalog.layout_parse(arena, layout_json);
+    const layout = try catalog.layout_parse(arena, layout_json, 5);
     var op: u64 = 1;
     var timestamp: u64 = 1;
     for ([_][2][]const u8{

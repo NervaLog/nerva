@@ -11,7 +11,9 @@ const VoprLog = enum { short, full };
 // Nerva has no client releases yet; every build is "the" release.
 // 0.0.5: data files record the export they were imported from, and pings and pongs carry it
 // (P90). Clients are unchanged, so 0.0.4's are still accepted.
-const release = "0.0.5";
+// 0.0.6: a commit may start with a `key` entry, and writes its key's row (P123), so 0.0.5 and
+// 0.0.6 replicas would diverge on it. Clients only gained an entry kind: 0.0.4's still work.
+const release = "0.0.6";
 const release_client_min = "0.0.4";
 // Only `zig build test:release` builds this release, to run a cluster of two releases (N61).
 const release_test_other = "0.0.200";
@@ -313,15 +315,17 @@ pub fn build(b: *std.Build) !void {
     run_integration_tests.has_side_effects = true; // Never cache: it runs real processes.
     steps.test_integration.dependOn(&run_integration_tests.step);
 
-    // zig build test:api: the JSON API, its documents, adds, then ledgers, against models, then a
-    // cluster and gateway over IPv6 (skipped without it), a gateway given an address it cannot
-    // open (#92), then key rotation through both gateways (NERVA_KEY_NEXT); one after the other:
-    // each runs a cluster.
+    // zig build test:api: the JSON API, its documents, adds, commit keys (P123), records and
+    // indexes (P123b, P123c), then ledgers, against models, then a cluster and gateway over IPv6
+    // (skipped without it), a gateway given an address it cannot open (#92), then key rotation
+    // through both gateways (NERVA_KEY_NEXT); one after the other: each runs a cluster.
     var api_previous: ?*std.Build.Step = null;
     for ([_][]const u8{
         "api.py",
         "documents.py",
         "adds.py",
+        "commit_keys.py",
+        "records.py",
         "ledgers.py",
         "ipv6.py",
         "addresses.py",
@@ -380,10 +384,17 @@ pub fn build(b: *std.Build) !void {
         .target = target,
         .mode = mode,
     });
-    // Then an upgrade: an export from `nerva`, imported by the other release (N80); then
-    // replicas imported from different exports (P90). One after the other: each runs a cluster.
+    // Then an upgrade: an export from `nerva`, imported by the other release (N80), without
+    // records (export version 1) and with them (version 2, P123b); then replicas imported from
+    // different exports (P90). One after the other: each runs a cluster.
     var release_previous: ?*std.Build.Step = null;
-    for ([_][]const u8{ "mixed.py", "upgrade.py", "origins.py" }) |script| {
+    for ([_][2][]const u8{
+        .{ "mixed.py", "" },
+        .{ "upgrade.py", "" },
+        .{ "upgrade.py", "--records" },
+        .{ "origins.py", "" },
+    }) |release_test| {
+        const script = release_test[0];
         const run_release_test = b.addSystemCommand(&.{
             "python3",
             b.fmt("tests/release/{s}", .{script}),
@@ -394,6 +405,7 @@ pub fn build(b: *std.Build) !void {
         else
             nerva_other;
         run_release_test.addFileArg(nerva_second.getEmittedBin());
+        if (release_test[1].len > 0) run_release_test.addArg(release_test[1]);
         if (b.args) |args| run_release_test.addArgs(args);
         run_release_test.setCwd(b.path("."));
         run_release_test.has_side_effects = true;
