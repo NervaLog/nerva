@@ -74,7 +74,12 @@ stay exact. The operations:
 | `get_view` | `ViewQuery` → `ViewRecord[]` | A maintained view's state, hash and group count, and a page of its groups (N52). |
 | `declare_ledger` | `LedgerDefinition` → `DeclareLedgerResult` | Declares a ledger: conserved fields that only pairs of adds change (N75). |
 | `get_ledger` | `LedgerQuery` → `Ledger` | A ledger by id, or, when `id` is zero, the `slot`th declared (from 1), to list them (N80). |
-| `pulse` | — | Sent by the cluster to itself while a view is building: adds a bounded number of existing rows to it (N52). |
+| `pulse` | — | Sent by the cluster to itself while a view or an index is building: adds a bounded number of existing rows or records to it (N52, P123c). |
+| `commit_wide` | `WideEntry` → `EntryResult` | `commit` for transactions that write records as well as rows (below), under the same rules (P123b). |
+| `lookup_records`, `get_record_changes`, `get_record_history` | `RecordKey` → `RecordValue`; `ChangesFilter`, `RecordHistoryFilter` → `RecordChange[]` | Records' point reads, change feed and history, as rows' (P123b). |
+| `declare_index` | `IndexDefinition` → `DeclareIndexResult` | Declares an index over a record table, maintained from then on by every commit (P123c). |
+| `scan_index` | `IndexQuery` → `IndexRecord[]` | A page of an index's records for one `eq` key, by order, with the records themselves (P123c). |
+| `get_index` | `IndexGet` → `Index` | An index's declaration, state and count of records. |
 
 Commits execute serially in op order, so validating each read's version at commit time gives
 serializable transactions over point reads.
@@ -90,6 +95,22 @@ key, and its resend executes again. A resend's reply has no adds' amounts: read 
 its op. Keys are kept forever, one 80-byte row each; their row ids are 64-bit hashes, so two
 keys may collide (about 3 in 10,000 among 10⁸ keys), and the second is refused with
 `key_collision`, which proves nothing committed under it: pick another key.
+
+**Records** are rows for facts (P123b): tables from `0x80000000` to `0xFFFEFFFF` hold records,
+identified by `(table, id)` with a 128-bit id (a UUID, say), each a fixed 448-byte value. A
+transaction (`commit_wide`) may read, put and delete records and rows together, so a fact
+commits in the op that moves its money (G1). Records are written whole: they take no adds.
+Their changes form a feed of their own, ordered with rows' by timestamp. A record's key keeps
+96 bits of a hash of its id: two ids of one table that collide are refused (`id_collision`, about
+one in 10¹³ among 10⁸ records), never merged.
+
+An **index** finds a record table's records other than by id (P123c): a declaration of up to
+three `eq` fields, then an `order` field (or the op of the record's last write), and optional
+`where` clauses that make it partial ("executions with status `reserved`, by `created_at`").
+The state machine keeps it exact in the commit that writes each record. Scanned for one `eq` key,
+it lists records by order, then in the order they were first written, a page at a time from a
+cursor. An index declared over records that exist builds by pulses, like a view, and answers no
+scan until it is ready. Indexes read the latest state; read the past through history.
 
 An **add** changes one 64-bit field (`u64` or `i64`, at a byte offset) inside the commit, with
 no read: adds to one row never conflict, they apply in log order. An add never moves a field
@@ -355,9 +376,30 @@ default). Zone ids (`[fe80::1%2]`) are refused.
 | `GET /v1/tables/<t>` | The table's layout. |
 | `PUT /v1/ledgers/<id>` `{"fields":[{"table","field" or "offset","floor"}]}` | Declare a ledger: 2 to 16 conserved `i64` fields (below). `200` created or exists, with its `op`; `409` `ledger_immutable`, `ledger_field_taken`, `field_viewed` or `ledgers_full`; `400` invalid. |
 | `GET /v1/ledgers/<id>` | The ledger's fields, floors and the op it was declared at. |
+| `PUT /v1/indexes/<name>` `{"table","eq":[…],"order"?,"where"?}` | Declare an index over a record table, by its layout's field names (P123c). `200` created or exists, with its `op`; `409` different (indexes are immutable) or full; `400` invalid. |
+| `GET /v1/indexes`, `GET /v1/indexes/<name>` | The indexes: name, id, table, fields, state, records, `declared_op`. |
+| `POST /v1/indexes/<name>/scan` `{"eq":{…},"min"?,"max"?,"descending"?,"limit"?,"after"?}` | A page of the records with these `eq` values, by order from `min` to `max`, each with its `id`, `op`, `order`, `value_hex` and `fields`; `next` is the next page's `after`, or null. `503` while the index builds. |
 
-64-bit numbers (ids, ops, cursors) are decimal strings; values are the 80 bytes as hex. Layouts
-live in the log, in a reserved catalog table; the core still stores bytes and never reads them.
+64-bit numbers (ids, ops, cursors) are decimal strings; values are the 80 bytes as hex. A
+record table's ids are 16 bytes as 32 hex digits, given back as sent, and its values 448 bytes;
+`/v1/lookup` reads rows or records, not both in one request, and `/v1/changes`, `/v1/history`
+and `/v1/row` serve both. Layouts live in the log, in a reserved catalog table; the core still
+stores bytes and never reads them. A record table's layout packs up to 448 bytes, a bytes field
+up to 255.
+
+```bash
+curl -X PUT -H 'X-Nerva-Key: secret' http://127.0.0.1:8080/v1/tables/2147483649 -d '{"name":"executions",
+  "fields":[{"name":"agent","type":"bytes","size":16},{"name":"status","type":"u8"},
+            {"name":"created","type":"u64"},{"name":"amount","type":"u64"}]}'
+# A balance (row) and the fact of its move (record) in one transaction:
+curl -H 'X-Nerva-Key: secret' http://127.0.0.1:8080/v1/commit -d '{"key":"<32 hex digits>","entries":[
+  {"kind":"add","table":7,"id":"1","field":"available","delta":"-30","min":"0"},
+  {"kind":"put","table":2147483649,"id":"0190f1c2a7e47b3c9d2e5f6a7b8c9d0e",
+   "fields":{"agent":"…","status":1,"created":"1760600000","amount":"30"}}]}'
+curl -X PUT -H 'X-Nerva-Key: secret' http://127.0.0.1:8080/v1/indexes/reserved -d '{"table":2147483649,
+  "order":"created","where":[{"field":"status","op":"eq","value":1}]}'
+curl -H 'X-Nerva-Key: secret' http://127.0.0.1:8080/v1/indexes/reserved/scan -d '{"max":"1760599000","limit":100}'
+```
 
 Both gateways (`nerva api`, `nerva view`) execute one request at a time but read up to 16
 connections at once, so a slow client holds up nobody; with all 16 busy, a new connection
@@ -387,7 +429,7 @@ be transactional (N76). A `get` reads at most as many chunks as 256 documents of
 | `POST /v1/documents/commit` `{"namespace","reads":[{"key","version"}],"writes":[{"key","value_hex"} or {"key","delete":true}]}` | One transaction. `200` committed with its `op`; `409` with the stale read's `key` and current `version`; `400` invalid. About 600 KB of keys and values per commit. |
 | `GET /v1/documents/changes?namespace=&cursor=&limit=` | The namespace's document writes in commit order (`key`, `op`, `kind` put or delete, `value_hex`), paged like `/v1/changes`. |
 
-`zig build test:api` checks every route against a model (documents included), races eight
+`zig build test:api` checks every route against a model (documents, records and indexes included), races eight
 writers on one row and on one document, races fifty reservations on one budget with adds
 (none retried), and races fifty clamped reservations on one ledger account (below).
 
@@ -458,7 +500,9 @@ curl -H 'X-Nerva-Key: secret' 'http://127.0.0.1:8080/v1/views/revenue?as_of=1234
 ```
 
 `where` ANDs comparisons (`eq`, `ne`, `lt`, `le`, `gt`, `ge`) on numeric and bool fields;
-`group_by` takes up to three fields; aggregates are `count`, `sum`, `min` and `max`.
+`group_by` takes up to three fields; aggregates are `count`, `sum`, `min` and `max`. A view over
+a record table takes `count` and `sum` only, and is served by `nerva api`, not `nerva view`
+(P123d).
 
 **Maintained by the replicas** (N52, N62, N66). The state machine keeps every view inside every
 commit, like the rows: each write updates its row's groups, and every replica holds the same
@@ -534,6 +578,12 @@ fails to fit after earlier transactions of the same request answers `503 views_b
 A view of more than 10,000 groups is read in pages. A table's views have at most four `min` and
 `max` aggregates between them.
 
+**Records and indexes:** a record's value is 448 bytes; a layout's bytes field in it at most
+255. A lookup reads at most about 2,000 records, and a page of the feed or a history about
+2,000 changes. At most 64 indexes, 4 per table; an index has up to three `eq` fields of 64
+bytes between them, and four `where` clauses. A scan returns at most about 2,000 records (1,024
+through `nerva api`). A view over records takes `count` and `sum` only.
+
 **Client sessions:** a cluster holds 64 client sessions. Every gateway, `nerva view` and Zig
 client takes one; a 65th evicts the session that committed least recently, whose next request
 fails (gateways reconnect on their own).
@@ -574,7 +624,10 @@ The 1.0 target is in [docs/GOALS-1.0.md](./docs/GOALS-1.0.md).
    recomputes them as a check.)
 5. **Snapshots and subscriptions** — reads as of op `N` ✅ (`get_history`, `row?as_of=`, views
    `as_of`); change cursors ✅ (`get_changes`); view snapshots.
-6. **Object storage tiering**, external operators, effect sinks.
+6. **Facts beside money** — commit keys, records with 128-bit ids and declared indexes, written
+   in the transaction that moves the money (P123, P123b, P123c). ✅ Index reads as of a past op,
+   and retention of keys and facts, are next.
+7. **Object storage tiering**, external operators, effect sinks.
 
 ## License
 
