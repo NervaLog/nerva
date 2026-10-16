@@ -336,7 +336,12 @@ fn command_export(gpa: std.mem.Allocator, args: *const cli.Command.Export) !void
     defer client.deinit();
 
     var buffered = std.io.bufferedWriter(file.writer());
-    var writer = try export_file.WriterType(@TypeOf(buffered).Writer).init(buffered.writer());
+    // Version 1 unless the cluster holds records or indexes (P123b), so that the release
+    // before can import it.
+    var writer = try export_file.WriterType(@TypeOf(buffered).Writer).init(
+        buffered.writer(),
+        try export_.format_version(&client),
+    );
     const summary = try export_.run(gpa, &client, &writer, args.as_of);
     try buffered.flush();
     try file.sync();

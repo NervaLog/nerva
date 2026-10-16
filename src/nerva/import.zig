@@ -71,7 +71,12 @@ pub const Plan = struct {
     timestamp_max: u64,
     /// The most changes of one op.
     op_changes_max: u64,
+    /// The most changes of one op that writes records (P123b): restored by `commit_wide`.
+    op_changes_wide_max: u64,
     views: [nerva.views_max]PlanView,
+    indexes: [nerva.indexes_max]export_file.Index,
+    /// By table.
+    checks_records: []const export_file.CheckRecords,
     ledgers: [nerva.ledgers_max]export_file.Ledger,
     checks_view: [nerva.views_max]export_file.CheckView,
     checks_ledger: [nerva.ledgers_max]export_file.CheckLedger,
@@ -84,6 +89,10 @@ pub const Plan = struct {
 
     pub fn ledger_slice(plan_: *const Plan) []const export_file.Ledger {
         return plan_.ledgers[0..plan_.summary.ledger_count];
+    }
+
+    pub fn index_slice(plan_: *const Plan) []const export_file.Index {
+        return plan_.indexes[0..plan_.summary.index_count];
     }
 };
 
@@ -102,13 +111,19 @@ pub fn plan(arena: std.mem.Allocator, path: []const u8) !Plan {
         .origin = undefined,
         .timestamp_max = 0,
         .op_changes_max = 0,
+        .op_changes_wide_max = 0,
         .views = undefined,
+        .indexes = undefined,
         .ledgers = undefined,
         .checks_view = undefined,
         .checks_ledger = undefined,
         .checks_table = &.{},
+        .checks_records = &.{},
     };
     var checks_table = std.ArrayList(export_file.CheckTable).init(arena);
+    var checks_records = std.ArrayList(export_file.CheckRecords).init(arena);
+    var index_count: u32 = 0;
+    var op_records = false;
     var catalog_rows: CatalogRows = .{};
     var view_count: u32 = 0;
     var ledger_count: u32 = 0;
@@ -126,9 +141,11 @@ pub fn plan(arena: std.mem.Allocator, path: []const u8) !Plan {
                 return error.Refused;
             }
             result.timestamp_max = change.timestamp;
+            if (change.op != op_last) op_records = false;
             op_changes = if (change.op == op_last) op_changes + 1 else 1;
             op_last = change.op;
             result.op_changes_max = @max(result.op_changes_max, op_changes);
+            if (op_records) result.op_changes_wide_max = @max(result.op_changes_wide_max, op_changes);
             if (change.table != catalog.table_catalog) continue;
             if (change.kind == .put) {
                 if (catalog_rows.count() == catalog_rows_max and
@@ -160,12 +177,34 @@ pub fn plan(arena: std.mem.Allocator, path: []const u8) !Plan {
         },
         .check_table => |*check| try checks_table.append(check.*),
         .summary => |*summary| result.summary = summary.*,
+        .record_change => |*change| {
+            if (change.timestamp > timestamp_restore_max) {
+                log.err("a change's timestamp {} is past {}", .{
+                    change.timestamp,
+                    timestamp_restore_max,
+                });
+                return error.Refused;
+            }
+            result.timestamp_max = change.timestamp;
+            op_changes = if (change.op == op_last) op_changes + 1 else 1;
+            op_last = change.op;
+            op_records = true;
+            result.op_changes_max = @max(result.op_changes_max, op_changes);
+            result.op_changes_wide_max = @max(result.op_changes_wide_max, op_changes);
+        },
+        .index => |*index| {
+            result.indexes[index_count] = index.*;
+            index_count += 1;
+        },
+        .check_records => |*check| try checks_records.append(check.*),
     };
     // The reader returns null only once everything checked.
     result.origin = reader.digest;
     assert(view_count == result.summary.view_count);
     assert(ledger_count == result.summary.ledger_count);
+    assert(index_count == result.summary.index_count);
     result.checks_table = checks_table.items;
+    result.checks_records = checks_records.items;
 
     if (result.summary.as_of == 0) return export_file.corrupt("the export's op is zero");
     if (result.summary.as_of > as_of_max) {
@@ -186,6 +225,23 @@ pub fn plan(arena: std.mem.Allocator, path: []const u8) !Plan {
             }
         }
         view.definition = try view_definition(arena, &catalog_rows, &view.record);
+    }
+    declared_op_last = 0;
+    for (result.index_slice()) |*index| {
+        if (index.declared_op <= declared_op_last or index.declared_op > result.summary.as_of) {
+            return export_file.corrupt("indexes are out of op order, or past the export's op");
+        }
+        declared_op_last = index.declared_op;
+        for (result.view_slice()) |*view| {
+            if (view.record.declared_op == index.declared_op) {
+                return export_file.corrupt("a view and an index are declared at one op");
+            }
+        }
+        for (result.ledger_slice()) |*ledger| {
+            if (ledger.op == index.declared_op) {
+                return export_file.corrupt("a ledger and an index are declared at one op");
+            }
+        }
     }
     // The checks name what they check, in the declarations' order; pass 2 asserts it (#78).
     for (result.view_slice(), result.checks_view[0..check_view_count], 1..) |*view, *check, id| {
@@ -335,6 +391,14 @@ pub fn ImporterType(comptime Storage: type) type {
             state_machine.open(Wait.state_machine_done);
             Wait.run(storage);
 
+            if (plan_.op_changes_wide_max > state_machine.restore_changes_wide_max()) {
+                log.err("an op has {} changes of records and rows; this release restores at " ++
+                    "most {} per op", .{
+                    plan_.op_changes_wide_max,
+                    state_machine.restore_changes_wide_max(),
+                });
+                return error.Refused;
+            }
             if (plan_.op_changes_max > state_machine.restore_changes_max()) {
                 log.err("an op has {} changes; this release restores at most {} per op", .{
                     plan_.op_changes_max,
@@ -361,9 +425,14 @@ pub fn ImporterType(comptime Storage: type) type {
                     constants.message_body_size_max,
                 ),
                 .changes = try gpa.alloc(nerva.Change, state_machine.restore_changes_max()),
+                .changes_wide = try gpa.alloc(
+                    nerva.RecordChange,
+                    state_machine.restore_changes_wide_max(),
+                ),
             };
             defer gpa.free(restore.body);
             defer gpa.free(restore.changes);
+            defer gpa.free(restore.changes_wide);
             // Registered last, so it runs first on an error (#78): the writes in flight land before
             // the grid's and state machine's buffers are freed and the file is closed.
             errdefer flush(storage);
@@ -411,6 +480,8 @@ pub fn ImporterType(comptime Storage: type) type {
             body: []align(constants.cache_line_size) u8,
             /// One op's changes.
             changes: []nerva.Change,
+            /// One op's changes, when it writes records: rows' and records' (P123b).
+            changes_wide: []nerva.RecordChange,
 
             /// Restores ops 1 to the trigger of the first checkpoint at or after the export's
             /// op, compacting after each and checkpointing at each trigger.
@@ -433,13 +504,15 @@ pub fn ImporterType(comptime Storage: type) type {
                 const Reader = export_file.ReaderType(@TypeOf(buffered).Reader);
                 var reader = try Reader.init(buffered.reader());
 
-                var pending: ?export_file.Change = null;
+                var pending: ?Pending = null;
                 var changes_done = false;
                 var view_index: u32 = 0;
                 var ledger_index: u32 = 0;
+                var index_index: u32 = 0;
                 var ops_restored: u64 = 0;
                 const views = restore.plan.view_slice();
                 const ledgers_ = restore.plan.ledger_slice();
+                const indexes_ = restore.plan.index_slice();
                 var checkpoint_previous: u64 = 0;
                 var op: u64 = 1;
                 while (op <= trigger_final) : (op += 1) {
@@ -448,7 +521,7 @@ pub fn ImporterType(comptime Storage: type) type {
                             pending = try change_next(&reader);
                             changes_done = pending == null;
                         }
-                        const change_op = if (pending) |change| change.op else null;
+                        const change_op = if (pending) |change| change.op() else null;
                         const view = if (view_index < views.len and
                             views[view_index].record.declared_op == op)
                             &views[view_index]
@@ -459,10 +532,15 @@ pub fn ImporterType(comptime Storage: type) type {
                             &ledgers_[ledger_index]
                         else
                             null;
+                        const index = if (index_index < indexes_.len and
+                            indexes_[index_index].declared_op == op)
+                            &indexes_[index_index]
+                        else
+                            null;
                         if (change_op != null and change_op.? < op) {
                             return export_file.corrupt("changes are out of op order");
                         }
-                        if (view != null or ledger != null) {
+                        if (view != null or ledger != null or index != null) {
                             if (change_op == op) {
                                 log.err("op {} both declares and changes rows", .{op});
                                 return export_file.corrupt("an op both declares and writes");
@@ -470,25 +548,43 @@ pub fn ImporterType(comptime Storage: type) type {
                             if (view) |declared| {
                                 try restore.view_restore(op, declared);
                                 view_index += 1;
-                            } else {
-                                try restore.ledger_restore(op, &ledger.?.definition);
+                            } else if (ledger) |declared| {
+                                try restore.ledger_restore(op, &declared.definition);
                                 ledger_index += 1;
+                            } else {
+                                try restore.index_restore(op, index.?);
+                                index_index += 1;
                             }
                             ops_restored += 1;
                         } else if (change_op == op) {
+                            // Rows' changes alone restore as `commit`; with records', as
+                            // `commit_wide` (P123b).
                             var count: u32 = 0;
+                            var records = false;
                             while (pending) |change| {
-                                if (change.op != op) break;
+                                if (change.op() != op) break;
                                 // Checked by pass 1, unless the file changed since.
                                 if (count == restore.changes.len) {
                                     return export_file.corrupt("an op has too many changes");
                                 }
-                                restore.changes[count] = change_from_record(&change);
+                                switch (change) {
+                                    .row => |*row| restore.changes[count] = change_from_record(row),
+                                    .record => records = true,
+                                }
+                                if (count < restore.changes_wide.len) {
+                                    restore.changes_wide[count] = change.wide();
+                                } else if (records) {
+                                    return export_file.corrupt("an op has too many changes");
+                                }
                                 count += 1;
                                 pending = try change_next(&reader);
                                 changes_done = pending == null;
                             }
-                            try restore.changes_restore(op, restore.changes[0..count]);
+                            if (records) {
+                                try restore.changes_restore_wide(op, restore.changes_wide[0..count]);
+                            } else {
+                                try restore.changes_restore(op, restore.changes[0..count]);
+                            }
                             ops_restored += 1;
                         }
                     }
@@ -516,7 +612,9 @@ pub fn ImporterType(comptime Storage: type) type {
                 }
                 assert(checkpoint_previous == checkpoint_final);
                 log.info("{} ops restored", .{ops_restored});
-                if (pending != null or view_index != views.len or ledger_index != ledgers_.len) {
+                if (pending != null or view_index != views.len or ledger_index != ledgers_.len or
+                    index_index != indexes_.len)
+                {
                     return export_file.corrupt("records past the export's op");
                 }
                 // The rest of the export, read again: its SHA-256 must still match (the file
@@ -527,12 +625,49 @@ pub fn ImporterType(comptime Storage: type) type {
                 while (try reader.next()) |_| {}
             }
 
+            /// A change of a row or of a record.
+            const Pending = union(enum) {
+                row: export_file.Change,
+                record: export_file.RecordChange,
+
+                fn op(pending: *const Pending) u64 {
+                    return switch (pending.*) {
+                        inline else => |*change| change.op,
+                    };
+                }
+
+                /// As `restore_entries_wide` takes it.
+                fn wide(pending: *const Pending) nerva.RecordChange {
+                    var change: nerva.RecordChange = undefined;
+                    switch (pending.*) {
+                        inline else => |*recorded| {
+                            change = .{
+                                .id = recorded.id,
+                                .table = recorded.table,
+                                .kind = switch (recorded.kind) {
+                                    .put => .put,
+                                    .delete => .delete,
+                                    _ => unreachable, // Refused by the reader.
+                                },
+                                .flags = .{},
+                                .op = recorded.op,
+                                .timestamp = recorded.timestamp,
+                                .value = @splat(0),
+                            };
+                            change.value[0..recorded.value.len].* = recorded.value;
+                        },
+                    }
+                    return change;
+                }
+            };
+
             /// The next change, or null once the changes' section has ended.
-            fn change_next(reader: anytype) !?export_file.Change {
-                if (reader.section > @intFromEnum(export_file.RecordKind.change)) return null;
+            fn change_next(reader: anytype) !?Pending {
+                if (reader.section > 1) return null; // The changes' section (`RecordKind`).
                 const record = try reader.next() orelse return null;
                 return switch (record) {
-                    .change => |change| change,
+                    .change => |change| .{ .row = change },
+                    .record_change => |change| .{ .record = change },
                     else => null,
                 };
             }
@@ -568,6 +703,47 @@ pub fn ImporterType(comptime Storage: type) type {
                     log.err("op {}: {} changes: {s}", .{ op, changes.len, @errorName(err) });
                     return error.Refused;
                 };
+            }
+
+            fn changes_restore_wide(
+                restore: *Restore,
+                op: u64,
+                changes: []const nerva.RecordChange,
+            ) !void {
+                const state_machine = restore.state_machine;
+                const size = state_machine.restore_entries_wide(changes, restore.body);
+                Wait.pending = true;
+                state_machine.restore_prefetch(
+                    Wait.state_machine_done,
+                    op,
+                    .commit_wide,
+                    restore.body[0..size],
+                );
+                Wait.run(restore.storage);
+                state_machine.restore_changes_wide(op, changes, &restore.timestamp_next) catch |err| {
+                    log.err("op {}: {} changes: {s}", .{ op, changes.len, @errorName(err) });
+                    return error.Refused;
+                };
+            }
+
+            fn index_restore(restore: *Restore, op: u64, index: *const export_file.Index) !void {
+                const state_machine = restore.state_machine;
+                const bytes = std.mem.asBytes(&index.definition);
+                stdx.copy_disjoint(.inexact, u8, restore.body, bytes);
+                Wait.pending = true;
+                state_machine.restore_prefetch(
+                    Wait.state_machine_done,
+                    op,
+                    .declare_index,
+                    restore.body[0..bytes.len],
+                );
+                Wait.run(restore.storage);
+                state_machine.restore_index(
+                    op,
+                    &index.definition,
+                    index.id,
+                    &restore.timestamp_next,
+                ) catch return error.Refused;
             }
 
             fn view_restore(restore: *Restore, op: u64, view: *const PlanView) !void {
@@ -821,12 +997,127 @@ pub fn ImporterType(comptime Storage: type) type {
                         failed = true;
                     }
                 }
+                failed = !(try records_check_run(restore, gpa, snapshot)) or failed;
+                assert(state_machine.restore_indexes().len == restore.plan.summary.index_count);
+
                 if (failed) return error.ChecksFailed;
-                log.info("checks passed: {} views, {} ledgers, {} tables", .{
+                log.info("checks passed: {} views, {} ledgers, {} tables, {} record tables " ++
+                    "({} indexes build in the new cluster)", .{
                     views.len,
                     ledgers_.len,
                     restore.plan.checks_table.len,
+                    restore.plan.checks_records.len,
+                    restore.plan.summary.index_count,
                 });
+            }
+        };
+
+        /// Whether every record table's live records match its check (P123b).
+        fn records_check_run(
+            restore: anytype,
+            gpa: std.mem.Allocator,
+            snapshot: u64,
+        ) !bool {
+            const page_records = try gpa.alloc(nerva.Record, check_rows_page);
+            defer gpa.free(page_records);
+            var scan: ScanRecords = .{ .records = page_records };
+            const checks = restore.plan.checks_records;
+            var check_index: usize = 0;
+            var failed = false;
+            var key_min: u128 = @as(u128, nerva.record_tables_min) << 96;
+            var table: u32 = 0;
+            var count: u64 = 0;
+            var hash = std.crypto.hash.sha2.Sha256.init(.{});
+            while (true) {
+                const page = scan.read(restore.storage, restore.state_machine, snapshot, key_min);
+                for (page) |*record| {
+                    if (record.flags.deleted) continue;
+                    if (record.table != table) {
+                        if (count > 0) {
+                            failed = !records_table_check(checks, &check_index, table, count, &hash) or
+                                failed;
+                        }
+                        table = record.table;
+                        count = 0;
+                        hash = std.crypto.hash.sha2.Sha256.init(.{});
+                    }
+                    count += 1;
+                    export_file.records_hash_update(&hash, table, record.id, record.op, &record.value);
+                }
+                if (page.len < page_records.len) break;
+                key_min = page[page.len - 1].key + 1;
+            }
+            if (count > 0) {
+                failed = !records_table_check(checks, &check_index, table, count, &hash) or failed;
+            }
+            if (check_index != checks.len) {
+                log.err("record table {}: no records here; the export has {}", .{
+                    checks[check_index].table,
+                    checks[check_index].record_count,
+                });
+                failed = true;
+            }
+            return !failed;
+        }
+
+        fn records_table_check(
+            checks: []const export_file.CheckRecords,
+            check_index: *usize,
+            table: u32,
+            count: u64,
+            hash: *std.crypto.hash.sha2.Sha256,
+        ) bool {
+            if (check_index.* < checks.len and checks[check_index.*].table < table) {
+                log.err("record table {}: no records here; the export has {}", .{
+                    checks[check_index.*].table,
+                    checks[check_index.*].record_count,
+                });
+                check_index.* += 1;
+                return false;
+            }
+            if (check_index.* == checks.len or checks[check_index.*].table != table) {
+                log.err("record table {}: {} records here; none in the export", .{ table, count });
+                return false;
+            }
+            const check = &checks[check_index.*];
+            check_index.* += 1;
+            const digest = hash.finalResult();
+            if (check.record_count != count or !std.mem.eql(u8, &digest, &check.records_hash)) {
+                log.err("record table {}: {} records here; {} in the export, or another hash", .{
+                    table,
+                    count,
+                    check.record_count,
+                });
+                return false;
+            }
+            return true;
+        }
+
+        const ScanRecords = struct {
+            records: []nerva.Record,
+            results: ?[]const nerva.Record = null,
+
+            fn read(
+                scan: *ScanRecords,
+                storage: *Storage,
+                state_machine: *StateMachine,
+                snapshot: u64,
+                key_min: u128,
+            ) []const nerva.Record {
+                assert(scan.results == null);
+                assert(current == null);
+                current = scan;
+                defer current = null;
+                state_machine.restore_scan_records(callback, snapshot, key_min, scan.records);
+                while (scan.results == null) storage.run();
+                defer scan.results = null;
+                return scan.results.?;
+            }
+
+            var current: ?*ScanRecords = null;
+
+            fn callback(_: *StateMachine, results: []const nerva.Record) void {
+                current.?.results = results;
             }
         };
 

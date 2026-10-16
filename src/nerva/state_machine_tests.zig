@@ -3203,3 +3203,176 @@ test "restore: the rules a commit checks are not checked again" {
         restore_op(context, context.op, &.{absent}, null, &timestamp_next),
     );
 }
+
+// ---- Restoring records and indexes (P123b, P123c) ----
+
+/// Restores one op of rows' and records' changes, as `nerva import` does for an op that writes
+/// records.
+fn restore_op_wide(
+    context: *Context,
+    op: u64,
+    changes: []const nerva.RecordChange,
+    timestamp_next: *u64,
+) !void {
+    assert(op >= context.op);
+    while (context.op < op) context.op_end();
+    const state_machine = &context.state_machine;
+    const size = state_machine.restore_entries_wide(changes, context.request);
+    context.prefetching = true;
+    state_machine.restore_prefetch(prefetch_callback_restore, op, .commit_wide, context.request[0..size]);
+    while (context.prefetching) context.storage.run();
+    defer context.op_end();
+    try state_machine.restore_changes_wide(op, changes, timestamp_next);
+}
+
+fn restore_index_op(
+    context: *Context,
+    op: u64,
+    id: u64,
+    definition: nerva.IndexDefinition,
+    timestamp_next: *u64,
+) !void {
+    assert(op >= context.op);
+    while (context.op < op) context.op_end();
+    const state_machine = &context.state_machine;
+    stdx.copy_disjoint(.inexact, u8, context.request, std.mem.asBytes(&definition));
+    context.prefetching = true;
+    state_machine.restore_prefetch(
+        prefetch_callback_restore,
+        op,
+        .declare_index,
+        context.request[0..@sizeOf(nerva.IndexDefinition)],
+    );
+    while (context.prefetching) context.storage.run();
+    defer context.op_end();
+    try state_machine.restore_index(op, &definition, id, timestamp_next);
+}
+
+/// Both feeds, merged by timestamp, as `nerva export` writes them: rows' changes widened.
+fn changes_all_wide(context: *Context) ![]const nerva.RecordChange {
+    var all = std.ArrayList(nerva.RecordChange).init(context.arena);
+    for (try changes_all(context)) |*change| {
+        var wide_change: nerva.RecordChange = .{
+            .id = change.id,
+            .table = change.table,
+            .kind = change.kind,
+            .flags = .{},
+            .op = change.op,
+            .timestamp = change.timestamp,
+            .value = @splat(0),
+        };
+        wide_change.value[0..nerva.value_size].* = change.value;
+        try all.append(wide_change);
+    }
+    var cursor: u64 = 0;
+    while (true) {
+        const page = try context.record_changes(cursor, StateMachine.record_changes_limit_max);
+        const end = page[page.len - 1];
+        try all.appendSlice(page[0 .. page.len - 1]);
+        if (!end.flags.more) break;
+        cursor = end.timestamp;
+    }
+    std.mem.sortUnstable(nerva.RecordChange, all.items, {}, struct {
+        fn less_than(_: void, a: nerva.RecordChange, b: nerva.RecordChange) bool {
+            return a.timestamp < b.timestamp;
+        }
+    }.less_than);
+    return all.items;
+}
+
+test "restore: records, an index and a record view restored at their ops read as committed" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const original = try context_init(&arena);
+
+    const index_definition = executions_by_status("by_status", true);
+    const declared_index = try original.declare_index(index_definition);
+    _ = original.pulse_until_ready();
+    for (0..12) |round| {
+        _ = try original.commit_wide(&.{
+            &.{
+                execution(id_wide + round % 5, @intCast(1 + round % 3), 100 - round, @intCast(round)),
+                wide(put(1, round, @intCast(round))),
+            },
+            &.{call(id_wide + 1000 + round, if (round % 2 == 0) "openai" else "claude", round)},
+        });
+        if (round % 4 == 3) _ = try original.commit_wide(&.{&.{record_delete(id_wide + round % 5)}});
+        _ = try original.commit(&.{&.{put(1, 100 + round, 1)}}); // An op of rows alone.
+    }
+    const view_declared = try original.declare(spend_by_provider());
+    _ = original.pulse_until_ready();
+    _ = try original.commit_wide(&.{&.{call(id_wide + 1000, "gemini", 5)}});
+    const as_of = original.op - 1;
+
+    const changes = try changes_all_wide(original);
+    const restored = try context_init(&arena);
+    var timestamp_next = changes[changes.len - 1].timestamp + StateMachine.entry_timestamps;
+    var index: usize = 0;
+    var op: u64 = 1;
+    while (op <= as_of) : (op += 1) {
+        if (op == declared_index.op) {
+            try restore_index_op(restored, op, declared_index.index_id, index_definition, &timestamp_next);
+        } else if (op == view_declared.op) {
+            try restore_op(restored, op, &.{}, .{ .view = .{
+                .id = view_declared.view_id,
+                .definition = spend_by_provider(),
+            } }, &timestamp_next);
+        } else {
+            const start = index;
+            var records = false;
+            while (index < changes.len and changes[index].op == op) : (index += 1) {
+                records = records or nerva.table_is_record(changes[index].table);
+            }
+            if (index == start) continue;
+            if (records) {
+                try restore_op_wide(restored, op, changes[start..index], &timestamp_next);
+            } else {
+                var narrow = std.ArrayList(Change).init(arena.allocator());
+                for (changes[start..index]) |*change| {
+                    try narrow.append(.{
+                        .id = @intCast(change.id),
+                        .table = change.table,
+                        .kind = change.kind,
+                        .flags = .{},
+                        .op = change.op,
+                        .timestamp = change.timestamp,
+                        .value = change.value[0..nerva.value_size].*,
+                    });
+                }
+                try restore_op(restored, op, narrow.items, null, &timestamp_next);
+            }
+        }
+    }
+    try testing.expectEqual(changes.len, index);
+    while (restored.op <= as_of) restored.op_end();
+
+    // Both feeds and every record, as committed.
+    const changes_restored = try changes_all_wide(restored);
+    try testing.expectEqual(changes.len, changes_restored.len);
+    for (changes, changes_restored) |expected, actual| {
+        try testing.expect(stdx.equal_bytes(nerva.RecordChange, &expected, &actual));
+    }
+    for (0..5) |i| {
+        const expected = try original.lookup_record(records_table, id_wide + i);
+        const actual = try restored.lookup_record(records_table, id_wide + i);
+        try testing.expectEqual(expected.flags, actual.flags);
+        try testing.expectEqual(expected.op, actual.op);
+        try testing.expectEqual(expected.value, actual.value);
+    }
+    // The index and the view build in the new cluster, then answer as the original's.
+    try testing.expect(restored.pulse_until_ready() > 0);
+    for (1..4) |status| {
+        try testing.expectEqualSlices(
+            u128,
+            try scan_all(original, status_query(@intCast(status), 3, .{})),
+            try scan_all(restored, status_query(@intCast(status), 3, .{})),
+        );
+    }
+    try testing.expectEqual(
+        (try view_header(original, view_declared.view_id, 0)).hash,
+        (try view_header(restored, view_declared.view_id, 0)).hash,
+    );
+    // A resent record's write commits on.
+    const results = try restored.commit_wide(&.{&.{execution(id_wide + 77, 1, 5, 5)}});
+    try expect_statuses(results[0], &.{.ok});
+}

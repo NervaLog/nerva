@@ -758,6 +758,7 @@ pub fn StateMachineType(comptime Storage: type) type {
         /// A view's restore: whether its table had any row (a tombstone counts) at its op.
         restore_table_rows: ?bool = null,
         restore_scan_callback: ?*const fn (*StateMachine, []const Row) void = null,
+        restore_scan_records_callback: ?*const fn (*StateMachine, []const Record) void = null,
 
         pub fn init(
             self: *StateMachine,
@@ -1209,6 +1210,7 @@ pub fn StateMachineType(comptime Storage: type) type {
                 .get_record_history,
                 .declare_index,
                 .scan_index,
+                .get_index,
                 => message_body_used,
             };
             self.prepare_timestamp +=
@@ -1231,6 +1233,7 @@ pub fn StateMachineType(comptime Storage: type) type {
                 .get_record_changes,
                 .get_record_history,
                 .scan_index,
+                .get_index,
                 => 0,
             };
         }
@@ -1252,6 +1255,7 @@ pub fn StateMachineType(comptime Storage: type) type {
                 .get_record_history,
                 .declare_index,
                 .scan_index,
+                .get_index,
                 => 0,
             };
         }
@@ -1305,7 +1309,7 @@ pub fn StateMachineType(comptime Storage: type) type {
                 .lookup_records => self.prefetch_records_lookup(message_body_used),
                 .get_record_changes => self.prefetch_record_changes(message_body_used),
                 .get_record_history => self.prefetch_record_history(message_body_used),
-                .declare_index, .scan_index => self.prefetch_indexes(),
+                .declare_index, .scan_index, .get_index => self.prefetch_indexes(),
                 .get_changes => self.prefetch_changes(message_body_used),
                 .get_history => self.prefetch_history(message_body_used),
                 .get_view, .pulse => self.prefetch_views(),
@@ -1611,7 +1615,7 @@ pub fn StateMachineType(comptime Storage: type) type {
             switch (self.prefetch_operation.?) {
                 .commit, .commit_wide => self.prefetch_commit_rows(),
                 .pulse => self.prefetch_backfill_rows(),
-                .declare_index => self.prefetch_finish(),
+                .declare_index, .get_index => self.prefetch_finish(),
                 .scan_index => self.prefetch_index_scan(),
                 else => unreachable,
             }
@@ -1891,6 +1895,27 @@ pub fn StateMachineType(comptime Storage: type) type {
             self.indexes_op_count += 1;
             self.index_count = self.indexes_op_count;
             return .{ .status = .created, .index_id = index.id, .op = op };
+        }
+
+        fn execute_get_index(
+            self: *StateMachine,
+            message_body_used: []align(constants.cache_line_size) const u8,
+            output_buffer: *align(constants.cache_line_size) [constants.message_body_size_max]u8,
+        ) usize {
+            assert(message_body_used.len == @sizeOf(nerva.IndexGet));
+            const query = std.mem.bytesToValue(
+                nerva.IndexGet,
+                message_body_used[0..@sizeOf(nerva.IndexGet)],
+            );
+            const result: *Index =
+                @alignCast(std.mem.bytesAsValue(Index, output_buffer[0..@sizeOf(Index)]));
+            result.* = std.mem.zeroes(Index);
+            if (stdx.zeroed(&query.reserved) and query.id >= 1 and
+                query.id <= self.indexes_op_count)
+            {
+                result.* = self.indexes_op[query.id - 1];
+            }
+            return @sizeOf(Index);
         }
 
         fn index_query(body: []align(constants.cache_line_size) const u8) *const IndexQuery {
@@ -2507,6 +2532,7 @@ pub fn StateMachineType(comptime Storage: type) type {
                     output_buffer,
                 ),
                 .scan_index => self.execute_scan_index(op, message_body_used, output_buffer),
+                .get_index => self.execute_get_index(message_body_used, output_buffer),
             };
         }
 
@@ -2569,6 +2595,7 @@ pub fn StateMachineType(comptime Storage: type) type {
                     .get_record_history,
                     .declare_index,
                     .scan_index,
+                    .get_index,
                     => comptime unreachable,
                 };
                 reply_encoder.add(@intCast(bytes_written));
@@ -4811,8 +4838,9 @@ pub fn StateMachineType(comptime Storage: type) type {
             body: []align(constants.cache_line_size) const u8,
         ) void {
             assert(!self.restoring);
-            assert(operation == .commit or operation == .declare_view or
-                operation == .declare_ledger);
+            assert(operation == .commit or operation == .commit_wide or
+                operation == .declare_view or operation == .declare_ledger or
+                operation == .declare_index);
             self.restoring = true;
             self.prefetch(callback, op, op, operation, body);
         }
@@ -4828,6 +4856,24 @@ pub fn StateMachineType(comptime Storage: type) type {
             if (definition.table == 0) {
                 self.restore_table_rows = false; // Refused by `view_declare`.
                 return self.prefetch_finish();
+            }
+            if (nerva.table_is_record(definition.table)) {
+                const table: u128 = definition.table;
+                const records = &self.forest.grooves.records;
+                const scan = records.scan_builder.scan_unique_key_range(
+                    .key,
+                    self.forest.scan_buffer_pool.acquire_assume_capacity(),
+                    self.prefetch_snapshot.?,
+                    table << 96,
+                    table << 96 | std.math.maxInt(u96),
+                    .ascending,
+                );
+                self.records_scan_lookup = RecordsScanLookup.init(records, scan);
+                self.records_scan_lookup.read(
+                    self.backfill_records[0..1],
+                    prefetch_restore_table_records_callback,
+                );
+                return;
             }
             const rows = &self.forest.grooves.rows;
             const scan = rows.scan_builder.scan_unique_key_range(
@@ -4853,6 +4899,224 @@ pub fn StateMachineType(comptime Storage: type) type {
             self.forest.scan_buffer_pool.reset();
             self.forest.grooves.rows.scan_builder.reset();
             self.prefetch_finish();
+        }
+
+        fn prefetch_restore_table_records_callback(
+            scan_lookup: *RecordsScanLookup,
+            results: []const Record,
+        ) void {
+            const self: *StateMachine =
+                @alignCast(@fieldParentPtr("records_scan_lookup", scan_lookup));
+            assert(results.len <= 1);
+            self.restore_table_rows = results.len > 0;
+            self.forest.scan_buffer_pool.reset();
+            self.forest.grooves.records.scan_builder.reset();
+            self.prefetch_finish();
+        }
+
+        /// The most changes one op of rows and records restores (`restore_entries_wide`).
+        pub fn restore_changes_wide_max(self: *const StateMachine) u32 {
+            return Operation.commit_wide.event_max(self.batch_size_limit);
+        }
+
+        /// Encodes one op's changes of rows and records (P123b) as the single batch of wide
+        /// entries `restore_prefetch` reads (`commit_wide`). A row's change is a
+        /// `RecordChange` of a row table: its id fits 64 bits, its value 80 bytes.
+        pub fn restore_entries_wide(
+            self: *const StateMachine,
+            changes: []const RecordChange,
+            body: []align(constants.cache_line_size) u8,
+        ) usize {
+            assert(changes.len > 0);
+            assert(changes.len <= self.restore_changes_wide_max());
+            var encoder = MultiBatchEncoder.init(body, .{ .element_size = @sizeOf(WideEntry) });
+            const entries = stdx.bytes_as_slice(.inexact, WideEntry, encoder.writable().?);
+            assert(entries.len >= changes.len);
+            for (changes, entries[0..changes.len]) |*change, *entry| {
+                assert(change.kind == .put or change.kind == .delete);
+                entry.* = .{
+                    .id = change.id,
+                    .table = change.table,
+                    .kind = if (change.kind == .put) .put else .delete,
+                    .op_seen = 0,
+                    .value = change.value,
+                };
+            }
+            encoder.add(@intCast(changes.len * @sizeOf(WideEntry)));
+            const size = encoder.finish();
+            assert(size <= self.batch_size_limit);
+            return size;
+        }
+
+        /// `restore_changes` for an op with records' changes (P123b): rows' and records'
+        /// changes, in timestamp order, as `restore_entries_wide` encoded them (prefetched as
+        /// `commit_wide`). Indexes and views over records are kept as a commit keeps them.
+        pub fn restore_changes_wide(
+            self: *StateMachine,
+            op: u64,
+            changes: []const RecordChange,
+            timestamp_next: *u64,
+        ) RestoreError!void {
+            assert(self.restoring);
+            defer self.restoring = false;
+            assert(changes.len > 0);
+            assert(self.groups_touched.items.len == 0);
+            assert(self.members_touched.items.len == 0);
+            if (self.view_txn_busy.isSet(0)) {
+                assert(self.view_txn_too_large.isSet(0));
+                self.views_finish_abandon();
+                return error.ViewsBudget;
+            }
+            for (changes, 0..) |*change, index| {
+                if (change.op != op) return error.HistoryInvalid;
+                if (!TimestampRange.valid(change.timestamp + entry_timestamps - 1)) {
+                    return error.HistoryInvalid;
+                }
+                if (index > 0 and
+                    change.timestamp < changes[index - 1].timestamp + entry_timestamps)
+                {
+                    return error.HistoryInvalid;
+                }
+                if (change.table == 0) return error.HistoryInvalid;
+                switch (change.kind) {
+                    .put => {},
+                    .delete => if (!stdx.zeroed(&change.value)) return error.HistoryInvalid,
+                    .end => return error.HistoryInvalid,
+                }
+                if (!nerva.table_is_record(change.table)) {
+                    if (change.id > std.math.maxInt(u64)) return error.HistoryInvalid;
+                    if (!stdx.zeroed(change.value[nerva.value_size..])) {
+                        return error.HistoryInvalid;
+                    }
+                    if (change.table == nerva.table_commit_keys) {
+                        if (change.kind != .put) return error.HistoryInvalid;
+                        const stored = std.mem.bytesToValue(
+                            CommitKey,
+                            change.value[0..nerva.value_size],
+                        );
+                        if (stored.key == 0 or !stdx.zeroed(&stored.reserved)) {
+                            return error.HistoryInvalid;
+                        }
+                    }
+                }
+            }
+
+            self.version_timestamp = timestamp_next.*;
+            self.version_timestamp_max = timestamp_next.* + self.versions_reserve(.commit) - 1;
+            assert(TimestampRange.valid(self.version_timestamp_max));
+            for (changes) |*change| {
+                const entry: WideEntry = .{
+                    .id = change.id,
+                    .table = change.table,
+                    .kind = if (change.kind == .put) .put else .delete,
+                    .op_seen = 0,
+                    .value = change.value,
+                };
+                // Checked as the op goes, since an earlier change of the op may have written
+                // the row or record: an error here leaves the op half applied, and the state
+                // machine must be discarded.
+                if (nerva.table_is_record(change.table)) {
+                    const stored = self.record_stored(&entry) catch return error.HistoryInvalid;
+                    const live = if (stored) |record| !record.flags.deleted else false;
+                    switch (change.kind) {
+                        .put => self.record_put(op, change.timestamp, &entry),
+                        .delete => {
+                            if (!live) return error.HistoryInvalid;
+                            self.record_delete(op, change.timestamp, &entry);
+                        },
+                        .end => unreachable,
+                    }
+                } else {
+                    const live = switch (self.forest.grooves.rows.get(entry_row_key(&entry))) {
+                        .found_object => |row| !row.flags.deleted,
+                        .not_found => false,
+                    };
+                    if (change.table == nerva.table_commit_keys and
+                        self.row_version(entry_row_key(&entry)) != 0)
+                    {
+                        return error.HistoryInvalid;
+                    }
+                    switch (change.kind) {
+                        .put => self.row_put(op, change.timestamp, &entry, entry.row_value()),
+                        .delete => {
+                            if (!live) return error.HistoryInvalid;
+                            self.row_delete(op, change.timestamp, &entry);
+                        },
+                        .end => unreachable,
+                    }
+                }
+            }
+            self.views_finish(op);
+            self.indexes_finish();
+            timestamp_next.* = self.version_timestamp;
+        }
+
+        /// Declares an index at its recorded op (P123c), building: the new cluster's pulses
+        /// add the records already written, as they add a view's rows.
+        pub fn restore_index(
+            self: *StateMachine,
+            op: u64,
+            definition: *const IndexDefinition,
+            index_id: u64,
+            timestamp_next: *u64,
+        ) RestoreError!void {
+            assert(self.restoring);
+            defer self.restoring = false;
+            const result = self.index_declare(op, timestamp_next.*, definition);
+            if (result.status != .created or result.index_id != index_id) {
+                log.warn("restore: index {} at op {}: {s} (id {})", .{
+                    index_id,
+                    op,
+                    @tagName(result.status),
+                    result.index_id,
+                });
+                return error.DeclarationRefused;
+            }
+            self.indexes_store();
+            timestamp_next.* += 1;
+        }
+
+        /// The indexes, as the last op restored left them.
+        pub fn restore_indexes(self: *const StateMachine) []const Index {
+            return self.indexes_op[0..self.indexes_op_count];
+        }
+
+        /// Reads the records with keys from `key_min`, tombstones included, in key order, up to
+        /// `records.len` of them, as of `snapshot`: the importer's checks (P123b).
+        pub fn restore_scan_records(
+            self: *StateMachine,
+            callback: *const fn (*StateMachine, []const Record) void,
+            snapshot: u64,
+            key_min: u128,
+            records: []Record,
+        ) void {
+            assert(self.restore_scan_records_callback == null);
+            assert(records.len > 0);
+            self.restore_scan_records_callback = callback;
+            const groove = &self.forest.grooves.records;
+            const scan = groove.scan_builder.scan_unique_key_range(
+                .key,
+                self.forest.scan_buffer_pool.acquire_assume_capacity(),
+                snapshot,
+                key_min,
+                std.math.maxInt(u128),
+                .ascending,
+            );
+            self.records_scan_lookup = RecordsScanLookup.init(groove, scan);
+            self.records_scan_lookup.read(records, restore_scan_records_done);
+        }
+
+        fn restore_scan_records_done(
+            scan_lookup: *RecordsScanLookup,
+            results: []const Record,
+        ) void {
+            const self: *StateMachine =
+                @alignCast(@fieldParentPtr("records_scan_lookup", scan_lookup));
+            self.forest.scan_buffer_pool.reset();
+            self.forest.grooves.records.scan_builder.reset();
+            const callback = self.restore_scan_records_callback.?;
+            self.restore_scan_records_callback = null;
+            callback(self, results);
         }
 
         /// Writes one op's changes with their recorded timestamps, and keeps the views as a

@@ -1147,6 +1147,18 @@ pub fn index_position(prefix: u64, order: u64) u128 {
     return @as(u128, prefix) << 64 | order;
 }
 
+/// The `get_index` event: an index by id (P123c). The result is its `Index`, all zero (state
+/// `missing`) if no index has the id.
+pub const IndexGet = extern struct {
+    id: u64,
+    reserved: [24]u8 = @splat(0),
+
+    comptime {
+        assert(@sizeOf(IndexGet) == 32);
+        assert(stdx.no_padding(IndexGet));
+    }
+};
+
 /// The `scan_index` event: a page of one index's records with one `eq` key, by order, within
 /// `[order_min, order_max]` (order values as `views.integer_ordered` encodes them).
 pub const IndexQuery = extern struct {
@@ -1346,6 +1358,7 @@ pub const Operation = enum(u8) {
     /// Declares an index over a record table, maintained from then on (P123c).
     declare_index = constants.vsr_operations_reserved + 13,
     scan_index = constants.vsr_operations_reserved + 14,
+    get_index = constants.vsr_operations_reserved + 15,
 
     pub fn EventType(comptime operation: Operation) type {
         return switch (operation) {
@@ -1364,6 +1377,7 @@ pub const Operation = enum(u8) {
             .get_record_history => RecordHistoryFilter,
             .declare_index => IndexDefinition,
             .scan_index => IndexQuery,
+            .get_index => IndexGet,
         };
     }
 
@@ -1382,6 +1396,7 @@ pub const Operation = enum(u8) {
             .get_record_changes, .get_record_history => RecordChange,
             .declare_index => DeclareIndexResult,
             .scan_index => IndexRecord,
+            .get_index => Index,
         };
     }
 
@@ -1412,6 +1427,7 @@ pub const Operation = enum(u8) {
             .get_record_history,
             .declare_index,
             .scan_index,
+            .get_index,
             => false,
         };
     }
@@ -1431,6 +1447,7 @@ pub const Operation = enum(u8) {
             .get_record_history,
             .declare_index,
             .scan_index,
+            .get_index,
             => false,
         };
     }
@@ -1486,7 +1503,7 @@ pub const Operation = enum(u8) {
                     operation.result_max(constants.message_body_size_max),
                 );
             },
-            .declare_view, .declare_ledger, .get_ledger, .declare_index => 1,
+            .declare_view, .declare_ledger, .get_ledger, .declare_index, .get_index => 1,
             .pulse => 0,
         };
     }

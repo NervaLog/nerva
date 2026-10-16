@@ -1144,6 +1144,15 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                 .pulse => unreachable, // Sent by the replica, reported to `on_pulse`.
                 .declare_ledger => workload.check_declare_ledger(op, request_body, reply_body),
                 .get_ledger => workload.check_get_ledger(request_body, reply_body),
+                // Records and indexes (P123b, P123c): not sent yet.
+                .commit_wide,
+                .lookup_records,
+                .get_record_changes,
+                .get_record_history,
+                .declare_index,
+                .scan_index,
+                .get_index,
+                => unreachable,
             }
         }
 
@@ -2010,7 +2019,7 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                     for (workload.model_views.items) |*view| {
                         if (view.definition.table != entry.table) continue;
                         var matched = false;
-                        for (views.entry_values(entry, value_old)) |candidate| {
+                        for (views.entry_values([value_size]u8, entry, value_old)) |candidate| {
                             const value = candidate orelse continue;
                             if (!views.row_matches(&view.definition, &value)) continue;
                             matched = true;

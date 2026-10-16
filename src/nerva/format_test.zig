@@ -151,6 +151,7 @@ test "format: wire and storage layouts" {
         nerva.IndexRecord,
         nerva.IndexRecord.Kind,
         @FieldType(nerva.IndexRecord, "flags"),
+        nerva.IndexGet,
     }) |T| try layout_render(writer, T);
 
     // Tree ids name the LSM trees in the data file: never renumber them (CLAUDE.md).
@@ -300,6 +301,7 @@ test "format: wire and storage layouts" {
         \\  get_record_history = 140
         \\  declare_index = 141
         \\  scan_index = 142
+        \\  get_index = 143
         \\nerva.documents.Header: extern struct, size 24
         \\  namespace: offset 0, size 8, u64
         \\  reserved_a: offset 8, size 8, u64
@@ -633,6 +635,9 @@ test "format: wire and storage layouts" {
         \\nerva.IndexRecord.Flags: packed struct, size 1
         \\  more: bit 0, 1 bits, bool
         \\  padding: bit 1, 7 bits, u7
+        \\nerva.IndexGet: extern struct, size 32
+        \\  id: offset 0, size 8, u64
+        \\  reserved: offset 8, size 24, [24]u8
         \\tree_ids:
         \\  Row.timestamp = 1
         \\  Row.key = 2
@@ -753,7 +758,7 @@ test "format: persisted derivations" {
 test "format: the export file" {
     var out = std.ArrayList(u8).init(testing.allocator);
     defer out.deinit();
-    var writer = try export_file.WriterType(std.ArrayList(u8).Writer).init(out.writer());
+    var writer = try export_file.WriterType(std.ArrayList(u8).Writer).init(out.writer(), 1);
 
     var value: [nerva.value_size]u8 = @splat(0);
     value[0] = 0xaa;

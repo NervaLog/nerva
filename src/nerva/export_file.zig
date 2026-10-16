@@ -8,9 +8,14 @@
 //!     record*  size (u32), kind (u32), body (`size` bytes, fixed per kind), CRC-32 of the three
 //!     end      a record of kind `end` whose body is the SHA-256 of every byte before it
 //!
-//! Integers are little-endian. Records come in sections, in this order: changes (strictly by
-//! timestamp), views (by id, 1, 2, …), ledgers (by op), view checks, ledger checks, table checks
-//! (by table), the summary, then `end` and nothing after. The CRC finds a damaged record; the
+//! Integers are little-endian. Records come in sections, in this order: changes (rows' and
+//! records', strictly by timestamp), views (by id, 1, 2, …), ledgers (by op), indexes (by id),
+//! view checks, ledger checks, table checks (by table), record checks (by table), the summary,
+//! then `end` and nothing after.
+//!
+//! Version 2 (P123b) adds records' changes, indexes and record checks, and three counts to the
+//! summary. A writer writes version 1 when it has none of them, so that a release that reads
+//! only version 1 can import it; a reader reads both. The CRC finds a damaged record; the
 //! SHA-256 finds anything else (a record moved, dropped or added). Neither authenticates: an
 //! export is trusted as the data files are.
 
@@ -21,7 +26,7 @@ const stdx = @import("stdx");
 const nerva = @import("../nerva.zig");
 
 pub const magic = "NERVAEXP".*;
-pub const format_version: u32 = 1;
+pub const format_version_max: u32 = 2;
 pub const header_size = magic.len + 4 + 4;
 
 /// Distinct tables one export may check (each has a `check_table` record).
@@ -36,9 +41,15 @@ pub const RecordKind = enum(u32) {
     check_table = 6,
     summary = 7,
     end = 8,
+    // Version 2 (P123b).
+    record_change = 9,
+    index = 10,
+    check_records = 11,
     _,
 
-    fn body_size(kind: RecordKind) ?u32 {
+    /// The body's size in an export of `version`, or null if the kind is not one of its.
+    fn body_size(kind: RecordKind, version: u32) ?u32 {
+        assert(version >= 1 and version <= format_version_max);
         return switch (kind) {
             .change => 4 + 8 + 8 + 8 + 1 + nerva.value_size,
             .view => 32 + 8 + 8,
@@ -46,15 +57,30 @@ pub const RecordKind = enum(u32) {
             .check_view => 8 + 1 + 8 + 32,
             .check_ledger => 4 + 16,
             .check_table => 4 + 8 + 32,
-            .summary => 8 + 8 + 4 + 4 + 4,
+            .summary => if (version == 1) 8 + 8 + 4 + 4 + 4 else 8 + 8 + 4 + 4 + 4 + 8 + 4 + 4,
             .end => 32,
+            .record_change => if (version >= 2) 4 + 16 + 8 + 8 + 1 + nerva.record_value_size else null,
+            .index => if (version >= 2) 8 + 8 + @sizeOf(nerva.IndexDefinition) else null,
+            .check_records => if (version >= 2) 4 + 8 + 32 else null,
             _ => null,
         };
     }
 
     /// The section a kind belongs to: records may only move to a later section.
     fn section(kind: RecordKind) u32 {
-        return @intFromEnum(kind);
+        return switch (kind) {
+            .change, .record_change => 1,
+            .view => 2,
+            .ledger => 3,
+            .index => 4,
+            .check_view => 5,
+            .check_ledger => 6,
+            .check_table => 7,
+            .check_records => 8,
+            .summary => 9,
+            .end => 10,
+            _ => unreachable,
+        };
     }
 };
 
@@ -116,6 +142,36 @@ pub const Summary = struct {
     view_count: u32,
     ledger_count: u32,
     table_count: u32,
+    /// Version 2: zero in version 1.
+    record_change_count: u64 = 0,
+    index_count: u32 = 0,
+    record_table_count: u32 = 0,
+};
+
+/// A committed put or delete of a record (P123b).
+pub const RecordChange = struct {
+    table: u32,
+    id: u128,
+    op: u64,
+    timestamp: u64,
+    kind: ChangeKind,
+    /// Zero for a delete.
+    value: [nerva.record_value_size]u8,
+};
+
+/// An index (P123c): its id, the op it was declared at, and its definition.
+pub const Index = struct {
+    id: u64,
+    declared_op: u64,
+    definition: nerva.IndexDefinition,
+};
+
+/// A record table's live records: their number, and the SHA-256 of `table, id, op, value` for
+/// each, in key order (`records_hash`).
+pub const CheckRecords = struct {
+    table: u32,
+    record_count: u64,
+    records_hash: [32]u8,
 };
 
 pub const Record = union(enum) {
@@ -126,6 +182,9 @@ pub const Record = union(enum) {
     check_ledger: CheckLedger,
     check_table: CheckTable,
     summary: Summary,
+    record_change: RecordChange,
+    index: Index,
+    check_records: CheckRecords,
 
     fn kind(record: *const Record) RecordKind {
         return switch (record.*) {
@@ -150,12 +209,28 @@ pub fn rows_hash_update(
     hash.update(&bytes);
 }
 
+/// One live record of a record table, as its check hashes it.
+pub fn records_hash_update(
+    hash: *std.crypto.hash.sha2.Sha256,
+    table: u32,
+    id: u128,
+    op: u64,
+    value: *const [nerva.record_value_size]u8,
+) void {
+    var bytes: [4 + 16 + 8 + nerva.record_value_size]u8 = undefined;
+    std.mem.writeInt(u32, bytes[0..4], table, .little);
+    std.mem.writeInt(u128, bytes[4..20], id, .little);
+    std.mem.writeInt(u64, bytes[20..28], op, .little);
+    bytes[28..].* = value.*;
+    hash.update(&bytes);
+}
+
 /// The fixed body of each kind, little-endian.
 const Body = struct {
     bytes: [body_size_max]u8 = undefined,
     size: u32 = 0,
 
-    const body_size_max = 256;
+    const body_size_max = 512;
 
     fn int(body: *Body, comptime T: type, value: T) void {
         std.mem.writeInt(T, body.bytes[body.size..][0..@sizeOf(T)], value, .little);
@@ -167,7 +242,7 @@ const Body = struct {
         body.size += @intCast(bytes.len);
     }
 
-    fn encode(record: *const Record) Body {
+    fn encode(record: *const Record, version: u32) Body {
         var body: Body = .{};
         switch (record.*) {
             .change => |*change| {
@@ -215,9 +290,36 @@ const Body = struct {
                 body.int(u32, summary.view_count);
                 body.int(u32, summary.ledger_count);
                 body.int(u32, summary.table_count);
+                if (version >= 2) {
+                    body.int(u64, summary.record_change_count);
+                    body.int(u32, summary.index_count);
+                    body.int(u32, summary.record_table_count);
+                } else {
+                    assert(summary.record_change_count == 0);
+                    assert(summary.index_count == 0);
+                    assert(summary.record_table_count == 0);
+                }
+            },
+            .record_change => |*change| {
+                body.int(u32, change.table);
+                body.int(u128, change.id);
+                body.int(u64, change.op);
+                body.int(u64, change.timestamp);
+                body.int(u8, @intFromEnum(change.kind));
+                body.raw(&change.value);
+            },
+            .index => |*index| {
+                body.int(u64, index.id);
+                body.int(u64, index.declared_op);
+                body.raw(std.mem.asBytes(&index.definition));
+            },
+            .check_records => |*check| {
+                body.int(u32, check.table);
+                body.int(u64, check.record_count);
+                body.raw(&check.records_hash);
             },
         }
-        assert(body.size == record.kind().body_size().?);
+        assert(body.size == record.kind().body_size(version).?);
         return body;
     }
 };
@@ -250,8 +352,8 @@ pub fn corrupt(reason: []const u8) error{Corrupt} {
 }
 
 /// The decoded record, or `error.Corrupt` for values no writer produces.
-fn decode(kind: RecordKind, bytes: []const u8) error{Corrupt}!Record {
-    assert(bytes.len == kind.body_size().?);
+fn decode(kind: RecordKind, version: u32, bytes: []const u8) error{Corrupt}!Record {
+    assert(bytes.len == kind.body_size(version).?);
     var body: BodyReader = .{ .bytes = bytes };
     defer body.done();
     switch (kind) {
@@ -328,13 +430,68 @@ fn decode(kind: RecordKind, bytes: []const u8) error{Corrupt}!Record {
             if (check.table == 0) return corrupt("a table check names table zero");
             return .{ .check_table = check };
         },
-        .summary => return .{ .summary = .{
-            .as_of = body.int(u64),
-            .change_count = body.int(u64),
-            .view_count = body.int(u32),
-            .ledger_count = body.int(u32),
-            .table_count = body.int(u32),
-        } },
+        .summary => {
+            var summary: Summary = .{
+                .as_of = body.int(u64),
+                .change_count = body.int(u64),
+                .view_count = body.int(u32),
+                .ledger_count = body.int(u32),
+                .table_count = body.int(u32),
+            };
+            if (version >= 2) {
+                summary.record_change_count = body.int(u64);
+                summary.index_count = body.int(u32);
+                summary.record_table_count = body.int(u32);
+            }
+            return .{ .summary = summary };
+        },
+        .record_change => {
+            const change: RecordChange = .{
+                .table = body.int(u32),
+                .id = body.int(u128),
+                .op = body.int(u64),
+                .timestamp = body.int(u64),
+                .kind = @enumFromInt(body.int(u8)),
+                .value = body.raw(nerva.record_value_size),
+            };
+            if (!nerva.table_is_record(change.table)) {
+                return corrupt("a record's change names a table that holds rows");
+            }
+            if (change.op == 0 or change.timestamp == 0) {
+                return corrupt("a record's change has a zero op or timestamp");
+            }
+            switch (change.kind) {
+                .put => {},
+                .delete => if (!stdx.zeroed(&change.value)) {
+                    return corrupt("a delete carries a value");
+                },
+                _ => return corrupt("a change is neither put nor delete"),
+            }
+            return .{ .record_change = change };
+        },
+        .index => {
+            const index: Index = .{
+                .id = body.int(u64),
+                .declared_op = body.int(u64),
+                .definition = std.mem.bytesToValue(
+                    nerva.IndexDefinition,
+                    &body.raw(@sizeOf(nerva.IndexDefinition)),
+                ),
+            };
+            if (index.declared_op == 0) return corrupt("an index's op is zero");
+            return .{ .index = index };
+        },
+        .check_records => {
+            const check: CheckRecords = .{
+                .table = body.int(u32),
+                .record_count = body.int(u64),
+                .records_hash = body.raw(32),
+            };
+            if (!nerva.table_is_record(check.table)) {
+                return corrupt("a record check names a table that holds rows");
+            }
+            return .{ .check_records = check };
+        },
         .end => unreachable,
         _ => unreachable,
     }
@@ -348,17 +505,20 @@ pub fn WriterType(comptime Inner: type) type {
 
         inner: Inner,
         hash: std.crypto.hash.sha2.Sha256,
+        version: u32,
         section: u32 = 0,
         finished: bool = false,
         /// The `end` record's SHA-256, once finished: the export's identity, which every data
         /// file imported from it records (`VSRState.origin`, P90).
         digest: [32]u8 = undefined,
 
-        pub fn init(inner: Inner) !Writer {
-            var writer: Writer = .{ .inner = inner, .hash = .init(.{}) };
+        /// `version`: 1 if the export holds no records and no indexes, else 2.
+        pub fn init(inner: Inner, version: u32) !Writer {
+            assert(version >= 1 and version <= format_version_max);
+            var writer: Writer = .{ .inner = inner, .hash = .init(.{}), .version = version };
             var header: [header_size]u8 = undefined;
             header[0..magic.len].* = magic;
-            std.mem.writeInt(u32, header[8..12], format_version, .little);
+            std.mem.writeInt(u32, header[8..12], version, .little);
             std.mem.writeInt(u32, header[12..16], 0, .little);
             try writer.write_bytes(&header);
             return writer;
@@ -367,9 +527,10 @@ pub fn WriterType(comptime Inner: type) type {
         pub fn write(writer: *Writer, record: *const Record) !void {
             assert(!writer.finished);
             const kind = record.kind();
+            assert(kind.body_size(writer.version) != null);
             assert(kind.section() >= writer.section);
             writer.section = kind.section();
-            const body = Body.encode(record);
+            const body = Body.encode(record, writer.version);
             try writer.write_frame(kind, body.bytes[0..body.size]);
         }
 
@@ -384,7 +545,7 @@ pub fn WriterType(comptime Inner: type) type {
         }
 
         fn write_frame(writer: *Writer, kind: RecordKind, body: []const u8) !void {
-            assert(body.len == kind.body_size().?);
+            assert(body.len == kind.body_size(writer.version).?);
             var prefix: [8]u8 = undefined;
             std.mem.writeInt(u32, prefix[0..4], @intCast(body.len), .little);
             std.mem.writeInt(u32, prefix[4..8], @intFromEnum(kind), .little);
@@ -415,6 +576,7 @@ pub fn ReaderType(comptime Inner: type) type {
 
         inner: Inner,
         hash: std.crypto.hash.sha2.Sha256,
+        version: u32 = 0,
         body: [Body.body_size_max]u8 = undefined,
         section: u32 = 0,
         state: enum { records, ended } = .records,
@@ -428,6 +590,10 @@ pub fn ReaderType(comptime Inner: type) type {
         table_count: u32 = 0,
         check_view_count: u32 = 0,
         check_ledger_count: u32 = 0,
+        record_change_count: u64 = 0,
+        index_count: u32 = 0,
+        record_table_last: u32 = 0,
+        record_table_count: u32 = 0,
         summary: ?Summary = null,
         /// The `end` record's SHA-256, once `next` returned null (see `WriterType.digest`).
         digest: [32]u8 = undefined,
@@ -439,7 +605,8 @@ pub fn ReaderType(comptime Inner: type) type {
             if (!std.mem.eql(u8, header[0..magic.len], &magic)) {
                 return corrupt("not an export: the magic is wrong");
             }
-            if (std.mem.readInt(u32, header[8..12], .little) != format_version) {
+            reader.version = std.mem.readInt(u32, header[8..12], .little);
+            if (reader.version == 0 or reader.version > format_version_max) {
                 return error.VersionUnsupported;
             }
             if (std.mem.readInt(u32, header[12..16], .little) != 0) {
@@ -456,7 +623,8 @@ pub fn ReaderType(comptime Inner: type) type {
             try reader.read_bytes(&prefix);
             const size = std.mem.readInt(u32, prefix[0..4], .little);
             const kind: RecordKind = @enumFromInt(std.mem.readInt(u32, prefix[4..8], .little));
-            const body_size = kind.body_size() orelse return corrupt("a record's kind is unknown");
+            const body_size = kind.body_size(reader.version) orelse
+                return corrupt("a record's kind is unknown");
             if (size != body_size) return corrupt("a record's size does not match its kind");
             if (kind.section() < reader.section) return corrupt("a record is out of order");
             reader.section = kind.section();
@@ -486,7 +654,7 @@ pub fn ReaderType(comptime Inner: type) type {
                 reader.digest = body[0..32].*;
                 return null;
             }
-            const record = try decode(kind, body);
+            const record = try decode(kind, reader.version, body);
             try reader.validate(&record);
             return record;
         }
@@ -495,13 +663,27 @@ pub fn ReaderType(comptime Inner: type) type {
         fn validate(reader: *Reader, record: *const Record) !void {
             switch (record.*) {
                 .change => |*change| {
-                    if (reader.change_last) |last| {
-                        if (change.timestamp <= last.timestamp or change.op < last.op) {
-                            return corrupt("changes are out of timestamp or op order");
-                        }
-                    }
-                    reader.change_last = .{ .op = change.op, .timestamp = change.timestamp };
+                    try reader.change_order(change.op, change.timestamp);
                     reader.change_count += 1;
+                },
+                .record_change => |*change| {
+                    try reader.change_order(change.op, change.timestamp);
+                    reader.record_change_count += 1;
+                },
+                .index => |*index| {
+                    if (index.id != reader.index_count + 1) {
+                        return corrupt("indexes are not 1, 2, …");
+                    }
+                    if (reader.index_count == nerva.indexes_max) return corrupt("too many indexes");
+                    reader.index_count += 1;
+                },
+                .check_records => |*check| {
+                    if (check.table <= reader.record_table_last) {
+                        return corrupt("record checks are out of order");
+                    }
+                    if (reader.record_table_count == tables_max) return corrupt("too many tables");
+                    reader.record_table_last = check.table;
+                    reader.record_table_count += 1;
                 },
                 .view => |*view| {
                     if (view.id != reader.view_count + 1) return corrupt("views are not 1, 2, …");
@@ -545,6 +727,9 @@ pub fn ReaderType(comptime Inner: type) type {
                         summary.view_count != reader.view_count or
                         summary.ledger_count != reader.ledger_count or
                         summary.table_count != reader.table_count or
+                        summary.record_change_count != reader.record_change_count or
+                        summary.index_count != reader.index_count or
+                        summary.record_table_count != reader.record_table_count or
                         reader.check_view_count != reader.view_count or
                         reader.check_ledger_count != reader.ledger_count)
                     {
@@ -559,6 +744,16 @@ pub fn ReaderType(comptime Inner: type) type {
                     reader.summary = summary.*;
                 },
             }
+        }
+
+        /// Rows' and records' changes share one order: strictly by timestamp, then by op.
+        fn change_order(reader: *Reader, op: u64, timestamp: u64) !void {
+            if (reader.change_last) |last| {
+                if (timestamp <= last.timestamp or op < last.op) {
+                    return corrupt("changes are out of timestamp or op order");
+                }
+            }
+            reader.change_last = .{ .op = op, .timestamp = timestamp };
         }
 
         fn read_bytes(reader: *Reader, bytes: []u8) !void {
@@ -635,7 +830,7 @@ fn test_records(arena: std.mem.Allocator) ![]const Record {
 
 fn test_encode(arena: std.mem.Allocator, records: []const Record) ![]u8 {
     var out = std.ArrayList(u8).init(arena);
-    var writer = try WriterType(std.ArrayList(u8).Writer).init(out.writer());
+    var writer = try WriterType(std.ArrayList(u8).Writer).init(out.writer(), 1);
     for (records) |*record| try writer.write(record);
     try writer.finish();
     return out.items;
@@ -671,7 +866,7 @@ test "export file: the writer and the reader name an export by its end record (P
 
     const records = try test_records(arena);
     var out = std.ArrayList(u8).init(arena);
-    var writer = try WriterType(std.ArrayList(u8).Writer).init(out.writer());
+    var writer = try WriterType(std.ArrayList(u8).Writer).init(out.writer(), 1);
     for (records) |*record| try writer.write(record);
     try writer.finish();
     // The end record's body, the last 32 bytes before its CRC-32.
@@ -687,7 +882,7 @@ test "export file: the writer and the reader name an export by its end record (P
     var other = try arena.dupe(Record, records);
     other[other.len - 1].summary.as_of += 1;
     var out_other = std.ArrayList(u8).init(arena);
-    var writer_other = try WriterType(std.ArrayList(u8).Writer).init(out_other.writer());
+    var writer_other = try WriterType(std.ArrayList(u8).Writer).init(out_other.writer(), 1);
     for (other) |*record| try writer_other.write(record);
     try writer_other.finish();
     try testing.expect(!std.mem.eql(u8, &writer.digest, &writer_other.digest));
@@ -724,7 +919,7 @@ test "export file: one byte changed, a truncation, or a record moved, each fails
 
     // Two records swapped, re-framed as a writer would (each CRC still matches): caught by the
     // order, or by the SHA-256 when the order still holds.
-    const frame_change = RecordKind.change.body_size().? + frame_size;
+    const frame_change = RecordKind.change.body_size(1).? + frame_size;
     const swapped = try arena.dupe(u8, bytes);
     const first = header_size;
     @memcpy(swapped[first..][0..frame_change], bytes[first + frame_change ..][0..frame_change]);
@@ -743,8 +938,93 @@ test "export file: one byte changed, a truncation, or a record moved, each fails
     const dropped = try std.mem.concat(arena, Record, &.{ records[0..1], records[2..] });
     try testing.expectError(error.Corrupt, test_decode(arena, try test_encode(arena, dropped)));
 
-    // Another format version.
+    // A format version past this release's.
     const versioned = try arena.dupe(u8, bytes);
-    versioned[8] = 2;
+    versioned[8] = format_version_max + 1;
     try testing.expectError(error.VersionUnsupported, test_decode(arena, versioned));
+    // Version 2's summary is larger: version 1's bytes are not a version 2 export.
+    versioned[8] = 2;
+    try testing.expectError(error.Corrupt, test_decode(arena, versioned));
+}
+
+test "export file: version 2 carries records, indexes and record checks" {
+    var arena_instance = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_instance.deinit();
+    const arena = arena_instance.allocator();
+
+    var records = std.ArrayList(Record).init(arena);
+    var row_value: [nerva.value_size]u8 = @splat(0);
+    row_value[0] = 1;
+    var record_value: [nerva.record_value_size]u8 = @splat(0);
+    record_value[447] = 9;
+    const table = nerva.record_tables_min + 3;
+    // Rows' and records' changes, merged by timestamp.
+    try records.append(.{ .change = .{
+        .table = 1,
+        .id = 1,
+        .op = 2,
+        .timestamp = 10,
+        .kind = .put,
+        .value = row_value,
+    } });
+    try records.append(.{ .record_change = .{
+        .table = table,
+        .id = std.math.maxInt(u128),
+        .op = 2,
+        .timestamp = 19,
+        .kind = .put,
+        .value = record_value,
+    } });
+    try records.append(.{ .record_change = .{
+        .table = table,
+        .id = std.math.maxInt(u128),
+        .op = 3,
+        .timestamp = 28,
+        .kind = .delete,
+        .value = @splat(0),
+    } });
+    var definition = std.mem.zeroes(nerva.IndexDefinition);
+    @memcpy(definition.name[0..2], "ix");
+    definition.table = table;
+    try records.append(.{ .index = .{ .id = 1, .declared_op = 1, .definition = definition } });
+    try records.append(.{ .check_table = .{ .table = 1, .row_count = 1, .rows_hash = @splat(3) } });
+    try records.append(.{ .check_records = .{
+        .table = table,
+        .record_count = 0,
+        .records_hash = @splat(4),
+    } });
+    try records.append(.{ .summary = .{
+        .as_of = 3,
+        .change_count = 1,
+        .view_count = 0,
+        .ledger_count = 0,
+        .table_count = 1,
+        .record_change_count = 2,
+        .index_count = 1,
+        .record_table_count = 1,
+    } });
+
+    var out = std.ArrayList(u8).init(arena);
+    var writer = try WriterType(std.ArrayList(u8).Writer).init(out.writer(), 2);
+    for (records.items) |*record| try writer.write(record);
+    try writer.finish();
+    try testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, out.items[8..12], .little));
+    const decoded = try test_decode(arena, out.items);
+    try testing.expectEqual(records.items.len, decoded.len);
+    for (records.items, decoded) |expected, actual| {
+        try testing.expectEqualDeep(expected, actual);
+    }
+
+    // A version 1 export cannot hold them: the kind is unknown there.
+    var downgraded = try arena.dupe(u8, out.items);
+    std.mem.writeInt(u32, downgraded[8..12], 1, .little);
+    try testing.expectError(error.Corrupt, test_decode(arena, downgraded));
+    // A record change out of timestamp order with a row's.
+    var reordered = try arena.dupe(Record, records.items);
+    reordered[1].record_change.timestamp = 10;
+    var out_bad = std.ArrayList(u8).init(arena);
+    var writer_bad = try WriterType(std.ArrayList(u8).Writer).init(out_bad.writer(), 2);
+    for (reordered) |*record| try writer_bad.write(record);
+    try writer_bad.finish();
+    try testing.expectError(error.Corrupt, test_decode(arena, out_bad.items));
 }
