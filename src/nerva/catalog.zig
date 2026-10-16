@@ -371,6 +371,12 @@ pub fn view_check(view: *const View, layout: *const Layout) error{Invalid}!void 
         const field = layout.field(name) orelse return invalid("unknown field in aggregates");
         if (field.type == .bytes) return invalid("sum, min and max take numbers only");
     }
+    // A view over records takes count and sum only (P123b): no `members` tree for records.
+    if (nerva.table_is_record(view.table)) for (view.aggregates) |aggregate| {
+        if (aggregate.function == .min or aggregate.function == .max) {
+            return invalid("a view over records takes count and sum only");
+        }
+    };
 }
 
 /// The view as stored: canonical JSON.
@@ -622,4 +628,29 @@ test "catalog: a view resolves to the state machine's definition through its lay
     try testing.expectEqual(@as(u8, 8), definition.aggregates[1].field.offset);
     // The state machine accepts what the catalog accepted.
     try testing.expectEqual(null, @import("views.zig").definition_validate(&definition));
+}
+
+test "catalog: a view over records takes count and sum only (P123b)" {
+    var arena_instance = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_instance.deinit();
+    const arena = arena_instance.allocator();
+
+    const layout = try layout_parse(arena,
+        \\{"name":"facts","fields":[{"name":"status","type":"u8"},{"name":"amount","type":"u64"},
+        \\{"name":"memo","type":"bytes","size":255},{"name":"tail","type":"u64"}]}
+    , nerva.record_tables_min);
+    // Offsets past a byte: the tail ends at 280 of 448.
+    try testing.expectEqual(@as(u16, 16), layout.field("memo").?.offset);
+    try testing.expectEqual(@as(u16, 272), layout.field("tail").?.offset);
+    const summed = try view_parse(arena,
+        \\{"table":2147483648,"group_by":["status"],
+        \\"aggregates":[{"fn":"count"},{"fn":"sum","field":"amount"}]}
+    );
+    try view_check(&summed, &layout);
+    for ([_][]const u8{ "min", "max" }) |function| {
+        const view = try view_parse(arena, try std.fmt.allocPrint(arena,
+            \\{{"table":2147483648,"aggregates":[{{"fn":"count"}},{{"fn":"{s}","field":"amount"}}]}}
+        , .{function}));
+        try testing.expectError(error.Invalid, view_check(&view, &layout));
+    }
 }

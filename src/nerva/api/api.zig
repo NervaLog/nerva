@@ -24,6 +24,12 @@
 //!     GET  /v1/ledgers/<id>  (conserved fields: N75)
 //!     POST /v1/documents/get, POST /v1/documents/commit, GET /v1/documents/changes
 //!                            (larger values, by key: `documents_routes.zig`)
+//!     GET  /v1/indexes       (the declared indexes: P123c)
+//!     PUT  /v1/indexes/<name>  {"table": 2147483655, "eq": ["agent"], "order": "created",
+//!                               "where": [{"field": "status", "op": "eq", "value": 1}]}
+//!     GET  /v1/indexes/<name>
+//!     POST /v1/indexes/<name>/scan  {"eq": {"agent": "…"}, "min", "max", "descending",
+//!                                    "limit", "after"}
 //!
 //! Conventions:
 //! - 64-bit numbers (`id`, `op`, `op_seen`, cursors) are decimal strings: JSON numbers lose
@@ -49,6 +55,14 @@
 //!   "key_collision"), "op"}`. Indices in replies are the request's, not counting the key.
 //! - A table may have a layout (`catalog.zig`, N34): then puts may give `fields` instead of
 //!   `value_hex`, and every row or change of that table also comes back with `fields`.
+//! - Tables from `0x80000000` to `catalog.tables_reserved_min` hold records (P123b): `id` is 16
+//!   bytes as 32 hex digits, `value_hex` and a layout are up to 448 bytes, and adds are refused.
+//!   A commit may mix rows and records (sent as `commit_wide`); a lookup reads one or the other.
+//!   `changes` merges rows' and records' feeds into one order, under one cursor.
+//! - An index (P123c) finds a record table's records by up to three `eq` fields and orders them
+//!   by one number field (or the op); `where` makes it partial. Declared over existing records,
+//!   it builds by pulses: until then a scan answers 503. A scan pages one `eq` key, from `min`
+//!   to `max` of the order field; `next` is the `after` of the following page, or null.
 //! - Tables from `catalog.tables_reserved_min` up are Nerva's own: refused here, and left out of
 //!   `changes`.
 //! - Errors are `{"error": "<reason>"}` with 400, 401, 404, 405, 409 or 503.
@@ -1428,6 +1442,13 @@ fn views(
                     409,
                     "a view with this name is declared differently; views are immutable",
                 ),
+                // `view_check` refuses min and max over records first; an older gateway's
+                // catalog document may still name one.
+                .unsupported => return error_reply(
+                    arena,
+                    409,
+                    "the state machine does not maintain this view",
+                ),
                 else => {},
             };
             switch (try layouts.view_put(arena, name, &view)) {
@@ -1440,7 +1461,8 @@ fn views(
                     // The state machine maintains it from now on (N52), unless it refused it.
                     const reason: ?[]const u8 = switch (declared.status) {
                         .created, .exists => null,
-                        .unsupported => unreachable, // No longer returned (N62).
+                        // Only for a document already in the catalog (as `.different`).
+                        .unsupported => "min and max are not maintained over records",
                         .table_extremes_full => "the table's views have too many min and max " ++
                             "aggregates (at most 4)",
                         .views_full => "the cluster's views are full",
