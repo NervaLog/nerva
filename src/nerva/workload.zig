@@ -3449,7 +3449,7 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                 std.mem.bytesAsValue(nerva.IndexQuery, body[0..@sizeOf(nerva.IndexQuery)]),
             );
             if (workload.scan_cursor) |cursor| {
-                if (prng.chance(stdx.PRNG.ratio(1, 2))) {
+                if (prng.chance(stdx.PRNG.ratio(3, 4))) {
                     query.* = cursor;
                     workload.scans_continued += 1;
                     return @sizeOf(nerva.IndexQuery);
@@ -3483,13 +3483,19 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                 query.order_min = prng.int_inclusive(u64, range_max);
                 query.order_max = query.order_min + prng.int_inclusive(u64, range_max);
             }
-            query.limit = limit_random(prng, 8, StateMachine.index_hits_max);
+            // Mostly small pages, so that scans continue from their cursors (#129).
+            query.limit = limit_random(prng, 3, StateMachine.index_hits_max);
             query.flags.descending = prng.boolean();
             if (prng.chance(stdx.PRNG.ratio(1, 50))) {
-                switch (prng.chances(.{ .reserved = 1, .range = 1, .padding = 1 })) {
+                switch (prng.chances(.{ .reserved = 1, .range = 1, .padding = 1, .cursor = 1 })) {
                     .reserved => query.reserved_b[prng.index(&query.reserved_b)] = 1,
                     .range => query.order_min = query.order_max +| 1,
                     .padding => query.flags.padding = 1,
+                    // Past every timestamp (#124).
+                    .cursor => {
+                        query.cursor_order = query.order_min;
+                        query.cursor_timestamp = timestamp_invalid(prng);
+                    },
                 }
             }
             return @sizeOf(nerva.IndexQuery);
@@ -3507,6 +3513,7 @@ pub fn WorkloadType(comptime StateMachine: type) type {
             if (query.limit == 0 or query.flags.padding != 0 or
                 !stdx.zeroed(&query.reserved_a) or !stdx.zeroed(&query.reserved_b) or
                 query.order_min > query.order_max or
+                (query.cursor_timestamp != 0 and !TimestampRange.valid(query.cursor_timestamp)) or
                 (query.index_id == 0 and query.name[0] == 0) or
                 (query.index_id != 0 and !stdx.zeroed(&query.name)))
             {

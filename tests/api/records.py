@@ -18,11 +18,13 @@ table: 128-bit ids, 448-byte values), and requires:
   name 409 `different`, and an index over a row table or an unknown field 400;
 - a view over the records (count and sum of `amount`, by `status`) to build and equal the
   model; `min` over a record table to be refused;
-- indexes to be listed under `/v1/indexes`, and read one by one.
+- indexes to be listed under `/v1/indexes`, and read one by one;
+- while four writers commit a row and a record together, a reader paging `/v1/changes` sees
+  every change once (#125).
 
 Usage: records.py <path to nerva> [--seed=N]
 """
-import os, random, sys, time
+import os, random, sys, threading, time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from api import Cluster, request  # noqa: E402
@@ -38,6 +40,8 @@ LAYOUT = {"name": "executions", "fields": [
 ]}
 RESERVED, SETTLED, RELEASED = 1, 2, 3
 AGENTS = ["%032x" % (0xA6E7 << 100 | n) for n in range(5)]
+# A fact for the concurrent feed test: settled (out of the reaper's index).
+FACT = {"agent": AGENTS[0], "status": 2, "created": "0", "amount": "1", "memo": "00"}
 REAPER = {"table": TABLE, "order": "created",
           "where": [{"field": "status", "op": "eq", "value": RESERVED}]}
 BY_AGENT = {"table": TABLE, "eq": ["agent"], "order": "created"}
@@ -273,6 +277,57 @@ def check_feed(port, model):
     return len(seen)
 
 
+def check_feed_concurrent(ports, writers=4, seconds=15):
+    """While writers commit a row and a record together through one gateway, a reader pages the
+    feed at its end through the other: every change committed comes back once, rows and records
+    alike (#125). The reader's two reads (rows', then records') fall between commits."""
+    cursor = "0"
+    while True:  # To the end of the feed so far.
+        status, body = request(ports[1], "GET", f"/v1/changes?cursor={cursor}&limit=1000")
+        assert status == 200, body
+        cursor = body["cursor"]
+        if not body["more"]:
+            break
+    written, stop = [], threading.Event()
+
+    def writer(index):
+        n = 0
+        while not stop.is_set():
+            n += 1
+            ident = index << 32 | n
+            status, body = commit(ports[0], [
+                {"kind": "put", "table": ROWS, "id": str(ident), "fields": {"available": "1"}},
+                {"kind": "put", "table": TABLE, "id": "%032x" % (1 << 120 | ident),
+                 "fields": FACT}])
+            assert status == 200, body
+            written.extend([(ROWS, str(ident)), (TABLE, "%032x" % (1 << 120 | ident))])
+
+    threads = [threading.Thread(target=writer, args=(i + 1,)) for i in range(writers)]
+    for thread in threads:
+        thread.start()
+    seen = []
+    deadline = time.time() + seconds
+    while True:
+        stopping = time.time() >= deadline
+        if stopping:
+            stop.set()
+            for thread in threads:
+                thread.join()
+        while True:
+            status, body = request(ports[1], "GET", f"/v1/changes?cursor={cursor}&limit=7")
+            assert status == 200, body
+            seen += [(c["table"], c["id"]) for c in body["changes"]]
+            cursor = body["cursor"]
+            if not body["more"] or not stopping:
+                break
+        if stopping:
+            break
+    assert len(seen) == len(set(seen)), "a change came back twice"
+    missing = set(written) - set(seen)
+    assert not missing, f"{len(missing)} of {len(written)} changes missing, e.g. {sorted(missing)[:3]}"
+    return len(written)
+
+
 def check_declarations(port):
     status, body = request(port, "PUT", "/v1/indexes/reaper", REAPER)
     assert status == 200 and body["declared"] == "exists", body
@@ -343,8 +398,9 @@ def main():
             reserved = check_all_scans(ports[(round_ + 1) % 2], model, rng)
         check_view(ports[0], model)
         changes = check_feed(ports[1], model)
+        concurrent = check_feed_concurrent(ports)
         print(f"records: PASSED ({len(model.records)} records, {reserved} reserved, "
-              f"{changes} changes; seed {seed})")
+              f"{changes} changes, {concurrent} paged while written; seed {seed})")
     finally:
         cluster.close()
 

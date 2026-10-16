@@ -1953,6 +1953,10 @@ pub fn StateMachineType(comptime Storage: type) type {
             if (query.flags.padding != 0) return null;
             if (!stdx.zeroed(&query.reserved_a) or !stdx.zeroed(&query.reserved_b)) return null;
             if (query.order_min > query.order_max) return null;
+            // A cursor names an entry: its timestamp is zero (none) or a valid one (#124).
+            if (query.cursor_timestamp != 0 and !TimestampRange.valid(query.cursor_timestamp)) {
+                return null;
+            }
             if (query.index_id == 0 and query.name[0] == 0) return null;
             if (query.index_id != 0 and !stdx.zeroed(&query.name)) return null;
             return @min(query.limit, index_hits_max);
@@ -2764,7 +2768,7 @@ pub fn StateMachineType(comptime Storage: type) type {
             if (self.commit_key_failure(entries)) |failure| return failure;
             if (admission != .fits) {
                 const index = for (entries, 0..) |*entry, index| {
-                    if (self.entry_viewed(entry)) break index;
+                    if (self.entry_viewed(entry, narrow)) break index;
                 } else unreachable; // A transaction without groups always fits.
                 return .{
                     .index = @intCast(index),
@@ -3515,7 +3519,7 @@ pub fn StateMachineType(comptime Storage: type) type {
             var batch_index: u32 = 0;
             while (decoder.pop()) |batch| : (batch_index += 1) {
                 const entries = self.batch_entries(operation, batch);
-                switch (self.view_txn_admit(entries)) {
+                switch (self.view_txn_admit(entries, operation == .commit)) {
                     .fits => {},
                     .busy => {
                         self.view_txn_busy.set(batch_index);
@@ -3539,7 +3543,11 @@ pub fn StateMachineType(comptime Storage: type) type {
         /// and `view_txn_members` hold those it added). Otherwise leaves the op's as they were.
         /// A write counts, in each view of its table, the groups of its old and new values that
         /// pass the view's filter, and if either does, its member in each `min` or `max` slot.
-        fn view_txn_admit(self: *StateMachine, entries: []const WideEntry) views.Admission {
+        fn view_txn_admit(
+            self: *StateMachine,
+            entries: []const WideEntry,
+            narrow: bool,
+        ) views.Admission {
             self.view_txn_keys.clearRetainingCapacity();
             self.view_txn_members.clearRetainingCapacity();
             // A transaction whose key's row exists writes nothing (`commit_key_failure`).
@@ -3550,7 +3558,7 @@ pub fn StateMachineType(comptime Storage: type) type {
             }
             const admission: views.Admission = admission: {
                 for (entries) |*entry| {
-                    if (!self.entry_viewed(entry)) continue;
+                    if (!self.entry_viewed(entry, narrow)) continue;
                     // A row's value is zero past its 80 bytes, which its views do not read.
                     const value_old = self.entry_value_old(entry);
                     for (self.views_op[0..self.views_op_count]) |*view| {
@@ -3633,8 +3641,11 @@ pub fn StateMachineType(comptime Storage: type) type {
         }
 
         /// Whether the entry writes a table with a view (in any state).
-        fn entry_viewed(self: *const StateMachine, entry: *const WideEntry) bool {
+        fn entry_viewed(self: *const StateMachine, entry: *const WideEntry, narrow: bool) bool {
             if (entry.table == 0) return false;
+            // `commit` refuses a record's entry (`table_invalid`) and writes nothing: its
+            // record was never prefetched, so it must not be read for admission (#128).
+            if (narrow and nerva.table_is_record(entry.table)) return false;
             switch (entry.kind) {
                 .put, .delete, .add => {},
                 else => return false,
@@ -3716,7 +3727,7 @@ pub fn StateMachineType(comptime Storage: type) type {
             while (decoder.pop()) |batch| : (batch_index += 1) {
                 if (self.view_txn_busy.isSet(batch_index)) continue;
                 for (self.batch_entries(operation, batch)) |*entry| {
-                    if (!self.entry_viewed(entry)) continue;
+                    if (!self.entry_viewed(entry, operation == .commit)) continue;
                     // Views over records have no `min` or `max`.
                     if (nerva.table_is_record(entry.table)) continue;
                     const old = switch (self.forest.grooves.rows.get(entry_row_key(entry))) {

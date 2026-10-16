@@ -24,7 +24,12 @@ binary exporting a cluster that has run for days was not tested.
 4. Restart one replica with v0.5.0 against the v0.6.0 cluster. **Pass:** it is ignored (N61) and
    the cluster keeps committing.
 5. Memory: **pass** if each replica's RSS stays under its Fly Machine's memory with 25 % to spare
-   after an hour of traffic (measured here: 1.83 GB at startup, from 1.33 GB with v0.5.0).
+   after an hour of traffic. Measured here at startup, default settings: 2.5 GB with v0.5.0, 3.0
+   GB with v0.6.0, 2.5 GB with v0.6.0 and `--cache-grid=512MiB` (#127). On a 4 GB Machine that
+   also runs the gateway and the metrics exporter, 3.0 GB leaves no such headroom: either
+   resize the Machines or lower `--cache-grid` first, and compare read latency both ways.
+6. Before exporting, list tables from `2147483648` up on v0.5.0 (`/v1/changes`): there must be
+   none (#126).
 
 ## 2. The application's money with its facts (Botpike/app, after the app adopts records)
 

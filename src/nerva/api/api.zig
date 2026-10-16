@@ -871,9 +871,15 @@ fn changes(arena: std.mem.Allocator, client: anytype, layouts: anytype, query: [
     var bound: u64 = std.math.maxInt(u64);
     if (rows_end.flags.more) bound = @min(bound, rows_[rows_.len - 1].timestamp);
     if (records_end.flags.more) bound = @min(bound, records_[records_.len - 1].timestamp);
+    // Records were read at a later op than rows. Rows' feed, complete, is complete only through
+    // its own op: a record change of a later op may lie past row changes committed between the
+    // two reads, which the next cursor would skip (#125). Take none of those, and say there is
+    // more. (With more, `bound` already keeps records before rows' last change.)
+    const rows_op: ?u64 = if (rows_end.flags.more) null else rows_end.op;
 
     const merged = try arena.alloc(nerva.RecordChange, limit + 1);
     var count: usize = 0;
+    var cut = false;
     var row_index: usize = 0;
     var record_index: usize = 0;
     while (count < limit) {
@@ -884,6 +890,10 @@ fn changes(arena: std.mem.Allocator, client: anytype, layouts: anytype, query: [
         else if (record_next != null) false else break;
         const timestamp = if (take_row) row_next.?.timestamp else record_next.?.timestamp;
         if (timestamp > bound) break;
+        if (!take_row and rows_op != null and record_next.?.op > rows_op.?) {
+            cut = true;
+            break;
+        }
         if (take_row) {
             merged[count] = change_wide(row_next.?);
             row_index += 1;
@@ -893,7 +903,7 @@ fn changes(arena: std.mem.Allocator, client: anytype, layouts: anytype, query: [
         }
         count += 1;
     }
-    const more = row_index < rows_.len or record_index < records_.len or
+    const more = cut or row_index < rows_.len or record_index < records_.len or
         rows_end.flags.more or records_end.flags.more;
     merged[count] = .{
         .id = 0,
@@ -1300,7 +1310,9 @@ fn index_scan(
             return bad("after is malformed");
         query.cursor_timestamp = std.fmt.parseInt(u64, text[dot + 1 ..], 10) catch
             return bad("after is malformed");
-        if (query.cursor_timestamp == 0) return bad("after is malformed");
+        if (query.cursor_timestamp == 0 or query.cursor_timestamp > std.math.maxInt(u63)) {
+            return bad("after is malformed");
+        }
     }
 
     const results = try arena.alloc(nerva.IndexRecord, query.limit + 1);

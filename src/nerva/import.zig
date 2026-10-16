@@ -146,6 +146,16 @@ pub fn plan(arena: std.mem.Allocator, path: []const u8) !Plan {
             op_last = change.op;
             result.op_changes_max = @max(result.op_changes_max, op_changes);
             if (op_records) result.op_changes_wide_max = @max(result.op_changes_wide_max, op_changes);
+            // Before P123b, rows could be in tables that now hold records (#126).
+            if (table_refused(change.table, null)) {
+                log.err("table {}: rows in a table from {} up, which now holds records: move " ++
+                    "them below {} with the release that wrote this export, then export again", .{
+                    change.table,
+                    nerva.record_tables_min,
+                    nerva.record_tables_min,
+                });
+                return error.Refused;
+            }
             if (change.table != catalog.table_catalog) continue;
             if (change.kind == .put) {
                 if (catalog_rows.count() == catalog_rows_max and
@@ -225,6 +235,17 @@ pub fn plan(arena: std.mem.Allocator, path: []const u8) !Plan {
             }
         }
         view.definition = try view_definition(arena, &catalog_rows, &view.record);
+        // A view over a table that held rows before P123b would now be a view over records
+        // (#126).
+        if (reader.version == 1 and table_refused(view.definition.table, 1)) {
+            log.err("view {s}: over table {}, which now holds records: declare it over a " ++
+                "table below {} with the release that wrote this export, then export again", .{
+                std.mem.sliceTo(&view.record.name, 0),
+                view.definition.table,
+                nerva.record_tables_min,
+            });
+            return error.Refused;
+        }
     }
     declared_op_last = 0;
     for (result.index_slice()) |*index| {
@@ -255,6 +276,15 @@ pub fn plan(arena: std.mem.Allocator, path: []const u8) !Plan {
         }
     }
     return result;
+}
+
+/// Whether a row (`version` null) or a view (of an export of `version`) is in a
+/// table that holds records since P123b, which this release cannot restore as the export
+/// wrote it (#126): a row there was a row, and a view of a version 1 export was over rows.
+fn table_refused(table: u32, version: ?u32) bool {
+    if (!nerva.table_is_record(table)) return false;
+    const view_version = version orelse return true;
+    return view_version == 1;
 }
 
 /// A view's definition, from its catalog document and its table's layout. `nerva export` runs
@@ -1294,4 +1324,15 @@ test "import: the data file records the export it was imported from, a formatted
             try std.testing.expect(stdx.zeroed(&header.vsr_state.reserved));
         }
     }
+}
+
+test "import: rows and views of tables that now hold records are refused (#126)" {
+    // Rows (no version).
+    try std.testing.expect(!table_refused(1, null));
+    try std.testing.expect(!table_refused(catalog.table_catalog, null));
+    try std.testing.expect(table_refused(nerva.record_tables_min, null));
+    // Views: of a version 1 export, over rows; of version 2, over records.
+    try std.testing.expect(!table_refused(1, 1));
+    try std.testing.expect(table_refused(nerva.record_tables_min + 1, 1));
+    try std.testing.expect(!table_refused(nerva.record_tables_min + 1, 2));
 }

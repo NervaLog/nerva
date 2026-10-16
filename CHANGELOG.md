@@ -82,17 +82,31 @@ A maintained view may group and filter a record table's fields, with `count` and
 
 ### Upgrading from v0.5.0
 
-1. **Give each replica about 0.5 GiB more memory.** A replica at the default settings took 1.33 GB
-   resident with v0.5.0, and takes 1.83 GB with v0.6.0 (the in-memory tables of the new trees).
-2. **Export, then import every replica**, as for v0.5.0 (N80): with v0.5.0, `nerva export`; stop
+1. **Give each replica about 0.5 GiB more memory, or a smaller grid cache.** At the default
+   settings, a replica took 2.5 GB resident at startup with v0.5.0, and takes 3.0 GB with
+   v0.6.0: the in-memory tables of the new trees (with `--development`, 1.33 and 1.83 GB). The
+   grid cache is 1 GiB by default; `nerva start --cache-grid=512MiB` brings v0.6.0 back to
+   2.5 GB, at the cost of more reads from disk. (#127)
+2. **Move rows out of tables `2147483648` to `4294901759` first.** v0.5.0 allowed rows there;
+   those tables now hold records. `nerva import` refuses an export with rows or views in them,
+   naming the table (#126): with v0.5.0, copy them to tables below `2147483648`, and export
+   again.
+3. **Export, then import every replica**, as for v0.5.0 (N80): with v0.5.0, `nerva export`; stop
    every replica; with v0.6.0, `nerva import` once per replica from the same export; start the
    replicas, then the gateways. v0.6.0 reads v0.5.0's exports (format version 1). Its own
    exports are version 2 once the cluster holds a record or an index, and v0.5.0 cannot read
    them: a downgrade is possible only before the first record or index.
-3. **Never run v0.5.0 and v0.6.0 replicas in one cluster.** They ignore each other (N61).
-4. v0.4.0 and v0.5.0 clients and gateways keep working against v0.6.0 replicas.
+4. **Never run v0.5.0 and v0.6.0 replicas in one cluster.** They ignore each other (N61).
+5. v0.4.0 and v0.5.0 clients and gateways keep working against v0.6.0 replicas. They cannot
+   write records: `commit` refuses an entry in a record table (`table_invalid`).
 
-Release review: (filled in by the release review).
+The adversarial release review found six issues, all fixed before this release:
+[#124](https://github.com/Botpike/nerva-ledger/issues/124),
+[#125](https://github.com/Botpike/nerva-ledger/issues/125),
+[#126](https://github.com/Botpike/nerva-ledger/issues/126),
+[#127](https://github.com/Botpike/nerva-ledger/issues/127),
+[#128](https://github.com/Botpike/nerva-ledger/issues/128),
+[#129](https://github.com/Botpike/nerva-ledger/issues/129).
 
 ## v0.5.0 — 2026-10-07
 

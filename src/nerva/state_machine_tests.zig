@@ -1212,6 +1212,33 @@ test "indexes: built and scanned when a batch holds no wide entry" {
     try testing.expectEqual(nerva.IndexState.ready, page[0].state);
 }
 
+test "indexes: a cursor past every timestamp is refused, not overflowed (#124)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const context = try context_init(&arena);
+    try testing.expectEqual(
+        nerva.DeclareIndexStatus.created,
+        (try context.declare_index(executions_by_status("by_status", true))).status,
+    );
+    _ = context.pulse_until_ready();
+    try expect_statuses(
+        (try context.commit_wide(&.{&.{ execution(1, 1, 5, 0), execution(2, 1, 5, 0) }}))[0],
+        &.{ .ok, .ok },
+    );
+    for ([_]bool{ false, true }) |descending| {
+        for ([_]u64{ std.math.maxInt(u64), (1 << 63) + 5 }) |cursor_timestamp| {
+            const page = try context.scan_index(status_query(1, 10, .{
+                .descending = descending,
+                .cursor_order = 5,
+                .cursor_timestamp = cursor_timestamp,
+            }));
+            try testing.expectEqual(@as(usize, 0), page.len); // Malformed: no reply.
+        }
+    }
+    // The cluster scans on.
+    try testing.expectEqual(@as(usize, 2), (try scan_all(context, status_query(1, 1, .{}))).len);
+}
+
 test "indexes: where filters, declarations, and queries the state machine refuses" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -1366,6 +1393,29 @@ test "record views: min and max are not kept over records; rows keep their 80 by
     var on_rows = spend_by_provider();
     on_rows.table = 5;
     try testing.expectEqual(nerva.DeclareStatus.invalid, (try context.declare(on_rows)).status);
+}
+
+test "record views: commit refuses a record entry without reading its record (#128)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const context = try context_init(&arena);
+    try expect_statuses(
+        (try context.commit_wide(&.{&.{call(id_wide, "openai", 10)}}))[0],
+        &.{.ok},
+    );
+    const declared = try context.declare(spend_by_provider());
+    try testing.expectEqual(nerva.DeclareStatus.created, declared.status);
+    _ = context.pulse_until_ready();
+    // `commit` writes rows only: a put to the viewed record table is refused, and the next
+    // transaction of the request commits.
+    const results = try context.commit(&.{
+        &.{put(records_table, 1, 0x11)},
+        &.{put(5, 1, 0x22)},
+    });
+    try expect_statuses(results[0], &.{.table_invalid});
+    try expect_statuses(results[1], &.{.ok});
+    var totals = try spend(context, declared.view_id);
+    try testing.expectEqual([2]i128{ 1, 10 }, totals.get("openai").?);
 }
 
 test "get_changes: committed writes in op order, paged by cursor" {
