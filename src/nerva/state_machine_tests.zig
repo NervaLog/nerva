@@ -1203,6 +1203,88 @@ test "indexes: where filters, declarations, and queries the state machine refuse
     try testing.expectEqual(@as(usize, 0), (try context.scan_index(reversed)).len);
 }
 
+// ---- Views over records (P123b) ----
+
+/// Calls: `provider` 8 bytes at 300, `cost` u64 at 400.
+fn call(id: u128, provider: []const u8, cost: u64) WideEntry {
+    var entry = record_put(id, 0);
+    entry.value = @splat(0);
+    @memcpy(entry.value[300..][0..provider.len], provider);
+    std.mem.writeInt(u64, entry.value[400..408], cost, .little);
+    return entry;
+}
+
+fn spend_by_provider() nerva.ViewDefinition {
+    var definition = std.mem.zeroes(nerva.ViewDefinition);
+    @memcpy(definition.name[0..5], "spend");
+    definition.table = records_table;
+    definition.group_by_count = 1;
+    definition.group_by[0] = nerva.FieldRef.at(300, 8, .bytes);
+    definition.aggregate_count = 2;
+    definition.aggregates[0] = .{ .function = .count, .field = std.mem.zeroes(nerva.FieldRef) };
+    definition.aggregates[1] = .{ .function = .sum, .field = nerva.FieldRef.at(400, 8, .unsigned) };
+    return definition;
+}
+
+/// Each provider's count and sum, from the view's groups.
+fn spend(context: *Context, view_id: u64) !std.StringHashMapUnmanaged([2]i128) {
+    var totals: std.StringHashMapUnmanaged([2]i128) = .{};
+    const records = try context.view(.{ .view_id = view_id, .group_hash_min = 0, .limit = 100 });
+    try testing.expectEqual(nerva.ViewState.ready, records[0].state);
+    for (records[1..]) |record| {
+        const provider = std.mem.sliceTo(record.group_key[0..8], 0);
+        try totals.put(context.arena, try context.arena.dupe(u8, provider), .{
+            record.count,
+            std.mem.readInt(i128, &record.sums[1], .little),
+        });
+    }
+    return totals;
+}
+
+test "record views: count and sum by a bytes field, built over records and kept by writes" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const context = try context_init(&arena);
+
+    for (0..10) |i| {
+        const provider: []const u8 = if (i % 2 == 0) "openai" else "claude";
+        try expect_statuses(
+            (try context.commit_wide(&.{&.{call(id_wide + i, provider, 10 * i)}}))[0],
+            &.{.ok},
+        );
+    }
+    const declared = try context.declare(spend_by_provider());
+    try testing.expectEqual(nerva.DeclareStatus.created, declared.status);
+    try testing.expect(context.pulse_until_ready() > 0);
+    var totals = try spend(context, declared.view_id);
+    try testing.expectEqual([2]i128{ 5, 200 }, totals.get("openai").?);
+    try testing.expectEqual([2]i128{ 5, 250 }, totals.get("claude").?);
+
+    // A call moves providers, one is deleted, one is added.
+    try expect_statuses((try context.commit_wide(&.{&.{
+        call(id_wide + 0, "claude", 1),
+        record_delete(id_wide + 1),
+        call(id_wide + 100, "gemini", 7),
+    }}))[0], &.{ .ok, .ok, .ok });
+    totals = try spend(context, declared.view_id);
+    try testing.expectEqual([2]i128{ 4, 200 }, totals.get("openai").?);
+    try testing.expectEqual([2]i128{ 5, 241 }, totals.get("claude").?);
+    try testing.expectEqual([2]i128{ 1, 7 }, totals.get("gemini").?);
+}
+
+test "record views: min and max are not kept over records; rows keep their 80 bytes" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const context = try context_init(&arena);
+
+    var extremes = spend_by_provider();
+    extremes.aggregates[1].function = .max;
+    try testing.expectEqual(nerva.DeclareStatus.unsupported, (try context.declare(extremes)).status);
+    var on_rows = spend_by_provider();
+    on_rows.table = 5;
+    try testing.expectEqual(nerva.DeclareStatus.invalid, (try context.declare(on_rows)).status);
+}
+
 test "get_changes: committed writes in op order, paged by cursor" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

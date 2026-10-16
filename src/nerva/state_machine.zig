@@ -226,6 +226,7 @@ pub fn StateMachineType(comptime Storage: type) type {
                     "reserved_a",
                     "hash",
                     "definition",
+                    "backfill_cursor_high",
                     "reserved_b",
                 },
                 .optional = &[_][:0]const u8{},
@@ -2135,6 +2136,82 @@ pub fn StateMachineType(comptime Storage: type) type {
             return (1 + count) * @sizeOf(IndexRecord);
         }
 
+        /// A pulse for a building view over a record table (P123b): its next records, then the
+        /// groups they join.
+        fn prefetch_backfill_view_records(self: *StateMachine, view: *const View) void {
+            assert(self.backfill_records_count == null);
+            const table: u128 = view.definition.table;
+            const records = &self.forest.grooves.records;
+            const scan = records.scan_builder.scan_unique_key_range(
+                .key,
+                self.forest.scan_buffer_pool.acquire_assume_capacity(),
+                self.prefetch_snapshot.?,
+                table << 96 | view_record_cursor(view),
+                table << 96 | std.math.maxInt(u96),
+                .ascending,
+            );
+            self.records_scan_lookup = RecordsScanLookup.init(records, scan);
+            self.records_scan_lookup.read(
+                self.backfill_records[0 .. self.group_writes_limit + 1],
+                prefetch_backfill_view_records_callback,
+            );
+        }
+
+        fn prefetch_backfill_view_records_callback(
+            scan_lookup: *RecordsScanLookup,
+            results: []const Record,
+        ) void {
+            const self: *StateMachine =
+                @alignCast(@fieldParentPtr("records_scan_lookup", scan_lookup));
+            assert(results.len == 0 or results.ptr == self.backfill_records.ptr);
+            self.backfill_records_count = @intCast(results.len);
+            self.forest.scan_buffer_pool.reset();
+            self.forest.grooves.records.scan_builder.reset();
+
+            const view = &self.views_op[self.backfill_view.?];
+            const groups = &self.forest.grooves.groups;
+            groups.prefetch_setup(self.prefetch_snapshot.?);
+            const count = @min(results.len, self.group_writes_limit);
+            for (results[0..count]) |*record| {
+                if (record.flags.deleted) continue;
+                if (!views.row_matches(&view.definition, &record.value)) continue;
+                const key = views.group_key(&view.definition, &record.value);
+                groups.prefetch_enqueue(.{ .key = views.group_tree_key(view.id, &key) });
+            }
+            groups.prefetch(prefetch_groups_callback, &self.groups_prefetch_context);
+        }
+
+        /// A pulse for a building view over a record table: adds the records it scanned.
+        fn execute_pulse_view_records(
+            self: *StateMachine,
+            op: u64,
+            timestamp: u64,
+            view: *View,
+        ) void {
+            defer self.backfill_records_count = null;
+            assert(view.state == .building);
+            const scanned = self.backfill_records[0..self.backfill_records_count.?];
+            const count = @min(scanned.len, self.group_writes_limit);
+            const timestamp_base = timestamp - self.prepare_delta(.pulse, &.{});
+            self.versions_begin(.pulse, timestamp_base);
+            for (scanned[0..count], 0..) |*record, k| {
+                assert(record.table == view.definition.table);
+                assert(record.key & std.math.maxInt(u96) >= view_record_cursor(view));
+                if (record.flags.deleted) continue;
+                const block = timestamp_base + k * entry_timestamps;
+                self.view_row_changed(view, 0, null, &record.value, block + 1, 0);
+            }
+            self.views_finish_groups(op);
+            if (scanned.len > count) {
+                const cursor: u96 = @truncate(scanned[count].key);
+                view.backfill_cursor = @truncate(cursor);
+                view.backfill_cursor_high = @intCast(cursor >> 64);
+            } else {
+                view.state = .ready;
+            }
+            self.views_finish_views(op);
+        }
+
         /// A pulse with no view building: the next records of the first building index (P123c),
         /// then their entries (none exist yet; prefetched so that the commit can tell).
         fn prefetch_backfill_records(self: *StateMachine) void {
@@ -2908,6 +2985,13 @@ pub fn StateMachineType(comptime Storage: type) type {
                 op,
                 timestamp,
             );
+            self.views_record_changed(
+                entry.table,
+                nerva.record_key(entry.table, entry.id),
+                if (stored) |*record| (if (record.flags.deleted) null else &record.value) else null,
+                &entry.value,
+                timestamp,
+            );
             if (stored) |record_old| {
                 // Equal when an earlier transaction in the same request wrote the record.
                 assert(record_old.op <= op);
@@ -2945,6 +3029,7 @@ pub fn StateMachineType(comptime Storage: type) type {
             if (record_old.flags.deleted) return;
             assert(record_old.op <= op);
             self.indexes_record_changed(entry.table, entry.id, &record_old, null, op, timestamp);
+            self.views_record_changed(entry.table, record_old.key, &record_old.value, null, timestamp);
             var record_new = record_old;
             record_new.value = @splat(0);
             record_new.op = op;
@@ -3418,16 +3503,12 @@ pub fn StateMachineType(comptime Storage: type) type {
             const admission: views.Admission = admission: {
                 for (entries) |*entry| {
                     if (!self.entry_viewed(entry)) continue;
-                    const rows = &self.forest.grooves.rows;
-                    const value_old: ?[nerva.value_size]u8 =
-                        switch (rows.get(entry_row_key(entry))) {
-                            .found_object => |row| if (row.flags.deleted) null else row.value,
-                            .not_found => null,
-                        };
+                    // A row's value is zero past its 80 bytes, which its views do not read.
+                    const value_old = self.entry_value_old(entry);
                     for (self.views_op[0..self.views_op_count]) |*view| {
                         if (view.definition.table != entry.table) continue;
                         var matched = false;
-                        for (views.entry_values(entry, value_old)) |candidate| {
+                        for (views.entry_values(RecordBytes, entry, value_old)) |candidate| {
                             const value = candidate orelse continue;
                             if (!views.row_matches(&view.definition, &value)) continue;
                             matched = true;
@@ -3484,6 +3565,25 @@ pub fn StateMachineType(comptime Storage: type) type {
             return true;
         }
 
+        const RecordBytes = [nerva.record_value_size]u8;
+
+        /// The value an entry's row or record holds before the op, as prefetched: null if it
+        /// is absent, deleted, or another id's record (`id_collision`). A row's is zero past
+        /// its 80 bytes.
+        fn entry_value_old(self: *StateMachine, entry: *const WideEntry) ?RecordBytes {
+            if (nerva.table_is_record(entry.table)) {
+                const record = (self.record_stored(entry) catch return null) orelse return null;
+                return if (record.flags.deleted) null else record.value;
+            }
+            const row = switch (self.forest.grooves.rows.get(entry_row_key(entry))) {
+                .found_object => |row| if (row.flags.deleted) return null else row,
+                .not_found => return null,
+            };
+            var value: RecordBytes = @splat(0);
+            value[0..nerva.value_size].* = row.value;
+            return value;
+        }
+
         /// Whether the entry writes a table with a view (in any state).
         fn entry_viewed(self: *const StateMachine, entry: *const WideEntry) bool {
             if (entry.table == 0) return false;
@@ -3530,8 +3630,10 @@ pub fn StateMachineType(comptime Storage: type) type {
         fn prefetch_backfill_members(self: *StateMachine) void {
             const members = &self.forest.grooves.members;
             members.prefetch_setup(self.prefetch_snapshot.?);
-            if (self.backfill_view) |index| {
+            if (self.backfill_view) |index| backfill: {
                 const view = &self.views_op[index];
+                // Views over records have no `min` or `max`, so no members.
+                if (nerva.table_is_record(view.definition.table)) break :backfill;
                 const count = @min(self.backfill_count.?, self.backfill_rows_max(view));
                 for (self.backfill_rows[0..count]) |*row| {
                     self.members_enqueue(view, @truncate(row.key));
@@ -3567,6 +3669,8 @@ pub fn StateMachineType(comptime Storage: type) type {
                 if (self.view_txn_busy.isSet(batch_index)) continue;
                 for (self.batch_entries(operation, batch)) |*entry| {
                     if (!self.entry_viewed(entry)) continue;
+                    // Views over records have no `min` or `max`.
+                    if (nerva.table_is_record(entry.table)) continue;
                     const old = switch (self.forest.grooves.rows.get(entry_row_key(entry))) {
                         .found_object => |row| if (row.flags.deleted) continue else row.value,
                         .not_found => continue,
@@ -3758,8 +3862,8 @@ pub fn StateMachineType(comptime Storage: type) type {
                 self.view_row_changed(
                     view,
                     id,
-                    old,
-                    new,
+                    bytes(old),
+                    bytes(new),
                     timestamp + 1 + slot,
                     timestamp + 1 + nerva.views_per_table_max + extreme_slot,
                 );
@@ -3767,13 +3871,50 @@ pub fn StateMachineType(comptime Storage: type) type {
             assert(extreme_slot <= nerva.view_extremes_per_table_max);
         }
 
+        /// Keeps the views over a record table exact after one record changed from `old` to
+        /// `new` (null: absent), as `views_row_changed` does for a row (P123b). `key` is the
+        /// record's key: a building view adds records below its cursor's key.
+        fn views_record_changed(
+            self: *StateMachine,
+            table: u32,
+            key: u128,
+            old: ?*const [nerva.record_value_size]u8,
+            new: ?*const [nerva.record_value_size]u8,
+            timestamp: u64,
+        ) void {
+            assert(nerva.table_is_record(table));
+            var slot: u64 = 0;
+            for (self.views_op[0..self.views_op_count]) |*view| {
+                if (view.definition.table != table) continue;
+                defer slot += 1;
+                assert(slot < nerva.views_per_table_max);
+                assert(views.extreme_count(&view.definition) == 0);
+                if (!view_maintained(view, table)) continue;
+                if (view.state == .building and
+                    key & std.math.maxInt(u96) >= view_record_cursor(view)) continue;
+                // No `min` or `max`: no members, so the record's id is not needed.
+                self.view_row_changed(view, 0, bytes(old), bytes(new), timestamp + 1 + slot, 0);
+            }
+        }
+
+        /// An optional row's or record's value as an optional slice.
+        fn bytes(value: anytype) ?[]const u8 {
+            return if (value) |array| array else null;
+        }
+
+        /// A building view's cursor over a record table: its 96 bits.
+        fn view_record_cursor(view: *const View) u96 {
+            assert(nerva.table_is_record(view.definition.table));
+            return @as(u96, view.backfill_cursor_high) << 64 | view.backfill_cursor;
+        }
+
         /// One view's part of `views_row_changed`, and a pulse's (with `old` null).
         fn view_row_changed(
             self: *StateMachine,
             view: *View,
             id: u64,
-            old: ?*const [nerva.value_size]u8,
-            new: ?*const [nerva.value_size]u8,
+            old: ?[]const u8,
+            new: ?[]const u8,
             group_timestamp: u64,
             member_timestamp: u64,
         ) void {
@@ -3793,7 +3934,7 @@ pub fn StateMachineType(comptime Storage: type) type {
             self: *StateMachine,
             view: *const View,
             id: u64,
-            value: ?*const [nerva.value_size]u8,
+            value: ?[]const u8,
             timestamp: u64,
         ) void {
             if (view.state == .failed) return; // An earlier collision.
@@ -3862,7 +4003,7 @@ pub fn StateMachineType(comptime Storage: type) type {
         fn group_change(
             self: *StateMachine,
             view: *View,
-            value: *const [nerva.value_size]u8,
+            value: []const u8,
             sign: enum { add, remove },
             timestamp: u64,
         ) void {
@@ -4306,6 +4447,9 @@ pub fn StateMachineType(comptime Storage: type) type {
             } else return self.prefetch_backfill_records();
             self.backfill_view = @intCast(index);
             const view = &self.views_op[index];
+            if (nerva.table_is_record(view.definition.table)) {
+                return self.prefetch_backfill_view_records(view);
+            }
 
             const rows = &self.forest.grooves.rows;
             const scan = rows.scan_builder.scan_unique_key_range(
@@ -4489,15 +4633,19 @@ pub fn StateMachineType(comptime Storage: type) type {
                     table_extremes += views.extreme_count(&view.definition);
                 }
             }
-            // Adds move conserved fields, and must not move rows between groups (N75).
+            // Adds move conserved fields, and must not move rows between groups (N75). Records
+            // have no adds, and no conserved fields.
             const ledger_index = &self.ledger_index;
+            const rows = !nerva.table_is_record(definition.table);
             for (definition.where[0..definition.where_count]) |*clause| {
+                if (!rows) break;
                 const field = clause.field;
                 if (ledger_index.touches(definition.table, field.offset, field.size)) {
                     return .{ .status = .ledger_field, .view_id = 0, .op = 0 };
                 }
             }
             for (definition.group_by[0..definition.group_by_count]) |field| {
+                if (!rows) break;
                 if (ledger_index.touches(definition.table, field.offset, field.size)) {
                     return .{ .status = .ledger_field, .view_id = 0, .op = 0 };
                 }
@@ -4559,6 +4707,10 @@ pub fn StateMachineType(comptime Storage: type) type {
             };
             const view = &self.views_op[index];
             assert(view.state == .building);
+            if (nerva.table_is_record(view.definition.table)) {
+                self.execute_pulse_view_records(op, timestamp, view);
+                return 0;
+            }
             const scanned = self.backfill_rows[0..self.backfill_count.?];
             const count = @min(scanned.len, self.backfill_rows_max(view));
             // Each row takes an entry's block of timestamps (`entry_timestamps`).

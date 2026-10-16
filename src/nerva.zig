@@ -685,7 +685,8 @@ pub const DeclareStatus = enum(u32) {
     table_invalid = 5,
     views_full = 6,
     table_views_full = 7,
-    /// No longer returned: `min` and `max` are maintained since N62.
+    /// `min` or `max` over a record table (P123b): a record's member would need its 128-bit
+    /// id. (Over rows, maintained since N62.)
     unsupported = 8,
     /// The table's views would have more than `view_extremes_per_table_max` `min` and `max`
     /// aggregates.
@@ -725,7 +726,8 @@ pub const View = extern struct {
     id: u64,
     timestamp: u64,
     declared_op: u64,
-    /// While building: rows with a smaller id are already in the groups.
+    /// While building: rows with a smaller id are already in the groups. Over a record table
+    /// (P123b): the low 64 of the 96 bits of the record keys below which records are.
     backfill_cursor: u64,
     /// Groups with a count above zero.
     group_count: u64,
@@ -734,7 +736,9 @@ pub const View = extern struct {
     /// The sum, modulo 2^256 (little-endian), of the digests of the non-empty groups.
     hash: [32]u8,
     definition: ViewDefinition,
-    reserved_b: [176]u8 = @splat(0),
+    /// Over a record table, while building: the high 32 bits of the cursor (P123b).
+    backfill_cursor_high: u32 = 0,
+    reserved_b: [172]u8 = @splat(0),
 
     comptime {
         assert(@sizeOf(View) == 512);

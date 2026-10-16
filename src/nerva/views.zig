@@ -31,11 +31,11 @@ pub fn definition_validate(definition: *const ViewDefinition) ?DeclareStatus {
     }
     // Zero padding only after the name.
     if (!stdx.zeroed(definition.name[name.len..])) return .invalid;
-    if (definition.table == 0 or definition.table >= catalog.tables_reserved_min or
-        nerva.table_is_record(definition.table))
-    {
+    if (definition.table == 0 or definition.table >= catalog.tables_reserved_min) {
         return .table_invalid;
     }
+    // A record's value is wider than a row's (P123b).
+    const value_size_max = nerva.table_value_size(definition.table);
     if (definition.reserved_a != 0 or !stdx.zeroed(&definition.reserved_b)) return .invalid;
     if (definition.where_count > nerva.view_where_max) return .invalid;
     if (definition.group_by_count > nerva.view_group_by_max) return .invalid;
@@ -47,7 +47,7 @@ pub fn definition_validate(definition: *const ViewDefinition) ?DeclareStatus {
             if (!stdx.zeroed(std.mem.asBytes(clause))) return .invalid;
             continue;
         }
-        if (!field_valid(clause.field, value_size) or clause.field.kind == .bytes) return .invalid;
+        if (!field_valid(clause.field, value_size_max) or clause.field.kind == .bytes) return .invalid;
         switch (clause.comparison) {
             .eq, .ne, .lt, .le, .gt, .ge => {},
             _ => return .invalid,
@@ -61,7 +61,7 @@ pub fn definition_validate(definition: *const ViewDefinition) ?DeclareStatus {
             if (!stdx.zeroed(std.mem.asBytes(&field))) return .invalid;
             continue;
         }
-        if (!field_valid(field, value_size)) return .invalid;
+        if (!field_valid(field, value_size_max)) return .invalid;
         key_size += field.size;
     }
     if (key_size > group_key_size_max) return .invalid;
@@ -75,8 +75,11 @@ pub fn definition_validate(definition: *const ViewDefinition) ?DeclareStatus {
         switch (aggregate.function) {
             .count => if (!stdx.zeroed(std.mem.asBytes(&aggregate.field))) return .invalid,
             .sum, .min, .max => {
-                if (!field_valid(aggregate.field, value_size) or aggregate.field.kind == .bytes) {
+                if (!field_valid(aggregate.field, value_size_max) or aggregate.field.kind == .bytes) {
                     return .invalid;
+                }
+                if (extreme(aggregate.function) and nerva.table_is_record(definition.table)) {
+                    return .unsupported;
                 }
             },
             _ => return .invalid,
@@ -293,16 +296,18 @@ pub fn hash_update(hash: *[32]u8, digest: *const [32]u8, sign: enum { add, remov
 
 /// The row values a write may leave behind or start from, for the groups it may touch: the old
 /// row's value, and a put's new value or a creating add's empty row (a superset: an add keeps
-/// its row in its group, `view_key_field`).
+/// its row in its group, `view_key_field`). `Value` is a row's or a record's value array.
 pub fn entry_values(
+    comptime Value: type,
     entry: anytype,
-    value_old: ?[value_size]u8,
-) [2]?[value_size]u8 {
-    var values: [2]?[value_size]u8 = .{ value_old, null };
+    value_old: ?Value,
+) [2]?Value {
+    const size = @typeInfo(Value).array.len;
+    var values: [2]?Value = .{ value_old, null };
     switch (entry.kind) {
-        .put => values[1] = entry.value[0..value_size].*,
+        .put => values[1] = entry.value[0..size].*,
         .add => if (nerva.Add.from_entry(entry).flags.create) {
-            values[1] = @as([value_size]u8, @splat(0));
+            values[1] = @as(Value, @splat(0));
         },
         else => {},
     }

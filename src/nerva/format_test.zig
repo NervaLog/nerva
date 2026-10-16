@@ -383,7 +383,8 @@ test "format: wire and storage layouts" {
         \\  reserved_a: offset 41, size 7, [7]u8
         \\  hash: offset 48, size 32, [32]u8
         \\  definition: offset 80, size 256, nerva.ViewDefinition
-        \\  reserved_b: offset 336, size 176, [176]u8
+        \\  backfill_cursor_high: offset 336, size 4, u32
+        \\  reserved_b: offset 340, size 172, [172]u8
         \\nerva.Group: extern struct, size 256
         \\  key: offset 0, size 16, u128
         \\  timestamp: offset 16, size 8, u64
