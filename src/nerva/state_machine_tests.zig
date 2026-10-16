@@ -46,7 +46,7 @@ const Context = struct {
     forest_busy: bool = false,
     superblock_context: SuperBlock.Context = undefined,
 
-    fn init(context: *Context, arena: std.mem.Allocator) !void {
+    fn init(context: *Context, arena: std.mem.Allocator, batch_size_limit: u32) !void {
         context.* = .{
             .arena = arena,
             .storage = try fixtures.init_storage(arena, .{
@@ -70,7 +70,7 @@ const Context = struct {
         // The first checkpoint is trivially durable.
         context.grid.free_set.mark_checkpoint_durable();
         try context.state_machine.init(arena, context.time_sim.interface(), &context.grid, .{
-            .batch_size_limit = constants.message_body_size_max,
+            .batch_size_limit = batch_size_limit,
             .lsm_forest_node_count = 1024,
         });
         context.forest_busy = true;
@@ -442,8 +442,13 @@ fn expect_statuses(results: []const EntryResult, statuses: []const nerva.EntrySt
 }
 
 fn context_init(arena: *std.heap.ArenaAllocator) !*Context {
+    return context_init_sized(arena, constants.message_body_size_max);
+}
+
+/// A state machine whose clients send batches of at most `batch_size_limit` bytes.
+fn context_init_sized(arena: *std.heap.ArenaAllocator, batch_size_limit: u32) !*Context {
     const context = try arena.allocator().create(Context);
-    try context.init(arena.allocator());
+    try context.init(arena.allocator(), batch_size_limit);
     return context;
 }
 
@@ -1186,6 +1191,25 @@ test "indexes: ties order by the record's own timestamp, however the entry was w
         }
         try testing.expectEqual(@as(usize, 25), count);
     }
+}
+
+test "indexes: built and scanned when a batch holds no wide entry" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    // The VOPR's smallest batch: one wide entry's size, which the multi-batch trailer leaves no
+    // room for. The record trees still take a write, pulses still build indexes, and a scan
+    // still reads a page.
+    const batch_size_limit = @sizeOf(WideEntry);
+    try testing.expectEqual(0, StateMachine.Operation.commit_wide.event_max(batch_size_limit));
+    const context = try context_init_sized(&arena, batch_size_limit);
+    try testing.expectEqual(
+        nerva.DeclareIndexStatus.created,
+        (try context.declare_index(executions_by_status("by_status", true))).status,
+    );
+    try testing.expectEqual(@as(u32, 1), context.pulse_until_ready());
+    const page = try context.scan_index(status_query(1, std.math.maxInt(u32), .{}));
+    try testing.expectEqual(@as(usize, 1), page.len);
+    try testing.expectEqual(nerva.IndexState.ready, page[0].state);
 }
 
 test "indexes: where filters, declarations, and queries the state machine refuses" {

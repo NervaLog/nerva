@@ -1454,6 +1454,14 @@ pub const Operation = enum(u8) {
 
     /// The maximum number of events per batch.
     pub inline fn event_max(operation: Operation, batch_size_limit: u32) u32 {
+        // A batch no larger than one result's trailer holds no event of a multi-batch
+        // operation, which `vsr.multi_batch.event_max` asserts never happens: a
+        // `lookup_records` result is 512 bytes, as large as the largest event, and so as the
+        // smallest batch the simulator may choose (P123b).
+        if (operation.is_multi_batch() and batch_size_limit <= vsr.multi_batch.trailer_total_size(.{
+            .element_size = operation.result_size(),
+            .batch_count = 1,
+        })) return 0;
         return vsr.multi_batch.event_max(Operation, operation, batch_size_limit);
     }
 
