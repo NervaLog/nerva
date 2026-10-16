@@ -11,7 +11,7 @@ const VoprLog = enum { short, full };
 // Nerva has no client releases yet; every build is "the" release.
 // 0.0.5: data files record the export they were imported from, and pings and pongs carry it
 // (P90). Clients are unchanged, so 0.0.4's are still accepted.
-// 0.0.6: a commit may start with a `key` entry, and writes its key's row (P<n>), so 0.0.5 and
+// 0.0.6: a commit may start with a `key` entry, and writes its key's row (P123), so 0.0.5 and
 // 0.0.6 replicas would diverge on it. Clients only gained an entry kind: 0.0.4's still work.
 const release = "0.0.6";
 const release_client_min = "0.0.4";
@@ -315,15 +315,16 @@ pub fn build(b: *std.Build) !void {
     run_integration_tests.has_side_effects = true; // Never cache: it runs real processes.
     steps.test_integration.dependOn(&run_integration_tests.step);
 
-    // zig build test:api: the JSON API, its documents, adds, then ledgers, against models, then a
-    // cluster and gateway over IPv6 (skipped without it), a gateway given an address it cannot
-    // open (#92), then key rotation through both gateways (NERVA_KEY_NEXT); one after the other:
-    // each runs a cluster.
+    // zig build test:api: the JSON API, its documents, adds, commit keys (P123), then ledgers,
+    // against models, then a cluster and gateway over IPv6 (skipped without it), a gateway given
+    // an address it cannot open (#92), then key rotation through both gateways (NERVA_KEY_NEXT);
+    // one after the other: each runs a cluster.
     var api_previous: ?*std.Build.Step = null;
     for ([_][]const u8{
         "api.py",
         "documents.py",
         "adds.py",
+        "commit_keys.py",
         "ledgers.py",
         "ipv6.py",
         "addresses.py",

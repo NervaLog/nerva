@@ -185,14 +185,14 @@ pub const EntryStatus = enum(u32) {
     key_invalid = 22,
 };
 
-/// Commit keys make a resent transaction commit at most once (docs/decisions, P<n>). A
-/// transaction may start with a `key` entry naming a 128-bit key the client chose. When the
-/// transaction commits, the state machine also writes the key's row: a row of
-/// `table_commit_keys`, at `commit_key_id(key)`, holding a `CommitKey`. The row is written once
-/// and never changed. A later transaction under the same key commits nothing: it reports
-/// `committed_before` (the same entries, at the original op), `key_reused` (other entries) or
-/// `key_collision` (another key's row) on its key entry, and `aborted` on the rest. A
-/// transaction that did not commit writes no key, so resending it executes it again.
+/// Commit keys make a resent transaction commit at most once (P123). A transaction may start
+/// with a `key` entry naming a 128-bit key the client chose. When the transaction commits, the
+/// state machine also writes the key's row: a row of `table_commit_keys`, at
+/// `commit_key_id(key)`, holding a `CommitKey`. The row is written once and never changed. A
+/// later transaction under the same key commits nothing: it reports `committed_before` (the
+/// same entries, at the original op), `key_reused` (other entries) or `key_collision` (another
+/// key's row) on its key entry, and `aborted` on the rest. A transaction that did not commit
+/// writes no key, so resending it executes it again.
 pub const table_commit_keys: u32 = 0xFFFF_0003;
 
 /// A key row's value.

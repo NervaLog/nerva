@@ -22,6 +22,8 @@ pub const tables_reserved_min: u32 = 0xFFFF_0000;
 pub const table_catalog: u32 = 0xFFFF_0001;
 /// Applications' documents (`documents.zig`, any namespace), through `/v1/documents/*` (N41).
 pub const table_documents: u32 = 0xFFFF_0002;
+// 0xFFFF_0003 is `nerva.table_commit_keys` (P123): commit keys' rows, written only by the state
+// machine.
 
 pub const fields_max = 16;
 pub const name_size_max = 32;

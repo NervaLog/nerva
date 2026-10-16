@@ -124,7 +124,7 @@ test "format: wire and storage layouts" {
         nerva.DeclareLedgerResult,
         nerva.LedgerQuery,
         nerva.Ledger,
-        // Commit keys (P<n>): a key's row value in `table_commit_keys`.
+        // Commit keys (P123): a key's row value in `table_commit_keys`.
         nerva.CommitKey,
     }) |T| try layout_render(writer, T);
 
@@ -502,7 +502,7 @@ test "format: persisted derivations" {
     try testing.expectEqual(@as(u64, 4613465043632273798), documents.tail_id(id0, 1));
     try testing.expectEqual(@as(u64, 4590579942568114901), documents.tail_id(id0, 2));
 
-    // Commit keys' row ids (P<n>), computed apart from this code (Python's hashlib).
+    // Commit keys' row ids (P123), computed apart from this code (Python's hashlib).
     try testing.expectEqual(@as(u64, 10562569181977696665), nerva.commit_key_id(1));
     try testing.expectEqual(
         @as(u64, 6225441356227291988),

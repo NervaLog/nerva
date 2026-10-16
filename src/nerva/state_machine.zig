@@ -3329,6 +3329,15 @@ pub fn StateMachineType(comptime Storage: type) type {
                     return error.HistoryInvalid;
                 }
                 if (change.table == 0) return error.HistoryInvalid;
+                // A key's row is a put of a `CommitKey` (P123): what `commit_key_failure`
+                // asserts of it.
+                if (change.table == nerva.table_commit_keys) {
+                    if (change.kind != .put) return error.HistoryInvalid;
+                    const stored = std.mem.bytesToValue(CommitKey, &change.value);
+                    if (stored.key == 0 or !stdx.zeroed(&stored.reserved)) {
+                        return error.HistoryInvalid;
+                    }
+                }
                 switch (change.kind) {
                     .put => {},
                     .delete => if (!stdx.zeroed(&change.value)) return error.HistoryInvalid,
@@ -3352,6 +3361,12 @@ pub fn StateMachineType(comptime Storage: type) type {
                         .not_found => false,
                     };
                     if (!live) return error.HistoryInvalid;
+                }
+                if (change.table == nerva.table_commit_keys) {
+                    // Written once: checked as the op goes, as for deletes.
+                    if (self.row_version(nerva.row_key(change.table, change.id)) != 0) {
+                        return error.HistoryInvalid;
+                    }
                 }
                 switch (change.kind) {
                     .put => self.row_put(op, change.timestamp, &entry, &change.value),

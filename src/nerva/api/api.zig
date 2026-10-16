@@ -43,6 +43,10 @@
 //!   clamp), then an add naming it in `delta_from` (which may not). Otherwise `409 {"status":
 //!   "unpaired", "index"}`; a put, delete or overlapping add that would change it, `409
 //!   {"status": "conserved_write", "index"}`.
+//! - A commit may carry a `key` (P123): 16 bytes as 32 hex digits. The same request again then
+//!   answers `200 {"status": "committed", "op", "replayed": true}` with the op it committed at,
+//!   and applies nothing; other entries under the key answer `409 {"status": "key_reused" (or
+//!   "key_collision"), "op"}`. Indices in replies are the request's, not counting the key.
 //! - A table may have a layout (`catalog.zig`, N34): then puts may give `fields` instead of
 //!   `value_hex`, and every row or change of that table also comes back with `fields`.
 //! - Tables from `catalog.tables_reserved_min` up are Nerva's own: refused here, and left out of

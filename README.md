@@ -79,6 +79,18 @@ stay exact. The operations:
 Commits execute serially in op order, so validating each read's version at commit time gives
 serializable transactions over point reads.
 
+A **commit key** makes a transaction safe to send again when its reply is lost (P123). A
+transaction may start with a `key` entry naming a 128-bit key the client chose. When it commits,
+the state machine also writes the key's row (in the reserved table `0xFFFF0003`), in the same
+op. Any later transaction under that key commits nothing: sent again with the same entries, it
+reports `committed_before` with the op it committed at; with other entries, `key_reused`. So a
+client that lost a reply resends the same transaction, under the same key, until it gets an
+answer, and it applies once. A transaction that did not commit (a conflict, a bound) writes no
+key, and its resend executes again. A resend's reply has no adds' amounts: read the rows as of
+its op. Keys are kept forever, one 80-byte row each; their row ids are 64-bit hashes, so two
+keys may collide (about 3 in 10,000 among 10⁸ keys), and the second is refused with
+`key_collision`, which proves nothing committed under it: pick another key.
+
 An **add** changes one 64-bit field (`u64` or `i64`, at a byte offset) inside the commit, with
 no read: adds to one row never conflict, they apply in log order. An add never moves a field
 past a bound (`min`, `max`, or the type's range) in the direction it moves: it fails the
@@ -335,7 +347,7 @@ default). Zone ids (`[fe80::1%2]`) are refused.
 | Route | Does |
 |---|---|
 | `POST /v1/lookup` `{"rows":[{"table","id"}]}` | Point reads: `exists`, version `op`, `value_hex`, and the `op` read at. |
-| `POST /v1/commit` `{"entries":[…]}` | One transaction of `read` (with `op_seen`), `put` (with `value_hex`), `delete` and `add` (`field`, or `offset` and `type`; `delta` or `delta_from`; optional `min`, `max`, `clamp`, `create`, `pair`). `200` committed with its `op` and each add's `applied` and `value`; `409` conflict with the stale entry's `index` and the row's current `op`, or `out_of_bounds` (with the field's `value`) or `row_absent` for an add, or `unpaired` or `conserved_write` for a ledger's field (below); `400` invalid. |
+| `POST /v1/commit` `{"key"?,"entries":[…]}` | One transaction of `read` (with `op_seen`), `put` (with `value_hex`), `delete` and `add` (`field`, or `offset` and `type`; `delta` or `delta_from`; optional `min`, `max`, `clamp`, `create`, `pair`). `200` committed with its `op` and each add's `applied` and `value`; `409` conflict with the stale entry's `index` and the row's current `op`, or `out_of_bounds` (with the field's `value`) or `row_absent` for an add, or `unpaired` or `conserved_write` for a ledger's field (below); `400` invalid. Under a `key` (16 bytes as 32 hex digits, not zero; P123): the same request again answers `200` with the original `op` and `"replayed": true`, and applies nothing; other entries under the key, `409 key_reused` (or `key_collision`) with the op that holds it. Indices are the request's. |
 | `GET /v1/changes?cursor=&limit=` | The change feed, paged. |
 | `GET /v1/history?table=&id=&op_max=&cursor=&limit=` | One row's writes, newest first, up to `op_max`. |
 | `GET /v1/row?table=&id=&as_of=` | One row as it was at an op (refused for an op not yet committed). |

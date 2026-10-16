@@ -652,7 +652,7 @@ test "commit key: other entries never commit under a committed key, nor misplace
     }
     // Only the state machine writes key rows.
     try expect_statuses(
-        (try context.commit(&.{&.{ read(nerva.table_commit_keys, 1, 0) }}))[0],
+        (try context.commit(&.{&.{read(nerva.table_commit_keys, 1, 0)}}))[0],
         &.{.table_invalid},
     );
     try expect_statuses(
@@ -688,6 +688,23 @@ test "commit key: a key whose row another key holds never commits" {
     try expect_statuses(results[0], &.{ .key_collision, .aborted });
     try testing.expectEqual(@as(u64, 1), results[0][0].op);
     try testing.expect(!(try context.lookup(1, 1)).flags.exists);
+
+    // An import refuses key rows no commit writes: a zero key, a delete, a second write.
+    var key_zero = change;
+    key_zero.id = 1;
+    key_zero.value = @splat(0);
+    var key_delete = change;
+    key_delete.kind = .delete;
+    key_delete.value = @splat(0);
+    for ([_]Change{ key_zero, key_delete, change }) |refused_| {
+        var refused = refused_;
+        refused.op = context.op;
+        refused.timestamp = timestamp_next;
+        try testing.expectError(
+            error.HistoryInvalid,
+            restore_op(context, context.op, &.{refused}, null, &timestamp_next),
+        );
+    }
 }
 
 test "get_changes: committed writes in op order, paged by cursor" {

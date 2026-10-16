@@ -15,7 +15,7 @@
 //! all fail. The checker asserts, independently of the row model, that the ledger's total stays
 //! what it was at its declaration (zero), and that no floored field goes below its floor.
 //!
-//! And commit keys (P<n>): some transactions start with a key, and some are sent again, as
+//! And commit keys (P123): some transactions start with a key, and some are sent again, as
 //! sent or with other entries. The model keeps each committed key's entries, so a resend must
 //! report `committed_before` at the op its transaction committed at, and apply nothing.
 //!
@@ -367,7 +367,7 @@ pub fn WorkloadType(comptime StateMachine: type) type {
         ledger_reads: u64 = 0,
         adds_applied: u64 = 0,
         adds_clamped: u64 = 0,
-        /// Commit keys (P<n>): each committed key's entries after its key entry, to tell a resend
+        /// Commit keys (P123): each committed key's entries after its key entry, to tell a resend
         /// (`committed_before`) from other entries under the key (`key_reused`).
         committed_keys: std.AutoHashMapUnmanaged(u128, []const Entry) = .{},
         /// Transactions sent under a key, to send again; at most `keyed_sent_max`.
@@ -1932,6 +1932,7 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                     if (!workload.row_version(key).exists) return; // No-op.
                     break :kind .delete;
                 },
+                .key => unreachable, // A key's row is `apply_key`'s.
                 _ => unreachable,
             };
             const value: [value_size]u8 = switch (entry.kind) {
