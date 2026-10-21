@@ -24,7 +24,9 @@ const RowKey = nerva.RowKey;
 const RowValue = nerva.RowValue;
 const Change = nerva.Change;
 
-const nerva_exe = @import("bench_load_options").nerva_exe;
+const botpike = @import("bench_botpike.zig");
+
+const nerva_exe_built = @import("bench_load_options").nerva_exe;
 
 pub const tigerbeetle_config = @import("config.zig").configs.default_production;
 
@@ -53,6 +55,9 @@ const Workload = enum {
     c5,
     /// 70% lookups, 20% read-modify-write, 5% feed pages, 5% history reads.
     c7,
+    /// Submits like Botpike's (a lookup, then a commit with an add pair) through one `nerva api`
+    /// gateway over HTTP, `--clients` at a time; `--keys` accounts (src/bench_botpike.zig).
+    botpike,
 };
 
 const CLIArgs = struct {
@@ -68,6 +73,9 @@ const CLIArgs = struct {
     rate: u32 = 0,
     seed: ?u64 = null,
     output: ?[]const u8 = null,
+    /// The `nerva` binary the `botpike` workload starts its gateway from (default: the one built
+    /// with this generator).
+    nerva: ?[]const u8 = null,
 
     pub const help =
         \\Usage:
@@ -75,9 +83,12 @@ const CLIArgs = struct {
         \\  bench-load (--local | --addresses=<addresses> [--cluster=<id>]) --workload=<workload>
         \\             [--clients=<n>] [--batch=<n>] [--keys=<n>] [--hot=<n>] [--seconds=<n>]
         \\             [--rate=<requests per second>] [--seed=<n>] [--output=<file>]
+        \\             [--nerva=<path>]
         \\
         \\Workloads: c1 puts, c2 read-modify-write, c3 hot rows with retries, c3_adds hot rows
-        \\with add entries, c4 lookups, c5 change feed, c7 mixed. See src/bench_load.zig.
+        \\with add entries, c4 lookups, c5 change feed, c7 mixed, botpike submits through one
+        \\`nerva api` gateway (--clients callers, --keys accounts, --nerva the binary to start it
+        \\from). See src/bench_load.zig.
         \\
     ;
 };
@@ -109,7 +120,18 @@ pub fn main() !void {
         stdx.Flags.fatal("exactly one of --local and --addresses is required", .{});
     }
     if (args.clients == 0) stdx.Flags.fatal("--clients must be at least 1", .{});
-    if (args.local and args.clients > local_clients_max) {
+    const gateway_workload = args.workload == .botpike;
+    if (gateway_workload) {
+        if (args.clients > botpike.callers_max) {
+            stdx.Flags.fatal("--clients allows at most {} for botpike", .{botpike.callers_max});
+        }
+        if (args.batch != 1) stdx.Flags.fatal("botpike takes no --batch", .{});
+        if (args.rate != 0) stdx.Flags.fatal("botpike is a closed loop: no --rate", .{});
+        if (args.keys < 2 or args.keys > 1_000_000) {
+            stdx.Flags.fatal("--keys (accounts) must be from 2 to 1000000 for botpike", .{});
+        }
+    }
+    if (args.local and !gateway_workload and args.clients > local_clients_max) {
         stdx.Flags.fatal("--local allows at most {} clients", .{local_clients_max});
     }
     if (args.batch == 0 or args.batch > batch_max) {
@@ -140,9 +162,13 @@ pub fn main() !void {
         break :addresses try vsr.parse_addresses(local.?.addresses_flag, &addresses_buffer);
     } else try vsr.parse_addresses(args.addresses.?, &addresses_buffer);
 
-    try preload(gpa, args.cluster, addresses, &config);
-
-    const result = try run(gpa, args.cluster, addresses, &config);
+    const addresses_text = if (args.local) local.?.addresses_flag else args.addresses.?;
+    const result = if (gateway_workload)
+        try run_botpike(gpa, args.cluster, addresses_text, args.nerva orelse nerva_exe_built, &config)
+    else result: {
+        try preload(gpa, args.cluster, addresses, &config);
+        break :result try run(gpa, args.cluster, addresses, &config);
+    };
     var json = std.ArrayList(u8).init(gpa);
     defer json.deinit();
     try result_write(json.writer(), &config, &result);
@@ -164,6 +190,7 @@ fn preload(
 ) !void {
     switch (config.workload) {
         .c1, .c3_adds => return, // Blind writes and adds (with `create`) need no rows.
+        .botpike => unreachable, // Set up through the gateway (`run_botpike`).
         .c2, .c3, .c4, .c5, .c7 => {},
     }
     const client = try gpa.create(Client);
@@ -256,6 +283,36 @@ fn run(
     return total;
 }
 
+/// The `botpike` workload: a gateway in front of the cluster, and callers of the gateway.
+fn run_botpike(
+    gpa: std.mem.Allocator,
+    cluster: u128,
+    addresses: []const u8,
+    nerva_exe: []const u8,
+    config: *const Config,
+) !Result {
+    var gateway = try botpike.Gateway.start(gpa, nerva_exe, cluster, addresses);
+    defer gateway.stop();
+    const outcome = try botpike.run(gpa, &.{
+        .address = gateway.address,
+        .callers = config.clients,
+        .accounts = config.keys,
+        .seconds = config.seconds,
+        .seed = config.seed,
+        .cluster = cluster,
+    });
+    return .{
+        .histogram = outcome.histogram,
+        .operations = outcome.submits,
+        .requests = outcome.requests,
+        .entries = outcome.entries,
+        .conflicts = outcome.conflicts,
+        .errors = outcome.errors,
+        .failures = outcome.failures,
+        .duration = .{ .ns = @as(u64, config.seconds) * std.time.ns_per_s },
+    };
+}
+
 const Worker = struct {
     shared: *Shared,
     index: u32,
@@ -337,6 +394,7 @@ const Worker = struct {
             .c3_adds => try worker.add(client),
             .c4 => try worker.lookups(client),
             .c5 => try worker.feed_page(client),
+            .botpike => unreachable,
             .c7 => {
                 const roll = worker.prng.int_inclusive(u8, 99);
                 if (roll < 70) {
@@ -488,13 +546,14 @@ fn result_write(writer: anytype, config: *const Config, result: *const Result) !
     );
     try writer.print(
         "\"operations\":{},\"requests\":{},\"entries\":{},\"conflicts\":{},\"retries\":{}," ++
-            "\"errors\":{},\"failures\":{},\"operations_per_s\":{d:.1},\"entries_per_s\":{d:.1},",
+            "\"errors\":{},\"failures\":{},\"operations_per_s\":{d:.1},\"requests_per_s\":{d:.1}," ++
+            "\"entries_per_s\":{d:.1},",
         .{
-            result.operations,                                 result.requests,
-            result.entries,                                    result.conflicts,
-            result.retries,                                    result.errors,
-            result.failures,                                   @as(f64, @floatFromInt(result.operations)) / seconds,
-            @as(f64, @floatFromInt(result.entries)) / seconds,
+            result.operations,                                  result.requests,
+            result.entries,                                     result.conflicts,
+            result.retries,                                     result.errors,
+            result.failures,                                    @as(f64, @floatFromInt(result.operations)) / seconds,
+            @as(f64, @floatFromInt(result.requests)) / seconds, @as(f64, @floatFromInt(result.entries)) / seconds,
         },
     );
     try writer.print(
@@ -545,7 +604,7 @@ const LocalCluster = struct {
         for (0..3) |replica| {
             const path = try std.fmt.bufPrint(&path_buffer, "{s}/0_{}.nerva", .{ tmp_path, replica });
             const format = try std.process.Child.run(.{ .allocator = gpa, .argv = &.{
-                nerva_exe,
+                nerva_exe_built,
                 "format",
                 "--cluster=0",
                 try std.fmt.bufPrint(&replica_buffer, "--replica={}", .{replica}),
@@ -564,7 +623,7 @@ const LocalCluster = struct {
         for (&cluster.processes, 0..) |*process, replica| {
             const path = try std.fmt.bufPrint(&path_buffer, "{s}/0_{}.nerva", .{ tmp_path, replica });
             process.* = std.process.Child.init(&.{
-                nerva_exe,
+                nerva_exe_built,
                 "start",
                 try std.fmt.bufPrint(&addresses_buffer, "--addresses={s}", .{addresses_flag}),
                 "--development",

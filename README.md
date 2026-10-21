@@ -325,7 +325,11 @@ with one thread and one client per `--clients` (`--local` starts a three-replica
 cluster, at most 6 clients) and prints one JSON object: operations and entries per second,
 conflicts and retries, and latency percentiles in µs. Workloads: `c1` puts, `c2`
 read-modify-write, `c3` hot rows with retries, `c3_adds` hot rows with adds, `c4` lookups, `c5`
-change feed, `c7` mixed. `--rate=0` (default) is a closed loop; `--rate=<n>` an open loop whose
+change feed, `c7` mixed, and `botpike`: submits like Botpike's app sends (a lookup, then a commit
+with a key, a transfer row and a clamped add pair, reserves and settles alternating) through one
+`nerva api` gateway over HTTP, with `--clients` concurrent callers (up to 64; `--keys` accounts;
+`--nerva=<path>` the binary to start the gateway from), so that it measures what an application
+behind one gateway gets (P132). `--rate=0` (default) is a closed loop; `--rate=<n>` an open loop whose
 latencies count from each request's due time. Use `-Drelease` so the `nerva` it starts is a
 release build.
 

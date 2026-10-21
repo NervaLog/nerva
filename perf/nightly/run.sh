@@ -21,8 +21,10 @@ development=()
 # Replicas authenticate each other with the cluster key (P102): one random key per run unless
 # one is given, never printed. Builds from before P102 ignore it.
 export NERVA_CLUSTER_KEY=${NERVA_CLUSTER_KEY:-$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')}
-# workload:batch pairs; the key in the results is "<workload>/b<batch>".
-workloads=${PERF_WORKLOADS:-"c1:1 c1:64 c2:1 c3:1 c3_adds:1 c4:1 c4:64 c5:1024 c7:1"}
+# workload:batch[:clients] triples; the key in the results is "<workload>/b<batch>", and
+# "<workload>/b<batch>/c<clients>" for botpike (P132), which goes through one `nerva api` gateway
+# and is measured at several numbers of callers.
+workloads=${PERF_WORKLOADS:-"c1:1 c1:64 c2:1 c3:1 c3_adds:1 c4:1 c4:64 c5:1024 c7:1 botpike:1:1 botpike:1:12"}
 
 results=$data/results.jsonl
 log=$data/run.log
@@ -81,17 +83,27 @@ load() { # role round
       return 1
     fi
   done
-  for pair in $workloads; do
-    local workload=${pair%%:*} batch=${pair##*:} out
+  for triple in $workloads; do
+    local workload batch workload_clients out gateway
+    IFS=: read -r workload batch workload_clients <<< "$triple"
+    workload_clients=${workload_clients:-$clients}
+    # A build from before a workload existed has nothing to measure: no result, no error.
+    if "$bin/$role/bench-load" --workload="$workload" 2>&1 | grep -q -- "--workload: expected one of"; then
+      echo "$workload: not in the $role build"
+      continue
+    fi
+    # Only botpike starts a gateway: older builds reject the flag.
+    gateway=()
+    [ "$workload" = botpike ] && gateway=(--nerva="$bin/$role/nerva")
     out=$("$bin/$role/bench-load" --addresses=$addresses --workload="$workload" --batch="$batch" \
-      --clients="$clients" --seconds="$seconds" --keys=100000 --seed=$((round * 1000 + 1)) \
-      2> "$dir/bench-load.err")
+      --clients="$workload_clients" --seconds="$seconds" --keys=100000 --seed=$((round * 1000 + 1)) \
+      "${gateway[@]}" 2> "$dir/bench-load.err")
     if [ -n "$out" ]; then
-      emit "$role" "$round" load "$(printf '%s' "$out" | python3 -c 'import json,sys; r=json.load(sys.stdin); r["key"]=r["workload"]+"/b"+str(r["batch"]); print(json.dumps(r))')"
-      echo "$workload/b$batch: $out"
+      emit "$role" "$round" load "$(printf '%s' "$out" | python3 -c 'import json,sys; r=json.load(sys.stdin); r["key"]=r["workload"]+"/b"+str(r["batch"])+("/c"+str(r["clients"]) if r["workload"]=="botpike" else ""); print(json.dumps(r))')"
+      echo "$workload/b$batch/c$workload_clients: $out"
     else
-      echo "$workload/b$batch: no result"; tail -5 "$dir/bench-load.err"
-      emit "$role" "$round" error "{\"key\":\"$workload/b$batch\",\"error\":\"bench-load failed\"}"
+      echo "$workload/b$batch/c$workload_clients: no result"; tail -5 "$dir/bench-load.err"
+      emit "$role" "$round" error "{\"key\":\"$workload/b$batch/c$workload_clients\",\"error\":\"bench-load failed\"}"
     fi
   done
   kill "${pids[@]}" 2>/dev/null; wait "${pids[@]}" 2>/dev/null

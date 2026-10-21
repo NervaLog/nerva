@@ -31,6 +31,14 @@ class Compare(unittest.TestCase):
         self.assertEqual(verdict["overall"], "pass")
         self.assertEqual(status(verdict, "load c4/b1 ops/s"), "pass")
 
+    def test_a_workload_only_the_candidate_has_is_not_compared(self):
+        # The baseline build predates the workload (P132): it has no result, and no error.
+        lines = [load(role, r, 1000) for r in (1, 2, 3) for role in ("baseline", "candidate")]
+        lines += [load("candidate", r, 150, key="botpike/b1/c12") for r in (1, 2, 3)]
+        verdict = compare.compare(lines)
+        self.assertEqual(verdict["overall"], "pass")
+        self.assertEqual([row["metric"] for row in verdict["metrics"] if "botpike" in row["metric"]], [])
+
     def test_worse_every_round_fails(self):
         lines = []
         for r in (1, 2, 3):

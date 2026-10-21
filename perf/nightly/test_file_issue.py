@@ -346,6 +346,18 @@ class Baseline(unittest.TestCase):
             self.assertEqual(result.stdout.strip() == "moved", moved, (advance, overall))
 
 
+class Pages(unittest.TestCase):
+    def test_pages_are_concatenated_arrays_and_gh_gets_no_slurp(self):
+        # `gh api --paginate` prints one array per page, back to back.
+        self.assertEqual(file_issue.pages_items('[{"a":1},{"a":2}]\n[{"a":3}]\n'), [{"a": 1}, {"a": 2}, {"a": 3}])
+        self.assertEqual(file_issue.pages_items(""), [])
+        self.assertEqual(file_issue.pages_items("[]"), [])
+        with mock.patch.object(file_issue.subprocess, "run") as run:
+            run.return_value = subprocess.CompletedProcess([], 0, '[{"n":1}][{"n":2}]', "")
+            self.assertEqual(file_issue.Gh("o/r").get("issues"), [{"n": 1}, {"n": 2}])
+            self.assertNotIn("--slurp", run.call_args.args[0])
+
+
 class RealGh(unittest.TestCase):
     """The `gh` command lines, with subprocess.run stubbed."""
 
@@ -373,9 +385,10 @@ class RealGh(unittest.TestCase):
         }
 
         def run(command, **kwargs):
-            self.assertEqual(command[:4], ["gh", "api", "--paginate", "--slurp"])
+            self.assertEqual(command[:3], ["gh", "api", "--paginate"])
             self.assertNotIn("--repo", command)
-            return subprocess.CompletedProcess(command, 0, json.dumps(pages[command[4]]), "")
+            self.assertNotIn("--slurp", command)
+            return subprocess.CompletedProcess(command, 0, "".join(json.dumps(page) + "\n" for page in pages[command[3]]), "")
 
         with mock.patch.object(file_issue.subprocess, "run", side_effect=run):
             issues = file_issue.Gh("Botpike/nerva-ledger").issues()

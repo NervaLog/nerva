@@ -81,6 +81,20 @@ def markers(issue):
     return found, runs
 
 
+def pages_items(text):
+    """The items of what `gh api --paginate` prints: one JSON array per page, back to back (not
+    `--slurp`, which the runner's `gh` lacks)."""
+    decoder = json.JSONDecoder()
+    items, position = [], 0
+    while True:
+        while position < len(text) and text[position].isspace():
+            position += 1
+        if position == len(text):
+            return items
+        page, position = decoder.raw_decode(text, position)
+        items += page
+
+
 class Gh:
     """The few `gh` calls this needs. Tests replace it with a fake that records the calls."""
 
@@ -96,8 +110,7 @@ class Gh:
 
     def get(self, path):
         """Every item of a paginated REST list (`gh api` reads with REST, not GraphQL)."""
-        pages = json.loads(self.run(["api", "--paginate", "--slurp", f"repos/{self.repo or '{owner}/{repo}'}/{path}"]) or "[]")
-        return [item for page in pages for item in page]
+        return pages_items(self.run(["api", "--paginate", f"repos/{self.repo or '{owner}/{repo}'}/{path}"]))
 
     def issues(self):
         """Every perf-regression issue, open or closed, with its comments."""
