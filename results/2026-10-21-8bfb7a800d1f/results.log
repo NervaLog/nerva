@@ -1,0 +1,115 @@
+=== perf nightly: baseline 5ba6764825c0dbb4072e8aa333b86d7bf18eab63 candidate 8bfb7a800d1f5ff212945e42ccfd8a384549b41a
+=== health
+{"iops": 23209, "mib_s": 90.7}
+=== micro baseline round 1
+=== load baseline round 1
+c1/b1/c8: no result
+error: unexpected argument: '--nerva=/opt/perf/baseline/nerva'
+c1/b64/c8: no result
+error: unexpected argument: '--nerva=/opt/perf/baseline/nerva'
+c2/b1/c8: no result
+error: unexpected argument: '--nerva=/opt/perf/baseline/nerva'
+c3/b1/c8: no result
+error: unexpected argument: '--nerva=/opt/perf/baseline/nerva'
+c3_adds/b1/c8: no result
+error: unexpected argument: '--nerva=/opt/perf/baseline/nerva'
+c4/b1/c8: no result
+error: unexpected argument: '--nerva=/opt/perf/baseline/nerva'
+c4/b64/c8: no result
+error: unexpected argument: '--nerva=/opt/perf/baseline/nerva'
+c5/b1024/c8: no result
+error: unexpected argument: '--nerva=/opt/perf/baseline/nerva'
+c7/b1/c8: no result
+error: unexpected argument: '--nerva=/opt/perf/baseline/nerva'
+botpike: not in the baseline build
+botpike: not in the baseline build
+=== micro candidate round 1
+=== load candidate round 1
+c1/b1/c8: {"workload":"c1","clients":8,"batch":1,"keys":100000,"hot":4,"seconds":20,"rate":0,"seed":1001,"operations":4970,"requests":4970,"entries":4970,"conflicts":0,"retries":0,"errors":0,"failures":0,"operations_per_s":248.5,"requests_per_s":248.5,"entries_per_s":248.5,"latency_us":{"p50":30719,"p90":51199,"p99":61439,"p999":91242,"max":91242}}
+c1/b64/c8: {"workload":"c1","clients":8,"batch":64,"keys":100000,"hot":4,"seconds":20,"rate":0,"seed":1001,"operations":4807,"requests":4807,"entries":307648,"conflicts":0,"retries":0,"errors":0,"failures":0,"operations_per_s":240.4,"requests_per_s":240.4,"entries_per_s":15382.4,"latency_us":{"p50":31743,"p90":51199,"p99":69631,"p999":73727,"max":81594}}
+c2/b1/c8: {"workload":"c2","clients":8,"batch":1,"keys":100000,"hot":4,"seconds":20,"rate":0,"seed":1001,"operations":2347,"requests":4694,"entries":4694,"conflicts":0,"retries":0,"errors":0,"failures":0,"operations_per_s":117.4,"requests_per_s":234.7,"entries_per_s":234.7,"latency_us":{"p50":73727,"p90":102399,"p99":131071,"p999":237567,"max":241346}}
+c3/b1/c8: {"workload":"c3","clients":8,"batch":1,"keys":100000,"hot":4,"seconds":20,"rate":0,"seed":1001,"operations":1105,"requests":4738,"entries":2210,"conflicts":1264,"retries":1264,"errors":0,"failures":0,"operations_per_s":55.3,"requests_per_s":236.9,"entries_per_s":110.5,"latency_us":{"p50":90111,"p90":294911,"p99":884735,"p999":1900543,"max":2107894}}
+c3_adds/b1/c8: {"workload":"c3_adds","clients":8,"batch":1,"keys":100000,"hot":4,"seconds":20,"rate":0,"seed":1001,"operations":4907,"requests":4907,"entries":4907,"conflicts":0,"retries":0,"errors":0,"failures":0,"operations_per_s":245.4,"requests_per_s":245.4,"entries_per_s":245.4,"latency_us":{"p50":30719,"p90":51199,"p99":61439,"p999":71091,"max":71091}}
+c4/b1/c8: {"workload":"c4","clients":8,"batch":1,"keys":100000,"hot":4,"seconds":20,"rate":0,"seed":1001,"operations":5140,"requests":5140,"entries":5140,"conflicts":0,"retries":0,"errors":0,"failures":0,"operations_per_s":257.0,"requests_per_s":257.0,"entries_per_s":257.0,"latency_us":{"p50":30719,"p90":51199,"p99":61439,"p999":73727,"max":81029}}
+c4/b64/c8: {"workload":"c4","clients":8,"batch":64,"keys":100000,"hot":4,"seconds":20,"rate":0,"seed":1001,"operations":5008,"requests":5008,"entries":320512,"conflicts":0,"retries":0,"errors":0,"failures":0,"operations_per_s":250.4,"requests_per_s":250.4,"entries_per_s":16025.6,"latency_us":{"p50":30719,"p90":51199,"p99":61439,"p999":77823,"max":80937}}
+c5/b1024/c8: {"workload":"c5","clients":8,"batch":1024,"keys":100000,"hot":4,"seconds":20,"rate":0,"seed":1001,"operations":4933,"requests":4933,"entries":5051392,"conflicts":0,"retries":0,"errors":0,"failures":0,"operations_per_s":246.7,"requests_per_s":246.7,"entries_per_s":252569.6,"latency_us":{"p50":31743,"p90":51199,"p99":61439,"p999":139263,"max":141183}}
+c7/b1/c8: {"workload":"c7","clients":8,"batch":1,"keys":100000,"hot":4,"seconds":20,"rate":0,"seed":1001,"operations":4172,"requests":4996,"entries":6670,"conflicts":0,"retries":0,"errors":0,"failures":0,"operations_per_s":208.6,"requests_per_s":249.8,"entries_per_s":333.5,"latency_us":{"p50":32767,"p90":69631,"p99":102399,"p999":122879,"max":138336}}
+botpike/b1/c1: {"workload":"botpike","clients":1,"batch":1,"keys":100000,"hot":4,"seconds":20,"rate":0,"seed":1001,"operations":1559,"requests":3118,"entries":7015,"conflicts":0,"retries":0,"errors":0,"failures":0,"operations_per_s":78.0,"requests_per_s":155.9,"entries_per_s":350.8,"latency_us":{"p50":3967,"p90":5119,"p99":442367,"p999":708231,"max":708231}}
+botpike/b1/c12: no result
+POST /v1/commit: 409 {"status":"conserved_write","index":0}
+error: SetupFailed
+=== micro candidate round 2
+=== load candidate round 2
+c1/b1/c8: {"workload":"c1","clients":8,"batch":1,"keys":100000,"hot":4,"seconds":20,"rate":0,"seed":2001,"operations":4867,"requests":4867,"entries":4867,"conflicts":0,"retries":0,"errors":0,"failures":0,"operations_per_s":243.4,"requests_per_s":243.4,"entries_per_s":243.4,"latency_us":{"p50":30719,"p90":51199,"p99":63487,"p999":73727,"max":81216}}
+c1/b64/c8: {"workload":"c1","clients":8,"batch":64,"keys":100000,"hot":4,"seconds":20,"rate":0,"seed":2001,"operations":4986,"requests":4986,"entries":319104,"conflicts":0,"retries":0,"errors":0,"failures":0,"operations_per_s":249.3,"requests_per_s":249.3,"entries_per_s":15955.2,"latency_us":{"p50":31743,"p90":51199,"p99":63487,"p999":73727,"max":81367}}
+c2/b1/c8: {"workload":"c2","clients":8,"batch":1,"keys":100000,"hot":4,"seconds":20,"rate":0,"seed":2001,"operations":2438,"requests":4876,"entries":4876,"conflicts":0,"retries":0,"errors":0,"failures":0,"operations_per_s":121.9,"requests_per_s":243.8,"entries_per_s":243.8,"latency_us":{"p50":63487,"p90":94207,"p99":114687,"p999":138520,"max":138520}}
+c3/b1/c8: {"workload":"c3","clients":8,"batch":1,"keys":100000,"hot":4,"seconds":20,"rate":0,"seed":2001,"operations":1161,"requests":5016,"entries":2322,"conflicts":1347,"retries":1347,"errors":0,"failures":0,"operations_per_s":58.1,"requests_per_s":250.8,"entries_per_s":116.1,"latency_us":{"p50":81919,"p90":294911,"p99":884735,"p999":1376255,"max":1589862}}
+c3_adds/b1/c8: {"workload":"c3_adds","clients":8,"batch":1,"keys":100000,"hot":4,"seconds":20,"rate":0,"seed":2001,"operations":4885,"requests":4885,"entries":4885,"conflicts":0,"retries":0,"errors":0,"failures":0,"operations_per_s":244.3,"requests_per_s":244.3,"entries_per_s":244.3,"latency_us":{"p50":31743,"p90":51199,"p99":63487,"p999":81406,"max":81406}}
+c4/b1/c8: {"workload":"c4","clients":8,"batch":1,"keys":100000,"hot":4,"seconds":20,"rate":0,"seed":2001,"operations":4937,"requests":4937,"entries":4937,"conflicts":0,"retries":0,"errors":0,"failures":0,"operations_per_s":246.9,"requests_per_s":246.9,"entries_per_s":246.9,"latency_us":{"p50":30719,"p90":51199,"p99":69631,"p999":73727,"max":80668}}
+c4/b64/c8: {"workload":"c4","clients":8,"batch":64,"keys":100000,"hot":4,"seconds":20,"rate":0,"seed":2001,"operations":4982,"requests":4982,"entries":318848,"conflicts":0,"retries":0,"errors":0,"failures":0,"operations_per_s":249.1,"requests_per_s":249.1,"entries_per_s":15942.4,"latency_us":{"p50":30719,"p90":51199,"p99":63487,"p999":77823,"max":80938}}
+c5/b1024/c8: {"workload":"c5","clients":8,"batch":1024,"keys":100000,"hot":4,"seconds":20,"rate":0,"seed":2001,"operations":4922,"requests":4922,"entries":5040128,"conflicts":0,"retries":0,"errors":0,"failures":0,"operations_per_s":246.1,"requests_per_s":246.1,"entries_per_s":252006.4,"latency_us":{"p50":30719,"p90":51199,"p99":73727,"p999":172031,"max":181728}}
+c7/b1/c8: {"workload":"c7","clients":8,"batch":1,"keys":100000,"hot":4,"seconds":20,"rate":0,"seed":2001,"operations":4154,"requests":4942,"entries":6738,"conflicts":0,"retries":0,"errors":0,"failures":0,"operations_per_s":207.7,"requests_per_s":247.1,"entries_per_s":336.9,"latency_us":{"p50":38911,"p90":63487,"p99":102399,"p999":114687,"max":130122}}
+botpike/b1/c1: {"workload":"botpike","clients":1,"batch":1,"keys":100000,"hot":4,"seconds":20,"rate":0,"seed":2001,"operations":1494,"requests":2988,"entries":6723,"conflicts":0,"retries":0,"errors":0,"failures":0,"operations_per_s":74.7,"requests_per_s":149.4,"entries_per_s":336.2,"latency_us":{"p50":4095,"p90":5119,"p99":458751,"p999":741763,"max":741763}}
+botpike/b1/c12: no result
+POST /v1/commit: 409 {"status":"conserved_write","index":0}
+error: SetupFailed
+=== micro baseline round 2
+=== load baseline round 2
+c1/b1/c8: no result
+error: unexpected argument: '--nerva=/opt/perf/baseline/nerva'
+c1/b64/c8: no result
+error: unexpected argument: '--nerva=/opt/perf/baseline/nerva'
+c2/b1/c8: no result
+error: unexpected argument: '--nerva=/opt/perf/baseline/nerva'
+c3/b1/c8: no result
+error: unexpected argument: '--nerva=/opt/perf/baseline/nerva'
+c3_adds/b1/c8: no result
+error: unexpected argument: '--nerva=/opt/perf/baseline/nerva'
+c4/b1/c8: no result
+error: unexpected argument: '--nerva=/opt/perf/baseline/nerva'
+c4/b64/c8: no result
+error: unexpected argument: '--nerva=/opt/perf/baseline/nerva'
+c5/b1024/c8: no result
+error: unexpected argument: '--nerva=/opt/perf/baseline/nerva'
+c7/b1/c8: no result
+error: unexpected argument: '--nerva=/opt/perf/baseline/nerva'
+botpike: not in the baseline build
+botpike: not in the baseline build
+=== micro baseline round 3
+=== load baseline round 3
+c1/b1/c8: no result
+error: unexpected argument: '--nerva=/opt/perf/baseline/nerva'
+c1/b64/c8: no result
+error: unexpected argument: '--nerva=/opt/perf/baseline/nerva'
+c2/b1/c8: no result
+error: unexpected argument: '--nerva=/opt/perf/baseline/nerva'
+c3/b1/c8: no result
+error: unexpected argument: '--nerva=/opt/perf/baseline/nerva'
+c3_adds/b1/c8: no result
+error: unexpected argument: '--nerva=/opt/perf/baseline/nerva'
+c4/b1/c8: no result
+error: unexpected argument: '--nerva=/opt/perf/baseline/nerva'
+c4/b64/c8: no result
+error: unexpected argument: '--nerva=/opt/perf/baseline/nerva'
+c5/b1024/c8: no result
+error: unexpected argument: '--nerva=/opt/perf/baseline/nerva'
+c7/b1/c8: no result
+error: unexpected argument: '--nerva=/opt/perf/baseline/nerva'
+botpike: not in the baseline build
+botpike: not in the baseline build
+=== micro candidate round 3
+=== load candidate round 3
+c1/b1/c8: {"workload":"c1","clients":8,"batch":1,"keys":100000,"hot":4,"seconds":20,"rate":0,"seed":3001,"operations":5087,"requests":5087,"entries":5087,"conflicts":0,"retries":0,"errors":0,"failures":0,"operations_per_s":254.4,"requests_per_s":254.4,"entries_per_s":254.4,"latency_us":{"p50":30719,"p90":51199,"p99":61439,"p999":81344,"max":81344}}
+c1/b64/c8: {"workload":"c1","clients":8,"batch":64,"keys":100000,"hot":4,"seconds":20,"rate":0,"seed":3001,"operations":4836,"requests":4836,"entries":309504,"conflicts":0,"retries":0,"errors":0,"failures":0,"operations_per_s":241.8,"requests_per_s":241.8,"entries_per_s":15475.2,"latency_us":{"p50":31743,"p90":51199,"p99":69631,"p999":81919,"max":82147}}
+c2/b1/c8: {"workload":"c2","clients":8,"batch":1,"keys":100000,"hot":4,"seconds":20,"rate":0,"seed":3001,"operations":2342,"requests":4684,"entries":4684,"conflicts":0,"retries":0,"errors":0,"failures":0,"operations_per_s":117.1,"requests_per_s":234.2,"entries_per_s":234.2,"latency_us":{"p50":73727,"p90":94207,"p99":122879,"p999":163839,"max":171232}}
+c3/b1/c8: {"workload":"c3","clients":8,"batch":1,"keys":100000,"hot":4,"seconds":20,"rate":0,"seed":3001,"operations":1091,"requests":4726,"entries":2182,"conflicts":1272,"retries":1272,"errors":0,"failures":0,"operations_per_s":54.6,"requests_per_s":236.3,"entries_per_s":109.1,"latency_us":{"p50":86015,"p90":294911,"p99":1114111,"p999":2031615,"max":2063668}}
+c3_adds/b1/c8: {"workload":"c3_adds","clients":8,"batch":1,"keys":100000,"hot":4,"seconds":20,"rate":0,"seed":3001,"operations":4924,"requests":4924,"entries":4924,"conflicts":0,"retries":0,"errors":0,"failures":0,"operations_per_s":246.2,"requests_per_s":246.2,"entries_per_s":246.2,"latency_us":{"p50":30719,"p90":51199,"p99":63487,"p999":73727,"max":81169}}
+c4/b1/c8: {"workload":"c4","clients":8,"batch":1,"keys":100000,"hot":4,"seconds":20,"rate":0,"seed":3001,"operations":5007,"requests":5007,"entries":5007,"conflicts":0,"retries":0,"errors":0,"failures":0,"operations_per_s":250.4,"requests_per_s":250.4,"entries_per_s":250.4,"latency_us":{"p50":30719,"p90":51199,"p99":73727,"p999":81919,"max":99594}}
+c4/b64/c8: {"workload":"c4","clients":8,"batch":64,"keys":100000,"hot":4,"seconds":20,"rate":0,"seed":3001,"operations":5087,"requests":5087,"entries":325568,"conflicts":0,"retries":0,"errors":0,"failures":0,"operations_per_s":254.4,"requests_per_s":254.4,"entries_per_s":16278.4,"latency_us":{"p50":30719,"p90":51199,"p99":61439,"p999":302605,"max":302605}}
+c5/b1024/c8: {"workload":"c5","clients":8,"batch":1024,"keys":100000,"hot":4,"seconds":20,"rate":0,"seed":3001,"operations":4799,"requests":4799,"entries":4914176,"conflicts":0,"retries":0,"errors":0,"failures":0,"operations_per_s":240.0,"requests_per_s":240.0,"entries_per_s":245708.8,"latency_us":{"p50":31743,"p90":51199,"p99":73727,"p999":73727,"max":81270}}
+c7/b1/c8: {"workload":"c7","clients":8,"batch":1,"keys":100000,"hot":4,"seconds":20,"rate":0,"seed":3001,"operations":4179,"requests":5002,"entries":6826,"conflicts":0,"retries":0,"errors":0,"failures":0,"operations_per_s":209.0,"requests_per_s":250.1,"entries_per_s":341.3,"latency_us":{"p50":40959,"p90":69631,"p99":102399,"p999":122879,"max":132158}}
+botpike/b1/c1: {"workload":"botpike","clients":1,"batch":1,"keys":100000,"hot":4,"seconds":20,"rate":0,"seed":3001,"operations":1589,"requests":3178,"entries":7150,"conflicts":0,"retries":0,"errors":0,"failures":0,"operations_per_s":79.5,"requests_per_s":158.9,"entries_per_s":357.5,"latency_us":{"p50":4351,"p90":5375,"p99":458751,"p999":684535,"max":684535}}
+botpike/b1/c12: no result
+POST /v1/commit: 409 {"status":"conserved_write","index":0}
+error: SetupFailed
+=== done: 85 results

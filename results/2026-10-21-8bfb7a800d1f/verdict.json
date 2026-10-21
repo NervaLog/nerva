@@ -1,0 +1,247 @@
+{
+ "overall": "fail",
+ "commits": {
+  "baseline": "5ba6764825c0dbb4072e8aa333b86d7bf18eab63",
+  "candidate": "8bfb7a800d1f5ff212945e42ccfd8a384549b41a"
+ },
+ "health": {
+  "iops": 23209,
+  "mib_s": 90.7
+ },
+ "errors": [
+  {
+   "role": "baseline",
+   "round": 1,
+   "key": "c1/b1/c8",
+   "error": "bench-load failed"
+  },
+  {
+   "role": "baseline",
+   "round": 1,
+   "key": "c1/b64/c8",
+   "error": "bench-load failed"
+  },
+  {
+   "role": "baseline",
+   "round": 1,
+   "key": "c2/b1/c8",
+   "error": "bench-load failed"
+  },
+  {
+   "role": "baseline",
+   "round": 1,
+   "key": "c3/b1/c8",
+   "error": "bench-load failed"
+  },
+  {
+   "role": "baseline",
+   "round": 1,
+   "key": "c3_adds/b1/c8",
+   "error": "bench-load failed"
+  },
+  {
+   "role": "baseline",
+   "round": 1,
+   "key": "c4/b1/c8",
+   "error": "bench-load failed"
+  },
+  {
+   "role": "baseline",
+   "round": 1,
+   "key": "c4/b64/c8",
+   "error": "bench-load failed"
+  },
+  {
+   "role": "baseline",
+   "round": 1,
+   "key": "c5/b1024/c8",
+   "error": "bench-load failed"
+  },
+  {
+   "role": "baseline",
+   "round": 1,
+   "key": "c7/b1/c8",
+   "error": "bench-load failed"
+  },
+  {
+   "role": "candidate",
+   "round": 1,
+   "key": "botpike/b1/c12",
+   "error": "bench-load failed"
+  },
+  {
+   "role": "candidate",
+   "round": 2,
+   "key": "botpike/b1/c12",
+   "error": "bench-load failed"
+  },
+  {
+   "role": "baseline",
+   "round": 2,
+   "key": "c1/b1/c8",
+   "error": "bench-load failed"
+  },
+  {
+   "role": "baseline",
+   "round": 2,
+   "key": "c1/b64/c8",
+   "error": "bench-load failed"
+  },
+  {
+   "role": "baseline",
+   "round": 2,
+   "key": "c2/b1/c8",
+   "error": "bench-load failed"
+  },
+  {
+   "role": "baseline",
+   "round": 2,
+   "key": "c3/b1/c8",
+   "error": "bench-load failed"
+  },
+  {
+   "role": "baseline",
+   "round": 2,
+   "key": "c3_adds/b1/c8",
+   "error": "bench-load failed"
+  },
+  {
+   "role": "baseline",
+   "round": 2,
+   "key": "c4/b1/c8",
+   "error": "bench-load failed"
+  },
+  {
+   "role": "baseline",
+   "round": 2,
+   "key": "c4/b64/c8",
+   "error": "bench-load failed"
+  },
+  {
+   "role": "baseline",
+   "round": 2,
+   "key": "c5/b1024/c8",
+   "error": "bench-load failed"
+  },
+  {
+   "role": "baseline",
+   "round": 2,
+   "key": "c7/b1/c8",
+   "error": "bench-load failed"
+  },
+  {
+   "role": "baseline",
+   "round": 3,
+   "key": "c1/b1/c8",
+   "error": "bench-load failed"
+  },
+  {
+   "role": "baseline",
+   "round": 3,
+   "key": "c1/b64/c8",
+   "error": "bench-load failed"
+  },
+  {
+   "role": "baseline",
+   "round": 3,
+   "key": "c2/b1/c8",
+   "error": "bench-load failed"
+  },
+  {
+   "role": "baseline",
+   "round": 3,
+   "key": "c3/b1/c8",
+   "error": "bench-load failed"
+  },
+  {
+   "role": "baseline",
+   "round": 3,
+   "key": "c3_adds/b1/c8",
+   "error": "bench-load failed"
+  },
+  {
+   "role": "baseline",
+   "round": 3,
+   "key": "c4/b1/c8",
+   "error": "bench-load failed"
+  },
+  {
+   "role": "baseline",
+   "round": 3,
+   "key": "c4/b64/c8",
+   "error": "bench-load failed"
+  },
+  {
+   "role": "baseline",
+   "round": 3,
+   "key": "c5/b1024/c8",
+   "error": "bench-load failed"
+  },
+  {
+   "role": "baseline",
+   "round": 3,
+   "key": "c7/b1/c8",
+   "error": "bench-load failed"
+  },
+  {
+   "role": "candidate",
+   "round": 3,
+   "key": "botpike/b1/c12",
+   "error": "bench-load failed"
+  }
+ ],
+ "metrics": [
+  {
+   "metric": "micro declared_views.as_of_middle_ns",
+   "status": "pass",
+   "baseline": 239919004,
+   "candidate": 236610813,
+   "worse_by": -0.0138,
+   "worse_by_rounds": [
+    -0.0723,
+    -0.0138,
+    0.0338
+   ],
+   "threshold": 0.1
+  },
+  {
+   "metric": "micro declared_views.latest_ns",
+   "status": "pass",
+   "baseline": 99428368,
+   "candidate": 100883568,
+   "worse_by": -0.0293,
+   "worse_by_rounds": [
+    -0.0607,
+    -0.0293,
+    0.0712
+   ],
+   "threshold": 0.1
+  },
+  {
+   "metric": "micro documents.decode_ns_per_document",
+   "status": "pass",
+   "baseline": 10045,
+   "candidate": 10124,
+   "worse_by": 0.0223,
+   "worse_by_rounds": [
+    0.0223,
+    -0.0058,
+    0.0348
+   ],
+   "threshold": 0.1
+  },
+  {
+   "metric": "micro documents.encode_ns_per_document",
+   "status": "pass",
+   "baseline": 246145,
+   "candidate": 248303,
+   "worse_by": 0.0119,
+   "worse_by_rounds": [
+    -0.0117,
+    0.0119,
+    0.0467
+   ],
+   "threshold": 0.1
+  }
+ ]
+}
