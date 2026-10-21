@@ -316,9 +316,10 @@ pub fn build(b: *std.Build) !void {
     steps.test_integration.dependOn(&run_integration_tests.step);
 
     // zig build test:api: the JSON API, its documents, adds, commit keys (P123), records and
-    // indexes (P123b, P123c), then ledgers, against models, then a cluster and gateway over IPv6
-    // (skipped without it), a gateway given an address it cannot open (#92), then key rotation
-    // through both gateways (NERVA_KEY_NEXT); one after the other: each runs a cluster.
+    // indexes (P123b, P123c), then layouts kept between requests (P135), then ledgers, against
+    // models, then a cluster and gateway over IPv6 (skipped without it), a gateway given an
+    // address it cannot open (#92), then key rotation through both gateways (NERVA_KEY_NEXT); one
+    // after the other: each runs a cluster.
     var api_previous: ?*std.Build.Step = null;
     for ([_][]const u8{
         "api.py",
@@ -326,6 +327,7 @@ pub fn build(b: *std.Build) !void {
         "adds.py",
         "commit_keys.py",
         "records.py",
+        "layouts.py",
         "ledgers.py",
         "ipv6.py",
         "addresses.py",

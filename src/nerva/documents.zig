@@ -273,6 +273,13 @@ pub fn TransactionType(comptime ClientType: type) type {
             return value;
         }
 
+        /// The version of `key`'s document this transaction read: chunk 0's op, which every write
+        /// of the document rewrites with the other chunks (0: absent). `key` must have been read
+        /// and not written.
+        pub fn version(transaction: *const DocumentsTransaction, key: []const u8) u64 {
+            return transaction.reads.get(row_id(transaction.namespace, key)).?;
+        }
+
         pub fn put(transaction: *DocumentsTransaction, key: []const u8, value: []const u8) Error!void {
             if (key.len > key_size_max or value.len > value_size_max) return error.TooLarge;
             const arena = transaction.arena;

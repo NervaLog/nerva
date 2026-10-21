@@ -6,9 +6,13 @@ const assert = std.debug.assert;
 const log = std.log.scoped(.api);
 
 const Client = @import("../client.zig").Client;
+const nerva = @import("../../nerva.zig");
 const catalog = @import("../catalog.zig");
 const documents = @import("../documents.zig");
 const LayoutPut = @import("api.zig").LayoutPut;
+const LayoutRead = @import("api.zig").LayoutRead;
+const LayoutCache = @import("layout_cache.zig").LayoutCache;
+const Cached = @import("layout_cache.zig").Cached;
 const ViewPut = @import("api.zig").ViewPut;
 
 /// A declaration that keeps conflicting with others is refused after this many attempts.
@@ -16,6 +20,8 @@ const attempts_max = 16;
 
 pub const CatalogStore = struct {
     transaction: documents.Transaction,
+    /// Layouts kept between requests (P135); see `api.zig`, "Layouts".
+    cache: LayoutCache = .{},
 
     pub fn init(client: *Client) CatalogStore {
         return .{ .transaction = .{
@@ -23,6 +29,33 @@ pub const CatalogStore = struct {
             .table = catalog.table_catalog,
             .namespace = 0,
         } };
+    }
+
+    /// The layout of `table` as kept from an earlier read, a copy in `arena`.
+    pub fn layout_cached(self: *CatalogStore, arena: std.mem.Allocator, table: u32) !?Cached {
+        return self.cache.find(arena, table);
+    }
+
+    /// Reads the layout of `table` from the log, and keeps it if there is one.
+    pub fn layout_fresh(self: *CatalogStore, arena: std.mem.Allocator, table: u32) !LayoutRead {
+        self.transaction.begin(arena);
+        const layout_ = try layout_read(&self.transaction, arena, table);
+        const version = self.transaction.version(try layout_key(arena, table));
+        if (layout_) |*found| self.cache.store(table, version, found) else self.cache.forget(table);
+        return .{ .layout = layout_, .version = version };
+    }
+
+    /// The row of the catalog whose op is the version of `table`'s layout.
+    pub fn layout_probe(_: *const CatalogStore, table: u32) nerva.RowKey {
+        assert(table != 0 and table < catalog.tables_reserved_min);
+        var key: [32]u8 = undefined;
+        const text = std.fmt.bufPrint(&key, "table.{}", .{table}) catch unreachable;
+        return .{ .id = documents.row_id(0, text), .table = catalog.table_catalog };
+    }
+
+    /// Forgets everything kept: the cluster client was replaced.
+    pub fn cache_clear(self: *CatalogStore) void {
+        self.cache.clear();
     }
 
     pub fn layout(self: *CatalogStore, arena: std.mem.Allocator, table: u32) !?catalog.Layout {
@@ -53,7 +86,10 @@ pub const CatalogStore = struct {
 
             try self.transaction.put(key, document);
             switch (try self.transaction.commit()) {
-                .committed => return outcome,
+                .committed => {
+                    self.cache.forget(table);
+                    return outcome;
+                },
                 .conflict => log.info("table {}: layout conflict, retrying", .{table}),
             }
         }

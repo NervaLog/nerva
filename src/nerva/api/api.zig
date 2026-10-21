@@ -79,6 +79,7 @@ const documents = @import("../documents.zig");
 const documents_routes = @import("documents_routes.zig");
 const ledgers_static = @import("../ledgers.zig");
 const view_fields = @import("../views.zig");
+const layout_cache = @import("layout_cache.zig");
 
 const Change = nerva.Change;
 const Entry = nerva.Entry;
@@ -146,7 +147,15 @@ pub const view_answer_groups_max = 10_000;
 ///     layout_put(arena, table: u32, layout: *const catalog.Layout) !LayoutPut
 ///     view(arena, name: []const u8) !?catalog.View
 ///     view_put(arena, name: []const u8, view: *const catalog.View) !ViewPut
+///
+/// and, for the layouts kept between requests ("Layouts"):
+///
+///     layout_cached(arena, table: u32) !?layout_cache.Cached
+///     layout_fresh(arena, table: u32) !LayoutRead
+///     layout_probe(table: u32) nerva.RowKey
 pub const LayoutPut = enum { created, extended, unchanged, incompatible };
+/// A layout read from the log, and the version of its document (0: there is none).
+pub const LayoutRead = struct { layout: ?catalog.Layout, version: u64 };
 /// A view's declaration is immutable: declaring a different one under the same name conflicts.
 pub const ViewPut = enum { created, unchanged, different };
 
@@ -231,13 +240,62 @@ pub fn handle(
     };
     if (method == .get and body.len > 0) return error_reply(arena, 400, "unexpected body");
 
-    var cache: Layouts(@TypeOf(layouts)) = .{ .arena = arena, .layouts = layouts };
+    const kept = route == .lookup or route == .commit;
+    const Cache = Layouts(@TypeOf(layouts));
+    var cache: Cache = .{
+        .arena = arena,
+        .layouts = layouts,
+        .source = if (kept) .kept else .log,
+    };
+    return dispatch(arena, client, layouts, &cache, route, method, path, query, body) catch |err| switch (err) {
+        error.BadRequest, error.Invalid => retry: {
+            // A kept layout may be behind the log: it lacks a field the request names. Ask the
+            // log before refusing.
+            if (!cache.used_kept()) return refuse(arena, err);
+            var fresh: Cache = .{ .arena = arena, .layouts = layouts, .source = .refresh };
+            break :retry dispatch(
+                arena,
+                client,
+                layouts,
+                &fresh,
+                route,
+                method,
+                path,
+                query,
+                body,
+            ) catch |err_fresh| refuse(arena, err_fresh);
+        },
+        else => |e| refuse(arena, e),
+    };
+}
+
+/// The answer to an error of a request: a 400, or the error itself.
+fn refuse(arena: std.mem.Allocator, err: anyerror) !Reply {
+    return switch (err) {
+        error.BadRequest => error_reply(arena, 400, bad_request_reason),
+        error.TooManyEvents => error_reply(arena, 400, "too many rows or entries for one request"),
+        error.Invalid => error_reply(arena, 400, catalog.invalid_reason),
+        else => err,
+    };
+}
+
+fn dispatch(
+    arena: std.mem.Allocator,
+    client: anytype,
+    layouts: anytype,
+    cache: anytype,
+    route: Route,
+    method: Method,
+    path: []const u8,
+    query: []const u8,
+    body: []const u8,
+) !Reply {
     return switch (route) {
-        .lookup => lookup(arena, client, &cache, body),
-        .commit => commit(arena, client, &cache, body),
-        .changes => changes(arena, client, &cache, query),
-        .history => history(arena, client, &cache, query),
-        .row => row(arena, client, &cache, query),
+        .lookup => lookup(arena, client, cache, body),
+        .commit => commit(arena, client, cache, body),
+        .changes => changes(arena, client, cache, query),
+        .history => history(arena, client, cache, query),
+        .row => row(arena, client, cache, query),
         .tables => tables(arena, layouts, method, path[tables_prefix.len..], body),
         .views => views(arena, client, layouts, method, path[views_prefix.len..], query, body),
         .view_definition => view_definition(
@@ -252,7 +310,7 @@ pub fn handle(
         .index_scan => index_scan(
             arena,
             client,
-            &cache,
+            cache,
             path[indexes_prefix.len .. path.len - index_scan_suffix.len],
             body,
         ),
@@ -266,33 +324,123 @@ pub fn handle(
         .documents_get => documents_routes.get(arena, client, body),
         .documents_commit => documents_routes.commit(arena, client, body),
         .documents_changes => documents_routes.changes(arena, client, query),
-    } catch |err| switch (err) {
-        error.BadRequest => error_reply(arena, 400, bad_request_reason),
-        error.TooManyEvents => error_reply(arena, 400, "too many rows or entries for one request"),
-        error.Invalid => error_reply(arena, 400, catalog.invalid_reason),
-        else => |e| e,
     };
 }
 
-/// The layouts one request has read, so that each table's is read at most once per request.
+/// The layouts one request uses, each read at most once per request.
+///
+/// Layouts. A gateway keeps the layouts it has read between requests (`layout_cache.zig`), so
+/// that a `lookup` or a `commit` does not read them from the log: that was most of a Botpike
+/// submit's log ops (#134). A kept layout may be behind the log, because another gateway
+/// extended it. It must never make an answer wrong:
+///
+/// - A write is exact. A layout only grows by appending fields (`catalog.layout_extends`), and
+///   `fields_encode` and `add_parse` use a named field's offset, size and type alone: absent
+///   fields are zero and unknown ones are refused. So bytes a put or an add produces under a
+///   layout that is behind are those it would produce under the log's, or it is refused. A
+///   refusal (`bad`, `Invalid`) after a kept layout was used is answered only after running the
+///   request again with every layout read from the log (`handle`). The commit's entries, and
+///   with them its indices and its key's checksum, are the same either way.
+/// - A read is checked. What a lookup renders as `fields` depends on every field of the layout,
+///   so the kept layouts' catalog rows are read at the version they were kept at: in the lookup's
+///   own `lookup_rows` (the same op), or, when those rows do not fit its batch or the lookup is
+///   of records (P123b), in one that follows it, which is as exact: the layouts were kept before
+///   the request began, so an unchanged version later is unchanged at the lookup's op. A layout
+///   that moved is read again before it is rendered.
+///
+/// `changes`, `history`, `row` and `index_scan` render fields too, and read their layouts from
+/// the log for each request, as before.
 fn Layouts(comptime Catalog: type) type {
     return struct {
         const Self = @This();
 
         arena: std.mem.Allocator,
         layouts: Catalog,
-        loaded: std.AutoHashMapUnmanaged(u32, ?catalog.Layout) = .{},
+        source: enum {
+            /// From the log, for this request alone.
+            log,
+            /// From the gateway's cache if it is there, else from the log (and kept).
+            kept,
+            /// From the log, and kept.
+            refresh,
+        },
+        loaded: std.AutoHashMapUnmanaged(u32, Loaded) = .{},
+
+        const Loaded = struct { layout: ?catalog.Layout, version: u64, kept: bool };
 
         fn get(self: *Self, table: u32) !?*const catalog.Layout {
             assert(table != 0 and table < catalog.tables_reserved_min);
             const entry = try self.loaded.getOrPut(self.arena, table);
-            if (!entry.found_existing) {
-                entry.value_ptr.* = try self.layouts.layout(self.arena, table);
+            if (!entry.found_existing) entry.value_ptr.* = try self.load(table);
+            return if (entry.value_ptr.layout) |*layout| layout else null;
+        }
+
+        fn load(self: *Self, table: u32) !Loaded {
+            if (self.source == .log) {
+                const layout = try self.layouts.layout(self.arena, table);
+                return .{ .layout = layout, .version = 0, .kept = false };
             }
-            return if (entry.value_ptr.*) |*layout| layout else null;
+            if (self.source == .kept) {
+                if (try self.layouts.layout_cached(self.arena, table)) |hit| {
+                    return .{ .layout = hit.layout, .version = hit.version, .kept = true };
+                }
+            }
+            const read = try self.layouts.layout_fresh(self.arena, table);
+            return .{ .layout = read.layout, .version = read.version, .kept = false };
+        }
+
+        /// Whether a layout from the cache was used.
+        fn used_kept(self: *const Self) bool {
+            var values = self.loaded.valueIterator();
+            while (values.next()) |loaded| {
+                if (loaded.kept) return true;
+            }
+            return false;
+        }
+
+        /// The catalog rows to read to check the kept layouts of `table_ids` (a table at most once
+        /// each, and not one this request has loaded): their layouts are now loaded.
+        fn probes(self: *Self, table_ids: []const u32) ![]const Probe {
+            var found = std.ArrayListUnmanaged(Probe){};
+            if (self.source != .kept) return found.items;
+            for (table_ids) |table| {
+                if (self.loaded.contains(table)) continue;
+                const hit = try self.layouts.layout_cached(self.arena, table) orelse continue;
+                try self.loaded.put(self.arena, table, .{
+                    .layout = hit.layout,
+                    .version = hit.version,
+                    .kept = true,
+                });
+                try found.append(self.arena, .{
+                    .table = table,
+                    .key = self.layouts.layout_probe(table),
+                });
+            }
+            return found.items;
+        }
+
+        /// Checks each probe against its row, read in the same op as the rows to render or after
+        /// them: a layout that moved is read again.
+        fn probes_check(self: *Self, found: []const Probe, rows: []const RowValue) !void {
+            assert(found.len == rows.len);
+            for (found, rows) |probe, row_| {
+                const loaded = self.loaded.getPtr(probe.table).?;
+                assert(loaded.kept);
+                assert(row_.table == catalog.table_catalog and row_.id == probe.key.id);
+                if (row_.op == loaded.version) continue;
+                loaded.* = try self.load_fresh(probe.table);
+            }
+        }
+
+        fn load_fresh(self: *Self, table: u32) !Loaded {
+            const read = try self.layouts.layout_fresh(self.arena, table);
+            return .{ .layout = read.layout, .version = read.version, .kept = false };
         }
     };
 }
+
+/// A kept layout's catalog row to read.
+const Probe = struct { table: u32, key: RowKey };
 
 /// The reason for the last `error.BadRequest` (set just before it is returned; one thread).
 var bad_request_reason: []const u8 = "";
@@ -322,8 +470,29 @@ fn lookup(arena: std.mem.Allocator, client: anytype, layouts: anytype, body: []c
         try table_check(row_request.table);
         key.* = .{ .table = row_request.table, .id = try u64_parse(row_request.id, "id") };
     }
-    const results = try arena.alloc(RowValue, keys.len);
-    try client.lookup_rows(keys, results);
+    // The kept layouts are checked in the same op, by reading their catalog rows with the rows.
+    const table_ids = try arena.alloc(u32, keys.len);
+    for (table_ids, keys) |*table, key| table.* = key.table;
+    const probes = try layouts.probes(table_ids);
+    const results_all = try arena.alloc(RowValue, keys.len + probes.len);
+    const results = results_all[0..keys.len];
+    const probe_rows = results_all[keys.len..];
+    if (probes.len == 0) {
+        try client.lookup_rows(keys, results);
+    } else {
+        const keys_all = try arena.alloc(RowKey, results_all.len);
+        @memcpy(keys_all[0..keys.len], keys);
+        for (keys_all[keys.len..], probes) |*key, probe| key.* = probe.key;
+        client.lookup_rows(keys_all, results_all) catch |err| switch (err) {
+            // No room for the probes: read them after, in an op that is not before the rows'.
+            error.TooManyEvents => {
+                try client.lookup_rows(keys, results);
+                try client.lookup_rows(keys_all[keys.len..], probe_rows);
+            },
+            else => return err,
+        };
+        try layouts.probes_check(probes, probe_rows);
+    }
 
     var out = Writer.init(arena);
     try out.raw("{\"op\":");
@@ -360,6 +529,20 @@ fn lookup_records(
     }
     const results = try arena.alloc(nerva.RecordValue, keys.len);
     try client.lookup_records(keys, results);
+
+    // The kept layouts of the records to render are checked after, in a lookup of their rows.
+    var table_ids = std.ArrayListUnmanaged(u32){};
+    for (results) |result| {
+        if (result.flags.exists) try table_ids.append(arena, result.table);
+    }
+    const probes = try layouts.probes(table_ids.items);
+    if (probes.len > 0) {
+        const probe_keys = try arena.alloc(RowKey, probes.len);
+        for (probe_keys, probes) |*key, probe| key.* = probe.key;
+        const probe_rows = try arena.alloc(RowValue, probes.len);
+        try client.lookup_rows(probe_keys, probe_rows);
+        try layouts.probes_check(probes, probe_rows);
+    }
 
     var out = Writer.init(arena);
     try out.raw("{\"op\":");
@@ -1956,6 +2139,8 @@ const FakeClient = struct {
     /// Answers `declare_view`, for the tests that set it; the rest are covered by
     /// `tests/views/maintained.py`.
     declared: ?nerva.DeclareStatus = null,
+    /// The most rows one `lookup_rows` takes.
+    lookup_max: usize = std.math.maxInt(usize),
 
     const Version = struct { op: u64, exists: bool, value: [value_size]u8 };
     const RecordVersion = struct { op: u64, exists: bool, value: [nerva.record_value_size]u8 };
@@ -1963,6 +2148,7 @@ const FakeClient = struct {
     pub const Error = error{ TooManyEvents, OutOfMemory };
 
     pub fn lookup_rows(fake: *FakeClient, keys: []const RowKey, results: []RowValue) Error!void {
+        if (keys.len > fake.lookup_max) return error.TooManyEvents;
         fake.op += 1;
         for (keys, results) |key, *result| {
             const found = fake.rows.get(nerva.row_key(key.table, key.id));
@@ -2181,9 +2367,38 @@ const FakeLayouts = struct {
     map: std.AutoHashMapUnmanaged(u32, catalog.Layout) = .{},
     views: std.StringHashMapUnmanaged(catalog.View) = .{},
     allocator: std.mem.Allocator,
+    /// Where each layout's version is visible, as in the catalog (`layout_probe`): rows of the
+    /// client, at the table's id.
+    client: ?*FakeClient = null,
+    cache: layout_cache.LayoutCache = .{},
+    /// How many layouts were read from the log.
+    reads: u32 = 0,
 
     pub fn layout(fake: *FakeLayouts, _: std.mem.Allocator, table: u32) !?catalog.Layout {
         return fake.map.get(table);
+    }
+
+    pub fn layout_cached(
+        fake: *FakeLayouts,
+        arena: std.mem.Allocator,
+        table: u32,
+    ) !?layout_cache.Cached {
+        return fake.cache.find(arena, table);
+    }
+
+    pub fn layout_fresh(fake: *FakeLayouts, _: std.mem.Allocator, table: u32) !LayoutRead {
+        fake.reads += 1;
+        const found = fake.map.get(table);
+        const version = if (fake.client) |client|
+            if (client.rows.get(nerva.row_key(catalog.table_catalog, table))) |row_| row_.op else 0
+        else
+            0;
+        if (found) |*layout_| fake.cache.store(table, version, layout_) else fake.cache.forget(table);
+        return .{ .layout = found, .version = version };
+    }
+
+    pub fn layout_probe(_: *const FakeLayouts, table: u32) RowKey {
+        return .{ .id = table, .table = catalog.table_catalog };
     }
 
     pub fn layout_put(
@@ -2196,7 +2411,18 @@ const FakeLayouts = struct {
             if (!catalog.layout_extends(&old, new)) break :outcome .incompatible;
             break :outcome if (old.fields.len == new.fields.len) .unchanged else .extended;
         } else .created;
-        if (outcome != .incompatible) try fake.map.put(fake.allocator, table, new.*);
+        if (outcome != .incompatible) {
+            try fake.map.put(fake.allocator, table, new.*);
+            fake.cache.forget(table);
+            if (fake.client) |client| {
+                client.op += 1;
+                try client.rows.put(fake.allocator, nerva.row_key(catalog.table_catalog, table), .{
+                    .op = client.op,
+                    .exists = true,
+                    .value = @splat(0),
+                });
+            }
+        }
         return outcome;
     }
 
@@ -2291,6 +2517,178 @@ test "api: layouts give puts and reads named fields" {
         @as(u16, 400),
         (try handle(arena, &fake, &layouts, .put, "/v1/tables/4294901761", declare)).status,
     );
+}
+
+/// What another gateway does: extends the layout of `table` in the log, which this one has kept.
+fn layout_extended_elsewhere(
+    arena: std.mem.Allocator,
+    layouts: *FakeLayouts,
+    client: *FakeClient,
+    table: u32,
+    json: []const u8,
+) !void {
+    const new = try catalog.layout_parse(arena, json, table);
+    try testing.expect(catalog.layout_extends(&layouts.map.get(table).?, &new));
+    try layouts.map.put(arena, table, new);
+    client.op += 1;
+    try client.rows.put(arena, nerva.row_key(catalog.table_catalog, table), .{
+        .op = client.op,
+        .exists = true,
+        .value = @splat(0),
+    });
+}
+
+test "api: kept layouts save the log ops of a submit, and never answer for an old layout (P135)" {
+    var arena_instance = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_instance.deinit();
+    const arena = arena_instance.allocator();
+    var fake: FakeClient = .{ .allocator = arena };
+    var layouts: FakeLayouts = .{ .allocator = arena, .client = &fake };
+
+    const v1 =
+        \\{"name":"seats","fields":[{"name":"section","type":"u8"},{"name":"price","type":"u64"}]}
+    ;
+    const v2 =
+        \\{"name":"seats","fields":[{"name":"section","type":"u8"},{"name":"price","type":"u64"},
+    ++
+        \\{"name":"tier","type":"u8"}]}
+    ;
+    try testing.expectEqual(
+        @as(u16, 200),
+        (try handle(arena, &fake, &layouts, .put, "/v1/tables/7", v1)).status,
+    );
+    const put = try handle(arena, &fake, &layouts, .post, "/v1/commit",
+        \\{"entries":[{"kind":"put","table":7,"id":"1","fields":{"section":2,"price":"4500"}}]}
+    );
+    try testing.expectEqual(@as(u16, 200), put.status);
+    const reads = layouts.reads;
+
+    // Kept: a lookup is one op and a commit is one op, and neither reads a layout.
+    const ops = fake.op;
+    const lookup_body =
+        \\{"rows":[{"table":7,"id":"1"}]}
+    ;
+    const found = try handle(arena, &fake, &layouts, .post, "/v1/lookup", lookup_body);
+    try testing.expect(std.mem.endsWith(u8, found.body,
+        \\,"fields":{"section":2,"price":"4500"}}]}
+    ));
+    const put_again = try handle(arena, &fake, &layouts, .post, "/v1/commit",
+        \\{"entries":[{"kind":"put","table":7,"id":"1","fields":{"section":3,"price":"1"}}]}
+    );
+    try testing.expectEqual(@as(u16, 200), put_again.status);
+    try testing.expectEqual(ops + 2, fake.op);
+    try testing.expectEqual(reads, layouts.reads);
+
+    // Another gateway appends a field. A lookup here shows it, in the same one op.
+    try layout_extended_elsewhere(arena, &layouts, &fake, 7, v2);
+    const ops_lookup = fake.op;
+    const extended = try handle(arena, &fake, &layouts, .post, "/v1/lookup", lookup_body);
+    try testing.expectEqual(ops_lookup + 1, fake.op);
+    try testing.expectEqual(reads + 1, layouts.reads);
+    try testing.expect(std.mem.endsWith(u8, extended.body,
+        \\,"fields":{"section":3,"price":"1","tier":0}}]}
+    ));
+
+    // A put naming the new field, to a gateway that has not seen it, is not refused.
+    try layout_extended_elsewhere(arena, &layouts, &fake, 7,
+        \\{"name":"seats","fields":[{"name":"section","type":"u8"},{"name":"price","type":"u64"},
+    ++
+        \\{"name":"tier","type":"u8"},{"name":"zone","type":"u8"}]}
+    );
+    const reads_before = layouts.reads;
+    const named = try handle(arena, &fake, &layouts, .post, "/v1/commit",
+        \\{"entries":[{"kind":"put","table":7,"id":"2","fields":{"tier":4,"zone":9}}]}
+    );
+    try testing.expectEqual(@as(u16, 200), named.status);
+    try testing.expectEqual(reads_before + 1, layouts.reads);
+    const two = try handle(arena, &fake, &layouts, .post, "/v1/lookup",
+        \\{"rows":[{"table":7,"id":"2"}]}
+    );
+    try testing.expect(std.mem.endsWith(u8, two.body,
+        \\,"fields":{"section":0,"price":"0","tier":4,"zone":9}}]}
+    ));
+
+    // A field no layout has is still refused, after the log is asked.
+    const unknown = try handle(arena, &fake, &layouts, .post, "/v1/commit",
+        \\{"entries":[{"kind":"put","table":7,"id":"3","fields":{"nope":1}}]}
+    );
+    try testing.expectEqual(@as(u16, 400), unknown.status);
+}
+
+test "api: a lookup checks kept layouts in a second op when they do not fit its batch (P135)" {
+    var arena_instance = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_instance.deinit();
+    const arena = arena_instance.allocator();
+    var fake: FakeClient = .{ .allocator = arena };
+    var layouts: FakeLayouts = .{ .allocator = arena, .client = &fake };
+
+    const v1 =
+        \\{"name":"seats","fields":[{"name":"section","type":"u8"}]}
+    ;
+    _ = try handle(arena, &fake, &layouts, .put, "/v1/tables/7", v1);
+    _ = try handle(arena, &fake, &layouts, .post, "/v1/commit",
+        \\{"entries":[{"kind":"put","table":7,"id":"1","fields":{"section":2}}]}
+    );
+    try layout_extended_elsewhere(arena, &layouts, &fake, 7,
+        \\{"name":"seats","fields":[{"name":"section","type":"u8"},{"name":"tier","type":"u8"}]}
+    );
+    fake.lookup_max = 1;
+    const ops = fake.op;
+    const found = try handle(arena, &fake, &layouts, .post, "/v1/lookup",
+        \\{"rows":[{"table":7,"id":"1"}]}
+    );
+    try testing.expectEqual(ops + 2, fake.op);
+    try testing.expect(std.mem.endsWith(u8, found.body,
+        \\,"fields":{"section":2,"tier":0}}]}
+    ));
+    // Too many rows alone is still refused as before.
+    fake.lookup_max = 0;
+    const refused = try handle(arena, &fake, &layouts, .post, "/v1/lookup",
+        \\{"rows":[{"table":7,"id":"1"}]}
+    );
+    try testing.expectEqual(@as(u16, 400), refused.status);
+}
+
+test "api: a layout that is behind the log encodes the bytes of the log's, or is refused (P135)" {
+    var arena_instance = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_instance.deinit();
+    const arena = arena_instance.allocator();
+    const old = try catalog.layout_parse(arena,
+        \\{"name":"t","fields":[{"name":"a","type":"u8"},{"name":"b","type":"u64"}]}
+    , 7);
+    const new = try catalog.layout_parse(arena,
+        \\{"name":"t","fields":[{"name":"a","type":"u8"},{"name":"b","type":"u64"},
+    ++
+        \\{"name":"c","type":"i64"}]}
+    , 7);
+    try testing.expect(catalog.layout_extends(&old, &new));
+    const bodies = [_][]const u8{
+        "{}",
+        \\{"a":1}
+        ,
+        \\{"b":"18446744073709551615"}
+        ,
+        \\{"a":255,"b":7}
+        ,
+    };
+    for (bodies) |body| {
+        const object = try std.json.parseFromSliceLeaky(std.json.Value, arena, body, .{});
+        try testing.expectEqualSlices(
+            u8,
+            &(try catalog.fields_encode(&old, object)),
+            &(try catalog.fields_encode(&new, object)),
+        );
+    }
+    const object = try std.json.parseFromSliceLeaky(std.json.Value, arena,
+        \\{"c":1}
+    , .{});
+    try testing.expectError(error.Invalid, catalog.fields_encode(&old, object));
+    for (old.fields) |field| {
+        const extended = new.field(field.name).?;
+        try testing.expectEqual(field.offset, extended.offset);
+        try testing.expectEqual(field.type, extended.type);
+        try testing.expectEqual(field.size, extended.size);
+    }
 }
 
 test "api: a view is cataloged only under the definition the state machine holds (#70)" {

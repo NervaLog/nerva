@@ -109,6 +109,8 @@ fn serve_request(
             error.Evicted, error.Timeout => {
                 log.err("{s}: {}", .{ target, err });
                 health.broke();
+                // The cluster may have changed under the new client: read layouts again (P135).
+                layouts.cache_clear();
                 return api.error_reply(arena, 503, "cluster unavailable");
             },
             error.OutOfMemory => return err,
