@@ -27,11 +27,21 @@ alone costs about 0.7 ms.
   asserts the same. Nerva's own `cli.zig` now names the default, 2/5, so it is visible in Nerva's
   code and not only in the vendored fallback. No vendored file changes (the option already existed
   and `nerva_main.zig` passed null).
-- **The default stays 2/5.** The flag changes no behaviour of an existing deployment. A different
-  default needs measurements that backups keep up (no lag stalls, repair or view changes) and a
-  VOPR run of the shipped value; the VOPR builds its replicas in `src/testing/cluster.zig`, which
-  is vendored and passes no value, so exercising a value other than the default means patching
-  that file (UPSTREAM.md, CLAUDE.md "Stop" 2). This decision does not do that.
+- **The default stays 2/5.** Measured on 3 `--development` replicas in one 4-CPU sandbox with 8
+  direct clients (two interleaved passes), ops/s at stall 2/5, 1/5 and 0: one client class 246/243,
+  473/465, 1199/1107; four 243/247, 511/510, 1756/959; adds 248/250, 471/469, 1455/1419; a 120 s
+  run 248/244, 466/472, 1248/1296. p50 went from 31.7 ms to 14-17 ms to 5-6 ms, p99 from 70-74 to
+  49-51 to 20-22 ms. Botpike through one gateway (1 and 12 callers) did not change beyond drift: a
+  serial gateway never has two ops in flight, so the stall only matters once requests are batched
+  (W5). At 0 no view change, sync or repair happened in 36 runs and replicas ended with equal
+  `commit_max`, but "lagging behind" warnings rose from 0-13 a run (2/5) to 136-1,815, and one run
+  reached a lag of 181 ops with 3,494 suspended prepares; the lag stall then fires 10-50 ms, up
+  to about 40% of wall time. Lag at 1/5 was not measured. There is no gain for Botpike before W5
+  and 0 lets backups fall behind, so the default is unchanged. Revisit it with W5, after a soak
+  with a slow or killed backup and simulator coverage of the chosen value. The VOPR builds its
+  replicas in `src/testing/cluster.zig`, which is vendored and passes no value, so it only ever
+  runs the default; exercising another value means patching that file (UPSTREAM.md, CLAUDE.md
+  "Stop" 2), which this decision does not do.
 - **Cost.** Another value is per replica: only the primary's value matters, and a replica of
   another setting speaks the same protocol. A lower value gives backups less breathing room, which
   the lag stall then has to absorb; 0 removes the first stall entirely.
