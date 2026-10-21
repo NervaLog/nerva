@@ -394,7 +394,7 @@ fn command_start(
         .random_nonce = stdx.crypto_u128(),
         .timeout_prepare_ticks = null,
         .timeout_grid_repair_message_ticks = null,
-        .commit_stall_probability = null,
+        .commit_stall_probability = args.commit_stall_probability,
         .commit_stall_lag_min = null,
         .commit_stall_lag_max = null,
         .commit_stall_multiple_max = null,

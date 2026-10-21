@@ -5,6 +5,7 @@
 //! unit tested; `parse_args` turns those errors into a fatal exit.
 
 const std = @import("std");
+const assert = std.debug.assert;
 
 const stdx = @import("stdx");
 const vsr = @import("../vsr.zig");
@@ -37,6 +38,7 @@ const CLIArgs = union(enum) {
         statsd: ?[]const u8 = null,
         trace: ?[]const u8 = null,
         trace_size_max: ?ByteSize = null,
+        commit_stall_probability: ?stdx.PRNG.Ratio = null,
         development: bool = false,
         log_debug: bool = false,
 
@@ -92,6 +94,7 @@ const CLIArgs = union(enum) {
         \\              [--cache-rows=<size><KiB|MiB|GiB>]
         \\              [--statsd=<host:port>] [--trace=<path>]
         \\              [--trace-size-max=<size><KiB|MiB|GiB>]
+        \\              [--commit-stall-probability=<numerator>/<denominator>]
         \\              [--development] [--log-debug] <path>
         \\
         \\  nerva view --cluster=<integer> --addresses=<addresses> --listen=<host:port>
@@ -169,6 +172,12 @@ const CLIArgs = union(enum) {
         \\
         \\  --trace-size-max=<size><KiB|MiB|GiB>
         \\        The largest trace file (default 1GiB).
+        \\
+        \\  --commit-stall-probability=<numerator>/<denominator>
+        \\        How often the primary pauses its commit for one tick (10 ms) to give backups
+        \\        breathing room, when no backup is lagging and another prepare is already
+        \\        acknowledged by all replicas. A ratio from 0 to 1, for example 1/5; 0 never
+        \\        pauses. The pause when a backup lags is not affected. Default 2/5.
         \\
         \\  --as-of=<op>|latest
         \\        Export every change at or before this op (default: the op of the export's
@@ -253,6 +262,7 @@ pub const Command = union(enum) {
         statsd: ?stdx.SocketAddress,
         trace: ?[]const u8,
         trace_size_max: u64,
+        commit_stall_probability: stdx.PRNG.Ratio,
         development: bool,
         log_debug: bool,
         path: []const u8,
@@ -276,6 +286,7 @@ pub fn parse_args(flags: *stdx.Flags) Command {
             .statsd = start.statsd,
             .trace = start.trace,
             .trace_size_max = start.trace_size_max,
+            .commit_stall_probability = start.commit_stall_probability,
             .development = start.development,
             .log_debug = start.log_debug,
             .path = start.path,
@@ -400,6 +411,7 @@ const Error = error{
     TracePathEmpty,
     TraceSizeMaxWithoutTrace,
     TraceSizeMaxZero,
+    CommitStallProbabilityInvalid,
 };
 
 fn error_message(err: Error) []const u8 {
@@ -428,6 +440,8 @@ fn error_message(err: Error) []const u8 {
         error.TracePathEmpty => "--trace must name a file",
         error.TraceSizeMaxWithoutTrace => "--trace-size-max needs --trace",
         error.TraceSizeMaxZero => "--trace-size-max must be positive",
+        error.CommitStallProbabilityInvalid => "--commit-stall-probability must be a ratio " ++
+            "from 0 to 1, such as 1/5",
     };
 }
 
@@ -447,10 +461,15 @@ const StartArgs = struct {
     statsd: ?[]const u8,
     trace: ?[]const u8,
     trace_size_max: ?ByteSize,
+    commit_stall_probability: ?stdx.PRNG.Ratio,
     development: bool,
     log_debug: bool,
     path: []const u8,
 };
+
+/// TigerBeetle's default (`replica.zig` falls back to it when the option is null); Nerva
+/// passes the value explicitly, so the shipped default is visible here (P136).
+const commit_stall_probability_default = stdx.PRNG.ratio(2, 5);
 
 const cache_rows_multiple = StateMachine.cache_entries_rows_multiple;
 const cache_rows_size_multiple = cache_rows_multiple * @sizeOf(nerva.Row);
@@ -498,6 +517,15 @@ fn start_resolve(start: StartArgs) Error!Command.Start {
     const trace_size_max: u64 = if (start.trace_size_max) |size| size.bytes() else trace_size_default;
     if (trace_size_max == 0) return error.TraceSizeMaxZero;
 
+    const commit_stall_probability = start.commit_stall_probability orelse
+        commit_stall_probability_default;
+    // The flag parser already refuses these; a caller that builds `StartArgs` by hand gets the
+    // same refusal.
+    assert(commit_stall_probability.denominator > 0);
+    if (commit_stall_probability.numerator > commit_stall_probability.denominator) {
+        return error.CommitStallProbabilityInvalid;
+    }
+
     const compaction_block_count_min = StateMachine.Forest.Options.compaction_block_count_min;
     return .{
         .addresses = start.addresses,
@@ -520,6 +548,7 @@ fn start_resolve(start: StartArgs) Error!Command.Start {
         .statsd = statsd,
         .trace = start.trace,
         .trace_size_max = trace_size_max,
+        .commit_stall_probability = commit_stall_probability,
         .development = start.development,
         .log_debug = start.log_debug,
         .path = start.path,
@@ -610,6 +639,7 @@ test start_resolve {
         .statsd = null,
         .trace = null,
         .trace_size_max = null,
+        .commit_stall_probability = null,
         .development = true,
         .log_debug = false,
         .path = "0_0.nerva",
@@ -654,6 +684,19 @@ test start_resolve {
     statsd_invalid.statsd = "10.0.0.7:";
     try std.testing.expectError(error.StatsdAddressInvalid, start_resolve(statsd_invalid));
 
+    try std.testing.expectEqual(commit_stall_probability_default, development.commit_stall_probability);
+    var stalled = start;
+    stalled.commit_stall_probability = stdx.PRNG.ratio(1, 5);
+    try std.testing.expectEqual(
+        stdx.PRNG.ratio(1, 5),
+        (try start_resolve(stalled)).commit_stall_probability,
+    );
+    stalled.commit_stall_probability = stdx.PRNG.Ratio.zero();
+    try std.testing.expectEqual(@as(u64, 0), (try start_resolve(stalled)).commit_stall_probability.numerator);
+    // A ratio built by hand above 1 is refused as the parser refuses it.
+    stalled.commit_stall_probability = .{ .numerator = 3, .denominator = 2 };
+    try std.testing.expectError(error.CommitStallProbabilityInvalid, start_resolve(stalled));
+
     var production_args = start;
     production_args.development = false;
     const production = try start_resolve(production_args);
@@ -670,4 +713,16 @@ test start_resolve {
     var unaligned = start;
     unaligned.cache_grid = .{ .value = cache_grid_size_min + 1 };
     try std.testing.expectError(error.CacheGridNotBlockMultiple, start_resolve(unaligned));
+}
+
+test "--commit-stall-probability parses a ratio and refuses nonsense" {
+    var diagnostic: ?[]const u8 = null;
+    const parse = stdx.PRNG.Ratio.parse_flag_value;
+    try std.testing.expectEqual(stdx.PRNG.ratio(1, 5), try parse("1/5", &diagnostic));
+    try std.testing.expectEqual(stdx.PRNG.ratio(2, 5), try parse("2/5", &diagnostic));
+    try std.testing.expectEqual(stdx.PRNG.Ratio.zero(), try parse("0", &diagnostic));
+    try std.testing.expectEqual(@as(u64, 0), (try parse("0/10", &diagnostic)).numerator);
+    for ([_][]const u8{ "3/2", "1/0", "1", "x/5", "1/y", "-1/5", "1/" }) |text| {
+        try std.testing.expectError(error.InvalidFlagValue, parse(text, &diagnostic));
+    }
 }
