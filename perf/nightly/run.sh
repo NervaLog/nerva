@@ -84,7 +84,7 @@ load() { # role round
     fi
   done
   for triple in $workloads; do
-    local workload batch workload_clients out
+    local workload batch workload_clients out gateway
     IFS=: read -r workload batch workload_clients <<< "$triple"
     workload_clients=${workload_clients:-$clients}
     # A build from before a workload existed has nothing to measure: no result, no error.
@@ -92,9 +92,12 @@ load() { # role round
       echo "$workload: not in the $role build"
       continue
     fi
+    # Only botpike starts a gateway: older builds reject the flag.
+    gateway=()
+    [ "$workload" = botpike ] && gateway=(--nerva="$bin/$role/nerva")
     out=$("$bin/$role/bench-load" --addresses=$addresses --workload="$workload" --batch="$batch" \
       --clients="$workload_clients" --seconds="$seconds" --keys=100000 --seed=$((round * 1000 + 1)) \
-      --nerva="$bin/$role/nerva" 2> "$dir/bench-load.err")
+      "${gateway[@]}" 2> "$dir/bench-load.err")
     if [ -n "$out" ]; then
       emit "$role" "$round" load "$(printf '%s' "$out" | python3 -c 'import json,sys; r=json.load(sys.stdin); r["key"]=r["workload"]+"/b"+str(r["batch"])+("/c"+str(r["clients"]) if r["workload"]=="botpike" else ""); print(json.dumps(r))')"
       echo "$workload/b$batch/c$workload_clients: $out"

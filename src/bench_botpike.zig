@@ -180,7 +180,8 @@ fn request(
 }
 
 /// Declares the layouts and the ledger, and funds every account from the source: the gateway's
-/// own routes, as Botpike's app uses them. Idempotent, so a cluster may be used again.
+/// own routes, as Botpike's app uses them. Idempotent, so a cluster may be used again by a later run (the nightly's): the source row is
+/// created by its first add, never put over a balance that has moved.
 fn setup(gpa: std.mem.Allocator, params: *const Params) !void {
     var reply: [reply_size_max]u8 = undefined;
     const address = params.address;
@@ -198,11 +199,6 @@ fn setup(gpa: std.mem.Allocator, params: *const Params) !void {
         \\{"fields":[{"table":7,"field":"available","floor":"0"},
         \\{"table":7,"field":"held","floor":"0"},{"table":8,"field":"balance","floor":null}]}
     , &reply);
-    // The source row exists, with a zero balance, before anything is moved out of it.
-    try send_ok(address, "POST", "/v1/commit",
-        \\{"entries":[{"kind":"put","table":8,"id":"1","fields":{"balance":0}}]}
-    , &reply);
-
     var body = try std.ArrayList(u8).initCapacity(gpa, funding_body_size_max);
     defer body.deinit();
     // The reply lists every add's applied amount and value.
@@ -218,7 +214,7 @@ fn setup(gpa: std.mem.Allocator, params: *const Params) !void {
             if (pair > 0) try writer.writeAll(",");
             try writer.print(
                 "{{\"kind\":\"add\",\"table\":{},\"id\":\"{}\",\"field\":\"balance\"," ++
-                    "\"delta\":\"-{}\",\"pair\":true}}," ++
+                    "\"delta\":\"-{}\",\"pair\":true,\"create\":true}}," ++
                     "{{\"kind\":\"add\",\"table\":{},\"id\":\"{}\",\"field\":\"available\"," ++
                     "\"delta_from\":{},\"create\":true}}",
                 .{ sources_table, source_id, funding, accounts_table, next + pair, pair * 2 },
