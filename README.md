@@ -304,6 +304,15 @@ with a warning in the log; the replica runs on (N71). The metrics most useful fo
 Timings are aggregated over each 10-second window. The `tb.` prefix and tag spellings come from
 TigerBeetle's tracer (UPSTREAM.md).
 
+### Commit stall
+
+The primary pauses a commit for one tick (10 ms) with some probability, when no backup is lagging
+and another prepare is already acknowledged by every replica, to give backups breathing room
+(vendored from TigerBeetle, default 2/5). `nerva start --commit-stall-probability=<n>/<d>` sets
+it (a ratio from 0 to 1, `0` never pauses; ratios above 1 and zero denominators are refused). It
+trades latency against backup lag: the pause is most of an op's time under a few clients. The
+longer pause the primary takes while a backup lags is not configurable (P136).
+
 ### Caches
 
 `--cache-grid` sizes the block cache. `--cache-rows=<size>` sizes the row cache (128 bytes a row,
