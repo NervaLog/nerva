@@ -5,6 +5,73 @@ publishes a version's section as its GitHub release notes, and refuses to releas
 without one. Design reasons are in [docs/DECISIONS.md](./docs/DECISIONS.md); the full log of
 work is [WORKLOG.md](./WORKLOG.md).
 
+## v0.6.1 — 2026-10-21
+
+`nerva api` no longer reads table layouts from the log on every request, so a lookup and a
+commit that use `fields` now take one log op each instead of several: about 3.5 times the
+submits per second through one gateway. `nerva start` gains `--commit-stall-probability`.
+Nothing about data files, the wire protocol or the API changes: the protocol release is still
+`0.0.6`.
+
+### Faster: gateways keep table layouts (#135)
+
+Each `nerva api` keeps up to 64 table layouts between requests (P135). A submit made of a
+lookup and a commit over three tables with layouts took 8 log ops and now takes 2. On a 4-CPU
+machine, through one gateway, that went from about 150 to 510–580 submits per second, at 1 to
+12 callers. Answers do not change, also with several gateways on one cluster:
+
+- **Writes** encode the same bytes under a kept layout as under the log's, because a layout
+  only grows by appending fields and fields a request does not name are zero. A field only a
+  newer layout has is refused, and the gateway then answers from layouts read from the log
+  before replying, so it is never refused wrongly. Nothing is sent before that check, so a
+  commit is never sent twice.
+- **Lookups** read the kept layouts' catalog rows in the same op as your rows and read a
+  layout again if it moved, so a field another gateway just added is there.
+
+### New: `nerva start --commit-stall-probability=<n>/<d>` (#136)
+
+When backups keep up, the primary waits one 10 ms tick before a commit with probability 2/5
+to give them room (TigerBeetle's default, unchanged). With several requests in flight this
+wait is most of an op's time. The flag sets that probability, from `0` to `1`; the default
+stays 2/5, and the stall for backups that fall behind is unchanged. Measured with 8 clients
+on one machine: 2/5 about 245 ops/s, 1/5 about 470, 0 about 1,150, but at 0 backups fell
+behind far more often (P136, #134). Use other values to test; the default will change only
+after the simulator covers them.
+
+```bash
+nerva start --addresses=3001,3002,3003 --commit-stall-probability=1/5 0_0.nerva
+```
+
+### Benchmarks
+
+- `bench:load --workload=botpike` drives one `nerva api` gateway over HTTP the way Botpike's
+  app does (a lookup, then a keyed commit with a transfer row and a ledger pair), with
+  `--clients` concurrent callers, and the nightly runs it at 1 and 12 (P132, #132).
+- Every `bench:load` result also reports `requests_per_s`.
+
+### Fixed
+
+- **#133:** a failing nightly could not file its `perf-regression` issue, because
+  `file_issue.py` used `gh api --slurp`, which the runner's `gh` does not have. Since
+  v0.6.0's nightly issue filing (1a03952). Fixed in #132.
+
+### Release review
+
+Reviewed adversarially before release (P105): [#139](https://github.com/Botpike/nerva-ledger/issues/139).
+No blockers. Non-blockers: [#137](https://github.com/Botpike/nerva-ledger/issues/137) (the
+layout cache replaces entries in turn, not the oldest as its comment says: speed only, past 64
+tables), and [#138](https://github.com/Botpike/nerva-ledger/issues/138) (the tutorial's layout
+note and cheat sheet, fixed in this release). Not run: Jepsen (no Docker in the review's
+environment), and upgrade and downgrade by hand (waived by the owner).
+
+### Upgrading from v0.6.0
+
+The protocol release is unchanged (`0.0.6`), so v0.6.1 replicas open v0.6.0 data files: stop a
+replica, start it with the v0.6.1 binary, and wait for it to rejoin before the next one. No
+export or import. Restart gateways (`nerva api`, `nerva view`) on v0.6.1 to get the layout
+cache; v0.6.0 and v0.6.1 gateways may run against one cluster side by side. This path was not
+tested by hand for this release (`zig build test:release` passed).
+
 ## v0.6.0 — 2026-10-16
 
 Facts can now live beside the money they record. A transaction may carry a **commit key**, so a
