@@ -398,7 +398,9 @@ record table's ids are 16 bytes as 32 hex digits, given back as sent, and its va
 `/v1/lookup` reads rows or records, not both in one request, and `/v1/changes`, `/v1/history`
 and `/v1/row` serve both. Layouts live in the log, in a reserved catalog table; the core still
 stores bytes and never reads them. A record table's layout packs up to 448 bytes, a bytes field
-up to 255.
+up to 255. A gateway keeps up to 64 layouts between requests (P135), so a lookup or commit does not
+read them from the log; one that another gateway extended is never used for an answer it would
+get wrong (`api.zig`, "Layouts").
 
 ```bash
 curl -X PUT -H 'X-Nerva-Key: secret' http://127.0.0.1:8080/v1/tables/2147483649 -d '{"name":"executions",
