@@ -297,8 +297,9 @@ The row's version is now `5`, the op that wrote it.
 
 Notice that the lookup itself took an op (6). **Every request goes through the log**, reads
 included, because that is what makes "this read reflects op 6" exact: the read is ordered
-against every write. One HTTP call can also take more than one op (the gateway reads the
-table's layout from the log too, Part 5), and other processes make requests of their own:
+against every write. One HTTP call can also take more than one op (the first time a gateway needs a table's
+layout, Part 5, it reads it from the log, and keeps it after that), and other processes make
+requests of their own:
 `nerva view` polls the feed, and the cluster sends itself requests while a view is building
 (Part 7). So op numbers climb between your commands, and the
 numbers in your terminal will not match this page. Wherever a later step uses a number from an
@@ -1545,7 +1546,8 @@ result.
 nerva format --cluster=<id> --replica=<i> --replica-count=<n> [--development] <file>
 NERVA_CLUSTER_KEY=… [NERVA_CLUSTER_KEY_NEXT=…] \
 nerva start  --addresses=<a0,a1,…> [--development] [--cache-grid=…] [--cache-rows=…]
-             [--statsd=<host:port>] [--trace=<new file>] [--trace-size-max=…] <file>
+             [--statsd=<host:port>] [--trace=<new file>] [--trace-size-max=…]
+             [--commit-stall-probability=<n>/<d>] <file>
 NERVA_KEY=… [NERVA_KEY_NEXT=…] nerva api  --cluster=<id> --addresses=<…> --listen=<host:port>
 NERVA_KEY=… [NERVA_KEY_NEXT=…] nerva view --cluster=<id> --addresses=<…> --listen=<host:port>
                                           # --listen=[::]:8080 for IPv6
