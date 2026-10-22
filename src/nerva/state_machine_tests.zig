@@ -3509,3 +3509,35 @@ test "restore: records, an index and a record view restored at their ops read as
     const results = try restored.commit_wide(&.{&.{execution(id_wide + 77, 1, 5, 5)}});
     try expect_statuses(results[0], &.{.ok});
 }
+
+test "workload: every request fits the state machine's input validation at the smallest batch (#141)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    // The VOPR's smallest batch size limit: the largest event's size. A `lookup_records` batch
+    // holds no key then (`event_max` is zero), but the workload built keys for it, so a replica
+    // evicted the client with `invalid_request_body`.
+    const batch_size_limit = @sizeOf(nerva.RecordValue);
+    try testing.expectEqual(0, Operation.lookup_records.event_max(batch_size_limit));
+    const context = try context_init_sized(&arena, batch_size_limit);
+
+    var prng = stdx.PRNG.from_seed(141);
+    const Workload = StateMachine.Workload;
+    var generator = Workload.init(testing.allocator, &prng, Workload.Options.generate(&prng, .{
+        .batch_size_limit = batch_size_limit,
+        .multi_batch_per_request_limit = 1,
+        .client_count = 1,
+        .in_flight_max = 1,
+    })) catch unreachable;
+    defer generator.deinit(testing.allocator);
+
+    var lookup_records: u32 = 0;
+    for (0..4000) |_| {
+        const request = generator.build_request(0, context.request);
+        if (request.operation == .lookup_records) lookup_records += 1;
+        try testing.expect(context.state_machine.input_valid(
+            request.operation,
+            context.request[0..request.size],
+        ));
+    }
+    try testing.expect(lookup_records > 0);
+}

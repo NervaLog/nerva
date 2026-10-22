@@ -3058,6 +3058,9 @@ pub fn WorkloadType(comptime StateMachine: type) type {
             };
         }
 
+        /// Every batch holds at most `event_max(batch_size_limit)` keys: a replica evicts the
+        /// client of a request with more (`invalid_request_body`), and at the smallest batch size
+        /// the simulator picks (512 bytes, one result's trailer) that maximum is 0 (#141).
         fn build_lookup_records(
             workload: *Workload,
             body: []align(constants.cache_line_size) u8,
@@ -3082,7 +3085,13 @@ pub fn WorkloadType(comptime StateMachine: type) type {
                     constants.message_body_size_max - reply_trailer_size,
                     @sizeOf(nerva.RecordValue),
                 ) -| keys_total;
-                const keys_max = @min(keys_free.len, reply_keys_free);
+                // The state machine accepts at most `event_max` keys per batch, and none when the
+                // batch size limit is no larger than one result's reply trailer (#141).
+                const keys_max = @min(
+                    keys_free.len,
+                    reply_keys_free,
+                    Operation.lookup_records.event_max(workload.options.batch_size_limit),
+                );
                 const keys = keys_free[0..prng.int_inclusive(usize, @min(keys_max, 8))];
                 keys_total += keys.len;
                 for (keys) |*key| {
