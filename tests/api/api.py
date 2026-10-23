@@ -13,6 +13,9 @@ Runs one replica and two API gateways, then:
 - `/v1/row?as_of=` for random rows and ops, and a refusal for an op not yet committed;
 - eight threads incrementing one counter with read-modify-write through both gateways,
   retrying on 409: no increment lost;
+- sixteen clients firing commits and lookups at one gateway at once, so that it answers several
+  with one cluster request (P143): each checks its own rows exactly (committed, conflict, 400,
+  commit keys resent and reused), and all add to one counter, whose answers are 1 to N each once;
 - layouts (N34): declaring, re-declaring, extending, refusing a change that does not append,
   two gateways declaring at once; puts by `fields`, read back as `fields` by lookup, the feed,
   history and `row`; reserved tables refused; catalog rows never in the feed;
@@ -264,6 +267,106 @@ def counter_race(ports, threads=8, increments=15):
     assert count == threads * increments, (count, threads * increments)
     assert conflicts[0] > 0, "no conflicts: the retry path was not exercised"
     return conflicts[0]
+
+
+def check_coalesced(port, threads=16, rounds=14):
+    """Many clients at one gateway, which answers those waiting together with one cluster
+    request (P143). Each client owns its rows, so its model is exact whatever the interleaving;
+    the shared counter is the only place the clients meet."""
+    errors, counter_values, ops = [], [], []
+    lock = threading.Lock()
+    zero = "0" * 160
+    counter_key = {"table": 8, "id": "2"}
+
+    def worker(index):
+        try:
+            base = 100 * index
+            rows = [base, base + 1, base + 2]   # Ids in table 3.
+            state = {row: (0, False, zero) for row in rows}
+            mine = []
+            for round_ in range(rounds):
+                status, body = request(port, "POST", "/v1/lookup", {"rows": [
+                    {"table": 3, "id": str(row)} for row in rows]})
+                assert status == 200, body
+                for row, found in zip(rows, body["rows"]):
+                    op, exists, value = state[row]
+                    assert found == {"table": 3, "id": str(row), "exists": exists, "op": str(op),
+                                     "value_hex": value}, (found, state[row])
+
+                # A read at the version seen, and two writes.
+                value = bytes([index, round_]).hex()
+                entries = [
+                    {"kind": "read", "table": 3, "id": str(rows[0]), "op_seen": str(state[rows[0]][0])},
+                    {"kind": "put", "table": 3, "id": str(rows[0]), "value_hex": value},
+                    {"kind": "put", "table": 3, "id": str(rows[1]), "value_hex": value}]
+                status, body = request(port, "POST", "/v1/commit", {"entries": entries})
+                assert status == 200 and body["status"] == "committed", (status, body)
+                op = int(body["op"])
+                mine.append(op)
+                for row in rows[:2]:
+                    state[row] = (op, True, value.ljust(160, "0"))
+
+                # A stale read: conflict at index 0, with the row's version.
+                stale = {"kind": "read", "table": 3, "id": str(rows[0]), "op_seen": "1"}
+                status, body = request(port, "POST", "/v1/commit", {"entries": [
+                    stale, {"kind": "put", "table": 3, "id": str(rows[2]), "value_hex": "ff"}]})
+                assert status == 409 and body == {
+                    "status": "conflict", "index": 0, "op": str(state[rows[0]][0])}, (status, body)
+
+                # Refused as it would alone.
+                status, body = request(port, "POST", "/v1/commit", {"entries": [
+                    {"kind": "delete", "table": 3, "id": str(rows[2]), "value_hex": "00"}]})
+                assert status == 400, (status, body)
+
+                # A key: committed once, the same request again replayed at the same op, other
+                # entries under it refused with that op.
+                key = bytes([index + 1, round_ + 1]).hex().ljust(32, "0")
+                keyed = {"key": key, "entries": [
+                    {"kind": "put", "table": 3, "id": str(rows[2]), "value_hex": value}]}
+                status, body = request(port, "POST", "/v1/commit", keyed)
+                assert status == 200 and body["status"] == "committed", (status, body)
+                op_keyed = int(body["op"])
+                mine.append(op_keyed)
+                state[rows[2]] = (op_keyed, True, value.ljust(160, "0"))
+                status, body = request(port, "POST", "/v1/commit", keyed)
+                assert (status, body) == (200, {
+                    "status": "committed", "op": str(op_keyed), "replayed": True}), (status, body)
+                other = {"key": key, "entries": [
+                    {"kind": "put", "table": 3, "id": str(rows[2]), "value_hex": "aa"}]}
+                status, body = request(port, "POST", "/v1/commit", other)
+                assert (status, body) == (409, {
+                    "status": "key_reused", "op": str(op_keyed)}), (status, body)
+
+                # The meeting place: add one to the counter.
+                status, body = request(port, "POST", "/v1/commit", {"entries": [
+                    {"kind": "add", **counter_key, "offset": 0, "type": "u64", "delta": "1",
+                     "create": True}]})
+                assert status == 200 and body["status"] == "committed", (status, body)
+                (added,) = body["adds"]
+                assert added["applied"] == "1", added
+                mine.append(int(body["op"]))
+                with lock:
+                    counter_values.append(int(added["value"]))
+            with lock:
+                ops.extend(mine)
+        except Exception as error:  # Reported below.
+            errors.append(repr(error))
+
+    pool = [threading.Thread(target=worker, args=(i,)) for i in range(threads)]
+    for thread in pool:
+        thread.start()
+    for thread in pool:
+        thread.join()
+    assert not errors, errors
+    total = threads * rounds
+    assert sorted(counter_values) == list(range(1, total + 1)), sorted(counter_values)
+    status, body = request(port, "POST", "/v1/lookup", {"rows": [
+        {"table": 8, "id": counter_key["id"]}]})
+    assert int.from_bytes(bytes.fromhex(body["rows"][0]["value_hex"])[:8], "little") == total
+    # Some were answered together: more than one committed request at one op.
+    together = len(ops) - len(set(ops))
+    assert together > 0, "no two requests committed at one op: nothing was combined"
+    return together
 
 
 SEATS = {"name": "seats", "fields": [{"name": "section", "type": "u8"},
@@ -637,6 +740,7 @@ def main():
         assert status == 400 and "not yet committed" in body["error"], body
 
         conflicts = counter_race(ports)
+        together = check_coalesced(ports[0])
         check_connections(ports[0])
         check_malformed(ports[0])
         rss = check_request_memory(cluster)
@@ -656,7 +760,8 @@ def main():
 
         print(f"api: PASSED ({steps} steps: {counts}; feed of {len(feed)} changes; "
               f"{len(keys)} histories; {as_of_reads} as-of reads; counter race with "
-              f"{conflicts} conflicts retried; gateway RSS {rss[0]} MiB, {rss[1]} MiB after "
+              f"{conflicts} conflicts retried; {together} requests committed at an op shared "
+              f"with another; gateway RSS {rss[0]} MiB, {rss[1]} MiB after "
               f"4 MiB nested bodies; trace stopped at {trace_size} bytes; NERVA_KEY_NEXT "
               f"accepted; seed {seed})")
     finally:

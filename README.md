@@ -425,8 +425,12 @@ curl -X PUT -H 'X-Nerva-Key: secret' http://127.0.0.1:8080/v1/indexes/reserved -
 curl -H 'X-Nerva-Key: secret' http://127.0.0.1:8080/v1/indexes/reserved/scan -d '{"max":"1760599000","limit":100}'
 ```
 
-Both gateways (`nerva api`, `nerva view`) execute one request at a time but read up to 16
-connections at once, so a slow client holds up nobody; with all 16 busy, a new connection
+Both gateways (`nerva api`, `nerva view`) execute one cluster request at a time but read up to 16
+connections at once, so a slow client holds up nobody. `nerva api` answers the `POST /v1/commit`
+and `POST /v1/lookup` requests that are waiting together when it turns to them with one cluster
+request, one transaction or read each (at most 16; it never waits for more), and each reply is
+the one the request would have had alone; if the cluster does not answer, each gets the `503`
+it would have had alone (P143). With all 16 connections busy, a new connection
 displaces the oldest one still sending its request. A request must arrive whole within 10 s
 of connecting and carries one request per connection (`Connection: close`). If a gateway
 loses its cluster session (a request times out after 30 s, or the session is evicted), it

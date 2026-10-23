@@ -26,6 +26,7 @@ const ManifestCheckerType = @import("cluster/manifest_checker.zig").ManifestChec
 const JournalCheckerType = @import("cluster/journal_checker.zig").JournalCheckerType;
 
 const vsr = @import("../vsr.zig");
+const nerva = @import("../nerva.zig");
 const format_writes_max = @import("../vsr/replica_format.zig").writes_max;
 
 const MiB = stdx.MiB;
@@ -50,6 +51,9 @@ pub const Failure = enum(u8) {
     liveness = 128,
     correctness = 129,
 };
+
+/// Mixed into the seed that draws the commit stall, so that it is not the seed of another draw.
+const commit_stall_salt: u64 = 0x5ca1_ab1e_c0de_57a1;
 
 /// Shift the id-generating index because the simulator network expects client ids to never collide
 /// with a replica index.
@@ -95,6 +99,11 @@ pub fn ClusterType(comptime StateMachineType: anytype) type {
             release_peers_strict: bool = false,
             /// Nerva: every replica's `VSRState.origin`, as `nerva import` writes it (P90).
             origin: [32]u8 = @splat(0),
+            /// Nerva: the primary's no-lag commit stall (P136, P143), the same on every replica.
+            /// Null: the simulator draws it from the seed (2/5, 1/5 or 0), so that every value a
+            /// gateway could be run with is simulated, and logs it. A cluster of another state
+            /// machine keeps the replica's default.
+            commit_stall_probability: ?Ratio = null,
         };
 
         pub const Callbacks = struct {
@@ -420,10 +429,27 @@ pub fn ClusterType(comptime StateMachineType: anytype) type {
                 errdefer for (cluster.aofs[0..i]) |*aof_| aof_.deinit(allocator);
             }
 
+            var cluster_options = options.cluster;
+            if (cluster_options.commit_stall_probability == null and
+                StateMachine.Operation == nerva.Operation)
+            {
+                // From the seed but not from `prng`, so that nothing else a seed does moves.
+                var stall_prng = stdx.PRNG.from_seed(options.cluster.seed ^ commit_stall_salt);
+                const choices = [_]Ratio{ ratio(2, 5), ratio(1, 5), Ratio.zero() };
+                cluster_options.commit_stall_probability =
+                    choices[stall_prng.int_inclusive(usize, choices.len - 1)];
+            }
+            if (cluster_options.commit_stall_probability) |probability| {
+                log.info("commit_stall_probability={}/{}", .{
+                    probability.numerator,
+                    probability.denominator,
+                });
+            }
+
             cluster.* = Cluster{
                 .allocator = allocator,
                 .prng = prng,
-                .options = options.cluster,
+                .options = cluster_options,
                 .callbacks = options.callbacks,
                 .network = network,
                 .storages = storages,
@@ -741,6 +767,7 @@ pub fn ClusterType(comptime StateMachineType: anytype) type {
                     .release_client_min = release_client_min,
                     .multiversion = replica_multiversion(replica),
                     .release_peers_strict = cluster.options.release_peers_strict,
+                    .commit_stall_probability = cluster.options.commit_stall_probability,
                     .test_context = cluster,
                     .tracer = &cluster.replica_tracers[replica_index],
                 },

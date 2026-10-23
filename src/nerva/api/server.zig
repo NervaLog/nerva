@@ -1,12 +1,16 @@
-//! The HTTP side of `nerva api` (docs/DECISIONS.md N33): one request at a time, keyed by
-//! `X-Nerva-Key`, every route one Nerva request (`api.zig`). Run several for more throughput:
-//! each is a separate client of the cluster, and commits from all of them are serialized there.
+//! The HTTP side of `nerva api` (docs/DECISIONS.md N33): keyed by `X-Nerva-Key`, every route one
+//! Nerva request (`api.zig`), one cluster request at a time over one session. The commits and
+//! lookups that are waiting together when the gateway turns to them are one cluster request, one
+//! batch each (docs/decisions/P143-nerva-api-combines-waiting-requests.md). Run several gateways
+//! for more throughput: each is a separate client of the cluster, and commits from all of them
+//! are serialized there.
 
 const std = @import("std");
 const assert = std.debug.assert;
 const log = std.log.scoped(.api);
 
 const Client = @import("../client.zig").Client;
+const client_batches_max = @import("../client.zig").batches_max;
 const api = @import("api.zig");
 const http_connection = @import("../http_connection.zig");
 const CatalogStore = @import("catalog_store.zig").CatalogStore;
@@ -17,6 +21,12 @@ const ClientHealth = @import("../client_health.zig").ClientHealth;
 const body_size_max = 4 * 1024 * 1024;
 /// Connections whose requests are read at once (N45): each holds a buffer of `body_size_max`.
 const connections_max = 16;
+
+comptime {
+    // A group is read from the connections, and is one request of the cluster client.
+    assert(api.group_max <= connections_max);
+    assert(api.group_max <= client_batches_max);
+}
 
 pub const Options = struct {
     listen: std.net.Address,
@@ -44,7 +54,6 @@ pub fn serve(gpa: std.mem.Allocator, client: *Client, options: Options) !noretur
     var budget = MemoryBudget.init(arena_instance.allocator(), MemoryBudget.limit_default);
 
     while (true) {
-        // Requests are read from many connections at once, and served one at a time (N45).
         const received = try receiver.next(health.idle_timeout_ms(-1)) orelse {
             // Idle with a broken client: replace it without waiting for a request (#44).
             _ = health.ready(client);
@@ -52,29 +61,107 @@ pub fn serve(gpa: std.mem.Allocator, client: *Client, options: Options) !noretur
         };
         budget.request_start();
         const arena = budget.allocator();
-        const reply = serve_request(
-            arena,
-            client,
-            &health,
-            &layouts,
-            options,
-            &received.request,
-        ) catch |err|
-            reply: {
-                if (err == error.OutOfMemory and budget.exceeded) {
-                    log.warn("request: past its memory budget", .{});
-                    break :reply api.Reply{
-                        .status = 413,
-                        .body = "{\"error\":\"request too complex\"}",
-                    };
-                }
-                log.warn("request: {}", .{err});
-                break :reply api.Reply{ .status = 500, .body = "{\"error\":\"internal error\"}" };
-            };
-        receiver.respond(received, reply.status, reply.body);
+        // Requests are read from many connections at once (N45). Those already waiting for the
+        // cluster, for the same route, are answered with one cluster request, never waiting for
+        // more (P143).
+        var group: [api.group_max]http_connection.Received = undefined;
+        group[0] = received;
+        var group_count: usize = 1;
+        const filter: GroupFilter = .{ .keys = options.keys, .target = received.request.target };
+        if (filter.accepts(&received.request)) {
+            group_count += receiver.take(filter, GroupFilter.accepts, group[1..]);
+        }
+        if (group_count > 1) {
+            serve_group(arena, client, &health, &layouts, &receiver, &budget, group[0..group_count]);
+        } else {
+            const reply = serve_request(
+                arena,
+                client,
+                &health,
+                &layouts,
+                options,
+                &received.request,
+            ) catch |err| reply_of_error(err, &budget);
+            receiver.respond(received, reply.status, reply.body);
+        }
         // `respond` has written the reply: give back what the request took at once, rather than
         // when the next request arrives (#60).
         _ = arena_instance.reset(.{ .retain_with_limit = MemoryBudget.retain_max });
+    }
+}
+
+/// The requests that may be answered with others by one cluster request: a commit or a lookup,
+/// with an accepted key and a body of a size that keeps the group inside a request's memory
+/// budget (`api.group_body_max`), all for one route.
+const GroupFilter = struct {
+    keys: http_connection.Keys,
+    target: []const u8,
+
+    fn accepts(filter: GroupFilter, request: *const http_connection.Request) bool {
+        return request.method == .post and
+            api.group_route(.post, request.target) and
+            std.mem.eql(u8, request.target, filter.target) and
+            request.body.len <= api.group_body_max and
+            http_connection.key_accepted(filter.keys, request.key);
+    }
+};
+
+/// What a request that failed with `err` is answered.
+fn reply_of_error(err: anyerror, budget: *const MemoryBudget) api.Reply {
+    if (err == error.OutOfMemory and budget.exceeded) {
+        log.warn("request: past its memory budget", .{});
+        return .{ .status = 413, .body = "{\"error\":\"request too complex\"}" };
+    }
+    log.warn("request: {}", .{err});
+    return .{ .status = 500, .body = "{\"error\":\"internal error\"}" };
+}
+
+const cluster_unavailable = api.Reply{
+    .status = 503,
+    .body = "{\"error\":\"cluster unavailable\"}",
+};
+
+/// Answers requests that were waiting together (`api.handle_group`), each as it would have been
+/// alone. If the cluster does not answer, every request that has no answer yet gets the 503 it
+/// would have had alone.
+fn serve_group(
+    arena: std.mem.Allocator,
+    client: *Client,
+    health: *ClientHealth,
+    layouts: *CatalogStore,
+    receiver: *http_connection.Receiver,
+    budget: *const MemoryBudget,
+    received: []const http_connection.Received,
+) void {
+    assert(received.len >= 2 and received.len <= api.group_max);
+    var members: [api.group_max]api.Member = undefined;
+    for (members[0..received.len], received) |*member, one| {
+        member.* = .{ .target = one.request.target, .body = one.request.body };
+    }
+    const members_used = members[0..received.len];
+    if (!health.ready(client)) {
+        for (members_used) |*member| member.result = cluster_unavailable;
+    } else if (api.handle_group(arena, client, layouts, members_used)) {
+        for (members_used) |*member| assert(member.result != null);
+    } else |err| switch (err) {
+        error.Evicted, error.Timeout => {
+            log.err("{s}: {}", .{ members_used[0].target, err });
+            health.broke();
+            // The cluster may have changed under the new client: read layouts again (P135).
+            layouts.cache_clear();
+            for (members_used) |*member| {
+                if (member.result == null) member.result = cluster_unavailable;
+            }
+        },
+        else => {
+            for (members_used) |*member| {
+                if (member.result == null) member.result = err;
+            }
+        },
+    }
+    for (members_used, received) |member, one| {
+        const reply = member.result.? catch |err| reply_of_error(err, budget);
+        receiver.respond(one, reply.status, reply.body);
     }
 }
 

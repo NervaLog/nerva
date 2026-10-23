@@ -44,6 +44,10 @@ comptime {
 }
 const Body = [constants.message_body_size_max]u8;
 
+/// The most batches one multi-batch request holds from this client (`nerva api` combines at most
+/// as many requests).
+pub const batches_max = 16;
+
 /// Changes per `get_history` call in `row_as_of`.
 const history_page_limit = 64;
 
@@ -185,6 +189,61 @@ pub const Client = struct {
             results,
             stdx.bytes_as_slice(.exact, EntryResult, reply),
         );
+    }
+
+    /// Point reads of several requests at once, one batch each, in one op: `results[i].len ==
+    /// keys[i].len`. Each batch is read at the same op (`op_read`).
+    pub fn lookup_rows_batches(
+        client: *Client,
+        keys: []const []const RowKey,
+        results: []const []RowValue,
+    ) Error!void {
+        return client.execute_batches(.lookup_rows, RowKey, RowValue, keys, results);
+    }
+
+    /// Commits several transactions at once, one batch each, in one op. The state machine
+    /// admits them in order, each on its own: one that cannot commit does not stop the rest.
+    /// `results[i].len == transactions[i].len`.
+    pub fn commit_batches(
+        client: *Client,
+        transactions: []const []const Entry,
+        results: []const []EntryResult,
+    ) Error!void {
+        return client.execute_batches(.commit, Entry, EntryResult, transactions, results);
+    }
+
+    /// As `commit_batches`, for transactions of rows and records.
+    pub fn commit_wide_batches(
+        client: *Client,
+        transactions: []const []const nerva.WideEntry,
+        results: []const []EntryResult,
+    ) Error!void {
+        return client.execute_batches(.commit_wide, nerva.WideEntry, EntryResult, transactions, results);
+    }
+
+    /// Whether batches of `counts` events each fit one request of `operation`: its events and
+    /// trailer in the batch size limit, each batch within `event_max`, and the replies and their
+    /// trailer in a message (the replicas' `input_valid`). `execute_batches` refuses what does not.
+    pub fn batches_fit(client: *const Client, comptime operation: Operation, counts: []const u32) bool {
+        comptime assert(operation.is_multi_batch());
+        if (counts.len == 0 or counts.len > batches_max) return false;
+        const limit = client.vsr_client.batch_size_limit.?;
+        var events: u64 = 0;
+        for (counts) |count| {
+            if (count == 0 or count > operation.event_max(limit)) return false;
+            events += count;
+        }
+        const batch_count: u16 = @intCast(counts.len);
+        const request_size = events * operation.event_size() + vsr.multi_batch.trailer_total_size(.{
+            .element_size = operation.event_size(),
+            .batch_count = batch_count,
+        });
+        const reply_size = events * operation.result_size() + vsr.multi_batch.trailer_total_size(.{
+            .element_size = operation.result_size(),
+            .batch_count = batch_count,
+        });
+        return request_size <= std.mem.alignBackward(u32, limit, 2) and
+            reply_size <= constants.message_body_size_max;
     }
 
     /// Reads the change feed. `changes.len` must hold `filter.limit` changes plus the `end`
@@ -434,6 +493,58 @@ pub const Client = struct {
             assert(end.timestamp != 0);
             timestamp_max = end.timestamp;
         }
+    }
+
+    /// Sends each of `batches` as one batch of a single request of `operation`, and copies each
+    /// batch's results out. Every batch is non-empty.
+    fn execute_batches(
+        client: *Client,
+        comptime operation: Operation,
+        comptime Event: type,
+        comptime Result: type,
+        batches: []const []const Event,
+        results: []const []Result,
+    ) Error!void {
+        comptime assert(operation.is_multi_batch());
+        comptime assert(@sizeOf(Event) == operation.event_size());
+        comptime assert(@sizeOf(Result) == operation.result_size());
+        assert(batches.len == results.len);
+        assert(batches.len > 0);
+        var counts_buffer: [batches_max]u32 = undefined;
+        if (batches.len > batches_max) return error.TooManyEvents;
+        for (batches, results, counts_buffer[0..batches.len]) |batch, result, *count| {
+            assert(batch.len == result.len);
+            count.* = @intCast(batch.len);
+        }
+        // Refused before the client is marked busy, so that it can serve the next request.
+        if (!client.batches_fit(operation, counts_buffer[0..batches.len])) {
+            return error.TooManyEvents;
+        }
+        try client.ensure_idle();
+
+        const batch_size_limit = client.vsr_client.batch_size_limit.?;
+        var encoder = MultiBatchEncoder.init(client.request[0..batch_size_limit], .{
+            .element_size = operation.event_size(),
+        });
+        for (batches) |batch| {
+            const bytes = std.mem.sliceAsBytes(batch);
+            stdx.copy_disjoint(.inexact, u8, encoder.writable().?, bytes);
+            encoder.add(@intCast(bytes.len));
+        }
+        const body_size = encoder.finish();
+
+        client.send(operation, client.request[0..body_size]);
+        try client.run_until_reply();
+
+        var decoder = MultiBatchDecoder.init(client.reply[0..client.reply_size.?], .{
+            .element_size = operation.result_size(),
+        }) catch unreachable; // The replica encoded it.
+        assert(decoder.batch_count() == batches.len);
+        for (results) |result| {
+            const reply = decoder.pop().?;
+            stdx.copy_disjoint(.exact, Result, result, stdx.bytes_as_slice(.exact, Result, reply));
+        }
+        assert(decoder.pop() == null);
     }
 
     /// Sends `events` as a single batch and returns that batch's results.

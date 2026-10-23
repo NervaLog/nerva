@@ -716,6 +716,32 @@ test "commit key: other entries never commit under a committed key, nor misplace
     try testing.expect(!(try context.lookup(1, 3)).flags.exists);
 }
 
+test "commit key: transactions under one key in one op answer as they would one after another (P143)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const context = try context_init(&arena);
+
+    // `nerva api` sends the requests waiting for it as the transactions of one op. The first
+    // commits, a copy reports it, other entries under the key are `key_reused` with the op of
+    // the first, and an unrelated transaction in between commits, as in order.
+    const key: u128 = 90;
+    const first = [_]Entry{ nerva.commit_key_entry(key), read(1, 1, 0), put(1, 1, 1) };
+    const other = [_]Entry{ nerva.commit_key_entry(key), put(1, 2, 2) };
+    const unrelated = [_]Entry{put(1, 3, 3)};
+    const results = try context.commit(&.{ &first, &first, &other, &unrelated, &first });
+    try expect_statuses(results[0], &.{ .ok, .ok, .ok });
+    const op = results[0][0].op;
+    try expect_statuses(results[1], &.{ .committed_before, .aborted, .aborted });
+    try expect_statuses(results[2], &.{ .key_reused, .aborted });
+    try expect_statuses(results[3], &.{.ok});
+    try expect_statuses(results[4], &.{ .committed_before, .aborted, .aborted });
+    for ([_]usize{ 1, 2, 4 }) |index| try testing.expectEqual(op, results[index][0].op);
+    try testing.expectEqual(op, results[3][0].op);
+    try testing.expectEqual(value(1), (try context.lookup(1, 1)).value);
+    try testing.expect(!(try context.lookup(1, 2)).flags.exists);
+    try testing.expect((try context.lookup(1, 3)).flags.exists);
+}
+
 test "commit key: a key whose row another key holds never commits" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
