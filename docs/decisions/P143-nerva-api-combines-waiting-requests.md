@@ -56,6 +56,13 @@ about 510 to 580 submits a second at 1 to 12 callers, flat: the gateway was the 
 - **Memory (N69).** A member's body is at most 16 KiB, so the 16 of a group take at most ~50 MiB
   parsed (a parsed body costs up to ~200 times its size), inside the one request's 128 MiB; the
   group's arena is given back when the last reply is written.
+- **Measured** (`bench:load --local --workload=botpike`, release, 20 s, 3 `--development` replicas
+  and one gateway on 4 CPUs; two passes before, two after; submits per second, p50, p99): 1 caller
+  280 to 307 before, 287 to 344 after; 4 callers 335 to 373 (11 ms, 27 to 30 ms) before, 654 to 717
+  (5.1 to 5.6 ms, 20 ms) after; 12 callers 326 to 356 (33 to 35 ms, 70 to 78 ms) before, 1,360 to
+  1,451 (7.4 to 7.9 ms, 28 to 31 ms) after; 24 callers 344 to 374 (61 to 70 ms, 119 to 123 ms)
+  before, 1,706 to 1,725 (12 to 13 ms, 41 ms) after. The direct-client workloads (`c1`, `c4` at 1
+  and 4 clients) do not go through the gateway and did not move beyond drift.
 - **Considered and rejected.** More sessions (the primary's per-tick commit stall, P136, applies
   to a second prepare in flight); waiting to gather more (adds latency to every request); combining
   `changes`, `history`, `row` and the views (they render fields or page and are not the hot path).
