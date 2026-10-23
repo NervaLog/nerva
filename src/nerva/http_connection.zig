@@ -257,15 +257,7 @@ pub const Receiver = struct {
         while (true) {
             receiver.expire();
             if (receiver.oldest_complete()) |index| {
-                const slot = &receiver.slots[index];
-                const head = slot.head.?;
-                slot.state = .serving;
-                return .{ .slot = index, .request = .{
-                    .method = head.method,
-                    .target = head.target,
-                    .key = head.key,
-                    .body = slot.buffer[slot.head_size..slot.size],
-                } };
+                return receiver.serve(index);
             }
 
             // Wait for activity, the nearest deadline, or the caller's timeout.
@@ -276,50 +268,133 @@ pub const Receiver = struct {
                 if (now - start >= timeout_ns) return null;
                 wait_ns = timeout_ns - (now - start);
             }
-            var fds_count: usize = 0;
             for (receiver.slots) |*slot| {
-                switch (slot.state) {
-                    .free => {},
-                    .reading => {
-                        const left = slot.deadline -| now;
-                        wait_ns = if (wait_ns) |wait| @min(wait, left) else left;
-                        receiver.poll_fds[fds_count] = .{
-                            .fd = slot.fd,
-                            .events = posix.POLL.IN,
-                            .revents = 0,
-                        };
-                        fds_count += 1;
-                    },
-                    .complete, .serving => unreachable,
+                if (slot.state == .reading) {
+                    const left = slot.deadline -| now;
+                    wait_ns = if (wait_ns) |wait| @min(wait, left) else left;
                 }
             }
-            // The listening socket always, and last: with every slot busy, a waiting connection
-            // displaces the oldest one still sending its request (#28). Last, so that a slot
-            // closed for it has had its own events handled before its fd can be reused.
+            _ = try receiver.poll(wait_ns, .displace);
+        }
+    }
+
+    /// Complete requests that `accepted` approves of, oldest connection first, handed out as
+    /// `next` does but without waiting for any: it only reads what has already arrived, and
+    /// stops when nothing more is readable. At most `out.len` are taken, returned in `out`. Unlike `next`, it may
+    /// be called while other requests are being served; each must be answered with `respond`.
+    pub fn take(
+        receiver: *Receiver,
+        context: anytype,
+        comptime accepted: fn (@TypeOf(context), *const Request) bool,
+        out: []Received,
+    ) usize {
+        var count: usize = 0;
+        // Accepting and reading take one pass each: bounded by the work that can be there.
+        for (0..receiver.slots.len * 2) |_| {
+            receiver.expire();
+            const ready = receiver.poll(0, .keep) catch break;
+            if (ready == 0) break;
+        }
+        while (count < out.len) {
+            var oldest: ?u32 = null;
+            for (receiver.slots, 0..) |*slot, index| {
+                if (slot.state != .complete) continue;
+                if (!accepted(context, &receiver.request_of(slot))) continue;
+                if (oldest == null or slot.accepted < receiver.slots[oldest.?].accepted) {
+                    oldest = @intCast(index);
+                }
+            }
+            out[count] = receiver.serve(oldest orelse break);
+            count += 1;
+        }
+        return count;
+    }
+
+    fn request_of(receiver: *const Receiver, slot: *const Slot) Request {
+        _ = receiver;
+        assert(slot.state == .complete or slot.state == .serving);
+        const head = slot.head.?;
+        return .{
+            .method = head.method,
+            .target = head.target,
+            .key = head.key,
+            .body = slot.buffer[slot.head_size..slot.size],
+        };
+    }
+
+    /// Hands out the complete request in slot `index`.
+    fn serve(receiver: *Receiver, index: u32) Received {
+        const slot = &receiver.slots[index];
+        assert(slot.state == .complete);
+        const request = receiver.request_of(slot);
+        slot.state = .serving;
+        return .{ .slot = index, .request = request };
+    }
+
+    /// One `poll` over the connections still reading and the listening socket, waiting at most
+    /// `wait_ns` (null: until there is activity), and the work it finds: accepting, reading.
+    /// With every slot taken, a waiting connection displaces the oldest one still sending its
+    /// request once that one is `displace_grace_ns` old (`.displace`, #28), or waits for a slot
+    /// (`.keep`: the listening socket is not even looked at, so that requests being served are
+    /// never preferred over a connection that is on its way). Returns how many descriptors were
+    /// ready.
+    fn poll(receiver: *Receiver, wait_ns_max: ?u64, full: enum { displace, keep }) !usize {
+        var wait_ns = wait_ns_max;
+        var fds_count: usize = 0;
+        for (receiver.slots) |*slot| {
+            switch (slot.state) {
+                .free, .complete, .serving => {},
+                .reading => {
+                    receiver.poll_fds[fds_count] = .{
+                        .fd = slot.fd,
+                        .events = posix.POLL.IN,
+                        .revents = 0,
+                    };
+                    fds_count += 1;
+                },
+            }
+        }
+        // The listening socket, and last: with every slot busy, a waiting connection
+        // displaces the oldest one still sending its request (#28). Last, so that a slot
+        // closed for it has had its own events handled before its fd can be reused.
+        const listening = receiver.slot_free() or full == .displace and listening: {
+            // A connection that has only just arrived may be about to send: it is displaced
+            // only when it has had its grace, and the wait ends then.
+            const oldest = receiver.oldest_reading() orelse break :listening false;
+            const accepted_ns = receiver.slots[oldest].deadline - receiver.options.deadline_ns;
+            const now = receiver.timer.read();
+            if (now >= accepted_ns + displace_grace_ns) break :listening true;
+            const left = accepted_ns + displace_grace_ns - now;
+            wait_ns = if (wait_ns) |wait| @min(wait, left) else left;
+            break :listening false;
+        };
+        if (listening) {
             receiver.poll_fds[fds_count] = .{
                 .fd = receiver.server.stream.handle,
                 .events = posix.POLL.IN,
                 .revents = 0,
             };
             fds_count += 1;
-            const ready = try posix.poll(receiver.poll_fds[0..fds_count], milliseconds(wait_ns));
-            if (ready == 0) continue;
+        }
+        if (fds_count == 0) return 0;
+        const ready = try posix.poll(receiver.poll_fds[0..fds_count], milliseconds(wait_ns));
+        if (ready == 0) return 0;
 
-            for (receiver.poll_fds[0..fds_count]) |poll_fd| {
-                if (poll_fd.revents == 0) continue;
-                if (poll_fd.fd == receiver.server.stream.handle) {
-                    if (!receiver.slot_free()) {
-                        // Every slot complete: serve them first, then accept.
-                        const oldest = receiver.oldest_reading() orelse continue;
-                        log.debug("every slot busy: closing the oldest unfinished request", .{});
-                        receiver.close(&receiver.slots[oldest]);
-                    }
-                    receiver.accept();
-                } else {
-                    receiver.read(receiver.slot_reading(poll_fd.fd));
+        for (receiver.poll_fds[0..fds_count]) |poll_fd| {
+            if (poll_fd.revents == 0) continue;
+            if (poll_fd.fd == receiver.server.stream.handle) {
+                if (!receiver.slot_free()) {
+                    // Every slot complete: serve them first, then accept.
+                    const oldest = receiver.oldest_reading() orelse continue;
+                    log.debug("every slot busy: closing the oldest unfinished request", .{});
+                    receiver.close(&receiver.slots[oldest]);
                 }
+                receiver.accept();
+            } else {
+                receiver.read(receiver.slot_reading(poll_fd.fd));
             }
         }
+        return ready;
     }
 
     /// Writes the reply to a request handed out by `next`, then closes its connection.
@@ -522,6 +597,10 @@ pub const Receiver = struct {
         unreachable;
     }
 };
+
+/// How old a connection still sending its request must be before a waiting one may displace it
+/// (#28): a client that connects and then sends is not cut off in between.
+const displace_grace_ns = 50 * std.time.ns_per_ms;
 
 /// A write to a closed connection must fail, not kill the process. Zig's start code ignores
 /// SIGPIPE on every target; Linux also gets `MSG_NOSIGNAL` (macOS has no such flag).
@@ -762,4 +841,143 @@ test "Receiver: with every slot busy, a new connection displaces the oldest unfi
     const later = (try receiver.next(1000)).?;
     try testing.expectEqualStrings("/later", later.request.target);
     receiver.respond(later, 200, "{}");
+}
+
+fn test_target_commit(_: void, request: *const Request) bool {
+    return std.mem.eql(u8, request.target, "/v1/commit");
+}
+
+test "Receiver.take hands out the requests already waiting that it is asked for, and waits for none (P143)" {
+    var receiver = try Receiver.init(
+        testing.allocator,
+        try std.net.Address.parseIp("127.0.0.1", 0),
+        .{ .connections_max = 8, .body_size_max = 64 },
+    );
+    defer receiver.deinit(testing.allocator);
+
+    // Nothing is waiting: nothing is taken, at once.
+    var taken: [8]Received = undefined;
+    const start = receiver.timer.read();
+    try testing.expectEqual(0, receiver.take({}, test_target_commit, &taken));
+    try testing.expect(receiver.timer.read() - start < 50 * std.time.ns_per_ms);
+
+    var clients: [6]std.net.Stream = undefined;
+    for (&clients, 0..) |*client, index| {
+        client.* = try test_connect(&receiver);
+        if (index == 3) {
+            try client.writeAll("GET /v1/other HTTP/1.1\r\n\r\n");
+        } else {
+            var request: [128]u8 = undefined;
+            try client.writeAll(try std.fmt.bufPrint(
+                &request,
+                "POST /v1/commit HTTP/1.1\r\nContent-Length: 2\r\n\r\n{d}{d}",
+                .{ index, index },
+            ));
+        }
+    }
+    defer for (clients) |client| client.close();
+
+    // The first is handed out as before, the connections behind it are accepted and read by
+    // `take`, oldest first, the one for another route left alone.
+    const first = (try receiver.next(1000)).?;
+    try testing.expectEqualStrings("00", first.request.body);
+    var count: usize = 0;
+    // Some may still be on their way through the loopback: ask until all are in, but never wait.
+    for (0..100) |_| {
+        count += receiver.take({}, test_target_commit, taken[count..4]);
+        if (count == 4) break;
+        std.time.sleep(std.time.ns_per_ms);
+    }
+    try testing.expectEqual(4, count);
+    const bodies = [_][]const u8{ "11", "22", "44", "55" };
+    for (taken[0..4], bodies) |one, body| try testing.expectEqualStrings(body, one.request.body);
+    // Everything taken is answered.
+    receiver.respond(first, 200, "{}");
+    for (taken[0..4]) |one| receiver.respond(one, 200, "{}");
+    var reply: [256]u8 = undefined;
+    for ([_]usize{ 0, 1, 2, 4, 5 }) |index| {
+        const size = try clients[index].readAll(&reply);
+        try testing.expect(std.mem.startsWith(u8, reply[0..size], "HTTP/1.1 200 OK\r\n"));
+    }
+    // The other route is served as always.
+    const other = (try receiver.next(1000)).?;
+    try testing.expectEqualStrings("/v1/other", other.request.target);
+    receiver.respond(other, 200, "{}");
+}
+
+test "Receiver.take never displaces a connection that is on its way (P143)" {
+    var receiver = try Receiver.init(
+        testing.allocator,
+        try std.net.Address.parseIp("127.0.0.1", 0),
+        .{ .connections_max = 2, .body_size_max = 64 },
+    );
+    defer receiver.deinit(testing.allocator);
+
+    const served = try test_connect(&receiver);
+    defer served.close();
+    try served.writeAll("POST /v1/commit HTTP/1.1\r\nContent-Length: 2\r\n\r\nhi");
+    const first = (try receiver.next(1000)).?;
+
+    // Another connection holds the second slot, its request still on its way; a third waits.
+    const slow = try test_connect(&receiver);
+    defer slow.close();
+    var taken: [2]Received = undefined;
+    for (0..20) |_| {
+        try testing.expectEqual(0, receiver.take({}, test_target_commit, &taken));
+        std.time.sleep(std.time.ns_per_ms);
+    }
+    const waiting = try test_connect(&receiver);
+    defer waiting.close();
+    for (0..20) |_| {
+        try testing.expectEqual(0, receiver.take({}, test_target_commit, &taken));
+        std.time.sleep(std.time.ns_per_ms);
+    }
+    // The slow one was not closed for the third: it can still send its request.
+    try slow.writeAll("POST /v1/commit HTTP/1.1\r\nContent-Length: 2\r\n\r\nok");
+    var count: usize = 0;
+    for (0..100) |_| {
+        count += receiver.take({}, test_target_commit, taken[count..]);
+        if (count == 1) break;
+        std.time.sleep(std.time.ns_per_ms);
+    }
+    try testing.expectEqual(1, count);
+    try testing.expectEqualStrings("ok", taken[0].request.body);
+    receiver.respond(first, 200, "{}");
+    receiver.respond(taken[0], 200, "{}");
+
+    // With the slots free again, the third is served.
+    try waiting.writeAll("POST /v1/commit HTTP/1.1\r\nContent-Length: 2\r\n\r\nno");
+    const third = (try receiver.next(1000)).?;
+    try testing.expectEqualStrings("no", third.request.body);
+    receiver.respond(third, 200, "{}");
+}
+
+test "Receiver: a connection that has only just arrived is not displaced before it can send (P143)" {
+    var receiver = try Receiver.init(
+        testing.allocator,
+        try std.net.Address.parseIp("127.0.0.1", 0),
+        .{ .connections_max = 2, .body_size_max = 64 },
+    );
+    defer receiver.deinit(testing.allocator);
+
+    const young_a = try test_connect(&receiver);
+    defer young_a.close();
+    const young_b = try test_connect(&receiver);
+    defer young_b.close();
+    try testing.expectEqual(null, try receiver.next(10));
+
+    // Both slots are held by connections that are about to send, a third waits with its request.
+    const waiting = try test_connect(&receiver);
+    defer waiting.close();
+    try waiting.writeAll("GET /waiting HTTP/1.1\r\n\r\n");
+    try testing.expectEqual(null, try receiver.next(10));
+    try young_a.writeAll("GET /a HTTP/1.1\r\n\r\n");
+    const a = (try receiver.next(1000)).?;
+    try testing.expectEqualStrings("/a", a.request.target);
+    receiver.respond(a, 200, "{}");
+
+    // Its slot goes to the waiting one.
+    const waited = (try receiver.next(2000)).?;
+    try testing.expectEqualStrings("/waiting", waited.request.target);
+    receiver.respond(waited, 200, "{}");
 }

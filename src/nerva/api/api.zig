@@ -66,6 +66,9 @@
 //! - Tables from `catalog.tables_reserved_min` up are Nerva's own: refused here, and left out of
 //!   `changes`.
 //! - Errors are `{"error": "<reason>"}` with 400, 401, 404, 405, 409 or 503.
+//! - A commit or a lookup of rows may be answered together with others that were waiting for the
+//!   gateway (`handle_group`, P143): one cluster request, one transaction or read each. Each
+//!   reply is the one the request would have had alone.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -269,6 +272,265 @@ pub fn handle(
     };
 }
 
+/// The most requests `handle_group` takes at once (the connections a gateway reads at once).
+pub const group_max = 16;
+/// The largest body of a request in a group. A parsed body costs up to ~200 times its size
+/// (N69): 16 bodies of 16 KiB stay far below one request's budget.
+pub const group_body_max = 16 * 1024;
+
+/// A request waiting to be answered with others in one cluster request (`handle_group`).
+pub const Member = struct {
+    /// `/v1/commit` or `/v1/lookup`, with no query (`group_route`).
+    target: []const u8,
+    body: []const u8,
+    /// Set by `handle_group`. A member left null when it returns an error was not answered.
+    result: ?(anyerror!Reply) = null,
+};
+
+/// Whether a request may be answered by `handle_group`: the routes whose requests are one
+/// transaction (`commit`) or one set of rows to read (`lookup`) and nothing more.
+pub fn group_route(method: Method, target: []const u8) bool {
+    return method == .post and
+        (std.mem.eql(u8, target, "/v1/commit") or std.mem.eql(u8, target, "/v1/lookup"));
+}
+
+/// What `handle_group` keeps of a member between its phases.
+fn GroupState(comptime Cache: type) type {
+    return struct {
+        const State = @This();
+
+        /// The layouts this member uses, kept or fresh as `handle` would have them.
+        cache: Cache,
+        what: union(enum) {
+            /// Answered while it was prepared (a refusal), or by `handle` since.
+            answered,
+            commit: Commit,
+            lookup: Lookup,
+            /// A lookup of records: not combined.
+            records,
+        } = .answered,
+
+        /// The operation of the cluster request this member could be a batch of.
+        fn operation(state: *const State) ?nerva.Operation {
+            return switch (state.what) {
+                .commit => |commit_| if (commit_.records) .commit_wide else .commit,
+                .lookup => .lookup_rows,
+                .answered, .records => null,
+            };
+        }
+
+        /// Its events.
+        fn count(state: *const State) u32 {
+            return switch (state.what) {
+                .commit => |commit_| @intCast(commit_.sent.len),
+                .lookup => |lookup_| lookup_.count(),
+                .answered, .records => unreachable,
+            };
+        }
+    };
+}
+
+/// A member's outcome: its answer, or the error that stops the whole group.
+fn settle(member: *Member, arena: std.mem.Allocator, result: anytype) !void {
+    if (result) |reply| {
+        member.result = reply;
+    } else |err| {
+        const any: anyerror = err;
+        if (any == error.Timeout or any == error.Evicted) return err;
+        member.result = refuse(arena, err);
+    }
+}
+
+/// Answers `members` (all the same `group_route`) with one cluster request where it can: each
+/// is one batch of a multi-batch `commit`, `commit_wide` or `lookup_rows`, which the state
+/// machine admits on its own. Every member's answer is the one it would have had alone:
+///
+/// - A request that is refused (400) is refused before anything is sent, after the same second
+///   look at the log as for a single request when it used a kept layout (P135).
+/// - A transaction refused `views_busy`, because transactions before it in the op filled its
+///   views budget, is sent again on its own, once: it then commits, or is `views_too_large`.
+/// - Each transaction keeps its own key, and the state machine answers `committed_before`,
+///   `key_reused` and `key_collision` in order, among the transactions of one op as among ops.
+/// - Each lookup brings its own probes, and compares them with the versions it kept.
+/// - A member that does not fit the request with the others, is of the other operation
+///   (`commit_wide` among `commit`s, a lookup of records), or is the only one left, runs alone
+///   through `handle`.
+///
+/// `error.Timeout` and `error.Evicted` (from anywhere) are returned, with every member that
+/// had no answer yet left null: none has an answer, as none would have had alone.
+pub fn handle_group(
+    arena: std.mem.Allocator,
+    client: anytype,
+    layouts: anytype,
+    members: []Member,
+) !void {
+    assert(members.len > 0 and members.len <= group_max);
+    const commits = std.mem.eql(u8, members[0].target, "/v1/commit");
+    for (members) |member| {
+        assert(group_route(.post, member.target));
+        assert(std.mem.eql(u8, member.target, members[0].target));
+        assert(member.result == null);
+    }
+    const Cache = Layouts(@TypeOf(layouts));
+    const State = GroupState(Cache);
+    var states_buffer: [group_max]State = undefined;
+    const states = states_buffer[0..members.len];
+
+    // Prepare: every refusal is made here, before anything is sent.
+    for (members, states) |*member, *state| {
+        state.* = .{ .cache = .{ .arena = arena, .layouts = layouts, .source = .kept } };
+        if (commits) {
+            if (commit_prepare_kept(arena, layouts, &state.cache, member.body)) |prepared| {
+                state.what = .{ .commit = prepared };
+                continue;
+            } else |err| try settle(member, arena, refuse(arena, err));
+        } else {
+            if (lookup_prepare_kept(arena, layouts, &state.cache, member.body)) |prepared| {
+                state.what = switch (prepared) {
+                    .rows => |rows| .{ .lookup = rows },
+                    .records => .records,
+                };
+                continue;
+            } else |err| try settle(member, arena, refuse(arena, err));
+        }
+    }
+
+    // Choose who travels together: the operation of the first, and as many as fit.
+    var operation: ?nerva.Operation = null;
+    var counts: [group_max]u32 = undefined;
+    var selected: [group_max]u8 = undefined;
+    var selected_count: u32 = 0;
+    for (states, 0..) |*state, index| {
+        const candidate = state.operation() orelse continue;
+        if (operation != null and operation.? != candidate) continue;
+        counts[selected_count] = state.count();
+        if (!batches_fit(client, candidate, counts[0 .. selected_count + 1])) continue;
+        operation = candidate;
+        selected[selected_count] = @intCast(index);
+        selected_count += 1;
+    }
+
+    if (selected_count >= 2) {
+        const batched = selected[0..selected_count];
+        try group_send(arena, client, operation.?, states, batched);
+        for (batched) |index| {
+            const member = &members[index];
+            const state = &states[index];
+            switch (state.what) {
+                .commit => |*commit_| {
+                    // Refused only because earlier transactions of this op filled its views
+                    // budget: it was never judged. Alone it commits or is too large.
+                    for (commit_.results_sent) |result| {
+                        if (result.status != .views_busy) continue;
+                        try commit_send(arena, client, commit_);
+                        break;
+                    }
+                    try settle(member, arena, commit_reply(arena, commit_));
+                },
+                .lookup => |*lookup_| {
+                    try settle(member, arena, lookup_reply(arena, &state.cache, lookup_));
+                },
+                .answered, .records => unreachable,
+            }
+            state.what = .answered;
+        }
+    }
+
+    // Whoever is left runs alone, as a single request does.
+    for (members, states) |*member, *state| {
+        if (state.what == .answered) continue;
+        try settle(member, arena, handle(arena, client, layouts, .post, member.target, member.body));
+    }
+}
+
+/// Whether `client` takes batches of `counts` events of `operation` in one request.
+fn batches_fit(client: anytype, operation: nerva.Operation, counts: []const u32) bool {
+    return switch (operation) {
+        .commit => client.batches_fit(.commit, counts),
+        .commit_wide => client.batches_fit(.commit_wide, counts),
+        .lookup_rows => client.batches_fit(.lookup_rows, counts),
+        else => unreachable,
+    };
+}
+
+/// Sends the chosen members, one batch each, as one cluster request.
+fn group_send(
+    arena: std.mem.Allocator,
+    client: anytype,
+    operation: nerva.Operation,
+    states: anytype,
+    selected: []const u8,
+) !void {
+    assert(selected.len >= 2 and selected.len <= group_max);
+    switch (operation) {
+        .commit => {
+            var events: [group_max][]const Entry = undefined;
+            var results: [group_max][]EntryResult = undefined;
+            for (selected, events[0..selected.len], results[0..selected.len]) |index, *e, *r| {
+                const commit_ = &states[index].what.commit;
+                e.* = try commit_narrow(arena, commit_);
+                r.* = commit_.results_sent;
+            }
+            try client.commit_batches(events[0..selected.len], results[0..selected.len]);
+        },
+        .commit_wide => {
+            var events: [group_max][]const nerva.WideEntry = undefined;
+            var results: [group_max][]EntryResult = undefined;
+            for (selected, events[0..selected.len], results[0..selected.len]) |index, *e, *r| {
+                const commit_ = &states[index].what.commit;
+                e.* = commit_.sent;
+                r.* = commit_.results_sent;
+            }
+            try client.commit_wide_batches(events[0..selected.len], results[0..selected.len]);
+        },
+        .lookup_rows => {
+            var events: [group_max][]const RowKey = undefined;
+            var results: [group_max][]RowValue = undefined;
+            for (selected, events[0..selected.len], results[0..selected.len]) |index, *e, *r| {
+                const lookup_ = &states[index].what.lookup;
+                e.* = lookup_.keys_all;
+                r.* = lookup_.results_all;
+            }
+            try client.lookup_rows_batches(events[0..selected.len], results[0..selected.len]);
+        },
+        else => unreachable,
+    }
+}
+
+/// Whether `err` is a refusal that `handle` asks the log about before it stands: it used a kept
+/// layout (P135).
+fn refusal_to_recheck(err: anyerror, cache: anytype) bool {
+    return (err == error.BadRequest or err == error.Invalid) and cache.used_kept();
+}
+
+/// `commit_prepare` as `handle` does it: with the gateway's kept layouts, then, if that refuses
+/// a request that used one, with every layout read from the log (P135).
+fn commit_prepare_kept(
+    arena: std.mem.Allocator,
+    layouts: anytype,
+    cache: anytype,
+    body: []const u8,
+) !Commit {
+    return commit_prepare(arena, cache, body) catch |err| {
+        if (!refusal_to_recheck(err, cache)) return err;
+        cache.* = .{ .arena = arena, .layouts = layouts, .source = .refresh };
+        return commit_prepare(arena, cache, body);
+    };
+}
+
+fn lookup_prepare_kept(
+    arena: std.mem.Allocator,
+    layouts: anytype,
+    cache: anytype,
+    body: []const u8,
+) !LookupPrepared {
+    return lookup_prepare(arena, cache, body) catch |err| {
+        if (!refusal_to_recheck(err, cache)) return err;
+        cache.* = .{ .arena = arena, .layouts = layouts, .source = .refresh };
+        return lookup_prepare(arena, cache, body);
+    };
+}
+
 /// The answer to an error of a request: a 400, or the error itself.
 fn refuse(arena: std.mem.Allocator, err: anyerror) !Reply {
     return switch (err) {
@@ -453,7 +715,46 @@ pub fn bad(reason: []const u8) error{BadRequest} {
 // ---- Routes ----
 
 fn lookup(arena: std.mem.Allocator, client: anytype, layouts: anytype, body: []const u8) !Reply {
-    const Request = struct { rows: []const struct { table: u32, id: []const u8 } };
+    switch (try lookup_prepare(arena, layouts, body)) {
+        .records => |rows| return lookup_records(arena, client, layouts, rows),
+        .rows => |*prepared| {
+            try lookup_send(client, prepared);
+            return lookup_reply(arena, layouts, prepared);
+        },
+    }
+}
+
+const LookupRequestRow = struct { table: u32, id: []const u8 };
+
+/// A lookup of rows, parsed and checked.
+const Lookup = struct {
+    /// The rows asked for.
+    keys: []const RowKey,
+    /// The kept layouts to check, by their catalog rows, read with `keys`.
+    probes: []const Probe,
+    /// `keys` then the probes' rows.
+    keys_all: []RowKey,
+    results_all: []RowValue,
+
+    fn results(lookup_: *const Lookup) []RowValue {
+        return lookup_.results_all[0..lookup_.keys.len];
+    }
+
+    /// Rows to read, the probes included.
+    fn count(lookup_: *const Lookup) u32 {
+        return @intCast(lookup_.keys_all.len);
+    }
+};
+
+const LookupPrepared = union(enum) {
+    /// A lookup of records (P123b): `lookup_records` reads them.
+    records: []const LookupRequestRow,
+    rows: Lookup,
+};
+
+/// Every refusal of a lookup is made here, before anything is sent.
+fn lookup_prepare(arena: std.mem.Allocator, layouts: anytype, body: []const u8) !LookupPrepared {
+    const Request = struct { rows: []const LookupRequestRow };
     const request = try json_parse(Request, arena, body);
     if (request.rows.len == 0) return bad("rows must not be empty");
     // One lookup reads at one op: rows, or records (P123b), not both.
@@ -463,7 +764,7 @@ fn lookup(arena: std.mem.Allocator, client: anytype, layouts: anytype, body: []c
             return bad("a lookup reads rows or records, not both: send two");
         }
     }
-    if (records) return lookup_records(arena, client, layouts, request.rows);
+    if (records) return .{ .records = request.rows };
 
     const keys = try arena.alloc(RowKey, request.rows.len);
     for (keys, request.rows) |*key, row_request| {
@@ -474,24 +775,40 @@ fn lookup(arena: std.mem.Allocator, client: anytype, layouts: anytype, body: []c
     const table_ids = try arena.alloc(u32, keys.len);
     for (table_ids, keys) |*table, key| table.* = key.table;
     const probes = try layouts.probes(table_ids);
-    const results_all = try arena.alloc(RowValue, keys.len + probes.len);
-    const results = results_all[0..keys.len];
-    const probe_rows = results_all[keys.len..];
-    if (probes.len == 0) {
+    const keys_all = try arena.alloc(RowKey, keys.len + probes.len);
+    @memcpy(keys_all[0..keys.len], keys);
+    for (keys_all[keys.len..], probes) |*key, probe| key.* = probe.key;
+    return .{ .rows = .{
+        .keys = keys,
+        .probes = probes,
+        .keys_all = keys_all,
+        .results_all = try arena.alloc(RowValue, keys_all.len),
+    } };
+}
+
+/// Reads the rows, and the probes with them, as one cluster request.
+fn lookup_send(client: anytype, prepared: *const Lookup) !void {
+    const keys = prepared.keys;
+    const results = prepared.results();
+    if (prepared.probes.len == 0) {
         try client.lookup_rows(keys, results);
     } else {
-        const keys_all = try arena.alloc(RowKey, results_all.len);
-        @memcpy(keys_all[0..keys.len], keys);
-        for (keys_all[keys.len..], probes) |*key, probe| key.* = probe.key;
-        client.lookup_rows(keys_all, results_all) catch |err| switch (err) {
+        client.lookup_rows(prepared.keys_all, prepared.results_all) catch |err| switch (err) {
             // No room for the probes: read them after, in an op that is not before the rows'.
             error.TooManyEvents => {
                 try client.lookup_rows(keys, results);
-                try client.lookup_rows(keys_all[keys.len..], probe_rows);
+                try client.lookup_rows(prepared.keys_all[keys.len..], prepared.results_all[keys.len..]);
             },
             else => return err,
         };
-        try layouts.probes_check(probes, probe_rows);
+    }
+}
+
+/// Checks the kept layouts against their rows, then renders the rows.
+fn lookup_reply(arena: std.mem.Allocator, layouts: anytype, prepared: *const Lookup) !Reply {
+    const results = prepared.results();
+    if (prepared.probes.len > 0) {
+        try layouts.probes_check(prepared.probes, prepared.results_all[prepared.keys.len..]);
     }
 
     var out = Writer.init(arena);
@@ -566,6 +883,27 @@ fn lookup_records(
 }
 
 fn commit(arena: std.mem.Allocator, client: anytype, layouts: anytype, body: []const u8) !Reply {
+    const prepared = try commit_prepare(arena, layouts, body);
+    try commit_send(arena, client, &prepared);
+    return commit_reply(arena, &prepared);
+}
+
+/// A commit request, parsed and checked, ready to be sent as one transaction.
+const Commit = struct {
+    key: ?u128,
+    /// The request's entries, as `commit_wide` carries them.
+    entries: []const nerva.WideEntry,
+    /// Per entry: an add's field type, for rendering its value.
+    add_fields: []const ?nerva.Add.AddField,
+    /// What is sent: `entries`, preceded by the key's entry under a key.
+    sent: []const nerva.WideEntry,
+    /// Whether an entry is a record's: sent as `commit_wide`, else as `commit`.
+    records: bool,
+    results_sent: []EntryResult,
+};
+
+/// Every refusal of a commit is made here, before anything is sent.
+fn commit_prepare(arena: std.mem.Allocator, layouts: anytype, body: []const u8) !Commit {
     const Request = struct {
         key: ?[]const u8 = null,
         entries: []const EntryRequest,
@@ -658,16 +996,39 @@ fn commit(arena: std.mem.Allocator, client: anytype, layouts: anytype, body: []c
         }
         break :sent sent;
     } else entries;
-    const results_sent = try arena.alloc(EntryResult, sent.len);
-    if (records) {
-        try client.commit_wide(sent, results_sent);
-    } else {
-        // Rows alone: `commit`, which every release since 0.1 takes.
-        const narrow = try arena.alloc(Entry, sent.len);
-        for (narrow, sent) |*entry, *wide| entry.* = narrow_entry(wide);
-        try client.commit(narrow, results_sent);
-    }
+    return .{
+        .key = key,
+        .entries = entries,
+        .add_fields = add_fields,
+        .sent = sent,
+        .records = records,
+        .results_sent = try arena.alloc(EntryResult, sent.len),
+    };
+}
 
+/// Rows alone are sent as `commit`, which every release since 0.1 takes.
+fn commit_narrow(arena: std.mem.Allocator, prepared: *const Commit) ![]const Entry {
+    assert(!prepared.records);
+    const narrow = try arena.alloc(Entry, prepared.sent.len);
+    for (narrow, prepared.sent) |*entry, *wide| entry.* = narrow_entry(wide);
+    return narrow;
+}
+
+/// Sends the transaction alone, as one cluster request.
+fn commit_send(arena: std.mem.Allocator, client: anytype, prepared: *const Commit) !void {
+    if (prepared.records) {
+        try client.commit_wide(prepared.sent, prepared.results_sent);
+    } else {
+        try client.commit(try commit_narrow(arena, prepared), prepared.results_sent);
+    }
+}
+
+/// The answer to a commit, from the results of its transaction.
+fn commit_reply(arena: std.mem.Allocator, prepared: *const Commit) !Reply {
+    const key = prepared.key;
+    const entries = prepared.entries;
+    const add_fields = prepared.add_fields;
+    const results_sent = prepared.results_sent;
     var out = Writer.init(arena);
     if (key != null) {
         const result = results_sent[0];
@@ -2139,17 +2500,102 @@ const FakeClient = struct {
     /// Answers `declare_view`, for the tests that set it; the rest are covered by
     /// `tests/views/maintained.py`.
     declared: ?nerva.DeclareStatus = null,
-    /// The most rows one `lookup_rows` takes.
+    /// The most events one batch takes (rows to look up, or entries of a transaction).
     lookup_max: usize = std.math.maxInt(usize),
+    /// The most events all the batches of one request hold together.
+    batch_events_max: usize = std.math.maxInt(usize),
+    /// Cluster requests received (a batch of many is one).
+    requests: u32 = 0,
+    /// From this batch of a request of several on, a transaction is refused `views_busy`, as the
+    /// state machine does for one that the op's views budget no longer holds. Alone it commits.
+    busy_from: usize = std.math.maxInt(usize),
+    /// How many transactions were refused so.
+    busy: u32 = 0,
+    /// The next request times out.
+    timeout_next: bool = false,
 
     const Version = struct { op: u64, exists: bool, value: [value_size]u8 };
     const RecordVersion = struct { op: u64, exists: bool, value: [nerva.record_value_size]u8 };
 
-    pub const Error = error{ TooManyEvents, OutOfMemory };
+    pub const Error = error{ TooManyEvents, OutOfMemory, Timeout };
+
+    pub fn batches_fit(fake: *const FakeClient, comptime operation: nerva.Operation, counts: []const u32) bool {
+        _ = operation;
+        if (counts.len == 0 or counts.len > group_max) return false;
+        var total: usize = 0;
+        for (counts) |count| {
+            if (count == 0 or count > fake.lookup_max) return false;
+            total += count;
+        }
+        return total <= fake.batch_events_max;
+    }
+
+    pub fn lookup_rows_batches(
+        fake: *FakeClient,
+        keys: []const []const RowKey,
+        results: []const []RowValue,
+    ) Error!void {
+        var counts: [group_max]u32 = undefined;
+        for (keys, counts[0..keys.len]) |batch, *count| count.* = @intCast(batch.len);
+        if (!fake.batches_fit(.lookup_rows, counts[0..keys.len])) return error.TooManyEvents;
+        if (fake.timeout_next) return error.Timeout;
+        fake.requests += 1;
+        fake.op += 1;
+        for (keys, results) |batch, result| fake.lookup_rows_at(fake.op, batch, result);
+    }
+
+    pub fn commit_batches(
+        fake: *FakeClient,
+        transactions: []const []const Entry,
+        results: []const []EntryResult,
+    ) Error!void {
+        var counts: [group_max]u32 = undefined;
+        for (transactions, counts[0..transactions.len]) |batch, *count| count.* = @intCast(batch.len);
+        if (!fake.batches_fit(.commit, counts[0..transactions.len])) return error.TooManyEvents;
+        if (fake.timeout_next) return error.Timeout;
+        fake.requests += 1;
+        fake.op += 1;
+        for (transactions, results, 0..) |entries, result, index| {
+            if (fake.refuse_busy(index, result)) continue;
+            try fake.commit_at(fake.op, entries, result);
+        }
+    }
+
+    pub fn commit_wide_batches(
+        fake: *FakeClient,
+        transactions: []const []const nerva.WideEntry,
+        results: []const []EntryResult,
+    ) Error!void {
+        var counts: [group_max]u32 = undefined;
+        for (transactions, counts[0..transactions.len]) |batch, *count| count.* = @intCast(batch.len);
+        if (!fake.batches_fit(.commit_wide, counts[0..transactions.len])) return error.TooManyEvents;
+        if (fake.timeout_next) return error.Timeout;
+        fake.requests += 1;
+        fake.op += 1;
+        for (transactions, results, 0..) |entries, result, index| {
+            if (fake.refuse_busy(index, result)) continue;
+            try fake.commit_wide_at(fake.op, entries, result);
+        }
+    }
+
+    fn refuse_busy(fake: *FakeClient, index: usize, results: []EntryResult) bool {
+        if (index < fake.busy_from) return false;
+        fake.busy += 1;
+        for (results, 0..) |*result, i| result.* = if (i == 0)
+            .{ .status = .views_busy, .op = 0 }
+        else
+            .{ .status = .aborted, .op = 0 };
+        return true;
+    }
 
     pub fn lookup_rows(fake: *FakeClient, keys: []const RowKey, results: []RowValue) Error!void {
         if (keys.len > fake.lookup_max) return error.TooManyEvents;
+        fake.requests += 1;
         fake.op += 1;
+        fake.lookup_rows_at(fake.op, keys, results);
+    }
+
+    fn lookup_rows_at(fake: *FakeClient, op: u64, keys: []const RowKey, results: []RowValue) void {
         for (keys, results) |key, *result| {
             const found = fake.rows.get(nerva.row_key(key.table, key.id));
             result.* = .{
@@ -2157,14 +2603,21 @@ const FakeClient = struct {
                 .table = key.table,
                 .flags = .{ .exists = if (found) |f| f.exists else false },
                 .op = if (found) |f| f.op else 0,
-                .op_read = fake.op,
+                .op_read = op,
                 .value = if (found) |f| f.value else @splat(0),
             };
         }
     }
 
     pub fn commit(fake: *FakeClient, entries: []const Entry, results: []EntryResult) Error!void {
+        if (entries.len > fake.lookup_max) return error.TooManyEvents;
+        fake.requests += 1;
         fake.op += 1;
+        try fake.commit_at(fake.op, entries, results);
+    }
+
+    /// A transaction of the op `op`, which may hold others before it.
+    fn commit_at(fake: *FakeClient, op: u64, entries: []const Entry, results: []EntryResult) Error!void {
         const keyed = entries[0].kind == .key;
         const hash = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(entries[1..]));
         if (keyed) {
@@ -2189,21 +2642,56 @@ const FakeClient = struct {
                 return;
             }
         }
+        // Adds of a u64 field, without a partner, clamp or create: the amount lands, or the
+        // field would cross its `min` (`out_of_bounds`), or the row is absent.
+        for (entries, 0..) |entry, index| {
+            if (entry.kind != .add) continue;
+            const add = nerva.Add.from_entry(&entry);
+            assert(add.field == .u64 and !add.flags.clamp and !add.flags.create);
+            const found = fake.rows.get(nerva.row_key(entry.table, entry.id));
+            const status: nerva.EntryStatus, const value: u64 = if (found == null or !found.?.exists)
+                .{ .row_absent, 0 }
+            else status: {
+                const current = std.mem.readInt(u64, found.?.value[add.offset..][0..8], .little);
+                const sum = @as(i128, current) + add.delta;
+                break :status if (sum < 0 or (add.flags.min and sum < add.min))
+                    .{ .out_of_bounds, current }
+                else
+                    .{ .ok, @intCast(sum) };
+            };
+            if (status == .ok) continue;
+            for (results, 0..) |*result, i| result.* = if (i == index)
+                .{ .status = status, .op = 0, .value = value }
+            else
+                .{ .status = .aborted, .op = 0 };
+            return;
+        }
         if (keyed) {
             try fake.keys.put(fake.allocator, nerva.CommitKey.entry_key(&entries[0]), .{
-                .op = fake.op,
+                .op = op,
                 .hash = hash,
             });
         }
-        for (entries) |entry| {
+        @memset(results, .{ .status = .ok, .op = op });
+        for (entries, results) |entry, *result| {
             if (entry.kind == .read or entry.kind == .key) continue;
+            var value = entry.value;
+            if (entry.kind == .add) {
+                const add = nerva.Add.from_entry(&entry);
+                var row_value = fake.rows.get(nerva.row_key(entry.table, entry.id)).?.value;
+                const current = std.mem.readInt(u64, row_value[add.offset..][0..8], .little);
+                const next: u64 = @intCast(@as(i128, current) + add.delta);
+                std.mem.writeInt(u64, row_value[add.offset..][0..8], next, .little);
+                value = row_value;
+                result.applied = add.delta;
+                result.value = next;
+            }
             try fake.rows.put(fake.allocator, nerva.row_key(entry.table, entry.id), .{
-                .op = fake.op,
-                .exists = entry.kind == .put,
-                .value = entry.value,
+                .op = op,
+                .exists = entry.kind != .delete,
+                .value = value,
             });
         }
-        @memset(results, .{ .status = .ok, .op = fake.op });
     }
 
     pub fn commit_wide(
@@ -2211,7 +2699,18 @@ const FakeClient = struct {
         entries: []const nerva.WideEntry,
         results: []EntryResult,
     ) Error!void {
+        if (entries.len > fake.lookup_max) return error.TooManyEvents;
+        fake.requests += 1;
         fake.op += 1;
+        try fake.commit_wide_at(fake.op, entries, results);
+    }
+
+    fn commit_wide_at(
+        fake: *FakeClient,
+        op: u64,
+        entries: []const nerva.WideEntry,
+        results: []EntryResult,
+    ) Error!void {
         const keyed = entries[0].kind == .key;
         const hash = std.hash.Wyhash.hash(1, std.mem.sliceAsBytes(entries[1..]));
         if (keyed) {
@@ -2239,7 +2738,7 @@ const FakeClient = struct {
             try fake.keys.put(
                 fake.allocator,
                 std.mem.readInt(u128, entries[0].value[0..16], .little),
-                .{ .op = fake.op, .hash = hash },
+                .{ .op = op, .hash = hash },
             );
         }
         for (entries) |*entry| {
@@ -2247,19 +2746,19 @@ const FakeClient = struct {
             assert(entry.kind == .put or entry.kind == .delete);
             if (nerva.table_is_record(entry.table)) {
                 try fake.records.put(fake.allocator, nerva.record_key(entry.table, entry.id), .{
-                    .op = fake.op,
+                    .op = op,
                     .exists = entry.kind == .put,
                     .value = entry.value,
                 });
             } else {
                 try fake.rows.put(fake.allocator, nerva.row_key(entry.table, @intCast(entry.id)), .{
-                    .op = fake.op,
+                    .op = op,
                     .exists = entry.kind == .put,
                     .value = entry.value[0..value_size].*,
                 });
             }
         }
-        @memset(results, .{ .status = .ok, .op = fake.op });
+        @memset(results, .{ .status = .ok, .op = op });
     }
 
     fn written(fake: *FakeClient, entry: *const nerva.WideEntry) ?struct { op: u64 } {
@@ -3085,4 +3584,346 @@ test "api: documents are written, read, conflict and deleted by key" {
     }
     // Nothing above was written; only the unanswerable `as_of` reached the cluster (a lookup).
     try testing.expectEqual(@as(u64, 8), fake.op);
+}
+
+// ---- Requests answered together (P143) ----
+
+/// Runs `bodies`, all for `target`, through `handle_group`.
+fn group_run(
+    arena: std.mem.Allocator,
+    fake: *FakeClient,
+    layouts: *FakeLayouts,
+    target: []const u8,
+    bodies: []const []const u8,
+) ![]Member {
+    const members = try arena.alloc(Member, bodies.len);
+    for (members, bodies) |*member, body| member.* = .{ .target = target, .body = body };
+    try handle_group(arena, fake, layouts, members);
+    return members;
+}
+
+/// A reply with the ops left out: a group commits at one op, one after another at several.
+fn without_ops(arena: std.mem.Allocator, body: []const u8) ![]const u8 {
+    var out = std.ArrayListUnmanaged(u8){};
+    var index: usize = 0;
+    while (index < body.len) {
+        const key = "\"op\":";
+        if (std.mem.startsWith(u8, body[index..], key)) {
+            try out.appendSlice(arena, key ++ "N");
+            index += key.len;
+            if (body[index] == '"') index += 1;
+            while (index < body.len and std.ascii.isDigit(body[index])) index += 1;
+            if (body[index] == '"') index += 1;
+        } else {
+            try out.append(arena, body[index]);
+            index += 1;
+        }
+    }
+    return out.items;
+}
+
+const group_seed = [_][]const u8{
+    \\{"entries":[{"kind":"put","table":1,"id":"1","value_hex":"01"}]}
+    ,
+    \\{"entries":[{"kind":"put","table":1,"id":"5","value_hex":"0300000000000000"}]}
+};
+
+test "api: requests answered together are answered as each would be alone (P143)" {
+    var arena_instance = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_instance.deinit();
+    const arena = arena_instance.allocator();
+    var together: FakeClient = .{ .allocator = arena };
+    var alone: FakeClient = .{ .allocator = arena };
+    var layouts: FakeLayouts = .{ .allocator = arena };
+    for (group_seed) |body| {
+        for ([_]*FakeClient{ &together, &alone }) |fake| {
+            try testing.expectEqual(
+                @as(u16, 200),
+                (try handle(arena, fake, &layouts, .post, "/v1/commit", body)).status,
+            );
+        }
+    }
+    const requests_seed = together.requests;
+
+    const bodies = [_][]const u8{
+        // 0: commits.
+        \\{"entries":[{"kind":"put","table":1,"id":"2","value_hex":"aa"}]}
+        ,
+        // 1: a stale read conflicts.
+        \\{"entries":[{"kind":"read","table":1,"id":"1","op_seen":"99"}]}
+        ,
+        // 2: an add past its minimum.
+        \\{"entries":[{"kind":"add","table":1,"id":"5","offset":0,"type":"u64","delta":"-5","min":"0"}]}
+        ,
+        // 3: invalid, answered before anything is sent.
+        \\{"entries":[{"kind":"delete","table":1,"id":"1","value_hex":"00"}]}
+        ,
+        // 4: an add that fits, after request 2 changed nothing.
+        \\{"entries":[{"kind":"add","table":1,"id":"5","offset":0,"type":"u64","delta":"-2","min":"0"}]}
+        ,
+        // 5: an add to a row that is not there.
+        \\{"entries":[{"kind":"add","table":1,"id":"6","offset":0,"type":"u64","delta":"1"}]}
+        ,
+        // 6: a read of what request 0 wrote in the same op.
+        \\{"entries":[{"kind":"read","table":1,"id":"2","op_seen":"0"}]}
+        ,
+        // 7: a request that is not JSON.
+        "{",
+    };
+    const members = try group_run(arena, &together, &layouts, "/v1/commit", &bodies);
+    // One cluster request for the six that reached it.
+    try testing.expectEqual(requests_seed + 1, together.requests);
+
+    for (members, bodies) |member, body| {
+        const reply = try member.result.?;
+        const reference = try handle(arena, &alone, &layouts, .post, "/v1/commit", body);
+        try testing.expectEqual(reference.status, reply.status);
+        try testing.expectEqualStrings(
+            try without_ops(arena, reference.body),
+            try without_ops(arena, reply.body),
+        );
+    }
+    try testing.expectEqual(requests_seed + 6, alone.requests);
+    // Each answer says the op its own transaction was judged at.
+    var expected = std.ArrayListUnmanaged(u8){};
+    try expected.writer(arena).print("{{\"status\":\"committed\",\"op\":\"{}\"}}", .{together.op});
+    try testing.expectEqualStrings(expected.items, (try members[0].result.?).body);
+    try testing.expectEqual(@as(u16, 409), (try members[2].result.?).status);
+    try testing.expectEqualStrings(
+        \\{"status":"out_of_bounds","index":0,"value":"3"}
+    , (try members[2].result.?).body);
+    try testing.expectEqualStrings(
+        \\{"status":"row_absent","index":0}
+    , (try members[5].result.?).body);
+}
+
+test "api: a transaction refused views_busy is sent again alone, and the caller never sees it (P143)" {
+    var arena_instance = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_instance.deinit();
+    const arena = arena_instance.allocator();
+    var fake: FakeClient = .{ .allocator = arena, .busy_from = 2 };
+    var layouts: FakeLayouts = .{ .allocator = arena };
+
+    const bodies = [_][]const u8{
+        \\{"entries":[{"kind":"put","table":1,"id":"1","value_hex":"01"}]}
+        ,
+        \\{"entries":[{"kind":"put","table":1,"id":"2","value_hex":"02"}]}
+        ,
+        \\{"entries":[{"kind":"put","table":1,"id":"3","value_hex":"03"}]}
+        ,
+        \\{"key":"000102030405060708090a0b0c0d0e0f","entries":[{"kind":"put","table":1,"id":"4","value_hex":"04"}]}
+        ,
+        \\{"entries":[{"kind":"put","table":1,"id":"5","value_hex":"05"}]}
+    };
+    const members = try group_run(arena, &fake, &layouts, "/v1/commit", &bodies);
+    // The cluster request, and the three refused sent again, one request each.
+    try testing.expectEqual(@as(u32, 3), fake.busy);
+    try testing.expectEqual(@as(u32, 1 + 3), fake.requests);
+    for (members, 0..) |member, index| {
+        const reply = try member.result.?;
+        try testing.expectEqual(@as(u16, 200), reply.status);
+        try testing.expect(std.mem.startsWith(u8, reply.body, "{\"status\":\"committed\""));
+        // Committed at the op of its own request.
+        const expected_op: u64 = if (index < 2) 1 else 1 + index - 1;
+        var expected: [64]u8 = undefined;
+        try testing.expect(std.mem.indexOf(u8, reply.body, try std.fmt.bufPrint(
+            &expected,
+            "\"op\":\"{}\"",
+            .{expected_op},
+        )) != null);
+    }
+    // Everything landed.
+    for (1..6) |id| {
+        const found = try handle(arena, &fake, &layouts, .post, "/v1/lookup", try std.fmt.allocPrint(
+            arena,
+            "{{\"rows\":[{{\"table\":1,\"id\":\"{}\"}}]}}",
+            .{id},
+        ));
+        try testing.expect(std.mem.indexOf(u8, found.body, "\"exists\":true") != null);
+    }
+}
+
+test "api: transactions under one key in one request answer as they would one after another (P123, P143)" {
+    var arena_instance = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_instance.deinit();
+    const arena = arena_instance.allocator();
+    var fake: FakeClient = .{ .allocator = arena };
+    var layouts: FakeLayouts = .{ .allocator = arena };
+
+    const bodies = [_][]const u8{
+        \\{"key":"000102030405060708090a0b0c0d0e0f","entries":[{"kind":"put","table":1,"id":"7","value_hex":"07"}]}
+        ,
+        // The same transaction again: it committed before, at the first one's op.
+        \\{"key":"000102030405060708090a0b0c0d0e0f","entries":[{"kind":"put","table":1,"id":"7","value_hex":"07"}]}
+        ,
+        // The same key for other entries.
+        \\{"key":"000102030405060708090a0b0c0d0e0f","entries":[{"kind":"put","table":1,"id":"8","value_hex":"08"}]}
+        ,
+        // Another key, then it again.
+        \\{"key":"ffffffffffffffffffffffffffffffff","entries":[{"kind":"put","table":1,"id":"9","value_hex":"09"}]}
+        ,
+        \\{"key":"ffffffffffffffffffffffffffffffff","entries":[{"kind":"put","table":1,"id":"9","value_hex":"09"}]}
+    };
+    const members = try group_run(arena, &fake, &layouts, "/v1/commit", &bodies);
+    try testing.expectEqual(@as(u32, 1), fake.requests);
+    const op = fake.op;
+    const committed = try std.fmt.allocPrint(arena, "{{\"status\":\"committed\",\"op\":\"{}\"}}", .{op});
+    const replayed = try std.fmt.allocPrint(
+        arena,
+        "{{\"status\":\"committed\",\"op\":\"{}\",\"replayed\":true}}",
+        .{op},
+    );
+    const reused = try std.fmt.allocPrint(arena, "{{\"status\":\"key_reused\",\"op\":\"{}\"}}", .{op});
+    const expected = [_][]const u8{ committed, replayed, reused, committed, replayed };
+    const statuses = [_]u16{ 200, 200, 409, 200, 200 };
+    for (members, expected, statuses) |member, body, status| {
+        const reply = try member.result.?;
+        try testing.expectEqual(status, reply.status);
+        try testing.expectEqualStrings(body, reply.body);
+    }
+}
+
+test "api: lookups answered together bring their own probes, and a layout that moved is read again (P135, P143)" {
+    var arena_instance = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_instance.deinit();
+    const arena = arena_instance.allocator();
+    var fake: FakeClient = .{ .allocator = arena };
+    var layouts: FakeLayouts = .{ .allocator = arena, .client = &fake };
+
+    const v1 =
+        \\{"name":"seats","fields":[{"name":"section","type":"u8"},{"name":"price","type":"u64"}]}
+    ;
+    const v2 =
+        \\{"name":"seats","fields":[{"name":"section","type":"u8"},{"name":"price","type":"u64"},
+    ++
+        \\{"name":"tier","type":"u8"}]}
+    ;
+    try testing.expectEqual(
+        @as(u16, 200),
+        (try handle(arena, &fake, &layouts, .put, "/v1/tables/7", v1)).status,
+    );
+    const put = try handle(arena, &fake, &layouts, .post, "/v1/commit",
+        \\{"entries":[{"kind":"put","table":7,"id":"1","fields":{"section":2,"price":"4500"}}]}
+    );
+    try testing.expectEqual(@as(u16, 200), put.status);
+
+    const lookups = [_][]const u8{
+        \\{"rows":[{"table":7,"id":"1"}]}
+        ,
+        \\{"rows":[{"table":7,"id":"1"},{"table":7,"id":"2"}]}
+        ,
+        \\{"rows":[{"table":3,"id":"1"}]}
+    };
+    // The layout is kept: a group reads no layout from the log.
+    const reads_before = layouts.reads;
+    const requests_before = fake.requests;
+    var members = try group_run(arena, &fake, &layouts, "/v1/lookup", &lookups);
+    try testing.expectEqual(requests_before + 1, fake.requests);
+    try testing.expectEqual(reads_before, layouts.reads);
+    for (members, lookups) |member, body| {
+        const reference = try handle(arena, &fake, &layouts, .post, "/v1/lookup", body);
+        const reply = try member.result.?;
+        try testing.expectEqual(reference.status, reply.status);
+        try testing.expectEqualStrings(
+            try without_ops(arena, reference.body),
+            try without_ops(arena, reply.body),
+        );
+        // Each rows' op_read is the one op of the group.
+        try testing.expect(std.mem.startsWith(u8, reply.body, "{\"op\":"));
+    }
+    try testing.expect(std.mem.indexOf(
+        u8,
+        (try members[0].result.?).body,
+        "\"fields\":{\"section\":2,\"price\":\"4500\"}",
+    ) != null);
+
+    // Another gateway extends the layout. The group reads it again before it renders, and every
+    // member shows the new field.
+    try layout_extended_elsewhere(arena, &layouts, &fake, 7, v2);
+    const reads_moved = layouts.reads;
+    members = try group_run(arena, &fake, &layouts, "/v1/lookup", &lookups);
+    try testing.expect(layouts.reads > reads_moved);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        (try members[0].result.?).body,
+        "\"fields\":{\"section\":2,\"price\":\"4500\",\"tier\":0}",
+    ) != null);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        (try members[1].result.?).body,
+        "\"fields\":{\"section\":2,\"price\":\"4500\",\"tier\":0}",
+    ) != null);
+
+    // A put by a field only the new layout has: refused first under the kept layout, answered
+    // after one look at the log, and a truly unknown field is refused without being sent.
+    try layout_extended_elsewhere(arena, &layouts, &fake, 7,
+        \\{"name":"seats","fields":[{"name":"section","type":"u8"},{"name":"price","type":"u64"},
+    ++
+        \\{"name":"tier","type":"u8"},{"name":"row","type":"u8"}]}
+    );
+    const commits = [_][]const u8{
+        \\{"entries":[{"kind":"put","table":7,"id":"3","fields":{"section":1,"row":9}}]}
+        ,
+        \\{"entries":[{"kind":"put","table":7,"id":"4","fields":{"nope":1}}]}
+        ,
+        \\{"entries":[{"kind":"put","table":7,"id":"5","fields":{"section":4}}]}
+    };
+    const requests_commits = fake.requests;
+    members = try group_run(arena, &fake, &layouts, "/v1/commit", &commits);
+    try testing.expectEqual(@as(u16, 200), (try members[0].result.?).status);
+    try testing.expectEqual(@as(u16, 400), (try members[1].result.?).status);
+    try testing.expectEqual(@as(u16, 200), (try members[2].result.?).status);
+    // The two that were valid travelled together.
+    try testing.expectEqual(requests_commits + 1, fake.requests);
+}
+
+test "api: what does not fit, or is of another operation, runs alone, and a lost cluster answers nobody (P143)" {
+    var arena_instance = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_instance.deinit();
+    const arena = arena_instance.allocator();
+    var fake: FakeClient = .{ .allocator = arena, .batch_events_max = 3 };
+    var layouts: FakeLayouts = .{ .allocator = arena };
+
+    const record = "0123456789abcdef0123456789abcdef";
+    const bodies = [_][]const u8{
+        \\{"entries":[{"kind":"put","table":1,"id":"1","value_hex":"01"}]}
+        ,
+        // A record: another operation, alone.
+        \\{"entries":[{"kind":"put","table":2147483649,"id":"
+        ++ record ++
+            \\","value_hex":"02"}]}
+        ,
+        \\{"entries":[{"kind":"put","table":1,"id":"2","value_hex":"02"},{"kind":"put","table":1,"id":"3","value_hex":"03"}]}
+        ,
+        // Does not fit the three events of the request with the two before it: alone.
+        \\{"entries":[{"kind":"put","table":1,"id":"4","value_hex":"04"},{"kind":"put","table":1,"id":"5","value_hex":"05"}]}
+        ,
+        // Fits no request at all: refused as it is alone.
+        \\{"entries":[{"kind":"put","table":1,"id":"6","value_hex":"06"},{"kind":"put","table":1,"id":"7","value_hex":"07"},{"kind":"put","table":1,"id":"8","value_hex":"08"},{"kind":"put","table":1,"id":"9","value_hex":"09"}]}
+    };
+    fake.lookup_max = 3;
+    const members = try group_run(arena, &fake, &layouts, "/v1/commit", &bodies);
+    // The batch of two (events 1 and 3 together fit), the record, the one that did not fit; the
+    // last was refused by the client as it would alone.
+    try testing.expectEqual(@as(u32, 3), fake.requests);
+    const statuses = [_]u16{ 200, 200, 200, 200, 400 };
+    for (members, statuses) |member, status| {
+        try testing.expectEqual(status, (try member.result.?).status);
+    }
+
+    // A cluster that does not answer: nobody has an answer, except the request refused before.
+    fake.timeout_next = true;
+    const lost = [_][]const u8{
+        \\{"entries":[{"kind":"put","table":1,"id":"1","value_hex":"01"}]}
+        ,
+        \\{"entries":[{"kind":"put","table":1,"id":"2","value_hex":"02"}]}
+        ,
+        "{",
+    };
+    const lost_members = try arena.alloc(Member, lost.len);
+    for (lost_members, lost) |*member, body| member.* = .{ .target = "/v1/commit", .body = body };
+    try testing.expectError(error.Timeout, handle_group(arena, &fake, &layouts, lost_members));
+    try testing.expect(lost_members[0].result == null);
+    try testing.expect(lost_members[1].result == null);
+    try testing.expectEqual(@as(u16, 400), (try lost_members[2].result.?).status);
 }
