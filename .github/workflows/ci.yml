@@ -75,6 +75,9 @@ jobs:
       - name: Release scripts (the bill of materials, N63)
         run: python3 .github/scripts/test_sbom.py
 
+      - name: Site builder (pages.yml)
+        run: python3 site/test_build.py
+
       - name: Nightly perf scripts (the comparison, its issues)
         run: |
           python3 perf/nightly/test_compare.py

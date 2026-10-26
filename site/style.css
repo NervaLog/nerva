@@ -1,0 +1,105 @@
+/* The project site (site/build.py). Pages are GitHub's rendered Markdown; pl-* are its syntax
+   highlighting classes. */
+:root {
+  --bg: #ffffff;
+  --fg: #1f2328;
+  --muted: #59636e;
+  --border: #d1d9e0;
+  --subtle: #f6f8fa;
+  --link: #0969da;
+  --accent: #6639ba;
+  --pl-comment: #59636e;
+  --pl-keyword: #cf222e;
+  --pl-string: #0a3069;
+  --pl-constant: #0550ae;
+  --pl-entity: #6639ba;
+  --pl-tag: #116329;
+  --pl-variable: #953800;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0d1117;
+    --fg: #e6edf3;
+    --muted: #9198a1;
+    --border: #3d444d;
+    --subtle: #151b23;
+    --link: #4493f8;
+    --accent: #ab7df8;
+    --pl-comment: #9198a1;
+    --pl-keyword: #ff7b72;
+    --pl-string: #a5d6ff;
+    --pl-constant: #79c0ff;
+    --pl-entity: #d2a8ff;
+    --pl-tag: #7ee787;
+    --pl-variable: #ffa657;
+  }
+}
+
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font: 16px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif;
+}
+a { color: var(--link); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+header.site {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.25rem 1rem;
+  padding: 0.75rem 16px;
+  border-bottom: 1px solid var(--border);
+  background: var(--subtle);
+}
+header.site .brand { font-weight: 700; font-size: 1.15rem; color: var(--fg); }
+header.site .version { color: var(--muted); font-size: 0.85rem; }
+header.site nav { display: flex; flex-wrap: wrap; gap: 0.25rem 1rem; margin-left: auto; }
+header.site nav a { color: var(--muted); }
+header.site nav a[aria-current="page"] { color: var(--accent); font-weight: 600; }
+
+main.markdown-body { max-width: 960px; margin: 0 auto; padding: 1.5rem 16px 3rem; overflow-wrap: break-word; }
+footer.site {
+  max-width: 960px;
+  margin: 0 auto;
+  padding: 1rem 16px 2rem;
+  border-top: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+.markdown-body h1, .markdown-body h2, .markdown-body h3, .markdown-body h4 { line-height: 1.25; margin: 1.5em 0 0.75em; }
+.markdown-body h1 { font-size: 2em; margin-top: 0.5em; }
+.markdown-body h1, .markdown-body h2 { padding-bottom: 0.3em; border-bottom: 1px solid var(--border); }
+.markdown-body .markdown-heading { position: relative; }
+.markdown-body .anchor { position: absolute; left: -1.25rem; top: 0.2em; opacity: 0; color: var(--muted); }
+.markdown-body .markdown-heading:hover .anchor { opacity: 1; }
+.markdown-body .anchor svg { fill: currentColor; vertical-align: middle; }
+.markdown-body blockquote { margin: 0 0 1rem; padding: 0 1em; color: var(--muted); border-left: 0.25em solid var(--border); }
+.markdown-body code, .markdown-body pre {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 85%;
+}
+.markdown-body code { padding: 0.2em 0.4em; background: var(--subtle); border-radius: 6px; }
+.markdown-body pre { padding: 1rem; overflow: auto; line-height: 1.45; background: var(--subtle); border-radius: 6px; }
+.markdown-body pre code { padding: 0; background: none; font-size: 100%; }
+.markdown-body .highlight pre { margin-bottom: 1rem; }
+.markdown-body table { display: block; width: max-content; max-width: 100%; overflow: auto; border-collapse: collapse; margin-bottom: 1rem; }
+.markdown-body th, .markdown-body td { padding: 6px 13px; border: 1px solid var(--border); vertical-align: top; }
+.markdown-body tr:nth-child(2n) { background: var(--subtle); }
+.markdown-body hr { height: 1px; border: 0; background: var(--border); margin: 1.5rem 0; }
+.markdown-body img { max-width: 100%; }
+/* github.com's script copies code blocks; a static page has none. */
+.markdown-body clipboard-copy, .markdown-body .zeroclipboard-container { display: none; }
+
+.pl-c { color: var(--pl-comment); }
+.pl-k, .pl-smi + .pl-k { color: var(--pl-keyword); }
+.pl-s, .pl-pds, .pl-sr { color: var(--pl-string); }
+.pl-c1, .pl-en .pl-c1, .pl-pse .pl-s1 { color: var(--pl-constant); }
+.pl-e, .pl-en { color: var(--pl-entity); }
+.pl-ent { color: var(--pl-tag); }
+.pl-v, .pl-smw { color: var(--pl-variable); }
+.pl-s1, .pl-smi { color: inherit; }

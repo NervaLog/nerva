@@ -1,0 +1,60 @@
+# The project site on GitHub Pages: the home page, tutorial, goals and milestones, README and
+# changelog, built by site/build.py from main. The site is public although the repository is
+# private, so build.py publishes only the pages it lists.
+name: Pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - README.md
+      - CHANGELOG.md
+      - VERSION
+      - docs/TUTORIAL.md
+      - docs/GOALS-1.0.md
+      - site/**
+      - .github/workflows/pages.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One deployment at a time; a newer push waits rather than cancelling one half done.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: [self-hosted, fly]
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+
+      - name: Test the builder
+        run: python3 -I site/test_build.py
+
+      - name: Build (GitHub's Markdown API renders each page)
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 -I site/build.py "$RUNNER_TEMP/site"
+
+      - uses: actions/upload-pages-artifact@7b1f4a764d45c48632c6b24a0339c27f5614fb0b # v4.0.0
+        with:
+          path: ${{ runner.temp }}/site
+
+  deploy:
+    needs: build
+    runs-on: [self-hosted, fly]
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4.0.5
