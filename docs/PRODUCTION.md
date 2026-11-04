@@ -180,6 +180,8 @@ can see what the gateway is doing.
   - session reconnects.
 - **Several gateways:** a README section and a test with two gateways on one cluster. It covers
   the sessions each takes against `clients_max`, and eviction (`src/config.zig:222`).
+- **Error codes on the wire.** Every error reply gains `"code"` from `docs/ERRORS.md` (P147c); body too large
+  becomes 413, and "not yet committed" one status on every route.
 - **Conservation as a metric.** Each replica emits each ledger's conserved sum and its view hash,
   so an operator can alert on a break without reading views.
 
@@ -222,6 +224,9 @@ to the same view hashes.
 - **`nerva backup` and `nerva restore`:** an export with a manifest of the op, the SHA-256 and every
   view hash, and a restore that checks the manifest before opening.
 - **`test:release`** gains a restore and a recover.
+- **Coded operator diagnostics.** Every `nerva` command prints `error[NRV-E…]` with a cause and a fix
+  (`docs/ERRORS.md`). The panics on operator input (another release's data file, #95; a missing or
+  damaged file; a held lock) become refusals.
 
 **Demo script:**
 
