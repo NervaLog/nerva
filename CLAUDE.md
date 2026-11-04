@@ -195,8 +195,8 @@ You are not done until:
 2. `./zig/zig build test:fmt` passes.
 3. Cleanup pass: no dead code, no stray `TODO` without a reason, assertions on new invariants.
 4. README.md / UPSTREAM.md updated if behaviour, design or vendored code changed, and README's
-   Production table and the site's data (`site/index.html`: `SITE`, `GOALS`, `PRODUCTION`) if a
-   status changed.
+   Production table and the site's data (`index.html` in `NervaLog/nervalog.github.io`: `SITE`,
+   `GOALS`, `PRODUCTION`) if a status changed.
 5. `worklog/<number>.md` exists for the change, and any decision you took is in `docs/decisions/`.
 6. The pull request description carries the three statements above.
 7. You ran [REVIEW.md](./REVIEW.md) on your own diff, and the description says which of its items
@@ -255,12 +255,14 @@ work done.
 
 ## README and site status (adopted from Zigbox, P147)
 
-- README's Production table and the site (`site/index.html`, the `SITE`, `GOALS`, `PRODUCTION`,
-  `NEXT` and `RELEASES` data at the top of its script) show the same status. Update both in the
-  same push that changes a status. Never mark anything delivered before its demo is green in CI;
-  never show output that was not recorded as recorded.
-- Pages deploys only from `main`. A commit that only records status (README and `site/` after a
-  CI result) carries `[skip ci]`; never use it on a commit that changes code, tests or CI.
+- The site is its own repository, `NervaLog/nervalog.github.io` (P148): `index.html`, served by
+  GitHub Pages from that repository's `main` at <https://nervalog.github.io/>. README's
+  Production table and the site (the `SITE`, `GOALS`, `PRODUCTION`, `NEXT` and `RELEASES` data
+  at the top of its script) show the same status: change the site in the same session that
+  changes a status here. Never mark anything delivered before its demo is green in CI; never show
+  output that was not recorded as recorded.
+- A commit here that only records status (README after a CI result) carries `[skip ci]`; never use
+  it on a commit that changes code, tests or CI.
 
 ## Disk (adopted from Zigbox, P147)
 
