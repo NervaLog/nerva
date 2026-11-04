@@ -8,7 +8,8 @@
 # `run_minutes_max`. A failing seed replays exactly, so the job prints the seed and the command to
 # replay it, writes them to the job summary, and fails. A run that hits the cap is reported as a
 # warning, not a failure: some fuzzers' default sizes are long. Writes nothing outside its own
-# log directory.
+# log directory, `$RUNNER_TEMP/fuzz-loop-<kind>-<name>/`: a log per seed, and on a failure
+# `failure.md` (the seed, the replay command and the log's tail), which fuzz.yml files as an issue.
 set -euo pipefail
 
 kind="$1"
@@ -63,7 +64,8 @@ while (( $(date +%s) < deadline )); do
       echo '```'
       tail -n 30 "$log"
       echo '```'
-    } >> "$summary"
+    } > "$logs/failure.md"
+    cat "$logs/failure.md" >> "$summary"
     # One failing seed is the finding: stop, so the job's time goes to other fuzzers.
     break
   fi

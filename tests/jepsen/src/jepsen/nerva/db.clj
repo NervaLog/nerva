@@ -19,6 +19,7 @@
 (def api-log (str dir "/api.log"))
 (def replica-pidfile (str dir "/replica.pid"))
 (def api-pidfile (str dir "/api.pid"))
+(def cluster-key-file (str dir "/cluster.key"))
 
 (def cluster
   "The cluster id (0 is reserved for testing)."
@@ -26,9 +27,26 @@
 
 (def replica-port 3000)
 
+(def cluster-key-bytes-min
+  "P102: a cluster key has at least 32 bytes."
+  32)
+
+(defn random-cluster-key
+  "64 hex digits from a SecureRandom: 32 random bytes."
+  []
+  (let [bytes (byte-array 32)]
+    (.nextBytes (java.security.SecureRandom.) bytes)
+    (apply str (map #(format "%02x" %) bytes))))
+
 (def cluster-key
-  "The key replicas authenticate each other with (P102): at least 32 bytes."
-  "jepsen-cluster-key-0123456789abcdefghij")
+  "The key replicas authenticate each other with (P102): $NERVA_CLUSTER_KEY on the control node
+  (jepsen.yml sets a fresh one per run), else a fresh random one for this process. Never a
+  constant, so a suite run never uses a key that anything else knows."
+  (delay
+    (let [key (or (not-empty (System/getenv "NERVA_CLUSTER_KEY")) (random-cluster-key))]
+      (assert (<= cluster-key-bytes-min (count (.getBytes ^String key "UTF-8")))
+              (str "NERVA_CLUSTER_KEY needs at least " cluster-key-bytes-min " bytes"))
+      key)))
 
 (def healthy-timeout-s
   "How long a fresh cluster may take until every gateway has a session."
@@ -56,7 +74,9 @@
                      :pidfile           replica-pidfile
                      :chdir             dir
                      :match-executable? false
-                     :env               {:NERVA_CLUSTER_KEY cluster-key}}
+                     ;; Read from the node's key file by the shell that starts the replica:
+                     ;; start-daemon! writes its env into the log, and P102's key is never logged.
+                     :env               (str "NERVA_CLUSTER_KEY=\"$(cat " cluster-key-file ")\"")}
                     binary :start (str "--addresses=" (addresses test)) :--development
                     data-file))
 
@@ -88,6 +108,9 @@
         (c/exec :mkdir :-p dir)
         (c/upload (:nerva-binary test) binary)
         (c/exec :chmod "+x" binary)
+        ;; Over stdin, so the key is in no command line.
+        (cu/write-file! @cluster-key cluster-key-file)
+        (c/exec :chmod "600" cluster-key-file)
         (c/exec binary :format (str "--cluster=" cluster)
                 (str "--replica=" (replica-index test node))
                 (str "--replica-count=" (count (:nodes test)))

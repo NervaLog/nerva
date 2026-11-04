@@ -148,11 +148,21 @@ publishes binaries for Linux and macOS (x86_64, aarch64) as GitHub release `v<VE
 notes; releasing a version twice, or without notes, fails. Each release also carries its bill of
 materials, `nerva-v<VERSION>.cdx.json` (CycloneDX 1.5, N63): Nerva, the vendored TigerBeetle
 commit, and the Zig standard library and compiler, read from the repository's pins and covered
-by `SHA256SUMS`. A separate workflow,
-`fuzz.yml`, runs every fuzzer and the VOPR on random seeds for a time budget; it is started by hand
-on runners brought up for it. [tests/jepsen](./tests/jepsen/README.md) is a Jepsen suite: five
-real nodes, clients through `nerva api`, kills, pauses and partitions, and a history checked
-against what Nerva promises (a declared ledger's conservation, so far); it runs by hand (N82).
+by `SHA256SUMS`. Two more workflows run every
+night on `main` and by hand at any commit (P106). `fuzz.yml` (01:17 UTC) runs every fuzzer and the
+VOPR on random seeds for 60 minutes a job (by hand: `minutes`, up to 300). `jepsen.yml` (03:23 UTC)
+runs [tests/jepsen](./tests/jepsen/README.md), a Jepsen suite: five real nodes, clients through
+`nerva api`, kills, pauses and partitions, and a history checked against what Nerva promises (a
+declared ledger's conservation, so far), one test per nemesis against a ReleaseSafe build, with
+a fresh random cluster key per run; its `store/` is the run's `jepsen-store` artifact. A failure
+files one issue labelled `fuzz` or `jepsen` (the run, the commit, and the failing seed's replay
+command or the history's path and the checker's output); while it is open, later failures add
+comments to it. Before a release, the review (P105) runs both at the candidate:
+
+```bash
+gh workflow run fuzz.yml -f candidate=<sha> -f minutes=120
+gh workflow run jepsen.yml -f candidate=<sha> -f time-limit=600 -f nemesis="kill pause partition"
+```
 
 Binaries report `<protocol>+<commit>`. The protocol release (`0.0.5` since data files record
 the export they were imported from, P90) is what data files and clients check: a replica refuses

@@ -40,7 +40,7 @@ the VOPR simulator are vendored from TigerBeetle; Nerva's own code is `src/nerva
 ./zig/zig build test:views    # declared views against a model; maintained views against nerva view (~2 min)
 ./zig/zig build test:release  # two releases: the odd replica is ignored; export, import (~2.5 min)
 ./zig/zig build test:demo     # seat and canvas demos (3 replicas each) under crashes (~3 min)
-tests/jepsen/run.sh zig-out/bin/nerva test --nemesis kill,partition  # Jepsen (Docker, JDK, lein)
+tests/jepsen/run.sh zig-out/bin/nerva test --nemesis kill,partition  # Jepsen (Docker, JDK, lein; nightly: jepsen.yml)
 ./zig/zig build               # zig-out/bin/nerva
 ./zig/zig fmt src build.zig
 ```
@@ -64,7 +64,17 @@ violations (determinism, `commit` doing IO, unbounded queues, renumbered identif
 committed ops), and runs VOPR seeds, the fuzzers and the release, integration and Jepsen suites
 against it. Each finding is a GitHub issue labelled `release-review`. The release waits until
 every blocker is fixed or the owner waives it in writing, and the CHANGELOG section links the
-review's issues.
+review's issues. The long fuzzers and Jepsen run nightly on `main` (P106); the review dispatches
+both at the candidate commit and waits for them (`gh workflow run` with `-f`, or the Actions tab;
+`gh` takes the workflow's ref with `--ref`, and the candidate as an input):
+
+```bash
+gh workflow run fuzz.yml -f candidate=<sha> -f minutes=120
+gh workflow run jepsen.yml -f candidate=<sha> -f time-limit=600 -f nemesis="kill pause partition kill,partition"
+```
+
+A failure files (or comments on) an issue labelled `fuzz` or `jepsen`; one at the candidate is a
+release blocker like any `release-review` finding.
 
 ## Vendored code
 

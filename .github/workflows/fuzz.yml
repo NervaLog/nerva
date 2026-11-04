@@ -1,13 +1,24 @@
-# Long fuzzing (N59): every fuzzer and the VOPR on random seeds for a time budget, by hand only.
-# Smoke (ci.yml) runs each fuzzer once at a fixed seed: a regression check. This searches. Start
-# Fly runners (Botpike/ci-runners) for the run, dispatch it, and stop them afterwards: every job
-# below runs at once if there are enough runners, else they queue.
-# A failure prints its seed and the command that replays it exactly, in the job log and summary.
+# Long fuzzing (N59, amended by P106): every fuzzer and the VOPR on random seeds for a time
+# budget, every night and by hand. Smoke (ci.yml) runs each fuzzer once at a fixed seed: a
+# regression check. This searches. Every job below runs at once if there are enough Fly runners
+# (Botpike/ci-runners), else they queue; the night runs at 01:17 UTC, well clear of perf-nightly
+# (06:47 UTC), which shares the pool: 23 jobs of 60 minutes plus a build each, about 25
+# runner-hours a night.
+# A failure prints its seed and the command that replays it exactly, in the job log and summary,
+# and the `report` job files it as one issue labelled `fuzz` (or comments on the one still open).
+# The release review (P105) dispatches it at a release candidate: `candidate` is the commit or
+# branch fuzzed; the scripts come from the ref the workflow runs on.
 name: Fuzz (long)
 
 on:
+  schedule:
+    - cron: '17 1 * * *'
   workflow_dispatch:
     inputs:
+      candidate:
+        description: "Commit, branch or tag to fuzz"
+        required: true
+        default: "main"
       minutes:
         description: "Minutes each job searches (at most 300; jobs time out at 330)"
         required: true
@@ -16,8 +27,34 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: fuzz-long-${{ inputs.candidate || 'main' }}
+  cancel-in-progress: false
+
+env:
+  CANDIDATE: ${{ inputs.candidate || 'main' }}
+  # The nightly budget; by hand, whatever `minutes` says.
+  MINUTES: ${{ inputs.minutes || '60' }}
+
 jobs:
+  # One commit for the whole night: jobs queue for runners, and main may move meanwhile.
+  commit:
+    runs-on: [self-hosted, fly]
+    timeout-minutes: 10
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+    steps:
+      - name: Resolve the candidate
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sha=$(gh api "repos/$GITHUB_REPOSITORY/commits/$CANDIDATE" --jq .sha)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "Fuzzing \`$sha\` (\`$CANDIDATE\`) for $MINUTES minutes a job" >> "$GITHUB_STEP_SUMMARY"
+
   fuzz:
+    needs: commit
     runs-on: [self-hosted, fly]
     timeout-minutes: 330
     strategy:
@@ -44,18 +81,34 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
+          ref: ${{ needs.commit.outputs.sha }}
+          persist-credentials: false
+
+      - name: The scripts, from the workflow's own ref
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          path: .ci
+          sparse-checkout: .github/scripts
           persist-credentials: false
 
       - name: Install the pinned Zig
         run: ./zig/download.sh
 
       - name: Fuzz ${{ matrix.fuzzer }} on random seeds
-        env:
-          MINUTES: ${{ inputs.minutes }}
         run: |
-          .github/scripts/fuzz_loop.sh fuzz '${{ matrix.fuzzer }}' "$(( MINUTES > 300 ? 300 : MINUTES ))"
+          .ci/.github/scripts/fuzz_loop.sh fuzz '${{ matrix.fuzzer }}' "$(( MINUTES > 300 ? 300 : MINUTES ))"
+
+      - name: Keep the failing seed for the report
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: failure-fuzz-${{ matrix.fuzzer }}
+          path: ${{ runner.temp }}/fuzz-loop-fuzz-${{ matrix.fuzzer }}/failure.md
+          if-no-files-found: ignore
+          retention-days: 30
 
   vopr:
+    needs: commit
     runs-on: [self-hosted, fly]
     timeout-minutes: 330
     strategy:
@@ -74,13 +127,78 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
+          ref: ${{ needs.commit.outputs.sha }}
+          persist-credentials: false
+
+      - name: The scripts, from the workflow's own ref
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          path: .ci
+          sparse-checkout: .github/scripts
           persist-credentials: false
 
       - name: Install the pinned Zig
         run: ./zig/download.sh
 
       - name: VOPR (${{ matrix.state_machine }}, lane ${{ matrix.lane }}) on random seeds
-        env:
-          MINUTES: ${{ inputs.minutes }}
         run: |
-          .github/scripts/fuzz_loop.sh vopr '${{ matrix.state_machine }}' "$(( MINUTES > 300 ? 300 : MINUTES ))"
+          .ci/.github/scripts/fuzz_loop.sh vopr '${{ matrix.state_machine }}' "$(( MINUTES > 300 ? 300 : MINUTES ))"
+
+      - name: Keep the failing seed for the report
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: failure-vopr-${{ matrix.state_machine }}-${{ matrix.lane }}
+          path: ${{ runner.temp }}/fuzz-loop-vopr-${{ matrix.state_machine }}/failure.md
+          if-no-files-found: ignore
+          retention-days: 30
+
+  # Any failed or timed-out job files one issue (or comments on the open one): the run, the
+  # commit, and each failing seed with its replay command. A job that failed before any seed (a
+  # build, a lost runner) is named without one: its log says why.
+  report:
+    needs: [commit, fuzz, vopr]
+    if: ${{ !cancelled() && (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')) }}
+    runs-on: [self-hosted, fly]
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+
+      - name: The failing seeds
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: failure-*
+          path: ${{ runner.temp }}/failures
+
+      - name: File or update the fuzz issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ needs.commit.outputs.sha }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          body="$RUNNER_TEMP/issue.md"
+          {
+            echo "Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID ($EVENT, attempt $GITHUB_RUN_ATTEMPT)"
+            echo "Commit: $SHA (\`$CANDIDATE\`), $MINUTES minutes a job"
+            echo
+            echo "Replay a seed at that commit (\`git checkout $SHA\`) with its command below."
+            echo
+            found=0
+            for f in "$RUNNER_TEMP"/failures/*/failure.md; do
+              [ -f "$f" ] || continue
+              found=1
+              cat "$f"
+              echo
+            done
+            if [ "$found" = 0 ]; then
+              echo "No job recorded a failing seed: a job failed before searching (a build, a lost"
+              echo "runner) or ran past its timeout. See the run's failed jobs."
+            fi
+          } > "$body"
+          .github/scripts/file_issue.sh fuzz "Long fuzzing found a failure" "$body"

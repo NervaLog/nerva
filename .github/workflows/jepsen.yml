@@ -1,0 +1,283 @@
+# Jepsen (N82, amended by P106): the suite in tests/jepsen/ against a ReleaseSafe `nerva`, every
+# night at 03:23 UTC (after the long fuzzing, before perf-nightly at 06:47: the Fly runner pool is
+# shared) and by hand. One test per nemesis spec, one after another on one runner, five Docker
+# containers each (run.sh). Results (`store/`) are an artifact; a failure files one issue
+# labelled `jepsen` (or comments on the one still open).
+# The release review (P105) dispatches it at a release candidate: `candidate` is the commit or
+# branch whose `nerva` is tested; the suite and the scripts come from the ref the workflow runs on.
+name: Jepsen
+
+on:
+  schedule:
+    - cron: '23 3 * * *'
+  workflow_dispatch:
+    inputs:
+      candidate:
+        description: "Commit, branch or tag whose nerva is tested"
+        required: true
+        default: "main"
+      time-limit:
+        description: "Seconds of requests and faults per test (60 to 2400)"
+        required: true
+        default: "600"
+      nemesis:
+        description: "Space-separated tests, each a comma-separated fault set (kill, pause, partition)"
+        required: true
+        default: "kill pause partition"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: jepsen-${{ inputs.candidate || 'main' }}
+  cancel-in-progress: false
+
+env:
+  CANDIDATE: ${{ inputs.candidate || 'main' }}
+  TIME_LIMIT: ${{ inputs.time-limit || '600' }}
+  NEMESES: ${{ inputs.nemesis || 'kill pause partition' }}
+  # Pinned tools, checked against these SHA-256 sums before use. Temurin's from
+  # api.adoptium.net; Leiningen's computed from its GitHub release.
+  JDK_VERSION: "21.0.12.1+1"
+  JDK_SHA256_X64: ce79869e1307ed8ee1e2baa86a412b1eb5b75d10a01006d788a6f968bcfaee94
+  JDK_SHA256_AARCH64: 23e37e026f12f3e706f18938ff611db3032d075b09d0879a25d06718c773e223
+  LEIN_VERSION: "2.12.0"
+  LEIN_SCRIPT_SHA256: f8e1266c0c78c08bd4af6e111889ecc316c9dd56d1e8645bbee6c1703d351bc3
+  LEIN_JAR_SHA256: b721a573af631784f27ccb52e719e6d1287d9d3951ad56d316d38f7ecfa81aa2
+
+jobs:
+  jepsen:
+    runs-on: [self-hosted, fly]
+    # At most 9000 s of tests (checked below), plus setup, checking and the build.
+    timeout-minutes: 210
+    outputs:
+      sha: ${{ steps.commit.outputs.sha }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+
+      - name: Check the inputs
+        run: |
+          if ! [[ "$TIME_LIMIT" =~ ^[0-9]+$ ]] || (( TIME_LIMIT < 60 || TIME_LIMIT > 2400 )); then
+            echo "::error::time-limit must be 60 to 2400 seconds, not '$TIME_LIMIT'"
+            exit 1
+          fi
+          read -r -a specs <<< "$NEMESES"
+          (( ${#specs[@]} >= 1 )) || { echo "::error::no nemesis given"; exit 1; }
+          for spec in "${specs[@]}"; do
+            [[ "$spec" =~ ^(kill|pause|partition)(,(kill|pause|partition))*$ ]] \
+              || { echo "::error::nemesis '$spec' is not a comma-separated set of kill, pause, partition"; exit 1; }
+          done
+          (( ${#specs[@]} * TIME_LIMIT <= 9000 )) \
+            || { echo "::error::${#specs[@]} tests of $TIME_LIMIT s exceed the job's 9000 s"; exit 1; }
+
+      - name: Resolve the candidate
+        id: commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sha=$(gh api "repos/$GITHUB_REPOSITORY/commits/$CANDIDATE" --jq .sha)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "Jepsen at \`$sha\` (\`$CANDIDATE\`): \`$NEMESES\`, $TIME_LIMIT s each" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ steps.commit.outputs.sha }}
+          path: candidate
+          persist-credentials: false
+
+      - name: Build nerva (ReleaseSafe)
+        working-directory: candidate
+        run: |
+          ./zig/download.sh
+          ./zig/zig build -Drelease
+
+      - name: Install the JDK and Leiningen
+        run: |
+          tools="$RUNNER_TEMP/jepsen-tools"
+          mkdir -p "$tools"
+          case "$(uname -m)" in
+            x86_64) arch=x64; sum="$JDK_SHA256_X64" ;;
+            aarch64) arch=aarch64; sum="$JDK_SHA256_AARCH64" ;;
+            *) echo "::error::no pinned JDK for $(uname -m)"; exit 1 ;;
+          esac
+          tag="jdk-${JDK_VERSION/+/%2B}"
+          file="OpenJDK21U-jdk_${arch}_linux_hotspot_${JDK_VERSION/+/_}.tar.gz"
+          curl -fsSL --retry 3 -o "$tools/jdk.tar.gz" \
+            "https://github.com/adoptium/temurin21-binaries/releases/download/$tag/$file"
+          echo "$sum  $tools/jdk.tar.gz" | sha256sum -c -
+          mkdir -p "$tools/jdk"
+          tar -xzf "$tools/jdk.tar.gz" -C "$tools/jdk" --strip-components=1
+          curl -fsSL --retry 3 -o "$tools/lein" \
+            "https://raw.githubusercontent.com/technomancy/leiningen/$LEIN_VERSION/bin/lein"
+          echo "$LEIN_SCRIPT_SHA256  $tools/lein" | sha256sum -c -
+          curl -fsSL --retry 3 -o "$tools/leiningen-standalone.jar" \
+            "https://github.com/technomancy/leiningen/releases/download/$LEIN_VERSION/leiningen-$LEIN_VERSION-standalone.jar"
+          echo "$LEIN_JAR_SHA256  $tools/leiningen-standalone.jar" | sha256sum -c -
+          chmod +x "$tools/lein"
+          echo "JAVA_HOME=$tools/jdk" >> "$GITHUB_ENV"
+          echo "LEIN_JAR=$tools/leiningen-standalone.jar" >> "$GITHUB_ENV"
+          echo "$tools/jdk/bin" >> "$GITHUB_PATH"
+          echo "$tools" >> "$GITHUB_PATH"
+
+      # Jobs run as `runner`, with sudo: Docker is used directly if `runner` may, else through
+      # sudo (a `docker` on PATH that calls it), and started if it is not running. run.sh needs
+      # ssh-keygen for the nodes' key (Jepsen's SSH client is in the JVM), and Jepsen's perf
+      # checker gnuplot: without it the graphs, and so the whole result, are `:unknown`.
+      - name: Docker, ssh-keygen and gnuplot
+        run: |
+          missing=()
+          command -v ssh-keygen > /dev/null || missing+=(openssh-client)
+          command -v gnuplot > /dev/null || missing+=(gnuplot-nox)
+          if (( ${#missing[@]} )); then
+            sudo -n apt-get update -q
+            sudo -n apt-get install -y -q --no-install-recommends "${missing[@]}"
+          fi
+          if ! docker info > /dev/null 2>&1; then
+            if ! sudo -n docker info > /dev/null 2>&1; then
+              # shellcheck disable=SC2024 # the log is the runner's, not root's
+              sudo -n systemctl start docker 2> /dev/null || (sudo -n dockerd > "$RUNNER_TEMP/dockerd.log" 2>&1 &)
+              for _ in $(seq 1 30); do sudo -n docker info > /dev/null 2>&1 && break; sleep 1; done
+            fi
+            shim="$RUNNER_TEMP/docker-shim"
+            mkdir -p "$shim"
+            printf '#!/bin/sh\nexec sudo -n %s "$@"\n' "$(command -v docker)" > "$shim/docker"
+            chmod +x "$shim/docker"
+            echo "$shim" >> "$GITHUB_PATH"
+            PATH="$shim:$PATH"
+          fi
+          docker info --format 'Docker {{.ServerVersion}}, {{.NCPU}} CPUs, {{.MemTotal}} bytes'
+          free -m
+
+      - name: Fetch the suite's dependencies
+        working-directory: tests/jepsen
+        run: lein deps
+
+      # A fresh cluster key for this run (P102), never a secret: nothing else ever knows it.
+      # Every test runs even if one fails; each failure is written for the report.
+      - name: Run Jepsen
+        run: |
+          NERVA_CLUSTER_KEY=$(openssl rand -hex 32)
+          echo "::add-mask::$NERVA_CLUSTER_KEY"
+          export NERVA_CLUSTER_KEY
+          failures="$RUNNER_TEMP/jepsen-failures"
+          mkdir -p "$failures"
+          read -r -a specs <<< "$NEMESES"
+          failed=0
+          for spec in "${specs[@]}"; do
+            echo "::group::Jepsen bank, nemesis $spec, $TIME_LIMIT s"
+            before=$(readlink -f tests/jepsen/store/latest 2> /dev/null || true)
+            status=0
+            tests/jepsen/run.sh candidate/zig-out/bin/nerva test --workload bank \
+              --nemesis "$spec" --time-limit "$TIME_LIMIT" || status=$?
+            echo "::endgroup::"
+            # Jepsen exits 0 valid, 1 invalid, 2 unknown, 255 on a crash. `latest` is this test's
+            # directory if it moved: a test that crashed before starting made none.
+            run_dir=$(readlink -f tests/jepsen/store/latest 2> /dev/null || true)
+            [[ "$run_dir" != "$before" ]] || run_dir=
+            if (( status == 0 )); then
+              echo "Jepsen \`$spec\`: valid" >> "$GITHUB_STEP_SUMMARY"
+              continue
+            fi
+            failed=1
+            echo "::error::Jepsen nemesis $spec exited $status (0 valid, 1 invalid, 2 unknown, 255 crash)"
+            report="$failures/$(echo "$spec" | tr ',' '-').md"
+            {
+              echo "### ❌ Jepsen \`bank\`, nemesis \`$spec\`: exit $status"
+              echo
+              echo "Exit 1 is an invalid history, 2 an unknown one, anything else a crash of the test."
+              if (( status == 137 )); then
+                echo "Exit 137 is SIGKILL: on a runner, usually the kernel's OOM killer (five replicas"
+                echo "take about 1.3 GiB each, the JVM up to 4 GiB)."
+              fi
+              if [[ -n "$run_dir" && -d "$run_dir" ]]; then
+                rel="store/${run_dir#*/tests/jepsen/store/}"
+                echo "History: \`$rel/history.txt\` (and \`history.edn\`) in the run's \`jepsen-store\` artifact"
+                echo
+                echo "Checker output (\`$rel/results.edn\`):"
+                echo
+                echo '```clojure'
+                head -c 20000 "$run_dir/results.edn" 2> /dev/null || echo "(no results.edn: the test did not finish)"
+                echo
+                echo '```'
+              else
+                echo "No store directory: the test failed before it started (see the job log)."
+              fi
+            } > "$report"
+            cat "$report" >> "$GITHUB_STEP_SUMMARY"
+          done
+          exit "$failed"
+
+      - name: Pack Jepsen's store
+        if: always()
+        run: |
+          if [ -d tests/jepsen/store ]; then
+            tar -czf "$RUNNER_TEMP/jepsen-store.tar.gz" -C tests/jepsen store
+          fi
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: jepsen-store
+          path: ${{ runner.temp }}/jepsen-store.tar.gz
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: failure()
+        with:
+          name: jepsen-failures
+          path: ${{ runner.temp }}/jepsen-failures/
+          if-no-files-found: ignore
+          retention-days: 30
+
+  # A failed or timed-out run files one issue (or comments on the open one): the run, the commit,
+  # and per failing test the history's path in the artifact and the checker's output.
+  report:
+    needs: jepsen
+    if: ${{ !cancelled() && (needs.jepsen.result == 'failure' || needs.jepsen.result == 'cancelled') }}
+    runs-on: [self-hosted, fly]
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: jepsen-failures
+          path: ${{ runner.temp }}/jepsen-failures
+        continue-on-error: true
+
+      - name: File or update the Jepsen issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ needs.jepsen.outputs.sha }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          body="$RUNNER_TEMP/issue.md"
+          {
+            echo "Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID ($EVENT, attempt $GITHUB_RUN_ATTEMPT)"
+            echo "Commit: ${SHA:-unresolved} (\`$CANDIDATE\`); nemeses \`$NEMESES\`, $TIME_LIMIT s each"
+            echo
+            echo "A Jepsen run has no seed (tests/jepsen/README.md): reproduce a failure as a VOPR seed or"
+            echo "a unit test before fixing it. The run's \`jepsen-store\` artifact holds every history."
+            echo
+            found=0
+            for f in "$RUNNER_TEMP"/jepsen-failures/*.md; do
+              [ -f "$f" ] || continue
+              found=1
+              cat "$f"
+              echo
+            done
+            if [ "$found" = 0 ]; then
+              echo "No test recorded a result: the job failed before Jepsen ran (the build, the tools,"
+              echo "Docker, a lost runner) or ran past its timeout. See the run's log."
+            fi
+          } > "$body"
+          .github/scripts/file_issue.sh jepsen "Jepsen found a failure" "$body"
