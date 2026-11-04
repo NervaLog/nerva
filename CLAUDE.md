@@ -250,8 +250,17 @@ work done.
   read only the failing lines.
 - **Delegate lookups** (searching the vendored TigerBeetle code, the Zig std) to a read-only agent
   and keep only the answer.
-- **Purely mechanical work goes to a smaller model** (threading an argument through call sites, a
-  rename, a status update, a CI tweak), given the exact pattern; whoever delegated checks its diff.
+- **The cheapest model suited to the task** (owner, P148b). Name the model whenever you start an
+  agent or session; never let it inherit one by default.
+  - **Haiku:** mechanical work fully specified by a pattern (threading an argument through call
+    sites, a rename, a status update, a CI tweak) and read-only lookups.
+  - **Sonnet:** implementing a slice, its tests, and fixing a review finding.
+  - **Opus:** design, briefs, adversarial and release review, and a judgment the cheaper model got
+    wrong.
+
+  Whoever delegated checks the diff.
+- **One agent per new task.** Every slice, fix, lookup or review gets a fresh agent; a finished
+  one is never resumed for the next task.
 
 ## README and site status (adopted from Zigbox, P147)
 
