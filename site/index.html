@@ -1,0 +1,394 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="description" content="Nerva: a research database where derived state (indexes, views, change feeds, history, conserved ledgers) is declared and maintained from one ordered, replicated log.">
+<title>Nerva</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Familjen+Grotesk:wght@500;700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+/* Design copied from the Zigbox and Zigcube sites (zigbox.github.io), recoloured emerald for Nerva. */
+:root{color-scheme:light;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+img{max-width:100%}[hidden]{display:none!important}
+/* Layout: a narrow reading column with a wide terminal band; the log's position (op) is the visual motif. */
+:root{
+  --bg:#f3f7f5; --surface:#ffffff; --fg:#111b17; --muted:#52645b; --line:#d6e3dc;
+  --accent:#047857; --accent-soft:#d1fae5; --term:#0a1914; --term-fg:#e0eee7; --term-dim:#86a395; --term-accent:#34d399;
+  --ok:#047857; --wip:#b45309; --plan:#7d8a83;
+  --display:"Familjen Grotesk", "Helvetica Neue", Arial, sans-serif;
+  --body:"IBM Plex Sans", "Helvetica Neue", Arial, sans-serif;
+  --mono:"IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){
+  --bg:#07110d; --surface:#0d1b15; --fg:#e0eee7; --muted:#93ab9f; --line:#1d3229;
+  --accent:#34d399; --accent-soft:#0f3a2a; --term:#030a07; --term-fg:#e0eee7; --term-dim:#7d978a; --term-accent:#34d399;
+  --ok:#34d399; --wip:#fbbf24; --plan:#8a978f; color-scheme:dark}}
+:root[data-theme="dark"]{
+  --bg:#07110d; --surface:#0d1b15; --fg:#e0eee7; --muted:#93ab9f; --line:#1d3229;
+  --accent:#34d399; --accent-soft:#0f3a2a; --term:#030a07; --term-fg:#e0eee7; --term-dim:#7d978a; --term-accent:#34d399;
+  --ok:#34d399; --wip:#fbbf24; --plan:#8a978f; color-scheme:dark}
+*{box-sizing:border-box}
+body{background:var(--bg);color:var(--fg);font-family:var(--body);font-size:16px;line-height:1.6;margin:0}
+body::before{content:"";position:fixed;inset:0 0 auto;height:env(safe-area-inset-top,0px);z-index:10;background:var(--bg)}
+.wrap{max-width:1040px;margin:0 auto;padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px))}
+a{color:var(--accent)} a:focus-visible,button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+h1,h2,h3{font-family:var(--display);text-wrap:balance;line-height:1.15;margin:0}
+h2{font-size:1.75rem} h3{font-size:1.15rem}
+code{font-family:var(--mono);font-size:.9em}
+.eyebrow{font-family:var(--mono);font-size:.75rem;letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}
+header.top{position:sticky;top:env(safe-area-inset-top,0px);z-index:5;background:var(--bg);border-bottom:1px solid var(--line)}
+header.top .wrap{display:flex;align-items:center;gap:20px;padding-block:12px;flex-wrap:wrap}
+.brand{font-family:var(--display);font-weight:700;font-size:1.2rem;color:var(--fg);text-decoration:none;display:flex;gap:8px;align-items:center}
+/* The mark: a log, three entries appended in order, the newest one lit. */
+.brand .mark{width:20px;height:20px;border:2px solid var(--accent);border-radius:3px;position:relative}
+.brand .mark::after{content:"";position:absolute;left:3px;right:3px;top:3px;height:2px;background:var(--accent);box-shadow:0 4px 0 var(--accent),0 8px 0 var(--accent);opacity:.9}
+nav{display:flex;gap:16px;flex-wrap:wrap;margin-left:auto;font-size:.9rem}
+nav a{color:var(--muted);text-decoration:none} nav a:hover{color:var(--fg)}
+.pill{display:inline-flex;align-items:center;gap:6px;font-family:var(--mono);font-size:.72rem;padding:2px 8px;border-radius:999px;border:1px solid currentColor;white-space:nowrap}
+.pill::before{content:"";width:6px;height:6px;border-radius:50%;background:currentColor}
+.s-done{color:var(--ok)} .s-wip{color:var(--wip)} .s-plan{color:var(--plan)}
+.hero{padding-block:56px 40px;display:grid;grid-template-columns:1.05fr 1fr;gap:40px;align-items:center}
+.hero>*{min-width:0}
+.hero h1{font-size:clamp(2.2rem,5vw,3.4rem);letter-spacing:-.01em}
+.hero p.lede{font-size:1.15rem;color:var(--muted);max-width:36ch;margin:16px 0 20px}
+.hero .note{font-size:.88rem;color:var(--muted);margin:16px 0 0;max-width:44ch}
+.cta{display:flex;gap:12px;flex-wrap:wrap;align-items:center}
+.btn{font:500 .95rem var(--body);padding:10px 16px;border-radius:6px;border:1px solid var(--line);background:var(--surface);color:var(--fg);text-decoration:none;cursor:pointer}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:var(--bg)}
+.term{background:var(--term);color:var(--term-fg);border-radius:10px;font:14px/1.55 var(--mono);overflow-x:auto}
+.term .bar{display:flex;justify-content:space-between;gap:12px;padding:8px 14px;border-bottom:1px solid #ffffff14;color:var(--term-dim);font-size:.75rem}
+.term pre{margin:0;padding:14px 16px;white-space:pre;min-height:3em}
+.term .p{color:var(--term-accent)} .term .d{color:var(--term-dim)}
+.rec{font-size:.7rem;color:var(--term-accent);border:1px solid var(--term-accent);border-radius:4px;padding:0 6px;text-decoration:none;white-space:nowrap} .rec:hover,.rec:focus-visible{background:#ffffff14}
+.planned{font-size:.7rem;color:var(--term-dim);border:1px dashed var(--term-dim);border-radius:4px;padding:0 6px;white-space:nowrap}
+section{padding-block:48px;border-top:1px solid var(--line)}
+.sec-head{display:flex;justify-content:space-between;align-items:end;gap:16px;flex-wrap:wrap;margin-bottom:24px}
+.sec-head p{color:var(--muted);margin:6px 0 0;max-width:62ch}
+.principles{display:grid;grid-template-columns:repeat(3,1fr);gap:28px 32px}
+.principles div{min-width:0}
+.principles h3{margin-bottom:6px}
+.principles p{margin:0;color:var(--muted);font-size:.95rem}
+.progress{display:flex;gap:4px;margin-bottom:20px}
+.progress span{flex:1;height:6px;border-radius:2px;background:var(--line)}
+.progress span.done{background:var(--ok)} .progress span.wip{background:var(--wip)}
+.ms{display:grid;grid-template-columns:260px 1fr;gap:24px;border:1px solid var(--line);border-radius:10px;background:var(--surface);padding:0;margin-bottom:14px;overflow:hidden}
+.ms>*{min-width:0}
+.ms .meta{padding:18px 20px;display:flex;flex-direction:column;gap:8px}
+.ms .meta .pill{align-self:flex-start}
+.ms .code{font-family:var(--mono);color:var(--accent);font-size:.85rem}
+.ms .meta p{margin:0;color:var(--muted);font-size:.92rem}
+.ms .meta .slices{font-family:var(--mono);font-size:.75rem;color:var(--muted)}
+.ms .meta .slices b{color:var(--ok);font-weight:600}
+.ms .term{border-radius:0}
+.docs{display:grid;grid-template-columns:repeat(2,1fr);gap:16px}
+.doc{border:1px solid var(--line);border-radius:10px;padding:18px 20px;background:var(--surface);display:flex;flex-direction:column;gap:6px;min-width:0}
+.doc p{margin:0;color:var(--muted);font-size:.93rem}
+.doc .when{font-family:var(--mono);font-size:.75rem;color:var(--muted)}
+.facts{display:grid;grid-template-columns:repeat(3,1fr);gap:24px}
+.facts div{min-width:0} .facts p{margin:4px 0 0;color:var(--muted);font-size:.93rem}
+footer{border-top:1px solid var(--line);padding-block:28px;color:var(--muted);font-size:.85rem}
+footer .wrap{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
+.digest{font-family:var(--mono);font-size:.75rem;color:var(--muted);word-break:break-all}
+.arch{display:grid;gap:8px;margin-bottom:28px}
+.arch .row{display:grid;gap:8px}
+.arch .box{border:1px solid var(--line);border-radius:8px;background:var(--surface);padding:12px 14px;min-width:0}
+.arch .box h3{font-size:1rem;margin-bottom:4px} .arch .box p{margin:0;color:var(--muted);font-size:.88rem}
+.arch .box .tag{font-family:var(--mono);font-size:.7rem;color:var(--accent)}
+.arch .r3{grid-template-columns:repeat(3,1fr)} .arch .r4{grid-template-columns:repeat(4,1fr)} .arch .host{border-style:dashed} .arch .log{background:var(--accent-soft)}
+.arch .r1{grid-template-columns:1fr}
+.flow{counter-reset:step;list-style:none;padding:0;margin:0;display:grid;gap:10px}
+.flow li{counter-increment:step;display:grid;grid-template-columns:2.2em 1fr;gap:10px;min-width:0}
+.flow li::before{content:counter(step);font-family:var(--mono);font-size:.8rem;color:var(--accent);border:1px solid var(--line);border-radius:6px;height:1.9em;display:grid;place-items:center}
+.flow li p{margin:0;color:var(--muted);font-size:.93rem} .flow li b{color:var(--fg);font-weight:600}
+.cols{display:grid;grid-template-columns:1.25fr 1fr;gap:32px;margin-bottom:32px} .cols>*{min-width:0}
+.cols h3{margin-bottom:12px}
+.next{display:grid;grid-template-columns:repeat(2,1fr);gap:14px}
+.next .item{border:1px solid var(--line);border-radius:10px;background:var(--surface);padding:16px 18px;display:flex;flex-direction:column;gap:6px;min-width:0}
+.next .item .head{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.next .item .code{font-family:var(--mono);color:var(--accent);font-size:.85rem}
+.next .item p{margin:0;color:var(--muted);font-size:.92rem}
+.rel{list-style:none;padding:0;margin:0;display:grid;gap:0;border:1px solid var(--line);border-radius:10px;background:var(--surface);overflow:hidden}
+.rel li{display:grid;grid-template-columns:170px 1fr;gap:16px;padding:14px 20px;border-top:1px solid var(--line);min-width:0}
+.rel li:first-child{border-top:0}
+.rel li>*{min-width:0}
+.rel .v{font-family:var(--mono);font-size:.9rem;display:flex;flex-direction:column}
+.rel .v small{color:var(--muted);font-size:.75rem}
+.rel p{margin:0;color:var(--muted);font-size:.93rem}
+.limits{display:grid;grid-template-columns:repeat(2,1fr);gap:16px 32px}
+.limits div{min-width:0}
+.limits h3{margin-bottom:6px}
+.limits ul{margin:0;padding-left:1.1em;color:var(--muted);font-size:.93rem}
+.limits li{margin-bottom:4px}
+@media (max-width:820px){.arch .r4,.arch .r3{grid-template-columns:1fr 1fr}.cols,.next,.limits{grid-template-columns:1fr}.hero{grid-template-columns:1fr;padding-block:36px 28px}.principles,.facts{grid-template-columns:1fr 1fr}.ms{grid-template-columns:1fr;gap:0}.docs{grid-template-columns:1fr}}
+@media (max-width:520px){.principles,.facts,.arch .r4,.arch .r3{grid-template-columns:1fr} nav{margin-left:0;width:100%}.rel li{grid-template-columns:1fr;gap:4px}}
+@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+</style>
+
+</head>
+<body>
+<header class="top"><div class="wrap">
+  <a class="brand" href="#top"><span class="mark" aria-hidden="true"></span>Nerva</a>
+  <span class="pill s-plan" id="hdr-status">Research</span>
+  <nav aria-label="Sections"><a href="#why">Why</a><a href="#architecture">Architecture</a><a href="#goals">Goals</a><a href="#releases">Releases</a><a href="#docs">Docs</a><a href="#limits">Limits</a><a href="#project">Project</a><a id="repo" href="#">GitHub →</a></nav>
+</div></header>
+
+<main class="wrap" id="top">
+  <div class="hero">
+    <div>
+      <p class="eyebrow">One log · Declared state · Reads at a position</p>
+      <h1>Derived state, declared once and kept by the log.</h1>
+      <p class="lede">Nerva is a research database. Indexes, views, change feeds, history and conserved balances are declared, then maintained from one ordered, replicated log, and every answer names the op it reflects.</p>
+      <div class="cta">
+        <a class="btn primary" href="#goals">See the goals</a>
+        <a class="btn" id="tutorial-btn" href="#">Read the tutorial</a>
+      </div>
+      <p class="note">Status: toy / research. Consensus, storage and the simulator come from TigerBeetle; Nerva has no external correctness review yet. Do not put data in it that you cannot lose.</p>
+    </div>
+    <div class="term" aria-label="Example session">
+      <div class="bar"><span>nerva api · a declared view</span><a class="rec" id="hero-rec" href="#">✓ real output · tutorial</a></div>
+      <pre id="hero-term"></pre>
+    </div>
+  </div>
+
+  <section id="why">
+    <div class="sec-head"><div><p class="eyebrow">Design principles</p><h2>No pipelines between your data and what is derived from it</h2>
+    <p>Keeping caches, indexes, aggregates, sync feeds and audit history in step with source data usually takes CDC, queues, consumers and backfill scripts. Nerva's bet is that all of it can be a deterministic function of one log.</p></div></div>
+    <div class="principles">
+      <div><h3>The log is the truth</h3><p>One ordered, replicated log. Base rows and every derived structure are deterministic functions of it, so every replica holds the same state at every op.</p></div>
+      <div><h3>Every read names its op</h3><p>Writes return their op. Reads ask for "at least op M" or "as of op N", and an <code>as_of</code> answer never changes later.</p></div>
+      <div><h3>Declared, not hand-built</h3><p>Views, indexes and ledgers are declarations in the log, not code. The state machine keeps them exact inside every commit.</p></div>
+      <div><h3>Verifiable answers</h3><p>A view's answer carries a hash of its groups. Replicas agree on it, and <code>nerva view</code> recomputes it from the log, byte for byte.</p></div>
+      <div><h3>Conservation in the cluster</h3><p>A declared ledger's fields move only by balanced pairs, never below a floor, whoever sends the request. No client can create or destroy value.</p></div>
+      <div><h3>Claims without locks</h3><p>Optimistic transactions: a read at the version seen plus a write. Two claimants of one receipt, exactly one wins, under crashes and faults.</p></div>
+    </div>
+  </section>
+
+  <section id="architecture">
+    <div class="sec-head"><div><p class="eyebrow">Architecture</p><h2>What runs today, layer by layer</h2>
+    <p>One binary, <code>nerva</code>: replicas (<code>start</code>), a JSON gateway (<code>api</code>) and an independent view recomputer (<code>view</code>). Nerva's own code is the state machine; everything under it is vendored from TigerBeetle.</p></div></div>
+    <div class="arch" aria-label="Nerva's layers, from clients down to the vendored foundation">
+      <div class="row r3">
+        <div class="box"><span class="tag">nerva api</span><h3>JSON over HTTP</h3><p>Every core operation for any language: lookups, commits, feeds, history, layouts, ledgers, views, indexes and documents. Bounded: 16 connections, 4 MiB bodies.</p></div>
+        <div class="box"><span class="tag">nerva view</span><h3>Independent check</h3><p>Follows the change feed and recomputes any view at any op, with the same hash the replicas serve.</p></div>
+        <div class="box"><span class="tag">client.zig</span><h3>Zig client</h3><p>A blocking client over the cluster protocol, in <code>src/nerva/client.zig</code>.</p></div>
+      </div>
+      <div class="row r4">
+        <div class="box"><span class="tag">commit core</span><h3>Rows and transactions</h3><p>80-byte rows versioned by op; reads at <code>op_seen</code>, puts, deletes and bounded adds; commit keys so a resend commits once.</p></div>
+        <div class="box"><span class="tag">records · indexes</span><h3>Facts</h3><p>448-byte records under 128-bit ids, written in the same transaction as rows; declared indexes find them by their fields.</p></div>
+        <div class="box"><span class="tag">views</span><h3>Declared views</h3><p><code>where</code>, <code>group_by</code>, <code>count</code>, <code>sum</code>, <code>min</code>, <code>max</code>, maintained in every commit and read as of any op.</p></div>
+        <div class="box"><span class="tag">ledgers</span><h3>Conserved fields</h3><p>Up to 64 ledgers of 2 to 16 <code>i64</code> fields, changed only by pairs of adds, never below a floor.</p></div>
+      </div>
+      <div class="row r1"><div class="box log"><span class="tag">the log</span><h3>One ordered, replicated, hash-chained log</h3><p>Every write, every declaration and every read goes through it. History, change feeds and as-of reads are indexes on it; nothing is physically deleted.</p></div></div>
+      <div class="row r1"><div class="box host"><span class="tag">vendored from TigerBeetle</span><h3>Consensus, storage, IO and the simulator</h3><p>Viewstamped Replication, the LSM forest on a checksummed block grid, io_uring IO and the VOPR deterministic simulator, copied from <a href="https://github.com/tigerbeetle/tigerbeetle">TigerBeetle</a> at a pinned commit. Every local change to a vendored file is listed in <a id="upstream-link" href="#">UPSTREAM.md</a>.</p></div></div>
+    </div>
+    <div class="cols">
+      <div><h3>The life of a commit</h3>
+        <ol class="flow">
+          <li><p><b>Send.</b> A client sends one transaction: reads with the version it saw, puts, deletes and adds, optionally under a commit key.</p></li>
+          <li><p><b>Order.</b> The primary assigns it the next op and a timestamp and replicates it; once a quorum holds it durably, it is committed.</p></li>
+          <li><p><b>Prefetch.</b> Each replica loads every row, record, view group and index entry the transaction touches. All IO happens here.</p></li>
+          <li><p><b>Validate.</b> A stale read is <code>conflict</code>, an add past a bound <code>out_of_bounds</code>, a lone add to a conserved field <code>unpaired</code>. On any failure, nothing applies.</p></li>
+          <li><p><b>Apply.</b> Rows, records, indexes, views and the change feed change in the same op, identically on every replica, with no IO and no clock but the prepare timestamp.</p></li>
+          <li><p><b>Reply.</b> The client gets the op. Any later read can ask for at least that op, or as of it.</p></li>
+        </ol>
+      </div>
+      <div><h3>How it is checked</h3>
+        <ol class="flow">
+          <li><p><b>The VOPR.</b> A whole cluster in one deterministic process, with crashes, partitions and disk faults; every reply is checked against a model, and every ledger's conservation after every commit. A seed replays a run exactly.</p></li>
+          <li><p><b>Seeded fuzzers.</b> TigerBeetle's and Nerva's own: adds, HTTP heads, documents and more.</p></li>
+          <li><p><b>Against models.</b> <code>test:api</code> and <code>test:views</code> check every route and every view against models, with write races.</p></li>
+          <li><p><b>Real clusters.</b> Three real replicas, two releases in one cluster, upgrades by export and import, and the demos under random crashes.</p></li>
+          <li><p><b>Jepsen, by hand.</b> Five nodes, kills, pauses and partitions; the history is checked for a ledger's conservation, so far.</p></li>
+          <li><p><b>Adversarial review.</b> Before every release, a separate reviewer tries to break the candidate; each finding is a GitHub issue that blocks the release until fixed or waived.</p></li>
+        </ol>
+      </div>
+    </div>
+    <h3 style="margin-bottom:12px">Coming next</h3>
+    <div class="next" id="next-list"></div>
+  </section>
+
+  <section id="goals">
+    <div class="sec-head">
+      <div><p class="eyebrow">Goals for 1.0</p><h2>Every authorization, receipt and report a position in one log</h2>
+      <p>1.0 is done when an agent-budget service can answer an auditor's three questions (what ran, who authorized it, is it current?) from properties of its database. Each goal below links to what delivers it. The output shown is from the tutorial, which runs every command against a real cluster.</p></div>
+      <span class="eyebrow" id="ms-count"></span>
+    </div>
+    <div class="progress" id="progress" aria-hidden="true"></div>
+    <div id="milestones"></div>
+  </section>
+
+  <section id="releases">
+    <div class="sec-head"><div><p class="eyebrow">Releases</p><h2>Each release says what changed and how to upgrade</h2>
+    <p>Binaries for Linux and macOS (x86_64, aarch64), with a bill of materials, published from <code>main</code>. Every release is now reviewed adversarially before it ships (P105).</p></div>
+    <a class="btn" id="releases-link" href="#">All releases →</a></div>
+    <ul class="rel" id="release-list"></ul>
+  </section>
+
+  <section id="docs">
+    <div class="sec-head"><div><p class="eyebrow">Documentation</p><h2>Docs live beside the code</h2>
+    <p>Every page is in the repository and changes in the same pull request as the behaviour it describes.</p></div></div>
+    <div class="docs" id="docs-list"></div>
+  </section>
+
+  <section id="limits">
+    <div class="sec-head"><div><p class="eyebrow">Limits and non-goals</p><h2>What Nerva is not, yet or ever</h2>
+    <p>Every limit a caller can hit is a constant in the code, asserted where it is used, and listed in the README.</p></div></div>
+    <div class="limits">
+      <div><h3>Status</h3><ul>
+        <li>Toy / research. No external correctness review comparable to TigerBeetle's Jepsen analysis yet.</li>
+        <li>The Jepsen suite exists, but runs by hand, and checks a ledger's conservation so far.</li>
+        <li>A release that changes the data file format needs new data files: upgrades go by export and import.</li>
+      </ul></div>
+      <div><h3>Not for 1.0</h3><ul>
+        <li>SQL and general-purpose queries; PostgreSQL compatibility.</li>
+        <li>Object-storage tiering and external operators such as embeddings.</li>
+        <li>Application-specific protocols or routes: applications keep their own rules.</li>
+      </ul></div>
+      <div><h3>Sizes</h3><ul>
+        <li>Rows hold 80 bytes, records 448, documents up to 512 KiB.</li>
+        <li>One op touches at most about 4,000 view groups; a larger transaction is refused whole.</li>
+        <li>A cluster holds 64 client sessions; at most 64 ledgers and 64 indexes.</li>
+      </ul></div>
+      <div><h3>Network</h3><ul>
+        <li>Gateways speak plain HTTP with a shared key: put them behind TLS off a private network.</li>
+        <li>Replicas authenticate each other, but their traffic is not encrypted: run them on a private, encrypted network.</li>
+      </ul></div>
+    </div>
+  </section>
+
+  <section id="project">
+    <div class="sec-head"><div><p class="eyebrow">The project</p><h2>Small, open, honest about what it is</h2></div></div>
+    <div class="facts">
+      <div><h3>Apache 2.0</h3><p>Nerva's own code and the vendored code alike. <code>NOTICE</code> credits TigerBeetle.</p></div>
+      <div><h3>Standing on TigerBeetle</h3><p>Consensus, storage, IO and the VOPR are TigerBeetle's work, copied at a pinned commit with every local patch recorded.</p></div>
+      <div><h3>Decided in writing</h3><p>Every design choice is a dated decision with its reason and cost, in <code>docs/DECISIONS.md</code> and <code>docs/decisions/</code>.</p></div>
+    </div>
+  </section>
+</main>
+
+<footer><div class="wrap">
+  <span>Nerva · research · updated <span id="updated"></span></span>
+  <span class="digest" id="digest"></span>
+</div></footer>
+
+<script>
+// ===== Site data: update SITE, GOALS, NEXT and RELEASES as work lands. =====
+// Every status here must be traceable to README.md (Roadmap), docs/GOALS-1.0.md or CHANGELOG.md.
+// A release: add it to RELEASES (newest first) from its CHANGELOG section, and set SITE.version.
+const SITE = {
+  updated: "2026-11-04",
+  repo: "https://github.com/Botpike/nerva-ledger",
+  version: "0.6.1",
+  released: "2026-10-21",
+  stage: "Research · v0.6.1 released",
+  stageStatus: "plan", // the header pill: "done" | "wip" | "plan"
+};
+const BLOB = SITE.repo + "/blob/main/";
+const TUTORIAL = BLOB + "docs/TUTORIAL.md";
+// status: "done" (delivered) | "wip" (in progress) | "plan" (open)
+// evidence: what docs/GOALS-1.0.md says delivers it. demo: real output from docs/TUTORIAL.md
+// (run against v0.5.0 and v0.6.0), trimmed where marked with …; `part` links to its section.
+const GOALS = [
+  {id:"G1", name:"One log, no dual truth", status:"done",
+   goal:"A reservation and the record of its attempt, a settlement and its receipt, commit in the same transaction.",
+   evidence:{head:"v0.6.0", note:"records, declared indexes and commit keys (P123, P123b, P123c). The first application still keeps its facts in PostgreSQL until it moves them"},
+   part:"#records-facts-with-128-bit-ids",
+   demo:[["$",`n -d '{"key":"0190…9d11","entries":[`],["",`  {"kind":"add","table":6,"id":"1","field":"available","delta":"-10","min":"0"},`],["",`  {"kind":"add","table":6,"id":"1","field":"held","delta_from":0},`],["",`  {"kind":"put","table":2147483649,"id":"0190…9e01","fields":{…,"status":1,"amount":"10"}}]}' $A/v1/commit`],["",`{"status":"committed","op":"26","adds":[{"index":0,"applied":"-10","value":"60"},{"index":1,"applied":"10","value":"40"}]}`],["$",`n -d '{"limit":2}' $A/v1/indexes/reserved/scan`],["",`{"index":"reserved","op":"53","records":[{"id":"…e01","op":"26","order":"1001",…},…]}`]]},
+  {id:"G2", name:"Every read names its position", status:"done",
+   goal:"Every reply is stamped with the op it reflects; a reader can demand at least op M, or as of op N.",
+   evidence:{head:"Milestone 3", note:"lookups carry op_read; views answer at a watermark, with min_op waits (N21–N23)"},
+   part:"#read-the-past-and-your-own-writes",
+   demo:[["$",`n -d '{"entries":[{"kind":"put","table":5,"id":"2","fields":{"section":1,"price":"100","sold":true}}]}' $A/v1/commit`],["",`{"status":"committed","op":"160"}`],["$",`n "$A/v1/views/revenue?min_op=160"`],["",`{"view":"revenue","op":"165","hash":"2560a945…",…,"groups":[{"section":1,"count":"2","sum_price":"200"},…]}`],["$",`n "$A/v1/views/revenue?as_of=999999999"`],["",`{"error":"as_of is not yet committed"}            (504)`]]},
+  {id:"G3", name:"Claims are compare-and-set", status:"done",
+   goal:"Exclusive ownership of a receipt, a lease or an approval is a read at the version seen plus a write.",
+   evidence:{head:"Milestone 1", note:"the receipt race, checked by the VOPR under crash and disk-fault injection"},
+   part:"#claim-something-exactly-once",
+   demo:[["","# Worker A"],["$",`n -d '{"entries":[{"kind":"read","table":2,"id":"1001","op_seen":"0"},{"kind":"put","table":2,"id":"1001","value_hex":"0a"}]}' $A/v1/commit`],["",`{"status":"committed","op":"12"}`],["","# Worker B, same claim"],["$",`n -d '{"entries":[{"kind":"read","table":2,"id":"1001","op_seen":"0"},{"kind":"put","table":2,"id":"1001","value_hex":"0b"}]}' $A/v1/commit`],["",`{"status":"conflict","index":0,"op":"12"}`]]},
+  {id:"G4", name:"Derived state is declared and verifiable", status:"done",
+   goal:"Reports and rollups are views maintained from the log, each with a watermark and a hash two copies can compare.",
+   evidence:{head:"Milestone 5", note:"views maintained by the replicas (N52), min and max as of any op (N62), recomputed by nerva view to the byte (N66)"},
+   part:"#read-a-view",
+   demo:[["$",`n $A/v1/views/revenue`],["",`{"view":"revenue","op":"142",`],["",` "hash":"aa945a74f02106ab0fd8759a5c46e31be48aff918a4f737b0638215c6d10026a",`],["",` "view_hash":"0c8ceeee30d22fcca2f2a5b97e80be1cf94912ed80cfc7218ff1225874c29739",`],["",` "declared_op":"129",`],["",` "groups":[{"section":1,"count":"1","sum_price":"100"},`],["",`           {"section":2,"count":"2","sum_price":"500"}]}`]]},
+  {id:"G5", name:"Effects happen once on Nerva's side", status:"plan",
+   goal:"Outbound actions are views whose sink is an effect, keyed by (view, row, op). A provider call in flight during a crash repeats unless the provider honours that key.",
+   evidence:{head:"Open", note:"effect sinks are not built"},
+   demo:[["","# Not built. The design: a view whose sink sends an email or calls an API,"],["","# with the idempotency key (view, row key, op): exactly-once on Nerva's side."]]},
+  {id:"G6", name:"History is queryable as of any op", status:"done",
+   goal:"\"What was this agent's allowance when it decided?\" is a read at the op of the decision, not a hand-kept journal.",
+   evidence:{head:"Milestone 4", note:"get_history through an index on the change feed (N27); row?as_of=, and views as_of any op"},
+   part:"#time-travel",
+   demo:[["$",`n "$A/v1/row?table=1&id=42&as_of=5"`],["",`{"table":1,"id":"42","as_of":"5","exists":true,"op":"5","value_hex":"68656c6c6f…"}`],["$",`n "$A/v1/row?table=1&id=42&as_of=4"`],["",`{"table":1,"id":"42","as_of":"4","exists":false,"op":"0",…}`],["$",`n "$A/v1/row?table=1&id=42&as_of=999999999"`],["",`{"error":"as_of is not yet committed"}`]]},
+  {id:"G7", name:"Durable, attributed workflow state", status:"wip",
+   goal:"Suspended work, pending approvals and their answers live in the log, and every approval is attributed to an identity.",
+   evidence:{head:"Partly", note:"values larger than a row: documents of up to 512 KiB (N41, N76). Attributed approvals still need an identity model (N30)"},
+   part:"#part-8-documents-larger-values-by-key",
+   demo:[["$",`n -d '{"namespace":"7","reads":[{"key":"cart/alice","version":"0"}],"writes":[{"key":"cart/alice","value_hex":"7b22…7d"}]}' $A/v1/documents/commit`],["",`{"status":"committed","op":"270"}`],["$",`n -d '{"namespace":"7","reads":[{"key":"cart/alice","version":"0"}],"writes":[{"key":"cart/alice","delete":true}]}' $A/v1/documents/commit`],["",`{"status":"conflict","key":"cart/alice","version":"270"}     (409)`]]},
+  {id:"G8", name:"Hot balances without conflicts", status:"done",
+   goal:"Many agents draw on one budget without serializing through retries; the cluster itself conserves balances.",
+   evidence:{head:"v0.2.0 · v0.4.0", note:"bounded, clampable adds (N42); declared ledgers that refuse any move that is not a balanced pair within floors (N75)"},
+   part:"#ledgers-balances-the-cluster-conserves",
+   demo:[["","# Reserve up to 30, four times: the fourth clamps at the floor of 0."],["$",`n -d '{"entries":[`],["",`  {"kind":"add","table":7,"id":"1","field":"available","delta":"-30","pair":true,"clamp":true},`],["",`  {"kind":"add","table":7,"id":"1","field":"held","delta_from":0}]}' $A/v1/commit`],["",`{"status":"committed","op":"106","adds":[{"index":0,"applied":"-10","value":"0"},{"index":1,"applied":"10","value":"100"}]}`],["","# A lone add to a conserved field: it would create money."],["$",`n -d '{"entries":[{"kind":"add","table":7,"id":"1","field":"available","delta":"5"}]}' $A/v1/commit`],["",`{"status":"unpaired","index":0}                          (409)`]]},
+];
+// "Coming next", from README.md's Roadmap and docs/GOALS-1.0.md; ref is a goal id or roadmap item.
+const NEXT = [
+  {ref:"Milestone 7", t:"First production use", status:"wip", d:"The first application's ledger on commit keys, then its facts as records, step by step (GOALS-1.0, milestone 7)."},
+  {ref:"Roadmap 6", t:"Past index reads and retention", status:"plan", d:"Index reads as of a past op, group_by on bytes fields, and retention of commit keys and facts."},
+  {ref:"Roadmap 5", t:"View snapshots", status:"plan", d:"Reads as of any op and change cursors exist; view snapshots are the part of subscriptions still to come."},
+  {ref:"G5", t:"Effect sinks", status:"plan", d:"Views whose sink is an email or an API call, keyed by (view, row key, op)."},
+  {ref:"G7", t:"Attributed approvals", status:"plan", d:"An identity model, so every approval in the log names who gave it."},
+  {ref:"Roadmap 7", t:"Beyond 1.0", status:"plan", d:"Object-storage tiering and external operators (embeddings), with their outputs recorded so replays read the recording."},
+];
+// From CHANGELOG.md, newest first. Each links to its GitHub release.
+const RELEASES = [
+  {v:"0.6.1", date:"2026-10-21", d:"nerva api keeps table layouts between requests: about 3.5 times the submits per second through one gateway. nerva start gains --commit-stall-probability."},
+  {v:"0.6.0", date:"2026-10-16", d:"Facts beside the money: commit keys, records with 128-bit ids, and declared indexes. Data files move by export and import."},
+  {v:"0.5.0", date:"2026-10-07", d:"Replicas prove to each other that they hold a cluster key; gateway keys rotate without downtime; gateways listen on IPv6."},
+  {v:"0.4.0", date:"2026-10-06", d:"Declared ledgers, so that the cluster itself conserves balances; views with min and max, read as of any op and served whole by nerva api."},
+  {v:"0.3.0", date:"2026-10-05", d:"Views that the cluster keeps itself, metrics and traces from replicas, and a faster client."},
+  {v:"0.2.0", date:"2026-10-04", d:"Documents (values larger than a row, by key) and adds: counters that many clients change at once."},
+  {v:"0.1.0", date:"2026-10-04", d:"The first release: the commit core, a change feed and history, nerva api and nerva view."},
+];
+const DOCS = [
+  {t:"Tutorial", path:"docs/TUTORIAL.md", d:"From an empty directory to a running cluster, through every capability, with real output; then a tour of the code."},
+  {t:"README", path:"README.md", d:"The design, the commit core, running a cluster, the JSON API, ledgers, views, limits and the roadmap."},
+  {t:"Goals for 1.0", path:"docs/GOALS-1.0.md", d:"The motivating workload, goals G1 to G8, the non-goals and the milestones."},
+  {t:"Decisions", path:"docs/DECISIONS.md", d:"Every design decision with its reason and cost; newer ones in docs/decisions/."},
+  {t:"Upstream", path:"UPSTREAM.md", d:"What is vendored from TigerBeetle, what was dropped, and every local patch."},
+  {t:"Demos", path:"demo/README.md", d:"A seat race and a shared canvas, built only on nerva api and declared views, run under crashes."},
+];
+// ===== Rendering =====
+const $ = s => document.querySelector(s);
+const label = {done:"Delivered", wip:"In progress", plan:"Open"};
+function esc(s){return s.replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]))}
+function termHTML(lines){return lines.map(([k,t])=>k? `<span class="p">${k}</span> ${esc(t)}` : `<span class="d">${esc(t)}</span>`).join("\n")}
+// From docs/TUTORIAL.md, Part 7 ("Declare a view", "Read a view"); n is curl with the key, $A the gateway.
+$("#hero-term").innerHTML = termHTML([["$",`n -X PUT $A/v1/views/revenue -d '{"table":5,`],["",`  "where":[{"field":"sold","op":"eq","value":true}],"group_by":["section"],`],["",`  "aggregates":[{"fn":"count"},{"fn":"sum","field":"price"}]}'`],["",`{"view":"revenue","declared":"created","maintained":true}`],["$","n $A/v1/views/revenue"],["",`{"view":"revenue","op":"142","hash":"aa945a74…",`],["",` "view_hash":"0c8ceeee…","declared_op":"129",`],["",` "groups":[{"section":1,"count":"1","sum_price":"100"},`],["",`           {"section":2,"count":"2","sum_price":"500"}]}`]]);
+$("#hero-rec").href = TUTORIAL + "#read-a-view";
+$("#tutorial-btn").href = TUTORIAL;
+$("#repo").href = SITE.repo;
+$("#upstream-link").href = BLOB + "UPSTREAM.md";
+$("#releases-link").href = SITE.repo + "/releases";
+const done = GOALS.filter(g=>g.status==="done").length;
+const wip = GOALS.filter(g=>g.status==="wip").length;
+$("#ms-count").textContent = `${done} of ${GOALS.length} delivered` + (wip?` · ${wip} in progress`:"");
+$("#progress").innerHTML = GOALS.map(g=>`<span class="${g.status}"></span>`).join("");
+$("#milestones").innerHTML = GOALS.map(g=>`
+  <article class="ms" id="${g.id.toLowerCase()}">
+    <div class="meta"><span class="code">${g.id}</span><h3>${esc(g.name)}</h3><p>${esc(g.goal)}</p><span class="pill s-${g.status}">${label[g.status]}</span><span class="slices"><b>${esc(g.evidence.head)}</b> ${esc(g.evidence.note)}</span></div>
+    <div class="term"><div class="bar"><span>${g.id.toLowerCase()} · nerva api</span>${g.part?`<a class="rec" href="${TUTORIAL}${g.part}">✓ real output · tutorial</a>`:'<span class="planned">not built</span>'}</div><pre>${termHTML(g.demo)}</pre></div>
+  </article>`).join("");
+$("#next-list").innerHTML = NEXT.map(n=>`<div class="item"><div class="head"><span class="code">${esc(n.ref)}</span><h3>${esc(n.t)}</h3><span class="pill s-${n.status}">${label[n.status]}</span></div><p>${esc(n.d)}</p></div>`).join("");
+$("#release-list").innerHTML = RELEASES.map(r=>`<li><span class="v"><a href="${SITE.repo}/releases/tag/v${r.v}">v${r.v}</a><small>${r.date}</small></span><p>${esc(r.d)}</p></li>`).join("");
+$("#docs-list").innerHTML = DOCS.map(d=>`<div class="doc"><h3><a href="${BLOB}${d.path}">${d.t}</a></h3><p>${esc(d.d)}</p><span class="when">${d.path}</span></div>`).join("");
+$("#updated").textContent = SITE.updated;
+$("#hdr-status").textContent = SITE.stage;
+$("#hdr-status").className = "pill s-" + (SITE.stageStatus || "plan");
+// The footer's motif: a position in the site's own log.
+$("#digest").textContent = "site at op " + GOALS.length + RELEASES.length + " · hash " + [...SITE.updated+SITE.version+GOALS.map(g=>g.status).join("")].reduce((h,c)=>((h<<5)-h+c.charCodeAt(0))>>>0,7).toString(16).padStart(8,"0");
+if(location.hash){const t=document.getElementById(location.hash.slice(1)); if(t) t.scrollIntoView();}
+</script>
+
+</body>
+</html>
