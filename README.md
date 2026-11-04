@@ -150,7 +150,9 @@ materials, `nerva-v<VERSION>.cdx.json` (CycloneDX 1.5, N63): Nerva, the vendored
 commit, and the Zig standard library and compiler, read from the repository's pins and covered
 by `SHA256SUMS`. A separate workflow,
 `fuzz.yml`, runs every fuzzer and the VOPR on random seeds for a time budget; it is started by hand
-on runners brought up for it. [tests/jepsen](./tests/jepsen/README.md) is a Jepsen suite: five
+on runners brought up for it. The simulation fleet ([ops/sim-fleet](./ops/sim-fleet/README.md))
+runs the VOPR and the fuzzers on fresh seeds on one host around the clock, at the tip of `main`,
+and files each distinct failure as an issue labelled `sim-fleet` (P147h). [tests/jepsen](./tests/jepsen/README.md) is a Jepsen suite: five
 real nodes, clients through `nerva api`, kills, pauses and partitions, and a history checked
 against what Nerva promises (a declared ledger's conservation, so far); it runs by hand (N82).
 
@@ -367,7 +369,7 @@ the middle of a regression does not absorb it. To try the issue step, run the wo
 
 ```bash
 python3 perf/nightly/file_issue.py --verdict verdict.json --summary summary.md \
-    --run-id 1 --run-url <url> --repo Botpike/nerva-ledger --dry-run
+    --run-id 1 --run-url <url> --repo NervaLog/nerva --dry-run
 python3 perf/nightly/test_file_issue.py   # its tests, offline (CI runs them)
 ```
 
