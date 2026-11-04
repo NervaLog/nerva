@@ -21,7 +21,7 @@ concurrency:
 
 jobs:
   version:
-    runs-on: [self-hosted, fly]
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
       tag: ${{ steps.version.outputs.tag }}
@@ -68,7 +68,7 @@ jobs:
 
   release:
     needs: [version, ci]
-    runs-on: [self-hosted, fly]
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
       contents: write

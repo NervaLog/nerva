@@ -32,13 +32,14 @@ green in CI, with a link to the run.
 | R1 · Proven | Jepsen nightly on a dedicated host: commit keys under unknown outcomes, the gateway killed and cut off | Not started (the bank suite exists; nightly is draft PR #106) |
 | R2 · Fleet | An always-on VOPR and fuzzer fleet on Hetzner that files every new failure | In progress (scripts and reporter written; host not provisioned) |
 | R3 · Measured | Sizing and latency on the real topology: three machines, the Fly p99 explained | Not started |
-| R4 · Gateway | No ambiguous 503, metrics from `nerva api`, several gateways as one service | Not started |
+| R4 · Gateway | Beside its client, never ambiguous, observable: a gateway per client process, no ambiguous 503, metrics | Not started |
 | R5 · Recover | Replace a lost replica, and restore from a backup, with the cluster open | Not started |
 | R6 · Upgrade | Rolling upgrades between releases with the same data format | Not started |
 | R7 · Retention | Commit keys, history and view versions trimmed below a horizon: bounded growth | Not started |
+| R8 · Native client | The client library over a C ABI, called from the JVM: no gateway, no JSON, batching as TigerBeetle's clients do | Not started |
 
 **The gate for strangers' money** (Botpike's invite-only launch on Nerva, Botpike/app P121b) is
-R1 to R5. R6 and R7 follow. Until R6, an upgrade is an export and import with the cluster closed,
+R1 to R5. R6, R7 and R8 follow. Until R6, an upgrade is an export and import with the cluster closed,
 as today (README, "Upgrading a cluster").
 
 ## R1 · Proven: Jepsen, nightly, on what the client actually does
@@ -152,12 +153,20 @@ commit lands within 10%.
 - [ ] The p99 cause is named in a decision.
 - [ ] Botpike's Machine size follows from the table.
 
-## R4 · Gateway: honest and observable
+## R4 · Gateway: beside its client, honest and observable
 
-**Goal:** a client of `nerva api` can always tell "not applied" from "unknown", and the operator
-can see what the gateway is doing.
+**Goal:** a gateway runs beside the process it serves, never as a shared hop in between. Its
+client can always tell "not applied" from "unknown", and the operator can see what it does.
 
 **Why:**
+
+- **A shared gateway is an extra network hop and a shared failure** for the clients behind it
+  (owner, 2026-11-04, P147g). Botpike runs one beside each replica and reaches it over the
+  network, with a cap of 12 callers per gateway, so a second app Machine already needs
+  re-tuning (Botpike/app P99b, P120).
+- **A gateway on the client's own machine fails only with that client.** It is reached on
+  loopback, so its plain HTTP and its key never cross a network. Each client process gets its
+  own cluster session, so capacity grows with the clients.
 
 - **#120:** a busy gateway can close a request mid-send, so a client sees a 503 it cannot tell
   from a lost commit.
@@ -178,8 +187,13 @@ can see what the gateway is doing.
   - displacements;
   - cluster-request latency;
   - session reconnects.
-- **Several gateways:** a README section and a test with two gateways on one cluster. It covers
-  the sessions each takes against `clients_max`, and eviction (`src/config.zig:222`).
+- **The sidecar topology is the documented one.** "Running a cluster" in the README shows
+  `nerva api` on `127.0.0.1` beside each client process, connected to every replica. It also
+  covers sessions against `clients_max` (64, `src/config.zig:222`), eviction, and which ports
+  clients need, as against replicas only.
+- **A gateway that loses its cluster says so on `/healthz` within one timeout,** so the process
+  beside it can stop taking work rather than queue.
+- **Several gateways in a test:** two on one cluster, with one killed.
 - **Error codes on the wire.** Every error reply gains `"code"` from `docs/ERRORS.md` (P147c); body too large
   becomes 413, and "not yet committed" one status on every route.
 - **Conservation as a metric.** Each replica emits each ledger's conserved sum and its view hash,
@@ -187,6 +201,8 @@ can see what the gateway is doing.
 
 **Demo script:**
 
+0. Three replicas, and two client processes each with its own gateway on loopback. Killing one
+   client's gateway stops only that client.
 1. 32 callers against a 16-slot gateway: every refused request says `"applied": false`, and no
    keyed commit is lost or doubled.
 2. The metrics endpoint shows the refusals.
@@ -284,13 +300,42 @@ have no retention (README, roadmap item 6; GOALS-1.0).
 **Demo script:** a cluster with a 1-day horizon at simulated time. Data, export time and memory
 stay flat across 30 simulated days of load. A retry of an expired key is refused as expired.
 
+## R8 · Native client: no gateway in the client's path
+
+**Goal:** a JVM client speaks to the cluster through Nerva's own client library, without a
+gateway or JSON, and concurrent callers share one op the way TigerBeetle's clients batch.
+
+**Why:**
+- **The gateway is a translation step.** It turns each JSON request into a cluster request,
+  grouping at most 16 (P143), where TigerBeetle's clients put up to about 8,000 events in one op.
+- **Botpike is a JVM application.** Java 21's foreign-function API calls a C ABI directly, as
+  TigerBeetle's Java client does with its native library.
+- **The gateway stays** as the language-neutral API other clients use (N39). It just leaves the
+  path of a client that has the library.
+
+**Scope:**
+- `src/nerva/client.zig` gains a C ABI and a binary encoding of commits, lookups and their
+  results, versioned and documented as a wire format.
+- A small JVM binding, published with each release, with the native library for Linux x86_64 and
+  aarch64.
+- Automatic batching of concurrent calls into one op, bounded.
+- Typed errors carrying the codes in `docs/ERRORS.md`.
+
+**Demo script:** Botpike's ledger load (`apps/ledger-load`) runs through the binding, with no
+gateway. Submits per second and p99 are compared with the sidecar gateway's on the R3 topology.
+
+**Acceptance:**
+- [ ] The binding passes the gateway's model tests (`test:api`'s model) for every operation it
+  offers.
+- [ ] Jepsen's `retry` workload passes through it.
+
 ## Order
 
 ```text
 R2 Fleet ──▶ R1 Proven (shares its host) ──▶ R4 Gateway ──▶ Botpike's gate (R1-R5)
 R3 Measured ──────────────────────────────▶ Machine size
 R5 Recover ───────────────────────────────▶
-                                            R6 Upgrade ──▶ R7 Retention
+                                            R6 Upgrade ──▶ R7 Retention ──▶ R8 Native client
 ```
 
 - **R2 first:** the host is the same one R1 needs.

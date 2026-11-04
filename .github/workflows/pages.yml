@@ -1,4 +1,5 @@
-# The project site (site/) on GitHub Pages, deployed on every push to main that changes it.
+# The project site (site/) on GitHub Pages, deployed on every push to main that changes it, and
+# the only workflow such a change starts: ci.yml ignores site/ (P147f).
 # Requires Settings -> Pages -> Source: GitHub Actions. Same shape as Zigbox's and Zigcube's.
 name: Deploy site to GitHub Pages
 
@@ -19,8 +20,8 @@ concurrency:
 
 jobs:
   deploy:
-    # Botpike's own runners, as every other job here (Botpike/ci-runners).
-    runs-on: [self-hosted, fly]
+    # GitHub's hosted runners, as every job here (P147e).
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     environment:
       name: github-pages

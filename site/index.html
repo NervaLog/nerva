@@ -366,9 +366,9 @@ const PRODUCTION = [
    note:"Every number so far ran on one host (#91, #134). A replica takes about 3.0 GB at the defaults (#127).",
    demo:[["$","perf/fly/run.sh --topology 3+1"],["","# p50, p99, p99.9 with checkpoints marked; a sizing table by working set"],["$","nerva start --cache-grid=8GiB …   # on a 4 GB machine"],["","# refused at start, naming the flag, instead of killed later"]]},
   {id:"R4", name:"Gateway", status:"plan", gate:true,
-   goal:"A client can always tell \"not applied\" from \"unknown\", the gateway reports what it does, and several gateways serve as one.",
-   note:"#120: a busy gateway can close a request mid-send. Gateways export no metrics today.",
-   demo:[["","# 32 callers against a 16-slot gateway"],["","{\"error\":\"busy\",\"applied\":false}                    (503)"],["","# two gateways, one killed: retries land on the other, under their keys"]]},
+   goal:"A gateway runs beside the process it serves, on loopback, never as a shared hop; its client can always tell \"not applied\" from \"unknown\", and it reports what it does.",
+   note:"Today Botpike reaches gateways beside the replicas over the network. #120: a busy gateway can close a request mid-send. No gateway metrics.",
+   demo:[["","# two client processes, each with nerva api on 127.0.0.1; one gateway killed: only its client stops"],["","# 32 callers against a 16-slot gateway"],["","{\"error\":\"busy\",\"applied\":false}                    (503)"],["","# two gateways, one killed: retries land on the other, under their keys"]]},
   {id:"R5", name:"Recover", status:"plan", gate:true,
    goal:"A replica whose disk is gone rejoins by state sync with the cluster open, and a backup restores to the same view hashes.",
    note:"Today a lost replica means exporting and importing all three, closed (P90, #94). The vendored protocol already supports a reformatted replica.",
@@ -381,6 +381,10 @@ const PRODUCTION = [
    goal:"Commit keys, history and view versions are kept for a declared horizon, then trimmed: disk, export and import stay bounded.",
    note:"Nothing is trimmed today (README roadmap item 6).",
    demo:[["","# a 1-day horizon over 30 simulated days: data and export time stay flat"],["","{\"status\":\"key_expired\"}                               (409)"]]},
+  {id:"R8", name:"Native client", status:"plan", gate:false,
+   goal:"A JVM client reaches the cluster through Nerva's client library over a C ABI: no gateway, no JSON, concurrent calls batched into one op.",
+   note:"The gateway groups at most 16 requests per op (P143); TigerBeetle's clients batch about 8,000 events. The gateway stays for other languages (N39).",
+   demo:[["","# Botpike's ledger load through the binding, no gateway in the path"],["","# submits/s and p99 against the sidecar gateway, on the R3 topology"]]},
 ];
 // From CHANGELOG.md, newest first. Each links to its GitHub release.
 const RELEASES = [
