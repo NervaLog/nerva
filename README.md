@@ -638,6 +638,22 @@ under random crashes.
 
 Decisions and their reasons: [docs/DECISIONS.md](./docs/DECISIONS.md).
 
+## Production
+
+Nerva holds its first client's money on the R milestones' terms, in
+[docs/PRODUCTION.md](./docs/PRODUCTION.md). Each ends in a demo that runs in CI; a milestone is
+**delivered** only when that demo is green. The gate for strangers' money is R1 to R5.
+
+| Milestone | What it adds | Status |
+| --- | --- | --- |
+| R1 · Proven | Jepsen nightly on a dedicated host: commit keys under unknown outcomes, the gateway killed and cut off | Not started (bank suite exists; nightly is draft #106) |
+| R2 · Fleet | An always-on VOPR and fuzzer fleet on Hetzner that files every new failure | In progress |
+| R3 · Measured | Sizing and latency on three machines; the Fly p99 explained | Not started |
+| R4 · Gateway | No ambiguous 503, gateway metrics, several gateways as one service | Not started |
+| R5 · Recover | Replace a lost replica, and restore a backup, with the cluster open | Not started |
+| R6 · Upgrade | Rolling upgrades between releases with the same data format | Not started |
+| R7 · Retention | Keys, history and view versions trimmed below a horizon | Not started |
+
 ## Roadmap
 
 The 1.0 target is in [docs/GOALS-1.0.md](./docs/GOALS-1.0.md).
