@@ -90,6 +90,9 @@ jobs:
           python3 perf/nightly/test_compare.py
           python3 perf/nightly/test_file_issue.py
 
+      - name: Simulation fleet's reporter (fingerprints, dedup, caps; no network, P147i)
+        run: python3 ops/sim-fleet/test_sim_fleet.py
+
       - name: Integration (three real replicas)
         run: ./zig/zig build test:integration
 
