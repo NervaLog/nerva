@@ -33,7 +33,7 @@ the VOPR simulator are vendored from TigerBeetle; Nerva's own code is `src/nerva
 ./zig/zig build check         # Typecheck (fast; run often)
 ./zig/zig build test:unit     # Unit tests (filter: -- "test name")
 ./zig/zig build test          # Unit tests + format check
-./zig/zig build vopr -- <seed>  # Simulator; a seed reproduces a run exactly (~5 min ReleaseSafe)
+./zig/zig build -Drelease vopr -- <seed>  # Simulator; a seed reproduces a run exactly (1-8 s ReleaseSafe, N74)
 ./zig/zig build fuzz -- smoke
 ./zig/zig build test:integration  # Real 3-replica cluster + client (~20 s, ~3.5 GiB disk)
 ./zig/zig build test:api      # nerva api (JSON), documents and adds against models, races (~3 min)
@@ -56,13 +56,23 @@ written for people running Nerva: new capabilities with examples, fixes with the
 upgrade steps), then bump `VERSION` (and add a worklog note, `worklog/<number>.md`) in its own commit. The section
 becomes the GitHub release notes; a version without one is refused.
 
+**Before every release, the release gate** (P147b, amending P105). A release is cut only from a
+`main` commit that is sim-clean (once R2's fleet runs: 24 hours of the fleet on that commit and no
+open `sim-fleet` issue against it), Jepsen-clean (once R1's nightly runs: the suite passes on that
+commit), and reviewed adversarially by **two** independent reviewers, as below. The release PR
+quotes the fleet's tracker line, the Jepsen result and both verdicts. Within a day of the release,
+a short retro goes in `docs/retros/<version>.md`: which assumptions were wrong, what each cost,
+and what changes; a rule it changes lands here or in `docs/decisions/` in the same PR.
+
 **Before every release, an adversarial review.** Before the `VERSION` commit, a separate bot that
 did none of the release's work reviews the release candidate (the `main` commit to be released)
 adversarially: its job is to break it, not to approve it. It reads every change since the last
 tag, every vendored patch (UPSTREAM.md) and the upgrade and downgrade paths, hunts for invariant
 violations (determinism, `commit` doing IO, unbounded queues, renumbered identifiers, lost
 committed ops), and runs VOPR seeds, the fuzzers and the release, integration and Jepsen suites
-against it. Each finding is a GitHub issue labelled `release-review`. The release waits until
+against it. Two reviewers do this, each a fresh session given the diff since the last tag and the
+briefs, never the other's findings nor the implementers' conclusions. Each finding is a GitHub
+issue labelled `release-review`. The release waits until
 every blocker is fixed or the owner waives it in writing, and the CHANGELOG section links the
 review's issues.
 
@@ -171,7 +181,7 @@ Check them against `git diff --name-only origin/main...` before you write them.
 ### Pre-existing bugs
 
 Whenever you find a bug that existed before your change (in Nerva's code or a vendored file),
-file a GitHub issue on `Botpike/nerva-ledger`, even if you fix it in the same pull request: what
+file a GitHub issue on `NervaLog/nerva`, even if you fix it in the same pull request: what
 fails, how to reproduce it, since when (the commit or release, if known), its impact, and the
 fix or the pull request that carries it. Fixing it in the PR does not replace the issue; link
 them (`Fixes #N`), and close the issue as completed if the fix has already merged.
@@ -184,9 +194,84 @@ You are not done until:
    consensus, storage or the state machine).
 2. `./zig/zig build test:fmt` passes.
 3. Cleanup pass: no dead code, no stray `TODO` without a reason, assertions on new invariants.
-4. README.md / UPSTREAM.md updated if behaviour, design or vendored code changed.
+4. README.md / UPSTREAM.md updated if behaviour, design or vendored code changed, and README's
+   Production table and the site's data (`site/index.html`: `SITE`, `GOALS`, `PRODUCTION`) if a
+   status changed.
 5. `worklog/<number>.md` exists for the change, and any decision you took is in `docs/decisions/`.
 6. The pull request description carries the three statements above.
+7. You ran [REVIEW.md](./REVIEW.md) on your own diff, and the description says which of its items
+   the change touched and what you checked.
+8. Every failure the change adds or touches is a registered code in [docs/ERRORS.md](./docs/ERRORS.md).
 
 A failing VOPR seed, integration run or Jepsen run is a finding, never noise: do not re-run it until
 it passes. Reproduce it from its seed, then fix it or file it (see "Pre-existing bugs").
+
+## Milestones and demos (adopted from Zigbox, P147)
+
+- The production work is milestones R1 to R7 in [docs/PRODUCTION.md](./docs/PRODUCTION.md). Work
+  one milestone at a time, from its brief in `docs/briefs/rN.md` once one is written; do not start
+  a later one, or build what a brief lists as a non-goal.
+- **A milestone is delivered only when its demo runs for real and is green in CI.** Unit tests
+  passing, or code that compiles, is never reported as a passed demo. Say exactly what was and was
+  not run.
+- Each demo script becomes an automated test, `zig build demo-rN` or a CI job. Never break an
+  earlier demo.
+- When scope is in doubt, cut scope and keep the demo. Record the cut in `docs/demos/rN.md`.
+- **Error messages are part of the demo:** one line saying what was refused and why, with its code
+  (`docs/ERRORS.md`), never a raw Zig error name or a stack trace for something the operator or
+  client caused.
+
+## Errors (P147c)
+
+- Every failure a client, an operator or a script can see has a stable code `NRV-<kind><4 digits>`
+  (`E` error, `W` warning, `B` bug), registered once in [docs/ERRORS.md](./docs/ERRORS.md) with
+  its surface, blame, cause and fix. Codes are never reused or renumbered.
+- A new failure path gets its code, its entry and a test that triggers it, in the same PR. A
+  message that blames the wrong layer, or ends in an errno or `error.Something`, is a bug.
+- The wire identifiers clients already match on (`conflict`, `out_of_bounds`, `unpaired`,
+  `key_reused` and the rest) keep their spelling: a code is added beside them, never in their
+  place.
+
+## Agent context discipline (adopted from Zigbox, P147)
+
+An agent re-reads its whole context on every turn, so cost grows with context size, not with the
+work done.
+
+- **One agent per slice.** A supervisor starts a fresh implementer for each slice of a milestone,
+  and does not resume a finished one for the next slice or for fixes.
+- **Hand off through the repository.** Before stopping, an implementer commits and ends its report
+  with a handoff note: decisions made, traps found, what is next. Lasting decisions go in
+  `docs/decisions/`.
+- **Context ceiling.** Stop at about 250K tokens of context or 60 turns, whichever comes first:
+  reach the next safe stopping place, commit, write the handoff note and report.
+- **Small fixes get new agents,** given the symptom and the commit, never the agent that wrote
+  the code.
+- **Keep noisy output out of context.** Redirect `zig build`, VOPR and test output to a file and
+  read only the failing lines.
+- **Delegate lookups** (searching the vendored TigerBeetle code, the Zig std) to a read-only agent
+  and keep only the answer.
+- **Purely mechanical work goes to a smaller model** (threading an argument through call sites, a
+  rename, a status update, a CI tweak), given the exact pattern; whoever delegated checks its diff.
+
+## README and site status (adopted from Zigbox, P147)
+
+- README's Production table and the site (`site/index.html`, the `SITE`, `GOALS`, `PRODUCTION`,
+  `NEXT` and `RELEASES` data at the top of its script) show the same status. Update both in the
+  same push that changes a status. Never mark anything delivered before its demo is green in CI;
+  never show output that was not recorded as recorded.
+- Pages deploys only from `main`. A commit that only records status (README and `site/` after a
+  CI result) carries `[skip ci]`; never use it on a commit that changes code, tests or CI.
+
+## Disk (adopted from Zigbox, P147)
+
+- A session's disk is a fixed allowance. `test:integration` needs about 3.5 GiB. Give each
+  parallel worktree its own `ZIG_GLOBAL_CACHE_DIR`, and never delete another worktree's cache.
+- A killed build can leave `.zig-cache` half written, which then fails with `FileNotFound`;
+  `rm -rf .zig-cache` fixes it.
+
+## Environment facts (Claude Code cloud container, 2026-11-04)
+
+- `perf_event_open` is denied, so `benchmark.perf: usage example` fails (see above).
+- There is no Docker, so Jepsen does not run here; it runs on the R1 host.
+- The repository moved from `Botpike/nerva-ledger` to `NervaLog/nerva`; GitHub redirects the old
+  name for reads only. File issues on `NervaLog/nerva`.

@@ -131,7 +131,7 @@ footer .wrap{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
 <header class="top"><div class="wrap">
   <a class="brand" href="#top"><span class="mark" aria-hidden="true"></span>Nerva</a>
   <span class="pill s-plan" id="hdr-status">Research</span>
-  <nav aria-label="Sections"><a href="#why">Why</a><a href="#architecture">Architecture</a><a href="#goals">Goals</a><a href="#releases">Releases</a><a href="#docs">Docs</a><a href="#limits">Limits</a><a href="#project">Project</a><a id="repo" href="#">GitHub →</a></nav>
+  <nav aria-label="Sections"><a href="#why">Why</a><a href="#architecture">Architecture</a><a href="#goals">Goals</a><a href="#production">Production</a><a href="#releases">Releases</a><a href="#docs">Docs</a><a href="#limits">Limits</a><a href="#project">Project</a><a id="repo" href="#">GitHub →</a></nav>
 </div></header>
 
 <main class="wrap" id="top">
@@ -219,6 +219,16 @@ footer .wrap{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
     <div id="milestones"></div>
   </section>
 
+  <section id="production">
+    <div class="sec-head">
+      <div><p class="eyebrow">Production</p><h2>What stands between the engine and strangers' money</h2>
+      <p>The engine already conserves balances and commits facts beside them. The R milestones are the work around it: proof under real faults, a fleet that never stops searching, the real topology measured, an honest gateway, recovery with the cluster open, rolling upgrades and bounded growth. Each ends in a demo that runs in CI; the gate for the first client's launch is R1 to R5. <a id="production-link" href="#">The plan →</a></p></div>
+      <span class="eyebrow" id="r-count"></span>
+    </div>
+    <div class="progress" id="r-progress" aria-hidden="true"></div>
+    <div id="r-milestones"></div>
+  </section>
+
   <section id="releases">
     <div class="sec-head"><div><p class="eyebrow">Releases</p><h2>Each release says what changed and how to upgrade</h2>
     <p>Binaries for Linux and macOS (x86_64, aarch64), with a bill of materials, published from <code>main</code>. Every release is now reviewed adversarially before it ships (P105).</p></div>
@@ -279,7 +289,7 @@ footer .wrap{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
 // A release: add it to RELEASES (newest first) from its CHANGELOG section, and set SITE.version.
 const SITE = {
   updated: "2026-11-04",
-  repo: "https://github.com/Botpike/nerva-ledger",
+  repo: "https://github.com/NervaLog/nerva",
   version: "0.6.1",
   released: "2026-10-21",
   stage: "Research · v0.6.1 released",
@@ -340,6 +350,42 @@ const NEXT = [
   {ref:"G7", t:"Attributed approvals", status:"plan", d:"An identity model, so every approval in the log names who gave it."},
   {ref:"Roadmap 7", t:"Beyond 1.0", status:"plan", d:"Object-storage tiering and external operators (embeddings), with their outputs recorded so replays read the recording."},
 ];
+// Production readiness, from docs/PRODUCTION.md. status as for GOALS; gate: part of the launch gate.
+// demo: the milestone's demo script, planned until it runs (shown with the "planned" badge).
+const PRODUCTION = [
+  {id:"R1", name:"Proven", status:"plan", gate:true,
+   goal:"Jepsen every night on a dedicated host, on what the client actually does: keyed commits under lost replies, gateways killed and cut off.",
+   note:"The bank suite exists and ran once by hand (v0.4.0). Nightly is draft #106; #107 was the runner's memory.",
+   demo:[["$","tests/jepsen/run.sh zig-out/bin/nerva test --workload retry \\"],["","    --nemesis kill,partition,gateway --time-limit 3600"],["","# each key commits at most once; a retry names the original op"],["$","tests/jepsen/run.sh … --workload bank --keys"],["","# conservation holds; a build without key dedup is caught"]]},
+  {id:"R2", name:"Fleet", status:"wip", gate:true,
+   goal:"The VOPR and the fuzzers run around the clock on Hetzner, and every new failure becomes one issue with its replay command.",
+   note:"About 300 seeds per push today; roughly 150,000 to 250,000 a day on one 8-core host. Scripts and reporter written; host not provisioned.",
+   demo:[["$","systemctl start sim-fleet"],["","# polls main, builds each tip once, runs vopr (nerva, testing) and 16 fuzzers"],["","# the tracker issue gets one post a day: seeds run per kind, failures filed"],["","# a canary fault: one issue, a replay command, no duplicate"],["","./zig/zig build -Drelease vopr -Dvopr-state-machine=nerva -- <seed>"]]},
+  {id:"R3", name:"Measured", status:"plan", gate:true,
+   goal:"Sizing and latency from three replicas on three machines with real disks, and the 150-190 ms p99 seen on Fly explained.",
+   note:"Every number so far ran on one host (#91, #134). A replica takes about 3.0 GB at the defaults (#127).",
+   demo:[["$","perf/fly/run.sh --topology 3+1"],["","# p50, p99, p99.9 with checkpoints marked; a sizing table by working set"],["$","nerva start --cache-grid=8GiB …   # on a 4 GB machine"],["","# refused at start, naming the flag, instead of killed later"]]},
+  {id:"R4", name:"Gateway", status:"plan", gate:true,
+   goal:"A gateway runs beside the process it serves, on loopback, never as a shared hop; its client can always tell \"not applied\" from \"unknown\", and it reports what it does.",
+   note:"Today Botpike reaches gateways beside the replicas over the network. #120: a busy gateway can close a request mid-send. No gateway metrics.",
+   demo:[["","# two client processes, each with nerva api on 127.0.0.1; one gateway killed: only its client stops"],["","# 32 callers against a 16-slot gateway"],["","{\"error\":\"busy\",\"applied\":false}                    (503)"],["","# two gateways, one killed: retries land on the other, under their keys"]]},
+  {id:"R5", name:"Recover", status:"plan", gate:true,
+   goal:"A replica whose disk is gone rejoins by state sync with the cluster open, and a backup restores to the same view hashes.",
+   note:"Today a lost replica means exporting and importing all three, closed (P90, #94). The vendored protocol already supports a reformatted replica.",
+   demo:[["$","rm data/2.nerva && nerva recover --replica=2 …"],["","# writes continue; replica 2 catches up; every view hash agrees"],["$","nerva backup … && nerva restore …"],["","# the manifest's op, SHA-256 and view hashes match before it opens"]]},
+  {id:"R6", name:"Upgrade", status:"plan", gate:false,
+   goal:"A release that keeps the data format upgrades one replica at a time, with the cluster taking writes.",
+   note:"Today every upgrade is an export and import with the cluster closed, about 14 s per million changes.",
+   demo:[["","# three replicas on N under load; each replaced in turn by N+1"],["","# no request fails except as retried under its key; hashes agree"]]},
+  {id:"R7", name:"Retention", status:"plan", gate:false,
+   goal:"Commit keys, history and view versions are kept for a declared horizon, then trimmed: disk, export and import stay bounded.",
+   note:"Nothing is trimmed today (README roadmap item 6).",
+   demo:[["","# a 1-day horizon over 30 simulated days: data and export time stay flat"],["","{\"status\":\"key_expired\"}                               (409)"]]},
+  {id:"R8", name:"Native client", status:"plan", gate:false,
+   goal:"A JVM client reaches the cluster through Nerva's client library over a C ABI: no gateway, no JSON, concurrent calls batched into one op.",
+   note:"The gateway groups at most 16 requests per op (P143); TigerBeetle's clients batch about 8,000 events. The gateway stays for other languages (N39).",
+   demo:[["","# Botpike's ledger load through the binding, no gateway in the path"],["","# submits/s and p99 against the sidecar gateway, on the R3 topology"]]},
+];
 // From CHANGELOG.md, newest first. Each links to its GitHub release.
 const RELEASES = [
   {v:"0.6.1", date:"2026-10-21", d:"nerva api keeps table layouts between requests: about 3.5 times the submits per second through one gateway. nerva start gains --commit-stall-probability."},
@@ -355,6 +401,8 @@ const DOCS = [
   {t:"README", path:"README.md", d:"The design, the commit core, running a cluster, the JSON API, ledgers, views, limits and the roadmap."},
   {t:"Goals for 1.0", path:"docs/GOALS-1.0.md", d:"The motivating workload, goals G1 to G8, the non-goals and the milestones."},
   {t:"Decisions", path:"docs/DECISIONS.md", d:"Every design decision with its reason and cost; newer ones in docs/decisions/."},
+  {t:"Production", path:"docs/PRODUCTION.md", d:"Milestones R1 to R7: what stands between the engine and its first client's money, each with its demo."},
+  {t:"Error codes", path:"docs/ERRORS.md", d:"Every failure a client or operator can see, with its code, blame, cause and fix, and which are safe to retry."},
   {t:"Upstream", path:"UPSTREAM.md", d:"What is vendored from TigerBeetle, what was dropped, and every local patch."},
   {t:"Demos", path:"demo/README.md", d:"A seat race and a shared canvas, built only on nerva api and declared views, run under crashes."},
 ];
@@ -378,6 +426,16 @@ $("#milestones").innerHTML = GOALS.map(g=>`
   <article class="ms" id="${g.id.toLowerCase()}">
     <div class="meta"><span class="code">${g.id}</span><h3>${esc(g.name)}</h3><p>${esc(g.goal)}</p><span class="pill s-${g.status}">${label[g.status]}</span><span class="slices"><b>${esc(g.evidence.head)}</b> ${esc(g.evidence.note)}</span></div>
     <div class="term"><div class="bar"><span>${g.id.toLowerCase()} · nerva api</span>${g.part?`<a class="rec" href="${TUTORIAL}${g.part}">✓ real output · tutorial</a>`:'<span class="planned">not built</span>'}</div><pre>${termHTML(g.demo)}</pre></div>
+  </article>`).join("");
+const rDone = PRODUCTION.filter(r=>r.status==="done").length;
+const rWip = PRODUCTION.filter(r=>r.status==="wip").length;
+$("#r-count").textContent = `${rDone} of ${PRODUCTION.length} delivered` + (rWip?` · ${rWip} in progress`:"") + " · gate R1–R5";
+$("#r-progress").innerHTML = PRODUCTION.map(r=>`<span class="${r.status}"></span>`).join("");
+$("#production-link").href = BLOB + "docs/PRODUCTION.md";
+$("#r-milestones").innerHTML = PRODUCTION.map(r=>`
+  <article class="ms" id="${r.id.toLowerCase()}">
+    <div class="meta"><span class="code">${r.id}${r.gate?" · launch gate":""}</span><h3>${esc(r.name)}</h3><p>${esc(r.goal)}</p><span class="pill s-${r.status}">${label[r.status]}</span><span class="slices">${esc(r.note)}</span></div>
+    <div class="term"><div class="bar"><span>demo-${r.id.toLowerCase()}</span><span class="planned">planned</span></div><pre>${termHTML(r.demo)}</pre></div>
   </article>`).join("");
 $("#next-list").innerHTML = NEXT.map(n=>`<div class="item"><div class="head"><span class="code">${esc(n.ref)}</span><h3>${esc(n.t)}</h3><span class="pill s-${n.status}">${label[n.status]}</span></div><p>${esc(n.d)}</p></div>`).join("");
 $("#release-list").innerHTML = RELEASES.map(r=>`<li><span class="v"><a href="${SITE.repo}/releases/tag/v${r.v}">v${r.v}</a><small>${r.date}</small></span><p>${esc(r.d)}</p></li>`).join("");

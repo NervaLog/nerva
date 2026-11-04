@@ -1,17 +1,20 @@
 # Every push and pull request to main, and every release (release.yml calls this first).
-# Every job runs on Botpike's own runners (Botpike/ci-runners): a Fly Machine started for the
-# job, performance-2x with 8 GB and a 10 GB volume that keeps the Zig cache between jobs.
-# The jobs run in parallel, balanced so none is much longer than the others (N57).
+# Every job runs on GitHub's hosted runners (ubuntu-24.04: 4 vCPU and 16 GB for a public
+# repository), since the repository is public and a fork's pull request must never run on a
+# self-hosted runner (P147e, superseding the Fly runners of N57 and N59). The pinned toolchain
+# comes from Actions' cache. The jobs run in parallel, balanced so none is much longer than the
+# others (N57).
 name: CI
 
 on:
-  # Markdown alone (docs, WORKLOG, CHANGELOG) starts nothing (N68); release.yml's call still runs.
+  # Markdown alone (docs, WORKLOG, CHANGELOG) starts nothing (N68), nor does the site alone
+  # (site/, which pages.yml deploys, P147f); release.yml's call still runs.
   push:
     branches: [main]
-    paths-ignore: ['**.md']
+    paths-ignore: ['**.md', 'site/**']
   pull_request:
     branches: [main]
-    paths-ignore: ['**.md']
+    paths-ignore: ['**.md', 'site/**']
   workflow_dispatch:
   workflow_call:
 
@@ -56,12 +59,19 @@ jobs:
   # with them; the unit tests, the longest step, run alone.
   system:
     name: check, integration, API, views
-    runs-on: [self-hosted, fly]
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           persist-credentials: false
+
+      # GitHub's runners start empty: the pinned toolchain is restored from Actions' cache, keyed by
+      # download.sh's hash, where INSTALL_ZIG looks for it (P147e).
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/nerva-toolchain
+          key: nerva-toolchain-${{ runner.os }}-${{ hashFiles('zig/download.sh') }}
 
       - name: Install the pinned Zig
         run: eval "$INSTALL_ZIG"
@@ -80,6 +90,9 @@ jobs:
           python3 perf/nightly/test_compare.py
           python3 perf/nightly/test_file_issue.py
 
+      - name: Simulation fleet's reporter (fingerprints, dedup, caps; no network, P147i)
+        run: python3 ops/sim-fleet/test_sim_fleet.py
+
       - name: Integration (three real replicas)
         run: ./zig/zig build test:integration
 
@@ -93,12 +106,19 @@ jobs:
         run: ./zig/zig build test:release
 
   unit:
-    runs-on: [self-hosted, fly]
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           persist-credentials: false
+
+      # GitHub's runners start empty: the pinned toolchain is restored from Actions' cache, keyed by
+      # download.sh's hash, where INSTALL_ZIG looks for it (P147e).
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/nerva-toolchain
+          key: nerva-toolchain-${{ runner.os }}-${{ hashFiles('zig/download.sh') }}
 
       - name: Install the pinned Zig
         run: eval "$INSTALL_ZIG"
@@ -114,12 +134,19 @@ jobs:
   # `lsm_segmented_array` logs "too slow for the smoke mode" in Debug; that is a warning, not a
   # failure.
   fuzz:
-    runs-on: [self-hosted, fly]
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           persist-credentials: false
+
+      # GitHub's runners start empty: the pinned toolchain is restored from Actions' cache, keyed by
+      # download.sh's hash, where INSTALL_ZIG looks for it (P147e).
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/nerva-toolchain
+          key: nerva-toolchain-${{ runner.os }}-${{ hashFiles('zig/download.sh') }}
 
       - name: Install the pinned Zig
         run: eval "$INSTALL_ZIG"
@@ -130,7 +157,7 @@ jobs:
   # The demos, three replicas and all, while processes are crashed and restarted: each demo on its
   # own Machine, run exactly as `zig build -Drelease test:demo -- --seconds=75` runs it.
   demo:
-    runs-on: [self-hosted, fly]
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -150,6 +177,13 @@ jobs:
             exit 1
           fi
 
+      # GitHub's runners start empty: the pinned toolchain is restored from Actions' cache, keyed by
+      # download.sh's hash, where INSTALL_ZIG looks for it (P147e).
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/nerva-toolchain
+          key: nerva-toolchain-${{ runner.os }}-${{ hashFiles('zig/download.sh') }}
+
       - name: Install the pinned Zig
         run: eval "$INSTALL_ZIG"
 
@@ -163,7 +197,7 @@ jobs:
   # the release's run, a dispatch) runs `vopr_main` instead (N74).
   vopr:
     if: github.event_name == 'pull_request'
-    runs-on: [self-hosted, fly]
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -173,6 +207,13 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           persist-credentials: false
+
+      # GitHub's runners start empty: the pinned toolchain is restored from Actions' cache, keyed by
+      # download.sh's hash, where INSTALL_ZIG looks for it (P147e).
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/nerva-toolchain
+          key: nerva-toolchain-${{ runner.os }}-${{ hashFiles('zig/download.sh') }}
 
       - name: Install the pinned Zig
         run: eval "$INSTALL_ZIG"
@@ -192,7 +233,7 @@ jobs:
   vopr_main:
     name: vopr (main, ${{ matrix.lane }})
     if: github.event_name != 'pull_request'
-    runs-on: [self-hosted, fly]
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -202,6 +243,13 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           persist-credentials: false
+
+      # GitHub's runners start empty: the pinned toolchain is restored from Actions' cache, keyed by
+      # download.sh's hash, where INSTALL_ZIG looks for it (P147e).
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/nerva-toolchain
+          key: nerva-toolchain-${{ runner.os }}-${{ hashFiles('zig/download.sh') }}
 
       - name: Install the pinned Zig
         run: eval "$INSTALL_ZIG"
