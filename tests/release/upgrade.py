@@ -136,7 +136,26 @@ class Cluster:
         self.replicas[index].wait()
         self.replicas[index] = None
 
+    def wait_listening(self):
+        """Waits until each running replica accepts connections on its port. A replica takes a
+        while to open its data file before it listens, and a gateway gives up on a port that is
+        not open yet (#155)."""
+        deadline = time.monotonic() + 120
+        ports = [int(port) for port in self.addresses.split(",")]
+        for index, replica in enumerate(self.replicas):
+            if replica is None:
+                continue
+            while True:
+                assert replica.poll() is None, self.log(index)[-3000:]
+                try:
+                    socket.create_connection(("127.0.0.1", ports[index]), timeout=1).close()
+                    break
+                except OSError:
+                    assert time.monotonic() < deadline, self.log(index)[-3000:]
+                    time.sleep(0.1)
+
     def gateway(self):
+        self.wait_listening()
         process = subprocess.Popen(
             [self.nerva, "api", "--cluster=0", f"--addresses={self.addresses}",
              "--listen=127.0.0.1:0"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
