@@ -53,6 +53,7 @@ BODY_MAX = 4 * 1024 * 1024
 STEP3_SECONDS, STEP5_SECONDS, STALL_SECONDS = 20, 30, 10
 WINDOW_SECONDS = 11  # A statsd window is 10 s.
 
+DEADLINE_SECONDS = 20 * 60  # CI allows 30 minutes; a hang prints a FAIL line well before it.
 step_number = 0
 
 
@@ -80,10 +81,18 @@ def free_ports(count):
     return ports
 
 
+class NotSent(OSError):
+    """The connection was never made: the request reached nobody, so it did not apply."""
+
+
 def request(port, method, target, body=None, key=KEY, timeout=60):
-    """One request on a connection of its own: (status, body)."""
+    """One request on a connection of its own: (status, body). `NotSent` if the connect fails."""
     connection = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
     try:
+        try:
+            connection.connect()
+        except OSError as error:
+            raise NotSent(repr(error)) from error
         headers = {"X-Nerva-Key": key} if key else {}
         connection.request(method, target, body=None if body is None else json.dumps(body),
                            headers=headers)
@@ -167,6 +176,19 @@ class Listener(threading.Thread):
                        for (n, t) in self.sums)
 
 
+def first_line(process, seconds):
+    """The first line `process` prints; a process that prints nothing in time is a failure."""
+    box = []
+    reader = threading.Thread(target=lambda: box.append(process.stdout.readline()), daemon=True)
+    reader.start()
+    reader.join(seconds)
+    if reader.is_alive():
+        process.kill()
+        process.wait()
+        raise StepFailed(f"a gateway printed no port in {seconds} s")
+    return box[0]
+
+
 class Demo:
     def __init__(self, nerva):
         self.nerva = nerva
@@ -225,7 +247,7 @@ class Demo:
                 self.gateway_command(f"127.0.0.1:{port or 0}"), stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE, stderr=open(log, "a"),
                 env={**os.environ, "NERVA_KEY": KEY}, text=True)
-            line = process.stdout.readline()
+            line = first_line(process, 60)
             if line:
                 self.gateways[name] = process
                 self.gateway_ports[name] = int(line)
@@ -286,6 +308,9 @@ class Client:
         self.counts = {"busy": 0, "other_503": 0}
         self.seen_busy = 0  # Every busy reply any of this client's sockets read.
         self.failures = []
+        self.drips = 0  # Dripper rounds completed.
+        self.cut = self.not_sent = 0  # Transport errors after a request was sent / at connect.
+        self.resent = {}
         self.next_worker = 0
         self.threads = []
         self.stop = threading.Event()
@@ -351,6 +376,10 @@ class Client:
                 check(mode == "once", f"transport error for {key}: {error!r}")
                 with self.lock:
                     self.unresolved[key] = entries
+                    if isinstance(error, NotSent):
+                        self.not_sent += 1
+                    else:
+                        self.cut += 1
                 return False
             if self.settle(key, status, body):
                 return True
@@ -372,39 +401,50 @@ class Client:
 
     def finish(self, seconds=120):
         self.stop.set()
+        deadline = time.monotonic() + seconds  # For all the threads together.
         for thread in self.threads:
-            thread.join(seconds)
+            thread.join(max(0.0, deadline - time.monotonic()))
             check(not thread.is_alive(), f"a caller of {self.name} never finished")
         check(not self.failures, self.failures[:3])
 
     def resend_unresolved(self, port, threads=8):
-        """Each unresolved key resent under itself until 200 or 409 (retrying refusals)."""
+        """Each unresolved key resent under itself until 200 or 409 (retrying refusals). Returns
+        the number of keys; `self.resent` counts the answers: first-time, replayed, conflict."""
         pending = sorted(self.unresolved.items())
         problems = []
+        self.resent = {"first": 0, "replayed": 0, "conflict": 0}
+        verified = [0]
 
         def work(share):
-            for key, entries in share:
-                deadline = time.monotonic() + 120
-                while True:
-                    try:
+            try:
+                for key, entries in share:
+                    deadline = time.monotonic() + 120
+                    while True:
                         status, body = request(port, "POST", "/v1/commit",
                                                {"key": key, "entries": entries})
-                    except (OSError, http.client.HTTPException) as error:
-                        problems.append((key, repr(error)))
-                        return
-                    if self.settle(key, status, body):
-                        break
-                    if time.monotonic() > deadline or status != 503:
-                        problems.append((key, status, body))
-                        return
-                    time.sleep(0.05)
+                        if self.settle(key, status, body):
+                            break
+                        if time.monotonic() > deadline or status != 503:
+                            problems.append((key, status, body))
+                            return
+                        time.sleep(0.05)
+                    kind = ("conflict" if status == 409 else
+                            "replayed" if body.get("replayed") is True else "first")
+                    with self.lock:
+                        self.resent[kind] += 1
+                        verified[0] += 1
+            except BaseException as error:  # noqa: BLE001
+                problems.append(repr(error))
 
         pool = [threading.Thread(target=work, args=(pending[i::threads],)) for i in range(threads)]
         for thread in pool:
             thread.start()
         for thread in pool:
-            thread.join()
+            thread.join(240)
+            check(not thread.is_alive(), "a resend thread never finished")
         check(not problems, problems[:3])
+        check(verified[0] == len(pending), f"{verified[0]} of {len(pending)} keys resent")
+        check(not self.unresolved, f"{len(self.unresolved)} keys still unresolved")
         return len(pending)
 
 
@@ -540,32 +580,33 @@ def step4(demo, a):
 
 
 def drip(a, stop):
-    """Sixteen connections that have sent half a head for 2 s of every 10; busy replies counted."""
-    while not stop.is_set():
-        held, refused = [], 0
-        for _ in range(SLOTS):
-            try:
+    """Sixteen connections that have sent half a head for 2 s of every 10; busy replies counted.
+    Any transport error is a failure; `a.drips` counts the rounds that completed."""
+    try:
+        while not stop.is_set():
+            held, refused = [], 0
+            for _ in range(SLOTS):
                 connection = socket.create_connection(("127.0.0.1", a.port), timeout=30)
-                connection.sendall(b"GET /healthz HTTP/1.1\r\n")
                 held.append(connection)
-            except OSError:
-                pass
-        stop.wait(2)
-        for connection in held:
-            try:
-                connection.sendall(b"connection: close\r\n\r\n")
-                status, body = read_reply(connection)
-                if is_busy(status, body):
-                    refused += 1
-                else:
-                    check(status == 200, (status, body))
-            except (OSError, StepFailed) as error:
-                a.failures.append(f"a dripper: {error!r}")
-            finally:
-                connection.close()
+                connection.sendall(b"GET /healthz HTTP/1.1\r\n")
+            stop.wait(2)
+            for connection in held:
+                try:
+                    connection.sendall(b"connection: close\r\n\r\n")
+                    status, body = read_reply(connection)
+                    if is_busy(status, body):
+                        refused += 1
+                    else:
+                        check(status == 200, (status, body))
+                finally:
+                    connection.close()
+            with a.lock:
+                a.seen_busy += refused
+                a.drips += 1
+            stop.wait(8)
+    except BaseException as error:  # noqa: BLE001
         with a.lock:
-            a.seen_busy += refused
-        stop.wait(8)
+            a.failures.append(f"a dripper: {error!r}")
 
 
 def step5(demo, a):
@@ -577,35 +618,42 @@ def step5(demo, a):
     time.sleep(STEP5_SECONDS)
     a.finish()
     dripper.join(60)
+    check(not dripper.is_alive(), "the dripper never finished")
     check(not a.failures, a.failures[:3])
+    check(a.drips >= 2, f"the dripper completed {a.drips} rounds")
     check(a.counts["other_503"] == 0, a.counts)
     check(a.counts["busy"] > 0, f"the gateway was never busy: {a.counts}")
     check(not a.unresolved, f"{len(a.unresolved)} keys never settled")
     a.seen_busy += a.counts["busy"]
     a.counts["busy"] = 0
-    say(f"{len(a.acked) - before} transfers committed, {a.seen_busy} busy replies in all, "
-        f"every one resent and settled, no transport error", started)
+    say(f"{len(a.acked) - before} transfers committed, {a.seen_busy} busy replies in all "
+        f"({a.drips} drip rounds), every one resent and settled, no transport error", started)
 
 
 def step6(demo, a, b):
     listener = demo.listener
     ga, gb = demo.gateway_ports["A"], demo.gateway_ports["B"]
-    time.sleep(WINDOW_SECONDS)  # The last window.
-    check(listener.failure is None, listener.failure)
-    deadline = time.monotonic() + 30
     names = ("nerva.api.requests", "nerva.api.group_size.count", "nerva.api.cluster_request_us.count")
-    while not all(listener.present(n, p) for n in names for p in (ga, gb)):
+    # Counters arrive once per 10 s window: poll for up to three windows, never one fixed sleep.
+    deadline = time.monotonic() + 3 * WINDOW_SECONDS
+    while True:
+        check(listener.failure is None, listener.failure)
+        busy = listener.total("nerva.api.refused", ga, reason="busy")
+        waited = listener.total("nerva.api.refused", ga, reason="queue_wait")
+        displaced = listener.total("nerva.api.refused", ga, reason="displaced")
+        # Every connection this script opens sends bytes at once, so none may be displaced (#120).
+        check(displaced == 0, f"{displaced} connections displaced that had sent bytes")
+        check(busy + waited <= a.seen_busy,
+              f"refused busy {busy} + queue_wait {waited} exceed the {a.seen_busy} busy replies seen")
+        missing = [(n, p) for n in names for p in (ga, gb) if not listener.present(n, p)]
+        if busy + waited == a.seen_busy and busy > 0 and not missing:
+            break
         check(time.monotonic() < deadline,
-              f"missing series: {[(n, p) for n in names for p in (ga, gb) if not listener.present(n, p)]}")
+              f"refused busy {busy} + queue_wait {waited} != {a.seen_busy} busy replies seen; "
+              f"missing series {missing}")
         time.sleep(0.5)
-    busy = listener.total("nerva.api.refused", ga, reason="busy")
-    other = sum(listener.total("nerva.api.refused", ga, reason=reason)
-                for reason in ("displaced", "queue_wait"))
-    check(busy + other == a.seen_busy,
-          f"refused busy {busy} + displaced/queue_wait {other} != {a.seen_busy} busy replies seen")
-    check(busy > 0, "no refused{reason:busy} was counted")
     check(listener.total("nerva.api.refused", gb, reason="busy") == 0, "GB refused busy")
-    say(f"refused{{reason:busy}} {busy} (+{other} displaced or queue_wait) equals the "
+    say(f"refused{{reason:busy}} {busy} (+{waited} queue_wait, 0 displaced) equals the "
         f"{a.seen_busy} busy replies seen; requests, group_size and cluster_request_us present "
         f"for GA and GB")
 
@@ -625,10 +673,12 @@ def step7(demo, a, b):
         check(not thread.is_alive(), "a caller of A is stuck")
     check(not a.failures, a.failures[:3])
     check(a.unresolved, "A saw no transport error")
+    check(a.cut > 0, f"no request of A was cut mid-flight ({a.not_sent} connects refused)")
+    check(a.cut + a.not_sent <= len(a.unresolved), (a.cut, a.not_sent, len(a.unresolved)))
     check(b_after > b_before, f"B committed nothing after GA died ({b_before} -> {b_after})")
     check(not b.unresolved and not b.failures, (b.unresolved, b.failures[:3]))
-    say(f"GA killed: A has {len(a.unresolved)} unknown keys; B committed {b_after - b_before} "
-        f"more with no error")
+    say(f"GA killed: A has {len(a.unresolved)} unresolved keys ({a.cut} cut mid-flight, unknown; "
+        f"{a.not_sent} refused at connect); B committed {b_after - b_before} more with no error")
 
 
 def step8(demo, a):
@@ -637,8 +687,10 @@ def step8(demo, a):
     check(demo.gateway_ports["A"] == port, "GA moved")
     demo.wait_healthy("A")
     count = a.resend_unresolved(a.port)
-    check(not a.unresolved, len(a.unresolved))
-    say(f"new GA on :{port}; {count} unknown keys resent, each answered 200")
+    check(a.resent["conflict"] == 0, f"a resend answered 409: {a.resent}")
+    check(a.resent["first"] + a.resent["replayed"] == count, (a.resent, count))
+    say(f"new GA on :{port}; {count} keys resent, each answered 200: {a.resent['first']} "
+        f"first-time, {a.resent['replayed']} replayed")
 
 
 def step9(demo, a, b):
@@ -732,7 +784,11 @@ def step9(demo, a, b):
     for sent, answered, status, body in records:
         check(status in (200, 409) or (status == 503 and body.get("code") in
               ("NRV-E0601", "NRV-E0605", "NRV-E0602")), (status, body))
+        if status == 503:  # Unknown exactly when the request may have reached the cluster.
+            check(body.get("applied") in (False, "unknown")
+                  and (body["applied"] == "unknown") == (body["code"] == "NRV-E0601"), (status, body))
     count = b.resend_unresolved(b.port)
+    check(not b.unresolved, f"{len(b.unresolved)} keys unresolved after the resend")
     say(f"{len(inflight)} in-flight requests answered 503 ({unknown} unknown, NRV-E0601) within {worst:.1f} s; "
         f"GA /healthz 503 (NRV-E0605) after {health['answered']:.1f} s; both ready {recovered:.1f} s "
         f"after SIGCONT; {count} keys resent", started)
@@ -783,26 +839,35 @@ def step11(demo, a, b):
     keys = [(k, op, c) for c in (a, b) for k, op in c.acked.items()]
     problems = []
 
+    verified = [0]
+
     def work(share):
-        for key, op, client in share:
-            entries = transfer(*client.effects[key][:2], client.effects[key][2])
-            deadline = time.monotonic() + 60
-            while True:
-                status, body = request(gb, "POST", "/v1/commit", {"key": key, "entries": entries})
-                if status != 503 or time.monotonic() > deadline:
-                    break
-                time.sleep(0.05)
-            if not (status == 200 and body.get("replayed") is True and int(body["op"]) == op
-                    and body.get("code") == "NRV-W0201"):
-                problems.append((key, op, status, body))
-                return
+        try:
+            for key, op, client in share:
+                entries = transfer(*client.effects[key][:2], client.effects[key][2])
+                deadline = time.monotonic() + 60
+                while True:
+                    status, body = request(gb, "POST", "/v1/commit", {"key": key, "entries": entries})
+                    if status != 503 or time.monotonic() > deadline:
+                        break
+                    time.sleep(0.05)
+                if not (status == 200 and body.get("replayed") is True and int(body["op"]) == op
+                        and body.get("code") == "NRV-W0201"):
+                    problems.append((key, op, status, body))
+                    return
+                with b.lock:
+                    verified[0] += 1
+        except BaseException as error:  # noqa: BLE001
+            problems.append(repr(error))
 
     pool = [threading.Thread(target=work, args=(keys[i::16],)) for i in range(16)]
     for thread in pool:
         thread.start()
     for thread in pool:
-        thread.join()
+        thread.join(300)
+        check(not thread.is_alive(), "a replay thread never finished")
     check(not problems, problems[:3])
+    check(verified[0] == len(keys), f"{verified[0]} of {len(keys)} keys replayed")
     # Each key applied once: every account holds its funding plus the unique effects.
     expected = [FUNDED] * ACCOUNT_ROWS
     for client in (a, b):
@@ -815,13 +880,23 @@ def step11(demo, a, b):
     check(source + sum(accounts) == 0 and source == -FUNDED * ACCOUNT_ROWS, (source, accounts))
     count, total = view_sum(gb)
     check(count == ACCOUNT_ROWS and total == FUNDED * ACCOUNT_ROWS, (count, total))
-    say(f"{len(keys)} acknowledged keys replayed with their ops; ledger total 0 and the view's sum "
+    say(f"{verified[0]} of {len(keys)} acknowledged keys replayed with their ops; ledger total 0 and the view's sum "
         f"{total} equal the funding", started)
 
 
 def main():
     global step_number
     demo = Demo(sys.argv[1])
+
+    def overdue():
+        print(f"demo-r4: FAIL step {step_number}: no end after {DEADLINE_SECONDS // 60} minutes",
+              flush=True)
+        demo.close()
+        os._exit(1)
+
+    watchdog = threading.Timer(DEADLINE_SECONDS, overdue)
+    watchdog.daemon = True
+    watchdog.start()
     try:
         a, b = Client("A", demo), Client("B", demo)
         steps = [lambda: step1(demo), lambda: step2(demo), lambda: step3(demo, a, b),
@@ -837,6 +912,7 @@ def main():
         print(f"demo-r4: FAIL step {step_number}: {message}", flush=True)
         sys.exit(1)
     finally:
+        watchdog.cancel()
         demo.close()
 
 

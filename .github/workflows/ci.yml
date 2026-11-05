@@ -217,6 +217,10 @@ jobs:
       - name: demo-r5 (release)
         run: ./zig/zig build -Drelease demo-r5
 
+  # R4's demo (docs/demos/r4.md): two clients, each with its own gateway on one three-replica
+  # cluster: busy refusals and their metrics, a killed gateway, a stalled cluster, keyed resends.
+  # Exactly what `./zig/zig build -Drelease demo-r4` runs; its last line is `demo-r4: PASS` or
+  # `demo-r4: FAIL step N: ...`.
   demo_r4:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
