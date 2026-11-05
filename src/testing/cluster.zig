@@ -101,7 +101,7 @@ pub fn ClusterType(comptime StateMachineType: anytype) type {
             origin: [32]u8 = @splat(0),
             /// Nerva: imports an export into every replica's storage after its format, so that
             /// the cluster starts at an imported checkpoint, as an imported cluster does (R5,
-            /// P151). `origin` is then the export's.
+            /// P159). `origin` is then the export's.
             import: ?*const fn (
                 allocator: mem.Allocator,
                 storage: *Storage,

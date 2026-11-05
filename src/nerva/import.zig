@@ -110,7 +110,7 @@ pub fn plan(arena: std.mem.Allocator, path: []const u8) !Plan {
     return plan_read(arena, &reader);
 }
 
-/// Pass 1 over an export in memory (the VOPR's imported start, P151).
+/// Pass 1 over an export in memory (the VOPR's imported start, P159).
 pub fn plan_bytes(arena: std.mem.Allocator, bytes: []const u8) !Plan {
     var stream = std.io.fixedBufferStream(bytes);
     var reader = try export_file.ReaderType(@TypeOf(stream).Reader).init(stream.reader());
@@ -371,7 +371,7 @@ pub const Options = struct {
     release: vsr.Release,
     /// The export, read again (pass 2): a path, unless `bytes` is set.
     input: []const u8,
-    /// The export itself, in memory, read instead of `input` (the VOPR's imported start, P151).
+    /// The export itself, in memory, read instead of `input` (the VOPR's imported start, P159).
     bytes: ?[]const u8 = null,
     /// The data file's size limit, as the replica that starts from it takes it.
     storage_size_limit: u64 = constants.storage_size_limit_default,

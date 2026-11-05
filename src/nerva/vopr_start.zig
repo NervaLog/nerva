@@ -1,4 +1,4 @@
-//! The VOPR's imported start (R5, P151): one deterministic export, built from the seed in
+//! The VOPR's imported start (R5, P159): one deterministic export, built from the seed in
 //! memory, that the simulator's testing cluster imports into every replica's simulated storage
 //! after its format, so that a seed starts at an imported checkpoint C, as an imported cluster
 //! does, with the replicas' journals empty and their state in the grid.

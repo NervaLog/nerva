@@ -456,7 +456,7 @@ fn options_swarm(prng: *stdx.PRNG) Simulator.Options {
         },
     };
 
-    // Nerva: some seeds start at an imported checkpoint (R5, P151); every replica's origin is
+    // Nerva: some seeds start at an imported checkpoint (R5, P159); every replica's origin is
     // then the export's, in place of the random one drawn above, which keeps the draws of the
     // seed's other parameters where they were.
     if (state_machine == .nerva and vopr_start.drawn(cluster_options.seed)) {
@@ -788,7 +788,7 @@ pub const Simulator = struct {
             .replica_releases = replica_releases,
             .replica_crash_stability = replica_crash_stability,
             .reply_sequence = reply_sequence,
-            // An imported cluster's first op is the one after its checkpoint (P151).
+            // An imported cluster's first op is the one after its checkpoint (P159).
             .reply_op_next = cluster.state_checker.commits.items.len,
         };
     }

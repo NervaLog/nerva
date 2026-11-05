@@ -41,7 +41,7 @@ pub fn StateCheckerType(comptime Client: type, comptime Replica: type) type {
         clients_exhaustive: bool = true,
         clients_register_op_latest: u64 = 0,
 
-        /// The first op `commits` holds a real header of: Nerva's imported start (P151).
+        /// The first op `commits` holds a real header of: Nerva's imported start (P159).
         commits_base: u64 = 0,
 
         /// The number of times the canonical state has been advanced.
@@ -96,7 +96,7 @@ pub fn StateCheckerType(comptime Client: type, comptime Replica: type) type {
             state_checker.commits.deinit();
         }
 
-        /// Nerva: starts the cluster at an imported checkpoint (P151). `header` is the
+        /// Nerva: starts the cluster at an imported checkpoint (P159). `header` is the
         /// checkpoint's prepare, every replica's commit. The ops before it were never run here:
         /// they hold the root header under their own op, and nothing checks them.
         pub fn start_at(state_checker: *StateChecker, header: *const vsr.Header.Prepare) void {
