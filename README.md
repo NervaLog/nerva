@@ -228,15 +228,16 @@ NERVA_KEY=secret nerva api --cluster=1 --addresses=10.0.0.1:3001,10.0.0.2:3001,1
     --listen=127.0.0.1:8080
 ```
 
-- **Loopback only.** `--listen` must be `127.0.0.0/8` or `::1`. `0.0.0.0` and
-  `[::]` serve every interface, and IPv4-mapped spellings such as `::ffff:127.0.0.1` are not plain
-  loopback; all are refused with NRV-E0009 (exit 1) unless `--listen-remote` is given (write
-  `127.0.0.1` for loopback). With the flag and a non-loopback address, one warning (NRV-W0010)
-  says the key and every reply cross the network in plain HTTP ("Network" under Limits). Anyone who bound `0.0.0.0` before must now pass
-  the flag, or move the caller beside the gateway.
+- **Loopback only.** `--listen` must be `127.0.0.0/8` or `::1`. `0.0.0.0` and `[::]` serve every
+  interface, and IPv4-mapped spellings such as `::ffff:127.0.0.1` are not plain loopback; all are
+  refused with NRV-E0009 (exit 1) unless `--listen-remote` is given (write `127.0.0.1` for
+  loopback). With the flag and a non-loopback address, one warning (NRV-W0010) says the key and
+  every reply cross the network in plain HTTP ("Network" under Limits). Anyone who bound `0.0.0.0`
+  before must now pass the flag, or move the caller beside the gateway.
 - **Start and stop.** Start the client process once `GET /healthz` answers `200` (the gateway
-  holds a cluster session), and stop sending it work on `503` NRV-E0605 (a lost session; `503` busy, NRV-E0602, keeps it): the gateway reconnects on its own
-  and `/healthz` says `"session":"ready"` again.
+  holds a cluster session), and stop sending it work on `503` NRV-E0605 (a lost session; `503`
+  busy, NRV-E0602, keeps it): the gateway reconnects on its own and `/healthz` says
+  `"session":"ready"` again.
 - **Timeouts.** Set the client's request timeout above the answer bound (below), and
   `--request-timeout` below the client's. The timeout is per cluster request, so a route that
   makes several can outlast it ("The answer bound"; #186).
@@ -245,6 +246,9 @@ NERVA_KEY=secret nerva api --cluster=1 --addresses=10.0.0.1:3001,10.0.0.2:3001,1
   adding gateways.
 - **Ports.** Every client machine reaches every replica's port; nothing needs to reach the
   gateway's.
+- **Forwarders.** The refusal is advisory: a forwarder (`socat`, a proxy) in front of a loopback
+  gateway reaches round it. That is the operator's choice and carries the same plain-HTTP risk as
+  `--listen-remote`.
 
 ### Upgrading a cluster
 
