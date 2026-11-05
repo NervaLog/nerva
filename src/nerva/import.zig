@@ -107,7 +107,18 @@ pub fn plan(arena: std.mem.Allocator, path: []const u8) !Plan {
     defer file.close();
     var buffered = std.io.bufferedReader(file.reader());
     var reader = try export_file.ReaderType(@TypeOf(buffered).Reader).init(buffered.reader());
+    return plan_read(arena, &reader);
+}
 
+/// Pass 1 over an export in memory (the VOPR's imported start, P151).
+pub fn plan_bytes(arena: std.mem.Allocator, bytes: []const u8) !Plan {
+    var stream = std.io.fixedBufferStream(bytes);
+    var reader = try export_file.ReaderType(@TypeOf(stream).Reader).init(stream.reader());
+    return plan_read(arena, &reader);
+}
+
+/// Pass 1 over `reader`, an `export_file.ReaderType` just initialized.
+fn plan_read(arena: std.mem.Allocator, reader: anytype) !Plan {
     var result: Plan = .{
         .version = reader.version,
         .summary = undefined,
@@ -358,8 +369,12 @@ fn document_read(
 pub const Options = struct {
     cluster: u128,
     release: vsr.Release,
-    /// The export, read again (pass 2).
+    /// The export, read again (pass 2): a path, unless `bytes` is set.
     input: []const u8,
+    /// The export itself, in memory, read instead of `input` (the VOPR's imported start, P151).
+    bytes: ?[]const u8 = null,
+    /// The data file's size limit, as the replica that starts from it takes it.
+    storage_size_limit: u64 = constants.storage_size_limit_default,
 };
 
 pub fn ImporterType(comptime Storage: type) type {
@@ -378,7 +393,7 @@ pub fn ImporterType(comptime Storage: type) type {
             plan_: *const Plan,
         ) !void {
             var superblock = try SuperBlock.init(gpa, storage, .{
-                .storage_size_limit = constants.storage_size_limit_default,
+                .storage_size_limit = options.storage_size_limit,
             });
             defer superblock.deinit(gpa);
             var superblock_context: SuperBlock.Context = undefined;
@@ -531,12 +546,29 @@ pub fn ImporterType(comptime Storage: type) type {
                     trigger_final,
                 });
 
+                if (restore.options.bytes) |bytes| {
+                    var stream = std.io.fixedBufferStream(bytes);
+                    var reader = try export_file.ReaderType(@TypeOf(stream).Reader)
+                        .init(stream.reader());
+                    return restore.ops_read(gpa, &reader, trigger_final, checkpoint_final);
+                }
                 const file = try std.fs.cwd().openFile(restore.options.input, .{});
                 defer file.close();
                 var buffered = std.io.bufferedReader(file.reader());
-                const Reader = export_file.ReaderType(@TypeOf(buffered).Reader);
-                var reader = try Reader.init(buffered.reader());
+                var reader = try export_file.ReaderType(@TypeOf(buffered).Reader)
+                    .init(buffered.reader());
+                return restore.ops_read(gpa, &reader, trigger_final, checkpoint_final);
+            }
 
+            /// `ops` over the export `reader` reads.
+            fn ops_read(
+                restore: *Restore,
+                gpa: std.mem.Allocator,
+                reader: anytype,
+                trigger_final: u64,
+                checkpoint_final: u64,
+            ) !void {
+                const as_of = restore.plan.summary.as_of;
                 var pending: ?Pending = null;
                 var changes_done = false;
                 var view_index: u32 = 0;
@@ -551,7 +583,7 @@ pub fn ImporterType(comptime Storage: type) type {
                 while (op <= trigger_final) : (op += 1) {
                     if (op <= as_of) {
                         if (pending == null and !changes_done) {
-                            pending = try change_next(&reader);
+                            pending = try change_next(reader);
                             changes_done = pending == null;
                         }
                         const change_op = if (pending) |change| change.op() else null;
@@ -610,7 +642,7 @@ pub fn ImporterType(comptime Storage: type) type {
                                     return export_file.corrupt("an op has too many changes");
                                 }
                                 count += 1;
-                                pending = try change_next(&reader);
+                                pending = try change_next(reader);
                                 changes_done = pending == null;
                             }
                             if (records) {
@@ -653,7 +685,7 @@ pub fn ImporterType(comptime Storage: type) type {
                 // The rest of the export, read again: its SHA-256 must still match (the file
                 // may have changed since pass 1).
                 if (!changes_done) {
-                    assert(try change_next(&reader) == null);
+                    assert(try change_next(reader) == null);
                 }
                 while (try reader.next()) |_| {}
             }

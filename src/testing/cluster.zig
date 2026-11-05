@@ -99,6 +99,17 @@ pub fn ClusterType(comptime StateMachineType: anytype) type {
             release_peers_strict: bool = false,
             /// Nerva: every replica's `VSRState.origin`, as `nerva import` writes it (P90).
             origin: [32]u8 = @splat(0),
+            /// Nerva: imports an export into every replica's storage after its format, so that
+            /// the cluster starts at an imported checkpoint, as an imported cluster does (R5,
+            /// P151). `origin` is then the export's.
+            import: ?*const fn (
+                allocator: mem.Allocator,
+                storage: *Storage,
+                seed: u64,
+                cluster_id: u128,
+                release: vsr.Release,
+                storage_size_limit: u64,
+            ) anyerror!void = null,
             /// Nerva: the primary's no-lag commit stall (P136, P143), the same on every replica.
             /// Null: the simulator draws it from the seed (2/5, 1/5 or 0), so that every value a
             /// gateway could be run with is simulated, and logs it. A cluster of another state
@@ -381,6 +392,29 @@ pub fn ClusterType(comptime StateMachineType: anytype) type {
                         .origin = options.cluster.origin,
                     },
                 );
+            }
+
+            if (options.cluster.import) |import| {
+                var header: ?vsr.Header.Prepare = null;
+                for (storages) |*storage| {
+                    // The import reads back what it wrote: no faults.
+                    const faulty = storage.faulty;
+                    storage.faulty = false;
+                    defer storage.faulty = faulty;
+                    try import(
+                        allocator,
+                        storage,
+                        options.cluster.seed,
+                        options.cluster.cluster_id,
+                        options.cluster.releases[0].release,
+                        options.cluster.storage_size_limit,
+                    );
+                    const checkpoint = storage.superblock_header(0).vsr_state.checkpoint.header;
+                    // Every replica imported the same export.
+                    if (header) |expected| assert(expected.checksum == checkpoint.checksum);
+                    header = checkpoint;
+                }
+                state_checker.start_at(&header.?);
             }
 
             const replica_releases_bundled = try allocator.alloc(vsr.ReleaseList, node_count);
