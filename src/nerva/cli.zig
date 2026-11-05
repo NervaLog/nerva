@@ -9,6 +9,7 @@ const assert = std.debug.assert;
 
 const stdx = @import("stdx");
 const vsr = @import("../vsr.zig");
+const diag = @import("diagnostic.zig");
 const nerva = @import("../nerva.zig");
 const constants = @import("../constants.zig");
 const IO = @import("../io.zig").IO;
@@ -278,7 +279,7 @@ pub fn parse_args(flags: *stdx.Flags) Command {
             .development = format.development,
             .log_debug = format.log_debug,
             .path = format.path,
-        }) catch |err| vsr.fatal(.cli, "format: {s}", .{error_message(err)}) },
+        }) catch |err| flag_range("format", err) },
         .start => |start| .{ .start = start_resolve(.{
             .addresses = start.addresses,
             .cache_grid = start.cache_grid,
@@ -290,28 +291,40 @@ pub fn parse_args(flags: *stdx.Flags) Command {
             .development = start.development,
             .log_debug = start.log_debug,
             .path = start.path,
-        }) catch |err| vsr.fatal(.cli, "start: {s}", .{error_message(err)}) },
+        }) catch |err| flag_range("start", err) },
         .view => |view| .{ .view = .{
             .cluster = view.cluster,
             .addresses = view.addresses,
             .listen = listen_parse(view.listen) orelse
-                vsr.fatal(.cli, "view: --listen must be <ipv4>:<port> or [<ipv6>]:<port>", .{}),
+                listen_invalid("view"),
             .log_debug = view.log_debug,
         } },
         .api => |api| .{ .api = .{
             .cluster = api.cluster,
             .addresses = api.addresses,
             .listen = listen_parse(api.listen) orelse
-                vsr.fatal(.cli, "api: --listen must be <ipv4>:<port> or [<ipv6>]:<port>", .{}),
+                listen_invalid("api"),
             .log_debug = api.log_debug,
         } },
         .@"export" => |args| .{ .@"export" = .{
             .cluster = args.cluster,
             .addresses = args.addresses,
             .as_of = as_of_parse(args.as_of) catch
-                vsr.fatal(.cli, "export: --as-of must be an op above zero, or latest", .{}),
+                diag.fail(
+                    "NRV-E0001",
+                    "export: --as-of must be an op above zero, or latest",
+                    .{},
+                    "give --as-of=latest or an op above zero",
+                    .{},
+                ),
             .output = if (args.output.len == 0)
-                vsr.fatal(.cli, "export: --output must name a file", .{})
+                diag.fail(
+                    "NRV-E0001",
+                    "export: --output must name a file",
+                    .{},
+                    "give --output=<path> for a file that does not exist yet",
+                    .{},
+                )
             else
                 args.output,
             .log_debug = args.log_debug,
@@ -324,8 +337,14 @@ pub fn parse_args(flags: *stdx.Flags) Command {
                 .development = args.development,
                 .log_debug = args.log_debug,
                 .path = args.path,
-            }) catch |err| vsr.fatal(.cli, "import: {s}", .{error_message(err)});
-            if (args.input.len == 0) vsr.fatal(.cli, "import: --input must name a file", .{});
+            }) catch |err| flag_range("import", err);
+            if (args.input.len == 0) diag.fail(
+                "NRV-E0001",
+                "import: --input must name a file",
+                .{},
+                "give --input=<path> of an export made by nerva export",
+                .{},
+            );
             break :import .{ .import = .{
                 .cluster = format.cluster,
                 .replica = format.replica,
@@ -338,6 +357,26 @@ pub fn parse_args(flags: *stdx.Flags) Command {
         },
         .version => .version,
     };
+}
+
+fn flag_range(comptime command: []const u8, err: Error) noreturn {
+    diag.fail(
+        "NRV-E0002",
+        command ++ ": {s}",
+        .{error_message(err)},
+        "nerva " ++ command ++ " --help names every flag and its bounds",
+        .{},
+    );
+}
+
+fn listen_invalid(comptime command: []const u8) noreturn {
+    diag.fail(
+        "NRV-E0003",
+        command ++ ": --listen must be <ipv4>:<port> or [<ipv6>]:<port>",
+        .{},
+        "give --listen=host:port, with an IPv6 host in brackets",
+        .{},
+    );
 }
 
 /// `--as-of`: an op above zero, or `latest` (null).

@@ -281,6 +281,21 @@ nerva start --addresses=3001,3002,3003 0_0.nerva   # and 0_1, 0_2
   970,000 rows exported in 5.8 s (365 MiB at most) and imported in 14 s (1.2 GiB, the state
   machine's fixed allocation, as a replica's); the export file is 121 bytes a change.
 
+### When a command refuses
+
+A `nerva` command that refuses prints one block and exits (R5, [docs/ERRORS.md](./docs/ERRORS.md)):
+
+```
+error[NRV-E0004]: export: cluster.export exists
+  cause  An output file already exists
+  fix    give a new path: nerva never overwrites a file
+```
+
+The exit status says who is to blame: 1 the operator's input, 2 the environment (disk, kernel,
+file system), 70 a bug in Nerva (`bug[NRV-B…]`, with the error's name on a `detail` line under
+`--log-debug`). `nerva start`'s runtime exits keep their statuses (2 to 8). The flag parser's own
+messages (an unknown or repeated flag) are not coded yet.
+
 ### Metrics and traces
 
 `nerva start --statsd=<host:port>` sends the replica's metrics over UDP every 10 seconds, in
