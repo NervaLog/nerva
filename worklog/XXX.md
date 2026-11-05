@@ -1,0 +1,5 @@
+# XXX
+
+2026-11-05. Records how the supervisor runs the review loop (PXXX): GitHub updates branches and
+waits for CI, re-reviews read the delta, text fixes go to Haiku, reports are short, a review with
+no MUST merges with its SHOULDs in a follow-up, and each agent logs into its own directory.
