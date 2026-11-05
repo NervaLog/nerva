@@ -25,11 +25,20 @@ main() {
     # the smaller of every core but one (git, builds and the reporter) and what memory holds.
     : "${SIM_FLEET_SEED_MEMORY_MB:=4096}"
     : "${SIM_FLEET_RESERVE_MB:=1024}"
+    local name
+    for name in SIM_FLEET_SEED_MEMORY_MB SIM_FLEET_RESERVE_MB; do
+        if [[ ! "${!name}" =~ ^[0-9]+$ ]] || (( 10#${!name} == 0 )); then
+            log "$name must be a positive whole number of MB, not '${!name}'"
+            exit 2
+        fi
+    done
     local mem_mb mem_source
     read -r mem_mb mem_source < <(memory_mb)
+    local computed=""
     if [[ -z "${SIM_FLEET_WORKERS:-}" ]]; then
-        SIM_FLEET_WORKERS=$(default_workers "$(nproc)" "$mem_mb")
+        SIM_FLEET_WORKERS=$(default_workers "$(nproc)" "$mem_mb" "$mem_source")
         workers_from="computed from $(nproc) cores and $mem_mb MB ($mem_source)"
+        computed=1
     else
         workers_from="set"
     fi
@@ -38,6 +47,12 @@ main() {
     plan=$(split_workers "$SIM_FLEET_WORKERS")
     read -r SIM_FLEET_WORKERS_VOPR_NERVA SIM_FLEET_WORKERS_VOPR_TESTING SIM_FLEET_WORKERS_FUZZ \
         SIM_FLEET_WORKERS_MIXED <<<"$plan"
+    local planned=$(( SIM_FLEET_WORKERS_VOPR_NERVA + SIM_FLEET_WORKERS_VOPR_TESTING \
+        + SIM_FLEET_WORKERS_FUZZ + SIM_FLEET_WORKERS_MIXED ))
+    if [[ -n "$computed" ]] && (( planned > SIM_FLEET_WORKERS )); then
+        log "warning: the worker settings in fleet.env add up to $planned, above the" \
+            "$SIM_FLEET_WORKERS that $mem_mb MB holds; the settings win, and seeds may be OOM-killed"
+    fi
     # Every fuzzer in src/fuzz_tests.zig but `canary` (fails on purpose) and `smoke`, as fuzz.yml.
     : "${SIM_FLEET_FUZZERS:=ewah lsm_scan lsm_cache_map lsm_manifest_log lsm_manifest_level \
 lsm_segmented_array lsm_tree message_bus storage vsr_free_set vsr_superblock \
@@ -82,7 +97,7 @@ vsr_superblock_quorums vsr_multi_batch nerva_adds nerva_http_head nerva_document
     fi
 
     STATE=$SIM_FLEET_STATE_DIR
-    mkdir -p "$STATE/bin"
+    mkdir -p "$STATE/bin" "$STATE/rotation"
     # One loop per state directory: two would race on the state file and the checkout.
     exec 9>"$STATE/lock"
     if ! flock -n 9; then
@@ -115,29 +130,45 @@ vsr_superblock_quorums vsr_multi_batch nerva_adds nerva_http_head nerva_document
     done
 }
 
-# The memory the fleet may use, in MB, and where the figure came from: MemTotal, or the cgroup's
-# memory.max when that is lower. MemTotal rather than MemAvailable: it does not move with the page
-# cache or with the fleet's own restart, so a restart picks the same worker count.
+# The memory the fleet may use, in MB, and where the figure came from: MemTotal, or the lowest
+# memory.max on the cgroup's path up to the root when that is lower than MemTotal (the unit's
+# MemoryMax, which setup.sh sets to MemTotal minus the reserve). MemTotal rather than
+# MemAvailable: it does not move with the page cache or with the fleet's own restart, so a
+# restart picks the same worker count. The three paths can be overridden for the tests.
 memory_mb() {
-    local total cg path limit=""
-    total=$(awk '/^MemTotal:/ { print int($2 / 1024) }' /proc/meminfo)
-    path=$(sed -n 's/^0:://p' /proc/self/cgroup 2>/dev/null || true)
-    for cg in "/sys/fs/cgroup$path/memory.max" /sys/fs/cgroup/memory.max; do
-        if [[ -r "$cg" ]]; then limit=$(cat "$cg"); break; fi
+    local meminfo=${SIM_FLEET_MEMINFO:-/proc/meminfo}
+    local proc_cgroup=${SIM_FLEET_PROC_CGROUP:-/proc/self/cgroup}
+    local root=${SIM_FLEET_CGROUP_ROOT:-/sys/fs/cgroup}
+    local total path limit lowest=""
+    total=$(awk '/^MemTotal:/ { print int($2 / 1024) }' "$meminfo")
+    path=$(sed -n 's/^0:://p' "$proc_cgroup" 2>/dev/null || true)
+    path=${path%/}
+    while :; do
+        if [[ -r "$root$path/memory.max" ]]; then
+            limit=$(cat "$root$path/memory.max" 2>/dev/null || true)
+            if [[ "$limit" =~ ^[0-9]+$ ]] && { [[ -z "$lowest" ]] || (( limit < lowest )); }; then
+                lowest=$limit
+            fi
+        fi
+        if [[ -z "$path" ]]; then break; fi
+        path=${path%/*}
     done
-    if [[ "$limit" =~ ^[0-9]+$ ]] && (( limit / 1048576 < total )); then
-        echo "$(( limit / 1048576 )) cgroup memory.max"
+    if [[ -n "$lowest" ]] && (( lowest / 1048576 < total )); then
+        echo "$(( lowest / 1048576 )) cgroup memory.max"
     else
         echo "$total MemTotal"
     fi
 }
 
-# Default worker count for $1 cores and $2 MB: the smaller of cores - 1 and (MB - reserve) per
-# seed, at least 1.
+# Default worker count for $1 cores and $2 MB: the smaller of cores - 1 and MB per seed, at least
+# 1. $3 says where the MB came from (memory_mb's second word): MemTotal leaves the reserve
+# SIM_FLEET_RESERVE_MB to the host; a cgroup limit is already MemTotal minus that reserve
+# (setup.sh), so the reserve is taken here only once.
 default_workers() {
-    local cores=$1 mem=$2 by_cpu by_mem
+    local cores=$1 mem=$2 source=${3:-MemTotal} by_cpu by_mem
     by_cpu=$(( cores > 1 ? cores - 1 : 1 ))
-    by_mem=$(( (mem - SIM_FLEET_RESERVE_MB) / SIM_FLEET_SEED_MEMORY_MB ))
+    if [[ "$source" == MemTotal ]]; then mem=$(( mem - SIM_FLEET_RESERVE_MB )); fi
+    by_mem=$(( mem / SIM_FLEET_SEED_MEMORY_MB ))
     echo $(( by_mem < by_cpu ? (by_mem > 1 ? by_mem : 1) : by_cpu ))
 }
 
@@ -147,15 +178,27 @@ default_workers() {
 # the kinds seed by seed (MIXED below, so Nerva's get half), as three single-kind workers would
 # not fit the memory that made the count small.
 split_workers() {
-    local total=$1 eighth n t f m
+    local total=$1 eighth n t f m left
     eighth=$(( total / 8 > 0 ? total / 8 : 1 ))
     if [[ -n "${SIM_FLEET_WORKERS_VOPR_NERVA:-}${SIM_FLEET_WORKERS_VOPR_TESTING:-}\
 ${SIM_FLEET_WORKERS_FUZZ:-}" ]]; then
-        # Kinds set by hand: the others keep the old defaults, and nothing rotates unless asked.
-        t=${SIM_FLEET_WORKERS_VOPR_TESTING:-$eighth}
-        f=${SIM_FLEET_WORKERS_FUZZ:-$eighth}
-        n=${SIM_FLEET_WORKERS_VOPR_NERVA:-$(( total - t - f > 0 ? total - t - f : 1 ))}
+        # Kinds set by hand keep their number. The others share only what is left of the total
+        # (Nerva's first, as by default), so one setting never adds workers: a worker is 4 GB.
         m=${SIM_FLEET_WORKERS_MIXED:-0}
+        left=$(( total - m - ${SIM_FLEET_WORKERS_VOPR_NERVA:-0} \
+            - ${SIM_FLEET_WORKERS_VOPR_TESTING:-0} - ${SIM_FLEET_WORKERS_FUZZ:-0} ))
+        if (( left < 0 )); then left=0; fi
+        n=${SIM_FLEET_WORKERS_VOPR_NERVA:-}
+        if [[ -z "$n" ]]; then
+            t=${SIM_FLEET_WORKERS_VOPR_TESTING:-$eighth}
+            f=${SIM_FLEET_WORKERS_FUZZ:-$eighth}
+            n=$(( total - t - f > 1 ? total - t - f : 1 ))
+            n=$(( n < left ? n : left ))
+            left=$(( left - n ))
+        fi
+        t=${SIM_FLEET_WORKERS_VOPR_TESTING:-$(( eighth < left ? eighth : left ))}
+        if [[ -z "${SIM_FLEET_WORKERS_VOPR_TESTING:-}" ]]; then left=$(( left - t )); fi
+        f=${SIM_FLEET_WORKERS_FUZZ:-$(( eighth < left ? eighth : left ))}
     elif (( total < 3 )); then
         n=0 t=0 f=0 m=${SIM_FLEET_WORKERS_MIXED:-$total}
     else
@@ -279,7 +322,14 @@ run_round() {
 worker() {
     local dir="$round/w$1" kind=$2 deadline=$3 next=${4:-0}
     local target exe seed code started out turn=$next cur=$kind
+    local rot="$STATE/rotation/$kind-${4:-0}" saved_turn saved_next
     mkdir -p "$dir"
+    # The rotation resumes where the last round left it: a round is short, and the last fuzzers
+    # of the list would never run if every round began at the first.
+    if [[ -r "$rot" ]] && read -r saved_turn saved_next <"$rot" &&
+        [[ "$saved_turn" =~ ^[0-9]+$ && "$saved_next" =~ ^[0-9]+$ ]]; then
+        turn=$saved_turn next=$saved_next
+    fi
     while (( $(date +%s) < deadline )); do
         seed=$(od -An -N8 -tu8 /dev/urandom | tr -d ' ')
         if [[ "$kind" == mixed ]]; then
@@ -314,6 +364,10 @@ worker() {
             fi
         fi
         echo "$target $seed $code $(( $(date +%s) - started ))" >>"$dir/results"
+        if [[ "$kind" == mixed || "$kind" == fuzz ]]; then
+            echo "$(( turn % ${#MIXED[@]} )) $(( next % ${#FUZZERS[@]} ))" >"$rot.new" &&
+                mv "$rot.new" "$rot"
+        fi
     done
     rm -f "$dir/seed.log"
 }

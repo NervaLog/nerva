@@ -401,8 +401,8 @@ class WorkerPlan(unittest.TestCase):
                              env=full, capture_output=True, text=True, check=True)
         return out.stdout.strip()
 
-    def count(self, cores, mem_mb):
-        return int(self.sh(f"default_workers {cores} {mem_mb}"))
+    def count(self, cores, mem_mb, source="MemTotal"):
+        return int(self.sh(f"default_workers {cores} {mem_mb} '{source}'"))
 
     def test_memory_limits_the_default_count(self):
         self.assertEqual(self.count(4, 7168), 1)   # The first host: 4 cores, 7 GiB.
@@ -410,9 +410,18 @@ class WorkerPlan(unittest.TestCase):
         self.assertEqual(self.count(16, 65536), 15)
         self.assertEqual(self.count(16, 32768), 7)
 
+    def test_a_cgroup_limit_already_leaves_the_reserve(self):
+        # setup.sh's MemoryMax is MemTotal - 1 GiB, at most 56G = 57344 MB: nothing more is taken.
+        self.assertEqual(self.count(16, 57344, "cgroup memory.max"), 14)   # A 64 GB host.
+        self.assertEqual(self.count(16, 8276, "cgroup memory.max"), 2)     # MemTotal 9300.
+        self.assertEqual(self.count(4, 6144, "cgroup memory.max"), 1)      # The first host.
+        # The same figure from MemTotal pays the reserve: 57344 - 1024 holds 13.
+        self.assertEqual(self.count(16, 57344, "MemTotal"), 13)
+
     def test_the_count_is_at_least_one(self):
         self.assertEqual(self.count(1, 512), 1)
         self.assertEqual(self.count(8, 2048), 1)
+        self.assertEqual(self.count(8, 512, "cgroup memory.max"), 1)
 
     def test_fewer_than_three_workers_are_all_mixed(self):
         self.assertEqual(self.sh("split_workers 1"), "0 0 0 1")
@@ -421,6 +430,7 @@ class WorkerPlan(unittest.TestCase):
     def test_three_or_more_split_as_before(self):
         self.assertEqual(self.sh("split_workers 3"), "1 1 1 0")
         self.assertEqual(self.sh("split_workers 15"), "13 1 1 0")
+        self.assertEqual(self.sh("split_workers 14"), "12 1 1 0")  # A 64 GB host.
 
     def test_the_split_never_exceeds_the_total(self):
         for total in range(1, 40):
@@ -431,11 +441,178 @@ class WorkerPlan(unittest.TestCase):
         self.assertEqual(self.sh("split_workers 1", SIM_FLEET_WORKERS_FUZZ="0",
                                  SIM_FLEET_WORKERS_VOPR_TESTING="0"), "1 0 0 0")
         self.assertEqual(self.sh("split_workers 2", SIM_FLEET_WORKERS_MIXED="3"), "0 0 0 3")
+        self.assertEqual(self.sh("split_workers 15", SIM_FLEET_WORKERS_FUZZ="4"), "10 1 4 0")
 
-    def test_memory_comes_from_the_host(self):
-        mem, source = self.sh("memory_mb").split(maxsplit=1)
+    def test_one_kind_set_by_hand_adds_no_workers(self):
+        self.assertEqual(self.sh("split_workers 1", SIM_FLEET_WORKERS_FUZZ="0"), "1 0 0 0")
+        self.assertEqual(self.sh("split_workers 1", SIM_FLEET_WORKERS_VOPR_TESTING="0"),
+                         "1 0 0 0")
+        self.assertEqual(self.sh("split_workers 1", SIM_FLEET_WORKERS_VOPR_NERVA="1"), "1 0 0 0")
+        self.assertEqual(self.sh("split_workers 2", SIM_FLEET_WORKERS_FUZZ="0"), "1 1 0 0")
+        for total in range(1, 20):
+            for var in ("FUZZ", "VOPR_TESTING", "VOPR_NERVA"):
+                for v in ("0", "1"):
+                    n, t, f, m = map(int, self.sh(
+                        f"split_workers {total}", **{f"SIM_FLEET_WORKERS_{var}": v}).split())
+                    self.assertLessEqual(n + t + f + m, max(total, int(v)))
+
+    def test_hand_set_kinds_above_the_total_are_kept(self):
+        self.assertEqual(self.sh("split_workers 1", SIM_FLEET_WORKERS_VOPR_NERVA="3"), "3 0 0 0")
+
+    def test_a_warning_when_hand_set_kinds_exceed_the_computed_total(self):
+        home = tempfile.mkdtemp()
+        meminfo = os.path.join(home, "meminfo")
+        with open(meminfo, "w") as f:
+            f.write("MemTotal: 7340032 kB\n")  # 7168 MB: one worker.
+        out = subprocess.run(
+            ["bash", "-c", f'source "{HERE}/run.sh"; main'],
+            env={"PATH": os.environ["PATH"], "SIM_FLEET_DRY_RUN": "1", "SIM_FLEET_HOME": home,
+                 "SIM_FLEET_MEMINFO": meminfo, "SIM_FLEET_PROC_CGROUP": "/nonexistent",
+                 "SIM_FLEET_REMOTE": "/nonexistent", "SIM_FLEET_GIT_TIMEOUT": "5",
+                 "SIM_FLEET_WORKERS_VOPR_NERVA": "3"},
+            capture_output=True, text=True)
+        warnings = [l for l in out.stdout.splitlines() if "warning" in l]
+        self.assertEqual(len(warnings), 1, out.stdout)
+        self.assertIn("add up to 3", warnings[0])
+        self.assertIn("above the 1", warnings[0])
+
+    def test_a_bad_memory_setting_is_refused_with_one_line(self):
+        for var in ("SIM_FLEET_SEED_MEMORY_MB", "SIM_FLEET_RESERVE_MB"):
+            for bad in ("0", "abc", "-5", "4G"):
+                out = subprocess.run(
+                    ["bash", "-c", f'source "{HERE}/run.sh"; main'],
+                    env={"PATH": os.environ["PATH"], "SIM_FLEET_DRY_RUN": "1",
+                         "SIM_FLEET_HOME": tempfile.mkdtemp(), var: bad},
+                    capture_output=True, text=True)
+                self.assertEqual(out.returncode, 2, (var, bad, out.stderr))
+                self.assertIn(f"{var} must be a positive whole number", out.stdout)
+                self.assertEqual(len(out.stdout.strip().splitlines()), 1)
+                self.assertEqual(out.stderr, "")
+
+
+class MemoryLimit(unittest.TestCase):
+    """memory_mb against fake /proc and /sys files."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.meminfo = os.path.join(self.dir, "meminfo")
+        self.proc = os.path.join(self.dir, "cgroup")
+        self.root = os.path.join(self.dir, "sys")
+        os.makedirs(self.root)
+        self.write(self.meminfo, "MemTotal:       65536000 kB\nMemFree: 1 kB\n")  # 64000 MB.
+
+    def write(self, path, text):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            f.write(text)
+
+    def limit(self, path, value):
+        self.write(os.path.join(self.root + path, "memory.max"), f"{value}\n")
+
+    def memory(self, cgroup="0::/system.slice/sim-fleet.service\n"):
+        if cgroup is not None:
+            self.write(self.proc, cgroup)
+        out = subprocess.run(
+            ["bash", "-c", f'set -euo pipefail; source "{HERE}/run.sh"; memory_mb'],
+            env={"PATH": os.environ["PATH"], "SIM_FLEET_MEMINFO": self.meminfo,
+                 "SIM_FLEET_PROC_CGROUP": self.proc, "SIM_FLEET_CGROUP_ROOT": self.root},
+            capture_output=True, text=True, check=True)
+        return out.stdout.strip()
+
+    def test_max_means_memtotal(self):
+        self.limit("/system.slice/sim-fleet.service", "max")
+        self.assertEqual(self.memory(), "64000 MemTotal")
+
+    def test_a_limit_below_memtotal_wins(self):
+        self.limit("/system.slice/sim-fleet.service", 57344 * 1048576)
+        self.assertEqual(self.memory(), "57344 cgroup memory.max")
+
+    def test_a_limit_above_memtotal_or_a_huge_one_is_ignored(self):
+        self.limit("/system.slice/sim-fleet.service", 128000 * 1048576)
+        self.assertEqual(self.memory(), "64000 MemTotal")
+        self.limit("/system.slice/sim-fleet.service", "9223372036854771712")
+        self.assertEqual(self.memory(), "64000 MemTotal")
+
+    def test_a_missing_file_means_memtotal(self):
+        self.assertEqual(self.memory(), "64000 MemTotal")
+        self.assertEqual(self.memory(cgroup=""), "64000 MemTotal")
+
+    def test_cgroup_v1_has_no_unified_line(self):
+        self.limit("", 1000 * 1048576)  # Even a stray file at the root of the fake tree.
+        self.assertEqual(self.memory("4:memory:/docker/abc\n1:name=systemd:/\n"),
+                         "1000 cgroup memory.max")
+        self.write(self.proc, "4:memory:/docker/abc\n")
+        os.remove(os.path.join(self.root, "memory.max"))
+        self.assertEqual(self.memory(None), "64000 MemTotal")
+
+    def test_the_lowest_limit_up_the_path_wins(self):
+        self.limit("/system.slice/sim-fleet.service", "max")
+        self.limit("/system.slice", 8000 * 1048576)
+        self.limit("", 20000 * 1048576)
+        self.assertEqual(self.memory(), "8000 cgroup memory.max")
+        self.limit("/system.slice/sim-fleet.service", 6000 * 1048576)
+        self.assertEqual(self.memory(), "6000 cgroup memory.max")
+
+    def test_the_real_host_gives_a_figure(self):
+        out = self.sh_real()
+        mem, source = out.split(maxsplit=1)
         self.assertGreater(int(mem), 0)
         self.assertIn(source, ("MemTotal", "cgroup memory.max"))
+
+    def sh_real(self):
+        return subprocess.run(
+            ["bash", "-c", f'set -euo pipefail; source "{HERE}/run.sh"; memory_mb'],
+            env={"PATH": os.environ["PATH"]}, capture_output=True, text=True,
+            check=True).stdout.strip()
+
+
+class Rotation(unittest.TestCase):
+    """A worker's rotation resumes where the last round left it."""
+
+    def run_worker(self, state, kind, start, fuzzers):
+        bindir = os.path.join(state, "fakebin")
+        os.makedirs(bindir, exist_ok=True)
+        for name in ("fuzz", "vopr-nerva", "vopr-testing"):
+            path = os.path.join(bindir, name)
+            with open(path, "w") as f:
+                f.write("#!/bin/sh\nexit 0\n")
+            os.chmod(path, 0o755)
+        rnd = os.path.join(state, "round-" + str(len(os.listdir(state))))
+        script = (f'source "{HERE}/run.sh"; STATE="{state}"; bin="{bindir}"; round="{rnd}"; '
+                  f'FUZZERS=({fuzzers}); mkdir -p "$STATE/rotation"; '
+                  f'worker 0 {kind} $(( $(date +%s) + 1 )) {start}')
+        subprocess.run(["bash", "-c", script], check=True, capture_output=True,
+                       env={"PATH": os.environ["PATH"], "SIM_FLEET_VOPR_SEED_TIMEOUT": "10",
+                            "SIM_FLEET_FUZZ_SEED_TIMEOUT": "10", "SIM_FLEET_TAIL_BYTES": "100",
+                            "SIM_FLEET_REPLAY_TIMEOUT": "10"})
+        with open(os.path.join(rnd, "w0", "results")) as f:
+            return [line.split()[0] for line in f]
+
+    def test_a_fuzz_worker_continues_through_the_list_across_rounds(self):
+        state = tempfile.mkdtemp()
+        fuzzers = "a b c d e"
+        first = self.run_worker(state, "fuzz", 0, fuzzers)
+        second = self.run_worker(state, "fuzz", 0, fuzzers)
+        names = fuzzers.split()
+        both = [t.split(":")[1] for t in first + second]
+        self.assertGreater(len(first), 0)
+        self.assertEqual(both, [names[i % 5] for i in range(len(both))])
+
+    def test_a_mixed_worker_continues_its_kinds_and_fuzzers_across_rounds(self):
+        state = tempfile.mkdtemp()
+        fuzzers = "a b c"
+        both = self.run_worker(state, "mixed", 1, fuzzers) + \
+            self.run_worker(state, "mixed", 1, fuzzers)
+        kinds = ["vopr-nerva", "vopr-testing", "vopr-nerva", "fuzz"]
+        want, fuzz_i = [], 1  # `next` starts at the worker's offset.
+        for i in range(len(both)):
+            kind = kinds[(1 + i) % 4]
+            if kind == "fuzz":
+                want.append("fuzz:" + fuzzers.split()[fuzz_i % 3])
+                fuzz_i += 1
+            else:
+                want.append(kind)
+        self.assertEqual(both, want)
 
 
 if __name__ == "__main__":
