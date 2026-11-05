@@ -1360,6 +1360,27 @@ pub const Operation = enum(u8) {
     scan_index = constants.vsr_operations_reserved + 14,
     get_index = constants.vsr_operations_reserved + 15,
 
+    /// Whether the operation can change the cluster's state (a commit or a declaration). The
+    /// gateway counts the writes a request sent to say whether it may have been applied
+    /// (`Client.writes_sent`, NRV-E0601). A new operation must choose: the switch is exhaustive.
+    pub fn is_write(operation: Operation) bool {
+        return switch (operation) {
+            .commit, .commit_wide, .declare_view, .declare_ledger, .declare_index => true,
+            .lookup_rows,
+            .get_changes,
+            .get_history,
+            .get_view,
+            .pulse,
+            .get_ledger,
+            .lookup_records,
+            .get_record_changes,
+            .get_record_history,
+            .scan_index,
+            .get_index,
+            => false,
+        };
+    }
+
     pub fn EventType(comptime operation: Operation) type {
         return switch (operation) {
             .lookup_rows => RowKey,

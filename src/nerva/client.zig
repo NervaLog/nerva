@@ -84,6 +84,10 @@ pub const Client = struct {
     /// The previous request's round trip, sent with the next request so that the primary
     /// records it as `client_request_round_trip` (0 until a request has completed).
     latency_previous_ns: u32,
+    /// Requests of a write (`Operation.is_write`) sent so far, whether or not answered. A gateway
+    /// compares it before and after a request: unchanged, nothing was applied; changed and no
+    /// reply, the write may have been (NRV-E0601).
+    writes_sent: u64,
 
     /// Connects and registers a session; blocks until registered.
     pub fn init(client: *Client, allocator: std.mem.Allocator, options: Options) !void {
@@ -102,6 +106,7 @@ pub const Client = struct {
             .reply_size = null,
             .request = undefined,
             .latency_previous_ns = 0,
+            .writes_sent = 0,
         };
         errdefer client.io.deinit();
 
@@ -146,8 +151,11 @@ pub const Client = struct {
         assert(client.state == .timed_out or client.state == .evicted);
         const allocator = client.allocator;
         const options = client.options;
+        const writes_sent = client.writes_sent;
         client.deinit();
         try client.init(allocator, options);
+        // A count a gateway took before the request still compares with it.
+        client.writes_sent = writes_sent;
     }
 
     pub fn deinit(client: *Client) void {
@@ -585,6 +593,7 @@ pub const Client = struct {
         assert(events.len % operation.event_size() == 0);
         assert(events.len <= client.vsr_client.batch_size_limit.?);
 
+        if (operation.is_write()) client.writes_sent += 1;
         const message = client.vsr_client.get_message().build(.request);
         message.header.* = .{
             .client = client.vsr_client.id,

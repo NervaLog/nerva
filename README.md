@@ -697,8 +697,8 @@ used; the sections above say why.
 
 **Gateways** (`nerva api`, `nerva view`):
 - A `nerva api` request body is at most 4 MiB; a larger `Content-Length` answers
-  `400 {"error":"body too large"}` before the body is read. `nerva view` takes no body: it answers
-  `GET` only, and any body answers that same `400`.
+  `413 {"error":"body too large",…}` before the body is read (a `400` before R4). `nerva view`
+  takes no body: it answers `GET` only, and any body answers that same `413`.
 - A `nerva api` request may allocate at most 128 MiB once parsed; more answers
   `413 {"error":"request too complex"}`. Between requests the gateway keeps at most 8 MiB.
 - 16 connections are read at once. With all 16 busy, a new connection displaces the oldest one

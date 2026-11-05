@@ -21,7 +21,7 @@ Usage: ledgers.py <path to nerva> [--seed=N]
 import os, random, sys, threading
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from api import Cluster, request  # noqa: E402
+from api import Cluster, plain, request  # noqa: E402
 
 ACCOUNTS = 40
 SOURCES = 41
@@ -177,16 +177,16 @@ def check_refusals(ports):
         status, body = commit(port, entries)
         assert status == 409 and body["status"] == "unpaired", (entries, status, body)
     status, body = commit(port, unpaired[2])
-    assert body == {"status": "unpaired", "index": 1}, body
+    assert plain(body) == {"status": "unpaired", "index": 1}, body
 
     # A partner stopped by its floor: the whole transaction is out_of_bounds.
     status, body = commit(port, [move(ACCOUNTS, 2, "held", delta=20, pair=True),
                                  move(ACCOUNTS, 2, "available", delta_from=0)])
-    assert status == 409 and body == {"status": "out_of_bounds", "index": 1, "value": "10"}, body
+    assert status == 409 and plain(body) == {"status": "out_of_bounds", "index": 1, "value": "10"}, body
     # A first half stopped by its floor, without clamp.
     status, body = commit(port, [move(ACCOUNTS, 2, "available", delta=-11, pair=True),
                                  move(ACCOUNTS, 2, "held", delta_from=0)])
-    assert status == 409 and body == {"status": "out_of_bounds", "index": 0, "value": "10"}, body
+    assert status == 409 and plain(body) == {"status": "out_of_bounds", "index": 0, "value": "10"}, body
 
     conserved_writes = [
         [{"kind": "put", "table": ACCOUNTS, "id": "2", "fields": {"available": "0", "note": "1"}}],
@@ -197,7 +197,7 @@ def check_refusals(ports):
     ]
     for entries in conserved_writes:
         status, body = commit(port, entries)
-        assert status == 409 and body == {"status": "conserved_write", "index": 0}, (entries, body)
+        assert status == 409 and plain(body) == {"status": "conserved_write", "index": 0}, (entries, body)
     assert (fields(port, ACCOUNTS, 2), fields(port, SOURCES, 1)) == before
 
     # Puts that leave balances alone, and deletes of empty accounts, commit.
@@ -213,10 +213,10 @@ def check_refusals(ports):
     different = {"fields": [dict(field) for field in LEDGER["fields"]]}
     different["fields"][0]["floor"] = "0"
     status, body = request(port, "PUT", "/v1/ledgers/1", different)
-    assert status == 409 and body == {"status": "ledger_immutable", "ledger": 1}, body
+    assert status == 409 and plain(body) == {"status": "ledger_immutable", "ledger": 1}, body
     status, body = request(port, "PUT", "/v1/ledgers/2", {"fields": [
         {"table": ACCOUNTS, "offset": 8}, {"table": ACCOUNTS, "offset": 24}]})
-    assert status == 409 and body == {"status": "ledger_field_taken", "ledger": 2}, body
+    assert status == 409 and plain(body) == {"status": "ledger_field_taken", "ledger": 2}, body
     assert request(port, "GET", "/v1/ledgers/2")[0] == 404
 
     # A view grouping by a field, then a ledger over it; a ledger, then a view filtering on it.
@@ -225,7 +225,7 @@ def check_refusals(ports):
     assert status == 200 and body["maintained"], body
     status, body = request(port, "PUT", "/v1/ledgers/3", {"fields": [
         {"table": GROUPED, "field": "kind"}, {"table": GROUPED, "field": "amount"}]})
-    assert status == 409 and body == {"status": "field_viewed", "ledger": 3}, body
+    assert status == 409 and plain(body) == {"status": "field_viewed", "ledger": 3}, body
     status, body = request(port, "PUT", "/v1/views/funded", {
         "table": ACCOUNTS, "where": [{"field": "available", "op": "gt", "value": 0}],
         "aggregates": [{"fn": "count"}]})

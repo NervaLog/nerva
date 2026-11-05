@@ -20,6 +20,12 @@ const http_connection = @import("../http_connection.zig");
 const FollowerType = @import("follower.zig").FollowerType;
 const DeclaredViews = @import("declared.zig").DeclaredViews;
 const ClientHealth = @import("../client_health.zig").ClientHealth;
+const wire = @import("../wire_code.zig");
+
+/// A fixed error reply: nothing a view server does changes the cluster (it only reads).
+fn failed(comptime status: u16, comptime code: wire.Code, comptime reason: []const u8) Reply {
+    return .{ .status = status, .body = wire.error_body(code, reason, .no) };
+}
 
 /// Connections whose requests are read at once (N45).
 const connections_max = 16;
@@ -86,7 +92,7 @@ pub fn serve(gpa: std.mem.Allocator, client: *Client, options: Options) !noretur
         ) catch |err|
             reply: {
                 log.warn("request: {}", .{err});
-                break :reply Reply{ .status = 500, .body = "{\"error\":\"internal error\"}" };
+                break :reply failed(500, .B0001, "internal error");
             };
         receiver.respond(received, reply.status, reply.body);
     }
@@ -108,34 +114,38 @@ fn serve_request(
     request: *const http_connection.Request,
 ) !Reply {
     if (request.method != .get) {
-        return .{ .status = 405, .body = "{\"error\":\"method not allowed\"}" };
+        return failed(405, .E0104, "method not allowed");
     }
     const target = request.target;
     if (std.mem.eql(u8, target, "/healthz")) {
         if (health.state != .ready) return unavailable_healthz;
-        return .{ .status = 200, .body = "{\"ok\":true}" };
+        return .{ .status = 200, .body = "{\"ok\":true,\"session\":\"ready\"}" };
     }
     if (!http_connection.key_accepted(options.keys, request.key)) {
-        return .{ .status = 401, .body = "{\"error\":\"invalid key\"}" };
+        return failed(401, .E0103, "invalid key");
     }
 
     const declared = declared_target(target) orelse
-        return .{ .status = 404, .body = "{\"error\":\"not found\"}" };
+        return failed(404, .E0104, "not found");
     if (!health.ready(client)) return unavailable;
     return serve_declared(arena, follower, views, declared) catch |err| switch (err) {
         error.Timeout, error.Evicted => {
             log.err("{s}: {}", .{ target, err });
             health.broke();
-            return unavailable;
+            return lost;
         },
         else => return err,
     };
 }
 
-const unavailable: Reply = .{ .status = 503, .body = "{\"error\":\"cluster unavailable\"}" };
+/// No session: nothing was sent (NRV-E0605).
+const unavailable = failed(503, .E0605, "cluster unavailable");
+/// The request reached a cluster that did not answer. A read, so not applied (NRV-E0601).
+const lost = failed(503, .E0601, "cluster unavailable");
 const unavailable_healthz: Reply = .{
     .status = 503,
-    .body = "{\"ok\":false,\"error\":\"cluster unavailable\"}",
+    .body = "{\"ok\":false,\"error\":\"cluster unavailable\",\"applied\":false," ++
+        "\"code\":\"NRV-E0605\",\"session\":\"reconnecting\"}",
 };
 
 /// A request for a declared view, or for their list.
@@ -169,7 +179,7 @@ fn serve_declared(
     const writer = out.writer();
     const name = target.name orelse {
         if (target.query.len > 0) {
-            return .{ .status = 400, .body = "{\"error\":\"unexpected query\"}" };
+            return failed(400, .E0107, "unexpected query");
         }
         try follower.catch_up();
         try writer.writeAll("{\"views\":[");
@@ -188,25 +198,25 @@ fn serve_declared(
     while (parameters.next()) |parameter| {
         if (parameter.len == 0) continue;
         const equals = std.mem.indexOfScalar(u8, parameter, '=') orelse
-            return .{ .status = 400, .body = "{\"error\":\"malformed query\"}" };
+            return failed(400, .E0107, "malformed query");
         const value = parameter[equals + 1 ..];
         if (std.mem.eql(u8, parameter[0..equals], "min_op")) {
             min_op = if (std.mem.eql(u8, value, "latest")) .latest else .{
                 .op = std.fmt.parseInt(u64, value, 10) catch
-                    return .{ .status = 400, .body = "{\"error\":\"min_op is malformed\"}" },
+                    return failed(400, .E0106, "min_op is malformed"),
             };
         } else if (std.mem.eql(u8, parameter[0..equals], "as_of")) {
             as_of = std.fmt.parseInt(u64, value, 10) catch
-                return .{ .status = 400, .body = "{\"error\":\"as_of is malformed\"}" };
+                return failed(400, .E0106, "as_of is malformed");
             if (as_of.? == 0) {
-                return .{ .status = 400, .body = "{\"error\":\"as_of must be positive\"}" };
+                return failed(400, .E0107, "as_of must be positive");
             }
         } else {
-            return .{ .status = 400, .body = "{\"error\":\"unknown query parameter\"}" };
+            return failed(400, .E0107, "unknown query parameter");
         }
     }
     if (as_of != null and std.mem.indexOf(u8, target.query, "min_op=") != null) {
-        return .{ .status = 400, .body = "{\"error\":\"min_op or as_of, not both\"}" };
+        return failed(400, .E0410, "min_op or as_of, not both");
     }
 
     // An answer as of op n needs the view to have seen n, so that nothing can still commit at or
@@ -220,16 +230,17 @@ fn serve_declared(
     if (wait_op == null or follower.watermark < wait_op.?) try follower.catch_up();
     if (wait_op) |op| {
         if (follower.watermark < op) {
-            return .{ .status = 504, .body = "{\"error\":\"the op is not committed yet\"}" };
+            return failed(504, .E1001, "the op is not committed yet");
         }
     }
 
     const result = declared.compute(arena, name, as_of) catch |err| switch (err) {
-        error.NoSuchView => return .{ .status = 404, .body = "{\"error\":\"no such view\"}" },
-        error.NoLayout, error.Invalid => return .{
-            .status = 409,
-            .body = "{\"error\":\"the view does not match its table's layout\"}",
-        },
+        error.NoSuchView => return failed(404, .E0402, "no such view"),
+        error.NoLayout, error.Invalid => return failed(
+            409,
+            .E1002,
+            "the view does not match its table's layout",
+        ),
         error.OutOfMemory => return error.OutOfMemory,
     };
     try writer.print("{{\"view\":\"{s}\",\"op\":\"{}\",\"hash\":\"{s}\",\"groups\":", .{

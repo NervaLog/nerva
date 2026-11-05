@@ -82,6 +82,9 @@ const documents = @import("../documents.zig");
 const documents_routes = @import("documents_routes.zig");
 const ledgers_static = @import("../ledgers.zig");
 const view_fields = @import("../views.zig");
+const wire = @import("../wire_code.zig");
+pub const Code = wire.Code;
+pub const Applied = wire.Applied;
 const layout_cache = @import("layout_cache.zig");
 
 const Change = nerva.Change;
@@ -177,36 +180,36 @@ pub fn handle(
     const query = if (question < target.len) target[question + 1 ..] else "";
 
     const route: Route = if (std.mem.eql(u8, path, "/v1/indexes")) route: {
-        if (method != .get) return error_reply(arena, 405, "method not allowed");
-        if (query.len > 0) return error_reply(arena, 400, "unexpected query");
+        if (method != .get) return error_reply(arena, .E0104, 405, "method not allowed", .no);
+        if (query.len > 0) return error_reply(arena, .E0107, 400, "unexpected query", .no);
         break :route .index_list;
     } else if (std.mem.startsWith(u8, path, indexes_prefix)) route: {
-        if (query.len > 0) return error_reply(arena, 400, "unexpected query");
+        if (query.len > 0) return error_reply(arena, .E0107, 400, "unexpected query", .no);
         const scan = std.mem.endsWith(u8, path, index_scan_suffix) and
             path.len > indexes_prefix.len + index_scan_suffix.len;
         if (scan) {
-            if (method != .post) return error_reply(arena, 405, "method not allowed");
+            if (method != .post) return error_reply(arena, .E0104, 405, "method not allowed", .no);
             break :route .index_scan;
         }
         if (method != .get and method != .put) {
-            return error_reply(arena, 405, "method not allowed");
+            return error_reply(arena, .E0104, 405, "method not allowed", .no);
         }
         break :route .indexes;
     } else if (std.mem.startsWith(u8, path, ledgers_prefix)) route: {
         if (method != .get and method != .put) {
-            return error_reply(arena, 405, "method not allowed");
+            return error_reply(arena, .E0104, 405, "method not allowed", .no);
         }
-        if (query.len > 0) return error_reply(arena, 400, "unexpected query");
+        if (query.len > 0) return error_reply(arena, .E0107, 400, "unexpected query", .no);
         break :route .ledgers;
     } else if (std.mem.eql(u8, path, "/v1/views")) route: {
-        if (method != .get) return error_reply(arena, 405, "method not allowed");
-        if (query.len > 0) return error_reply(arena, 400, "unexpected query");
+        if (method != .get) return error_reply(arena, .E0104, 405, "method not allowed", .no);
+        if (query.len > 0) return error_reply(arena, .E0107, 400, "unexpected query", .no);
         break :route .view_list;
     } else if (std.mem.startsWith(u8, path, tables_prefix) or
         std.mem.startsWith(u8, path, views_prefix))
     route: {
         if (method != .get and method != .put) {
-            return error_reply(arena, 405, "method not allowed");
+            return error_reply(arena, .E0104, 405, "method not allowed", .no);
         }
         // `/v1/views/<name>/groups` and `/definition`, with a name: `/v1/views/groups` is the
         // view named `groups`.
@@ -221,11 +224,11 @@ pub fn handle(
         const definition = view_suffix(path, views_definition_suffix);
         const tables_route = std.mem.startsWith(u8, path, tables_prefix);
         if ((groups or definition) and method != .get) {
-            return error_reply(arena, 405, "method not allowed");
+            return error_reply(arena, .E0104, 405, "method not allowed", .no);
         }
         // A view takes `as_of` and `min_op` (N66); a table or a definition takes none.
         const queried = groups or (!tables_route and !definition and method == .get);
-        if (!queried and query.len > 0) return error_reply(arena, 400, "unexpected query");
+        if (!queried and query.len > 0) return error_reply(arena, .E0107, 400, "unexpected query", .no);
         break :route if (tables_route)
             .tables
         else if (groups)
@@ -237,11 +240,11 @@ pub fn handle(
     } else route: {
         const entry = for (routes) |entry| {
             if (std.mem.eql(u8, entry.path, path)) break entry;
-        } else return error_reply(arena, 404, "not found");
-        if (entry.method != method) return error_reply(arena, 405, "method not allowed");
+        } else return error_reply(arena, .E0104, 404, "not found", .no);
+        if (entry.method != method) return error_reply(arena, .E0104, 405, "method not allowed", .no);
         break :route entry.route;
     };
-    if (method == .get and body.len > 0) return error_reply(arena, 400, "unexpected body");
+    if (method == .get and body.len > 0) return error_reply(arena, .E0105, 400, "unexpected body", .no);
 
     const kept = route == .lookup or route == .commit;
     const Cache = Layouts(@TypeOf(layouts));
@@ -531,12 +534,32 @@ fn lookup_prepare_kept(
     };
 }
 
-/// The answer to an error of a request: a 400, or the error itself.
+/// The answer to an error of a request: a 400 (or a 504, for an op not committed yet), or the
+/// error itself. Nothing was applied.
 fn refuse(arena: std.mem.Allocator, err: anyerror) !Reply {
     return switch (err) {
-        error.BadRequest => error_reply(arena, 400, bad_request_reason),
-        error.TooManyEvents => error_reply(arena, 400, "too many rows or entries for one request"),
-        error.Invalid => error_reply(arena, 400, catalog.invalid_reason),
+        error.BadRequest => error_reply(
+            arena,
+            bad_request_code orelse wire.of_bad(bad_request_reason) orelse .E0105,
+            400,
+            bad_request_reason,
+            .no,
+        ),
+        error.TooManyEvents => error_reply(
+            arena,
+            .E0112,
+            400,
+            "too many rows or entries for one request",
+            .no,
+        ),
+        error.Invalid => error_reply(
+            arena,
+            wire.of_invalid(catalog.invalid_reason) orelse .E0301,
+            400,
+            catalog.invalid_reason,
+            .no,
+        ),
+        error.NotCommitted => error_reply(arena, .E0401, 504, not_committed_reason, .no),
         else => err,
     };
 }
@@ -706,10 +729,28 @@ const Probe = struct { table: u32, key: RowKey };
 
 /// The reason for the last `error.BadRequest` (set just before it is returned; one thread).
 var bad_request_reason: []const u8 = "";
+/// The code of the last `error.BadRequest`, when its maker named one (`bad_as`).
+var bad_request_code: ?Code = null;
 
 pub fn bad(reason: []const u8) error{BadRequest} {
     bad_request_reason = reason;
+    bad_request_code = null;
     return error.BadRequest;
+}
+
+/// `bad`, for a reason whose family is not told by its text alone.
+pub fn bad_as(code: Code, reason: []const u8) error{BadRequest} {
+    bad_request_reason = reason;
+    bad_request_code = code;
+    return error.BadRequest;
+}
+
+/// A read of an op that is not committed yet: answered `504` NRV-E0401, on every route.
+var not_committed_reason: []const u8 = "";
+
+pub fn not_committed(reason: []const u8) error{NotCommitted} {
+    not_committed_reason = reason;
+    return error.NotCommitted;
 }
 
 // ---- Routes ----
@@ -1039,18 +1080,20 @@ fn commit_reply(arena: std.mem.Allocator, prepared: *const Commit) !Reply {
             .committed_before => {
                 try out.raw("{\"status\":\"committed\",\"op\":");
                 try out.number(result.op);
-                try out.raw(",\"replayed\":true}");
+                try out.raw(",\"replayed\":true,\"code\":\"NRV-W0201\"}");
                 return .{ .status = 200, .body = out.items() };
             },
             .key_reused, .key_collision => {
                 try out.print("{{\"status\":\"{s}\",\"op\":", .{@tagName(result.status)});
                 try out.number(result.op);
                 try out.raw("}");
-                return .{ .status = 409, .body = out.items() };
+                return refused_reply(
+                    &out,
+                    409,
+                    if (result.status == .key_reused) .E0207 else .E0208,
+                );
             },
-            else => std.debug.panic("api: commit rejected key: {s}", .{
-                @tagName(result.status),
-            }),
+            else => return unexpected_status(arena, "commit rejected key", result.status),
         }
     }
     const results = results_sent[@intFromBool(key != null)..];
@@ -1062,14 +1105,14 @@ fn commit_reply(arena: std.mem.Allocator, prepared: *const Commit) !Reply {
                 try out.print("{{\"status\":\"conflict\",\"index\":{},\"op\":", .{index});
                 try out.number(result.op);
                 try out.raw("}");
-                return .{ .status = 409, .body = out.items() };
+                return refused_reply(&out, 409, .E0202);
             },
             .id_collision => {
                 try out.print(
                     "{{\"status\":\"id_collision\",\"index\":{}}}",
                     .{index},
                 );
-                return .{ .status = 409, .body = out.items() };
+                return refused_reply(&out, 409, .E0209);
             },
             .write_duplicate => {
                 try out.print(
@@ -1077,32 +1120,32 @@ fn commit_reply(arena: std.mem.Allocator, prepared: *const Commit) !Reply {
                         "\"index\":{}}}",
                     .{index},
                 );
-                return .{ .status = 400, .body = out.items() };
+                return refused_reply(&out, 400, .E0210);
             },
             .out_of_bounds => {
                 try out.print("{{\"status\":\"out_of_bounds\",\"index\":{},\"value\":", .{index});
                 try out.field_value(add_fields[index].?, result.value);
                 try out.raw("}");
-                return .{ .status = 409, .body = out.items() };
+                return refused_reply(&out, 409, .E0203);
             },
             .row_absent => {
                 try out.print("{{\"status\":\"row_absent\",\"index\":{}}}", .{index});
-                return .{ .status = 409, .body = out.items() };
+                return refused_reply(&out, 409, .E0204);
             },
             // An add to a field a view filters or groups by (N52).
             .view_key_field => {
                 try out.print("{{\"status\":\"view_key_field\",\"index\":{}}}", .{index});
-                return .{ .status = 409, .body = out.items() };
+                return refused_reply(&out, 409, .E0206);
             },
             // This op's views budget is spent; nothing applied, so retrying is safe (N52).
             .views_busy => {
                 try out.print("{{\"status\":\"views_busy\",\"index\":{}}}", .{index});
-                return .{ .status = 503, .body = out.items() };
+                return refused_reply(&out, 503, .E0211);
             },
             // The transaction alone is too large for any op: nothing applied; split it (#32).
             .views_too_large => {
                 try out.print("{{\"status\":\"views_too_large\",\"index\":{}}}", .{index});
-                return .{ .status = 413, .body = out.items() };
+                return refused_reply(&out, 413, .E0212);
             },
             // A conserved field changed other than by a pair (N75).
             .unpaired, .conserved_write => {
@@ -1110,13 +1153,10 @@ fn commit_reply(arena: std.mem.Allocator, prepared: *const Commit) !Reply {
                     @tagName(result.status),
                     index,
                 });
-                return .{ .status = 409, .body = out.items() };
+                return refused_reply(&out, 409, .E0205);
             },
             // Validated above: the server would be at fault.
-            else => std.debug.panic("api: commit rejected entry {}: {s}", .{
-                index,
-                @tagName(result.status),
-            }),
+            else => return unexpected_status(arena, "commit rejected an entry", result.status),
         }
     }
     assert(results[0].status == .ok);
@@ -1134,6 +1174,13 @@ fn commit_reply(arena: std.mem.Allocator, prepared: *const Commit) !Reply {
     if (adds > 0) try out.raw("]");
     try out.raw("}");
     return .{ .status = 200, .body = out.items() };
+}
+
+/// A commit result the gateway's own checks make impossible (NRV-B0002): where it once stopped
+/// the process, it answers 500. The transaction was sent, so whether it was applied is unknown.
+pub fn unexpected_status(arena: std.mem.Allocator, what: []const u8, status: anytype) !Reply {
+    std.log.scoped(.api).err("{s}: {s}", .{ what, @tagName(status) });
+    return error_reply(arena, .B0002, 500, "internal error", .unknown);
 }
 
 const EntryRequest = struct {
@@ -1270,7 +1317,7 @@ fn ledgers(
     switch (method) {
         .get => {
             const ledger = try client.get_ledger(id);
-            if (ledger.slot == 0) return error_reply(arena, 404, "no such ledger");
+            if (ledger.slot == 0) return error_reply(arena, .E0402, 404, "no such ledger", .no);
             assert(ledger.definition.id == id);
             try out.print("{{\"ledger\":{},\"op\":", .{id});
             try out.number(ledger.op);
@@ -1311,7 +1358,11 @@ fn ledgers(
             };
             if (conflict) |status| {
                 try out.print("{{\"status\":\"{s}\",\"ledger\":{}}}", .{ status, id });
-                return .{ .status = 409, .body = out.items() };
+                return refused_reply(
+                    &out,
+                    409,
+                    if (declared.status == .ledgers_full) .E0306 else .E0305,
+                );
             }
             try out.print("{{\"ledger\":{},\"declared\":\"{s}\",\"op\":", .{
                 id,
@@ -1533,12 +1584,12 @@ fn row(arena: std.mem.Allocator, client: anytype, layouts: anytype, query: []con
     const found = if (nerva.table_is_record(table)) found: {
         var current: [1]nerva.RecordValue = undefined;
         try client.lookup_records(&.{.{ .table = table, .id = id }}, &current);
-        if (as_of >= current[0].op_read) return bad("as_of is not yet committed");
+        if (as_of >= current[0].op_read) return not_committed("as_of is not yet committed");
         break :found try record_as_of(client, table, id, as_of);
     } else found: {
         var current: [1]RowValue = undefined;
         try client.lookup_rows(&.{.{ .table = table, .id = @intCast(id) }}, &current);
-        if (as_of >= current[0].op_read) return bad("as_of is not yet committed");
+        if (as_of >= current[0].op_read) return not_committed("as_of is not yet committed");
         const change = try change_as_of(client, table, @intCast(id), as_of) orelse break :found null;
         break :found change_wide(&change);
     };
@@ -1727,7 +1778,7 @@ fn indexes_route(
     if (method == .get) {
         if (body.len > 0) return bad("unexpected body");
         const index = try index_find(client, name) orelse
-            return error_reply(arena, 404, "no such index");
+            return error_reply(arena, .E0402, 404, "no such index", .no);
         var out = Writer.init(arena);
         try index_render(&out, &index);
         return .{ .status = 200, .body = out.items() };
@@ -1790,7 +1841,7 @@ fn indexes_route(
         },
         .different, .indexes_full, .table_indexes_full => {
             try out.print("{{\"status\":\"{s}\"}}", .{@tagName(result.status)});
-            return .{ .status = 409, .body = out.items() };
+            return refused_reply(&out, 409, .E0312);
         },
         .invalid => return bad("the index breaks a rule (an eq key is at most 64 bytes)"),
         .table_invalid => return bad("an index is over a record table"),
@@ -1818,7 +1869,7 @@ fn index_scan(
     const request = try json_parse(Request, arena, body);
     if (request.limit == 0) return bad("limit must be positive");
     const index = try index_find(client, name) orelse
-        return error_reply(arena, 404, "no such index");
+        return error_reply(arena, .E0402, 404, "no such index", .no);
     const definition = &index.definition;
     const layout = try layouts.get(definition.table) orelse
         return bad("the index's table has no layout");
@@ -1866,8 +1917,8 @@ fn index_scan(
     assert(header.kind == .header);
     switch (header.state) {
         .ready => {},
-        .building => return error_reply(arena, 503, "index building"),
-        .missing => return error_reply(arena, 404, "no such index"),
+        .building => return error_reply(arena, .E0404, 503, "index building", .no),
+        .missing => return error_reply(arena, .E0402, 404, "no such index", .no),
     }
     var out = Writer.init(arena);
     try out.raw("{\"index\":");
@@ -1921,7 +1972,7 @@ fn tables(
     switch (method) {
         .get => {
             const layout = try layouts.layout(arena, table) orelse
-                return error_reply(arena, 404, "no layout for this table");
+                return error_reply(arena, .E0303, 404, "no layout for this table", .no);
             try out.raw(try catalog.layout_render(arena, &layout));
             return .{ .status = 200, .body = out.items() };
         },
@@ -1930,8 +1981,10 @@ fn tables(
             switch (try layouts.layout_put(arena, table, &layout)) {
                 .incompatible => return error_reply(
                     arena,
+                    .E0302,
                     409,
                     "a layout may only be extended by appending fields",
+                    .no,
                 ),
                 inline else => |outcome| {
                     try out.print("{{\"table\":{},\"layout\":\"{s}\"}}", .{
@@ -1976,8 +2029,10 @@ fn views(
                 );
                 if (!same) return error_reply(
                     arena,
+                    .E0308,
                     409,
                     "a view with this name is declared differently; views are immutable",
+                    .no,
                 );
                 cataloged = true;
             }
@@ -1990,28 +2045,36 @@ fn views(
             if (!cataloged) switch (declared.status) {
                 .ledger_field => return error_reply(
                     arena,
+                    .E0309,
                     409,
                     "the view filters or groups by a field of a ledger",
+                    .no,
                 ),
                 .different => return error_reply(
                     arena,
+                    .E0308,
                     409,
                     "a view with this name is declared differently; views are immutable",
+                    .no,
                 ),
                 // `view_check` refuses min and max over records first; an older gateway's
                 // catalog document may still name one.
                 .unsupported => return error_reply(
                     arena,
+                    .E0307,
                     409,
                     "the state machine does not maintain this view",
+                    .no,
                 ),
                 else => {},
             };
             switch (try layouts.view_put(arena, name, &view)) {
                 .different => return error_reply(
                     arena,
+                    .E0308,
                     409,
                     "a view with this name is declared differently; views are immutable",
+                    .no,
                 ),
                 inline else => |outcome| {
                     // The state machine maintains it from now on (N52), unless it refused it.
@@ -2074,7 +2137,7 @@ fn view_groups(
     else
         page_limit_max;
 
-    const view = try layouts.view(arena, name) orelse return error_reply(arena, 404, "no such view");
+    const view = try layouts.view(arena, name) orelse return error_reply(arena, .E0402, 404, "no such view", .no);
     const layout = try layouts.layout(arena, view.table) orelse return error.Corrupt;
 
     var query_view: nerva.ViewQuery = .{
@@ -2089,10 +2152,10 @@ fn view_groups(
     assert(count >= 1);
     const header = records[0];
     assert(header.kind == .header);
-    if (as_of != 0 and as_of >= header.op) return bad("as_of is not yet committed");
+    if (as_of != 0 and as_of >= header.op) return not_committed("as_of is not yet committed");
     if (header.state == .missing) {
-        if (as_of != 0) return error_reply(arena, 404, "the view was declared after as_of");
-        return error_reply(arena, 404, "this view is not maintained by the state machine");
+        if (as_of != 0) return error_reply(arena, .E0403, 404, "the view was declared after as_of", .no);
+        return error_reply(arena, .E0406, 404, "this view is not maintained by the state machine", .no);
     }
 
     var out = Writer.init(arena);
@@ -2181,7 +2244,7 @@ fn table_check(table: u32) error{BadRequest}!void {
 ///     GET /v1/views/<name>/definition
 fn view_definition(arena: std.mem.Allocator, layouts: anytype, name: []const u8) !Reply {
     try catalog.view_name_validate(name);
-    const view = try layouts.view(arena, name) orelse return error_reply(arena, 404, "no such view");
+    const view = try layouts.view(arena, name) orelse return error_reply(arena, .E0402, 404, "no such view", .no);
     return .{ .status = 200, .body = try catalog.view_render(arena, &view) };
 }
 
@@ -2246,7 +2309,7 @@ fn view_answer(
     } else 0;
     if (as_of != 0 and parameters.get("min_op") != null) return bad("min_op or as_of, not both");
 
-    const view = try layouts.view(arena, name) orelse return error_reply(arena, 404, "no such view");
+    const view = try layouts.view(arena, name) orelse return error_reply(arena, .E0402, 404, "no such view", .no);
     const layout = try layouts.layout(arena, view.table) orelse return error.Corrupt;
 
     const records = try arena.alloc(nerva.ViewRecord, page_limit_max + 1);
@@ -2271,18 +2334,30 @@ fn view_answer(
         if (read_op == null) {
             read_op = header.op;
             // Committed ops are below the read's own.
-            if (as_of >= header.op) return error_reply(arena, 504, "as_of is not yet committed");
+            if (as_of >= header.op) return not_committed("as_of is not yet committed");
             if (min_op) |op| {
-                if (op >= header.op) return error_reply(arena, 504, "min_op is not yet committed");
+                if (op >= header.op) return not_committed("min_op is not yet committed");
             }
             switch (header.state) {
                 .ready => {},
-                .missing => return error_reply(arena, 404, if (as_of != 0)
-                    "the view was declared after as_of"
+                .missing => return if (as_of != 0)
+                    error_reply(arena, .E0403, 404, "the view was declared after as_of", .no)
                 else
-                    "this view is not maintained by the state machine"),
-                .building => return error_reply(arena, 503, "the view is still building"),
-                .failed => return error_reply(arena, 503, "the view failed (a hash collision)"),
+                    error_reply(
+                        arena,
+                        .E0406,
+                        404,
+                        "this view is not maintained by the state machine",
+                        .no,
+                    ),
+                .building => return error_reply(arena, .E0404, 503, "the view is still building", .no),
+                .failed => return error_reply(
+                    arena,
+                    .E0405,
+                    503,
+                    "the view failed (a hash collision)",
+                    .no,
+                ),
             }
             view_hash = header.hash;
             declared_op = header.declared_op;
@@ -2420,11 +2495,36 @@ pub fn query_parse(
 
 // ---- Rendering ----
 
-pub fn error_reply(arena: std.mem.Allocator, status: u16, reason: []const u8) !Reply {
+/// An error reply: `{"error": reason, "applied": …, "code": …}`. The `error` text keeps its
+/// spelling for the clients that match on it; `code` is registered in docs/ERRORS.md and
+/// `applied` says whether the request may have changed the cluster (P168b).
+pub fn error_reply(
+    arena: std.mem.Allocator,
+    code: Code,
+    status: u16,
+    reason: []const u8,
+    applied: Applied,
+) !Reply {
     var out = Writer.init(arena);
     try out.raw("{\"error\":");
     try std.json.stringify(reason, .{}, out.list.writer());
-    try out.raw("}");
+    try out.print(",\"applied\":{s},\"code\":\"{s}\"}}", .{ applied.json(), code.text() });
+    return .{ .status = status, .body = out.items() };
+}
+
+/// Whether a request that failed may have changed the cluster, when `Client.writes_sent` was
+/// `writes_before` as it began and is `writes_now` now: `unknown` if a write went out, `no` if
+/// not (P168b). A count that went backwards (a client replaced meanwhile) is a change.
+pub fn applied_since(writes_before: u64, writes_now: u64) Applied {
+    return if (writes_now == writes_before) .no else .unknown;
+}
+
+/// Closes the `{…}` object in `out` with `"applied":false,"code":…`: the reply to a request the
+/// cluster refused, which changed nothing.
+pub fn refused_reply(out: *Writer, status: u16, code: Code) !Reply {
+    assert(out.list.items[out.list.items.len - 1] == '}');
+    _ = out.list.pop();
+    try out.print(",\"applied\":false,\"code\":\"{s}\"}}", .{code.text()});
     return .{ .status = status, .body = out.items() };
 }
 
@@ -2513,6 +2613,9 @@ const FakeClient = struct {
     busy: u32 = 0,
     /// The next request times out.
     timeout_next: bool = false,
+    /// Requests of a write received, as `Client.writes_sent` counts them: it counts one that
+    /// then times out.
+    writes_sent: u64 = 0,
 
     const Version = struct { op: u64, exists: bool, value: [value_size]u8 };
     const RecordVersion = struct { op: u64, exists: bool, value: [nerva.record_value_size]u8 };
@@ -2552,6 +2655,7 @@ const FakeClient = struct {
         var counts: [group_max]u32 = undefined;
         for (transactions, counts[0..transactions.len]) |batch, *count| count.* = @intCast(batch.len);
         if (!fake.batches_fit(.commit, counts[0..transactions.len])) return error.TooManyEvents;
+        fake.writes_sent += 1;
         if (fake.timeout_next) return error.Timeout;
         fake.requests += 1;
         fake.op += 1;
@@ -2569,6 +2673,7 @@ const FakeClient = struct {
         var counts: [group_max]u32 = undefined;
         for (transactions, counts[0..transactions.len]) |batch, *count| count.* = @intCast(batch.len);
         if (!fake.batches_fit(.commit_wide, counts[0..transactions.len])) return error.TooManyEvents;
+        fake.writes_sent += 1;
         if (fake.timeout_next) return error.Timeout;
         fake.requests += 1;
         fake.op += 1;
@@ -2611,6 +2716,7 @@ const FakeClient = struct {
 
     pub fn commit(fake: *FakeClient, entries: []const Entry, results: []EntryResult) Error!void {
         if (entries.len > fake.lookup_max) return error.TooManyEvents;
+        fake.writes_sent += 1;
         fake.requests += 1;
         fake.op += 1;
         try fake.commit_at(fake.op, entries, results);
@@ -3278,7 +3384,7 @@ test "api: lookup and commit translate to and from JSON" {
     );
     try testing.expectEqual(@as(u16, 409), stale.status);
     try testing.expectEqualStrings(
-        \\{"status":"conflict","index":1,"op":"2"}
+        \\{"status":"conflict","index":1,"op":"2","applied":false,"code":"NRV-E0202"}
     , stale.body);
 }
 
@@ -3367,7 +3473,7 @@ test "api: a commit under a key commits once" {
     const resend = try handle(arena, &fake, no_layouts, .post, "/v1/commit", put);
     try testing.expectEqual(@as(u16, 200), resend.status);
     try testing.expectEqualStrings(
-        \\{"status":"committed","op":"1","replayed":true}
+        \\{"status":"committed","op":"1","replayed":true,"code":"NRV-W0201"}
     , resend.body);
 
     // Other entries under the same key never commit.
@@ -3378,7 +3484,7 @@ test "api: a commit under a key commits once" {
     );
     try testing.expectEqual(@as(u16, 409), reused.status);
     try testing.expectEqualStrings(
-        \\{"status":"key_reused","op":"1"}
+        \\{"status":"key_reused","op":"1","applied":false,"code":"NRV-E0207"}
     , reused.body);
 
     // Under another key, indices are the request's: the key entry is not counted.
@@ -3388,7 +3494,7 @@ test "api: a commit under a key commits once" {
     );
     try testing.expectEqual(@as(u16, 409), stale.status);
     try testing.expectEqualStrings(
-        \\{"status":"conflict","index":0,"op":"1"}
+        \\{"status":"conflict","index":0,"op":"1","applied":false,"code":"NRV-E0202"}
     , stale.body);
 
     const keys_bad = [_][]const u8{
@@ -3474,8 +3580,103 @@ test "api: bad requests are refused before reaching the cluster" {
             return err;
         };
         try testing.expect(std.mem.startsWith(u8, reply.body, "{\"error\":"));
+        try expect_coded(arena, reply, false);
     }
     try testing.expectEqual(@as(u64, 0), fake.op); // Nothing reached the cluster.
+    try testing.expectEqual(@as(u64, 0), fake.writes_sent);
+}
+
+/// `reply` is a refusal: it names a code registered in `Code`, and says whether the request may
+/// have been applied (`"unknown"` if `unknown`, else `false`).
+fn expect_coded(arena: std.mem.Allocator, reply: Reply, unknown: bool) !void {
+    const Coded = struct { code: []const u8, applied: std.json.Value };
+    const parsed = try std.json.parseFromSliceLeaky(Coded, arena, reply.body, .{
+        .ignore_unknown_fields = true,
+    });
+    try testing.expect(std.mem.startsWith(u8, parsed.code, "NRV-"));
+    try testing.expect(std.meta.stringToEnum(Code, parsed.code["NRV-".len..]) != null);
+    if (unknown) {
+        try testing.expectEqualStrings("unknown", parsed.applied.string);
+    } else {
+        try testing.expectEqual(false, parsed.applied.bool);
+    }
+}
+
+test "api: a refusal that is not a malformed request carries its code" {
+    var arena_instance = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_instance.deinit();
+    const arena = arena_instance.allocator();
+    var fake: FakeClient = .{ .allocator = arena };
+
+    // A read at the op just made, and one past it: not committed yet is 504 on every route.
+    const put = try handle(arena, &fake, no_layouts, .post, "/v1/commit",
+        \\{"entries":[{"kind":"put","table":1,"id":"1","value_hex":"01"}]}
+    );
+    try testing.expectEqual(@as(u16, 200), put.status);
+    const early = try handle(arena, &fake, no_layouts, .get, "/v1/row?table=1&id=1&as_of=99", "");
+    try testing.expectEqual(@as(u16, 504), early.status);
+    try expect_coded(arena, early, false);
+    try testing.expect(std.mem.indexOf(u8, early.body, "NRV-E0401") != null);
+    const early_document = try handle(arena, &fake, no_layouts, .post, "/v1/documents/get",
+        \\{"namespace":"7","keys":["a"],"as_of":"99"}
+    );
+    try testing.expectEqual(@as(u16, 504), early_document.status);
+
+    // A transaction the cluster refuses: nothing applied, with its code.
+    const stale = try handle(arena, &fake, no_layouts, .post, "/v1/commit",
+        \\{"entries":[{"kind":"read","table":1,"id":"1","op_seen":"0"},
+        \\ {"kind":"put","table":1,"id":"1","value_hex":"02"}]}
+    );
+    try testing.expectEqual(@as(u16, 409), stale.status);
+    try expect_coded(arena, stale, false);
+    try testing.expect(std.mem.indexOf(u8, stale.body, "NRV-E0202") != null);
+
+    // A key the cluster has seen: the replay says so.
+    const keyed =
+        \\{"key":"00000000000000000000000000000001","entries":[{"kind":"put","table":1,"id":"2","value_hex":"01"}]}
+    ;
+    _ = try handle(arena, &fake, no_layouts, .post, "/v1/commit", keyed);
+    const replayed = try handle(arena, &fake, no_layouts, .post, "/v1/commit", keyed);
+    try testing.expectEqual(@as(u16, 200), replayed.status);
+    try testing.expect(std.mem.indexOf(u8, replayed.body, "\"code\":\"NRV-W0201\"") != null);
+}
+
+test "api: a request that sent a write and lost the cluster is unknown; one that sent none is not" {
+    var arena_instance = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_instance.deinit();
+    const arena = arena_instance.allocator();
+    var fake: FakeClient = .{ .allocator = arena };
+    // Two commits travel together and the cluster does not answer: a write went out.
+    fake.timeout_next = true;
+    const commit_bodies = [_][]const u8{
+        \\{"entries":[{"kind":"put","table":1,"id":"1","value_hex":"01"}]}
+        ,
+        \\{"entries":[{"kind":"put","table":1,"id":"2","value_hex":"02"}]}
+    };
+    var commits: [2]Member = undefined;
+    for (&commits, commit_bodies) |*member, body| member.* = .{ .target = "/v1/commit", .body = body };
+    const writes_before = fake.writes_sent;
+    try testing.expectError(error.Timeout, handle_group(arena, &fake, no_layouts, &commits));
+    try testing.expectEqual(Applied.unknown, applied_since(writes_before, fake.writes_sent));
+
+    // Two lookups do the same: nothing was written.
+    const lookup_bodies = [_][]const u8{
+        \\{"rows":[{"table":1,"id":"1"}]}
+        ,
+        \\{"rows":[{"table":1,"id":"2"}]}
+    };
+    var lookups: [2]Member = undefined;
+    for (&lookups, lookup_bodies) |*member, body| member.* = .{ .target = "/v1/lookup", .body = body };
+    const reads_before = fake.writes_sent;
+    try testing.expectError(error.Timeout, handle_group(arena, &fake, no_layouts, &lookups));
+    try testing.expectEqual(Applied.no, applied_since(reads_before, fake.writes_sent));
+
+    // A write refused before it was sent: the count did not move.
+    fake.timeout_next = false;
+    const refused_before = fake.writes_sent;
+    const refused = try handle(arena, &fake, no_layouts, .post, "/v1/commit", "{");
+    try testing.expectEqual(@as(u16, 400), refused.status);
+    try testing.expectEqual(Applied.no, applied_since(refused_before, fake.writes_sent));
 }
 
 test "api: documents are written, read, conflict and deleted by key" {
@@ -3520,7 +3721,7 @@ test "api: documents are written, read, conflict and deleted by key" {
     );
     try testing.expectEqual(@as(u16, 409), stale.status);
     try testing.expectEqualStrings(
-        \\{"status":"conflict","key":"cart/1","version":"1"}
+        \\{"status":"conflict","key":"cart/1","version":"1","applied":false,"code":"NRV-E0503"}
     , stale.body);
 
     // A delete is a write: the version moves on, and a read at it can commit.
@@ -3549,8 +3750,6 @@ test "api: documents are written, read, conflict and deleted by key" {
         ,
         \\{"namespace":"7","keys":["a"],"as_of":"0"}
         ,
-        \\{"namespace":"7","keys":["a"],"as_of":"99"}
-        ,
         \\{"namespace":"7","keys":["
         ++ "k" ** 1025 ++
             \\"]}
@@ -3559,6 +3758,11 @@ test "api: documents are written, read, conflict and deleted by key" {
         const reply = try handle(arena, &fake, no_layouts, .post, "/v1/documents/get", body);
         try testing.expectEqual(@as(u16, 400), reply.status);
     }
+    // An op not committed yet is 504 on every route (NRV-E0401).
+    const early = try handle(arena, &fake, no_layouts, .post, "/v1/documents/get",
+        \\{"namespace":"7","keys":["a"],"as_of":"99"}
+    );
+    try testing.expectEqual(@as(u16, 504), early.status);
     const commit_refused = [_][]const u8{
         \\{"namespace":"7"}
         ,
@@ -3690,10 +3894,10 @@ test "api: requests answered together are answered as each would be alone (P143)
     try testing.expectEqualStrings(expected.items, (try members[0].result.?).body);
     try testing.expectEqual(@as(u16, 409), (try members[2].result.?).status);
     try testing.expectEqualStrings(
-        \\{"status":"out_of_bounds","index":0,"value":"3"}
+        \\{"status":"out_of_bounds","index":0,"value":"3","applied":false,"code":"NRV-E0203"}
     , (try members[2].result.?).body);
     try testing.expectEqualStrings(
-        \\{"status":"row_absent","index":0}
+        \\{"status":"row_absent","index":0,"applied":false,"code":"NRV-E0204"}
     , (try members[5].result.?).body);
 }
 
@@ -3770,10 +3974,10 @@ test "api: transactions under one key in one request answer as they would one af
     const committed = try std.fmt.allocPrint(arena, "{{\"status\":\"committed\",\"op\":\"{}\"}}", .{op});
     const replayed = try std.fmt.allocPrint(
         arena,
-        "{{\"status\":\"committed\",\"op\":\"{}\",\"replayed\":true}}",
+        "{{\"status\":\"committed\",\"op\":\"{}\",\"replayed\":true,\"code\":\"NRV-W0201\"}}",
         .{op},
     );
-    const reused = try std.fmt.allocPrint(arena, "{{\"status\":\"key_reused\",\"op\":\"{}\"}}", .{op});
+    const reused = try std.fmt.allocPrint(arena, "{{\"status\":\"key_reused\",\"op\":\"{}\",\"applied\":false,\"code\":\"NRV-E0207\"}}", .{op});
     const expected = [_][]const u8{ committed, replayed, reused, committed, replayed };
     const statuses = [_]u16{ 200, 200, 409, 200, 200 };
     for (members, expected, statuses) |member, body, status| {

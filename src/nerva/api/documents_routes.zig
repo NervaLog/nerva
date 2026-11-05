@@ -44,7 +44,7 @@ const value_size = nerva.value_size;
 
 const Reply = api.Reply;
 const Writer = api.Writer;
-const bad = api.bad;
+const bad_as = api.bad_as;
 
 const table = catalog.table_documents;
 
@@ -86,16 +86,16 @@ pub fn get(arena: std.mem.Allocator, client: anytype, body: []const u8) !Reply {
     };
     const request = try api.json_parse(Request, arena, body);
     const namespace = try api.u64_parse(request.namespace, "namespace");
-    if (request.keys.len == 0) return bad("keys must not be empty");
-    if (request.keys.len > keys_max) return bad("too many keys for one request");
+    if (request.keys.len == 0) return bad_as(.E0502, "keys must not be empty");
+    if (request.keys.len > keys_max) return bad_as(.E0502, "too many keys for one request");
     var seen: std.StringHashMapUnmanaged(void) = .{};
     for (request.keys) |key| {
         try key_check(key);
-        if ((try seen.getOrPut(arena, key)).found_existing) return bad("repeated key");
+        if ((try seen.getOrPut(arena, key)).found_existing) return bad_as(.E0502, "repeated key");
     }
 
     const as_of: ?u64 = if (request.as_of) |text| try api.u64_parse(text, "as_of") else null;
-    if (as_of == 0) return bad("as_of must be positive");
+    if (as_of == 0) return bad_as(.E0107, "as_of must be positive");
 
     const row_keys = try arena.alloc(RowKey, request.keys.len);
     for (row_keys, request.keys) |*row_key, key| {
@@ -106,7 +106,7 @@ pub fn get(arena: std.mem.Allocator, client: anytype, body: []const u8) !Reply {
     const op_read = chunk0s[0].op_read;
 
     // As in `/v1/row`: a lookup's own op is newer than every committed op.
-    if (as_of != null and as_of.? >= op_read) return bad("as_of is not yet committed");
+    if (as_of != null and as_of.? >= op_read) return api.not_committed("as_of is not yet committed");
 
     // Each document's chunk 0 at the read's op: the lookup's, or the history's for `as_of`.
     for (chunk0s) |*chunk0| {
@@ -125,10 +125,13 @@ pub fn get(arena: std.mem.Allocator, client: anytype, body: []const u8) !Reply {
         chunk_total += documents.chunk0_count(&chunk0.value) catch return error.Corrupt;
     }
     if (chunk_total > get_chunks_max) {
-        return .{
-            .status = 413,
-            .body = "{\"error\":\"documents too large for one get: ask for fewer keys\"}",
-        };
+        return api.error_reply(
+            arena,
+            .E0504,
+            413,
+            "documents too large for one get: ask for fewer keys",
+            .no,
+        );
     }
 
     const found = try arena.alloc(Document, request.keys.len);
@@ -253,7 +256,7 @@ pub fn commit(arena: std.mem.Allocator, client: anytype, body: []const u8) !Repl
     const request = try api.json_parse(Request, arena, body);
     const namespace = try api.u64_parse(request.namespace, "namespace");
     if (request.reads.len + request.writes.len == 0) {
-        return bad("reads and writes must not both be empty");
+        return bad_as(.E0502, "reads and writes must not both be empty");
     }
 
     var entries: std.ArrayListUnmanaged(Entry) = .{};
@@ -261,7 +264,7 @@ pub fn commit(arena: std.mem.Allocator, client: anytype, body: []const u8) !Repl
     for (request.reads) |read| {
         try key_check(read.key);
         if ((try keys_read.getOrPut(arena, read.key)).found_existing) {
-            return bad("a commit reads a key at most once");
+            return bad_as(.E0502, "a commit reads a key at most once");
         }
         try entries.append(arena, .{
             .id = documents.row_id(namespace, read.key),
@@ -276,10 +279,10 @@ pub fn commit(arena: std.mem.Allocator, client: anytype, body: []const u8) !Repl
     for (request.writes) |write| {
         try key_check(write.key);
         if ((try keys_written.getOrPut(arena, write.key)).found_existing) {
-            return bad("a commit writes a key at most once");
+            return bad_as(.E0502, "a commit writes a key at most once");
         }
         if (write.delete == (write.value_hex != null)) {
-            return bad("a write has value_hex or \"delete\": true");
+            return bad_as(.E0501, "a write has value_hex or \"delete\": true");
         }
         const value: ?[]const u8 =
             if (write.value_hex) |text| try value_parse(arena, text) else null;
@@ -311,15 +314,16 @@ pub fn commit(arena: std.mem.Allocator, client: anytype, body: []const u8) !Repl
                 try out.raw(",\"version\":");
                 try out.number(result.op);
                 try out.raw("}");
-                return .{ .status = 409, .body = out.items() };
+                return api.refused_reply(&out, 409, .E0503);
             },
             // Two keys' chunks share a row id: a hash collision, never expected.
             .write_duplicate => return error.Corrupt,
             // Built above from valid parts: the server would be at fault.
-            else => std.debug.panic("api: documents commit rejected entry {}: {s}", .{
-                index,
-                @tagName(result.status),
-            }),
+            else => return api.unexpected_status(
+                arena,
+                "documents commit rejected an entry",
+                result.status,
+            ),
         }
     }
     assert(results[0].status == .ok);
@@ -332,7 +336,7 @@ pub fn commit(arena: std.mem.Allocator, client: anytype, body: []const u8) !Repl
 pub fn changes(arena: std.mem.Allocator, client: anytype, query: []const u8) !Reply {
     const parameters = try api.query_parse(arena, query, &.{ "namespace", "cursor", "limit" });
     const namespace = try api.u64_parse(
-        parameters.get("namespace") orelse return bad("namespace is required"),
+        parameters.get("namespace") orelse return bad_as(.E0107, "namespace is required"),
         "namespace",
     );
     const limit = try api.limit_parse(parameters.get("limit"));
@@ -347,7 +351,7 @@ pub fn changes(arena: std.mem.Allocator, client: anytype, query: []const u8) !Re
     for (0..changes_per_op_max / limit + 2) |iteration| {
         const count = try client.get_changes(.{ .timestamp_min = cursor, .limit = limit }, page);
         if (count == 0) {
-            if (iteration == 0) return bad("invalid cursor");
+            if (iteration == 0) return bad_as(.E0408, "invalid cursor");
             return error.Corrupt; // The feed's own cursor.
         }
         const end = page[count - 1];
@@ -446,16 +450,16 @@ fn op_documents(
 }
 
 fn key_check(key: []const u8) error{BadRequest}!void {
-    if (key.len == 0) return bad("a key must not be empty");
-    if (key.len > documents.key_size_max) return bad("a key is at most 1024 bytes");
-    if (!std.unicode.utf8ValidateSlice(key)) return bad("a key must be UTF-8");
+    if (key.len == 0) return bad_as(.E0501, "a key must not be empty");
+    if (key.len > documents.key_size_max) return bad_as(.E0501, "a key is at most 1024 bytes");
+    if (!std.unicode.utf8ValidateSlice(key)) return bad_as(.E0501, "a key must be UTF-8");
 }
 
 fn value_parse(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
-    if (text.len % 2 != 0) return bad("value_hex is not hex");
-    if (text.len > documents.value_size_max * 2) return bad("a value is at most 512 KiB");
+    if (text.len % 2 != 0) return bad_as(.E0501, "value_hex is not hex");
+    if (text.len > documents.value_size_max * 2) return bad_as(.E0501, "a value is at most 512 KiB");
     const value = try arena.alloc(u8, text.len / 2);
-    _ = std.fmt.hexToBytes(value, text) catch return bad("value_hex is not hex");
+    _ = std.fmt.hexToBytes(value, text) catch return bad_as(.E0501, "value_hex is not hex");
     return value;
 }
 

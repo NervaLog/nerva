@@ -20,7 +20,7 @@ Usage: commit_keys.py <path to nerva> [--seed=N]
 import json, os, random, socket, sys, threading
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from api import KEY, Cluster, request  # noqa: E402
+from api import KEY, Cluster, plain, request  # noqa: E402
 
 TABLE = 31
 TABLE_COMMIT_KEYS = 0xFFFF0003
@@ -74,11 +74,12 @@ def check_resend(ports, rng):
     for port in ports:
         status, again = commit(port, reserve(1, 30), key)
         assert status == 200, again
-        assert again == {"status": "committed", "op": first["op"], "replayed": True}, again
+        assert plain(again) == {"status": "committed", "op": first["op"], "replayed": True}, again
+        assert again["code"] == "NRV-W0201", again
     assert lookup(ports[0], 1)["fields"] == {"available": "70", "held": "30"}
 
     status, reused = commit(ports[1], reserve(1, 31), key)
-    assert status == 409 and reused == {"status": "key_reused", "op": first["op"]}, reused
+    assert status == 409 and plain(reused) == {"status": "key_reused", "op": first["op"]}, reused
     assert lookup(ports[0], 1)["fields"] == {"available": "70", "held": "30"}
 
 
