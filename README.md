@@ -264,23 +264,6 @@ nerva start --addresses=3001,3002,3003 0_0.nerva   # and 0_1, 0_2
   both exports, and nothing from them reaches its data file: import it again from the cluster's
   export. The others log that they ignore it and run on. A replica imported from the cluster's
   export that has not started yet may start later and catch up.
-- **Replacing a lost replica** of a cluster that was formatted, with the cluster open: stop the
-  lost replica and destroy its data file (it must never start again), then, on its host,
-  `nerva recover --cluster=<id> --replica=<i> --replica-count=<n> --addresses=<every replica, in
-  order> --origin=none <path>`, then `nerva start` on the new file. It registers a session with
-  the running cluster, commits a pipeline's worth of no-op requests, and writes a data file whose
-  view is two past the cluster's, so that the new replica never contradicts what its
-  predecessor promised (`src/vsr/replica_reformat.zig`, upstream's recovery). The data file is
-  written as `<path>.recovering` and renamed once complete. It needs at least three replicas,
-  refuses with `NRV-E0713` while anything answers at the replica's address, with `NRV-E0712` when
-  the others have no quorum, and recovers one replica at a time, each caught up before the next.
-  A cluster that was imported is recovered the same way with `--origin=<export>`, the SHA-256 that
-  `nerva export` prints and `nerva import` and `nerva start` log: the new data file records that
-  export, so its peers handle it (P90). `--origin` has no default. With the wrong one the
-  replica exits with status 8 and `NRV-E0711` when it starts, naming the export its peers
-  announce, and they ignore it and run on; recover it again with the right one. Importing only
-  the lost replica instead is not safe: its replacement forgets the prepares the lost replica
-  acknowledged, and with one more failure a committed op could be lost (P90).
 - A view declared only through the Zig client, with no catalog document, cannot be imported:
   `import` refuses it. Declare views through `nerva api`.
 - **Format versions.** An export of a cluster with records or indexes is version 2 (P123b);
@@ -293,6 +276,106 @@ nerva start --addresses=3001,3002,3003 0_0.nerva   # and 0_1, 0_2
 - Measured (`perf/upgrade.py`, a 4-CPU sandbox, `--development`): a million changes over
   970,000 rows exported in 5.8 s (365 MiB at most) and imported in 14 s (1.2 GiB, the state
   machine's fixed allocation, as a replica's); the export file is 121 bytes a change.
+
+### Replacing a lost replica
+
+A replica whose disk is gone rejoins a running cluster without closing it (R5, P149).
+`nerva recover` makes the replacement's data file; `nerva start` runs it, and it catches up by
+repair, or by state sync when the cluster has checkpointed since. Three replicas at least: a
+cluster of one or two restores from a [backup](#backups) instead.
+
+1. **Make sure the lost replica is gone.** Stop it, and destroy its data file or its machine. A
+   replica that comes back beside its replacement shares its index, and the protocol's guarantees
+   are void. `nerva recover` can only see an address that answers from where it runs, and
+   refuses while one does (`NRV-E0713`); it cannot see a replica alive behind a partition.
+2. **On the replacement's host**, with the cluster running and the lost replica's address
+   unchanged:
+
+   ```bash
+   nerva recover --cluster=0 --replica=2 --replica-count=3 --addresses=3001,3002,3003 \
+       --origin=none 0_2.nerva
+   nerva start --addresses=3001,3002,3003 0_2.nerva     # with NERVA_CLUSTER_KEY
+   ```
+
+   `recover` registers a session with the cluster, commits a pipeline's worth of no-op requests,
+   and writes a data file whose view is two past the cluster's, so that the new replica never
+   contradicts what its predecessor promised (`src/vsr/replica_reformat.zig`, upstream's
+   recovery, run unchanged). It writes `<path>.recovering` and renames it once complete, prints
+   one `recover:` line naming the view, and exits; a killed `recover` leaves only
+   `<path>.recovering`, which blocks the next try (`NRV-E0715`) until it is removed. It takes one
+   of the cluster's 64 client sessions.
+3. **`--origin` has no default.** Pass `none` for a cluster made with `nerva format`, or the
+   SHA-256 of the export a cluster was imported from (`nerva export` prints it; `import` and
+   `start` log it). With the wrong one the replica exits with status 8 and `NRV-E0711` when it
+   starts, naming the export its peers announce, and they ignore it and run on; recover it again
+   with the right one. Importing only the lost replica instead is not safe: its replacement
+   forgets the prepares the lost replica acknowledged, and with one more failure a committed op
+   could be lost (P90).
+4. **One replica at a time.** Wait until the replacement has caught up, shown by `sync: done`
+   in its log when it state-synced and by its `replica_commit_min` gauge (`--statsd`) reaching
+   the others', before recovering another. Nothing enforces the wait; two recoveries in a row leave the cluster
+   unavailable, safely. With fewer than a quorum of the others running, `recover` refuses at once
+   (`NRV-E0712`); more lost replicas than the quorum allows is a restore.
+
+`zig build demo-r5` loses a replica after its first checkpoint under keyed writes, recovers it,
+restarts the others until it leads, and checks every view hash, the ledger's total and every
+acknowledged key.
+
+**At a new address** (written down, neither automated nor tested; R6's rolling restarts will
+test it). A replica dials only the replicas after it in `--addresses` (P102), so changing replica
+`i`'s address changes what replicas `0` to `i-1` must dial, and what every gateway dials.
+
+1. Destroy the lost replica. List the new address in slot `i` of `--addresses`, the other slots
+   unchanged, and run `nerva recover` and then `nerva start` with that list on the new host.
+   The replicas after `i` accept its connection as they would any dial and need no restart.
+2. When the replacement has caught up, restart replicas `0` to `i-1` one at a time with the new
+   list, each caught up before the next (until then they cannot reach it). Replicas after `i` keep
+   their lists: they never dial `i`.
+3. Restart every `nerva api` and `nerva view` with the new list; `export` and `backup` take it
+   from their flags.
+
+### Backups
+
+`nerva backup` is an export (above) that checks itself and keeps a record apart from it:
+
+```bash
+nerva backup --cluster=0 --addresses=3001,3002,3003 --output=b.nerva-backup
+# backup b.nerva-backup: op 10001, sha256 521eb1ce3f94...
+# manifest b.nerva-backup.manifest.json
+```
+
+It writes the export at `--output`, reads it back through the checks `import` makes (every CRC,
+the SHA-256, every view definition rebuilt), so a backup that `restore` would refuse is refused
+now, and then writes `<output>.manifest.json`: the release, the op, the export's SHA-256, size
+and version, and the hash of every view and the total of every ledger as the cluster reported
+them at that op. Neither file is ever overwritten (`NRV-E0004`). `--as-of=<op>` backs up an
+earlier op while writers go on. Where backups are kept, and for how long, is the operator's; a
+backup is a whole export (about 121 bytes a change), not an increment.
+
+`nerva restore` is `import` with the manifest checked first:
+
+```bash
+nerva restore --cluster=0 --replica=0 --replica-count=3 --input=b.nerva-backup \
+    --manifest=b.nerva-backup.manifest.json 0_0.nerva      # and --replica=1, 2
+```
+
+Before any file exists it compares the backup's size, SHA-256, op, version and every view's and
+ledger's check with the manifest, and refuses with `NRV-E0809` naming the first difference
+(`NRV-E0808` when the manifest is missing, malformed or of another version; `NRV-E0804` when the
+backup itself is damaged). The manifest is a record kept apart so that a damaged or swapped
+backup is caught by something it did not carry; it holds no checksum of its own. Then it restores
+as `import` does: the data file is named only once its state equals the checks.
+
+- **Restore every replica from the same backup, with the cluster closed**, then start them. A
+  replica of a running cluster is never restored alone (P90): use `recover`.
+- **A restore drill** costs nothing to the cluster: `--cluster` may differ from the backup's, so
+  a one-replica cluster of another id can be restored beside the running one and its view hashes
+  and ledger totals compared with the manifest (and with `nerva view`, the independent check).
+- A restored cluster is an imported one: op numbers jump to the next checkpoint, and its replicas
+  carry the backup's SHA-256 as their origin, which `recover` needs as `--origin` (above).
+
+`zig build demo-r5` backs up a cluster that has just had a replica recovered, restores it into a
+drill cluster while the original runs, then wipes the original and restores its three replicas.
 
 ### When a command refuses
 
@@ -664,7 +747,8 @@ two must differ; a gateway refuses to start otherwise, without printing either k
 [demo/](./demo/README.md) holds public demos built only on the pieces above: a seat race (512
 seats, simulated buyers; buy, rewind the show to any op, crash any process, declare views) and
 a shared canvas (paint, play the timelapse, crash, declare). `zig build test:demo` runs both
-under random crashes.
+under random crashes. `zig build -Drelease demo-r5` is R5's: a replica lost and recovered while
+writes go on, then a backup and its restores (`tests/demo/r5.py`, [docs/demos/r5.md](./docs/demos/r5.md)).
 
 Decisions and their reasons: [docs/DECISIONS.md](./docs/DECISIONS.md).
 

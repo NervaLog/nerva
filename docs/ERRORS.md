@@ -12,9 +12,12 @@ a one-line summary, who is to blame, the cause and a fix. Codes are never reused
   `error[NRV-E…]` (or `bug[NRV-B…]`), then a `cause` line (the code's summary) and a `fix` line
   (R5, `src/nerva/diagnostic.zig`; a unit test keeps its table equal to this file). Exit statuses:
   1 the operator's input, 2 the environment (disk, kernel, file system), 70 Nerva's bug (P149e);
-  `nerva start`'s runtime exits (2 to 8) keep their statuses. Still uncoded, and R5's later
-  slices: the vendored flag parser's own errors (NRV-E0001, `error: …`), and the
-  runtime exits of 07xx (E0707 to E0709; E0711 is coded).
+  `nerva start`'s runtime exits (2 to 8) keep their statuses. R5's commands (`recover`,
+  `backup`, `restore`) emit NRV-E0711 to E0716, E0808 and E0809, and `demo-r5`
+  (`tests/demo/r5.py`) shows E0713 and E0804 or E0809 from the real binary. Still uncoded: the
+  vendored flag parser's own errors (NRV-E0001, `error: …`), and the runtime exits E0708 (a disk
+  that fails a read, write or fsync under `start` is still a panic) and E0709 (a damaged WAL;
+  `start` prints a raw error). E0707 and E0711 are coded in the exit's message.
 - **Until the wire has them,** this file maps today's texts to codes, so a client can match on a
   code's identifier now and on the code later.
 

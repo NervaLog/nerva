@@ -93,6 +93,7 @@ pub fn build(b: *std.Build) !void {
             "Run a cluster of two releases, and an upgrade by export and import (python3)",
         ),
         .test_demo = b.step("test:demo", "Run the demos under crashes (python3)"),
+        .demo_r5 = b.step("demo-r5", "Run R5's demo: recover, backup, restore (python3)"),
         .vopr = b.step("vopr", "Run the VOPR"),
         .vopr_build = b.step("vopr:build", "Build the VOPR"),
         .fuzz = b.step("fuzz", "Run non-VOPR fuzzers"),
@@ -450,6 +451,15 @@ pub fn build(b: *std.Build) !void {
         demo_previous = &run_demo_test.step;
         steps.test_demo.dependOn(&run_demo_test.step);
     }
+
+    // zig build demo-r5: R5's demo (docs/briefs/r5.md, docs/demos/r5.md), three replicas, a
+    // recovered one, a backup and restores. Not part of any other step: CI runs it as `demo_r5`.
+    const run_demo_r5 = b.addSystemCommand(&.{ "python3", "tests/demo/r5.py" });
+    run_demo_r5.addFileArg(nerva.getEmittedBin());
+    if (b.args) |args| run_demo_r5.addArgs(args);
+    run_demo_r5.setCwd(b.path("."));
+    run_demo_r5.has_side_effects = true;
+    steps.demo_r5.dependOn(&run_demo_r5.step);
 
     // zig build test:fmt
     const run_fmt = b.addFmt(.{ .paths = &.{ "build.zig", "src" }, .check = true });

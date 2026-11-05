@@ -193,6 +193,30 @@ jobs:
       - name: ${{ matrix.demo }} under crashes
         run: python3 tests/demo/${{ matrix.demo }} zig-out/bin/nerva --seconds=75
 
+  # R5's demo (docs/demos/r5.md): three replicas, one lost and recovered while writes go on, a
+  # backup, a restore drill, a wipe and a restore. Exactly what `./zig/zig build -Drelease demo-r5`
+  # runs; its last line is `demo-r5: PASS` or `demo-r5: FAIL step N: ...`.
+  demo_r5:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+
+      # GitHub's runners start empty: the pinned toolchain is restored from Actions' cache, keyed by
+      # download.sh's hash, where INSTALL_ZIG looks for it (P147e).
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/nerva-toolchain
+          key: nerva-toolchain-${{ runner.os }}-${{ hashFiles('zig/download.sh') }}
+
+      - name: Install the pinned Zig
+        run: eval "$INSTALL_ZIG"
+
+      - name: demo-r5 (release)
+        run: ./zig/zig build -Drelease demo-r5
+
   # Pull requests: the fixed seeds and one random seed, in Debug. Everything else (pushes to main,
   # the release's run, a dispatch) runs `vopr_main` instead (N74).
   vopr:
