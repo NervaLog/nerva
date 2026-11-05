@@ -230,7 +230,11 @@ def check_documents(ports, rng):
         assert document(port, name)["version"] == found["version"], (found, again)
     for key in ["0" * 32, "abc", "0" * 34, "g" * 32, 5]:
         status, body = documents_commit(port, put, key)
+        # A string that is not 32 nonzero hex digits is NRV-E0109; a number is not a string,
+        # so it is malformed JSON, NRV-E0105.
+        code = "NRV-E0105" if isinstance(key, int) else "NRV-E0109"
         assert status == 400 and body.get("applied") is False, (key, body)
+        assert body.get("code") == code, (key, body)
 
 
 def main():

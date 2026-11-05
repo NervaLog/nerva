@@ -71,6 +71,7 @@
 //!   reply is the one the request would have had alone.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const assert = std.debug.assert;
 
 const stdx = @import("stdx");
@@ -1186,7 +1187,9 @@ fn commit_reply(arena: std.mem.Allocator, prepared: *const Commit) !Reply {
 /// A commit result the gateway's own checks make impossible (NRV-B0002): where it once stopped
 /// the process, it answers 500. The transaction was sent, so whether it was applied is unknown.
 pub fn unexpected_status(arena: std.mem.Allocator, what: []const u8, status: anytype) !Reply {
-    std.log.scoped(.api).err("{s}: {s}", .{ what, @tagName(status) });
+    // The test runner fails a test that logs an error: the tests that reach this path on
+    // purpose cannot log it.
+    if (!builtin.is_test) std.log.scoped(.api).err("{s}: {s}", .{ what, @tagName(status) });
     return error_reply(arena, .B0002, 500, "internal error", .unknown);
 }
 
@@ -2603,6 +2606,9 @@ const FakeClient = struct {
     records: std.AutoArrayHashMapUnmanaged(u128, RecordVersion) = .{},
     /// Commit keys: the op and a hash of the entries each committed.
     keys: std.AutoArrayHashMapUnmanaged(u128, struct { op: u64, hash: u64 }) = .{},
+    /// Answers the key entry of a keyed transaction with this status at op 7, for the tests of
+    /// the statuses a real cluster gives rarely (`key_collision`) or never (anything else).
+    key_answer: ?nerva.EntryStatus = null,
     allocator: std.mem.Allocator,
     /// Answers `declare_view`, for the tests that set it; the rest are covered by
     /// `tests/views/maintained.py`.
@@ -2734,6 +2740,11 @@ const FakeClient = struct {
         const keyed = entries[0].kind == .key;
         const hash = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(entries[1..]));
         if (keyed) {
+            if (fake.key_answer) |status| {
+                results[0] = .{ .status = status, .op = 7 };
+                @memset(results[1..], .{ .status = .aborted, .op = 0 });
+                return;
+            }
             if (fake.keys.get(nerva.CommitKey.entry_key(&entries[0]))) |committed| {
                 results[0] = .{
                     .status = if (committed.hash == hash) .committed_before else .key_reused,
@@ -3719,6 +3730,7 @@ test "api: a documents commit under a key commits once (P123)" {
     , reused.body);
 
     // A conflict under another key names the document, not an index, and frees the key.
+    // (The key is `...01`: it must commit now, not replay.)
     const stale = try handle(arena, &fake, no_layouts, .post, "/v1/documents/commit",
         \\{"key":"00000000000000000000000000000001","namespace":"7",
         \\ "reads":[{"key":"cart/1","version":"0"}]}
@@ -3727,6 +3739,16 @@ test "api: a documents commit under a key commits once (P123)" {
     try testing.expectEqualStrings(
         \\{"status":"conflict","key":"cart/1","version":"1","applied":false,"code":"NRV-E0503"}
     , stale.body);
+
+    // The conflict freed the key: resent with a read that holds, it commits, not replays.
+    const freed = try handle(arena, &fake, no_layouts, .post, "/v1/documents/commit",
+        \\{"key":"00000000000000000000000000000001","namespace":"7",
+        \\ "reads":[{"key":"cart/1","version":"1"}],
+        \\ "writes":[{"key":"cart/1","value_hex":"01"}]}
+    );
+    try testing.expectEqual(@as(u16, 200), freed.status);
+    try testing.expect(std.mem.startsWith(u8, freed.body, "{\"status\":\"committed\",\"op\":"));
+    try testing.expect(std.mem.indexOf(u8, freed.body, "replayed") == null);
 
     const keys_bad = [_][]const u8{
         "00000000000000000000000000000000",
@@ -3741,6 +3763,38 @@ test "api: a documents commit under a key commits once (P123)" {
         try testing.expectEqual(@as(u16, 400), reply.status);
         try testing.expect(std.mem.indexOf(u8, reply.body, "\"applied\":false") != null);
         try testing.expect(std.mem.indexOf(u8, reply.body, "\"code\":\"NRV-E0109\"") != null);
+    }
+}
+
+test "api: a key the cluster answers key_collision or an impossible status (P123)" {
+    var arena_instance = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_instance.deinit();
+    const arena = arena_instance.allocator();
+    var fake: FakeClient = .{ .allocator = arena };
+    const cases = [_]struct { target: []const u8, body: []const u8 }{
+        .{ .target = "/v1/commit", .body = 
+        \\{"key":"0123456789abcdef0123456789abcdef",
+        \\ "entries":[{"kind":"put","table":1,"id":"5","value_hex":"c0ffee"}]}
+        },
+        .{ .target = "/v1/documents/commit", .body = 
+        \\{"key":"0123456789abcdef0123456789abcdef","namespace":"7",
+        \\ "writes":[{"key":"cart/1","value_hex":"c0ffee"}]}
+        },
+    };
+    for (cases) |route| {
+        // Proof that nothing committed under the key: pick another.
+        fake.key_answer = .key_collision;
+        const collision = try handle(arena, &fake, no_layouts, .post, route.target, route.body);
+        try testing.expectEqual(@as(u16, 409), collision.status);
+        try testing.expectEqualStrings(
+            \\{"status":"key_collision","op":"7","applied":false,"code":"NRV-E0208"}
+        , collision.body);
+
+        // A status the gateway's own checks make impossible is the server's fault.
+        fake.key_answer = .out_of_bounds;
+        const impossible = try handle(arena, &fake, no_layouts, .post, route.target, route.body);
+        try testing.expectEqual(@as(u16, 500), impossible.status);
+        try testing.expect(std.mem.indexOf(u8, impossible.body, "NRV-B0002") != null);
     }
 }
 
