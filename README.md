@@ -228,7 +228,7 @@ NERVA_KEY=secret nerva api --cluster=1 --addresses=10.0.0.1:3001,10.0.0.2:3001,1
     --listen=127.0.0.1:8080
 ```
 
-- **Loopback only.** `--listen` must be `127.0.0.0/8` or `::1`. `0.0.0.0`, `[::]` and
+- **Loopback only.** `--listen` must be `127.0.0.0/8` or `::1`. `0.0.0.0` and
   `[::]` serve every interface, and IPv4-mapped spellings such as `::ffff:127.0.0.1` are not plain
   loopback; all are refused with NRV-E0009 (exit 1) unless `--listen-remote` is given (write
   `127.0.0.1` for loopback). With the flag and a non-loopback address, one warning (NRV-W0010)
