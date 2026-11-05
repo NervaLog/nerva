@@ -446,6 +446,34 @@ with a warning in the log; the replica runs on (N71). The metrics most useful fo
 Timings are aggregated over each 10-second window. The `tb.` prefix and tag spellings come from
 TigerBeetle's tracer (UPSTREAM.md).
 
+### Gateway metrics
+
+`nerva api --statsd=<host:port>` sends the gateway's metrics over UDP every 10 seconds, in the
+replicas' format (DogStatsD tags, so the same `statsd_exporter` reads both) with the prefix
+`nerva.api.`. Every line carries the tags `cluster` (as the replicas') and `listen` (the address the
+gateway is bound to). A gateway that cannot set up its socket (an address this host cannot send to)
+does not start: `error[NRV-E0010]`, before it says it listens. The socket never blocks: a packet the
+kernel does not take is dropped and its lines are counted in `nerva.api.statsd_dropped`, reported in
+the next window (again, if the report's own packet is refused). A series with no events in a window is not
+sent, except the two gauges. The gateway is one thread and sends a window at the top of its loop, so a window
+due while it blocks goes out when the call returns. A blocking call (a reconnect, a cluster request) lasts up to `--request-timeout`, and a request makes up to
+two (a reconnect, then the request), so the gap between windows is at most 10 s + 2 x `--request-timeout`; with the
+cluster down it is 10 s + `--request-timeout` (40 s by default, 70 s at most), one blocked reconnect.
+A late window is not lost: counters are deltas of the whole gap, and `session` is the state when it is sent (P176e). `nerva view` sends nothing.
+
+| Metric | Type, tags | What it counts |
+|---|---|---|
+| `nerva.api.requests` | counter; `route`, `status` | Every reply written, by route (`lookup`, `commit`, `changes`, `history`, `row`, `tables`, `views`, `view_groups`, `view_definition`, `view_list`, `ledgers`, `indexes`, `index_list`, `index_scan`, `documents_*`, `healthz`; `other` for a path that is no route and for refusals written before the request was read) and status (`200`, `400`, `401`, `404`, `405`, `408`, `409`, `413`, `500`, `503`, `504`, or `other`) |
+| `nerva.api.refused` | counter; `reason` | Replies with `applied: false` the gateway wrote itself: `busy`, `displaced` and `queue_wait` (NRV-E0602), `deadline` (NRV-E0116), `malformed` (E0101), `too_large` (E0102), `unavailable` (no session, E0605) |
+| `nerva.api.unknown` | counter; `route` | Replies with `applied: "unknown"`: any reply of status 400 or more that says so (NRV-E0601 after a write went out, B0002, and `500` NRV-B0001 after a write went out): the one to page on |
+| `nerva.api.group_size.*` | `count`, `sum` (counters), `min`, `max`, `avg` (gauges) | Requests answered by one pass of the gateway that reached the cluster (P143): 1 for a single request |
+| `nerva.api.cluster_request_us.*` (tag `operation`) | as above, microseconds | From a request being sent to the cluster to its reply, an eviction or a timeout; the idle probe is a `lookup_rows` |
+| `nerva.api.queue_wait_us.*` | as above, microseconds | From a request being complete to the gateway taking it |
+| `nerva.api.reconnects` | counter; `result`: `ok`, `failed` | Attempts to replace a broken session |
+| `nerva.api.session` | gauge, 1 or 0 | A session is ready at the end of the window |
+| `nerva.api.connections` | gauge | The most slots in use at once in the window, from those in use as it began (at most 16) |
+| `nerva.api.lingering_dropped`, `nerva.api.statsd_dropped` | counters | A refused connection closed at once because the lingering table was full; lines dropped because the socket did not take their packet |
+
 ### Commit stall
 
 The primary pauses a commit for one tick (10 ms) with some probability, when no backup is lagging

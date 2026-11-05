@@ -337,8 +337,8 @@ pub fn build(b: *std.Build) !void {
     // indexes (P123b, P123c), then layouts kept between requests (P135), then ledgers, against
     // models, then a cluster and gateway over IPv6 (skipped without it), a gateway given an
     // address it cannot open (#92), then key rotation through both gateways (NERVA_KEY_NEXT), a
-    // gateway with more connections than slots (R4), and every code it puts on the wire; one
-    // after the other: each runs a cluster.
+    // gateway with more connections than slots (R4), its statsd metrics, and every code it puts
+    // on the wire; one after the other: each runs a cluster.
     var api_previous: ?*std.Build.Step = null;
     for ([_][]const u8{
         "api.py",
@@ -352,6 +352,7 @@ pub fn build(b: *std.Build) !void {
         "addresses.py",
         "keys.py",
         "busy.py",
+        "metrics.py",
         "../errors/wire.py",
     }) |script| {
         const run_api_test = b.addSystemCommand(&.{ "python3", b.fmt("tests/api/{s}", .{script}) });

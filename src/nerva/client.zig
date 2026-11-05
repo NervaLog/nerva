@@ -13,6 +13,7 @@ const stdx = @import("stdx");
 const vsr = @import("../vsr.zig");
 const constants = @import("../constants.zig");
 const nerva = @import("../nerva.zig");
+const timings = @import("timings.zig");
 const IO = @import("../io.zig").IO;
 const MessageBus = @import("../message_bus.zig").MessageBusType(IO);
 const MessagePool = @import("../message_pool.zig").MessagePool;
@@ -58,6 +59,9 @@ pub const Client = struct {
         addresses: []const stdx.SocketAddress,
         /// How long a call (including registration) may wait for its reply.
         timeout: stdx.Duration,
+        /// Where a gateway reads what this client counts (`timings.zig`). It outlives the client,
+        /// which is replaced when it breaks, and a replacement can fail; none: nothing is counted.
+        tally: ?*timings.Tally = null,
     };
 
     pub const Error = error{
@@ -88,10 +92,8 @@ pub const Client = struct {
     /// compares it before and after a request: unchanged, nothing was applied; changed and no
     /// reply, the write may have been (NRV-E0601).
     writes_sent: u64,
-    /// Requests of any operation sent so far. A gateway compares it before and after serving, to
-    /// know the cluster was asked (and, if the session is still sound, replied): the idle probe
-    /// waits for quiet from the cluster, not from clients (P168d).
-    requests_sent: u64,
+    /// The operation whose request is in flight.
+    sending: ?Operation,
 
     /// Connects and registers a session; blocks until registered.
     pub fn init(client: *Client, allocator: std.mem.Allocator, options: Options) !void {
@@ -111,7 +113,7 @@ pub const Client = struct {
             .request = undefined,
             .latency_previous_ns = 0,
             .writes_sent = 0,
-            .requests_sent = 0,
+            .sending = null,
         };
         errdefer client.io.deinit();
 
@@ -157,12 +159,10 @@ pub const Client = struct {
         const allocator = client.allocator;
         const options = client.options;
         const writes_sent = client.writes_sent;
-        const requests_sent = client.requests_sent;
         client.deinit();
         try client.init(allocator, options);
         // A count a gateway took before the request still compares with it.
         client.writes_sent = writes_sent;
-        client.requests_sent = requests_sent;
     }
 
     pub fn deinit(client: *Client) void {
@@ -597,10 +597,12 @@ pub const Client = struct {
     /// Like `vsr.Client.request`, but the header carries the previous round trip.
     fn send(client: *Client, operation: Operation, events: []const u8) void {
         assert(client.state == .waiting);
+        assert(client.sending == null);
         assert(events.len % operation.event_size() == 0);
         assert(events.len <= client.vsr_client.batch_size_limit.?);
 
-        client.requests_sent += 1;
+        if (client.options.tally) |tally| tally.requests += 1;
+        client.sending = operation;
         if (operation.is_write()) client.writes_sent += 1;
         const message = client.vsr_client.get_message().build(.request);
         message.header.* = .{
@@ -633,6 +635,14 @@ pub const Client = struct {
         assert(client.state == .registering or client.state == .waiting);
         const start = client.time_os.monotonic();
         var tick_next = start;
+        defer if (client.sending) |operation| {
+            // A reply, an eviction or a timeout ends a round trip.
+            if (client.options.tally) |tally| {
+                const elapsed = start.elapsed(client.time_os.monotonic());
+                tally.operations.getPtr(operation).record(elapsed.ns);
+            }
+            client.sending = null;
+        };
         while (true) {
             switch (client.state) {
                 .idle => {
@@ -742,4 +752,24 @@ test "Client: a message after the eviction, in the same IO pass, is dropped (#74
     defer buffer.deinit(&pool);
     VSRClient.on_messages(&vsr_client.message_bus, &buffer);
     try std.testing.expectEqual(.evicted, buffer.invalid.?);
+}
+
+test "Client: what a gateway tallied survives a registration that fails" {
+    var tally: timings.Tally = .{};
+    tally.operations.getPtr(.commit).record(2_000);
+    tally.requests = 3;
+    // Nothing listens at this address: registration times out, as a reconnect to a cluster that
+    // is still away does, and `init` leaves the client uninitialized.
+    const addresses = [_]stdx.SocketAddress{.{ .ip = .@"127.0.0.1", .port = 1 }};
+    var client: Client = undefined;
+    try std.testing.expectError(error.Timeout, client.init(std.testing.allocator, .{
+        .cluster = 0,
+        .addresses = &addresses,
+        .timeout = stdx.Duration.ms(200),
+        .tally = &tally,
+    }));
+    const commits = tally.operations.get(.commit);
+    try std.testing.expectEqual(@as(u64, 1), commits.count);
+    try std.testing.expectEqual(@as(u64, 2_000), commits.sum);
+    try std.testing.expectEqual(@as(u64, 3), tally.requests);
 }

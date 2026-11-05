@@ -29,6 +29,7 @@ comptime {
     _ = @import("nerva/api/documents_routes.zig");
     _ = @import("nerva/api/layout_cache.zig");
     _ = @import("nerva/api/memory_budget.zig");
+    _ = @import("nerva/api/metrics.zig");
     _ = @import("nerva/backup.zig");
     _ = @import("nerva/catalog.zig");
     _ = @import("nerva/cli.zig");
@@ -50,6 +51,7 @@ comptime {
     _ = @import("nerva/recover.zig");
     _ = @import("nerva/release_peers.zig");
     _ = @import("nerva/state_machine_tests.zig");
+    _ = @import("nerva/timings.zig");
     _ = @import("nerva/trace_file.zig");
     _ = @import("nerva/view/declared.zig");
     _ = @import("nerva/view/declared_benchmark.zig");

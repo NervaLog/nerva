@@ -169,6 +169,8 @@ pub fn key_accepted(keys: Keys, candidate: ?[]const u8) bool {
     return (@intFromBool(current) | (@intFromBool(next) & @intFromBool(next_set))) == 1;
 }
 
+const metrics = @import("api/metrics.zig");
+
 pub const Options = struct {
     /// Connections read at once. A further connection displaces the oldest one that has sent
     /// nothing, or is refused `503 busy` if every connection has sent bytes.
@@ -184,6 +186,8 @@ pub const Options = struct {
     /// How long a complete request waits for the caller to take it (`next`, `take`) before it
     /// is refused `503 busy` (NRV-E0602, `queue_wait_max`).
     queue_wait_ns: u64 = queue_wait_ns_default,
+    /// What the receiver counts for a gateway's metrics (`api/metrics.zig`); `nerva view` has none.
+    counters: ?*metrics.Counters = null,
 };
 
 /// How long a complete request may wait to be taken: past it nothing was applied, and the
@@ -412,6 +416,9 @@ pub const Receiver = struct {
     fn serve(receiver: *Receiver, index: u32) Received {
         const slot = &receiver.slots[index];
         assert(slot.state == .complete);
+        if (receiver.options.counters) |counters| {
+            counters.waited(receiver.timer.read() -| slot.completed);
+        }
         const request = receiver.request_of(slot);
         slot.state = .serving;
         return .{ .slot = index, .request = request };
@@ -487,7 +494,7 @@ pub const Receiver = struct {
                 // Every slot taken, and one holds a connection that has sent nothing in its
                 // grace: it is told, and its slot goes to the one waiting.
                 log.debug("every slot busy: displacing the oldest silent connection", .{});
-                receiver.shut(&receiver.slots[silent], 503, busy_body);
+                receiver.shut(&receiver.slots[silent], 503, busy_body, .displaced);
                 receiver.accept();
             } else {
                 receiver.refuse_waiting();
@@ -498,10 +505,21 @@ pub const Receiver = struct {
 
     /// Writes the reply to a request handed out by `next`, then closes its connection.
     pub fn respond(receiver: *Receiver, received: Received, status: u16, body: []const u8) void {
+        _ = receiver.respond_written(received, status, body);
+    }
+
+    /// Like `respond`; true if the whole reply was written (the peer may still not read it).
+    pub fn respond_written(
+        receiver: *Receiver,
+        received: Received,
+        status: u16,
+        body: []const u8,
+    ) bool {
         const slot = &receiver.slots[received.slot];
         assert(slot.state == .serving);
-        receiver.reply(slot, status, body);
+        const written = receiver.reply(slot, status, body);
         receiver.close(slot);
+        return written;
     }
 
     /// Accepts one waiting connection, non-blocking; null if none is, or it was lost.
@@ -539,6 +557,15 @@ pub const Receiver = struct {
             .deadline = receiver.timer.read() + receiver.options.deadline_ns,
             .accepted = receiver.accepted_count,
         };
+        if (receiver.options.counters) |counters| counters.connections_seen(receiver.slots_in_use());
+    }
+
+    /// Slots holding a connection now, at most as many as there are slots.
+    pub fn slots_in_use(receiver: *const Receiver) u32 {
+        var in_use: u32 = 0;
+        for (receiver.slots) |other| in_use += @intFromBool(other.state != .free);
+        assert(in_use <= receiver.slots.len);
+        return in_use;
     }
 
     /// With every slot holding a connection that has sent bytes: answers the connections
@@ -548,7 +575,7 @@ pub const Receiver = struct {
         for (0..refusals_per_wake_max) |_| {
             const fd = receiver.accept_fd() orelse return;
             log.debug("every slot busy: refusing a new connection", .{});
-            receiver.linger(fd, 503, busy_body);
+            receiver.linger(fd, 503, busy_body, .busy);
         }
     }
 
@@ -620,15 +647,21 @@ pub const Receiver = struct {
         log.debug("refused: " ++ reason, .{});
         const body = "{\"error\":\"" ++ reason ++ "\",\"applied\":false,\"code\":\"" ++
             code ++ "\"}";
-        receiver.shut(slot, status, body);
+        receiver.shut(slot, status, body, if (status == 413) .too_large else .malformed);
     }
 
     /// Answers the request in `slot` (still being read, or complete and not yet taken) with
     /// `status` and `body` (short, written without waiting), ends the reply, and frees the
     /// slot. The connection lingers (`linger`): nothing is closed without a status line.
-    fn shut(receiver: *Receiver, slot: *Slot, status: u16, body: []const u8) void {
+    fn shut(
+        receiver: *Receiver,
+        slot: *Slot,
+        status: u16,
+        body: []const u8,
+        reason: metrics.RefusalReason,
+    ) void {
         assert(slot.state == .reading or slot.state == .complete);
-        receiver.linger(slot.fd, status, body);
+        receiver.linger(slot.fd, status, body, reason);
         slot.* = .{ .buffer = slot.buffer };
     }
 
@@ -637,7 +670,13 @@ pub const Receiver = struct {
     /// or `linger_bytes_max` have arrived. Closing at once instead, with a request unread,
     /// would reset the connection, which can discard the reply before the client reads it. With
     /// the table full the reply is still written, the connection is closed and counted.
-    fn linger(receiver: *Receiver, fd: posix.fd_t, status: u16, body: []const u8) void {
+    fn linger(
+        receiver: *Receiver,
+        fd: posix.fd_t,
+        status: u16,
+        body: []const u8,
+        reason: metrics.RefusalReason,
+    ) void {
         var message: [512]u8 = undefined;
         assert(body.len <= 256);
         const head = std.fmt.bufPrint(&message, "HTTP/1.1 {d} {s}\r\n" ++
@@ -647,7 +686,12 @@ pub const Receiver = struct {
         @memcpy(message[head.len..][0..body.len], body);
         // One send into a connection that has been sent nothing: it fits the socket's buffer.
         const sent = posix.send(fd, message[0 .. head.len + body.len], send_flags) catch 0;
-        if (sent != head.len + body.len) log.debug("refusal: not written whole ({d} bytes)", .{sent});
+        if (sent == head.len + body.len) {
+            // Counted only if written, as `answer` does.
+            if (receiver.options.counters) |counters| counters.refusal_written(reason, status);
+        } else {
+            log.debug("refusal: not written whole ({d} bytes)", .{sent});
+        }
         posix.shutdown(fd, .send) catch {};
         if (receiver.lingering_count == receiver.options.linger_entries_max) {
             receiver.lingering_dropped += 1;
@@ -689,7 +733,7 @@ pub const Receiver = struct {
         receiver.lingering[index] = receiver.lingering[receiver.lingering_count];
     }
 
-    fn reply(receiver: *Receiver, slot: *Slot, status: u16, body: []const u8) void {
+    fn reply(receiver: *Receiver, slot: *Slot, status: u16, body: []const u8) bool {
         assert(slot.state != .free);
         var head_buffer: [256]u8 = undefined;
         const head = std.fmt.bufPrint(&head_buffer, "HTTP/1.1 {d} {s}\r\n" ++
@@ -701,10 +745,15 @@ pub const Receiver = struct {
             body.len,
         }) catch unreachable;
         const deadline = receiver.timer.read() + receiver.options.deadline_ns;
-        receiver.write_all(slot.fd, head, deadline) catch |err|
-            return log.debug("reply: {}", .{err});
-        receiver.write_all(slot.fd, body, deadline) catch |err|
-            return log.debug("reply: {}", .{err});
+        receiver.write_all(slot.fd, head, deadline) catch |err| {
+            log.debug("reply: {}", .{err});
+            return false;
+        };
+        receiver.write_all(slot.fd, body, deadline) catch |err| {
+            log.debug("reply: {}", .{err});
+            return false;
+        };
+        return true;
     }
 
     /// Writes all of `bytes` to a non-blocking socket by `deadline` (a `timer` reading).
@@ -744,12 +793,12 @@ pub const Receiver = struct {
         for (receiver.slots) |*slot| {
             if (slot.state == .reading and now >= slot.deadline) {
                 log.debug("request not received within the deadline", .{});
-                receiver.shut(slot, 408, deadline_body);
+                receiver.shut(slot, 408, deadline_body, .deadline);
             } else if (slot.state == .complete and
                 now - slot.completed >= receiver.options.queue_wait_ns)
             {
                 log.debug("request not taken within the queue wait", .{});
-                receiver.shut(slot, 503, busy_body);
+                receiver.shut(slot, 503, busy_body, .queue_wait);
             }
         }
         var index: usize = receiver.lingering_count;
@@ -1421,6 +1470,37 @@ test "Receiver: a refused client that sends a body still reads its 503, at the l
     past.writeAll(&big) catch {};
     try testing.expectEqual(null, try receiver.next(200));
     try testing.expectEqual(0, receiver.lingering_count);
+}
+
+fn socket_pair() ![2]posix.fd_t {
+    var fds: [2]i32 = undefined;
+    const rc = std.os.linux.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &fds);
+    try testing.expectEqual(@as(usize, 0), rc);
+    return fds;
+}
+
+test "Receiver: a refusal is counted only when it was written whole" {
+    var counters: metrics.Counters = .{};
+    var receiver = try Receiver.init(
+        testing.allocator,
+        try std.net.Address.parseIp("127.0.0.1", 0),
+        .{ .connections_max = 1, .body_size_max = 8, .counters = &counters },
+    );
+    defer receiver.deinit(testing.allocator);
+    const busy = @intFromEnum(metrics.RefusalReason.busy);
+
+    // The sending side is shut: the send fails, so nothing is counted.
+    const shut = try socket_pair();
+    defer posix.close(shut[1]);
+    try posix.shutdown(shut[0], .send);
+    receiver.linger(shut[0], 503, busy_body, .busy);
+    try testing.expectEqual(@as(u64, 0), counters.refused[busy]);
+
+    // An open one is written whole and counted.
+    const open = try socket_pair();
+    defer posix.close(open[1]);
+    receiver.linger(open[0], 503, busy_body, .busy);
+    try testing.expectEqual(@as(u64, 1), counters.refused[busy]);
 }
 
 test "Receiver: a second Receiver on the same port is refused (#112)" {

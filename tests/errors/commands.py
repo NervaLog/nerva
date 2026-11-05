@@ -20,6 +20,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "api"))
 from api import Cluster  # noqa: E402
@@ -92,6 +93,10 @@ def main():
                       [command, "--cluster=0", "--addresses=127.0.0.1:1", "--listen=127.0.0.1:0",
                        f"--request-timeout={milliseconds}"], "NRV-E0002", 1,
                       "--request-timeout must be 1000 to 60000", env={"NERVA_KEY": KEY})
+            if command == "api":
+                check("api statsd", [command, "--cluster=0", "--addresses=127.0.0.1:1",
+                                     "--listen=127.0.0.1:0", "--statsd=127.0.0.1:0"], "NRV-E0002", 1,
+                      "--statsd must be", env={"NERVA_KEY": KEY})
             # E0009 is decided before the key is read (P183b): no NERVA_KEY, still E0009.
             check(f"{command} listen without key", [command, "--cluster=0",
                                                     "--addresses=127.0.0.1:1",
@@ -206,6 +211,29 @@ def main():
                 check("listen taken", ["api", "--cluster=0", f"--addresses={cluster.address}",
                                        f"--listen=127.0.0.1:{taken.getsockname()[1]}"],
                       "NRV-E0007", 1, "cannot listen", env={"NERVA_KEY": KEY})
+            # A statsd address this host cannot send to: the gateway refuses to start, before it
+            # says it listens or prints its port (P176b).
+            api = ["api", "--cluster=0", f"--addresses={cluster.address}", "--listen=127.0.0.1:0"]
+            statsd_bad = ["255.255.255.255:8125"]
+            try:
+                socket.socket(socket.AF_INET6, socket.SOCK_DGRAM).close()
+            except OSError:
+                statsd_bad.append("[2001:db8::1]:8125")  # a host without IPv6 has no such socket
+            for statsd in statsd_bad:
+                result = run(nerva, api + [f"--statsd={statsd}"], {"NERVA_KEY": KEY})
+                expect(result, "NRV-E0010", 1, "cannot send statsd to", f"statsd {statsd}")
+                seen.append("NRV-E0010")
+                assert result.stdout == "", (statsd, result.stdout)
+                assert "listening on" not in result.stderr, (statsd, result.stderr[-1000:])
+            # The check comes before the client registers: with the cluster unreachable a bad
+            # `--statsd` still exits at once with E0010, not after a 30 s registration (P176d).
+            started = time.monotonic()
+            result = run(nerva, ["api", "--cluster=0", "--addresses=127.0.0.1:1",
+                                 "--listen=127.0.0.1:0", "--statsd=255.255.255.255:8125"],
+                         {"NERVA_KEY": KEY}, timeout=20)
+            expect(result, "NRV-E0010", 1, "cannot send statsd to", "statsd bad, cluster down")
+            seen.append("NRV-E0010")
+            assert time.monotonic() - started < 10, "E0010 waited for the cluster"
             # `--listen-remote` accepts 0.0.0.0 and says so once (NRV-W0010); on loopback, never.
             for command in ("api", "view"):
                 for listen, warnings in (("0.0.0.0:0", 1), ("127.0.0.1:0", 0)):

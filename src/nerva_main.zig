@@ -13,9 +13,11 @@ const constants = @import("constants.zig");
 const config = constants.config;
 const cli = @import("nerva/cli.zig");
 const diagnostic = @import("nerva/diagnostic.zig");
+const timings = @import("nerva/timings.zig");
 const Client = @import("nerva/client.zig").Client;
 const view_server = @import("nerva/view/server.zig");
 const api_server = @import("nerva/api/server.zig");
+const metrics = @import("nerva/api/metrics.zig");
 const http_connection = @import("nerva/http_connection.zig");
 const export_file = @import("nerva/export_file.zig");
 const export_ = @import("nerva/export.zig");
@@ -844,11 +846,28 @@ fn command_api(gpa: std.mem.Allocator, args: *const cli.Command.Api) !void {
     const keys = gateway_keys("api");
     listen_remote_warn("api", args);
 
+    // Outside the client, which is replaced when it breaks: what the gateway reports survives it.
+    var tally: timings.Tally = .{};
+    // Before the client registers a session: a bad `--statsd` must not wait for the cluster, nor
+    // burn a session per start (P176d).
+    var emitter: ?metrics.Emitter = null;
+    if (args.statsd) |address| {
+        emitter = metrics.Emitter.open(address, args.cluster) catch |err| diagnostic.fail(
+            "NRV-E0010",
+            "api: cannot send statsd to {}: {s}",
+            .{ address.to_std(), metrics.init_reason(err) },
+            "give --statsd an address this host can send UDP to, or leave it out",
+            .{},
+        );
+    }
+    defer if (emitter) |*sender| sender.deinit();
+
     var client: Client = undefined;
     try client.init(gpa, .{
         .cluster = args.cluster,
         .addresses = args.addresses.slice(),
         .timeout = stdx.Duration.ms(args.request_timeout_ms),
+        .tally = &tally,
     });
     defer client.deinit();
 
@@ -856,6 +875,8 @@ fn command_api(gpa: std.mem.Allocator, args: *const cli.Command.Api) !void {
         .listen = args.listen,
         .keys = keys,
         .on_listening = on_listening,
+        .emitter = if (emitter) |*sender| sender else null,
+        .tally = &tally,
     });
 }
 

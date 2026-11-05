@@ -40,6 +40,9 @@ pub const ClientHealth = struct {
     since_ns: u64 = 0,
     /// When the cluster last replied (a `timer` reading): a request, a probe, a new session.
     replied_ns: u64 = 0,
+    /// Attempts to replace the client, by outcome, since the start (`ready`).
+    reconnects_ok: u64 = 0,
+    reconnects_failed: u64 = 0,
     timer: std.time.Timer,
     allocator: std.mem.Allocator,
     options: Client.Options,
@@ -70,11 +73,13 @@ pub const ClientHealth = struct {
         };
         result catch |err| {
             log.err("reconnecting to the cluster: {}", .{err});
+            health.reconnects_failed += 1;
             health.state = .gone;
             health.since_ns = health.timer.read();
             return false;
         };
         log.info("reconnected to the cluster", .{});
+        health.reconnects_ok += 1;
         health.state = .ready;
         health.replied();
         return true;
