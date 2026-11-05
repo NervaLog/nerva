@@ -68,6 +68,7 @@ a one-line summary, who is to blame, the cause and a fix. Codes are never reused
 | NRV-E0006 | A data file is missing at `start`'s path | `error[NRV-E0006]: start: <path> does not exist`, exit 1 (pre-flight, before the vendored open, which panics `Path does not exist.`) | operator | Run `nerva format` first, or fix the path |
 | NRV-E0007 | A replica, gateway or view server cannot listen | `error[NRV-E0007]: <command>: cannot listen: <reason>`, exit 1 | operator | The port is taken or not allowed, or the host has no socket for that address |
 | NRV-E0008 | `NERVA_KEY` is missing or invalid | `error[NRV-E0008]: api: set NERVA_KEY`, `NERVA_KEY_NEXT is set but empty`, `… equals NERVA_KEY` (http_connection.zig:147-150), exit 1 | operator | Set it; `_NEXT` differs from it during a rotation |
+| NRV-E0009 | `--listen` is not loopback and `--listen-remote` was not given | `error[NRV-E0009]: api: --listen=<address> is not loopback; the gateway speaks plain HTTP`, same for `view`, exit 1. Loopback is 127.0.0.0/8 and `::1`; `0.0.0.0`, `[::]` and `::ffff:127.0.0.1` are not | operator | Listen on `127.0.0.1` beside the client, or pass `--listen-remote` (one warning is logged) and put TLS in front |
 
 ## 01xx · The gateway: transport, keys, routes, requests
 

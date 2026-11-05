@@ -20,6 +20,25 @@
 (def replica-pidfile (str dir "/replica.pid"))
 (def api-pidfile (str dir "/api.pid"))
 
+(defn gateways
+  "How many `nerva api` gateways each node runs (`--gateways`, 1 or 2): R4's sidecar topology
+  has one per client process, so two gateways share every replica."
+  [test]
+  (:gateways test 1))
+
+(defn gateway-port
+  "Gateway `index` listens on `http/api-port` plus its index."
+  [index]
+  (+ http/api-port index))
+
+(defn gateway-pidfile
+  [index]
+  (if (zero? index) api-pidfile (str dir "/api-" index ".pid")))
+
+(defn gateway-log
+  [index]
+  (if (zero? index) api-log (str dir "/api-" index ".log")))
+
 (def cluster
   "The cluster id (0 is reserved for testing)."
   1)
@@ -61,19 +80,25 @@
                     data-file))
 
 (defn start-api!
+  "Starts the test's gateways. The control node reaches them over the network, so they listen
+  on every address and say so: `--listen-remote` (P168, NRV-E0009)."
   [test]
-  (cu/start-daemon! {:logfile           api-log
-                     :pidfile           api-pidfile
-                     :chdir             dir
-                     :match-executable? false
-                     :env               {:NERVA_KEY http/api-key}}
-                    binary :api (str "--cluster=" cluster) (str "--addresses=" (addresses test))
-                    (str "--listen=0.0.0.0:" http/api-port)))
+  (doseq [index (range (gateways test))]
+    (cu/start-daemon! {:logfile           (gateway-log index)
+                       :pidfile           (gateway-pidfile index)
+                       :chdir             dir
+                       :match-executable? false
+                       :env               {:NERVA_KEY http/api-key}}
+                      binary :api (str "--cluster=" cluster) (str "--addresses=" (addresses test))
+                      (str "--listen=0.0.0.0:" (gateway-port index))
+                      :--listen-remote)))
 
 (defn kill-all!
-  "SIGKILLs the gateway and the replica."
+  "SIGKILLs the gateways and the replica. The pidfile of a gateway the test did not start is
+  harmless: `stop-daemon!` ignores a missing one."
   []
-  (cu/stop-daemon! api-pidfile)
+  (doseq [index (range 2)]
+    (cu/stop-daemon! (gateway-pidfile index)))
   (cu/stop-daemon! replica-pidfile))
 
 (defn db
@@ -125,5 +150,6 @@
 
     db/LogFiles
     (log-files [_ test node]
-      {replica-log "replica.log"
-       api-log     "api.log"})))
+      (into {replica-log "replica.log"}
+            (for [index (range (gateways test))]
+              [(gateway-log index) (if (zero? index) "api.log" (str "api-" index ".log"))])))))

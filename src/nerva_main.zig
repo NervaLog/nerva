@@ -812,8 +812,15 @@ fn cluster_keys(args: *const cli.Command.Start) peer_auth.Keys {
     };
 }
 
+/// `--listen-remote`: once, before listening (README, "Network").
+fn listen_remote_warn(comptime command: []const u8) void {
+    log.warn(command ++ ": --listen-remote serves plain HTTP: the key and every reply cross the " ++
+        "network unencrypted; put TLS in front, or use a loopback address beside the client", .{});
+}
+
 fn command_view(gpa: std.mem.Allocator, args: *const cli.Command.View) !void {
     const keys = gateway_keys("view");
+    if (args.listen_remote) listen_remote_warn("view");
 
     var client: Client = undefined;
     try client.init(gpa, .{
@@ -832,6 +839,7 @@ fn command_view(gpa: std.mem.Allocator, args: *const cli.Command.View) !void {
 
 fn command_api(gpa: std.mem.Allocator, args: *const cli.Command.Api) !void {
     const keys = gateway_keys("api");
+    if (args.listen_remote) listen_remote_warn("api");
 
     var client: Client = undefined;
     try client.init(gpa, .{

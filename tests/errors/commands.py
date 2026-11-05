@@ -82,6 +82,11 @@ def main():
             check(f"{command} listen", [command, "--cluster=0", "--addresses=127.0.0.1:1",
                                         "--listen=bogus"], "NRV-E0003", 1, "--listen must be",
                   env={"NERVA_KEY": KEY})
+            for listen in ("0.0.0.0:0", "[::]:0", "10.0.0.1:0", "[::ffff:127.0.0.1]:0"):
+                check(f"{command} listen {listen}", [command, "--cluster=0",
+                                                     "--addresses=127.0.0.1:1",
+                                                     f"--listen={listen}"], "NRV-E0009", 1,
+                      "is not loopback", env={"NERVA_KEY": KEY})
             for milliseconds in ("999", "60001"):
                 check(f"{command} request timeout {milliseconds}",
                       [command, "--cluster=0", "--addresses=127.0.0.1:1", "--listen=127.0.0.1:0",
@@ -188,6 +193,19 @@ def main():
                 check("listen taken", ["api", "--cluster=0", f"--addresses={cluster.address}",
                                        f"--listen=127.0.0.1:{taken.getsockname()[1]}"],
                       "NRV-E0007", 1, "cannot listen", env={"NERVA_KEY": KEY})
+            # `--listen-remote` accepts 0.0.0.0 and says so once.
+            for command in ("api", "view"):
+                process = subprocess.Popen(
+                    [nerva, command, "--cluster=0", f"--addresses={cluster.address}",
+                     "--listen=0.0.0.0:0", "--listen-remote"], stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE, text=True, env={**os.environ, "NERVA_KEY": KEY})
+                try:
+                    assert int(process.stdout.readline()) > 0, command
+                finally:
+                    process.kill()
+                    stderr = process.communicate()[1]
+                assert stderr.count("--listen-remote serves plain HTTP") == 1, (command, stderr)
+                assert not diagnostic_lines(subprocess.CompletedProcess([], 0, "", stderr)), stderr
         finally:
             cluster.close()
 
