@@ -196,8 +196,9 @@ client can always tell "not applied" from "unknown", and the operator can see wh
 - **Several gateways in a test:** two on one cluster, with one killed.
 - **Error codes on the wire.** Every error reply gains `"code"` from `docs/ERRORS.md` (P147c); body too large
   becomes 413, and "not yet committed" one status on every route.
-- **Conservation as a metric.** Each replica emits each ledger's conserved sum and its view hash,
-  so an operator can alert on a break without reading views.
+- ~~**Conservation as a metric.**~~ Cut from R4 (P168, answer 5): replicas hold no ledger totals,
+  and a total kept from applied deltas is zero by construction. A true one needs a scan or a
+  persisted total; it is replica work, left for later.
 
 **Demo script:**
 
@@ -205,13 +206,17 @@ client can always tell "not applied" from "unknown", and the operator can see wh
    client's gateway stops only that client.
 1. 32 callers against a 16-slot gateway: every refused request says `"applied": false`, and no
    keyed commit is lost or doubled.
-2. The metrics endpoint shows the refusals.
-3. Two gateways, one killed: the client's retries land on the other, under their keys.
+2. The gateway's statsd counts equal the refusals the callers saw (statsd is pushed; there is no
+   endpoint).
+3. One client's gateway killed and restarted on the same port: its retries apply once, under
+   their keys (a sidecar has no second gateway to fail over to; P168). The full demo is
+   `docs/briefs/r4.md`, "The demo".
 
 **Acceptance:**
 
 - [ ] `test:api` gains the refusal cases.
-- [ ] Jepsen R1 runs with two gateways per node.
+- [ ] `demo_r4` is green in CI (R4 is delivered on this, P168 answer 7).
+- [ ] Jepsen R1 runs with two gateways per node (after R1's nightly runs; Botpike's gate waits for it).
 - [ ] #120 and #112 are closed.
 
 ## R5 · Recover: a lost replica, and a restore, with the cluster open
