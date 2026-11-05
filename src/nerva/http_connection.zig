@@ -169,6 +169,8 @@ pub fn key_accepted(keys: Keys, candidate: ?[]const u8) bool {
     return (@intFromBool(current) | (@intFromBool(next) & @intFromBool(next_set))) == 1;
 }
 
+const metrics = @import("api/metrics.zig");
+
 pub const Options = struct {
     /// Connections read at once. A further connection displaces the oldest one that has sent
     /// nothing, or is refused `503 busy` if every connection has sent bytes.
@@ -184,6 +186,8 @@ pub const Options = struct {
     /// How long a complete request waits for the caller to take it (`next`, `take`) before it
     /// is refused `503 busy` (NRV-E0602, `queue_wait_max`).
     queue_wait_ns: u64 = queue_wait_ns_default,
+    /// What the receiver counts for a gateway's metrics (`api/metrics.zig`); `nerva view` has none.
+    counters: ?*metrics.Counters = null,
 };
 
 /// How long a complete request may wait to be taken: past it nothing was applied, and the
@@ -412,6 +416,9 @@ pub const Receiver = struct {
     fn serve(receiver: *Receiver, index: u32) Received {
         const slot = &receiver.slots[index];
         assert(slot.state == .complete);
+        if (receiver.options.counters) |counters| {
+            counters.waited(receiver.timer.read() -| slot.completed);
+        }
         const request = receiver.request_of(slot);
         slot.state = .serving;
         return .{ .slot = index, .request = request };
@@ -487,7 +494,7 @@ pub const Receiver = struct {
                 // Every slot taken, and one holds a connection that has sent nothing in its
                 // grace: it is told, and its slot goes to the one waiting.
                 log.debug("every slot busy: displacing the oldest silent connection", .{});
-                receiver.shut(&receiver.slots[silent], 503, busy_body);
+                receiver.shut(&receiver.slots[silent], 503, busy_body, .displaced);
                 receiver.accept();
             } else {
                 receiver.refuse_waiting();
@@ -539,6 +546,11 @@ pub const Receiver = struct {
             .deadline = receiver.timer.read() + receiver.options.deadline_ns,
             .accepted = receiver.accepted_count,
         };
+        if (receiver.options.counters) |counters| {
+            var in_use: u32 = 0;
+            for (receiver.slots) |other| in_use += @intFromBool(other.state != .free);
+            counters.connections_seen(in_use);
+        }
     }
 
     /// With every slot holding a connection that has sent bytes: answers the connections
@@ -548,7 +560,7 @@ pub const Receiver = struct {
         for (0..refusals_per_wake_max) |_| {
             const fd = receiver.accept_fd() orelse return;
             log.debug("every slot busy: refusing a new connection", .{});
-            receiver.linger(fd, 503, busy_body);
+            receiver.linger(fd, 503, busy_body, .busy);
         }
     }
 
@@ -620,15 +632,21 @@ pub const Receiver = struct {
         log.debug("refused: " ++ reason, .{});
         const body = "{\"error\":\"" ++ reason ++ "\",\"applied\":false,\"code\":\"" ++
             code ++ "\"}";
-        receiver.shut(slot, status, body);
+        receiver.shut(slot, status, body, if (status == 413) .too_large else .malformed);
     }
 
     /// Answers the request in `slot` (still being read, or complete and not yet taken) with
     /// `status` and `body` (short, written without waiting), ends the reply, and frees the
     /// slot. The connection lingers (`linger`): nothing is closed without a status line.
-    fn shut(receiver: *Receiver, slot: *Slot, status: u16, body: []const u8) void {
+    fn shut(
+        receiver: *Receiver,
+        slot: *Slot,
+        status: u16,
+        body: []const u8,
+        reason: metrics.RefusalReason,
+    ) void {
         assert(slot.state == .reading or slot.state == .complete);
-        receiver.linger(slot.fd, status, body);
+        receiver.linger(slot.fd, status, body, reason);
         slot.* = .{ .buffer = slot.buffer };
     }
 
@@ -637,7 +655,14 @@ pub const Receiver = struct {
     /// or `linger_bytes_max` have arrived. Closing at once instead, with a request unread,
     /// would reset the connection, which can discard the reply before the client reads it. With
     /// the table full the reply is still written, the connection is closed and counted.
-    fn linger(receiver: *Receiver, fd: posix.fd_t, status: u16, body: []const u8) void {
+    fn linger(
+        receiver: *Receiver,
+        fd: posix.fd_t,
+        status: u16,
+        body: []const u8,
+        reason: metrics.RefusalReason,
+    ) void {
+        if (receiver.options.counters) |counters| counters.refusal_written(reason, status);
         var message: [512]u8 = undefined;
         assert(body.len <= 256);
         const head = std.fmt.bufPrint(&message, "HTTP/1.1 {d} {s}\r\n" ++
@@ -744,12 +769,12 @@ pub const Receiver = struct {
         for (receiver.slots) |*slot| {
             if (slot.state == .reading and now >= slot.deadline) {
                 log.debug("request not received within the deadline", .{});
-                receiver.shut(slot, 408, deadline_body);
+                receiver.shut(slot, 408, deadline_body, .deadline);
             } else if (slot.state == .complete and
                 now - slot.completed >= receiver.options.queue_wait_ns)
             {
                 log.debug("request not taken within the queue wait", .{});
-                receiver.shut(slot, 503, busy_body);
+                receiver.shut(slot, 503, busy_body, .queue_wait);
             }
         }
         var index: usize = receiver.lingering_count;

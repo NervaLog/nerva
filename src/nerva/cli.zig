@@ -61,6 +61,7 @@ const CLIArgs = union(enum) {
         addresses: vsr.ClusterAddress,
         listen: []const u8,
         request_timeout: u32 = request_timeout_default_ms,
+        statsd: ?[]const u8 = null,
         log_debug: bool = false,
     },
 
@@ -139,7 +140,7 @@ const CLIArgs = union(enum) {
         \\             [--request-timeout=<milliseconds>] [--log-debug]
         \\
         \\  nerva api --cluster=<integer> --addresses=<addresses> --listen=<host:port>
-        \\            [--request-timeout=<milliseconds>] [--log-debug]
+        \\            [--request-timeout=<milliseconds>] [--statsd=<host:port>] [--log-debug]
         \\
         \\  nerva export --cluster=<integer> --addresses=<addresses> [--as-of=<op>|latest]
         \\               --output=<path> [--log-debug]
@@ -224,8 +225,9 @@ const CLIArgs = union(enum) {
         \\        cache sets. The default is the minimum, one set.
         \\
         \\  --statsd=<host:port>
-        \\        Send the replica's metrics as statsd over UDP every 10 seconds. The port
-        \\        defaults to 8125; a bare port means 127.0.0.1. IPv6 goes in brackets.
+        \\        Send the replica's (or, for api, the gateway's) metrics as statsd over UDP every
+        \\        10 seconds. The port defaults to 8125; a bare port means 127.0.0.1. IPv6 goes
+        \\        in brackets.
         \\
         \\  --request-timeout=<milliseconds>
         \\        view and api: how long a request to the cluster may wait for its reply,
@@ -334,6 +336,8 @@ pub const Command = union(enum) {
         listen: std.net.Address,
         /// How long a cluster request may wait for its reply, in milliseconds.
         request_timeout_ms: u32,
+        /// Where the gateway sends its metrics as statsd, if anywhere.
+        statsd: ?stdx.SocketAddress,
         log_debug: bool,
     };
 
@@ -425,6 +429,8 @@ pub fn parse_args(flags: *stdx.Flags) Command {
                 listen_invalid("api"),
             .request_timeout_ms = request_timeout_validate(api.request_timeout) catch |err|
                 flag_range("api", err),
+            .statsd = if (api.statsd) |text| statsd_parse(text) catch |err|
+                flag_range("api", err) else null,
             .log_debug = api.log_debug,
         } },
         .@"export" => |args| .{ .@"export" = export_resolve("export", args) },

@@ -6,6 +6,7 @@
 //! are serialized there.
 
 const std = @import("std");
+const stdx = @import("stdx");
 const assert = std.debug.assert;
 const log = std.log.scoped(.api);
 
@@ -17,6 +18,7 @@ const CatalogStore = @import("catalog_store.zig").CatalogStore;
 const MemoryBudget = @import("memory_budget.zig");
 const ClientHealth = @import("../client_health.zig").ClientHealth;
 const wire = @import("../wire_code.zig");
+const metrics = @import("metrics.zig");
 
 /// The largest request body: a full commit request in JSON is well under this.
 const body_size_max = 4 * 1024 * 1024;
@@ -34,18 +36,29 @@ pub const Options = struct {
     /// `X-Nerva-Key` must be one of these (`http_connection.key_accepted`).
     keys: http_connection.Keys,
     on_listening: ?*const fn (address: std.net.Address) void = null,
+    /// Where to send metrics as statsd (`--statsd`); none without it.
+    statsd: ?stdx.SocketAddress = null,
+    /// The cluster's id, a tag on every metric.
+    cluster: u128 = 0,
 };
 
 pub fn serve(gpa: std.mem.Allocator, client: *Client, options: Options) !noreturn {
     assert(http_connection.Keys.invalid(options.keys.current, options.keys.next) == null);
+    var counters: metrics.Counters = .{};
     var receiver = try http_connection.Receiver.init(gpa, options.listen, .{
         .connections_max = connections_max,
         .body_size_max = body_size_max,
+        .counters = &counters,
     });
     defer receiver.deinit(gpa);
     log.info("listening on {}", .{receiver.listen_address()});
     if (options.on_listening) |on_listening| on_listening(receiver.listen_address());
 
+    var emitter: ?metrics.Emitter = if (options.statsd) |address|
+        try metrics.Emitter.init(address, options.cluster, receiver.listen_address())
+    else
+        null;
+    defer if (emitter) |*sender| sender.deinit();
     var layouts = CatalogStore.init(client);
     var health = try ClientHealth.init(client);
     // Each request's memory is bounded, and the arena gives back what one large request took
@@ -63,7 +76,17 @@ pub fn serve(gpa: std.mem.Allocator, client: *Client, options: Options) !noretur
         } else {
             _ = health.ready(client);
         }
-        const received = try receiver.next(health.idle_timeout_ms(-1)) orelse continue;
+        var wake_ms = health.idle_timeout_ms(-1);
+        if (emitter) |*sender| {
+            sender.tick(&counters, &client.timings, .{
+                .session = health.state == .ready,
+                .reconnects_ok = health.reconnects_ok,
+                .reconnects_failed = health.reconnects_failed,
+                .lingering_dropped = receiver.lingering_dropped,
+            });
+            wake_ms = sender.wait_ms(wake_ms);
+        }
+        const received = try receiver.next(wake_ms) orelse continue;
         const requests_before = client.requests_sent;
         budget.request_start();
         const arena = budget.allocator();
@@ -78,7 +101,7 @@ pub fn serve(gpa: std.mem.Allocator, client: *Client, options: Options) !noretur
             group_count += receiver.take(filter, GroupFilter.accepts, group[1..]);
         }
         if (group_count > 1) {
-            serve_group(arena, client, &health, &layouts, &receiver, &budget, group[0..group_count]);
+            serve_group(arena, client, &health, &layouts, &receiver, &counters, &budget, group[0..group_count]);
         } else {
             const writes_before = client.writes_sent;
             const reply = serve_request(
@@ -89,13 +112,32 @@ pub fn serve(gpa: std.mem.Allocator, client: *Client, options: Options) !noretur
                 options,
                 &received.request,
             ) catch |err| reply_of_error(err, &budget, writes_before, client.writes_sent);
-            receiver.respond(received, reply.status, reply.body);
+            answer(&receiver, &counters, received, reply);
         }
+        if (client.requests_sent != requests_before) counters.group(group_count);
         if (health.state == .ready and client.requests_sent != requests_before) health.replied();
         // `respond` has written the reply: give back what the request took at once, rather than
         // when the next request arrives (#60).
         _ = arena_instance.reset(.{ .retain_with_limit = MemoryBudget.retain_max });
     }
+}
+
+/// Writes `reply` to the request `received`, and counts it (`metrics.zig`): by route and status,
+/// as unknown if it says so, and as refused if the gateway had no session to send it to.
+fn answer(
+    receiver: *http_connection.Receiver,
+    counters: *metrics.Counters,
+    received: http_connection.Received,
+    reply: api.Reply,
+) void {
+    const route = metrics.route_of(received.request.method == .get, received.request.target);
+    counters.replied(route, reply.status, metrics.reply_unknown(reply.status, reply.body));
+    if (route != .healthz and reply.status == 503 and
+        std.mem.eql(u8, reply.body, cluster_unavailable.body))
+    {
+        counters.refused_with(.unavailable);
+    }
+    receiver.respond(received, reply.status, reply.body);
 }
 
 /// The requests that may be answered with others by one cluster request: a commit or a lookup,
@@ -159,6 +201,7 @@ fn serve_group(
     health: *ClientHealth,
     layouts: *CatalogStore,
     receiver: *http_connection.Receiver,
+    counters: *metrics.Counters,
     budget: *const MemoryBudget,
     received: []const http_connection.Received,
 ) void {
@@ -195,7 +238,7 @@ fn serve_group(
     for (members_used, received) |member, one| {
         const reply = member.result.? catch |err|
             reply_of_error(err, budget, writes_before, client.writes_sent);
-        receiver.respond(one, reply.status, reply.body);
+        answer(receiver, counters, one, reply);
     }
 }
 

@@ -845,6 +845,8 @@ fn command_api(gpa: std.mem.Allocator, args: *const cli.Command.Api) !void {
         .listen = args.listen,
         .keys = keys,
         .on_listening = on_listening,
+        .statsd = args.statsd,
+        .cluster = args.cluster,
     });
 }
 

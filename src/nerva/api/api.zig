@@ -105,7 +105,7 @@ pub const Reply = struct {
     body: []const u8,
 };
 
-const Route = enum {
+pub const Route = enum {
     lookup,
     commit,
     changes,
@@ -125,7 +125,7 @@ const Route = enum {
     index_scan,
 };
 
-const routes = [_]struct { path: []const u8, route: Route, method: Method }{
+pub const routes = [_]struct { path: []const u8, route: Route, method: Method }{
     .{ .path = "/v1/lookup", .route = .lookup, .method = .post },
     .{ .path = "/v1/commit", .route = .commit, .method = .post },
     .{ .path = "/v1/changes", .route = .changes, .method = .get },
@@ -136,13 +136,13 @@ const routes = [_]struct { path: []const u8, route: Route, method: Method }{
     .{ .path = "/v1/documents/changes", .route = .documents_changes, .method = .get },
 };
 
-const tables_prefix = "/v1/tables/";
-const views_prefix = "/v1/views/";
-const ledgers_prefix = "/v1/ledgers/";
-const indexes_prefix = "/v1/indexes/";
-const index_scan_suffix = "/scan";
-const views_groups_suffix = "/groups";
-const views_definition_suffix = "/definition";
+pub const tables_prefix = "/v1/tables/";
+pub const views_prefix = "/v1/views/";
+pub const ledgers_prefix = "/v1/ledgers/";
+pub const indexes_prefix = "/v1/indexes/";
+pub const index_scan_suffix = "/scan";
+pub const views_groups_suffix = "/groups";
+pub const views_definition_suffix = "/definition";
 /// The most groups `GET /v1/views/<name>` answers with at once (N66); larger views are read in
 /// pages from `/groups`.
 pub const view_answer_groups_max = 10_000;
