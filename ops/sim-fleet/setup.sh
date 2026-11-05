@@ -87,10 +87,14 @@ mem_total_mb=$(awk '/^MemTotal:/ { print int($2 / 1024) }' /proc/meminfo)
 mem_max_mb=$((mem_total_mb - 1024))
 [ "$mem_max_mb" -le 57344 ] || mem_max_mb=57344
 seed_mb=$(sed -n 's/^SIM_FLEET_SEED_MEMORY_MB=//p' /etc/sim-fleet/fleet.env | tail -n1)
+# One pair of surrounding quotes is dropped, as systemd's EnvironmentFile= does.
+case "$seed_mb" in
+\"*\" | \'*\') seed_mb=${seed_mb#?}; seed_mb=${seed_mb%?} ;;
+esac
 seed_mb=${seed_mb:-4096}
 case "$seed_mb" in
-'' | *[!0-9]*)
-    echo "setup.sh: SIM_FLEET_SEED_MEMORY_MB in /etc/sim-fleet/fleet.env is '$seed_mb', not a number" >&2
+'' | *[!0-9]* | 0 | 00*)
+    echo "setup.sh: SIM_FLEET_SEED_MEMORY_MB in /etc/sim-fleet/fleet.env is '$seed_mb', not a positive number" >&2
     exit 1
     ;;
 esac

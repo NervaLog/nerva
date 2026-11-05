@@ -476,6 +476,21 @@ class WorkerPlan(unittest.TestCase):
         self.assertIn("add up to 3", warnings[0])
         self.assertIn("above the 1", warnings[0])
 
+    def test_a_plan_of_zero_workers_is_refused_with_one_line(self):
+        home = tempfile.mkdtemp()
+        for env in ({"SIM_FLEET_WORKERS": "2", "SIM_FLEET_WORKERS_MIXED": "0"},
+                    {"SIM_FLEET_WORKERS": "2", "SIM_FLEET_WORKERS_VOPR_NERVA": "0",
+                     "SIM_FLEET_WORKERS_VOPR_TESTING": "0", "SIM_FLEET_WORKERS_FUZZ": "0",
+                     "SIM_FLEET_WORKERS_MIXED": "0"}):
+            out = subprocess.run(
+                ["bash", "-c", f'source "{HERE}/run.sh"; main'],
+                env={"PATH": os.environ["PATH"], "SIM_FLEET_DRY_RUN": "1",
+                     "SIM_FLEET_HOME": home, **env},
+                capture_output=True, text=True)
+            self.assertEqual(out.returncode, 2, (env, out.stdout, out.stderr))
+            self.assertIn("0 workers in total", out.stdout)
+            self.assertEqual(len(out.stdout.strip().splitlines()), 1, out.stdout)
+
     def test_a_bad_memory_setting_is_refused_with_one_line(self):
         for var in ("SIM_FLEET_SEED_MEMORY_MB", "SIM_FLEET_RESERVE_MB"):
             for bad in ("0", "abc", "-5", "4G"):

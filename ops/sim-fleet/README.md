@@ -29,8 +29,9 @@ takes `flock` on `state/lock`) loops over rounds:
    workers are all "mixed": each rotates through the kinds seed by seed (vopr-nerva,
    vopr-testing, vopr-nerva, fuzz), so no kind goes uncovered. The split, all in `fleet.env`:
    `SIM_FLEET_WORKERS_VOPR_TESTING` and `SIM_FLEET_WORKERS_FUZZ` default to an eighth of the
-   workers each (at least one), `SIM_FLEET_WORKERS_VOPR_NERVA` to the rest; 0 stops a kind. On a
-   16-thread host that is 13, 1 and 1. Each worker starts seeds for `SIM_FLEET_ROUND_SECONDS`
+   workers each (at least one), `SIM_FLEET_WORKERS_VOPR_NERVA` to the rest; 0 stops a dedicated
+   kind (mixed workers rotate through all kinds). On a 16-thread, 64 GB host that is 12, 1 and 1
+   (14 workers: memory, not cores, is the limit). Each worker starts seeds for `SIM_FLEET_ROUND_SECONDS`
    (900): a fresh random 64-bit seed per run, `vopr-<sm> <seed>` or `fuzz <fuzzer> <seed>`, each
    under its own deadline (`SIM_FLEET_VOPR_SEED_TIMEOUT` 600 s, `SIM_FLEET_FUZZ_SEED_TIMEOUT`
    900 s; past it, a seed is counted as a timeout, never filed, as `fuzz_loop.sh` does). A fuzz

@@ -53,6 +53,11 @@ main() {
         log "warning: the worker settings in fleet.env add up to $planned, above the" \
             "$SIM_FLEET_WORKERS that $mem_mb MB holds; the settings win, and seeds may be OOM-killed"
     fi
+    if (( planned == 0 )); then
+        log "no workers: SIM_FLEET_WORKERS=$SIM_FLEET_WORKERS ($workers_from) and the" \
+            "SIM_FLEET_WORKERS_* settings give a plan of 0 workers in total; set at least one"
+        exit 2
+    fi
     # Every fuzzer in src/fuzz_tests.zig but `canary` (fails on purpose) and `smoke`, as fuzz.yml.
     : "${SIM_FLEET_FUZZERS:=ewah lsm_scan lsm_cache_map lsm_manifest_log lsm_manifest_level \
 lsm_segmented_array lsm_tree message_bus storage vsr_free_set vsr_superblock \
