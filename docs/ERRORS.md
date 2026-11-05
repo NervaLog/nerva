@@ -169,11 +169,11 @@ These are the replies to `POST /v1/commit`. The identifier is the state machine'
 | NRV-E0709 | A replica's WAL is damaged | Today a raw `error: WALInvalid` or `WALCorrupt` | operator | Replace the replica (R5) |
 | NRV-E0710 | Not every replica address was given | `error[NRV-E0710]: start: all --addresses must be provided`, exit 1 | operator | Give all of them, in replica order |
 | NRV-E0711 | This replica was imported from another export than its peers | Exit 8, `origin_mismatch`: `this replica was imported from export <A>, but <n> of the cluster's <m> replicas announce another` (replica.zig, P90) | operator | Import it again from the cluster's export, or `nerva recover` it with `--origin=` the export its peers announce |
-| NRV-E0712 | `nerva recover`: the other replicas did not commit its requests; they have no quorum | Not yet: R5 (`docs/briefs/r5.md`) | operator | Bring back enough of the other replicas first; with fewer, restore from a backup |
-| NRV-E0713 | `nerva recover`: the replica it would replace still answers at its address | Not yet: R5 | operator | Stop that replica and destroy its data file, then recover again |
-| NRV-E0714 | `nerva recover` needs a cluster of at least three replicas | Not yet: R5 | operator | Restore a smaller cluster from a backup |
-| NRV-E0715 | An earlier `nerva recover` did not finish | Not yet: R5 (`<path>.recovering` is left) | operator | Remove `<path>.recovering`, then recover again |
-| NRV-E0716 | `nerva recover`'s session was evicted before it finished | Not yet: R5 | retry | Run it again; fewer clients than 64 sessions |
+| NRV-E0712 | `nerva recover`: the other replicas did not commit its requests; they have no quorum | `error[NRV-E0712]`, exit 1: `only <n> of the other <m> replicas answer` at once, or `did not commit recover's requests within 60 seconds` (`recover.zig`) | operator | Bring back enough of the other replicas first; with fewer, restore from a backup |
+| NRV-E0713 | `nerva recover`: the replica it would replace still answers at its address | `error[NRV-E0713]`, exit 1: `replica <i> still answers at <address>` (`recover.zig`) | operator | Stop that replica and destroy its data file, then recover again |
+| NRV-E0714 | `nerva recover` needs a cluster of at least three replicas | `error[NRV-E0714]`, exit 1: `recover: --replica-count=<n> is too small` (`recover.zig`) | operator | Restore a smaller cluster from a backup |
+| NRV-E0715 | An earlier `nerva recover` did not finish | `error[NRV-E0715]`, exit 1: `an earlier recover did not finish: <path>.recovering is left` (`recover.zig`) | operator | Remove `<path>.recovering`, then recover again |
+| NRV-E0716 | `nerva recover`'s session was evicted before it finished | `error[NRV-E0716]`, exit 1: `the cluster evicted this session before it finished` (`recover.zig`; no test triggers it) | retry | Run it again; fewer clients than 64 sessions |
 
 ## 08xx · Export and import
 

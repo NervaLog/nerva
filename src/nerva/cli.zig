@@ -18,6 +18,7 @@ const ByteSize = stdx.ByteSize;
 const trace_size_default = @import("trace_file.zig").size_max_default;
 
 const StateMachine = @import("state_machine.zig").StateMachineType(Storage);
+const recover = @import("recover.zig");
 const Grid = vsr.GridType(Storage);
 
 const CLIArgs = union(enum) {
@@ -81,6 +82,19 @@ const CLIArgs = union(enum) {
         path: []const u8,
     },
 
+    recover: struct {
+        cluster: u128,
+        replica: u8,
+        replica_count: u8,
+        addresses: vsr.ClusterAddress,
+        origin: []const u8,
+        development: bool = false,
+        log_debug: bool = false,
+
+        @"--": void,
+        path: []const u8,
+    },
+
     version: struct {},
 
     pub const help =
@@ -110,6 +124,10 @@ const CLIArgs = union(enum) {
         \\  nerva import --cluster=<integer> --replica=<index> --replica-count=<integer>
         \\               --input=<path> [--development] [--log-debug] <path>
         \\
+        \\  nerva recover --cluster=<integer> --replica=<index> --replica-count=<integer>
+        \\               --addresses=<addresses> --origin=<sha256>|none
+        \\               [--development] [--log-debug] <path>
+        \\
         \\  nerva version
         \\
         \\Commands:
@@ -135,6 +153,12 @@ const CLIArgs = union(enum) {
         \\  import   Create a replica's data file at <path> from an export: run once per
         \\           replica, on the same export, then start the replicas. Fails, and
         \\           removes <path>, if the export is damaged or the checks do not match.
+        \\
+        \\  recover  Create the data file of a replica whose disk is gone, at <path>, as a
+        \\           replica of the running cluster, then exit: run nerva start on it. Stop
+        \\           the lost replica and destroy its data file first: it must never start
+        \\           again. One replica at a time, each caught up before the next; at least
+        \\           three replicas. Writes <path>.recovering and renames it once complete.
         \\
         \\  version  Print the version.
         \\
@@ -184,6 +208,11 @@ const CLIArgs = union(enum) {
         \\        Export every change at or before this op (default: the op of the export's
         \\        first read).
         \\
+        \\  --origin=<sha256>|none
+        \\        The export the cluster was imported from (the SHA-256 that export prints,
+        \\        and import and start log), or none for a cluster that was formatted. A
+        \\        replica recovered with the wrong one exits with status 8 when it starts.
+        \\
         \\  --output=<path>, --input=<path>
         \\        The export file. `export` refuses an existing file.
         \\
@@ -207,6 +236,7 @@ pub const Command = union(enum) {
     api: Api,
     @"export": Export,
     import: Import,
+    recover: Recover,
     version,
 
     pub const Export = struct {
@@ -223,6 +253,18 @@ pub const Command = union(enum) {
         replica: u8,
         replica_count: u8,
         input: []const u8,
+        development: bool,
+        log_debug: bool,
+        path: []const u8,
+    };
+
+    pub const Recover = struct {
+        cluster: u128,
+        replica: u8,
+        replica_count: u8,
+        addresses: vsr.ClusterAddress,
+        /// The export the cluster was imported from; zeroes if it was formatted (P90).
+        origin: [32]u8,
         development: bool,
         log_debug: bool,
         path: []const u8,
@@ -355,6 +397,7 @@ pub fn parse_args(flags: *stdx.Flags) Command {
                 .path = format.path,
             } };
         },
+        .recover => |args| .{ .recover = recover_resolve(args) },
         .version => .version,
     };
 }
@@ -377,6 +420,58 @@ fn listen_invalid(comptime command: []const u8) noreturn {
         "give --listen=host:port, with an IPv6 host in brackets",
         .{},
     );
+}
+
+/// `recover`'s flags, checked before anything runs; exits with a coded line if they are wrong.
+fn recover_resolve(args: anytype) Command.Recover {
+    const origin = recover.flags_check(.{
+        .replica = args.replica,
+        .replica_count = args.replica_count,
+        .address_count = args.addresses.members_count(),
+        .addresses_zero = args.addresses.zero,
+        .origin = args.origin,
+    }) catch |err| switch (err) {
+        error.ReplicaCountTooSmall => diag.fail(
+            "NRV-E0714",
+            "recover: --replica-count={} is too small; recover needs at least {} replicas",
+            .{ args.replica_count, recover.replica_count_min },
+            "restore a cluster of fewer replicas from a backup",
+            .{},
+        ),
+        error.ReplicaCountTooLarge => flag_range("recover", error.ReplicaCountTooLarge),
+        error.ReplicaOutOfRange => flag_range("recover", error.ReplicaIndexOutOfRange),
+        error.AddressesZero => diag.fail(
+            "NRV-E0002",
+            "recover: --addresses=0 is for tests of start",
+            .{},
+            "give --addresses=<host:port of each replica, in order>",
+            .{},
+        ),
+        error.AddressCount => diag.fail(
+            "NRV-E0710",
+            "recover: --addresses gave {} addresses; the cluster has {} replicas",
+            .{ args.addresses.members_count(), args.replica_count },
+            "give every replica's address, in replica order, the lost one's included",
+            .{},
+        ),
+        error.OriginInvalid => diag.fail(
+            "NRV-E0001",
+            "recover: --origin must be an export's 64 hex digits, or none",
+            .{},
+            "give the SHA-256 that export prints, or none for a cluster that was formatted",
+            .{},
+        ),
+    };
+    return .{
+        .cluster = args.cluster,
+        .replica = args.replica,
+        .replica_count = args.replica_count,
+        .addresses = args.addresses,
+        .origin = origin,
+        .development = args.development,
+        .log_debug = args.log_debug,
+        .path = args.path,
+    };
 }
 
 /// `--as-of`: an op above zero, or `latest` (null).

@@ -264,10 +264,21 @@ nerva start --addresses=3001,3002,3003 0_0.nerva   # and 0_1, 0_2
   exports, and nothing from them reaches its data file: import it again from the cluster's
   export. The others log that they ignore it and run on. A replica imported from the cluster's
   export that has not started yet may start later and catch up.
-- **Replacing a lost replica**: export the cluster and import every replica again (the cluster
-  is closed meanwhile). Importing only the lost one is not safe: its replacement forgets the
-  prepares the lost replica acknowledged, and with one more failure a committed op could be lost
-  (P90). A formatted replica cannot join an imported cluster either: its origin is none.
+- **Replacing a lost replica** of a cluster that was formatted, with the cluster open: stop the
+  lost replica and destroy its data file (it must never start again), then, on its host,
+  `nerva recover --cluster=<id> --replica=<i> --replica-count=<n> --addresses=<every replica, in
+  order> --origin=none <path>`, then `nerva start` on the new file. It registers a session with
+  the running cluster, commits a pipeline's worth of no-op requests, and writes a data file whose
+  view is two past the cluster's, so that the new replica never contradicts what its
+  predecessor promised (`src/vsr/replica_reformat.zig`, upstream's recovery). The data file is
+  written as `<path>.recovering` and renamed once complete. It needs at least three replicas,
+  refuses with `NRV-E0713` while anything answers at the replica's address, with `NRV-E0712` when
+  the others have no quorum, and recovers one replica at a time, each caught up before the next.
+  Recovering a cluster that was imported (`--origin=<export>`) is not yet tested (R5): export
+  the cluster and import every replica again (the cluster is closed meanwhile). Importing only
+  the lost one is not safe: its replacement forgets the prepares the lost replica acknowledged,
+  and with one more failure a committed op could be lost (P90). A formatted replica cannot join
+  an imported cluster either: its origin is none.
 - A view declared only through the Zig client, with no catalog document, cannot be imported:
   `import` refuses it. Declare views through `nerva api`.
 - **Format versions.** An export of a cluster with records or indexes is version 2 (P123b);
