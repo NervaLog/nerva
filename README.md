@@ -94,7 +94,8 @@ answer, and it applies once. A transaction that did not commit (a conflict, a bo
 key, and its resend executes again. A resend's reply has no adds' amounts: read the rows as of
 its op. Keys are kept forever, one 80-byte row each; their row ids are 64-bit hashes, so two
 keys may collide (about 3 in 10,000 among 10⁸ keys), and the second is refused with
-`key_collision`, which proves nothing committed under it: pick another key.
+`key_collision`, which proves nothing committed under it: pick another key. A documents commit
+takes the same optional `key` (`POST /v1/documents/commit`), with the same three replies.
 
 **Records** are rows for facts (P123b): tables from `0x80000000` to `0xFFFEFFFF` hold records,
 identified by `(table, id)` with a 128-bit id (a UUID, say), each a fixed 448-byte value. A
@@ -572,7 +573,7 @@ be transactional (N76). A `get` reads at most as many chunks as 256 documents of
 | Route | Does |
 |---|---|
 | `POST /v1/documents/get` `{"namespace","keys":[…],"as_of"?}` | Up to 256 keys as of one op (the latest, or `as_of` a committed op): `exists`, `version` (the op of the last write, `"0"` if never written), `value_hex`. |
-| `POST /v1/documents/commit` `{"namespace","reads":[{"key","version"}],"writes":[{"key","value_hex"} or {"key","delete":true}]}` | One transaction. `200` committed with its `op`; `409` with the stale read's `key` and current `version`; `400` invalid. About 600 KB of keys and values per commit. |
+| `POST /v1/documents/commit` `{"key"?,"namespace","reads":[{"key","version"}],"writes":[{"key","value_hex"} or {"key","delete":true}]}` | One transaction. `200` committed with its `op`; `409` with the stale read's `key` and current `version`; `400` invalid. About 600 KB of keys and values per commit. An optional commit `key` (32 hex digits) works as on `/v1/commit` (P123): a resent request answers `200 {"status":"committed","op","replayed":true}` and applies nothing, other reads and writes under the key answer `409 key_reused` (or `key_collision`). The request's top-level `key` is the commit key; `key` in a `409` conflict reply names the document. |
 | `GET /v1/documents/changes?namespace=&cursor=&limit=` | The namespace's document writes in commit order (`key`, `op`, `kind` put or delete, `value_hex`), paged like `/v1/changes`. |
 
 `zig build test:api` checks every route against a model (documents, records and indexes included), races eight
