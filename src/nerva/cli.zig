@@ -362,7 +362,20 @@ pub const Command = union(enum) {
     };
 };
 
+/// The vendored flag parser's failures (unknown or repeated flag, missing or malformed value,
+/// unexpected argument) as NRV-E0001, through `stdx.Flags.fatal_hook`.
+fn flag_fatal(message: []const u8) noreturn {
+    diag.fail(
+        "NRV-E0001",
+        "{s}",
+        .{message},
+        "run nerva --help, or nerva <command> --help, for the flags it takes",
+        .{},
+    );
+}
+
 pub fn parse_args(flags: *stdx.Flags) Command {
+    stdx.Flags.fatal_hook = flag_fatal;
     return switch (flags.parse(CLIArgs)) {
         .format => |format| .{ .format = format_validate(.{
             .cluster = format.cluster,
