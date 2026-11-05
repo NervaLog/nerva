@@ -3,7 +3,7 @@
 //! documents in `catalog.table_documents`.
 //!
 //!     POST /v1/documents/get     {"namespace": "7", "keys": ["a", …], "as_of": "12"}
-//!     POST /v1/documents/commit  {"namespace": "7",
+//!     POST /v1/documents/commit  {"namespace": "7", "key": "<32 hex digits>",
 //!                                 "reads": [{"key": "a", "version": "9"}],
 //!                                 "writes": [{"key": "a", "value_hex": "…"},
 //!                                            {"key": "b", "delete": true}]}
@@ -17,6 +17,10 @@
 //! - A commit is one transaction: every read must still be at its `version` ("0" for a key never
 //!   written), or nothing applies. `200 {"status": "committed", "op"}`, `409 {"status":
 //!   "conflict", "key", "version"}` (the stale read and the document's current version), or 400.
+//!   A commit may carry a `key`, exactly as `/v1/commit` does (P123, `api.zig`): it is sent as
+//!   the transaction's first entry, and the same request again answers `200 {"status":
+//!   "committed", "op", "replayed": true, "code": "NRV-W0201"}` and applies nothing; other
+//!   reads and writes under the key answer `409 key_reused` (or `key_collision`).
 //!   A commit's entries are limited by one request: about 600 KB of keys and values in all.
 //! - `changes` lists the namespace's document writes in commit order, each with its `op`, `kind`
 //!   (`put` or `delete`), and `value_hex` for a put. Paging is as in `/v1/changes`: `limit`
@@ -245,6 +249,7 @@ fn documents_read(
 
 pub fn commit(arena: std.mem.Allocator, client: anytype, body: []const u8) !Reply {
     const Request = struct {
+        key: ?[]const u8 = null,
         namespace: []const u8,
         reads: []const struct { key: []const u8, version: []const u8 } = &.{},
         writes: []const struct {
@@ -254,12 +259,17 @@ pub fn commit(arena: std.mem.Allocator, client: anytype, body: []const u8) !Repl
         } = &.{},
     };
     const request = try api.json_parse(Request, arena, body);
+    const key: ?u128 = if (request.key) |text| try api.key_parse(text) else null;
     const namespace = try api.u64_parse(request.namespace, "namespace");
     if (request.reads.len + request.writes.len == 0) {
         return bad_as(.E0502, "reads and writes must not both be empty");
     }
 
     var entries: std.ArrayListUnmanaged(Entry) = .{};
+    // Under a key, the transaction starts with its key entry (P123); the reads and writes
+    // that follow are indexed from `first`.
+    if (key) |k| try entries.append(arena, nerva.commit_key_entry(k));
+    const first = entries.items.len;
     var keys_read: std.StringHashMapUnmanaged(void) = .{};
     for (request.reads) |read| {
         try key_check(read.key);
@@ -303,7 +313,10 @@ pub fn commit(arena: std.mem.Allocator, client: anytype, body: []const u8) !Repl
     try client.commit(entries.items, results);
 
     var out = Writer.init(arena);
-    for (results, 0..) |result, index| {
+    if (key != null) {
+        if (try api.key_reply(arena, &out, results[0])) |reply| return reply;
+    }
+    for (results[first..], 0..) |result, index| {
         switch (result.status) {
             .ok, .aborted => continue,
             .conflict => {

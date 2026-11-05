@@ -5,6 +5,9 @@
 # 0600. It starts the service only when a token is present. It stops a running service first,
 # so its build never races the service's, and starts it again at the end.
 set -eu
+# This script's directory, resolved before the `cd /` below: run by a relative path, as the
+# README's "Deploy" says, `dirname "$0"` would be read against / (#178).
+SCRIPT_DIR=$(CDPATH= cd -P -- "$(dirname -- "$(readlink -f -- "$0")")" && pwd -P)
 # `su simfleet` keeps the working directory, which simfleet may not be allowed to read.
 cd /
 
@@ -68,11 +71,38 @@ echo "$GITHUB_HOST_KEY" >"$HOME_DIR/known_hosts"
 chown simfleet:simfleet "$HOME_DIR/known_hosts"
 
 if [ ! -f /etc/sim-fleet/fleet.env ]; then
-    cp "$(dirname "$0")/fleet.env.example" /etc/sim-fleet/fleet.env
+    cp "$SCRIPT_DIR/fleet.env.example" /etc/sim-fleet/fleet.env
 fi
 # The remote fleet.env names (a private repository is fetched over SSH with the deploy key).
 REMOTE=$(sed -n 's/^SIM_FLEET_REMOTE=//p' /etc/sim-fleet/fleet.env | tail -n1)
 REMOTE=${REMOTE:-https://github.com/NervaLog/nerva.git}
+
+# MemoryMax from this host (P179): the shipped unit's 56G suits a 64 GB host, and on a smaller one
+# the kernel's global OOM killer acts before the cgroup limit does. The drop-in caps the service
+# at MemTotal - 1 GiB (at most the unit's 56G), so the cgroup limit is hit first and sshd and the
+# journal keep their memory; run.sh then takes its workers from that limit. Worked out, and
+# refused, before anything is stopped: a host too small for one seed is not left with the fleet
+# down. Rewritten on every run, so run it again after resizing the host.
+mem_total_mb=$(awk '/^MemTotal:/ { print int($2 / 1024) }' /proc/meminfo)
+mem_max_mb=$((mem_total_mb - 1024))
+[ "$mem_max_mb" -le 57344 ] || mem_max_mb=57344
+seed_mb=$(sed -n 's/^SIM_FLEET_SEED_MEMORY_MB=//p' /etc/sim-fleet/fleet.env | tail -n1)
+# One pair of surrounding quotes is dropped, as systemd's EnvironmentFile= does.
+case "$seed_mb" in
+\"*\" | \'*\') seed_mb=${seed_mb#?}; seed_mb=${seed_mb%?} ;;
+esac
+seed_mb=${seed_mb:-4096}
+case "$seed_mb" in
+'' | *[!0-9]* | 0 | 00*)
+    echo "setup.sh: SIM_FLEET_SEED_MEMORY_MB in /etc/sim-fleet/fleet.env is '$seed_mb', not a positive number" >&2
+    exit 1
+    ;;
+esac
+if [ "$mem_max_mb" -lt "$seed_mb" ]; then
+    echo "setup.sh: $mem_total_mb MB of memory leaves $mem_max_mb MB for the service, and a seed" \
+        "needs about $seed_mb MB (SIM_FLEET_SEED_MEMORY_MB); use a bigger host" >&2
+    exit 1
+fi
 
 if systemctl is-active --quiet sim-fleet.service; then
     echo "sim-fleet: stopping the service for the setup build"
@@ -110,7 +140,17 @@ run_as_simfleet "cd '$CHECKOUT' && timeout 300 git fetch --quiet origin main && 
 if [ -n "$key_copy" ]; then rm -f "$key_copy"; fi
 
 cp "$CHECKOUT/ops/sim-fleet/sim-fleet.service" /etc/systemd/system/sim-fleet.service
+mkdir -p /etc/systemd/system/sim-fleet.service.d
+# Named to sort after `override.conf` (`systemctl edit`), so no hand-made cap silently wins.
+rm -f /etc/systemd/system/sim-fleet.service.d/memory.conf
+printf '[Service]\nMemoryMax=%sM\n' "$mem_max_mb" \
+    >/etc/systemd/system/sim-fleet.service.d/zz-memory.conf
 systemctl daemon-reload
+effective=$(systemctl show -p MemoryMax --value sim-fleet.service)
+if [ "$effective" != $((mem_max_mb * 1048576)) ]; then
+    echo "sim-fleet: warning: MemoryMax is $effective bytes, not ${mem_max_mb}M; another drop-in" \
+        "or the unit overrides zz-memory.conf (systemctl cat sim-fleet)" >&2
+fi
 systemctl enable sim-fleet.service
 
 # Keep the journal from filling the disk.

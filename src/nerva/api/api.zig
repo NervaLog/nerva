@@ -71,6 +71,7 @@
 //!   reply is the one the request would have had alone.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const assert = std.debug.assert;
 
 const stdx = @import("stdx");
@@ -1064,6 +1065,35 @@ fn commit_send(arena: std.mem.Allocator, client: anytype, prepared: *const Commi
     }
 }
 
+/// The answer to a keyed transaction's key entry (P123), or null when the key admits the
+/// transaction (`ok`, or `aborted` by an entry): a resend of a committed transaction answers
+/// `replayed`, other entries under the key `key_reused` or `key_collision`. Shared by every
+/// route that commits under a key (`/v1/commit`, `/v1/documents/commit`).
+pub fn key_reply(arena: std.mem.Allocator, out: *Writer, result: EntryResult) !?Reply {
+    switch (result.status) {
+        .ok, .aborted => return null,
+        // A resend of a transaction that committed: nothing applied now. Its adds' amounts
+        // are not kept: read the rows as of `op`.
+        .committed_before => {
+            try out.raw("{\"status\":\"committed\",\"op\":");
+            try out.number(result.op);
+            try out.raw(",\"replayed\":true,\"code\":\"NRV-W0201\"}");
+            return .{ .status = 200, .body = out.items() };
+        },
+        .key_reused, .key_collision => {
+            try out.print("{{\"status\":\"{s}\",\"op\":", .{@tagName(result.status)});
+            try out.number(result.op);
+            try out.raw("}");
+            return try refused_reply(
+                out,
+                409,
+                if (result.status == .key_reused) .E0207 else .E0208,
+            );
+        },
+        else => return try unexpected_status(arena, "commit rejected key", result.status),
+    }
+}
+
 /// The answer to a commit, from the results of its transaction.
 fn commit_reply(arena: std.mem.Allocator, prepared: *const Commit) !Reply {
     const key = prepared.key;
@@ -1072,29 +1102,7 @@ fn commit_reply(arena: std.mem.Allocator, prepared: *const Commit) !Reply {
     const results_sent = prepared.results_sent;
     var out = Writer.init(arena);
     if (key != null) {
-        const result = results_sent[0];
-        switch (result.status) {
-            .ok, .aborted => {},
-            // A resend of a transaction that committed: nothing applied now. Its adds' amounts
-            // are not kept: read the rows as of `op`.
-            .committed_before => {
-                try out.raw("{\"status\":\"committed\",\"op\":");
-                try out.number(result.op);
-                try out.raw(",\"replayed\":true,\"code\":\"NRV-W0201\"}");
-                return .{ .status = 200, .body = out.items() };
-            },
-            .key_reused, .key_collision => {
-                try out.print("{{\"status\":\"{s}\",\"op\":", .{@tagName(result.status)});
-                try out.number(result.op);
-                try out.raw("}");
-                return refused_reply(
-                    &out,
-                    409,
-                    if (result.status == .key_reused) .E0207 else .E0208,
-                );
-            },
-            else => return unexpected_status(arena, "commit rejected key", result.status),
-        }
+        if (try key_reply(arena, &out, results_sent[0])) |reply| return reply;
     }
     const results = results_sent[@intFromBool(key != null)..];
     assert(results.len == entries.len);
@@ -1179,7 +1187,9 @@ fn commit_reply(arena: std.mem.Allocator, prepared: *const Commit) !Reply {
 /// A commit result the gateway's own checks make impossible (NRV-B0002): where it once stopped
 /// the process, it answers 500. The transaction was sent, so whether it was applied is unknown.
 pub fn unexpected_status(arena: std.mem.Allocator, what: []const u8, status: anytype) !Reply {
-    std.log.scoped(.api).err("{s}: {s}", .{ what, @tagName(status) });
+    // The test runner fails a test that logs an error: the tests that reach this path on
+    // purpose cannot log it.
+    if (!builtin.is_test) std.log.scoped(.api).err("{s}: {s}", .{ what, @tagName(status) });
     return error_reply(arena, .B0002, 500, "internal error", .unknown);
 }
 
@@ -2418,7 +2428,7 @@ pub fn limit_parse(text: ?[]const u8) error{BadRequest}!u32 {
 
 /// A commit key: 16 bytes as 32 hex digits, not all zero. The bytes are the key's row value's
 /// first 16 (`nerva.CommitKey`), so the key is them read little-endian.
-fn key_parse(text: []const u8) error{BadRequest}!u128 {
+pub fn key_parse(text: []const u8) error{BadRequest}!u128 {
     if (text.len != 32) return bad("key must be 16 bytes of hex");
     var bytes: [16]u8 = undefined;
     _ = std.fmt.hexToBytes(&bytes, text) catch return bad("key is not hex");
@@ -2596,6 +2606,9 @@ const FakeClient = struct {
     records: std.AutoArrayHashMapUnmanaged(u128, RecordVersion) = .{},
     /// Commit keys: the op and a hash of the entries each committed.
     keys: std.AutoArrayHashMapUnmanaged(u128, struct { op: u64, hash: u64 }) = .{},
+    /// Answers the key entry of a keyed transaction with this status at op 7, for the tests of
+    /// the statuses a real cluster gives rarely (`key_collision`) or never (anything else).
+    key_answer: ?nerva.EntryStatus = null,
     allocator: std.mem.Allocator,
     /// Answers `declare_view`, for the tests that set it; the rest are covered by
     /// `tests/views/maintained.py`.
@@ -2727,6 +2740,11 @@ const FakeClient = struct {
         const keyed = entries[0].kind == .key;
         const hash = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(entries[1..]));
         if (keyed) {
+            if (fake.key_answer) |status| {
+                results[0] = .{ .status = status, .op = 7 };
+                @memset(results[1..], .{ .status = .aborted, .op = 0 });
+                return;
+            }
             if (fake.keys.get(nerva.CommitKey.entry_key(&entries[0]))) |committed| {
                 results[0] = .{
                     .status = if (committed.hash == hash) .committed_before else .key_reused,
@@ -3677,6 +3695,107 @@ test "api: a request that sent a write and lost the cluster is unknown; one that
     const refused = try handle(arena, &fake, no_layouts, .post, "/v1/commit", "{");
     try testing.expectEqual(@as(u16, 400), refused.status);
     try testing.expectEqual(Applied.no, applied_since(refused_before, fake.writes_sent));
+}
+
+test "api: a documents commit under a key commits once (P123)" {
+    var arena_instance = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_instance.deinit();
+    const arena = arena_instance.allocator();
+    var fake: FakeClient = .{ .allocator = arena };
+    const put =
+        \\{"key":"0123456789abcdef0123456789abcdef","namespace":"7",
+        \\ "reads":[{"key":"cart/1","version":"0"}],
+        \\ "writes":[{"key":"cart/1","value_hex":"c0ffee"}]}
+    ;
+    const first = try handle(arena, &fake, no_layouts, .post, "/v1/documents/commit", put);
+    try testing.expectEqualStrings(
+        \\{"status":"committed","op":"1"}
+    , first.body);
+
+    // Its resend applies nothing, and answers the op it committed at.
+    const resend = try handle(arena, &fake, no_layouts, .post, "/v1/documents/commit", put);
+    try testing.expectEqual(@as(u16, 200), resend.status);
+    try testing.expectEqualStrings(
+        \\{"status":"committed","op":"1","replayed":true,"code":"NRV-W0201"}
+    , resend.body);
+
+    // Other reads and writes under the key never commit.
+    const reused = try handle(arena, &fake, no_layouts, .post, "/v1/documents/commit",
+        \\{"key":"0123456789abcdef0123456789abcdef","namespace":"7",
+        \\ "writes":[{"key":"cart/1","value_hex":"01"}]}
+    );
+    try testing.expectEqual(@as(u16, 409), reused.status);
+    try testing.expectEqualStrings(
+        \\{"status":"key_reused","op":"1","applied":false,"code":"NRV-E0207"}
+    , reused.body);
+
+    // A conflict under another key names the document, not an index, and frees the key.
+    // (The key is `...01`: it must commit now, not replay.)
+    const stale = try handle(arena, &fake, no_layouts, .post, "/v1/documents/commit",
+        \\{"key":"00000000000000000000000000000001","namespace":"7",
+        \\ "reads":[{"key":"cart/1","version":"0"}]}
+    );
+    try testing.expectEqual(@as(u16, 409), stale.status);
+    try testing.expectEqualStrings(
+        \\{"status":"conflict","key":"cart/1","version":"1","applied":false,"code":"NRV-E0503"}
+    , stale.body);
+
+    // The conflict freed the key: resent with a read that holds, it commits, not replays.
+    const freed = try handle(arena, &fake, no_layouts, .post, "/v1/documents/commit",
+        \\{"key":"00000000000000000000000000000001","namespace":"7",
+        \\ "reads":[{"key":"cart/1","version":"1"}],
+        \\ "writes":[{"key":"cart/1","value_hex":"01"}]}
+    );
+    try testing.expectEqual(@as(u16, 200), freed.status);
+    try testing.expect(std.mem.startsWith(u8, freed.body, "{\"status\":\"committed\",\"op\":"));
+    try testing.expect(std.mem.indexOf(u8, freed.body, "replayed") == null);
+
+    const keys_bad = [_][]const u8{
+        "00000000000000000000000000000000",
+        "0123456789abcdef",
+        "0123456789abcdef0123456789abcdeg",
+    };
+    for (keys_bad) |key| {
+        const body = try std.fmt.allocPrint(arena,
+            \\{{"key":"{s}","namespace":"7","writes":[{{"key":"cart/1","value_hex":"01"}}]}}
+        , .{key});
+        const reply = try handle(arena, &fake, no_layouts, .post, "/v1/documents/commit", body);
+        try testing.expectEqual(@as(u16, 400), reply.status);
+        try testing.expect(std.mem.indexOf(u8, reply.body, "\"applied\":false") != null);
+        try testing.expect(std.mem.indexOf(u8, reply.body, "\"code\":\"NRV-E0109\"") != null);
+    }
+}
+
+test "api: a key the cluster answers key_collision or an impossible status (P123)" {
+    var arena_instance = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_instance.deinit();
+    const arena = arena_instance.allocator();
+    var fake: FakeClient = .{ .allocator = arena };
+    const cases = [_]struct { target: []const u8, body: []const u8 }{
+        .{ .target = "/v1/commit", .body = 
+        \\{"key":"0123456789abcdef0123456789abcdef",
+        \\ "entries":[{"kind":"put","table":1,"id":"5","value_hex":"c0ffee"}]}
+        },
+        .{ .target = "/v1/documents/commit", .body = 
+        \\{"key":"0123456789abcdef0123456789abcdef","namespace":"7",
+        \\ "writes":[{"key":"cart/1","value_hex":"c0ffee"}]}
+        },
+    };
+    for (cases) |route| {
+        // Proof that nothing committed under the key: pick another.
+        fake.key_answer = .key_collision;
+        const collision = try handle(arena, &fake, no_layouts, .post, route.target, route.body);
+        try testing.expectEqual(@as(u16, 409), collision.status);
+        try testing.expectEqualStrings(
+            \\{"status":"key_collision","op":"7","applied":false,"code":"NRV-E0208"}
+        , collision.body);
+
+        // A status the gateway's own checks make impossible is the server's fault.
+        fake.key_answer = .out_of_bounds;
+        const impossible = try handle(arena, &fake, no_layouts, .post, route.target, route.body);
+        try testing.expectEqual(@as(u16, 500), impossible.status);
+        try testing.expect(std.mem.indexOf(u8, impossible.body, "NRV-B0002") != null);
+    }
 }
 
 test "api: documents are written, read, conflict and deleted by key" {
