@@ -28,6 +28,8 @@ const StateMachineType = switch (state_machine) {
     .testing => @import("testing/state_machine.zig").StateMachineType,
 };
 
+const vopr_start = @import("nerva/vopr_start.zig");
+
 const Cluster = @import("testing/cluster.zig").ClusterType(StateMachineType);
 const Release = @import("testing/cluster.zig").Release;
 const StateMachine = Cluster.StateMachine;
@@ -376,6 +378,11 @@ pub fn main() !void {
         simulator.cluster.reformat_count,
         if (stdx.zeroed(&simulator.cluster.options.origin)) "none" else "non-zero",
     });
+    log.info("imported start={} checkpoint={} reformats={}", .{
+        options.cluster.import != null,
+        simulator.cluster.state_checker.commits_base,
+        simulator.cluster.reformat_count,
+    });
     log.info("\n          PASSED ({} ticks)", .{tick_total});
 }
 
@@ -414,7 +421,7 @@ fn options_swarm(prng: *stdx.PRNG) Simulator.Options {
         200 * MiB - prng.int_inclusive(u64, 20 * MiB),
     );
 
-    const cluster_options: Cluster.Options = .{
+    var cluster_options: Cluster.Options = .{
         .cluster_id = cluster_id,
         .replica_count = replica_count,
         .standby_count = standby_count,
@@ -448,6 +455,14 @@ fn options_swarm(prng: *stdx.PRNG) Simulator.Options {
             },
         },
     };
+
+    // Nerva: some seeds start at an imported checkpoint (R5, P159); every replica's origin is
+    // then the export's, in place of the random one drawn above, which keeps the draws of the
+    // seed's other parameters where they were.
+    if (state_machine == .nerva and vopr_start.drawn(cluster_options.seed)) {
+        cluster_options.import = vopr_start.import_storage;
+        cluster_options.origin = vopr_start.origin(cluster_options.seed);
+    }
 
     const network_options: Cluster.NetworkOptions = .{
         .node_count = node_count,
@@ -773,6 +788,8 @@ pub const Simulator = struct {
             .replica_releases = replica_releases,
             .replica_crash_stability = replica_crash_stability,
             .reply_sequence = reply_sequence,
+            // An imported cluster's first op is the one after its checkpoint (P159).
+            .reply_op_next = cluster.state_checker.commits.items.len,
         };
     }
 

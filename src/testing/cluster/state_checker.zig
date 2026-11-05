@@ -41,6 +41,9 @@ pub fn StateCheckerType(comptime Client: type, comptime Replica: type) type {
         clients_exhaustive: bool = true,
         clients_register_op_latest: u64 = 0,
 
+        /// The first op `commits` holds a real header of: Nerva's imported start (P159).
+        commits_base: u64 = 0,
+
         /// The number of times the canonical state has been advanced.
         requests_committed: u64 = 0,
 
@@ -91,6 +94,41 @@ pub fn StateCheckerType(comptime Client: type, comptime Replica: type) type {
             allocator.free(state_checker.replica_head_max);
             state_checker.client_replies.deinit(allocator);
             state_checker.commits.deinit();
+        }
+
+        /// Nerva: starts the cluster at an imported checkpoint (P159). `header` is the
+        /// checkpoint's prepare, every replica's commit. The ops before it were never run here:
+        /// they hold the root header under their own op, and nothing checks them.
+        pub fn start_at(state_checker: *StateChecker, header: *const vsr.Header.Prepare) void {
+            assert(state_checker.commits.items.len == 1);
+            assert(state_checker.commits_base == 0);
+            assert(header.op > 0);
+            assert(header.command == .prepare);
+
+            var replicas: ReplicaSet = .{};
+            for (state_checker.replicas, 0..) |_, i| replicas.set(i);
+            const root = state_checker.commits.items[0].header;
+            for (1..header.op) |op| {
+                var placeholder = root;
+                placeholder.op = op;
+                state_checker.commits.append(.{
+                    .header = placeholder,
+                    .release = null,
+                    .replicas = replicas,
+                }) catch unreachable;
+            }
+            state_checker.commits.append(.{
+                .header = header.*,
+                .release = null,
+                .replicas = replicas,
+            }) catch unreachable;
+            assert(state_checker.commits.items.len == header.op + 1);
+            state_checker.commits_base = header.op;
+            state_checker.requests_committed = header.op;
+            @memset(state_checker.commit_mins[0..state_checker.replicas.len], header.op);
+            for (state_checker.replica_head_max) |*head| {
+                head.* = .{ .view = 0, .op = header.op };
+            }
         }
 
         pub fn on_client_eviction(state_checker: *StateChecker, client_id: u128) void {
@@ -312,7 +350,7 @@ pub fn StateCheckerType(comptime Client: type, comptime Replica: type) type {
                 assert(commit.replicas.count() > 0);
                 assert(commit.header.command == .prepare);
                 assert(commit.header.op == i);
-                if (i > 0) {
+                if (i > state_checker.commits_base) {
                     const previous = state_checker.commits.items[i - 1].header;
                     assert(commit.header.parent == previous.checksum);
                     assert(commit.header.view >= previous.view);
