@@ -657,7 +657,7 @@ pub fn GridType(comptime Storage: type) type {
             return grid.free_set.reserve(blocks_count) orelse vsr.fatal(
                 .storage_size_would_exceed_limit,
                 "data file would become too large size={} + reservation={} > limit={}, " ++
-                    "restart the replica increasing '--limit-storage'",
+                    "NRV-E0707: Nerva has no flag to raise the limit (docs/ERRORS.md)",
                 .{
                     grid.superblock.working.vsr_state.checkpoint.storage_size,
                     blocks_count * constants.block_size,

@@ -1392,7 +1392,7 @@ pub fn SuperBlockType(comptime Storage: type) type {
                     vsr.fatal(
                         .storage_size_exceeds_limit,
                         "data file too large size={} > limit={}, " ++
-                            "restart the replica increasing '--limit-storage'",
+                            "NRV-E0707: Nerva has no flag to raise the limit (docs/ERRORS.md)",
                         .{
                             superblock.working.vsr_state.checkpoint.storage_size,
                             superblock.storage_size_limit,

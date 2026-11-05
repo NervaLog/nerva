@@ -11,6 +11,7 @@ other code, and panicked with "checkpoint diverged" at the first checkpoint. Now
 - with replica 1 stopped nothing commits, since replica 2 does not count;
 - replica 1 back, it commits again, past the first checkpoint, and replica 2 never panics.
 """
+import hashlib
 import http.client
 import json
 import os
@@ -111,6 +112,29 @@ def wait_for(condition, seconds, what):
         time.sleep(0.1)
 
 
+def refuses_other_release(nerva, cluster):
+    """#95: `nerva start` on a data file of another release is refused with NRV-E0701, and the
+    file is not touched (it used to panic with `multiversion unsupported`)."""
+    cluster.stop(2)
+    copy = os.path.join(cluster.tmp, "other-release.nerva")
+    shutil.copy(cluster.data_file(2), copy)
+
+    def digest():
+        with open(copy, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+
+    before = digest()
+    result = subprocess.run(
+        [nerva, "start", f"--addresses={cluster.addresses}", "--development", copy],
+        capture_output=True, text=True, timeout=60)
+    first = result.stderr.splitlines()[0] if result.stderr else ""
+    assert result.returncode == 1, (result.returncode, result.stderr[-2000:])
+    assert first.startswith("error[NRV-E0701]: start: "), result.stderr[-2000:]
+    assert "release 0.0.200" in first, first
+    assert "panic" not in result.stderr and "multiversion" not in result.stderr, result.stderr
+    assert digest() == before, "the data file changed"
+
+
 def main():
     nerva, nerva_other = sys.argv[1], sys.argv[2]
     cluster = Cluster([nerva, nerva, nerva_other])
@@ -143,6 +167,7 @@ def main():
         for index, replica in enumerate(cluster.replicas):
             assert replica.poll() is None, f"replica {index} exited: {cluster.log(index)[-2000:]}"
             assert "panic" not in cluster.log(index), cluster.log(index)[-2000:]
+        refuses_other_release(nerva, cluster)
         print(f"mixed releases: PASSED (replica 2 on another release ignored; {CHECKPOINT_OPS} "
               f"commits past the first checkpoint in {time.monotonic() - started:.0f} s)")
     finally:

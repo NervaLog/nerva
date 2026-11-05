@@ -5,10 +5,14 @@ Usage: commands.py <nerva>
 
 For each code a command emits (docs/ERRORS.md, 00xx, 06xx, 08xx, 09xx), triggers it and checks
 the first line (`error[NRV-…]: …`), the `cause` and `fix` lines, the exit status, and that no
-stack trace and no raw Zig error name (`error.Name`) is printed. Codes that need a failing disk
+stack trace and no raw Zig error name (`error.Name`) is printed. NRV-E0701 is in `tests/release/mixed.py` (it needs a binary of another release), NRV-E0704
+and E0705 need a file system without direct IO and a kernel older than 5.11, so only unit tests of
+`src/nerva/preflight.zig` cover their parts. Codes that need a failing disk
 or an export whose checks fail (NRV-E0706, E0708, E0803, E0807) are covered by unit tests of
 `src/nerva/diagnostic.zig` only.
 """
+import fcntl
+import hashlib
 import os
 import re
 import shutil
@@ -91,6 +95,34 @@ def main():
         check("trace exists", ["start", "--addresses=127.0.0.1:1,127.0.0.1:2,127.0.0.1:3",
                                "--development", "--trace=" + trace, data],
               "NRV-E0004", 1, "--trace")
+
+
+        # Pre-flight before the vendored open (R5, P149): nothing here may panic or write.
+        start = ["start", "--addresses=127.0.0.1:1,127.0.0.1:2,127.0.0.1:3", "--development"]
+
+        def sha(path):
+            with open(path, "rb") as f:
+                return hashlib.sha256(f.read()).hexdigest()
+
+        check("start missing file", start + [os.path.join(tmp, "nope.nerva")], "NRV-E0006", 1,
+              "does not exist")
+        assert not os.path.exists(os.path.join(tmp, "nope.nerva"))
+        with open(data, "rb") as f:
+            good = f.read()
+        for label, content in (("truncated", good[:1000]), ("empty", b""),
+                               ("zeros", bytes(len(good))), ("text", b"not a data file" * 100)):
+            damaged = os.path.join(tmp, f"{label}.nerva")
+            with open(damaged, "wb") as f:
+                f.write(content)
+            before = sha(damaged)
+            check(f"start {label} file", start + [damaged], "NRV-E0702", 1, "no usable superblock")
+            assert sha(damaged) == before and os.path.getsize(damaged) == len(content), label
+        check("start a directory", start + [tmp], "NRV-E0810", 1, "directory")
+        before = sha(data)
+        with open(data, "rb") as holder:
+            fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            check("start locked file", start + [data], "NRV-E0703", 1, "another process holds")
+        assert sha(data) == before
 
         # import
         junk = os.path.join(tmp, "junk")
