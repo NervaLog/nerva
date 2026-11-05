@@ -652,7 +652,7 @@ Nerva holds its first client's money on the R milestones' terms, in
 | R2 · Fleet | An always-on VOPR and fuzzer fleet on Hetzner that files every new failure | In progress |
 | R3 · Measured | Sizing and latency on three machines; the Fly p99 explained | Not started |
 | R4 · Gateway | Beside its client: a gateway per client process on loopback, no ambiguous 503, metrics | Not started |
-| R5 · Recover | Replace a lost replica, and restore a backup, with the cluster open | Not started |
+| R5 · Recover | Replace a lost replica, and restore a backup, with the cluster open | Brief written ([docs/briefs/r5.md](./docs/briefs/r5.md)) |
 | R6 · Upgrade | Rolling upgrades between releases with the same data format | Not started |
 | R7 · Retention | Keys, history and view versions trimmed below a horizon | Not started |
 | R8 · Native client | The client library from the JVM over a C ABI: no gateway, no JSON, batched ops | Not started |
