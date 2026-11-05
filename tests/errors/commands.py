@@ -82,6 +82,11 @@ def main():
             check(f"{command} listen", [command, "--cluster=0", "--addresses=127.0.0.1:1",
                                         "--listen=bogus"], "NRV-E0003", 1, "--listen must be",
                   env={"NERVA_KEY": KEY})
+            for milliseconds in ("999", "60001"):
+                check(f"{command} request timeout {milliseconds}",
+                      [command, "--cluster=0", "--addresses=127.0.0.1:1", "--listen=127.0.0.1:0",
+                       f"--request-timeout={milliseconds}"], "NRV-E0002", 1,
+                      "--request-timeout must be 1000 to 60000", env={"NERVA_KEY": KEY})
             check(f"{command} key", [command, "--cluster=0", "--addresses=127.0.0.1:1",
                                      "--listen=127.0.0.1:0"], "NRV-E0008", 1, "NERVA_KEY")
         # The vendored flag parser's own failures (stdx/flags.zig `fatal`, through the hook).

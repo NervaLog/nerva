@@ -88,6 +88,10 @@ pub const Client = struct {
     /// compares it before and after a request: unchanged, nothing was applied; changed and no
     /// reply, the write may have been (NRV-E0601).
     writes_sent: u64,
+    /// Requests of any operation sent so far. A gateway compares it before and after serving, to
+    /// know the cluster was asked (and, if the session is still sound, replied): the idle probe
+    /// waits for quiet from the cluster, not from clients (P168d).
+    requests_sent: u64,
 
     /// Connects and registers a session; blocks until registered.
     pub fn init(client: *Client, allocator: std.mem.Allocator, options: Options) !void {
@@ -107,6 +111,7 @@ pub const Client = struct {
             .request = undefined,
             .latency_previous_ns = 0,
             .writes_sent = 0,
+            .requests_sent = 0,
         };
         errdefer client.io.deinit();
 
@@ -152,10 +157,12 @@ pub const Client = struct {
         const allocator = client.allocator;
         const options = client.options;
         const writes_sent = client.writes_sent;
+        const requests_sent = client.requests_sent;
         client.deinit();
         try client.init(allocator, options);
         // A count a gateway took before the request still compares with it.
         client.writes_sent = writes_sent;
+        client.requests_sent = requests_sent;
     }
 
     pub fn deinit(client: *Client) void {
@@ -593,6 +600,7 @@ pub const Client = struct {
         assert(events.len % operation.event_size() == 0);
         assert(events.len <= client.vsr_client.batch_size_limit.?);
 
+        client.requests_sent += 1;
         if (operation.is_write()) client.writes_sent += 1;
         const message = client.vsr_client.get_message().build(.request);
         message.header.* = .{

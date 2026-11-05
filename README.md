@@ -549,9 +549,11 @@ displaces the oldest one that has sent nothing yet, or, if all 16 have sent byte
 Nothing is closed without a status line (P168b, P168c). A request must arrive whole within 10 s
 of connecting (`408`, NRV-E0116) and carries one request per connection (`Connection: close`).
 A gateway listens on a socket of its own: a second one on the same port exits with NRV-E0007. If a gateway
-loses its cluster session (a request times out after 30 s, or the session is evicted), it
-answers `503` and `/healthz` answers `503`, and it reconnects on its own, trying at most every
-5 s whether or not requests arrive (N64); `nerva view` then reads the feed on from where it
+loses its cluster session (a request times out after `--request-timeout`, 30 s unless set, or the
+session is evicted), it answers `503` and `/healthz` answers `503`, and it reconnects on its own,
+trying at most every 5 s whether or not requests arrive (N64). An idle `nerva api` sends one
+read to the cluster whenever it has had no reply for 5 s, so `/healthz` turns `503` within 5 s
+plus `--request-timeout` of the cluster going away (P168d); `nerva view` then reads the feed on from where it
 stopped. Heads are parsed
 strictly: lines end in CRLF, bodies have a `Content-Length` (no `Transfer-Encoding`), and
 anything malformed answers `400`. A body is at most 4 MiB, and a `nerva api` request may
@@ -713,8 +715,11 @@ used; the sections above say why.
   rotation, `NERVA_KEY_NEXT`; a missing or other key answers `401`. A method the gateway never
   takes (for `nerva api` anything but `GET`, `POST` and `PUT`; for `nerva view` anything but `GET`)
   answers `405` before the key is checked.
-- A gateway's cluster session times out a request after 30 s; the gateway then answers `503`
-  until it has reconnected.
+- `--request-timeout=<ms>` (`nerva api` and `nerva view`, 1,000 to 60,000, default 30,000; out
+  of range is NRV-E0002): a gateway's cluster session times out a request after it; the gateway
+  then answers `503` until it has reconnected. A request that has arrived whole is answered
+  within 1 s (the queue wait) + `--request-timeout` + 1 s, so a client whose own timeout is
+  longer always gets the gateway's answer: set the flag below the client's timeout.
 
 **Documents:** a value is at most 512 KiB, under a key of at most 1024 bytes of UTF-8. A commit
 carries about 600 KB of keys and values. A `get` takes at most 256 keys (more answers `400`), and

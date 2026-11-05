@@ -819,7 +819,7 @@ fn command_view(gpa: std.mem.Allocator, args: *const cli.Command.View) !void {
     try client.init(gpa, .{
         .cluster = args.cluster,
         .addresses = args.addresses.slice(),
-        .timeout = stdx.Duration.seconds(30),
+        .timeout = stdx.Duration.ms(args.request_timeout_ms),
     });
     defer client.deinit();
 
@@ -837,7 +837,7 @@ fn command_api(gpa: std.mem.Allocator, args: *const cli.Command.Api) !void {
     try client.init(gpa, .{
         .cluster = args.cluster,
         .addresses = args.addresses.slice(),
-        .timeout = stdx.Duration.seconds(30),
+        .timeout = stdx.Duration.ms(args.request_timeout_ms),
     });
     defer client.deinit();
 

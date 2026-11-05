@@ -55,11 +55,16 @@ pub fn serve(gpa: std.mem.Allocator, client: *Client, options: Options) !noretur
     var budget = MemoryBudget.init(arena_instance.allocator(), MemoryBudget.limit_default);
 
     while (true) {
-        const received = try receiver.next(health.idle_timeout_ms(-1)) orelse {
-            // Idle with a broken client: replace it without waiting for a request (#44).
+        // Before every wait, not only when idle: a load balancer polling `/healthz` every second
+        // must not keep a broken client from being replaced (#44), or a quiet cluster from being
+        // probed, so that `/healthz` notices a cluster that went away (P168d).
+        if (health.state == .ready) {
+            if (!health.probe(client)) layouts.cache_clear();
+        } else {
             _ = health.ready(client);
-            continue;
-        };
+        }
+        const received = try receiver.next(health.idle_timeout_ms(-1)) orelse continue;
+        const requests_before = client.requests_sent;
         budget.request_start();
         const arena = budget.allocator();
         // Requests are read from many connections at once (N45). Those already waiting for the
@@ -86,6 +91,7 @@ pub fn serve(gpa: std.mem.Allocator, client: *Client, options: Options) !noretur
             ) catch |err| reply_of_error(err, &budget, writes_before, client.writes_sent);
             receiver.respond(received, reply.status, reply.body);
         }
+        if (health.state == .ready and client.requests_sent != requests_before) health.replied();
         // `respond` has written the reply: give back what the request took at once, rather than
         // when the next request arrives (#60).
         _ = arena_instance.reset(.{ .retain_with_limit = MemoryBudget.retain_max });

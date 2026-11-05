@@ -1131,7 +1131,7 @@ Kill the replica the hard way, as in a power cut:
 kill -9 %1        # or: kill -9 <pid of nerva start>
 ```
 
-While the cluster is unreachable, `nerva api` holds each request for up to 30 seconds, then
+While the cluster is unreachable, `nerva api` holds each request for up to 30 seconds (`--request-timeout`), then
 answers `503 {"error":"cluster unavailable"}`. If the cluster comes back within those 30
 seconds, held requests simply complete. Leave it down longer and watch the gateway notice:
 
