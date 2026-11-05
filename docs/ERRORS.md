@@ -14,7 +14,7 @@ a one-line summary, who is to blame, the cause and a fix. Codes are never reused
   1 the operator's input, 2 the environment (disk, kernel, file system), 70 Nerva's bug (P149e);
   `nerva start`'s runtime exits (2 to 8) keep their statuses. Still uncoded, and R5's later
   slices: the vendored flag parser's own errors (NRV-E0001, `error: …`), and the
-  runtime exits of 07xx (E0707 to E0709, E0711).
+  runtime exits of 07xx (E0707 to E0709; E0711 is coded).
 - **Until the wire has them,** this file maps today's texts to codes, so a client can match on a
   code's identifier now and on the code later.
 

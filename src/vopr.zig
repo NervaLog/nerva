@@ -372,6 +372,12 @@ pub fn main() !void {
         log.debug("\nMessages:\n{}", .{simulator.cluster.network.message_summary});
     }
 
+    // Nerva: how many replicas were reformatted, and whether the cluster's origin (the export it
+    // was imported from, P90) is non-zero, so that a run can be checked to exercise both (R5).
+    log.info("reformats={} origin={s}", .{
+        simulator.cluster.reformat_count,
+        if (stdx.zeroed(&simulator.cluster.options.origin)) "none" else "non-zero",
+    });
     log.info("imported start={} checkpoint={} reformats={}", .{
         options.cluster.import != null,
         simulator.cluster.state_checker.commits_base,

@@ -247,7 +247,8 @@ const CLIArgs = union(enum) {
         \\  --origin=<sha256>|none
         \\        The export the cluster was imported from (the SHA-256 that export prints,
         \\        and import and start log), or none for a cluster that was formatted. A
-        \\        replica recovered with the wrong one exits with status 8 when it starts.
+        \\        replica recovered with the wrong one exits with status 8 and NRV-E0711 when it
+        \\        starts, naming the export its peers announce.
         \\
         \\  --output=<path>, --input=<path>
         \\        The export file. `export` and `backup` refuse an existing file.
