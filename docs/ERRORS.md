@@ -14,8 +14,8 @@ a one-line summary, who is to blame, the cause and a fix. Codes are never reused
   1 the operator's input, 2 the environment (disk, kernel, file system), 70 Nerva's bug (P149e);
   `nerva start`'s runtime exits (2 to 8) keep their statuses. R5's commands (`recover`,
   `backup`, `restore`) emit NRV-E0711 to E0716, E0808 and E0809, and `demo-r5`
-  (`tests/demo/r5.py`) shows E0713 and E0804 or E0809 from the real binary. Still uncoded: the
-  vendored flag parser's own errors (NRV-E0001, `error: …`), and the runtime exits E0708 (a disk
+  (`tests/demo/r5.py`) shows E0713 and E0804 or E0809 from the real binary. Every flag-parser failure is coded E0001 (a hook in the vendored
+  parser). Still uncoded: the runtime exits E0708 (a disk
   that fails a read, write or fsync under `start` is still a panic) and E0709 (a damaged WAL;
   `start` prints a raw error). E0707 and E0711 are coded in the exit's message.
 - **Until the wire has them,** this file maps today's texts to codes, so a client can match on a
@@ -58,7 +58,7 @@ a one-line summary, who is to blame, the cause and a fix. Codes are never reused
 
 | Code | Summary | Today | Blame | Fix |
 | --- | --- | --- | --- | --- |
-| NRV-E0001 | A command or flag is unknown, repeated or malformed | `error: unknown subcommand …`, `<flag>: duplicate argument`, `unexpected argument …` (stdx/flags.zig, vendored: printed as `error: …` without the code, exit 1); `error[NRV-E0001]: export: --as-of must be …`, `--output must name a file`, `--input must name a file` | operator | `nerva --help` |
+| NRV-E0001 | A command or flag is unknown, repeated or malformed | `error: unknown subcommand …`, `<flag>: duplicate argument`, `unexpected argument …` (stdx/flags.zig, vendored: its `fatal` goes through a hook that prints them coded, exit 1); `error[NRV-E0001]: export: --as-of must be …`, `--output must name a file`, `--input must name a file` | operator | `nerva --help` |
 | NRV-E0002 | A flag's value is out of range | `error[NRV-E0002]: <command>: --replica-count must be …`, `--cache-grid …`, `--cache-rows …`, `--commit-stall-probability …`, `--statsd …`, `--trace …`, exit 1 | operator | The message names the bound |
 | NRV-E0003 | `--listen` is not an address | `error[NRV-E0003]: api: --listen must be <ipv4>:<port> or [<ipv6>]:<port>`, same for `view`, exit 1 | operator | Give `host:port`, IPv6 in brackets |
 | NRV-E0004 | An output file already exists | `error[NRV-E0004]: start: --trace <p> exists`, `export: <out> exists`, `import: <path> exists`, exit 1 | operator | Give a new path; Nerva never overwrites |

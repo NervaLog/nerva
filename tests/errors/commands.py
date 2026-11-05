@@ -84,6 +84,18 @@ def main():
                   env={"NERVA_KEY": KEY})
             check(f"{command} key", [command, "--cluster=0", "--addresses=127.0.0.1:1",
                                      "--listen=127.0.0.1:0"], "NRV-E0008", 1, "NERVA_KEY")
+        # The vendored flag parser's own failures (stdx/flags.zig `fatal`, through the hook).
+        check("unknown subcommand", ["frobnicate"], "NRV-E0001", 1, "unknown subcommand")
+        check("no subcommand", [], "NRV-E0001", 1, "subcommand required")
+        check("unknown flag", ["format", "--bogus=1"], "NRV-E0001", 1, "--bogus")
+        check("missing value", ["format", "--cluster"], "NRV-E0001", 1, "--cluster")
+        check("bad integer", ["format", "--cluster=x", "--replica=0", "--replica-count=3",
+                              data + ".z"], "NRV-E0001", 1, "--cluster")
+        check("duplicate flag", ["format", "--cluster=0", "--cluster=1", "--replica=0",
+                                 "--replica-count=3", data + ".z"], "NRV-E0001", 1, "duplicate")
+        check("missing required flag", ["format", "--replica=0", "--replica-count=3",
+                                        data + ".z"], "NRV-E0001", 1, "--cluster")
+        check("unexpected positional", ["version", "extra"], "NRV-E0001", 1, "extra")
         check("as-of", ["export", "--cluster=0", "--addresses=127.0.0.1:1", "--as-of=0",
                         "--output=" + os.path.join(tmp, "x")], "NRV-E0001", 1, "--as-of")
         check("addresses", ["start", "--addresses=127.0.0.1:1,127.0.0.1:2", "--development",

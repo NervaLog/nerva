@@ -78,6 +78,7 @@ originals should be checked for relevance.
 | `src/io/darwin.zig`, `src/io/windows.zig` | Added `IO.run_once`, which calls `run_for_ns` (correct, without the early return; production is Linux) (N51). |
 | `src/io/test.zig` | Added the test "run_once returns after the first completion" (Linux only) (N51). |
 | `src/stdx/benchmark/bench.zig` | Added `Bench.metric(name, value, unit)`: in benchmark mode, one `bench-json:` line per result for the nightly job (N55). |
+| `src/stdx/flags.zig` | Added `fatal_hook`: when set, `fatal` passes its formatted message to the hook instead of printing `error: …`; `cli.parse_args` sets it to print the message as NRV-E0001 (exit status 1 as before). Every flag-parser failure is now coded. Unset (other binaries, the parser's own tests), `fatal` is unchanged. Owner-approved 2026-11-05. |
 
 ## Known differences in behaviour
 
