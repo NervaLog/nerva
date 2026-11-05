@@ -217,6 +217,27 @@ jobs:
       - name: demo-r5 (release)
         run: ./zig/zig build -Drelease demo-r5
 
+  demo_r4:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+
+      # GitHub's runners start empty: the pinned toolchain is restored from Actions' cache, keyed by
+      # download.sh's hash, where INSTALL_ZIG looks for it (P147e).
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/nerva-toolchain
+          key: nerva-toolchain-${{ runner.os }}-${{ hashFiles('zig/download.sh') }}
+
+      - name: Install the pinned Zig
+        run: eval "$INSTALL_ZIG"
+
+      - name: demo-r4 (release)
+        run: ./zig/zig build -Drelease demo-r4
+
   # Pull requests: the fixed seeds and one random seed, in Debug. Everything else (pushes to main,
   # the release's run, a dispatch) runs `vopr_main` instead (N74).
   vopr:
