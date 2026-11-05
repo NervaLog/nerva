@@ -11,6 +11,7 @@ const vsr = @import("vsr.zig");
 const constants = @import("constants.zig");
 const config = constants.config;
 const cli = @import("nerva/cli.zig");
+const diagnostic = @import("nerva/diagnostic.zig");
 const Client = @import("nerva/client.zig").Client;
 const view_server = @import("nerva/view/server.zig");
 const api_server = @import("nerva/api/server.zig");
@@ -43,6 +44,10 @@ pub fn log_runtime(
     comptime format: []const u8,
     args: anytype,
 ) void {
+    // The first reason an export or an import logs goes into the failure that follows.
+    if (message_level == .err and (scope == .import_ or scope == .export_)) {
+        diagnostic.note(format, args);
+    }
     if (@intFromEnum(message_level) <= @intFromEnum(log_level_runtime)) {
         stdx.log_with_timestamp(message_level, scope, format, args);
     }
@@ -54,7 +59,16 @@ pub const std_options: std.Options = .{
     .logFn = log_runtime,
 };
 
-pub fn main() !void {
+pub fn main() void {
+    run() catch |err| diagnostic.fail_error(err);
+}
+
+fn log_level_set(log_debug: bool) void {
+    log_level_runtime = if (log_debug) .debug else .info;
+    diagnostic.debug = log_debug;
+}
+
+fn run() !void {
     var allocator: std.heap.GeneralPurposeAllocator(.{}) = .init;
     allocator.backing_allocator = stdx.huge_page_allocator;
     const gpa = allocator.allocator();
@@ -67,105 +81,118 @@ pub fn main() !void {
     defer flags.deinit(gpa);
 
     const command = cli.parse_args(&flags);
+    diagnostic.command = @tagName(command);
     switch (command) {
         .version => {
             try std.io.getStdOut().writer().print("Nerva version {}\n", .{constants.semver});
             return;
         },
         .view => |*args| {
-            log_level_runtime = if (args.log_debug) .debug else .info;
+            log_level_set(args.log_debug);
             try command_view(gpa, args);
         },
         .api => |*args| {
-            log_level_runtime = if (args.log_debug) .debug else .info;
+            log_level_set(args.log_debug);
             try command_api(gpa, args);
         },
         .@"export" => |*args| {
-            log_level_runtime = if (args.log_debug) .debug else .info;
+            log_level_set(args.log_debug);
             command_export(gpa, args) catch |err| {
                 std.fs.cwd().deleteFile(args.output) catch {};
                 switch (err) {
-                    error.Timeout => vsr.fatal(
-                        .cli,
-                        "export: no reply from the cluster: check --cluster and --addresses",
+                    error.Timeout => diagnostic.fail(
+                        "NRV-E0801",
+                        "export: no reply from the cluster",
+                        .{},
+                        "check --cluster and --addresses, and that a quorum of replicas is running",
                         .{},
                     ),
-                    error.AsOfAhead => vsr.fatal(
-                        .cli,
+                    error.AsOfAhead => diagnostic.fail(
+                        "NRV-E0802",
                         "export: --as-of is past the cluster's latest op",
                         .{},
-                    ),
-                    error.TooManyTables => vsr.fatal(
-                        .cli,
-                        "export: more than {} tables hold rows; an export checks at most that many",
-                        .{export_file.tables_max},
-                    ),
-                    error.TooManyCatalogRows, error.ViewRefused => vsr.fatal(
-                        .cli,
-                        "export: `nerva import` would refuse this export (see above)",
+                        "give --as-of=latest or an op the cluster has reached",
                         .{},
                     ),
-                    else => vsr.fatal(.cli, "export: {s}", .{@errorName(err)}),
+                    error.TooManyTables => diagnostic.fail(
+                        "NRV-E0803",
+                        "export: more than {} tables hold rows; an export checks at most that many",
+                        .{export_file.tables_max},
+                        "keep fewer tables with rows, then export again",
+                        .{},
+                    ),
+                    error.TooManyCatalogRows, error.ViewRefused => diagnostic.fail(
+                        "NRV-E0803",
+                        "export: `nerva import` would refuse this export: {s}",
+                        .{refusal_reason()},
+                        "fix what the log names, then export again",
+                        .{},
+                    ),
+                    error.RecordsAppeared => diagnostic.fail(
+                        "NRV-E0803",
+                        "export: records or an index appeared during the export",
+                        .{},
+                        "export again",
+                        .{},
+                    ),
+                    else => diagnostic.fail_file(args.output, err),
                 }
             };
         },
         .import => |*args| {
-            log_level_runtime = if (args.log_debug) .debug else .info;
+            log_level_set(args.log_debug);
             // Before reading the export, which may be large: the data file must be new. The
             // import writes `<path>.importing` and links it to `<path>` once its checks pass,
             // so a failed or killed import never leaves a file a replica would start from (#78).
             if (std.fs.cwd().access(args.path, .{})) {
-                vsr.fatal(.cli, "import: {s} exists; give a new file", .{args.path});
+                diagnostic.fail(
+                    "NRV-E0004",
+                    "import: {s} exists",
+                    .{args.path},
+                    "give a new path: nerva never overwrites a data file",
+                    .{},
+                );
             } else |_| {}
             var path_importing_buffer: [std.fs.max_path_bytes]u8 = undefined;
             const path_importing = std.fmt.bufPrint(
                 &path_importing_buffer,
                 "{s}.importing",
                 .{args.path},
-            ) catch vsr.fatal(.cli, "import: {s}: the path is too long", .{args.path});
+            ) catch diagnostic.fail_file(args.path, error.NameTooLong);
             if (std.fs.cwd().access(path_importing, .{})) {
-                vsr.fatal(
-                    .cli,
-                    "import: {s} is left from an import that did not finish; remove it",
+                diagnostic.fail(
+                    "NRV-E0806",
+                    "import: {s} is left from an import that did not finish",
+                    .{path_importing},
+                    "remove {s}, then import again",
                     .{path_importing},
                 );
             } else |_| {}
             // Pass 1, before the data file exists: the whole export is checked.
             var arena = std.heap.ArenaAllocator.init(gpa);
             defer arena.deinit();
-            const plan = import_.plan(arena.allocator(), args.input) catch |err| switch (err) {
-                error.Corrupt => vsr.fatal(.cli, "import: {s}: {s}", .{
-                    args.input,
-                    export_file.corrupt_reason,
-                }),
-                else => vsr.fatal(.cli, "import: {s}: {s}", .{ args.input, @errorName(err) }),
-            };
+            const plan = import_.plan(arena.allocator(), args.input) catch |err|
+                import_failed(args.input, args.path, err);
             // Pass 2. Any failure removes the data file, which the import created.
             command_import(gpa, args, path_importing, &plan) catch |err| {
                 std.fs.cwd().deleteFile(path_importing) catch {};
-                switch (err) {
-                    error.Corrupt => vsr.fatal(.cli, "import: {s}: {s}", .{
-                        args.input,
-                        export_file.corrupt_reason,
-                    }),
-                    else => vsr.fatal(.cli, "import: {s}", .{@errorName(err)}),
-                }
+                import_failed(args.input, path_importing, err);
             };
             // Every write is on disk: the data file is complete, and takes its name.
             const cwd = std.posix.AT.FDCWD;
             std.posix.linkat(cwd, path_importing, cwd, args.path, 0) catch |err| {
                 std.fs.cwd().deleteFile(path_importing) catch {};
-                vsr.fatal(.cli, "import: {s}: {s}", .{ args.path, @errorName(err) });
+                diagnostic.fail_file(args.path, err);
             };
             std.fs.cwd().deleteFile(path_importing) catch |err| {
-                vsr.fatal(.cli, "import: {s}: {s}", .{ path_importing, @errorName(err) });
+                diagnostic.fail_file(path_importing, err);
             };
             directory_sync(args.path) catch |err| {
-                vsr.fatal(.cli, "import: {s}: {s}", .{ args.path, @errorName(err) });
+                diagnostic.fail_file(args.path, err);
             };
         },
         inline .format, .start => |*args, tag| {
-            log_level_runtime = if (args.log_debug) .debug else .info;
+            log_level_set(args.log_debug);
 
             // Initialise IO before creating any file, so a failure leaves nothing behind.
             var io = try IO.init(if (tag == .format) 2048 else 128, 0);
@@ -180,12 +207,14 @@ pub fn main() !void {
             const trace_file: ?std.fs.File = if (tag == .start and args.trace != null)
                 std.fs.cwd().createFile(args.trace.?, .{ .exclusive = true }) catch |err|
                     switch (err) {
-                        error.PathAlreadyExists => vsr.fatal(
-                            .cli,
-                            "--trace: {s} exists; give a new file",
+                        error.PathAlreadyExists => diagnostic.fail(
+                            "NRV-E0004",
+                            "start: --trace {s} exists",
                             .{args.trace.?},
+                            "give a new path: nerva never overwrites a file",
+                            .{},
                         ),
-                        else => return err,
+                        else => diagnostic.fail_file(args.trace.?, err),
                     }
             else
                 null;
@@ -209,7 +238,7 @@ pub fn main() !void {
             } else .{});
             defer tracer.deinit(gpa);
 
-            var storage = try Storage.init(&io, &tracer, .{
+            var storage = Storage.init(&io, &tracer, .{
                 .path = args.path,
                 .size_min = data_file_size_min,
                 .purpose = if (tag == .format) .format else .open,
@@ -219,7 +248,16 @@ pub fn main() !void {
                     .direct_io_optional
                 else
                     .direct_io_required,
-            });
+            }) catch |err| switch (err) {
+                error.PathAlreadyExists => diagnostic.fail(
+                    "NRV-E0005",
+                    "format: {s} exists",
+                    .{args.path},
+                    "give a new path, or remove the old file if it is really unwanted",
+                    .{},
+                ),
+                else => return err,
+            };
             defer storage.deinit();
 
             switch (tag) {
@@ -248,6 +286,47 @@ fn command_format(
         args.cluster,
         args.replica_count,
     });
+}
+
+/// The first reason an export or import logged, for a failure's headline.
+fn refusal_reason() []const u8 {
+    const buffer = struct {
+        var bytes: [768]u8 = undefined;
+    };
+    return diagnostic.reason_take(&buffer.bytes) orelse "see the log above";
+}
+
+/// Exits with the code for an import that failed in `plan` or while restoring.
+fn import_failed(input: []const u8, output: []const u8, err: anyerror) noreturn {
+    switch (err) {
+        error.Corrupt => diagnostic.fail(
+            "NRV-E0804",
+            "import: {s}: {s}",
+            .{ input, export_file.corrupt_reason },
+            "use an intact export, or export again",
+            .{},
+        ),
+        error.VersionUnsupported => diagnostic.fail(
+            "NRV-E0805",
+            "import: {s}: the export's version is not one this release reads",
+            .{input},
+            "import it with a release that reads it, or export again with this one",
+            .{},
+        ),
+        error.Refused, error.ChecksFailed => diagnostic.fail(
+            "NRV-E0807",
+            "import: the export was refused: {s}",
+            .{refusal_reason()},
+            "read the log lines above; nothing was named {s}",
+            .{output},
+        ),
+        error.FileNotFound,
+        error.AccessDenied,
+        error.PermissionDenied,
+        error.IsDir,
+        => diagnostic.fail_file(input, err),
+        else => diagnostic.fail_file(output, err),
+    }
 }
 
 /// Makes a new directory entry durable: the directory holding `path` is synced.
@@ -318,12 +397,14 @@ fn command_export(gpa: std.mem.Allocator, args: *const cli.Command.Export) !void
     // Never an existing file: a path given by mistake would be truncated.
     const file = std.fs.cwd().createFile(args.output, .{ .exclusive = true }) catch |err|
         switch (err) {
-            error.PathAlreadyExists => vsr.fatal(
-                .cli,
-                "export: {s} exists; give a new file",
+            error.PathAlreadyExists => diagnostic.fail(
+                "NRV-E0004",
+                "export: {s} exists",
                 .{args.output},
+                "give a new path: nerva never overwrites a file",
+                .{},
             ),
-            else => return err,
+            else => diagnostic.fail_file(args.output, err),
         };
     defer file.close();
 
@@ -414,7 +495,13 @@ fn command_start(
         .grid_cache_blocks_count = args.cache_grid_blocks,
         .tracer = tracer,
     }) catch |err| switch (err) {
-        error.NoAddress => vsr.fatal(.cli, "all --addresses must be provided", .{}),
+        error.NoAddress => diagnostic.fail(
+            "NRV-E0710",
+            "start: all --addresses must be provided",
+            .{},
+            "give every replica's address, in replica order",
+            .{},
+        ),
         else => |e| return e,
     };
 
@@ -474,7 +561,13 @@ fn cluster_keys(args: *const cli.Command.Start) peer_auth.Keys {
                 "public development key (--development, loopback addresses only)", .{});
             break :keys .{ .current = peer_auth.development_key };
         },
-        .refused => |reason| vsr.fatal(.cli, "start: {s}", .{reason}),
+        .refused => |reason| diagnostic.fail(
+            "NRV-E0901",
+            "start: {s}",
+            .{reason},
+            "set NERVA_CLUSTER_KEY (and NERVA_CLUSTER_KEY_NEXT during a rotation) as the message says",
+            .{},
+        ),
     };
 }
 
@@ -520,7 +613,13 @@ fn gateway_keys(comptime command: []const u8) http_connection.Keys {
     const current = std.posix.getenv("NERVA_KEY") orelse "";
     const next = std.posix.getenv("NERVA_KEY_NEXT");
     if (http_connection.Keys.invalid(current, next)) |reason| {
-        vsr.fatal(.cli, command ++ ": {s}", .{reason});
+        diagnostic.fail(
+            "NRV-E0008",
+            command ++ ": {s}",
+            .{reason},
+            "set NERVA_KEY; during a rotation NERVA_KEY_NEXT differs from it",
+            .{},
+        );
     }
     if (next != null) log.info(command ++ ": accepting NERVA_KEY and NERVA_KEY_NEXT", .{});
     return .{ .current = current, .next = next };

@@ -4,13 +4,19 @@ Every failure a client, an operator or a script can see has a stable code, regis
 (P147c). This follows Zigbox's diagnostics standard (`Zigbox/zigbox`, `DIAGNOSTICS.md`): a code,
 a one-line summary, who is to blame, the cause and a fix. Codes are never reused or renumbered.
 
-**Status, 2026-11-04: registered, not yet emitted.**
+**Status, 2026-11-05: commands emit their codes; the wire does not yet.**
 - **On the wire:** replies still carry only the identifiers and texts in the "Today" column. Codes
   reach `nerva api` replies in R4, as a `code` member beside today's `status` or `error`, never in
   their place.
-- **In commands:** codes reach `nerva` command output in R5 (`docs/PRODUCTION.md`).
-- **Until then,** this file maps today's texts to codes, so a client can match on a code's
-  identifier now and on the code later.
+- **In commands:** every `nerva` command failure that Nerva's code reports prints
+  `error[NRV-E…]` (or `bug[NRV-B…]`), then a `cause` line (the code's summary) and a `fix` line
+  (R5, `src/nerva/diagnostic.zig`; a unit test keeps its table equal to this file). Exit statuses:
+  1 the operator's input, 2 the environment (disk, kernel, file system), 70 Nerva's bug (P149e);
+  `nerva start`'s runtime exits (2 to 8) keep their statuses. Still uncoded, and R5's later
+  slices: the vendored flag parser's own errors (NRV-E0001, `error: …`), and the panics and
+  runtime exits of 07xx.
+- **Until the wire has them,** this file maps today's texts to codes, so a client can match on a
+  code's identifier now and on the code later.
 
 ## Format
 
@@ -49,14 +55,14 @@ a one-line summary, who is to blame, the cause and a fix. Codes are never reused
 
 | Code | Summary | Today | Blame | Fix |
 | --- | --- | --- | --- | --- |
-| NRV-E0001 | A command or flag is unknown, repeated or malformed | `error: unknown subcommand …`, `<flag>: duplicate argument`, `unexpected argument …` (stdx/flags.zig), exit 1 | operator | `nerva --help` |
-| NRV-E0002 | A flag's value is out of range | `--replica-count must be …`, `--cache-grid must be …`, `--cache-rows …`, `--commit-stall-probability …`, `--statsd …`, `--trace …` (cli.zig:281-440), exit 1 | operator | The message names the bound |
-| NRV-E0003 | `--listen` is not an address | `api: --listen must be <ipv4>:<port> or [<ipv6>]:<port>`, same for `view` | operator | Give `host:port`, IPv6 in brackets |
-| NRV-E0004 | An output file already exists | `--trace: <p> exists`, `export: <out> exists`, `import: <path> exists; give a new file` | operator | Give a new path; Nerva never overwrites |
-| NRV-E0005 | A data file already exists at `format`'s path | Today a raw `error: PathAlreadyExists` and a trace (io/linux.zig:1553) | operator | Choose another path, or remove the old file if it is really unwanted |
+| NRV-E0001 | A command or flag is unknown, repeated or malformed | `error: unknown subcommand …`, `<flag>: duplicate argument`, `unexpected argument …` (stdx/flags.zig, vendored: printed as `error: …` without the code, exit 1); `error[NRV-E0001]: export: --as-of must be …`, `--output must name a file`, `--input must name a file` | operator | `nerva --help` |
+| NRV-E0002 | A flag's value is out of range | `error[NRV-E0002]: <command>: --replica-count must be …`, `--cache-grid …`, `--cache-rows …`, `--commit-stall-probability …`, `--statsd …`, `--trace …`, exit 1 | operator | The message names the bound |
+| NRV-E0003 | `--listen` is not an address | `error[NRV-E0003]: api: --listen must be <ipv4>:<port> or [<ipv6>]:<port>`, same for `view`, exit 1 | operator | Give `host:port`, IPv6 in brackets |
+| NRV-E0004 | An output file already exists | `error[NRV-E0004]: start: --trace <p> exists`, `export: <out> exists`, `import: <path> exists`, exit 1 | operator | Give a new path; Nerva never overwrites |
+| NRV-E0005 | A data file already exists at `format`'s path | `error[NRV-E0005]: format: <path> exists`, exit 1 (`format` only; the pre-flight for `start` and `import` is R5 slice 2) | operator | Choose another path, or remove the old file if it is really unwanted |
 | NRV-E0006 | A data file is missing at `start`'s path | Today a panic, `Path does not exist.` (io/linux.zig:1475) | operator | Run `nerva format` first, or fix the path |
-| NRV-E0007 | A gateway or view server cannot listen | Today a raw bind or listen error | operator | The port is taken or not allowed |
-| NRV-E0008 | `NERVA_KEY` is missing or invalid | `api: set NERVA_KEY`, `NERVA_KEY_NEXT is set but empty`, `… equals NERVA_KEY` (http_connection.zig:147-150) | operator | Set it; `_NEXT` differs from it during a rotation |
+| NRV-E0007 | A replica, gateway or view server cannot listen | `error[NRV-E0007]: <command>: cannot listen: <reason>`, exit 1 | operator | The port is taken or not allowed, or the host has no socket for that address |
+| NRV-E0008 | `NERVA_KEY` is missing or invalid | `error[NRV-E0008]: api: set NERVA_KEY`, `NERVA_KEY_NEXT is set but empty`, `… equals NERVA_KEY` (http_connection.zig:147-150), exit 1 | operator | Set it; `_NEXT` differs from it during a rotation |
 
 ## 01xx · The gateway: transport, keys, routes, requests
 
@@ -146,6 +152,7 @@ These are the replies to `POST /v1/commit`. The identifier is the state machine'
 | NRV-E0601 | The cluster did not answer; the outcome is unknown | 503 `cluster unavailable` (also after eviction or a 30 s timeout) | retry | Resend under the same commit key: it commits at most once. Without a key, read before you write again |
 | NRV-E0602 | The gateway closed a request it could not take | Today the connection closes with no reply, or a 503 like NRV-E0601 (#120) | retry | R4 makes this `"applied": false` |
 | NRV-E0603 | A client's session was evicted by a newer one | Zig client `error.Evicted`; behind the gateway, NRV-E0601 | retry | Fewer clients than 64 sessions |
+| NRV-E0604 | A gateway or view server could not reach the cluster | `error[NRV-E0604]: api: no reply from the cluster` after the client's 30 s registration timeout, exit 1 (R5 slice 1) | operator | Check `--cluster` and `--addresses`, and that a quorum of replicas is running |
 
 ## 07xx · Replicas and data files
 
@@ -156,11 +163,11 @@ These are the replies to `POST /v1/commit`. The identifier is the state machine'
 | NRV-E0703 | Another process holds the data file | Today a panic, `another process holds the data file lock` | operator | Stop the other replica |
 | NRV-E0704 | The file system cannot do direct IO | Today a panic, after log lines that say "TigerBeetle" | operator | Put the data file on ext4 or XFS |
 | NRV-E0705 | The kernel is older than 5.11 | Today a panic | operator | Upgrade the kernel |
-| NRV-E0706 | The disk is full | Exit 2, `write failed: no space left on device` | operator | Free space or grow the volume |
+| NRV-E0706 | The disk is full | Exit 2, `write failed: no space left on device`; commands that write a file (`export`, `import`) print `error[NRV-E0706]`, exit 2 | operator | Free space or grow the volume |
 | NRV-E0707 | The data file outgrew its limit | Exit 4 or 5, which names a `--limit-storage` flag that Nerva does not have | operator | Today: export, then import into a larger file. The message is fixed in R5 |
-| NRV-E0708 | The disk failed a read, a write or an fsync | Today a panic: `latent sector error`, `fsync failure` | operator | Replace the disk, then the replica (R5) |
+| NRV-E0708 | The disk failed a read, a write or an fsync | Today a panic: `latent sector error`, `fsync failure`; `export` and `import` print `error[NRV-E0708]` for an I/O error on their files, exit 2 | operator | Replace the disk, then the replica (R5) |
 | NRV-E0709 | A replica's WAL is damaged | Today a raw `error: WALInvalid` or `WALCorrupt` | operator | Replace the replica (R5) |
-| NRV-E0710 | Not every replica address was given | `all --addresses must be provided` | operator | Give all of them, in replica order |
+| NRV-E0710 | Not every replica address was given | `error[NRV-E0710]: start: all --addresses must be provided`, exit 1 | operator | Give all of them, in replica order |
 | NRV-E0711 | This replica was imported from another export than its peers | Exit 8, `origin_mismatch`: `this replica was imported from export <A>, but <n> of the cluster's <m> replicas announce another` (replica.zig, P90) | operator | Import it again from the cluster's export, or `nerva recover` it with `--origin=` the export its peers announce |
 | NRV-E0712 | `nerva recover`: the other replicas did not commit its requests; they have no quorum | Not yet: R5 (`docs/briefs/r5.md`) | operator | Bring back enough of the other replicas first; with fewer, restore from a backup |
 | NRV-E0713 | `nerva recover`: the replica it would replace still answers at its address | Not yet: R5 | operator | Stop that replica and destroy its data file, then recover again |
@@ -172,21 +179,22 @@ These are the replies to `POST /v1/commit`. The identifier is the state machine'
 
 | Code | Summary | Today | Blame | Fix |
 | --- | --- | --- | --- | --- |
-| NRV-E0801 | The cluster did not answer the export | `export: no reply from the cluster: check --cluster and --addresses` | operator | As the message says |
-| NRV-E0802 | `--as-of` is past the latest op | `export: --as-of is past the cluster's latest op` | operator | Use `latest` or an earlier op |
-| NRV-E0803 | The export would be refused by `nerva import` | `export: nerva import would refuse this export` (with the reasons logged) | operator | Fix what the log names first |
-| NRV-E0804 | The file is not an export, or is damaged or truncated | `import: <input>: not an export: the magic is wrong`, `the export is truncated`, `the SHA-256 does not match` and about 40 more (export_file.zig:370-761) | operator | Use an intact export |
-| NRV-E0805 | The export's version is not one this release imports | Today a raw `import: <input>: VersionUnsupported` | operator | Import with a release that reads it |
-| NRV-E0806 | An earlier import did not finish | `import: <p>.importing is left from an import that did not finish; remove it` | operator | As the message says |
-| NRV-E0807 | The imported data failed its checks | Today a raw `import: Refused` or `ChecksFailed`, with the detail only logged | operator | Read the log lines above. R5 puts the reason in the message |
+| NRV-E0801 | The cluster did not answer the export | `error[NRV-E0801]: export: no reply from the cluster`, exit 1 | operator | As the message says |
+| NRV-E0802 | `--as-of` is past the latest op | `error[NRV-E0802]: export: --as-of is past the cluster's latest op`, exit 1 | operator | Use `latest` or an earlier op |
+| NRV-E0803 | The export would be refused by `nerva import` | `error[NRV-E0803]: export: `nerva import` would refuse this export: <first reason>`, also too many tables and records or an index that appeared during the export; exit 1 | operator | Fix what the message names first, then export again |
+| NRV-E0804 | The file is not an export, or is damaged or truncated | `error[NRV-E0804]: import: <input>: not an export: the magic is wrong`, `the export is truncated`, `the SHA-256 does not match` and about 40 more (export_file.zig:370-761), exit 1 | operator | Use an intact export |
+| NRV-E0805 | The export's version is not one this release imports | `error[NRV-E0805]: import: <input>: the export's version is not one this release reads`, exit 1 | operator | Import with a release that reads it |
+| NRV-E0806 | An earlier import did not finish | `error[NRV-E0806]: import: <p>.importing is left from an import that did not finish`, exit 1 | operator | As the message says |
+| NRV-E0807 | The imported data failed its checks | `error[NRV-E0807]: import: the export was refused: <first reason>` (and N more in the log above), exit 1 | operator | Read the log lines above the error |
 | NRV-E0808 | A backup's manifest is missing, malformed, too large or of an unknown version | Not yet: R5 (`nerva restore`) | operator | Give the `.manifest.json` that `nerva backup` wrote beside the backup |
 | NRV-E0809 | A backup does not match its manifest: size, SHA-256, op, version, a view hash or a ledger total | Not yet: R5 (`nerva restore`) | operator | Use the backup the manifest names, or another backup with its own manifest |
+| NRV-E0810 | A file `export` or `import` was given cannot be opened, read or written | `error[NRV-E0810]: import: cannot use <path>: no such file or directory` and the like, exit 1 (R5 slice 1) | operator | Check the path and its permissions |
 
 ## 09xx · Keys between replicas
 
 | Code | Summary | Today | Blame | Fix |
 | --- | --- | --- | --- | --- |
-| NRV-E0901 | `NERVA_CLUSTER_KEY` is missing, short, or wrongly paired with `_NEXT` | `start: set NERVA_CLUSTER_KEY (at least 32 bytes)` and the rest (peer_auth.zig:45-94) | operator | As the message says |
+| NRV-E0901 | `NERVA_CLUSTER_KEY` is missing, short, or wrongly paired with `_NEXT` | `error[NRV-E0901]: start: set NERVA_CLUSTER_KEY (at least 32 bytes)` and the rest (peer_auth.zig:45-94), exit 1 | operator | As the message says |
 | NRV-E0902 | A peer proved a different cluster key | Logged by the replica; the peer is ignored | operator | Give every replica the same key |
 
 ## 10xx · `nerva view`
@@ -204,14 +212,14 @@ These are the replies to `POST /v1/commit`. The identifier is the state machine'
 | NRV-B0001 | The gateway hit an internal error | 500 `internal error`, the Zig error only logged (server.zig:116, 206); includes `error.Corrupt` from a missing layout or bad document chunks | Report it with the gateway's log line |
 | NRV-B0002 | The gateway got a commit result it never expects | Today a panic of the gateway (api.zig:1051, 1116; documents_routes.zig) on `kind_invalid`, `field_invalid`, `key_invalid` and the rest: statuses the gateway's own checks should make impossible | Report it; R4 turns the panic into this reply |
 | NRV-B0003 | A replica stopped on an unknown protocol command | Exit 7, `unknown VSR command, crashing for safety` (#111) | Report it |
-| NRV-B0004 | A `nerva` command hit an error it did not expect | Not yet: R5; today a raw `error: <Name>` or `<command>: <Name>` (nerva_main.zig) | Report it with the command's output under `--log-debug` |
+| NRV-B0004 | A `nerva` command hit an error it did not expect | `bug[NRV-B0004]: <command> hit an error it did not expect`, exit 70; the Zig error name only on a `detail` line under `--log-debug` | Report it with the command's output under `--log-debug` |
 
 ## What the codes change, and when
 
 | Milestone | Change |
 | --- | --- |
 | R4 | Every `nerva api` and `nerva view` error reply gains `"code"`. Body too large becomes 413. "Not yet committed" becomes one status (504) on every route. Gateway panics become NRV-B0002. |
-| R5 | Every `nerva` command prints `error[NRV-E…]: <summary>` with a cause and a fix, never a raw Zig error name. The panics in 07xx become coded refusals. The exit codes follow Zigbox's: 1 operator, 2 environment, 70 internal. |
+| R5 | Every `nerva` command prints `error[NRV-E…]: <summary>` with a cause and a fix, never a raw Zig error name. The panics in 07xx become coded refusals (slice 2). The exit codes follow Zigbox's: 1 operator, 2 environment, 70 internal. |
 
 **Tests:** each registered code gets a test that triggers it and checks its code and summary, and
 a check fails any command output that contains a stack trace or a raw `error.Name`.

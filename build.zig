@@ -315,6 +315,14 @@ pub fn build(b: *std.Build) !void {
     run_integration_tests.has_side_effects = true; // Never cache: it runs real processes.
     steps.test_integration.dependOn(&run_integration_tests.step);
 
+    // The coded failures of every command, from the real binary (R5, P147c).
+    const run_errors_test = b.addSystemCommand(&.{ "python3", "tests/errors/commands.py" });
+    run_errors_test.addFileArg(nerva.getEmittedBin());
+    run_errors_test.setCwd(b.path("."));
+    run_errors_test.has_side_effects = true;
+    run_errors_test.step.dependOn(&run_integration_tests.step);
+    steps.test_integration.dependOn(&run_errors_test.step);
+
     // zig build test:api: the JSON API, its documents, adds, commit keys (P123), records and
     // indexes (P123b, P123c), then layouts kept between requests (P135), then ledgers, against
     // models, then a cluster and gateway over IPv6 (skipped without it), a gateway given an

@@ -56,7 +56,7 @@ def gateway_alone(nerva):
     log = result.stderr
     assert "panic" not in log, log[-3000:]
     assert result.returncode == 1, (result.returncode, log[-3000:])
-    assert "Timeout" in log, log[-3000:]
+    assert "error[NRV-E0604]" in log, log[-3000:]
     assert said_once(log), log[-3000:]  # Said once, though retried every tick.
 
 
