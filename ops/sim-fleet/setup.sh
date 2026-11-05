@@ -113,6 +113,19 @@ run_as_simfleet "cd '$CHECKOUT' && timeout 300 git fetch --quiet origin main && 
 if [ -n "$key_copy" ]; then rm -f "$key_copy"; fi
 
 cp "$CHECKOUT/ops/sim-fleet/sim-fleet.service" /etc/systemd/system/sim-fleet.service
+# MemoryMax from this host (P179): the shipped unit's 56G suits a 64 GB host, and on a smaller one
+# the kernel's global OOM killer acts before the cgroup limit does. The drop-in caps the service
+# at MemTotal - 1 GiB (at most the unit's 56G), so the cgroup limit is hit first and sshd and the
+# journal keep their memory. Rewritten on every run.
+mem_total_mb=$(awk '/^MemTotal:/ { print int($2 / 1024) }' /proc/meminfo)
+mem_max_mb=$((mem_total_mb - 1024))
+[ "$mem_max_mb" -le 57344 ] || mem_max_mb=57344
+if [ "$mem_max_mb" -lt 1024 ]; then
+    echo "setup.sh: only $mem_total_mb MB of memory; a seed needs about 4096 MB" >&2
+    exit 1
+fi
+mkdir -p /etc/systemd/system/sim-fleet.service.d
+printf '[Service]\nMemoryMax=%sM\n' "$mem_max_mb" >/etc/systemd/system/sim-fleet.service.d/memory.conf
 systemctl daemon-reload
 systemctl enable sim-fleet.service
 

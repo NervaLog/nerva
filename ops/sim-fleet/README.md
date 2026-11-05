@@ -20,8 +20,12 @@ takes `flock` on `state/lock`) loops over rounds:
    build that succeeded becomes the one in use (`state/built`); a tip that does not build is
    recorded in `state/broken`, logged once, and the last good build keeps running. Both survive a
    restart, so a restart neither rebuilds a good commit nor retries a bad one.
-2. **Workers**, one core each, `SIM_FLEET_WORKERS` of them (default: every core but one, which is
-   left for git, builds and the reporter). The split, all in `fleet.env`:
+2. **Workers**, one core and about 4 GB of RAM each, `SIM_FLEET_WORKERS` of them (default: the
+   smaller of every core but one, which is left for git, builds and the reporter, and
+   `(memory - 1 GiB) / SIM_FLEET_SEED_MEMORY_MB`, at least 1; memory is MemTotal, or the cgroup's
+   `memory.max` when lower; the `workers:` log line says which). With fewer than 3 workers the
+   workers are all "mixed": each rotates through the kinds seed by seed (vopr-nerva,
+   vopr-testing, vopr-nerva, fuzz), so no kind goes uncovered. The split, all in `fleet.env`:
    `SIM_FLEET_WORKERS_VOPR_TESTING` and `SIM_FLEET_WORKERS_FUZZ` default to an eighth of the
    workers each (at least one), `SIM_FLEET_WORKERS_VOPR_NERVA` to the rest; 0 stops a kind. On a
    16-thread host that is 13, 1 and 1. Each worker starts seeds for `SIM_FLEET_ROUND_SECONDS`
@@ -107,7 +111,13 @@ is (P147i). Its tests need no network: `python3 ops/sim-fleet/test_sim_fleet.py`
    NVMe. A VOPR seed takes 1 to 14 s in ReleaseSafe (N74; 1.4, 8.5 and 13.6 s measured for three
    seeds on 2026-11-04), about 5 s on average, so 13 VOPR workers run about 150,000 to 250,000
    seeds a day (SMT threads are slower than cores), against about 300 a push in CI today. Memory:
-   the unit caps the service at 56 GB (`MemoryMax`). Disk: the build caches are emptied past
+   a single seed of any kind peaks near 4 GB (anon-rss 3.2 to 3.9 GB for the VOPR of both state
+   machines and the fuzzers, seen on the first deploy), so plan **about 4 GB of RAM per worker**
+   (`SIM_FLEET_SEED_MEMORY_MB`, 4096). A 4-core, 8 GB host therefore runs 1 worker, at roughly a
+   tenth of the suggested host's throughput. `setup.sh` caps the service with a drop-in,
+   `sim-fleet.service.d/memory.conf`, at the smaller of 56 GB and the host's memory minus 1 GiB
+   (`MemoryMax`), so the cgroup limit is reached before the kernel's global OOM killer starts on
+   sshd or the journal; a seed it kills (137) is still counted as the host's. Disk: the build caches are emptied past
    `SIM_FLEET_CACHE_MB` (16 GB); 100 GB is plenty. The Jepsen suite (N82, #106) could share the
    host later; it would take cores from the workers.
 2. **A token**, a fine-grained personal access token (Settings, Developer settings, Fine-grained

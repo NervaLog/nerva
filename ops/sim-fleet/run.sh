@@ -21,16 +21,23 @@ main() {
     : "${SIM_FLEET_GH_REPO:=NervaLog/nerva}"
     : "${SIM_FLEET_BRANCH:=main}"
     : "${SIM_FLEET_TRACKER:=}"
-    # Workers: one core each. By default every core but one (git, builds and the reporter).
-    : "${SIM_FLEET_WORKERS:=$(( $(nproc) > 1 ? $(nproc) - 1 : 1 ))}"
-    # The split. The testing state machine and the fuzzers get an eighth each (at least one);
-    # Nerva's state machine the rest. Set any of the three to override; 0 stops that kind.
-    local eighth=$(( SIM_FLEET_WORKERS / 8 > 0 ? SIM_FLEET_WORKERS / 8 : 1 ))
-    : "${SIM_FLEET_WORKERS_VOPR_TESTING:=$eighth}"
-    : "${SIM_FLEET_WORKERS_FUZZ:=$eighth}"
-    : "${SIM_FLEET_WORKERS_VOPR_NERVA:=$(( SIM_FLEET_WORKERS - SIM_FLEET_WORKERS_VOPR_TESTING \
-        - SIM_FLEET_WORKERS_FUZZ > 0 ? SIM_FLEET_WORKERS - SIM_FLEET_WORKERS_VOPR_TESTING \
-        - SIM_FLEET_WORKERS_FUZZ : 1 ))}"
+    # Workers: one core each, and about SIM_FLEET_SEED_MEMORY_MB of RAM each (P179). By default
+    # the smaller of every core but one (git, builds and the reporter) and what memory holds.
+    : "${SIM_FLEET_SEED_MEMORY_MB:=4096}"
+    : "${SIM_FLEET_RESERVE_MB:=1024}"
+    local mem_mb mem_source
+    read -r mem_mb mem_source < <(memory_mb)
+    if [[ -z "${SIM_FLEET_WORKERS:-}" ]]; then
+        SIM_FLEET_WORKERS=$(default_workers "$(nproc)" "$mem_mb")
+        workers_from="computed from $(nproc) cores and $mem_mb MB ($mem_source)"
+    else
+        workers_from="set"
+    fi
+    # The split. Set any of the four to override; 0 stops that kind.
+    local plan
+    plan=$(split_workers "$SIM_FLEET_WORKERS")
+    read -r SIM_FLEET_WORKERS_VOPR_NERVA SIM_FLEET_WORKERS_VOPR_TESTING SIM_FLEET_WORKERS_FUZZ \
+        SIM_FLEET_WORKERS_MIXED <<<"$plan"
     # Every fuzzer in src/fuzz_tests.zig but `canary` (fails on purpose) and `smoke`, as fuzz.yml.
     : "${SIM_FLEET_FUZZERS:=ewah lsm_scan lsm_cache_map lsm_manifest_log lsm_manifest_level \
 lsm_segmented_array lsm_tree message_bus storage vsr_free_set vsr_superblock \
@@ -54,11 +61,11 @@ vsr_superblock_quorums vsr_multi_batch nerva_adds nerva_http_head nerva_document
     : "${SIM_FLEET_PYTHON:=python3}"
 
     (( SIM_FLEET_WORKERS_VOPR_NERVA + SIM_FLEET_WORKERS_VOPR_TESTING + SIM_FLEET_WORKERS_FUZZ \
-        <= 1024 )) || { log "more than 1024 workers"; exit 2; }
+        + SIM_FLEET_WORKERS_MIXED <= 1024 )) || { log "more than 1024 workers"; exit 2; }
     (( SIM_FLEET_TAIL_BYTES > 0 && SIM_FLEET_TAIL_BYTES <= 262144 )) ||
         { log "SIM_FLEET_TAIL_BYTES must be 1..262144"; exit 2; }
     read -r -a FUZZERS <<<"$SIM_FLEET_FUZZERS"
-    if (( SIM_FLEET_WORKERS_FUZZ > 0 && ${#FUZZERS[@]} == 0 )); then
+    if (( SIM_FLEET_WORKERS_FUZZ + SIM_FLEET_WORKERS_MIXED > 0 && ${#FUZZERS[@]} == 0 )); then
         log "fuzz workers but no SIM_FLEET_FUZZERS"
         exit 2
     fi
@@ -92,7 +99,9 @@ vsr_superblock_quorums vsr_multi_batch nerva_adds nerva_http_head nerva_document
     broken=$(cat "$STATE/broken" 2>/dev/null || true)
     if [[ -n "$built" && ! -x "$STATE/bin/$built/fuzz" ]]; then built=""; fi
     log "workers: vopr-nerva $SIM_FLEET_WORKERS_VOPR_NERVA, vopr-testing" \
-        "$SIM_FLEET_WORKERS_VOPR_TESTING, fuzz $SIM_FLEET_WORKERS_FUZZ"
+        "$SIM_FLEET_WORKERS_VOPR_TESTING, fuzz $SIM_FLEET_WORKERS_FUZZ, mixed" \
+        "$SIM_FLEET_WORKERS_MIXED ($SIM_FLEET_WORKERS $workers_from; $SIM_FLEET_SEED_MEMORY_MB MB" \
+        "a seed, $SIM_FLEET_RESERVE_MB MB reserved)"
     local rounds=0
     while (( SIM_FLEET_ROUNDS == 0 || rounds < SIM_FLEET_ROUNDS )); do
         rounds=$(( rounds + 1 ))
@@ -105,6 +114,59 @@ vsr_superblock_quorums vsr_multi_batch nerva_adds nerva_http_head nerva_document
         run_round
     done
 }
+
+# The memory the fleet may use, in MB, and where the figure came from: MemTotal, or the cgroup's
+# memory.max when that is lower. MemTotal rather than MemAvailable: it does not move with the page
+# cache or with the fleet's own restart, so a restart picks the same worker count.
+memory_mb() {
+    local total cg path limit=""
+    total=$(awk '/^MemTotal:/ { print int($2 / 1024) }' /proc/meminfo)
+    path=$(sed -n 's/^0:://p' /proc/self/cgroup 2>/dev/null || true)
+    for cg in "/sys/fs/cgroup$path/memory.max" /sys/fs/cgroup/memory.max; do
+        if [[ -r "$cg" ]]; then limit=$(cat "$cg"); break; fi
+    done
+    if [[ "$limit" =~ ^[0-9]+$ ]] && (( limit / 1048576 < total )); then
+        echo "$(( limit / 1048576 )) cgroup memory.max"
+    else
+        echo "$total MemTotal"
+    fi
+}
+
+# Default worker count for $1 cores and $2 MB: the smaller of cores - 1 and (MB - reserve) per
+# seed, at least 1.
+default_workers() {
+    local cores=$1 mem=$2 by_cpu by_mem
+    by_cpu=$(( cores > 1 ? cores - 1 : 1 ))
+    by_mem=$(( (mem - SIM_FLEET_RESERVE_MB) / SIM_FLEET_SEED_MEMORY_MB ))
+    echo $(( by_mem < by_cpu ? (by_mem > 1 ? by_mem : 1) : by_cpu ))
+}
+
+# The split of $1 workers: `nerva testing fuzz mixed`. A setting in the environment wins. By
+# default, 3 workers or more give an eighth each (at least one) to the testing state machine and
+# the fuzzers and the rest to Nerva's. Fewer than 3 are all mixed workers, which rotate through
+# the kinds seed by seed (MIXED below, so Nerva's get half), as three single-kind workers would
+# not fit the memory that made the count small.
+split_workers() {
+    local total=$1 eighth n t f m
+    eighth=$(( total / 8 > 0 ? total / 8 : 1 ))
+    if [[ -n "${SIM_FLEET_WORKERS_VOPR_NERVA:-}${SIM_FLEET_WORKERS_VOPR_TESTING:-}\
+${SIM_FLEET_WORKERS_FUZZ:-}" ]]; then
+        # Kinds set by hand: the others keep the old defaults, and nothing rotates unless asked.
+        t=${SIM_FLEET_WORKERS_VOPR_TESTING:-$eighth}
+        f=${SIM_FLEET_WORKERS_FUZZ:-$eighth}
+        n=${SIM_FLEET_WORKERS_VOPR_NERVA:-$(( total - t - f > 0 ? total - t - f : 1 ))}
+        m=${SIM_FLEET_WORKERS_MIXED:-0}
+    elif (( total < 3 )); then
+        n=0 t=0 f=0 m=${SIM_FLEET_WORKERS_MIXED:-$total}
+    else
+        t=$eighth f=$eighth n=$(( total - 2 * eighth ))
+        m=${SIM_FLEET_WORKERS_MIXED:-0}
+    fi
+    echo "$n $t $f $m"
+}
+
+# What a mixed worker runs, seed by seed: Nerva's state machine half the time.
+MIXED=(vopr-nerva vopr-testing vopr-nerva fuzz)
 
 log() {
     printf '%s sim-fleet: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"
@@ -202,6 +264,10 @@ run_round() {
         # Each fuzz worker starts at a different fuzzer and moves to the next after every seed.
         worker "$w" fuzz "$deadline" "$i" & w=$(( w + 1 ))
     done
+    for (( i = 0; i < SIM_FLEET_WORKERS_MIXED; i++ )); do
+        # Each mixed worker starts at a different place in the rotation.
+        worker "$w" mixed "$deadline" "$i" & w=$(( w + 1 ))
+    done
     wait
     ingest
 }
@@ -212,14 +278,18 @@ run_round() {
 # `[err]` lines, since the short log the fleet runs with has none.
 worker() {
     local dir="$round/w$1" kind=$2 deadline=$3 next=${4:-0}
-    local target exe seed code started out
+    local target exe seed code started out turn=$next cur=$kind
     mkdir -p "$dir"
     while (( $(date +%s) < deadline )); do
         seed=$(od -An -N8 -tu8 /dev/urandom | tr -d ' ')
-        case "$kind" in
+        if [[ "$kind" == mixed ]]; then
+            cur=${MIXED[turn % ${#MIXED[@]}]}
+            turn=$(( turn + 1 ))
+        fi
+        case "$cur" in
         vopr-*)
-            target=$kind
-            set -- timeout "$SIM_FLEET_VOPR_SEED_TIMEOUT" "$bin/$kind" "$seed"
+            target=$cur
+            set -- timeout "$SIM_FLEET_VOPR_SEED_TIMEOUT" "$bin/$cur" "$seed"
             ;;
         fuzz)
             target="fuzz:${FUZZERS[next % ${#FUZZERS[@]}]}"
@@ -236,10 +306,10 @@ worker() {
             out="$dir/fail-${target/:/-}-$seed"
             mkdir -p "$out"
             tail -c "$SIM_FLEET_TAIL_BYTES" "$dir/seed.log" >"$out/tail.log"
-            if [[ "$kind" == vopr-* && $code -eq 129 ]]; then
+            if [[ "$cur" == vopr-* && $code -eq 129 ]]; then
                 # The last 20: a passing run logs `[err] (client): ... session evicted` too, and
                 # the checker's message is the last line before the exit.
-                timeout "$SIM_FLEET_REPLAY_TIMEOUT" "$bin/$kind-full" "$seed" 2>&1 </dev/null 9>&- |
+                timeout "$SIM_FLEET_REPLAY_TIMEOUT" "$bin/$cur-full" "$seed" 2>&1 </dev/null 9>&- |
                     grep -a -E '^\[err\] ' | tail -n 20 >"$out/errors.log" || true
             fi
         fi
@@ -268,4 +338,5 @@ ingest() {
     log "sim_fleet.py ingest exited $code; the round is in $STATE/last-failed-round"
 }
 
-main "$@"
+# Sourced by the tests, which call the functions above.
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then main "$@"; fi

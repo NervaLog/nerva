@@ -6,6 +6,7 @@ import importlib.util
 import io
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -387,6 +388,54 @@ class StateFile(unittest.TestCase):
                                "--state", self.path, "--dry-run"], now=DAY_ONE)
         self.assertEqual(code, 1)
         self.assertFalse(os.path.exists(self.path))
+
+
+class WorkerPlan(unittest.TestCase):
+    """run.sh's worker count and split (P179), by sourcing it and calling its functions."""
+
+    def sh(self, script, **env):
+        full = {"PATH": os.environ["PATH"], "SIM_FLEET_SEED_MEMORY_MB": "4096",
+                "SIM_FLEET_RESERVE_MB": "1024"}
+        full.update(env)
+        out = subprocess.run(["bash", "-c", f'set -euo pipefail; source "{HERE}/run.sh"; {script}'],
+                             env=full, capture_output=True, text=True, check=True)
+        return out.stdout.strip()
+
+    def count(self, cores, mem_mb):
+        return int(self.sh(f"default_workers {cores} {mem_mb}"))
+
+    def test_memory_limits_the_default_count(self):
+        self.assertEqual(self.count(4, 7168), 1)   # The first host: 4 cores, 7 GiB.
+        self.assertEqual(self.count(4, 16384), 3)  # Cores are the limit.
+        self.assertEqual(self.count(16, 65536), 15)
+        self.assertEqual(self.count(16, 32768), 7)
+
+    def test_the_count_is_at_least_one(self):
+        self.assertEqual(self.count(1, 512), 1)
+        self.assertEqual(self.count(8, 2048), 1)
+
+    def test_fewer_than_three_workers_are_all_mixed(self):
+        self.assertEqual(self.sh("split_workers 1"), "0 0 0 1")
+        self.assertEqual(self.sh("split_workers 2"), "0 0 0 2")
+
+    def test_three_or_more_split_as_before(self):
+        self.assertEqual(self.sh("split_workers 3"), "1 1 1 0")
+        self.assertEqual(self.sh("split_workers 15"), "13 1 1 0")
+
+    def test_the_split_never_exceeds_the_total(self):
+        for total in range(1, 40):
+            n, t, f, m = map(int, self.sh(f"split_workers {total}").split())
+            self.assertEqual(n + t + f + m, total)
+
+    def test_explicit_settings_win(self):
+        self.assertEqual(self.sh("split_workers 1", SIM_FLEET_WORKERS_FUZZ="0",
+                                 SIM_FLEET_WORKERS_VOPR_TESTING="0"), "1 0 0 0")
+        self.assertEqual(self.sh("split_workers 2", SIM_FLEET_WORKERS_MIXED="3"), "0 0 0 3")
+
+    def test_memory_comes_from_the_host(self):
+        mem, source = self.sh("memory_mb").split(maxsplit=1)
+        self.assertGreater(int(mem), 0)
+        self.assertIn(source, ("MemTotal", "cgroup memory.max"))
 
 
 if __name__ == "__main__":
