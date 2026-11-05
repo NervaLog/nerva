@@ -10,7 +10,9 @@ transactions without stopping, past a checkpoint. Then:
   status 8 and NRV-E0711 naming the export its peers announce, and the peers log that they ignore
   it and commit on;
 - each replica in turn is lost (the primary once) and recovered with the export's SHA-256, and
-  catches up: with another backup stopped, commits need it;
+  catches up: with another backup stopped, commits need it, and the stopped backup is restarted
+  and caught up (normal status, no state sync, commit_min at commit_max, from its statsd gauges)
+  before the next replica is lost, so that a loss never finds two replicas missing (#162);
 - P90's scenario: after the last recovery, the backup that would lead the next view stops while the
   recovered one and the primary commit on; then the primary is killed with SIGKILL, so that the
   recovered replica must be in the view-change quorum.
@@ -39,6 +41,9 @@ RECOVER_TIMEOUT_SECONDS = 60  # `recover_timeout` in src/nerva/recover.zig.
 STATUS_ORIGIN_MISMATCH = 8
 EXPORT_COMMITS = 40  # Before the first checkpoint (op 959).
 COMMITS_BEFORE_LOSS = 1100  # Past the next checkpoint: the first replacement needs state sync.
+CAUGHT_UP_LAG_MAX = 16  # Ops a caught up replica may be behind commit_max, one pipeline's worth.
+GAUGE = re.compile(rb"^tb\.(replica_status|replica_sync_stage|replica_commit_min|"
+                   rb"replica_commit_max):(\d+)\|g", re.MULTILINE)
 
 
 def free_ports(count):
@@ -126,6 +131,13 @@ class Cluster:
         self.addresses = ",".join(str(port) for port in self.ports)
         self.replicas = [None] * 3
         self.gateway_process = None
+        self.gauges = [{} for _ in range(3)]  # The latest value of each gauge a replica sent.
+        self.statsd = []  # One UDP socket per replica: statsd packets, every 10 seconds.
+        for _ in range(3):
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.bind(("127.0.0.1", 0))
+            sock.setblocking(False)
+            self.statsd.append(sock)
         for index in range(3):
             prepare(index, self.data_file(index))
         for index in range(3):
@@ -145,6 +157,37 @@ class Cluster:
                     assert time.monotonic() < deadline, self.log(index)[-3000:]
                     time.sleep(0.1)
 
+    def poll_gauges(self, index):
+        """Reads the statsd packets that arrived from replica `index` since the last call."""
+        while True:
+            try:
+                packet = self.statsd[index].recv(65536)
+            except BlockingIOError:
+                return
+            if self.replicas[index] is None:
+                continue  # A packet of a process that is gone.
+            for name, value in GAUGE.findall(packet):
+                self.gauges[index][name.decode()] = int(value)
+
+    def wait_caught_up(self, index, seconds=240):
+        """Waits until replica `index`, restarted, is in normal status, is not syncing, and has
+        committed to within a pipeline of what it knows the cluster has committed.
+
+        Listening is not enough: a restarted backup repairs, or syncs state, for a while, and a
+        cluster that loses a replica meanwhile has to change view with it missing (#162)."""
+        deadline = time.monotonic() + seconds
+        while True:
+            assert self.replicas[index].poll() is None, self.log(index)[-3000:]
+            self.poll_gauges(index)
+            gauges = self.gauges[index]
+            if len(gauges) == 4 and gauges["replica_status"] == 0 and \
+                    gauges["replica_sync_stage"] == 0 and \
+                    gauges["replica_commit_max"] - gauges["replica_commit_min"] <= \
+                    CAUGHT_UP_LAG_MAX:
+                return
+            assert time.monotonic() < deadline, (index, gauges, self.log(index)[-3000:])
+            time.sleep(0.2)
+
     def data_file(self, index):
         return os.path.join(self.tmp, f"{self.name}_{index}.nerva")
 
@@ -157,8 +200,11 @@ class Cluster:
 
     def start(self, index):
         assert self.replicas[index] is None
+        self.poll_gauges(index)  # Packets of a former process say nothing of this one.
+        self.gauges[index] = {}
         self.replicas[index] = subprocess.Popen(
             [self.nerva, "start", f"--addresses={self.addresses}", "--development",
+             f"--statsd=127.0.0.1:{self.statsd[index].getsockname()[1]}",
              self.data_file(index)],
             stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
             stderr=open(self.data_file(index) + ".log", "a"))
@@ -242,6 +288,8 @@ class Cluster:
                 process.kill()
                 process.wait()
         self.replicas = [None] * 3
+        for sock in self.statsd:
+            sock.close()
         for index in range(3):  # Data files are large: remove them once done with.
             for suffix in ("", ".log", ".recovering"):
                 path = self.data_file(index) + suffix
@@ -318,6 +366,9 @@ def recover_imported(tmp, nerva):
         cluster.start(other)
         cluster.wait_listening([other])
         writer.wait_for(50)
+        # Commits do not need `other` (the victim and the primary are a quorum), so they prove
+        # nothing about it. The next loss must find all three replicas whole.
+        cluster.wait_caught_up(other)
 
     try:
         port = cluster.gateway()
