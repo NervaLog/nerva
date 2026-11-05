@@ -22,6 +22,11 @@ Runs one replica and two API gateways, then:
 - the gateway serves one request per connection and reads many at once: a client holding its
   connection open, one that connects and sends nothing, or one that sends a byte at a time does
   not hold up the next client (N37, N45);
+- a connection is never closed without a status line: one that drips is answered 408 at the
+  deadline (NRV-E0116); with sixteen requests half sent, a seventeenth reads 503 busy (NRV-E0602,
+  "applied": false) and none of the sixteen is cut (#120), nor is a refused client's reply lost
+  while it sends a body; a second gateway on a running gateway's port exits with NRV-E0007
+  (#112);
 - many idle connections do not hold up a request (#28); `start --trace` refuses an existing
   file (#29); after a cluster stall past the client's timeout the gateway reports itself
   unhealthy, then recovers on its own (#27);
@@ -38,7 +43,7 @@ Runs one replica and two API gateways, then:
 
 Usage: api.py <path to nerva> [--seed=N] [--steps=N]
 """
-import http.client, json, os, random, shutil, signal, socket, subprocess, sys, tempfile, threading, time
+import http.client, json, os, random, select, shutil, signal, socket, subprocess, sys, tempfile, threading, time
 
 # Replicas authenticate each other with a real cluster key, never the development key (P102).
 os.environ["NERVA_CLUSTER_KEY"] = os.urandom(32).hex()
@@ -455,21 +460,80 @@ def check_connections(port):
     drip = socket.create_connection(("127.0.0.1", port))
     drip.sendall(b"GET /healthz HTTP/1.1\r\n")
     started = time.monotonic()
-    for _ in range(6):
+    reply = b""
+    while True:
         drip.sendall(b"x")
         before = time.monotonic()
         assert request(port, "POST", "/v1/lookup", {"rows": [{"table": 1, "id": "0"}]})[0] == 200
         assert time.monotonic() - before < 2, "a dripping connection held up the next client"
-        time.sleep(2)
-    # It is closed at the deadline, 10 s after it connected, though it kept sending.
-    drip.settimeout(5)
-    try:
-        closed = drip.recv(1) == b""
-    except ConnectionResetError:
-        closed = True
-    assert closed and time.monotonic() - started < 16, "a dripping connection outlived the deadline"
+        assert time.monotonic() - started < 16, "a dripping connection outlived the deadline"
+        # It is answered 408 at the deadline, 10 s after it connected, though it kept sending:
+        # never closed without a status line (NRV-E0116).
+        if select.select([drip], [], [], 2)[0]:
+            while chunk := drip.recv(4096):
+                reply += chunk
+            break
+    assert 9 < time.monotonic() - started < 16, "the drip was answered at the wrong time"
+    assert reply.startswith(b"HTTP/1.1 408 "), reply
+    body = json.loads(reply.split(b"\r\n\r\n", 1)[1])
+    assert body["code"] == "NRV-E0116" and body["applied"] is False, body
     drip.close()
     silent.close()
+
+
+def check_busy(nerva, cluster, port):
+    # Issue #120: sixteen clients have sent the start of a request each, and a seventeenth asks
+    # for /healthz. The seventeenth reads 503 busy, "applied": false, NRV-E0602, at once; none
+    # of the sixteen is cut: all finish and are answered.
+    partial = []
+    for _ in range(16):
+        connection = socket.create_connection(("127.0.0.1", port))
+        connection.sendall(b"GET /healthz HTTP/1.1\r\n")
+        partial.append(connection)
+    time.sleep(0.2)
+    started = time.monotonic()
+    status, body = request(port, "GET", "/healthz", key=None)
+    assert status == 503, (status, body)
+    assert body == {"error": "busy", "applied": False, "code": "NRV-E0602"}, body
+    assert time.monotonic() - started < 1, "the busy reply was not immediate"
+    for connection in partial:
+        connection.sendall(b"\r\n")
+    for connection in partial:
+        connection.settimeout(10)
+        reply = b""
+        while chunk := connection.recv(4096):
+            reply += chunk
+        assert reply.startswith(b"HTTP/1.1 200 "), reply
+        connection.close()
+
+    # A refused client that is still sending a body reads its 503 (lingering close).
+    partial = []
+    for _ in range(16):
+        connection = socket.create_connection(("127.0.0.1", port))
+        connection.sendall(b"GET /healthz HTTP/1.1\r\n")
+        partial.append(connection)
+    time.sleep(0.2)
+    refused = socket.create_connection(("127.0.0.1", port))
+    head = b"POST /v1/commit HTTP/1.1\r\nContent-Length: 60000\r\n\r\n"
+    refused.sendall(head + b"x" * (64 * 1024 - len(head)))
+    refused.settimeout(10)
+    reply = b""
+    while chunk := refused.recv(4096):
+        reply += chunk
+    assert reply.startswith(b"HTTP/1.1 503 ") and b"NRV-E0602" in reply, reply
+    refused.close()
+    for connection in partial:
+        connection.close()
+
+    # A second gateway on a running gateway's port does not bind silently and share its
+    # connections (#112): it exits with NRV-E0007, and the first still answers.
+    second = subprocess.run(
+        [nerva, "api", "--cluster=0", f"--addresses={cluster.address}",
+         f"--listen=127.0.0.1:{port}"],
+        env={**os.environ, "NERVA_KEY": KEY}, capture_output=True, text=True, timeout=60)
+    assert second.returncode == 1 and "NRV-E0007" in second.stderr, (second.returncode,
+                                                                    second.stderr)
+    assert request(port, "GET", "/healthz", key=None)[0] == 200
 
 
 MALFORMED = [
@@ -747,6 +811,7 @@ def main():
         check_documents_get_max(ports[0])
         check_multiline_body(ports[0])
         check_idle_flood(ports[0])
+        check_busy(nerva, cluster, ports[0])
         check_trace_refuses_existing(nerva, cluster.tmp)
         trace_size = check_trace_bounded(nerva, cluster.tmp)
         check_stall_recovery(cluster, ports[1])

@@ -4,9 +4,10 @@ Every failure a client, an operator or a script can see has a stable code, regis
 (P147c). This follows Zigbox's diagnostics standard (`Zigbox/zigbox`, `DIAGNOSTICS.md`): a code,
 a one-line summary, who is to blame, the cause and a fix. Codes are never reused or renumbered.
 
-**Status, 2026-11-05: commands emit their codes; the wire does not yet.**
-- **On the wire:** replies still carry only the identifiers and texts in the "Today" column. Codes
-  reach `nerva api` replies in R4, as a `code` member beside today's `status` or `error`, never in
+**Status, 2026-11-05: commands emit their codes; the wire does in part.**
+- **On the wire:** the replies the `Receiver` itself writes (NRV-E0101, E0102, E0116, E0602) carry
+  `code` and `applied`; every other reply still carries only the identifiers and texts in the
+  "Today" column. Codes reach the rest of `nerva api`'s replies in R4, as a `code` member beside today's `status` or `error`, never in
   their place.
 - **In commands:** every `nerva` command failure that Nerva's code reports prints
   `error[NRV-E…]` (or `bug[NRV-B…]`), then a `cause` line (the code's summary) and a `fix` line
@@ -71,8 +72,8 @@ a one-line summary, who is to blame, the cause and a fix. Codes are never reused
 
 | Code | Summary | Today | Blame | Fix |
 | --- | --- | --- | --- | --- |
-| NRV-E0101 | The request is not valid HTTP | 400 `malformed request`, `request head too large`; then the connection closes | client | Send HTTP/1.1, one request per connection |
-| NRV-E0102 | The body is larger than 4 MiB | 400 `body too large` (a 413 in R4) | client | Split the request |
+| NRV-E0101 | The request is not valid HTTP | 400 `malformed request`, `request head too large`, with `"applied": false` and `"code": "NRV-E0101"`; then the connection lingers briefly and closes | client | Send HTTP/1.1, one request per connection |
+| NRV-E0102 | The body is larger than 4 MiB | 400 `body too large`, with `"applied": false` and `"code": "NRV-E0102"` (a 413 in R4) | client | Split the request |
 | NRV-E0103 | The key is missing or wrong | 401 `invalid key` | client | Send `X-Nerva-Key` |
 | NRV-E0104 | No such route, or not with this method | 404 `not found`, 405 `method not allowed` | client | See README, "JSON API" |
 | NRV-E0105 | The JSON is malformed, or has an unknown or missing member | 400 `malformed JSON`, `unknown field`, `missing field`, `unexpected body` | client | Send exactly the members the route documents |
@@ -86,7 +87,7 @@ a one-line summary, who is to blame, the cause and a fix. Codes are never reused
 | NRV-E0113 | The request needs more memory than one request may use | 413 `request too complex` (128 MiB, N69) | client | Fewer or smaller entries |
 | NRV-E0114 | A field needs a layout, or names no field of it | 400 `fields need a layout for the table (PUT /v1/tables/<t>)`, `no such field`, `an add's field must be u64 or i64` | client | Declare the layout first |
 | NRV-E0115 | A field value does not fit its type | 400 `a bool field takes true or false`, `a bytes field takes at most its size in hex`, `a number is out of range` and the rest (catalog.zig) | client | As the message says |
-| NRV-E0116 | The request did not arrive whole within 10 s | Not yet emitted: today the connection closes with no reply (http_connection.zig:552-561). R4 answers `408` with `"applied": false` (docs/briefs/r4.md) | client | Send the whole request at once; nothing was applied |
+| NRV-E0116 | The request did not arrive whole within 10 s | `408 {"error":"request not received within 10 s","applied":false,"code":"NRV-E0116"}`, written before the connection closes (`http_connection.zig`, R4 slice 1) | client | Send the whole request at once; nothing was applied |
 
 ## 02xx · Commit results
 
@@ -154,7 +155,7 @@ These are the replies to `POST /v1/commit`. The identifier is the state machine'
 | Code | Summary | Today | Blame | Fix |
 | --- | --- | --- | --- | --- |
 | NRV-E0601 | The cluster did not answer; the outcome is unknown | 503 `cluster unavailable` (also after eviction or a 30 s timeout) | retry | Resend under the same commit key: it commits at most once. Without a key, read before you write again |
-| NRV-E0602 | The gateway closed a request it could not take | Today the connection closes with no reply, or a 503 like NRV-E0601 (#120) | retry | R4 makes this `"applied": false` |
+| NRV-E0602 | The gateway closed a request it could not take | `503 {"error":"busy","applied":false,"code":"NRV-E0602"}`, sent without reading the request: to a connection displaced while it had sent nothing, and to a newcomer when every slot holds a connection that has sent bytes (R4 slice 1; #120). A request complete but not sent within `queue_wait_max` gets it in slice 2 | retry | Nothing was applied: resend, with a pause |
 | NRV-E0603 | A client's session was evicted by a newer one | Zig client `error.Evicted`; behind the gateway, NRV-E0601 | retry | Fewer clients than 64 sessions |
 | NRV-E0604 | A gateway or view server could not reach the cluster | `error[NRV-E0604]: api: no reply from the cluster` after the client's 30 s registration timeout, exit 1 (R5 slice 1) | operator | Check `--cluster` and `--addresses`, and that a quorum of replicas is running |
 | NRV-E0605 | The gateway has no cluster session now; the request was not sent | Not yet emitted: today the same `503 cluster unavailable` as NRV-E0601 (server.zig:193). R4 answers it with `"applied": false` (docs/briefs/r4.md) | retry | Resend: nothing was applied. The gateway reconnects on its own, at most every 5 s |
