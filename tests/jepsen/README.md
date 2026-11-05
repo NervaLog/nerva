@@ -37,6 +37,7 @@ Options (`lein run test --help` lists Jepsen's own):
 | `--rate` | 20 | Requests per second, over all workers |
 | `--time-limit` | 60 | Seconds of requests and faults, before healing |
 | `--recovery-time` | 20 | Seconds between healing and the final reads |
+| `--gateways` | 1 | Gateways per node: 1, or 2 (ports 8080 and 8081; the workload's clients use the first). They listen on `0.0.0.0` with `--listen-remote`, since the control node reaches them over the network |
 
 ## What a reply means
 

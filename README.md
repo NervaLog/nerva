@@ -218,6 +218,34 @@ gateways do not hold the key and are not affected.
   network (6PN), which is WireGuard. Put gateways (`nerva api`, `nerva view`) behind TLS for any
   caller off that network.
 
+### Gateways beside their clients
+
+A gateway serves plain HTTP on loopback, one `nerva api` per client process. Start it next to
+the process it serves, with every replica's address, and give that process its own `NERVA_KEY`:
+
+```bash
+NERVA_KEY=secret nerva api --cluster=1 --addresses=10.0.0.1:3001,10.0.0.2:3001,10.0.0.3:3001 \
+    --listen=127.0.0.1:8080
+```
+
+- **Loopback only.** `--listen` must be `127.0.0.0/8` or `::1`. `0.0.0.0` and
+  `[::]` serve every interface, and IPv4-mapped spellings such as `::ffff:127.0.0.1` are not plain
+  loopback; all are refused with NRV-E0009 (exit 1) unless `--listen-remote` is given (write
+  `127.0.0.1` for loopback). With the flag and a non-loopback address, one warning (NRV-W0010)
+  says the key and every reply cross the network in plain HTTP ("Network" under Limits). Anyone who bound `0.0.0.0` before must now pass
+  the flag, or move the caller beside the gateway.
+- **Start and stop.** Start the client process once `GET /healthz` answers `200` (the gateway
+  holds a cluster session), and stop sending it work on `503` NRV-E0605 (a lost session; `503` busy, NRV-E0602, keeps it): the gateway reconnects on its own
+  and `/healthz` says `"session":"ready"` again.
+- **Timeouts.** Set the client's request timeout above the answer bound (below), and
+  `--request-timeout` below the client's. The timeout is per cluster request, so a route that
+  makes several can outlast it ("The answer bound"; #186).
+- **Sessions.** A cluster holds 64 client sessions. Every gateway, `nerva view`, `export`,
+  `recover` and Zig client takes one, and a 65th evicts the least recent. Count them before
+  adding gateways.
+- **Ports.** Every client machine reaches every replica's port; nothing needs to reach the
+  gateway's.
+
 ### Upgrading a cluster
 
 From v0.4.0 on (v0.3.0 has no `nerva export`), a new release keeps the data: the old release's
@@ -525,9 +553,11 @@ curl -H 'X-Nerva-Key: secret' -d '{"entries":[{"kind":"put","table":1,"id":"5","
 ```
 
 `--listen` (for `nerva api` and `nerva view`) takes `<ipv4>:<port>` or `[<ipv6>]:<port>`, as
-`--addresses` does: `--listen=[::]:8080` serves every IPv6 address, as on an IPv6-only network.
-On Linux, `[::]` accepts IPv4 connections too unless `net.ipv6.bindv6only` is set (it is not by
-default). Zone ids (`[fe80::1%2]`) are refused.
+`--addresses` does, and only on loopback (`127.0.0.0/8`, `[::1]`) unless `--listen-remote` is
+given (NRV-E0009; "Gateways beside their clients"). With the flag, `--listen=[::]:8080` serves
+every IPv6 address, as on an IPv6-only network. On Linux, `[::]` accepts IPv4 connections too
+unless `net.ipv6.bindv6only` is set (it is not by default). Zone ids (`[fe80::1%2]`) are
+refused.
 
 | Route | Does |
 |---|---|
@@ -589,6 +619,38 @@ anything malformed answers `400`. A body is at most 4 MiB, and a `nerva api` req
 allocate at most 128 MiB: a body that would take more once parsed (deeply nested or very long
 JSON arrays) answers `413 {"error":"request too complex"}`. What a request took is given back as
 soon as its reply is written; the gateway keeps at most 8 MiB between requests (N69).
+
+### What a reply means
+
+A gateway answers nearly every connection it accepts with a status line before it closes it. A
+transport error with no status means nothing was applied or the outcome is unknown: the gateway
+died; or its table of 16 lingering connections was full, so it closed right after writing the
+status and a reset destroyed the reply (`lingering_dropped`); or a client kept sending more than
+64 KiB after a refusal; or the backlog of 128 connections was full, so connect failed (nothing
+was sent, nothing applied). Resend a `/v1/commit` under the same `key` (only commits take one on
+this branch), to the restarted gateway if need be: it answers `replayed` if the commit had
+landed (P123).
+
+Every reply that is not `2xx` carries `"applied"` and a `"code"` (docs/ERRORS.md), beside the
+`error` or `status` it always had:
+
+| `applied` | Meaning | Client |
+|---|---|---|
+| `false` | Nothing reached the cluster, or the cluster refused it | Safe to resend, after fixing the request or waiting for the cause to pass |
+| `"unknown"` | A write went out and no reply came back (`503` NRV-E0601, `500` NRV-B0002, and `500` NRV-B0001 when a write had been sent) | The write may have committed: resend a `/v1/commit` only under its `key`, or read to find out |
+
+A replayed commit answers `200` with `"replayed":true` and `"code":"NRV-W0201"`. A body over
+4 MiB answers `413`; an op that is not committed yet answers `504`, on every route; a gateway
+without a session answers `503` NRV-E0605, and `/healthz` says `"session":"reconnecting"`.
+
+**The answer bound.** Each cluster request is answered within the queue wait (1 s) plus
+`--request-timeout` plus a margin to write the reply (1 s): 32 s by default. The timeout is per
+cluster request (the client restarts its deadline for every call), not per HTTP request, and some
+routes make several: a commit or lookup whose table layouts are not cached (the cache is cleared
+on every reconnect, so the first commit after one makes at least two), `layout_put` and view
+declares (a read, then a commit), and the `get_ledger` loop. Against a slow cluster such a
+request can take (k+1) times as long. A client whose own timeout is shorter than that may give up
+on a request that still commits. One deadline per HTTP request is tracked in #186.
 
 **Documents** hold values larger than a row: up to 512 KiB under a string key (up to 1024 bytes
 of UTF-8) in a namespace (a `u64`, as a decimal string). Nerva chunks them over rows of a
@@ -746,9 +808,12 @@ used; the sections above say why.
   answers `405` before the key is checked.
 - `--request-timeout=<ms>` (`nerva api` and `nerva view`, 1,000 to 60,000, default 30,000; out
   of range is NRV-E0002): a gateway's cluster session times out a request after it; the gateway
-  then answers `503` until it has reconnected. A request that has arrived whole is answered
-  within 1 s (the queue wait) + `--request-timeout` + 1 s, so a client whose own timeout is
-  longer always gets the gateway's answer: set the flag below the client's timeout.
+  then answers `503` until it has reconnected. Each cluster request is answered
+  within 1 s (the queue wait) + `--request-timeout` + 1 s (32 s by default); the timeout is per
+  cluster request, so routes that make several take longer ("What a reply means"; #186). Set the
+  flag below the client's timeout.
+- `--listen` is loopback (`127.0.0.0/8`, `::1`) unless `--listen-remote` is given; `0.0.0.0`,
+  `[::]` and IPv4-mapped spellings such as `::ffff:127.0.0.1` are refused with NRV-E0009.
 
 **Documents:** a value is at most 512 KiB, under a key of at most 1024 bytes of UTF-8. A commit
 carries about 600 KB of keys and values. A `get` takes at most 256 keys (more answers `400`), and
@@ -771,7 +836,8 @@ client takes one; a 65th evicts the session that committed least recently, whose
 fails (gateways reconnect on their own).
 
 **Network.** Gateways authenticate their callers with `X-Nerva-Key`, but send it, and every
-reply, in plain HTTP: put them behind TLS (a load balancer or proxy) when callers are not on a
+reply, in plain HTTP. They listen on loopback only, beside their client (NRV-E0009 otherwise);
+with `--listen-remote`, put them behind TLS (a load balancer or proxy) when callers are not on a
 private network. Replicas authenticate each other with the cluster key (P102, "Replicas
 authenticate each other" above), but their traffic is neither encrypted nor signed after the
 handshake, and anyone who can reach a replica's port can still act as a client. Run replicas on a

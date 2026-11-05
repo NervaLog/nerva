@@ -38,21 +38,23 @@
 
 (defn request!
   "Sends one request to node's gateway. Returns {:status int, :body parsed JSON or nil}.
-  Throws an IOException when no reply arrives."
-  [node method path body]
-  (let [publisher (if (nil? body)
-                    (HttpRequest$BodyPublishers/noBody)
-                    (HttpRequest$BodyPublishers/ofString (json/write-str body)))
-        request   (-> (HttpRequest/newBuilder (URI. (str "http://" node ":" api-port path)))
-                      (.timeout (Duration/ofMillis timeout-ms))
-                      (.header "X-Nerva-Key" api-key)
-                      (.header "Content-Type" "application/json")
-                      (.method method publisher)
-                      (.build))
-        response  (.send ^HttpClient @client request (HttpResponse$BodyHandlers/ofString))
-        text      (.body response)]
-    {:status (.statusCode response)
-     :body   (when-not (str/blank? text) (json/read-str text))}))
+  Throws an IOException when no reply arrives. With a port, sends it to that gateway."
+  ([node method path body]
+   (request! node api-port method path body))
+  ([node port method path body]
+   (let [publisher (if (nil? body)
+                     (HttpRequest$BodyPublishers/noBody)
+                     (HttpRequest$BodyPublishers/ofString (json/write-str body)))
+         request   (-> (HttpRequest/newBuilder (URI. (str "http://" node ":" port path)))
+                       (.timeout (Duration/ofMillis timeout-ms))
+                       (.header "X-Nerva-Key" api-key)
+                       (.header "Content-Type" "application/json")
+                       (.method method publisher)
+                       (.build))
+         response  (.send ^HttpClient @client request (HttpResponse$BodyHandlers/ofString))
+         text      (.body response)]
+     {:status (.statusCode response)
+      :body   (when-not (str/blank? text) (json/read-str text))})))
 
 (defn ok!
   "Like request!, for setup: returns the body of a `200`, and throws on anything else."
@@ -100,18 +102,24 @@
           (no-reply ~op ~write? e#))))
 
 (defn healthy?
-  "Whether node's gateway has a cluster session (`/healthz` answers 200)."
-  [node]
-  (try (= 200 (:status (request! node "GET" "/healthz" nil)))
-       (catch IOException _ false)))
+  "Whether the gateway at node (and port, `api-port` when omitted) has a cluster session
+  (`/healthz` answers 200)."
+  ([node]
+   (healthy? node api-port))
+  ([node port]
+   (try (= 200 (:status (request! node port "GET" "/healthz" nil)))
+        (catch IOException _ false))))
 
 (defn await-healthy!
-  "Waits until node's gateway is healthy, at most timeout-s seconds; throws past that."
-  [node timeout-s]
-  (let [deadline (+ (System/nanoTime) (* timeout-s 1000000000))]
-    (loop []
-      (cond (healthy? node) :healthy
-            (< deadline (System/nanoTime))
-            (throw (ex-info (str node "'s gateway not healthy after " timeout-s " s")
-                            {:node node}))
-            :else (do (Thread/sleep 500) (recur))))))
+  "Waits until the gateway at node (and port, `api-port` when omitted) is healthy, at most
+  timeout-s seconds; throws past that."
+  ([node timeout-s]
+   (await-healthy! node api-port timeout-s))
+  ([node port timeout-s]
+   (let [deadline (+ (System/nanoTime) (* timeout-s 1000000000))]
+     (loop []
+       (cond (healthy? node port) :healthy
+             (< deadline (System/nanoTime))
+             (throw (ex-info (str node ":" port " gateway not healthy after " timeout-s " s")
+                             {:node node :port port}))
+             :else (do (Thread/sleep 500) (recur)))))))

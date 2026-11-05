@@ -83,6 +83,11 @@ def main():
             check(f"{command} listen", [command, "--cluster=0", "--addresses=127.0.0.1:1",
                                         "--listen=bogus"], "NRV-E0003", 1, "--listen must be",
                   env={"NERVA_KEY": KEY})
+            for listen in ("0.0.0.0:0", "[::]:0", "10.0.0.1:0", "[::ffff:127.0.0.1]:0"):
+                check(f"{command} listen {listen}", [command, "--cluster=0",
+                                                     "--addresses=127.0.0.1:1",
+                                                     f"--listen={listen}"], "NRV-E0009", 1,
+                      "is not loopback", env={"NERVA_KEY": KEY})
             for milliseconds in ("999", "60001"):
                 check(f"{command} request timeout {milliseconds}",
                       [command, "--cluster=0", "--addresses=127.0.0.1:1", "--listen=127.0.0.1:0",
@@ -92,6 +97,19 @@ def main():
                 check("api statsd", [command, "--cluster=0", "--addresses=127.0.0.1:1",
                                      "--listen=127.0.0.1:0", "--statsd=127.0.0.1:0"], "NRV-E0002", 1,
                       "--statsd must be", env={"NERVA_KEY": KEY})
+            # E0009 is decided before the key is read (P183b): no NERVA_KEY, still E0009.
+            check(f"{command} listen without key", [command, "--cluster=0",
+                                                    "--addresses=127.0.0.1:1",
+                                                    "--listen=0.0.0.0:0"], "NRV-E0009", 1,
+                  "is not loopback")
+            # And before anything is bound: a held port is E0009, not E0007.
+            with socket.socket() as held:
+                held.bind(("0.0.0.0", 0))
+                held.listen()
+                check(f"{command} listen held", [command, "--cluster=0",
+                                                 "--addresses=127.0.0.1:1",
+                                                 f"--listen=0.0.0.0:{held.getsockname()[1]}"],
+                      "NRV-E0009", 1, "is not loopback", env={"NERVA_KEY": KEY})
             check(f"{command} key", [command, "--cluster=0", "--addresses=127.0.0.1:1",
                                      "--listen=127.0.0.1:0"], "NRV-E0008", 1, "NERVA_KEY")
         # The vendored flag parser's own failures (stdx/flags.zig `fatal`, through the hook).
@@ -216,6 +234,23 @@ def main():
             expect(result, "NRV-E0010", 1, "cannot send statsd to", "statsd bad, cluster down")
             seen.append("NRV-E0010")
             assert time.monotonic() - started < 10, "E0010 waited for the cluster"
+            # `--listen-remote` accepts 0.0.0.0 and says so once (NRV-W0010); on loopback, never.
+            for command in ("api", "view"):
+                for listen, warnings in (("0.0.0.0:0", 1), ("127.0.0.1:0", 0)):
+                    process = subprocess.Popen(
+                        [nerva, command, "--cluster=0", f"--addresses={cluster.address}",
+                         f"--listen={listen}", "--listen-remote"], stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE, text=True,
+                        env={**os.environ, "NERVA_KEY": KEY})
+                    try:
+                        assert int(process.stdout.readline()) > 0, command
+                    finally:
+                        process.kill()
+                        stderr = process.communicate()[1]
+                    assert stderr.count("NRV-W0010") == warnings, (command, listen, stderr)
+                    assert stderr.count("--listen-remote serves plain HTTP") == warnings, stderr
+                    assert not diagnostic_lines(subprocess.CompletedProcess([], 0, "", stderr)), \
+                        stderr
         finally:
             cluster.close()
 
