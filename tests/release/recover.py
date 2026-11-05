@@ -12,7 +12,9 @@ transactions without stopping, past a checkpoint. Then:
 - each replica in turn is lost (the primary once) and recovered with the export's SHA-256, and
   catches up: with another backup stopped, commits need it, and the stopped backup is restarted
   and caught up (normal status, no state sync, commit_min at commit_max, from its statsd gauges)
-  before the next replica is lost, so that a loss never finds two replicas missing (#162);
+  before the next replica is lost, so that a loss never finds two replicas missing (#162); the
+  first one is recovered only after the cluster has committed on past a checkpoint, so that it
+  state syncs (`sync: done` in its log) whatever the writer's speed (#164);
 - P90's scenario: after the last recovery, the backup that would lead the next view stops while the
   recovered one and the primary commit on; then the primary is killed with SIGKILL, so that the
   recovered replica must be in the view-change quorum.
@@ -40,7 +42,8 @@ TABLE = 3
 RECOVER_TIMEOUT_SECONDS = 60  # `recover_timeout` in src/nerva/recover.zig.
 STATUS_ORIGIN_MISMATCH = 8
 EXPORT_COMMITS = 40  # Before the first checkpoint (op 959).
-COMMITS_BEFORE_LOSS = 1100  # Past the next checkpoint: the first replacement needs state sync.
+COMMITS_BEFORE_LOSS = 1100  # Past the first checkpoint.
+SYNC_OPS = 960 + 128  # Ops past a loss that put the cluster's checkpoint beyond the lost replica.
 CAUGHT_UP_LAG_MAX = 16  # Ops a caught up replica may be behind commit_max, one pipeline's worth.
 GAUGE = re.compile(rb"^tb\.(replica_status|replica_sync_stage|replica_commit_min|"
                    rb"replica_commit_max):(\d+)\|g", re.MULTILINE)
@@ -345,11 +348,25 @@ def recover_imported(tmp, nerva):
 
     cluster = Cluster(tmp, "imported", nerva, import_)
     writer = None
-    synced = 0
 
-    def recover_right(index):
-        """Loses `index` and recovers it with the export's origin; returns once it listens."""
+    def newest_op():
+        return max(op for _, op in writer.acked.values())
+
+    def recover_right(index, sync=False):
+        """Loses `index` and recovers it with the export's origin; returns once it listens.
+
+        With `sync`, the cluster commits on past a checkpoint (`vsr_checkpoint_ops`) before the
+        recovery, so that the replacement cannot repair and must sync state, whatever the writer's
+        speed (#164)."""
         cluster.lose(index)
+        if sync:
+            writer.wait_for(1)
+            target = newest_op() + SYNC_OPS
+            deadline = time.monotonic() + 600
+            while newest_op() < target:
+                assert writer.failure is None, writer.failure
+                assert time.monotonic() < deadline, f"op {newest_op()} short of {target}"
+                time.sleep(0.05)
         result = cluster.recover(index, origin=origin)
         assert result.returncode == 0, result.stderr[-3000:]
         assert f"export {origin}; start it with nerva start" in result.stderr, result.stderr
@@ -401,11 +418,12 @@ def recover_imported(tmp, nerva):
         # Each replica in turn, the primary once, each caught up before the next.
         order = [first, cluster.primary()]
         order.append(next(i for i in range(3) if i not in order))
-        for victim in order:
-            recover_right(victim)
+        for position, victim in enumerate(order):
+            syncing = position == 0  # The first replica to be recovered is made to state sync.
+            recover_right(victim, sync=syncing)
             caught_up(victim)
-            synced += "sync: done" in cluster.log(victim)
-        assert synced >= 1, "no recovered replica used state sync"
+            if syncing:
+                assert "sync: done" in cluster.log(victim), cluster.log(victim)[-4000:]
         last = order[-1]
 
         # P90: the recovered replica must be in the view-change quorum. The backup that would
@@ -424,7 +442,7 @@ def recover_imported(tmp, nerva):
         writer.finish()
         acknowledged_commits_survive(writer, port)
         cluster.check_no_panic()
-        return len(writer.acked), synced
+        return len(writer.acked)
     finally:
         if writer is not None:
             writer.stopping = True
@@ -436,9 +454,9 @@ def main():
     tmp = tempfile.mkdtemp(prefix="nerva-recover-origin-")
     try:
         started = time.monotonic()
-        count, synced = recover_imported(tmp, nerva)
+        count = recover_imported(tmp, nerva)
         print(f"recover (imported): the wrong origin exits with status {STATUS_ORIGIN_MISMATCH} "
-              f"and NRV-E0711; each replica recovered in turn ({synced} by state sync), and the "
+              f"and NRV-E0711; each replica recovered in turn (the first by state sync), and the "
               f"view-change quorum of the last one keeps all {count} acknowledged commits "
               f"({time.monotonic() - started:.0f} s)")
     finally:
