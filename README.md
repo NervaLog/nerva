@@ -544,8 +544,11 @@ and `POST /v1/lookup` requests that are waiting together when it turns to them w
 request, one transaction or read each (at most 16; it never waits for more), and each reply is
 the one the request would have had alone; if the cluster does not answer, each gets the `503`
 it would have had alone (P143). With all 16 connections busy, a new connection
-displaces the oldest one still sending its request. A request must arrive whole within 10 s
-of connecting and carries one request per connection (`Connection: close`). If a gateway
+displaces the oldest one that has sent nothing yet, or, if all 16 have sent bytes, is answered
+`503 {"error":"busy","applied":false,"code":"NRV-E0602"}` without its request being read.
+Nothing is closed without a status line (P168b, P168c). A request must arrive whole within 10 s
+of connecting (`408`, NRV-E0116) and carries one request per connection (`Connection: close`).
+A gateway listens on a socket of its own: a second one on the same port exits with NRV-E0007. If a gateway
 loses its cluster session (a request times out after 30 s, or the session is evicted), it
 answers `503` and `/healthz` answers `503`, and it reconnects on its own, trying at most every
 5 s whether or not requests arrive (N64); `nerva view` then reads the feed on from where it
@@ -699,9 +702,13 @@ used; the sections above say why.
 - A `nerva api` request may allocate at most 128 MiB once parsed; more answers
   `413 {"error":"request too complex"}`. Between requests the gateway keeps at most 8 MiB.
 - 16 connections are read at once. With all 16 busy, a new connection displaces the oldest one
-  still sending its request.
-- A request must arrive whole within 10 s of connecting, and its reply is written within another
-  10 s. One request per connection (`Connection: close`).
+  that has sent nothing yet; if all 16 have sent bytes, it is answered `503 busy`
+  (`"applied": false`, NRV-E0602) and its request is not read. A connection that has sent bytes
+  is never displaced (#120). The refused or displaced connection lingers at most 1 s (16 at a
+  time, discarding up to 64 KiB) so that the client reads the reply.
+- A request must arrive whole within 10 s of connecting (else `408`, NRV-E0116), and its reply
+  is written within another 10 s. One request per connection (`Connection: close`). The kernel
+  queues 128 waiting connections; more are not accepted.
 - Every request but `GET /healthz` needs `X-Nerva-Key`, equal to `NERVA_KEY` or, during a
   rotation, `NERVA_KEY_NEXT`; a missing or other key answers `401`. A method the gateway never
   takes (for `nerva api` anything but `GET`, `POST` and `PUT`; for `nerva view` anything but `GET`)
