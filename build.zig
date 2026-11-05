@@ -405,7 +405,7 @@ pub fn build(b: *std.Build) !void {
     });
     // Then an upgrade: an export from `nerva`, imported by the other release (N80), without
     // records (export version 1) and with them (version 2, P123b); then replicas imported from
-    // different exports (P90). One after the other: each runs a cluster.
+    // different exports (P90); then a backup, a restore drill and a restore (R5). One after the other: each runs a cluster.
     var release_previous: ?*std.Build.Step = null;
     for ([_][2][]const u8{
         .{ "mixed.py", "" },
@@ -413,6 +413,7 @@ pub fn build(b: *std.Build) !void {
         .{ "upgrade.py", "--records" },
         .{ "origins.py", "" },
         .{ "recover.py", "" },
+        .{ "restore.py", "" },
     }) |release_test| {
         const script = release_test[0];
         const run_release_test = b.addSystemCommand(&.{

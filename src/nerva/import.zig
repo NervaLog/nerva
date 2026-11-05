@@ -63,6 +63,8 @@ pub const PlanView = struct {
 
 /// What pass 1 learned from a verified export.
 pub const Plan = struct {
+    /// The export file's format version.
+    version: u32,
     summary: export_file.Summary,
     /// The export's identity, its `end` record's SHA-256: the data file's `VSRState.origin`
     /// (P90).
@@ -107,6 +109,7 @@ pub fn plan(arena: std.mem.Allocator, path: []const u8) !Plan {
     var reader = try export_file.ReaderType(@TypeOf(buffered).Reader).init(buffered.reader());
 
     var result: Plan = .{
+        .version = reader.version,
         .summary = undefined,
         .origin = undefined,
         .timestamp_max = 0,

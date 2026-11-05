@@ -21,6 +21,7 @@ const export_file = @import("nerva/export_file.zig");
 const export_ = @import("nerva/export.zig");
 const import_ = @import("nerva/import.zig");
 const recover = @import("nerva/recover.zig");
+const backup = @import("nerva/backup.zig");
 const release_peers = @import("nerva/release_peers.zig");
 const peer_auth = @import("nerva/peer_auth.zig");
 const preflight = @import("nerva/preflight.zig");
@@ -100,100 +101,22 @@ fn run() !void {
         },
         .@"export" => |*args| {
             log_level_set(args.log_debug);
-            command_export(gpa, args) catch |err| {
+            command_export("export", gpa, args) catch |err| {
                 std.fs.cwd().deleteFile(args.output) catch {};
-                switch (err) {
-                    error.Timeout => diagnostic.fail(
-                        "NRV-E0801",
-                        "export: no reply from the cluster",
-                        .{},
-                        "check --cluster and --addresses, and that a quorum of replicas is running",
-                        .{},
-                    ),
-                    error.AsOfAhead => diagnostic.fail(
-                        "NRV-E0802",
-                        "export: --as-of is past the cluster's latest op",
-                        .{},
-                        "give --as-of=latest or an op the cluster has reached",
-                        .{},
-                    ),
-                    error.TooManyTables => diagnostic.fail(
-                        "NRV-E0803",
-                        "export: more than {} tables hold rows; an export checks at most that many",
-                        .{export_file.tables_max},
-                        "keep fewer tables with rows, then export again",
-                        .{},
-                    ),
-                    error.TooManyCatalogRows, error.ViewRefused => diagnostic.fail(
-                        "NRV-E0803",
-                        "export: `nerva import` would refuse this export: {s}",
-                        .{refusal_reason()},
-                        "fix what the log names, then export again",
-                        .{},
-                    ),
-                    error.RecordsAppeared => diagnostic.fail(
-                        "NRV-E0803",
-                        "export: records or an index appeared during the export",
-                        .{},
-                        "export again",
-                        .{},
-                    ),
-                    else => diagnostic.fail_file(args.output, err),
-                }
+                export_failed("export", args.output, err);
             };
+        },
+        .backup => |*args| {
+            log_level_set(args.log_debug);
+            command_backup(gpa, args);
         },
         .import => |*args| {
             log_level_set(args.log_debug);
-            preflight.kernel_check();
-            // Before reading the export, which may be large: the data file must be new. The
-            // import writes `<path>.importing` and links it to `<path>` once its checks pass,
-            // so a failed or killed import never leaves a file a replica would start from (#78).
-            if (std.fs.cwd().access(args.path, .{})) {
-                diagnostic.fail(
-                    "NRV-E0004",
-                    "import: {s} exists",
-                    .{args.path},
-                    "give a new path: nerva never overwrites a data file",
-                    .{},
-                );
-            } else |_| {}
-            var path_importing_buffer: [std.fs.max_path_bytes]u8 = undefined;
-            const path_importing = std.fmt.bufPrint(
-                &path_importing_buffer,
-                "{s}.importing",
-                .{args.path},
-            ) catch diagnostic.fail_file(args.path, error.NameTooLong);
-            if (std.fs.cwd().access(path_importing, .{})) {
-                diagnostic.fail(
-                    "NRV-E0806",
-                    "import: {s} is left from an import that did not finish",
-                    .{path_importing},
-                    "remove {s}, then import again",
-                    .{path_importing},
-                );
-            } else |_| {}
-            // Pass 1, before the data file exists: the whole export is checked.
-            var arena = std.heap.ArenaAllocator.init(gpa);
-            defer arena.deinit();
-            const plan = import_.plan(arena.allocator(), args.input) catch |err|
-                import_failed(args.input, args.path, err);
-            // Pass 2. Any failure removes the data file, which the import created.
-            command_import(gpa, args, path_importing, &plan) catch |err| {
-                std.fs.cwd().deleteFile(path_importing) catch {};
-                import_failed(args.input, path_importing, err);
-            };
-            // Every write is on disk: the data file is complete, and takes its name.
-            const cwd = std.posix.AT.FDCWD;
-            std.posix.linkat(cwd, path_importing, cwd, args.path, 0) catch |err| {
-                std.fs.cwd().deleteFile(path_importing) catch {};
-                diagnostic.fail_file(args.path, err);
-            };
-            std.fs.cwd().deleteFile(path_importing) catch |err| {
-                diagnostic.fail_file(path_importing, err);
-            };
-            directory_sync(args.path) catch |err| {
-                diagnostic.fail_file(args.path, err);
-            };
+            import_run("import", gpa, args, null);
+        },
+        .restore => |*args| {
+            log_level_set(args.import.log_debug);
+            import_run("restore", gpa, &args.import, args.manifest);
         },
         .recover => |*args| {
             log_level_runtime = if (args.log_debug) .debug else .info;
@@ -289,7 +212,7 @@ fn run() !void {
             switch (tag) {
                 .format => try command_format(gpa, &storage, args),
                 .start => try command_start(gpa, &io, time, &tracer, &storage, args),
-                .version, .view, .api, .@"export", .import, .recover => comptime unreachable,
+                .version, .view, .api, .@"export", .backup, .import, .restore, .recover => comptime unreachable,
             }
         },
     }
@@ -322,26 +245,314 @@ fn refusal_reason() []const u8 {
     return diagnostic.reason_take(&buffer.bytes) orelse "see the log above";
 }
 
-/// Exits with the code for an import that failed in `plan` or while restoring.
-fn import_failed(input: []const u8, output: []const u8, err: anyerror) noreturn {
+/// Exits with the code for an export that failed; `output` is the file it was writing.
+fn export_failed(comptime command: []const u8, output: []const u8, err: anyerror) noreturn {
+    switch (err) {
+        error.Timeout => diagnostic.fail(
+            "NRV-E0801",
+            command ++ ": no reply from the cluster",
+            .{},
+            "check --cluster and --addresses, and that a quorum of replicas is running",
+            .{},
+        ),
+        error.AsOfAhead => diagnostic.fail(
+            "NRV-E0802",
+            command ++ ": --as-of is past the cluster's latest op",
+            .{},
+            "give --as-of=latest or an op the cluster has reached",
+            .{},
+        ),
+        error.TooManyTables => diagnostic.fail(
+            "NRV-E0803",
+            command ++ ": more than {} tables hold rows; an export checks at most that many",
+            .{export_file.tables_max},
+            "keep fewer tables with rows, then export again",
+            .{},
+        ),
+        error.TooManyCatalogRows, error.ViewRefused => diagnostic.fail(
+            "NRV-E0803",
+            command ++ ": `nerva import` would refuse this export: {s}",
+            .{refusal_reason()},
+            "fix what the log names, then export again",
+            .{},
+        ),
+        error.RecordsAppeared => diagnostic.fail(
+            "NRV-E0803",
+            command ++ ": records or an index appeared during the export",
+            .{},
+            "export again",
+            .{},
+        ),
+        else => diagnostic.fail_file(output, err),
+    }
+}
+
+/// `import` and `restore`: creates the data file at `args.path` from an export. With a manifest
+/// (`restore`) the manifest is read first and the export is compared with it before any file
+/// exists (R5, P149).
+fn import_run(
+    comptime command: []const u8,
+    gpa: std.mem.Allocator,
+    args: *const cli.Command.Import,
+    manifest_path: ?[]const u8,
+) void {
+    preflight.kernel_check();
+    // Before reading the export, which may be large: the data file must be new. The
+    // import writes `<path>.importing` and links it to `<path>` once its checks pass,
+    // so a failed or killed import never leaves a file a replica would start from (#78).
+    if (std.fs.cwd().access(args.path, .{})) {
+        diagnostic.fail(
+            "NRV-E0004",
+            command ++ ": {s} exists",
+            .{args.path},
+            "give a new path: nerva never overwrites a data file",
+            .{},
+        );
+    } else |_| {}
+    var path_importing_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path_importing = std.fmt.bufPrint(
+        &path_importing_buffer,
+        "{s}.importing",
+        .{args.path},
+    ) catch diagnostic.fail_file(args.path, error.NameTooLong);
+    if (std.fs.cwd().access(path_importing, .{})) {
+        diagnostic.fail(
+            "NRV-E0806",
+            command ++ ": {s} is left from an import that did not finish",
+            .{path_importing},
+            "remove {s}, then {s} again",
+            .{ path_importing, command },
+        );
+    } else |_| {}
+    // The manifest first: a backup is compared with a record it did not carry.
+    var manifest: backup.Manifest = undefined;
+    if (manifest_path) |path| manifest_read(command, path, &manifest);
+    // Pass 1, before the data file exists: the whole export is checked.
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const plan = import_.plan(arena.allocator(), args.input) catch |err|
+        import_failed(command, args.input, args.path, err);
+    if (manifest_path) |path| manifest_compare(command, args, path, &manifest, &plan);
+    // Pass 2. Any failure removes the data file, which the import created.
+    command_import(gpa, args, path_importing, &plan) catch |err| {
+        std.fs.cwd().deleteFile(path_importing) catch {};
+        import_failed(command, args.input, path_importing, err);
+    };
+    // Every write is on disk: the data file is complete, and takes its name.
+    const cwd = std.posix.AT.FDCWD;
+    std.posix.linkat(cwd, path_importing, cwd, args.path, 0) catch |err| {
+        std.fs.cwd().deleteFile(path_importing) catch {};
+        diagnostic.fail_file(args.path, err);
+    };
+    std.fs.cwd().deleteFile(path_importing) catch |err| {
+        diagnostic.fail_file(path_importing, err);
+    };
+    directory_sync(args.path) catch |err| {
+        diagnostic.fail_file(args.path, err);
+    };
+    if (manifest_path != null) {
+        var counts_buffer: [64]u8 = undefined;
+        std.io.getStdOut().writer().print(
+            "restored replica {} from backup {} at op {}: {s} match the manifest\n",
+            .{
+                args.replica,
+                std.fmt.fmtSliceHexLower(&plan.origin),
+                plan.summary.as_of,
+                backup.counts_text(&counts_buffer, &manifest),
+            },
+        ) catch {};
+    }
+}
+
+/// Reads and parses the manifest at `path`; exits with NRV-E0808 if it is not one.
+fn manifest_read(comptime command: []const u8, path: []const u8, manifest: *backup.Manifest) void {
+    const fix = "give the .manifest.json that nerva backup wrote beside the backup";
+    const file = std.fs.cwd().openFile(path, .{}) catch |err| switch (err) {
+        error.FileNotFound => diagnostic.fail(
+            "NRV-E0808",
+            command ++ ": {s}: the manifest does not exist",
+            .{path},
+            fix,
+            .{},
+        ),
+        else => diagnostic.fail_file(path, err),
+    };
+    defer file.close();
+    // One byte more than the bound, to tell a manifest at the bound from one past it.
+    var buffer: [backup.manifest_size_max + 1]u8 = undefined;
+    const size = file.readAll(&buffer) catch |err| diagnostic.fail_file(path, err);
+    backup.parse(buffer[0..size], manifest) catch |err| diagnostic.fail(
+        "NRV-E0808",
+        command ++ ": {s}: {s}",
+        .{ path, switch (err) {
+            error.Malformed => "it is not a manifest this release writes",
+            error.TooLarge => "it is larger than a manifest can be",
+            error.UnknownVersion => "its version is not one this release reads",
+        } },
+        fix,
+        .{},
+    );
+}
+
+/// Exits with NRV-E0809 unless the verified export (`plan`) is the one `manifest` describes.
+fn manifest_compare(
+    comptime command: []const u8,
+    args: *const cli.Command.Import,
+    manifest_path: []const u8,
+    manifest: *const backup.Manifest,
+    plan: *const import_.Plan,
+) void {
+    const stat = std.fs.cwd().statFile(args.input) catch |err|
+        diagnostic.fail_file(args.input, err);
+    const actual = backup.from_plan(plan, manifest.release_slice(), manifest.cluster, stat.size);
+    var difference_buffer: [512]u8 = undefined;
+    const difference = backup.first_difference(&difference_buffer, manifest, &actual) orelse
+        return;
+    diagnostic.fail(
+        "NRV-E0809",
+        command ++ ": {s} does not match {s}: {s}",
+        .{ args.input, manifest_path, difference },
+        "use the backup the manifest names, or another backup with its own manifest",
+        .{},
+    );
+}
+
+/// `nerva backup`: an export, read back as `import` reads it, and its manifest beside it.
+fn command_backup(gpa: std.mem.Allocator, args: *const cli.Command.Backup) void {
+    var manifest_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const manifest_path = std.fmt.bufPrint(
+        &manifest_path_buffer,
+        "{s}" ++ backup.manifest_suffix,
+        .{args.output},
+    ) catch diagnostic.fail_file(args.output, error.NameTooLong);
+    // Neither file is ever overwritten; the manifest is checked first so that no backup is
+    // made that could not be completed.
+    if (std.fs.cwd().access(manifest_path, .{})) {
+        manifest_exists(manifest_path);
+    } else |_| {}
+
+    command_export("backup", gpa, args) catch |err| {
+        std.fs.cwd().deleteFile(args.output) catch {};
+        export_failed("backup", args.output, err);
+    };
+    // A backup that `restore` would refuse is refused now.
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const plan = import_.plan(arena.allocator(), args.output) catch |err| {
+        std.fs.cwd().deleteFile(args.output) catch {};
+        backup_unreadable(args.output, err);
+    };
+    const size = (std.fs.cwd().statFile(args.output) catch |err| {
+        std.fs.cwd().deleteFile(args.output) catch {};
+        diagnostic.fail_file(args.output, err);
+    }).size;
+    const release = config.process.release.triple();
+    var release_buffer: [backup.release_size_max]u8 = undefined;
+    const release_text = std.fmt.bufPrint(&release_buffer, "{}.{}.{}", .{
+        release.major,
+        release.minor,
+        release.patch,
+    }) catch unreachable; // Three u16 and two dots fit.
+    const manifest = backup.from_plan(&plan, release_text, args.cluster, size);
+    var buffer: [backup.manifest_size_max]u8 = undefined;
+    const bytes = backup.render(&manifest, &buffer);
+
+    const file = std.fs.cwd().createFile(manifest_path, .{ .exclusive = true }) catch |err| {
+        std.fs.cwd().deleteFile(args.output) catch {};
+        if (err == error.PathAlreadyExists) manifest_exists(manifest_path);
+        diagnostic.fail_file(manifest_path, err);
+    };
+    manifest_write(file, bytes, args.output) catch |err| {
+        file.close();
+        std.fs.cwd().deleteFile(manifest_path) catch {};
+        std.fs.cwd().deleteFile(args.output) catch {};
+        diagnostic.fail_file(manifest_path, err);
+    };
+    file.close();
+    log.info("backup {s}: op {}, {} bytes, SHA-256 {}", .{
+        args.output,
+        plan.summary.as_of,
+        size,
+        std.fmt.fmtSliceHexLower(&plan.origin),
+    });
+    std.io.getStdOut().writer().print("backup {s}: op {}, sha256 {}\nmanifest {s}\n", .{
+        args.output,
+        plan.summary.as_of,
+        std.fmt.fmtSliceHexLower(&plan.origin),
+        manifest_path,
+    }) catch {};
+}
+
+fn manifest_exists(manifest_path: []const u8) noreturn {
+    diagnostic.fail(
+        "NRV-E0004",
+        "backup: {s} exists",
+        .{manifest_path},
+        "give a new --output: nerva never overwrites a file",
+        .{},
+    );
+}
+
+/// Writes and syncs the manifest, then makes it and the backup durable.
+fn manifest_write(file: std.fs.File, bytes: []const u8, output: []const u8) !void {
+    try file.writeAll(bytes);
+    try file.sync();
+    try directory_sync(output);
+}
+
+/// The backup just written does not read back as `import` reads it.
+fn backup_unreadable(output: []const u8, err: anyerror) noreturn {
     switch (err) {
         error.Corrupt => diagnostic.fail(
             "NRV-E0804",
-            "import: {s}: {s}",
+            "backup: {s}: {s}",
+            .{ output, export_file.corrupt_reason },
+            "check the disk, then back up again; nothing was named {s}",
+            .{output},
+        ),
+        error.VersionUnsupported => diagnostic.fail(
+            "NRV-E0805",
+            "backup: {s}: the export's version is not one this release reads",
+            .{output},
+            "back up again; nothing was named {s}",
+            .{output},
+        ),
+        error.Refused, error.ChecksFailed => diagnostic.fail(
+            "NRV-E0803",
+            "backup: `nerva import` would refuse this export: {s}",
+            .{refusal_reason()},
+            "fix what the log names, then back up again; nothing was named {s}",
+            .{output},
+        ),
+        else => diagnostic.fail_file(output, err),
+    }
+}
+
+/// Exits with the code for an import that failed in `plan` or while restoring.
+fn import_failed(
+    comptime command: []const u8,
+    input: []const u8,
+    output: []const u8,
+    err: anyerror,
+) noreturn {
+    switch (err) {
+        error.Corrupt => diagnostic.fail(
+            "NRV-E0804",
+            command ++ ": {s}: {s}",
             .{ input, export_file.corrupt_reason },
             "use an intact export, or export again",
             .{},
         ),
         error.VersionUnsupported => diagnostic.fail(
             "NRV-E0805",
-            "import: {s}: the export's version is not one this release reads",
+            command ++ ": {s}: the export's version is not one this release reads",
             .{input},
             "import it with a release that reads it, or export again with this one",
             .{},
         ),
         error.Refused, error.ChecksFailed => diagnostic.fail(
             "NRV-E0807",
-            "import: the export was refused: {s}",
+            command ++ ": the export was refused: {s}",
             .{refusal_reason()},
             "read the log lines above; nothing was named {s}",
             .{output},
@@ -419,13 +630,17 @@ fn command_import(
 }
 
 /// Writes the export to a new file; a failure leaves the caller to remove it (N80).
-fn command_export(gpa: std.mem.Allocator, args: *const cli.Command.Export) !void {
+fn command_export(
+    comptime command: []const u8,
+    gpa: std.mem.Allocator,
+    args: *const cli.Command.Export,
+) !void {
     // Never an existing file: a path given by mistake would be truncated.
     const file = std.fs.cwd().createFile(args.output, .{ .exclusive = true }) catch |err|
         switch (err) {
             error.PathAlreadyExists => diagnostic.fail(
                 "NRV-E0004",
-                "export: {s} exists",
+                command ++ ": {s} exists",
                 .{args.output},
                 "give a new path: nerva never overwrites a file",
                 .{},
