@@ -13,7 +13,10 @@ Runs one replica and two API gateways, then:
 - requests whose replies are lost (the connection closed right after sending), then resent:
   each moves its amount exactly once;
 - key rows are Nerva's own: refused as a table, and left out of `/v1/changes`;
-- malformed keys are refused with 400.
+- malformed keys are refused with 400;
+- documents commit under a key too (`/v1/documents/commit`): a put resent answers `replayed` and
+  leaves the document's version, other writes under the key answer `key_reused`, a stale read
+  leaves the key free, and a lost reply resent applies once.
 
 Usage: commit_keys.py <path to nerva> [--seed=N]
 """
@@ -120,10 +123,10 @@ def check_resend_race(ports, rng, threads=30):
     assert lookup(ports[0], 2)["fields"] == {"available": "993", "held": "7"}
 
 
-def send_and_drop(port, body):
+def send_and_drop(port, body, path="/v1/commit"):
     """Sends a request and closes the connection without reading the reply: a lost reply."""
     data = json.dumps(body).encode()
-    head = (f"POST /v1/commit HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Nerva-Key: {KEY}\r\n"
+    head = (f"POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Nerva-Key: {KEY}\r\n"
             f"Content-Type: application/json\r\nContent-Length: {len(data)}\r\n\r\n").encode()
     with socket.create_connection(("127.0.0.1", port), timeout=10) as connection:
         connection.sendall(head + data)
@@ -164,6 +167,72 @@ def check_reserved(port, rng):
     assert lookup(port, 1)["fields"] == {"available": "65", "held": "35"}
 
 
+def documents_commit(port, body, key=None):
+    if key is not None:
+        body = dict(body, key=key)
+    return request(port, "POST", "/v1/documents/commit", body)
+
+
+def document(port, name):
+    status, body = request(port, "POST", "/v1/documents/get",
+                           {"namespace": "9", "keys": [name]})
+    assert status == 200, body
+    return body["documents"][0]
+
+
+def check_documents(ports, rng):
+    port = ports[0]
+    put = {"namespace": "9", "reads": [{"key": "a", "version": "0"}],
+           "writes": [{"key": "a", "value_hex": "0102"}]}
+    key = key_of(rng)
+    status, first = documents_commit(port, put, key)
+    assert status == 200 and plain(first) == {"status": "committed", "op": first["op"]}, first
+    version = document(port, "a")["version"]
+    assert version == first["op"], (version, first)
+    # The same request again, through either gateway: replayed, and the version does not move.
+    for other in ports:
+        status, again = documents_commit(other, put, key)
+        assert status == 200, again
+        assert plain(again) == {"status": "committed", "op": first["op"], "replayed": True}, again
+        assert again["code"] == "NRV-W0201", again
+    assert document(port, "a") == {"key": "a", "exists": True, "version": version,
+                                   "value_hex": "0102"}
+    # The same key for other writes never commits.
+    other = {"namespace": "9", "writes": [{"key": "a", "value_hex": "ff"}]}
+    status, reused = documents_commit(ports[1], other, key)
+    assert status == 409, reused
+    assert plain(reused) == {"status": "key_reused", "op": first["op"]}, reused
+    assert reused["code"] == "NRV-E0207", reused
+    assert document(port, "a")["value_hex"] == "0102"
+    # A stale read leaves its key free.
+    key = key_of(rng)
+    stale = {"namespace": "9", "reads": [{"key": "a", "version": "0"}],
+             "writes": [{"key": "a", "value_hex": "03"}]}
+    status, body = documents_commit(port, stale, key)
+    assert status == 409 and body["status"] == "conflict" and body["key"] == "a", body
+    fresh = dict(stale, reads=[{"key": "a", "version": version}])
+    status, body = documents_commit(port, fresh, key)
+    assert status == 200 and "replayed" not in body, body
+    assert document(port, "a")["value_hex"] == "03"
+    # A lost reply, resent: one application (the second would conflict without the key).
+    for index in range(10):
+        name = f"lost{index}"
+        key = key_of(rng)
+        body = {"namespace": "9", "reads": [{"key": name, "version": "0"}],
+                "writes": [{"key": name, "value_hex": "%02x" % index}]}
+        send_and_drop(ports[index % 2], dict(body, key=key), "/v1/documents/commit")
+        status, again = documents_commit(ports[(index + 1) % 2], body, key)
+        assert status == 200, again
+        found = document(port, name)
+        assert found["exists"] and found["value_hex"] == "%02x" % index, found
+        status, again = documents_commit(port, body, key)
+        assert status == 200 and again.get("replayed") is True, again
+        assert document(port, name)["version"] == found["version"], (found, again)
+    for key in ["0" * 32, "abc", "0" * 34, "g" * 32, 5]:
+        status, body = documents_commit(port, put, key)
+        assert status == 400 and body.get("applied") is False, (key, body)
+
+
 def main():
     nerva = sys.argv[1]
     seed = next((int(a.split("=")[1]) for a in sys.argv[2:] if a.startswith("--seed=")), 1)
@@ -178,7 +247,8 @@ def main():
         check_resend_race(ports, rng)
         check_lost_replies(ports, rng)
         check_reserved(ports[0], rng)
-        print(f"commit_keys: PASSED (resends, a race of 30 resends, 20 lost replies; seed {seed})")
+        check_documents(ports, rng)
+        print(f"commit_keys: PASSED (resends, a race of 30 resends, 20 lost replies, documents; seed {seed})")
     finally:
         cluster.close()
 

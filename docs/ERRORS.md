@@ -97,14 +97,14 @@ These are the replies to `POST /v1/commit`. The identifier is the state machine'
 
 | Code | Summary | Today | Blame | Fix |
 | --- | --- | --- | --- | --- |
-| NRV-W0201 | The key committed earlier; this is its answer | 200 `{"status":"committed","op":…,"replayed":true,"code":"NRV-W0201"}` | — | None: this is the success of a resend |
+| NRV-W0201 | The key committed earlier; this is its answer | 200 `{"status":"committed","op":…,"replayed":true,"code":"NRV-W0201"}` (also on `/v1/documents/commit`) | — | None: this is the success of a resend |
 | NRV-E0202 | A read saw an old version | 409 `conflict`, with `index` and the newer `op` | client | Read again, then decide again |
 | NRV-E0203 | An add would cross its bound | 409 `out_of_bounds`, with `index` and the current `value` | client | Ask for less, or send `clamp` |
 | NRV-E0204 | An add names a row that does not exist | 409 `row_absent` | client | Send `create`, or put the row first |
 | NRV-E0205 | A conserved field changed other than by a pair | 409 `unpaired`, `conserved_write` | client | Move money only as a pair of adds (README, "Ledgers") |
 | NRV-E0206 | An add changes a field a view filters or groups by | 409 `view_key_field` | client | Change that field with a put |
-| NRV-E0207 | The key was used for a different transaction | 409 `key_reused` | client | A key names one transaction. A new transaction needs a new key |
-| NRV-E0208 | Two keys share their 64-bit hash | 409 `key_collision` | client | Choose a new key (about 3 in 10,000 among 10^8 keys) |
+| NRV-E0207 | The key was used for a different transaction | 409 `key_reused` (also on `/v1/documents/commit`) | client | A key names one transaction. A new transaction needs a new key |
+| NRV-E0208 | Two keys share their 64-bit hash | 409 `key_collision` (also on `/v1/documents/commit`) | client | Choose a new key (about 3 in 10,000 among 10^8 keys) |
 | NRV-E0209 | Two record ids share their 64-bit hash | 409 `id_collision` | client | Choose a new record id |
 | NRV-E0210 | A transaction writes one row twice | 400 `a transaction writes a row at most once (adds aside)` | client | Merge the writes |
 | NRV-E0211 | Views have no room in this op | 503 `views_busy` | retry | Resend under the same key |
