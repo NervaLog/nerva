@@ -5,7 +5,7 @@ Runs one replica and one gateway with `--statsd` to this script's UDP listener, 
 request of each kind: commits that answer 200 and 409, a group of waiting commits, 503 busy
 (sixteen connections that have sent bytes and one more), 408 (a drip), and a commit in flight
 when the replica stops (`"unknown"`, then a reconnect). Every counter shows in the listener's
-lines within 25 s of the last event, and `nerva.api.refused{reason:busy}`, summed over windows,
+lines within 15 s of the last event, and `nerva.api.refused{reason:busy}`, summed over windows,
 equals the busy replies the script read. A second gateway whose `--statsd` has nothing listening
 must stay alive through all of it: its refused packets are dropped, never a panic (M1).
 
@@ -81,7 +81,7 @@ class Listener:
         with self.lock:
             return self.gauges.get((name, tuple(sorted(tags.items()))))
 
-    def wait_for(self, what, test, seconds=25):
+    def wait_for(self, what, test, seconds=15):
         deadline = time.monotonic() + seconds
         while time.monotonic() < deadline:
             self.check()
@@ -208,7 +208,7 @@ def main():
         dripper.join()
         assert drip_reply and drip_reply[0].startswith(b"HTTP/1.1 408 "), drip_reply
 
-        # Everything shows within 25 s of the last event (a window is 10 s).
+        # Everything shows within 15 s of the last event (a window is 10 s).
         def counter(name, **tags):
             return lambda: listener.total(name, **tags) >= 1
 

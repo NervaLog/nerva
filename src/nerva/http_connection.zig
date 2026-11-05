@@ -677,7 +677,6 @@ pub const Receiver = struct {
         body: []const u8,
         reason: metrics.RefusalReason,
     ) void {
-        if (receiver.options.counters) |counters| counters.refusal_written(reason, status);
         var message: [512]u8 = undefined;
         assert(body.len <= 256);
         const head = std.fmt.bufPrint(&message, "HTTP/1.1 {d} {s}\r\n" ++
@@ -687,7 +686,12 @@ pub const Receiver = struct {
         @memcpy(message[head.len..][0..body.len], body);
         // One send into a connection that has been sent nothing: it fits the socket's buffer.
         const sent = posix.send(fd, message[0 .. head.len + body.len], send_flags) catch 0;
-        if (sent != head.len + body.len) log.debug("refusal: not written whole ({d} bytes)", .{sent});
+        if (sent == head.len + body.len) {
+            // Counted only if written, as `answer` does.
+            if (receiver.options.counters) |counters| counters.refusal_written(reason, status);
+        } else {
+            log.debug("refusal: not written whole ({d} bytes)", .{sent});
+        }
         posix.shutdown(fd, .send) catch {};
         if (receiver.lingering_count == receiver.options.linger_entries_max) {
             receiver.lingering_dropped += 1;
@@ -1466,6 +1470,37 @@ test "Receiver: a refused client that sends a body still reads its 503, at the l
     past.writeAll(&big) catch {};
     try testing.expectEqual(null, try receiver.next(200));
     try testing.expectEqual(0, receiver.lingering_count);
+}
+
+fn socket_pair() ![2]posix.fd_t {
+    var fds: [2]i32 = undefined;
+    const rc = std.os.linux.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &fds);
+    try testing.expectEqual(@as(usize, 0), rc);
+    return fds;
+}
+
+test "Receiver: a refusal is counted only when it was written whole" {
+    var counters: metrics.Counters = .{};
+    var receiver = try Receiver.init(
+        testing.allocator,
+        try std.net.Address.parseIp("127.0.0.1", 0),
+        .{ .connections_max = 1, .body_size_max = 8, .counters = &counters },
+    );
+    defer receiver.deinit(testing.allocator);
+    const busy = @intFromEnum(metrics.RefusalReason.busy);
+
+    // The sending side is shut: the send fails, so nothing is counted.
+    const shut = try socket_pair();
+    defer posix.close(shut[1]);
+    try posix.shutdown(shut[0], .send);
+    receiver.linger(shut[0], 503, busy_body, .busy);
+    try testing.expectEqual(@as(u64, 0), counters.refused[busy]);
+
+    // An open one is written whole and counted.
+    const open = try socket_pair();
+    defer posix.close(open[1]);
+    receiver.linger(open[0], 503, busy_body, .busy);
+    try testing.expectEqual(@as(u64, 1), counters.refused[busy]);
 }
 
 test "Receiver: a second Receiver on the same port is refused (#112)" {

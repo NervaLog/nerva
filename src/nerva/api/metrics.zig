@@ -977,3 +977,73 @@ test "tick: dropped lines are counted, then reported whole in the next window (S
     try testing.expectEqual(@as(u64, 3), emitter.dropped_reported);
     try testing.expect(emitter.dropped >= emitter.dropped_reported);
 }
+
+/// A sink that only counts lines and remembers the longest.
+const LongestSink = struct {
+    lines: usize = 0,
+    longest: usize = 0,
+
+    fn send(sink: *LongestSink, bytes: []const u8) bool {
+        var split = std.mem.splitScalar(u8, bytes, '\n');
+        while (split.next()) |line| {
+            sink.lines += 1;
+            sink.longest = @max(sink.longest, line.len);
+        }
+        return true;
+    }
+};
+
+test "the longest real line, with tags at tags_size_max, fits line_size_max and drops nothing" {
+    var counters: Counters = .{};
+    var timings = OperationTimings.initFill(.{});
+    // Every route with every status, and every operation, under the longest tags.
+    for (std.enums.values(Route)) |route| {
+        for (0..status_slots) |slot| {
+            counters.requests[@intFromEnum(route)][slot] = std.math.maxInt(u64);
+        }
+        counters.unknown[@intFromEnum(route)] = std.math.maxInt(u64);
+    }
+    for (std.enums.values(nerva.Operation)) |operation| {
+        timings.getPtr(operation).record(1_000_000);
+    }
+    var tags: [tags_size_max]u8 = undefined;
+    @memset(&tags, 't');
+    var sink: LongestSink = .{};
+    const spent = render(&counters, &timings, test_window(true), &tags, &sink);
+    try testing.expectEqual(@as(u64, 0), spent.dropped);
+    try testing.expect(sink.lines > 0);
+    try testing.expect(sink.longest <= line_size_max);
+}
+
+test "a line at line_size_max is kept, one byte past is dropped and counted" {
+    // The line is `nerva.api.<name>:1|c|#t`: size the name to the bound.
+    const base = "nerva.api.:1|c|#t".len;
+    var name: [line_size_max]u8 = undefined;
+    @memset(&name, 'n');
+    var sink: LongestSink = .{};
+    var packet: Packet = .{};
+
+    const fits = name[0 .. line_size_max - base];
+    try testing.expect(packet.series(&sink, fits, "", 1, 'c', "t", &.{}));
+    try testing.expectEqual(@as(u64, 0), packet.dropped);
+    packet.flush(&sink);
+    try testing.expectEqual(@as(usize, line_size_max), sink.longest);
+
+    const past = name[0 .. line_size_max - base + 1];
+    try testing.expect(!packet.series(&sink, past, "", 1, 'c', "t", &.{}));
+    try testing.expectEqual(@as(u64, 1), packet.dropped);
+    // Nothing of the dropped line was added.
+    try testing.expectEqual(@as(usize, 0), packet.len);
+}
+
+test "the longest listen address fits the tags" {
+    const target: stdx.SocketAddress = .{ .ip = .@"127.0.0.1", .port = 9 };
+    var emitter = try Emitter.open(target, std.math.maxInt(u128));
+    defer emitter.deinit();
+    // Eight full groups, the largest port and a scope id: the longest text an address has.
+    var bytes: [16]u8 = undefined;
+    @memset(&bytes, 0xff);
+    emitter.set_listen(std.net.Address.initIp6(bytes, 65535, 0, 0xffffffff));
+    try testing.expect(emitter.tags_len <= tags_size_max);
+    try testing.expect(std.mem.indexOf(u8, emitter.tags[0..emitter.tags_len], ",listen:") != null);
+}
