@@ -38,10 +38,9 @@ pub const Options = struct {
     /// `X-Nerva-Key` must be one of these (`http_connection.key_accepted`).
     keys: http_connection.Keys,
     on_listening: ?*const fn (address: std.net.Address) void = null,
-    /// Where to send metrics as statsd (`--statsd`); none without it.
-    statsd: ?stdx.SocketAddress = null,
-    /// The cluster's id, a tag on every metric.
-    cluster: u128 = 0,
+    /// Where metrics go as statsd (`--statsd`); none without it. Opened by the caller before the
+    /// client registers a session (P176d); the caller closes it.
+    emitter: ?*metrics.Emitter = null,
     /// What `client` counts; the gateway reports it. It is `client.options.tally`, so that it
     /// survives the client being replaced.
     tally: *timings.Tally,
@@ -58,19 +57,7 @@ pub fn serve(gpa: std.mem.Allocator, client: *Client, options: Options) !noretur
     });
     defer receiver.deinit(gpa);
 
-    // Before the gateway says it listens: one that cannot send its metrics does not start (P176b).
-    var emitter: ?metrics.Emitter = null;
-    if (options.statsd) |address| {
-        emitter = metrics.Emitter.init(address, options.cluster, receiver.listen_address()) catch |err|
-            diagnostic.fail(
-                "NRV-E0010",
-                "api: cannot send statsd to {}: {s}",
-                .{ address.to_std(), metrics.init_reason(err) },
-                "give --statsd an address this host can send UDP to, or leave it out",
-                .{},
-            );
-    }
-    defer if (emitter) |*sender| sender.deinit();
+    if (options.emitter) |emitter| emitter.set_listen(receiver.listen_address());
     log.info("listening on {}", .{receiver.listen_address()});
     if (options.on_listening) |on_listening| on_listening(receiver.listen_address());
     var layouts = CatalogStore.init(client);
@@ -91,7 +78,7 @@ pub fn serve(gpa: std.mem.Allocator, client: *Client, options: Options) !noretur
             _ = health.ready(client);
         }
         var wake_ms = health.idle_timeout_ms(-1);
-        if (emitter) |*sender| {
+        if (options.emitter) |sender| {
             sender.tick(&counters, &options.tally.operations, .{
                 .session = health.state == .ready,
                 .reconnects_ok = health.reconnects_ok,
@@ -156,13 +143,14 @@ fn answer(
     reply: api.Reply,
 ) void {
     const route = metrics.route_of(received.request.method == .get, received.request.target);
+    // Counted only if written: a client that went away was not answered.
+    if (!receiver.respond_written(received, reply.status, reply.body)) return;
     counters.replied(route, reply.status, metrics.reply_unknown(reply.status, reply.body));
     if (route != .healthz and reply.status == 503 and
         std.mem.eql(u8, reply.body, cluster_unavailable.body))
     {
         counters.refused_with(.unavailable);
     }
-    receiver.respond(received, reply.status, reply.body);
 }
 
 /// The requests that may be answered with others by one cluster request: a commit or a lookup,

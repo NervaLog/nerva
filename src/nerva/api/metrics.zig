@@ -249,8 +249,10 @@ const Packet = struct {
         var stream = std.io.fixedBufferStream(&scratch);
         const writer = stream.writer();
         const written = write: {
-            writer.print("nerva.api.{s}{s}:{d}|{c}|#{s}", .{ name, suffix, value, kind, tags }) catch
-                break :write false;
+            writer.print(
+                "nerva.api.{s}{s}:{d}|{c}|#{s}",
+                .{ name, suffix, value, kind, tags },
+            ) catch break :write false;
             for (extra) |pair| {
                 writer.print(",{s}:{s}", .{ pair[0], pair[1] }) catch break :write false;
             }
@@ -319,7 +321,9 @@ pub fn render(
     for (std.enums.values(RefusalReason)) |reason| {
         const count = counters.refused[@intFromEnum(reason)];
         if (count == 0) continue;
-        _ = packet.series(sink, "refused", "", count, 'c', tags, &.{.{ "reason", @tagName(reason) }});
+        _ = packet.series(sink, "refused", "", count, 'c', tags, &.{
+            .{ "reason", @tagName(reason) },
+        });
     }
     for (std.enums.values(Route)) |route| {
         const count = counters.unknown[@intFromEnum(route)];
@@ -401,6 +405,7 @@ pub fn init_reason(err: anyerror) []const u8 {
         error.ProcessFdQuotaExceeded,
         error.SystemFdQuotaExceeded,
         => "the host is out of sockets",
+        error.TimerUnsupported => "this host has no monotonic clock",
         else => "the socket could not be set up",
     };
 }
@@ -408,6 +413,9 @@ pub fn init_reason(err: anyerror) []const u8 {
 /// Sends windows over UDP. The socket is non-blocking: a window never waits for the network.
 pub const Emitter = struct {
     socket: posix.socket_t,
+    /// Where the metrics go. Every send names it, so a socket whose `connect` found no route
+    /// still sends (P176d).
+    destination: std.net.Address,
     tags: [tags_size_max]u8,
     tags_len: usize,
     timer: std.time.Timer,
@@ -425,7 +433,11 @@ pub const Emitter = struct {
     dropped: u64 = 0,
     dropped_reported: u64 = 0,
 
-    pub fn init(address: stdx.SocketAddress, cluster: u128, listen: std.net.Address) !Emitter {
+    /// Opens the socket, before the gateway registers a session or listens (P176b). Fails only
+    /// when the socket cannot exist: no such address family, no permission (a broadcast address),
+    /// no descriptors. A route that is merely missing now does not fail it: those packets are
+    /// dropped and counted (P176d). `set_listen` completes the tags.
+    pub fn open(address: stdx.SocketAddress, cluster: u128) !Emitter {
         const address_std = address.to_std();
         const socket = try posix.socket(
             address_std.any.family,
@@ -433,23 +445,35 @@ pub const Emitter = struct {
             posix.IPPROTO.UDP,
         );
         errdefer posix.close(socket);
-        // Connected, so that `send` is a plain write.
-        try posix.connect(socket, &address_std.any, address_std.getOsSockLen());
-
+        // Connecting only checks that the address can be sent to at all.
+        const size = address_std.getOsSockLen();
+        posix.connect(socket, &address_std.any, size) catch |err| switch (err) {
+            error.NetworkUnreachable, error.ConnectionRefused, error.ConnectionTimedOut => {},
+            else => return err,
+        };
         var emitter: Emitter = .{
             .socket = socket,
+            .destination = address_std,
             .tags = undefined,
             .tags_len = 0,
             .timer = try std.time.Timer.start(),
         };
-        const tags = std.fmt.bufPrint(
-            &emitter.tags,
-            "cluster:{x:0>32},listen:{}",
-            .{ cluster, listen },
-        ) catch unreachable; // A 32-digit cluster and an address fit `tags_size_max`.
+        const tags = std.fmt.bufPrint(&emitter.tags, "cluster:{x:0>32}", .{cluster}) catch
+            unreachable; // A 32-digit cluster fits `tags_size_max`.
         emitter.tags_len = tags.len;
         log.info("sending statsd metrics to {}", .{address_std});
         return emitter;
+    }
+
+    /// Adds the address the gateway listens on to the tags. Once.
+    pub fn set_listen(emitter: *Emitter, listen: std.net.Address) void {
+        assert(std.mem.indexOf(u8, emitter.tags[0..emitter.tags_len], ",listen:") == null);
+        const tags = std.fmt.bufPrint(
+            emitter.tags[emitter.tags_len..],
+            ",listen:{}",
+            .{listen},
+        ) catch unreachable; // An address fits `tags_size_max`.
+        emitter.tags_len += tags.len;
     }
 
     pub fn deinit(emitter: *Emitter) void {
@@ -472,6 +496,18 @@ pub const Emitter = struct {
         timings_now: *OperationTimings,
         observed: Observed,
     ) void {
+        var sink: UdpSink = .{ .socket = emitter.socket, .destination = &emitter.destination };
+        emitter.tick_to(counters, timings_now, observed, &sink);
+    }
+
+    /// `tick` into any sink (`fn send(*Sink, []const u8) bool`).
+    fn tick_to(
+        emitter: *Emitter,
+        counters: *Counters,
+        timings_now: *OperationTimings,
+        observed: Observed,
+        sink: anytype,
+    ) void {
         const now = emitter.timer.read();
         if (!window_due(now, emitter.window_start, emitter.interval_ns)) return;
         emitter.window_start = now;
@@ -488,9 +524,8 @@ pub const Emitter = struct {
             .reconnects_failed = observed.reconnects_failed,
             .lingering_dropped = observed.lingering_dropped,
         };
-        var sink: UdpSink = .{ .socket = emitter.socket };
         const tags = emitter.tags[0..emitter.tags_len];
-        const spent = render(counters, timings_now, window, tags, &sink);
+        const spent = render(counters, timings_now, window, tags, sink);
         // The next window starts from the slots in use now, not from none.
         counters.connections_seen(observed.connections);
         // A report that did not leave is made again, with what dropped since.
@@ -501,10 +536,19 @@ pub const Emitter = struct {
 
     const UdpSink = struct {
         socket: posix.socket_t,
+        destination: *const std.net.Address,
 
+        /// Every refusal is a dropped packet: `posix.send` would make a refused or unreachable
+        /// destination `unreachable`, a panic ten seconds after start with no collector (M1).
         fn send(sink: *UdpSink, bytes: []const u8) bool {
             const flags = posix.MSG.DONTWAIT | posix.MSG.NOSIGNAL;
-            const sent = posix.send(sink.socket, bytes, flags) catch return false;
+            const sent = posix.sendto(
+                sink.socket,
+                bytes,
+                flags,
+                &sink.destination.any,
+                sink.destination.getOsSockLen(),
+            ) catch return false;
             return sent == bytes.len;
         }
     };
@@ -521,6 +565,7 @@ const TestSink = struct {
     refuse_from: usize = std.math.maxInt(usize),
 
     fn send(sink: *TestSink, bytes: []const u8) bool {
+        assert(sink.count < packets_max);
         if (sink.count >= sink.refuse_from) {
             sink.count += 1;
             return false;
@@ -577,14 +622,16 @@ test "route_of names a request's route as the API does" {
     try testing.expectEqual(Route.other, route_of(false, ""));
     // Every route of the API's table is found by its own path.
     for (api.routes) |entry| {
-        try testing.expectEqualStrings(@tagName(entry.route), @tagName(route_of(false, entry.path)));
+        const found = route_of(false, entry.path);
+        try testing.expectEqualStrings(@tagName(entry.route), @tagName(found));
     }
 }
 
 test "reply_unknown reads an error reply's applied member" {
-    try testing.expect(reply_unknown(503, "{\"error\":\"cluster unavailable\",\"applied\":\"unknown\"," ++
-        "\"code\":\"NRV-E0601\"}"));
-    try testing.expect(!reply_unknown(503, "{\"error\":\"busy\",\"applied\":false,\"code\":\"NRV-E0602\"}"));
+    try testing.expect(reply_unknown(503, "{\"error\":\"cluster unavailable\"," ++
+        "\"applied\":\"unknown\",\"code\":\"NRV-E0601\"}"));
+    try testing.expect(!reply_unknown(503, "{\"error\":\"busy\",\"applied\":false," ++
+        "\"code\":\"NRV-E0602\"}"));
     // A success never says it, whatever its body holds.
     try testing.expect(!reply_unknown(200, "{\"applied\":\"unknown\"}"));
 }
@@ -612,7 +659,8 @@ test "render: the golden lines of one window" {
     window.lingering_dropped = 2;
 
     var sink: TestSink = .{};
-    try testing.expectEqual(@as(u64, 0), render(&counters, &timings, window, test_tags, &sink).dropped);
+    const spent = render(&counters, &timings, window, test_tags, &sink);
+    try testing.expectEqual(@as(u64, 0), spent.dropped);
     const lines = [_][]const u8{
         "nerva.api.requests:1|c|#" ++ test_tags ++ ",route:lookup,status:503",
         "nerva.api.requests:2|c|#" ++ test_tags ++ ",route:commit,status:200",
@@ -731,7 +779,8 @@ test "an emitter sends a window over UDP and the next window reports what was dr
 
     const target: stdx.SocketAddress = .{ .ip = .@"127.0.0.1", .port = bound.getPort() };
     const listen = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 8080);
-    var emitter = try Emitter.init(target, 42, listen);
+    var emitter = try Emitter.open(target, 42);
+    emitter.set_listen(listen);
     defer emitter.deinit();
     var counters: Counters = .{};
     var timings = OperationTimings.initFill(.{});
@@ -819,7 +868,8 @@ test "a statsd_dropped line that did not leave is reported again" {
     var taken: TestSink = .{};
     const kept = render(&counters, &timings_now, window, test_tags, &taken);
     try testing.expect(!kept.report_lost);
-    try testing.expect(std.mem.indexOf(u8, taken.packet(0), "nerva.api.statsd_dropped:3|c") != null);
+    const report = "nerva.api.statsd_dropped:3|c";
+    try testing.expect(std.mem.indexOf(u8, taken.packet(0), report) != null);
 }
 
 test "connections: a window starts from the slots in use, and a quiet one still reports them" {
@@ -835,10 +885,95 @@ test "connections: a window starts from the slots in use, and a quiet one still 
     try posix.bind(listener, &bound.any, bound_size);
     try posix.getsockname(listener, &bound.any, &bound_size);
     const target: stdx.SocketAddress = .{ .ip = .@"127.0.0.1", .port = bound.getPort() };
-    var emitter = try Emitter.init(target, 42, std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 8080));
+    var emitter = try Emitter.open(target, 42);
+    emitter.set_listen(std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 8080));
     emitter.interval_ns = 0;
     defer emitter.deinit();
     emitter.tick(&counters, &timings_now, observed);
     // Nothing accepted since: the held slots are the next window's least.
     try testing.expectEqual(@as(u32, 5), counters.connections);
+}
+
+/// A UDP port nothing listens on: bound, then closed.
+fn closed_port() !u16 {
+    const socket = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.CLOEXEC, 0);
+    defer posix.close(socket);
+    var bound = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
+    var bound_size = bound.getOsSockLen();
+    try posix.bind(socket, &bound.any, bound_size);
+    try posix.getsockname(socket, &bound.any, &bound_size);
+    return bound.getPort();
+}
+
+test "an emitter whose collector is not listening drops and counts, and never panics (M1)" {
+    const target: stdx.SocketAddress = .{ .ip = .@"127.0.0.1", .port = try closed_port() };
+    var emitter = try Emitter.open(target, 42);
+    emitter.set_listen(std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 8080));
+    emitter.interval_ns = 0;
+    defer emitter.deinit();
+    var counters: Counters = .{};
+    var timings = OperationTimings.initFill(.{});
+    // The first packet leaves; the ICMP error it draws makes the next sends fail with
+    // `ConnectionRefused`, which `posix.send` would have turned into a panic.
+    for (0..5) |_| {
+        counters.replied(.commit, 200, false);
+        emitter.tick(&counters, &timings, test_observed);
+    }
+    try testing.expect(emitter.dropped > 0);
+    // Nothing reached a collector, so no report was marked reported.
+    try testing.expect(emitter.dropped_reported <= emitter.dropped);
+}
+
+test "a socket with no route at open still opens, and its packets are dropped (S2)" {
+    // Port 9 on an address no host route reaches may connect or not, by the host; either way the
+    // emitter exists and ticking it does not panic.
+    const target: stdx.SocketAddress = .{ .ip = stdx.IPAddress.from_v4(.{ 10, 255, 255, 1 }), .port = 9 };
+    var emitter = try Emitter.open(target, 42);
+    emitter.set_listen(std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 8080));
+    emitter.interval_ns = 0;
+    defer emitter.deinit();
+    var counters: Counters = .{};
+    var timings = OperationTimings.initFill(.{});
+    counters.replied(.commit, 200, false);
+    emitter.tick(&counters, &timings, test_observed);
+}
+
+test "tick: dropped lines are counted, then reported whole in the next window (S3)" {
+    var emitter = try Emitter.open(.{ .ip = .@"127.0.0.1", .port = 9 }, 42);
+    emitter.set_listen(std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 8080));
+    emitter.interval_ns = 0;
+    defer emitter.deinit();
+    var counters: Counters = .{};
+    var timings = OperationTimings.initFill(.{});
+
+    // Window 1: the socket refuses everything.
+    counters.replied(.commit, 200, false);
+    var refusing: TestSink = .{ .refuse_from = 0 };
+    emitter.tick_to(&counters, &timings, test_observed, &refusing);
+    // The request line, `session` and `connections`.
+    try testing.expectEqual(@as(u64, 3), emitter.dropped);
+    try testing.expectEqual(@as(u64, 0), emitter.dropped_reported);
+
+    // Window 2: the socket takes it. The report carries window 1's whole count, and is marked
+    // reported.
+    var taking: TestSink = .{};
+    emitter.tick_to(&counters, &timings, test_observed, &taking);
+    try testing.expectEqual(@as(u64, 3), emitter.dropped);
+    try testing.expectEqual(@as(u64, 3), emitter.dropped_reported);
+    var found = false;
+    for (0..taking.count) |index| {
+        found = found or std.mem.indexOf(
+            u8,
+            taking.packet(index),
+            "nerva.api.statsd_dropped:3|c",
+        ) != null;
+    }
+    try testing.expect(found);
+
+    // Window 3: refused again, report included. Window 2's lines dropped as well; the report is
+    // not marked until a packet carrying it leaves.
+    var refusing_again: TestSink = .{ .refuse_from = 0 };
+    emitter.tick_to(&counters, &timings, test_observed, &refusing_again);
+    try testing.expectEqual(@as(u64, 3), emitter.dropped_reported);
+    try testing.expect(emitter.dropped >= emitter.dropped_reported);
 }

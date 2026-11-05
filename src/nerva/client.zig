@@ -597,6 +597,7 @@ pub const Client = struct {
     /// Like `vsr.Client.request`, but the header carries the previous round trip.
     fn send(client: *Client, operation: Operation, events: []const u8) void {
         assert(client.state == .waiting);
+        assert(client.sending == null);
         assert(events.len % operation.event_size() == 0);
         assert(events.len <= client.vsr_client.batch_size_limit.?);
 
@@ -637,7 +638,8 @@ pub const Client = struct {
         defer if (client.sending) |operation| {
             // A reply, an eviction or a timeout ends a round trip.
             if (client.options.tally) |tally| {
-                tally.operations.getPtr(operation).record(start.elapsed(client.time_os.monotonic()).ns);
+                const elapsed = start.elapsed(client.time_os.monotonic());
+                tally.operations.getPtr(operation).record(elapsed.ns);
             }
             client.sending = null;
         };

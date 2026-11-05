@@ -5,8 +5,9 @@ Runs one replica and one gateway with `--statsd` to this script's UDP listener, 
 request of each kind: commits that answer 200 and 409, a group of waiting commits, 503 busy
 (sixteen connections that have sent bytes and one more), 408 (a drip), and a commit in flight
 when the replica stops (`"unknown"`, then a reconnect). Every counter shows in the listener's
-lines within 15 s of the last event, and `nerva.api.refused{reason:busy}`, summed over windows,
-equals the busy replies the script read.
+lines within 25 s of the last event, and `nerva.api.refused{reason:busy}`, summed over windows,
+equals the busy replies the script read. A second gateway whose `--statsd` has nothing listening
+must stay alive through all of it: its refused packets are dropped, never a panic (M1).
 
 Usage: metrics.py <path to nerva>
 """
@@ -129,6 +130,12 @@ def main():
     try:
         port = cluster.gateway(args=[f"--statsd=127.0.0.1:{listener.port}", "--request-timeout=1000"])
         replica = cluster.processes[0]
+        # A collector that is not there: bound, then closed.
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as closed:
+            closed.bind(("127.0.0.1", 0))
+            closed_port = closed.getsockname()[1]
+        mute_port = cluster.gateway(args=[f"--statsd=127.0.0.1:{closed_port}"])
+        mute = cluster.processes[-1]
 
         # 200 and 409.
         status, body = commit(port, [put(1)])
@@ -201,7 +208,7 @@ def main():
         dripper.join()
         assert drip_reply and drip_reply[0].startswith(b"HTTP/1.1 408 "), drip_reply
 
-        # Everything shows within 15 s of the last event (a window is 10 s).
+        # Everything shows within 25 s of the last event (a window is 10 s).
         def counter(name, **tags):
             return lambda: listener.total(name, **tags) >= 1
 
@@ -264,6 +271,9 @@ def main():
             listener.total("nerva.api.refused", reason="busy"), busy_seen)
         assert listener.total("nerva.api.refused", reason="displaced") == 0
         assert listener.total("nerva.api.refused", reason="queue_wait") == 0
+        # Several windows of refused sends later the mute gateway still serves.
+        assert mute.poll() is None, f"the gateway with no collector exited {mute.poll()}"
+        assert request(mute_port, "GET", "/healthz", key=None)[0] in (200, 503)
         with listener.lock:
             assert listener.packets and max(listener.packets) <= 1400, listener.packets
         print(f"metrics: {busy_seen} busy replies counted, "

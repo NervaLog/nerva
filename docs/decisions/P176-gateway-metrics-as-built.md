@@ -11,7 +11,8 @@ amends: P168e
 
 - Counters are deltas per 10 s window. A series with no events in a window is not sent. The two
   gauges are always sent: `session` (1 if ready at the end of the window) and `connections` (the
-  window's maximum number of slots in use, sampled at accept).
+  window's maximum number of slots in use, sampled at accept; a window starts from the slots in use
+  now, not from none).
 - `requests` counts every reply written. Refusals the Receiver writes itself count under
   `route:other`. `refused{reason:unavailable}` counts the E0605 reply to a request, never `/healthz`.
 - `group_size` is recorded once per loop turn that reached the cluster: 1 for a single request,

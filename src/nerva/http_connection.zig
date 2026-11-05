@@ -505,10 +505,21 @@ pub const Receiver = struct {
 
     /// Writes the reply to a request handed out by `next`, then closes its connection.
     pub fn respond(receiver: *Receiver, received: Received, status: u16, body: []const u8) void {
+        _ = receiver.respond_written(received, status, body);
+    }
+
+    /// Like `respond`; true if the whole reply was written (the peer may still not read it).
+    pub fn respond_written(
+        receiver: *Receiver,
+        received: Received,
+        status: u16,
+        body: []const u8,
+    ) bool {
         const slot = &receiver.slots[received.slot];
         assert(slot.state == .serving);
-        receiver.reply(slot, status, body);
+        const written = receiver.reply(slot, status, body);
         receiver.close(slot);
+        return written;
     }
 
     /// Accepts one waiting connection, non-blocking; null if none is, or it was lost.
@@ -718,7 +729,7 @@ pub const Receiver = struct {
         receiver.lingering[index] = receiver.lingering[receiver.lingering_count];
     }
 
-    fn reply(receiver: *Receiver, slot: *Slot, status: u16, body: []const u8) void {
+    fn reply(receiver: *Receiver, slot: *Slot, status: u16, body: []const u8) bool {
         assert(slot.state != .free);
         var head_buffer: [256]u8 = undefined;
         const head = std.fmt.bufPrint(&head_buffer, "HTTP/1.1 {d} {s}\r\n" ++
@@ -730,10 +741,15 @@ pub const Receiver = struct {
             body.len,
         }) catch unreachable;
         const deadline = receiver.timer.read() + receiver.options.deadline_ns;
-        receiver.write_all(slot.fd, head, deadline) catch |err|
-            return log.debug("reply: {}", .{err});
-        receiver.write_all(slot.fd, body, deadline) catch |err|
-            return log.debug("reply: {}", .{err});
+        receiver.write_all(slot.fd, head, deadline) catch |err| {
+            log.debug("reply: {}", .{err});
+            return false;
+        };
+        receiver.write_all(slot.fd, body, deadline) catch |err| {
+            log.debug("reply: {}", .{err});
+            return false;
+        };
+        return true;
     }
 
     /// Writes all of `bytes` to a non-blocking socket by `deadline` (a `timer` reading).

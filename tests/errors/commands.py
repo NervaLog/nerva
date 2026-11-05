@@ -20,6 +20,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "api"))
 from api import Cluster  # noqa: E402
@@ -206,6 +207,15 @@ def main():
                 seen.append("NRV-E0010")
                 assert result.stdout == "", (statsd, result.stdout)
                 assert "listening on" not in result.stderr, (statsd, result.stderr[-1000:])
+            # The check comes before the client registers: with the cluster unreachable a bad
+            # `--statsd` still exits at once with E0010, not after a 30 s registration (P176d).
+            started = time.monotonic()
+            result = run(nerva, ["api", "--cluster=0", "--addresses=127.0.0.1:1",
+                                 "--listen=127.0.0.1:0", "--statsd=255.255.255.255:8125"],
+                         {"NERVA_KEY": KEY}, timeout=20)
+            expect(result, "NRV-E0010", 1, "cannot send statsd to", "statsd bad, cluster down")
+            seen.append("NRV-E0010")
+            assert time.monotonic() - started < 10, "E0010 waited for the cluster"
         finally:
             cluster.close()
 
