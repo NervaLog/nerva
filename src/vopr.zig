@@ -885,6 +885,10 @@ pub const Simulator = struct {
 
     pub fn cluster_recoverable(simulator: *Simulator, gpa: std.mem.Allocator) !bool {
         if (simulator.core_missing_primary()) {
+            // Nerva: name the scenario, so a run that stops here can be told apart (P171).
+            log.info("liveness: the core is replicas {b} and the primary is outside it", .{
+                simulator.core.bits,
+            });
             unimplemented("repair requires reachable primary");
         } else if (simulator.core_missing_quorum()) {
             log.warn("no liveness, core replicas cannot view-change", .{});
@@ -1740,6 +1744,9 @@ fn unimplemented(comptime message: []const u8) noreturn {
     const full_message = "unimplemented: " ++ message;
     log.info(full_message, .{});
     log.info("not crashing in VOPR", .{});
+    // Nerva: exit 0 skips the end-of-run summary, so say what this run did not check (P171).
+    // Safety was checked on every tick up to here; only liveness was not.
+    log.info("LIVENESS NOT CHECKED (" ++ full_message ++ ") unimplemented=true", .{});
     std.process.exit(0);
 }
 
