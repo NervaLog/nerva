@@ -541,9 +541,9 @@ fn listen_resolve(comptime command: []const u8, text: []const u8, remote: bool) 
     return address;
 }
 
-/// Plain loopback: 127.0.0.0/8 or ::1. `0.0.0.0` and `[::]` serve every interface, and
-/// `::ffff:127.0.0.1` is IPv4-mapped (dual-stack), so none of them is loopback.
-fn listen_is_loopback(address: std.net.Address) bool {
+/// Plain loopback: 127.0.0.0/8 or ::1. `0.0.0.0` and `[::]` serve every interface; an IPv4-mapped
+/// address such as `::ffff:127.0.0.1` is not plain loopback and is refused too (write `127.0.0.1`).
+pub fn listen_is_loopback(address: std.net.Address) bool {
     switch (address.any.family) {
         std.posix.AF.INET => return @as([4]u8, @bitCast(address.in.sa.addr))[0] == 127,
         std.posix.AF.INET6 => return std.mem.eql(u8, &address.in6.sa.addr, &loopback_ipv6),
@@ -554,11 +554,14 @@ fn listen_is_loopback(address: std.net.Address) bool {
 const loopback_ipv6 = [_]u8{0} ** 15 ++ [_]u8{1};
 
 test listen_is_loopback {
-    const accepted = [_][]const u8{ "127.0.0.1:0", "127.255.255.254:80", "[::1]:8080" };
+    const accepted = [_][]const u8{
+        "127.0.0.1:0",       "127.255.255.254:80",  "[::1]:8080", "127.0.0.0:1",
+        "127.255.255.255:1", "[0:0:0:0:0:0:0:1]:1", "[::0:1]:1",
+    };
     for (accepted) |text| try std.testing.expect(listen_is_loopback(listen_parse(text).?));
     const refused = [_][]const u8{
         "0.0.0.0:0",   "[::]:8080", "10.0.0.1:80", "[::ffff:127.0.0.1]:80", "126.255.255.255:1",
-        "128.0.0.1:1", "[::2]:1",
+        "128.0.0.1:1", "[::2]:1",   "128.0.0.0:1",
     };
     for (refused) |text| try std.testing.expect(!listen_is_loopback(listen_parse(text).?));
 }

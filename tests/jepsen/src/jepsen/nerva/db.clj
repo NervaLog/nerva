@@ -119,7 +119,8 @@
                 :--development data-file)
         (start-replica! test)
         (start-api! test))
-      (http/await-healthy! node healthy-timeout-s)
+      (doseq [index (range (gateways test))]
+        (http/await-healthy! node (gateway-port index) healthy-timeout-s))
       (jepsen/synchronize test)
       (when (= node (jepsen/primary test))
         (info "Bootstrapping the workload through" node)
