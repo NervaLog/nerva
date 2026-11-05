@@ -44,6 +44,7 @@ comptime {
     _ = @import("nerva/latency_histogram.zig");
     _ = @import("nerva/ledgers.zig");
     _ = @import("nerva/peer_auth.zig");
+    _ = @import("nerva/recover.zig");
     _ = @import("nerva/release_peers.zig");
     _ = @import("nerva/state_machine_tests.zig");
     _ = @import("nerva/trace_file.zig");

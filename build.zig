@@ -323,6 +323,15 @@ pub fn build(b: *std.Build) !void {
     run_errors_test.step.dependOn(&run_integration_tests.step);
     steps.test_integration.dependOn(&run_errors_test.step);
 
+    // `nerva recover` on three real replicas (R5): after the integration tests, which run a
+    // cluster of their own.
+    const run_recover_test = b.addSystemCommand(&.{ "python3", "tests/recover/recover.py" });
+    run_recover_test.addFileArg(nerva.getEmittedBin());
+    run_recover_test.setCwd(b.path("."));
+    run_recover_test.has_side_effects = true;
+    run_recover_test.step.dependOn(&run_integration_tests.step);
+    steps.test_integration.dependOn(&run_recover_test.step);
+
     // zig build test:api: the JSON API, its documents, adds, commit keys (P123), records and
     // indexes (P123b, P123c), then layouts kept between requests (P135), then ledgers, against
     // models, then a cluster and gateway over IPv6 (skipped without it), a gateway given an

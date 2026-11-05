@@ -1,4 +1,5 @@
-//! The `nerva` binary: `format`, `start`, `view`, `api`, `export`, `import` and `version`.
+//! The `nerva` binary: `format`, `start`, `view`, `api`, `export`, `import`, `recover` and
+//! `version`.
 //!
 //! Trimmed from TigerBeetle's `src/tigerbeetle/main.zig`: no REPL, benchmark, inspection, AOF or
 //! upgrades between releases (every replica runs the single bundled release).
@@ -19,6 +20,7 @@ const http_connection = @import("nerva/http_connection.zig");
 const export_file = @import("nerva/export_file.zig");
 const export_ = @import("nerva/export.zig");
 const import_ = @import("nerva/import.zig");
+const recover = @import("nerva/recover.zig");
 const release_peers = @import("nerva/release_peers.zig");
 const peer_auth = @import("nerva/peer_auth.zig");
 
@@ -191,6 +193,18 @@ fn run() !void {
                 diagnostic.fail_file(args.path, err);
             };
         },
+        .recover => |*args| {
+            log_level_runtime = if (args.log_debug) .debug else .info;
+            recover.run(gpa, .{
+                .cluster = args.cluster,
+                .replica = args.replica,
+                .replica_count = args.replica_count,
+                .addresses = args.addresses.slice(),
+                .origin = args.origin,
+                .development = args.development,
+                .path = args.path,
+            });
+        },
         inline .format, .start => |*args, tag| {
             log_level_set(args.log_debug);
 
@@ -263,7 +277,7 @@ fn run() !void {
             switch (tag) {
                 .format => try command_format(gpa, &storage, args),
                 .start => try command_start(gpa, &io, time, &tracer, &storage, args),
-                .version, .view, .api, .@"export", .import => comptime unreachable,
+                .version, .view, .api, .@"export", .import, .recover => comptime unreachable,
             }
         },
     }
