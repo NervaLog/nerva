@@ -86,6 +86,7 @@ a one-line summary, who is to blame, the cause and a fix. Codes are never reused
 | NRV-E0113 | The request needs more memory than one request may use | 413 `request too complex` (128 MiB, N69) | client | Fewer or smaller entries |
 | NRV-E0114 | A field needs a layout, or names no field of it | 400 `fields need a layout for the table (PUT /v1/tables/<t>)`, `no such field`, `an add's field must be u64 or i64` | client | Declare the layout first |
 | NRV-E0115 | A field value does not fit its type | 400 `a bool field takes true or false`, `a bytes field takes at most its size in hex`, `a number is out of range` and the rest (catalog.zig) | client | As the message says |
+| NRV-E0116 | The request did not arrive whole within 10 s | Not yet emitted: today the connection closes with no reply (http_connection.zig:552-561). R4 answers `408` with `"applied": false` (docs/briefs/r4.md) | client | Send the whole request at once; nothing was applied |
 
 ## 02xx · Commit results
 
@@ -156,6 +157,7 @@ These are the replies to `POST /v1/commit`. The identifier is the state machine'
 | NRV-E0602 | The gateway closed a request it could not take | Today the connection closes with no reply, or a 503 like NRV-E0601 (#120) | retry | R4 makes this `"applied": false` |
 | NRV-E0603 | A client's session was evicted by a newer one | Zig client `error.Evicted`; behind the gateway, NRV-E0601 | retry | Fewer clients than 64 sessions |
 | NRV-E0604 | A gateway or view server could not reach the cluster | `error[NRV-E0604]: api: no reply from the cluster` after the client's 30 s registration timeout, exit 1 (R5 slice 1) | operator | Check `--cluster` and `--addresses`, and that a quorum of replicas is running |
+| NRV-E0605 | The gateway has no cluster session now; the request was not sent | Not yet emitted: today the same `503 cluster unavailable` as NRV-E0601 (server.zig:193). R4 answers it with `"applied": false` (docs/briefs/r4.md) | retry | Resend: nothing was applied. The gateway reconnects on its own, at most every 5 s |
 
 ## 07xx · Replicas and data files
 
