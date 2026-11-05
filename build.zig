@@ -412,6 +412,7 @@ pub fn build(b: *std.Build) !void {
         .{ "upgrade.py", "" },
         .{ "upgrade.py", "--records" },
         .{ "origins.py", "" },
+        .{ "recover.py", "" },
     }) |release_test| {
         const script = release_test[0];
         const run_release_test = b.addSystemCommand(&.{
