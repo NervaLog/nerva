@@ -3739,9 +3739,10 @@ pub fn ReplicaType(
                 origin_self,
                 &self.peer_origins,
             )) {
-                vsr.fatal(.origin_mismatch, "{}: this replica was imported from export {s}, but " ++
-                    "{} of the cluster's {} replicas announce another: it can never reach a " ++
-                    "quorum. Import every replica from the same export: import this one again " ++
+                vsr.fatal(.origin_mismatch, "{}: NRV-E0711: this replica was imported from export {s}, " ++
+                    "but {} of the cluster's {} replicas announce another: it can never reach " ++
+                    "a quorum. Import every replica from the same export: import this one " ++
+                    "again, or nerva recover it with --origin= the export its peers announce " ++
                     "(replica {} announces {s})", .{
                     self.log_prefix(),
                     release_peers.origin_name(origin_self),

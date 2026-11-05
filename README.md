@@ -260,8 +260,8 @@ nerva start --addresses=3001,3002,3003 0_0.nerva   # and 0_1, 0_2
 - **Every replica from one export** (P90). An export is named by its SHA-256 (`export` prints
   it; `import` and `start` log it), and every data file records the export it was imported from
   (none, for `nerva format`). Replicas handle a peer only once it has announced their export. A
-  replica whose peers of other exports leave it no quorum exits with status 8, naming both
-  exports, and nothing from them reaches its data file: import it again from the cluster's
+  replica whose peers of other exports leave it no quorum exits with status 8 (`NRV-E0711`), naming
+  both exports, and nothing from them reaches its data file: import it again from the cluster's
   export. The others log that they ignore it and run on. A replica imported from the cluster's
   export that has not started yet may start later and catch up.
 - **Replacing a lost replica** of a cluster that was formatted, with the cluster open: stop the
@@ -274,11 +274,13 @@ nerva start --addresses=3001,3002,3003 0_0.nerva   # and 0_1, 0_2
   written as `<path>.recovering` and renamed once complete. It needs at least three replicas,
   refuses with `NRV-E0713` while anything answers at the replica's address, with `NRV-E0712` when
   the others have no quorum, and recovers one replica at a time, each caught up before the next.
-  Recovering a cluster that was imported (`--origin=<export>`) is not yet tested (R5): export
-  the cluster and import every replica again (the cluster is closed meanwhile). Importing only
-  the lost one is not safe: its replacement forgets the prepares the lost replica acknowledged,
-  and with one more failure a committed op could be lost (P90). A formatted replica cannot join
-  an imported cluster either: its origin is none.
+  A cluster that was imported is recovered the same way with `--origin=<export>`, the SHA-256 that
+  `nerva export` prints and `nerva import` and `nerva start` log: the new data file records that
+  export, so its peers handle it (P90). `--origin` has no default. With the wrong one the
+  replica exits with status 8 and `NRV-E0711` when it starts, naming the export its peers
+  announce, and they ignore it and run on; recover it again with the right one. Importing only
+  the lost replica instead is not safe: its replacement forgets the prepares the lost replica
+  acknowledged, and with one more failure a committed op could be lost (P90).
 - A view declared only through the Zig client, with no catalog document, cannot be imported:
   `import` refuses it. Declare views through `nerva api`.
 - **Format versions.** An export of a cluster with records or indexes is version 2 (P123b);
