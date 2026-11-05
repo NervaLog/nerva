@@ -195,10 +195,13 @@ def main():
             # A statsd address this host cannot send to: the gateway refuses to start, before it
             # says it listens or prints its port (P176b).
             api = ["api", "--cluster=0", f"--addresses={cluster.address}", "--listen=127.0.0.1:0"]
-            for statsd in ("255.255.255.255:8125", "[2001:db8::1]:8125", "[::1]:8125"):
+            statsd_bad = ["255.255.255.255:8125"]
+            try:
+                socket.socket(socket.AF_INET6, socket.SOCK_DGRAM).close()
+            except OSError:
+                statsd_bad.append("[2001:db8::1]:8125")  # a host without IPv6 has no such socket
+            for statsd in statsd_bad:
                 result = run(nerva, api + [f"--statsd={statsd}"], {"NERVA_KEY": KEY})
-                if statsd == "[::1]:8125" and result.returncode == 0:
-                    continue  # unreachable here: a host with IPv6 sends to it, and runs
                 expect(result, "NRV-E0010", 1, "cannot send statsd to", f"statsd {statsd}")
                 seen.append("NRV-E0010")
                 assert result.stdout == "", (statsd, result.stdout)

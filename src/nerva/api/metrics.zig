@@ -448,7 +448,7 @@ pub const Emitter = struct {
             .{ cluster, listen },
         ) catch unreachable; // A 32-digit cluster and an address fit `tags_size_max`.
         emitter.tags_len = tags.len;
-        log.info("sending statsd metrics to {}", .{address});
+        log.info("sending statsd metrics to {}", .{address_std});
         return emitter;
     }
 

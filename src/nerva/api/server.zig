@@ -65,7 +65,7 @@ pub fn serve(gpa: std.mem.Allocator, client: *Client, options: Options) !noretur
             diagnostic.fail(
                 "NRV-E0010",
                 "api: cannot send statsd to {}: {s}",
-                .{ address, metrics.init_reason(err) },
+                .{ address.to_std(), metrics.init_reason(err) },
                 "give --statsd an address this host can send UDP to, or leave it out",
                 .{},
             );
