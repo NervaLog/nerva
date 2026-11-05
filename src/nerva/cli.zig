@@ -82,6 +82,27 @@ const CLIArgs = union(enum) {
         path: []const u8,
     },
 
+    backup: struct {
+        cluster: u128,
+        addresses: vsr.ClusterAddress,
+        as_of: []const u8 = "latest",
+        output: []const u8,
+        log_debug: bool = false,
+    },
+
+    restore: struct {
+        cluster: u128,
+        replica: u8,
+        replica_count: u8,
+        input: []const u8,
+        manifest: []const u8,
+        development: bool = false,
+        log_debug: bool = false,
+
+        @"--": void,
+        path: []const u8,
+    },
+
     recover: struct {
         cluster: u128,
         replica: u8,
@@ -124,6 +145,12 @@ const CLIArgs = union(enum) {
         \\  nerva import --cluster=<integer> --replica=<index> --replica-count=<integer>
         \\               --input=<path> [--development] [--log-debug] <path>
         \\
+        \\  nerva backup --cluster=<integer> --addresses=<addresses> [--as-of=<op>|latest]
+        \\               --output=<path> [--log-debug]
+        \\
+        \\  nerva restore --cluster=<integer> --replica=<index> --replica-count=<integer>
+        \\                --input=<path> --manifest=<path> [--development] [--log-debug] <path>
+        \\
         \\  nerva recover --cluster=<integer> --replica=<index> --replica-count=<integer>
         \\               --addresses=<addresses> --origin=<sha256>|none
         \\               [--development] [--log-debug] <path>
@@ -153,6 +180,15 @@ const CLIArgs = union(enum) {
         \\  import   Create a replica's data file at <path> from an export: run once per
         \\           replica, on the same export, then start the replicas. Fails, and
         \\           removes <path>, if the export is damaged or the checks do not match.
+        \\
+        \\  backup   Write an export of the cluster to --output, check it as `import` would, and
+        \\           write <output>.manifest.json beside it: the op, the SHA-256 and size of
+        \\           the export, and every view's hash and ledger's total. Prints the SHA-256.
+        \\           Neither file is overwritten.
+        \\
+        \\  restore  Create a replica's data file at <path> from a backup, as `import`, after
+        \\           checking the backup against its manifest: run once per replica, on the
+        \\           same backup. --cluster may differ from the backup's (a restore drill).
         \\
         \\  recover  Create the data file of a replica whose disk is gone, at <path>, as a
         \\           replica of the running cluster, then exit: run nerva start on it. Stop
@@ -214,7 +250,10 @@ const CLIArgs = union(enum) {
         \\        replica recovered with the wrong one exits with status 8 when it starts.
         \\
         \\  --output=<path>, --input=<path>
-        \\        The export file. `export` refuses an existing file.
+        \\        The export file. `export` and `backup` refuse an existing file.
+        \\
+        \\  --manifest=<path>
+        \\        The manifest `backup` wrote beside the backup (<output>.manifest.json).
         \\
         \\  --listen=<host:port>
         \\        Where to serve HTTP: <ipv4>:<port>, or [<ipv6>]:<port>. The bound port is printed
@@ -236,6 +275,8 @@ pub const Command = union(enum) {
     api: Api,
     @"export": Export,
     import: Import,
+    backup: Backup,
+    restore: Restore,
     recover: Recover,
     version,
 
@@ -246,6 +287,14 @@ pub const Command = union(enum) {
         as_of: ?u64,
         output: []const u8,
         log_debug: bool,
+    };
+
+    pub const Backup = Export;
+
+    /// `import`, with the backup's manifest checked first.
+    pub const Restore = struct {
+        import: Import,
+        manifest: []const u8,
     };
 
     pub const Import = struct {
@@ -348,57 +397,79 @@ pub fn parse_args(flags: *stdx.Flags) Command {
                 listen_invalid("api"),
             .log_debug = api.log_debug,
         } },
-        .@"export" => |args| .{ .@"export" = .{
-            .cluster = args.cluster,
-            .addresses = args.addresses,
-            .as_of = as_of_parse(args.as_of) catch
+        .@"export" => |args| .{ .@"export" = export_resolve("export", args) },
+        .backup => |args| .{ .backup = export_resolve("backup", args) },
+        .import => |args| .{ .import = import_resolve("import", args) },
+        .restore => |args| .{ .restore = .{
+            .import = import_resolve("restore", args),
+            .manifest = if (args.manifest.len == 0)
                 diag.fail(
                     "NRV-E0001",
-                    "export: --as-of must be an op above zero, or latest",
+                    "restore: --manifest must name a file",
                     .{},
-                    "give --as-of=latest or an op above zero",
-                    .{},
-                ),
-            .output = if (args.output.len == 0)
-                diag.fail(
-                    "NRV-E0001",
-                    "export: --output must name a file",
-                    .{},
-                    "give --output=<path> for a file that does not exist yet",
+                    "give --manifest=<path> of the .manifest.json that nerva backup wrote",
                     .{},
                 )
             else
-                args.output,
-            .log_debug = args.log_debug,
+                args.manifest,
         } },
-        .import => |args| import: {
-            const format = format_validate(.{
-                .cluster = args.cluster,
-                .replica = args.replica,
-                .replica_count = args.replica_count,
-                .development = args.development,
-                .log_debug = args.log_debug,
-                .path = args.path,
-            }) catch |err| flag_range("import", err);
-            if (args.input.len == 0) diag.fail(
-                "NRV-E0001",
-                "import: --input must name a file",
-                .{},
-                "give --input=<path> of an export made by nerva export",
-                .{},
-            );
-            break :import .{ .import = .{
-                .cluster = format.cluster,
-                .replica = format.replica,
-                .replica_count = format.replica_count,
-                .input = args.input,
-                .development = format.development,
-                .log_debug = format.log_debug,
-                .path = format.path,
-            } };
-        },
         .recover => |args| .{ .recover = recover_resolve(args) },
         .version => .version,
+    };
+}
+
+/// `export`'s and `backup`'s flags, checked before anything runs.
+fn export_resolve(comptime command: []const u8, args: anytype) Command.Export {
+    return .{
+        .cluster = args.cluster,
+        .addresses = args.addresses,
+        .as_of = as_of_parse(args.as_of) catch
+            diag.fail(
+                "NRV-E0001",
+                command ++ ": --as-of must be an op above zero, or latest",
+                .{},
+                "give --as-of=latest or an op above zero",
+                .{},
+            ),
+        .output = if (args.output.len == 0)
+            diag.fail(
+                "NRV-E0001",
+                command ++ ": --output must name a file",
+                .{},
+                "give --output=<path> for a file that does not exist yet",
+                .{},
+            )
+        else
+            args.output,
+        .log_debug = args.log_debug,
+    };
+}
+
+/// `import`'s and `restore`'s flags, checked before anything runs.
+fn import_resolve(comptime command: []const u8, args: anytype) Command.Import {
+    const format = format_validate(.{
+        .cluster = args.cluster,
+        .replica = args.replica,
+        .replica_count = args.replica_count,
+        .development = args.development,
+        .log_debug = args.log_debug,
+        .path = args.path,
+    }) catch |err| flag_range(command, err);
+    if (args.input.len == 0) diag.fail(
+        "NRV-E0001",
+        command ++ ": --input must name a file",
+        .{},
+        "give --input=<path> of an export made by nerva export",
+        .{},
+    );
+    return .{
+        .cluster = format.cluster,
+        .replica = format.replica,
+        .replica_count = format.replica_count,
+        .input = args.input,
+        .development = format.development,
+        .log_debug = format.log_debug,
+        .path = format.path,
     };
 }
 
