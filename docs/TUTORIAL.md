@@ -1550,7 +1550,7 @@ nerva start  --addresses=<a0,a1,…> [--development] [--cache-grid=…] [--cache
              [--commit-stall-probability=<n>/<d>] <file>
 NERVA_KEY=… [NERVA_KEY_NEXT=…] nerva api  --cluster=<id> --addresses=<…> --listen=<host:port>
 NERVA_KEY=… [NERVA_KEY_NEXT=…] nerva view --cluster=<id> --addresses=<…> --listen=<host:port>
-                                          # --listen=[::]:8080 for IPv6
+                                          # --listen=[::1]:8080 for IPv6; loopback unless --listen-remote
 nerva export --cluster=<id> --addresses=<…> [--as-of=<op>] --output=<new file>
 nerva import --cluster=<id> --replica=<i> --replica-count=<n> --input=<export> [--development] <file>
 ```

@@ -812,8 +812,18 @@ fn cluster_keys(args: *const cli.Command.Start) peer_auth.Keys {
     };
 }
 
+/// `--listen-remote` on an address that is not loopback: once, before listening (NRV-W0010;
+/// README, "Network"). On a loopback address nothing crosses the network, so nothing is said.
+fn listen_remote_warn(comptime command: []const u8, args: anytype) void {
+    if (!args.listen_remote or cli.listen_is_loopback(args.listen)) return;
+    log.warn("NRV-W0010 " ++ command ++ ": --listen-remote serves plain HTTP: the key and every " ++
+        "reply cross the network unencrypted; put TLS in front, or use a loopback address " ++
+        "beside the client", .{});
+}
+
 fn command_view(gpa: std.mem.Allocator, args: *const cli.Command.View) !void {
     const keys = gateway_keys("view");
+    listen_remote_warn("view", args);
 
     var client: Client = undefined;
     try client.init(gpa, .{
@@ -832,6 +842,7 @@ fn command_view(gpa: std.mem.Allocator, args: *const cli.Command.View) !void {
 
 fn command_api(gpa: std.mem.Allocator, args: *const cli.Command.Api) !void {
     const keys = gateway_keys("api");
+    listen_remote_warn("api", args);
 
     var client: Client = undefined;
     try client.init(gpa, .{

@@ -100,6 +100,10 @@
    [nil "--recovery-time SECONDS" "Seconds between healing and the final reads."
     :default  20
     :parse-fn parse-long]
+   [nil "--gateways N" "Gateways per node: 1, or 2 (ports 8080 and 8081), as R4's sidecars."
+    :default  1
+    :parse-fn parse-long
+    :validate [#{1 2} "Must be 1 or 2"]]
    [nil "--nerva-binary PATH" "The nerva binary to install on every node."
     :default "../../zig-out/bin/nerva"]])
 

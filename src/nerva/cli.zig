@@ -52,6 +52,7 @@ const CLIArgs = union(enum) {
         cluster: u128,
         addresses: vsr.ClusterAddress,
         listen: []const u8,
+        listen_remote: bool = false,
         request_timeout: u32 = request_timeout_default_ms,
         log_debug: bool = false,
     },
@@ -60,6 +61,7 @@ const CLIArgs = union(enum) {
         cluster: u128,
         addresses: vsr.ClusterAddress,
         listen: []const u8,
+        listen_remote: bool = false,
         request_timeout: u32 = request_timeout_default_ms,
         log_debug: bool = false,
     },
@@ -136,10 +138,10 @@ const CLIArgs = union(enum) {
         \\              [--development] [--log-debug] <path>
         \\
         \\  nerva view --cluster=<integer> --addresses=<addresses> --listen=<host:port>
-        \\             [--request-timeout=<milliseconds>] [--log-debug]
+        \\             [--listen-remote] [--request-timeout=<milliseconds>] [--log-debug]
         \\
         \\  nerva api --cluster=<integer> --addresses=<addresses> --listen=<host:port>
-        \\            [--request-timeout=<milliseconds>] [--log-debug]
+        \\            [--listen-remote] [--request-timeout=<milliseconds>] [--log-debug]
         \\
         \\  nerva export --cluster=<integer> --addresses=<addresses> [--as-of=<op>|latest]
         \\               --output=<path> [--log-debug]
@@ -266,7 +268,13 @@ const CLIArgs = union(enum) {
         \\
         \\  --listen=<host:port>
         \\        Where to serve HTTP: <ipv4>:<port>, or [<ipv6>]:<port>. The bound port is printed
-        \\        to stdout (use port 0 for an ephemeral one).
+        \\        to stdout (use port 0 for an ephemeral one). Only loopback (127.0.0.0/8, ::1) is
+        \\        accepted unless --listen-remote is given; 0.0.0.0 and [::] are not loopback.
+        \\
+        \\  --listen-remote
+        \\        Serve on an address that is not loopback. The gateway speaks plain HTTP, so its
+        \\        key and every reply cross the network in the clear: put it behind TLS. Logs one
+        \\        warning.
         \\
         \\  --development
         \\        Allow running without Direct IO, with small default caches.
@@ -332,6 +340,8 @@ pub const Command = union(enum) {
         cluster: u128,
         addresses: vsr.ClusterAddress,
         listen: std.net.Address,
+        /// `--listen-remote`: the address is not loopback, and the operator said so (NRV-E0009).
+        listen_remote: bool,
         /// How long a cluster request may wait for its reply, in milliseconds.
         request_timeout_ms: u32,
         log_debug: bool,
@@ -341,6 +351,8 @@ pub const Command = union(enum) {
         cluster: u128,
         addresses: vsr.ClusterAddress,
         listen: std.net.Address,
+        /// `--listen-remote`: the address is not loopback, and the operator said so (NRV-E0009).
+        listen_remote: bool,
         /// How long a cluster request may wait for its reply, in milliseconds.
         request_timeout_ms: u32,
         log_debug: bool,
@@ -412,8 +424,8 @@ pub fn parse_args(flags: *stdx.Flags) Command {
         .view => |view| .{ .view = .{
             .cluster = view.cluster,
             .addresses = view.addresses,
-            .listen = listen_parse(view.listen) orelse
-                listen_invalid("view"),
+            .listen = listen_resolve("view", view.listen, view.listen_remote),
+            .listen_remote = view.listen_remote,
             .request_timeout_ms = request_timeout_validate(view.request_timeout) catch |err|
                 flag_range("view", err),
             .log_debug = view.log_debug,
@@ -421,8 +433,8 @@ pub fn parse_args(flags: *stdx.Flags) Command {
         .api => |api| .{ .api = .{
             .cluster = api.cluster,
             .addresses = api.addresses,
-            .listen = listen_parse(api.listen) orelse
-                listen_invalid("api"),
+            .listen = listen_resolve("api", api.listen, api.listen_remote),
+            .listen_remote = api.listen_remote,
             .request_timeout_ms = request_timeout_validate(api.request_timeout) catch |err|
                 flag_range("api", err),
             .log_debug = api.log_debug,
@@ -511,6 +523,47 @@ fn flag_range(comptime command: []const u8, err: Error) noreturn {
         "nerva " ++ command ++ " --help names every flag and its bounds",
         .{},
     );
+}
+
+/// `--listen`, parsed, and refused (NRV-E0009) when it is not loopback and `--listen-remote` was
+/// not given (P168, owner question 2).
+fn listen_resolve(comptime command: []const u8, text: []const u8, remote: bool) std.net.Address {
+    const address = listen_parse(text) orelse listen_invalid(command);
+    if (!remote and !listen_is_loopback(address)) {
+        diag.fail(
+            "NRV-E0009",
+            command ++ ": --listen={s} is not loopback; the gateway speaks plain HTTP",
+            .{text},
+            "listen on 127.0.0.1 beside the client, or pass --listen-remote and put TLS in front",
+            .{},
+        );
+    }
+    return address;
+}
+
+/// Plain loopback: 127.0.0.0/8 or ::1. `0.0.0.0` and `[::]` serve every interface; an IPv4-mapped
+/// address such as `::ffff:127.0.0.1` is not plain loopback and is refused too (write `127.0.0.1`).
+pub fn listen_is_loopback(address: std.net.Address) bool {
+    switch (address.any.family) {
+        std.posix.AF.INET => return @as([4]u8, @bitCast(address.in.sa.addr))[0] == 127,
+        std.posix.AF.INET6 => return std.mem.eql(u8, &address.in6.sa.addr, &loopback_ipv6),
+        else => unreachable,
+    }
+}
+
+const loopback_ipv6 = [_]u8{0} ** 15 ++ [_]u8{1};
+
+test listen_is_loopback {
+    const accepted = [_][]const u8{
+        "127.0.0.1:0",       "127.255.255.254:80",  "[::1]:8080", "127.0.0.0:1",
+        "127.255.255.255:1", "[0:0:0:0:0:0:0:1]:1", "[::0:1]:1",
+    };
+    for (accepted) |text| try std.testing.expect(listen_is_loopback(listen_parse(text).?));
+    const refused = [_][]const u8{
+        "0.0.0.0:0",   "[::]:8080", "10.0.0.1:80", "[::ffff:127.0.0.1]:80", "126.255.255.255:1",
+        "128.0.0.1:1", "[::2]:1",   "128.0.0.0:1",
+    };
+    for (refused) |text| try std.testing.expect(!listen_is_loopback(listen_parse(text).?));
 }
 
 fn listen_invalid(comptime command: []const u8) noreturn {
