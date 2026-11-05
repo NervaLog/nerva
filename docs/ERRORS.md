@@ -68,6 +68,7 @@ a one-line summary, who is to blame, the cause and a fix. Codes are never reused
 | NRV-E0006 | A data file is missing at `start`'s path | `error[NRV-E0006]: start: <path> does not exist`, exit 1 (pre-flight, before the vendored open, which panics `Path does not exist.`) | operator | Run `nerva format` first, or fix the path |
 | NRV-E0007 | A replica, gateway or view server cannot listen | `error[NRV-E0007]: <command>: cannot listen: <reason>`, exit 1 | operator | The port is taken or not allowed, or the host has no socket for that address |
 | NRV-E0008 | `NERVA_KEY` is missing or invalid | `error[NRV-E0008]: api: set NERVA_KEY`, `NERVA_KEY_NEXT is set but empty`, `… equals NERVA_KEY` (http_connection.zig:147-150), exit 1 | operator | Set it; `_NEXT` differs from it during a rotation |
+| NRV-E0010 | A gateway cannot send its metrics to `--statsd` | `error[NRV-E0010]: api: cannot send statsd to <address>: <reason>`, exit 1, before the gateway says it listens (it does not run without its metrics) | operator | Give `--statsd` an address this host can send UDP to (an IPv6 one needs an IPv6 host; a broadcast address is refused), or leave the flag out |
 
 ## 01xx · The gateway: transport, keys, routes, requests
 

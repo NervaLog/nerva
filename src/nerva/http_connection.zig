@@ -546,11 +546,15 @@ pub const Receiver = struct {
             .deadline = receiver.timer.read() + receiver.options.deadline_ns,
             .accepted = receiver.accepted_count,
         };
-        if (receiver.options.counters) |counters| {
-            var in_use: u32 = 0;
-            for (receiver.slots) |other| in_use += @intFromBool(other.state != .free);
-            counters.connections_seen(in_use);
-        }
+        if (receiver.options.counters) |counters| counters.connections_seen(receiver.slots_in_use());
+    }
+
+    /// Slots holding a connection now, at most as many as there are slots.
+    pub fn slots_in_use(receiver: *const Receiver) u32 {
+        var in_use: u32 = 0;
+        for (receiver.slots) |other| in_use += @intFromBool(other.state != .free);
+        assert(in_use <= receiver.slots.len);
+        return in_use;
     }
 
     /// With every slot holding a connection that has sent bytes: answers the connections

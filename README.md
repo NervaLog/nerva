@@ -422,8 +422,10 @@ TigerBeetle's tracer (UPSTREAM.md).
 `nerva api --statsd=<host:port>` sends the gateway's metrics over UDP every 10 seconds, in the
 replicas' format (DogStatsD tags, so the same `statsd_exporter` reads both) with the prefix
 `nerva.api.`. Every line carries the tags `cluster` (as the replicas') and `listen` (the address the
-gateway is bound to). The socket never blocks: a packet the kernel does not take is dropped and counted
-in `nerva.api.statsd_dropped`, reported in the next window. A series with no events in a window is not
+gateway is bound to). A gateway that cannot set up its socket (an address this host cannot send to)
+does not start: `error[NRV-E0010]`, before it says it listens. The socket never blocks: a packet the
+kernel does not take is dropped and its lines are counted in `nerva.api.statsd_dropped`, reported in
+the next window (again, if the report's own packet is refused). A series with no events in a window is not
 sent, except the two gauges. `nerva view` sends nothing.
 
 | Metric | Type, tags | What it counts |
@@ -436,7 +438,7 @@ sent, except the two gauges. `nerva view` sends nothing.
 | `nerva.api.queue_wait_us.*` | as above, microseconds | From a request being complete to the gateway taking it |
 | `nerva.api.reconnects` | counter; `result`: `ok`, `failed` | Attempts to replace a broken session |
 | `nerva.api.session` | gauge, 1 or 0 | A session is ready at the end of the window |
-| `nerva.api.connections` | gauge | The most slots in use at once in the window (at most 16) |
+| `nerva.api.connections` | gauge | The most slots in use at once in the window, from those in use as it began (at most 16) |
 | `nerva.api.lingering_dropped`, `nerva.api.statsd_dropped` | counters | A refused connection closed at once because the lingering table was full; lines dropped because the socket did not take their packet |
 
 ### Commit stall

@@ -192,6 +192,17 @@ def main():
                 check("listen taken", ["api", "--cluster=0", f"--addresses={cluster.address}",
                                        f"--listen=127.0.0.1:{taken.getsockname()[1]}"],
                       "NRV-E0007", 1, "cannot listen", env={"NERVA_KEY": KEY})
+            # A statsd address this host cannot send to: the gateway refuses to start, before it
+            # says it listens or prints its port (P176b).
+            api = ["api", "--cluster=0", f"--addresses={cluster.address}", "--listen=127.0.0.1:0"]
+            for statsd in ("255.255.255.255:8125", "[2001:db8::1]:8125", "[::1]:8125"):
+                result = run(nerva, api + [f"--statsd={statsd}"], {"NERVA_KEY": KEY})
+                if statsd == "[::1]:8125" and result.returncode == 0:
+                    continue  # unreachable here: a host with IPv6 sends to it, and runs
+                expect(result, "NRV-E0010", 1, "cannot send statsd to", f"statsd {statsd}")
+                seen.append("NRV-E0010")
+                assert result.stdout == "", (statsd, result.stdout)
+                assert "listening on" not in result.stderr, (statsd, result.stderr[-1000:])
         finally:
             cluster.close()
 

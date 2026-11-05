@@ -13,6 +13,7 @@ const constants = @import("constants.zig");
 const config = constants.config;
 const cli = @import("nerva/cli.zig");
 const diagnostic = @import("nerva/diagnostic.zig");
+const timings = @import("nerva/timings.zig");
 const Client = @import("nerva/client.zig").Client;
 const view_server = @import("nerva/view/server.zig");
 const api_server = @import("nerva/api/server.zig");
@@ -833,11 +834,14 @@ fn command_view(gpa: std.mem.Allocator, args: *const cli.Command.View) !void {
 fn command_api(gpa: std.mem.Allocator, args: *const cli.Command.Api) !void {
     const keys = gateway_keys("api");
 
+    // Outside the client, which is replaced when it breaks: what the gateway reports survives it.
+    var tally: timings.Tally = .{};
     var client: Client = undefined;
     try client.init(gpa, .{
         .cluster = args.cluster,
         .addresses = args.addresses.slice(),
         .timeout = stdx.Duration.ms(args.request_timeout_ms),
+        .tally = &tally,
     });
     defer client.deinit();
 
@@ -847,6 +851,7 @@ fn command_api(gpa: std.mem.Allocator, args: *const cli.Command.Api) !void {
         .on_listening = on_listening,
         .statsd = args.statsd,
         .cluster = args.cluster,
+        .tally = &tally,
     });
 }
 

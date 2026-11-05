@@ -170,7 +170,8 @@ client can always tell "not applied" from "unknown", and the operator can see wh
 
 - **#120:** a busy gateway can close a request mid-send, so a client sees a 503 it cannot tell
   from a lost commit.
-- **No metrics:** gateways export nothing; only replicas send statsd (N50).
+- **No metrics (until R4 slice 4, P168e, P176):** gateways exported nothing; only replicas sent
+  statsd (N50). `nerva api --statsd` now sends them.
 - **One session per gateway:** each gateway holds one cluster session and runs one cluster request
   at a time (`src/nerva/api/server.zig:1-6`). Several gateways are the way to scale, but nothing
   says how.

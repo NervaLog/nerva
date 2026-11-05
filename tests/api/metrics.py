@@ -17,6 +17,7 @@ from api import Cluster, request  # noqa: E402
 
 BUSY_ATTEMPTS = 3
 DRIPPERS = 16
+GROUP = 8
 
 
 class Listener:
@@ -32,19 +33,28 @@ class Listener:
         self.gauges = {}    # (name, tags) -> (last, greatest)
         self.packets = []   # sizes
         self.stop = threading.Event()
+        self.failure = None  # why the listener thread stopped, if it did
         self.thread = threading.Thread(target=self.run)
         self.thread.start()
 
     def run(self):
-        while not self.stop.is_set():
-            try:
-                data = self.socket.recv(65535)
-            except socket.timeout:
-                continue
-            with self.lock:
-                self.packets.append(len(data))
-                for line in data.decode().split("\n"):
-                    self.add(line)
+        try:
+            while not self.stop.is_set():
+                try:
+                    data = self.socket.recv(65535)
+                except socket.timeout:
+                    continue
+                with self.lock:
+                    self.packets.append(len(data))
+                    for line in data.decode().split("\n"):
+                        self.add(line)
+        except Exception as error:  # noqa: BLE001
+            # A line the script cannot read is a failure of the test, with its own message.
+            self.failure = f"the listener could not read a packet: {error!r}"
+
+    def check(self):
+        if self.failure:
+            raise AssertionError(self.failure)
 
     def add(self, line):
         head, kind, tags = line.split("|")
@@ -73,9 +83,11 @@ class Listener:
     def wait_for(self, what, test, seconds=25):
         deadline = time.monotonic() + seconds
         while time.monotonic() < deadline:
+            self.check()
             if test():
                 return
             time.sleep(0.25)
+        self.check()
         with self.lock:
             seen = sorted(self.sums.items())
         raise AssertionError(f"not seen within {seconds} s: {what}; counters {seen}")
@@ -128,9 +140,12 @@ def main():
         # Commits waiting together are answered with one cluster request.
         errors = []
 
+        together = threading.Barrier(16, timeout=60)
+
         def burst(index):
             try:
                 for round_ in range(30):
+                    together.wait()
                     status, body = commit(port, [put(1000 + index * 100 + round_)])
                     assert status == 200, (status, body)
             except Exception as error:  # noqa: BLE001
@@ -207,7 +222,7 @@ def main():
         # A group: one cluster request answered several waiting requests.
         assert listener.total("nerva.api.group_size.count") > 0
         greatest = listener.gauge("nerva.api.group_size.max")
-        assert greatest is not None and greatest[1] >= 2, f"no group formed: {greatest}"
+        assert greatest is not None and greatest[1] >= GROUP, f"no group of {GROUP}: {greatest}"
         # Sum of group sizes is at least as large as its count.
         assert listener.total("nerva.api.group_size.sum") >= listener.total("nerva.api.group_size.count")
 
@@ -216,6 +231,32 @@ def main():
                           and listener.gauge("nerva.api.session")[0] == 1)
         connections = listener.gauge("nerva.api.connections")
         assert connections is not None and connections[1] >= DRIPPERS, connections
+        listener.check()
+
+        # Round trips timed before a reconnect that fails are still reported (review of #176):
+        # the replica stays stopped past the reconnect interval (5 s), so the first attempt to
+        # replace the session fails, and the samples taken before it are not lost with the client.
+        time.sleep(11)
+        samples = lambda: listener.total("nerva.api.cluster_request_us.count", operation="commit")  # noqa: E731
+        failed_before = listener.total("nerva.api.reconnects", result="failed")
+        samples_before = samples()
+        status, body = commit(port, [put(7)])
+        assert status == 200, (status, body)
+        replica.send_signal(signal.SIGSTOP)
+        try:
+            status, body = commit(port, [put(8)], key="2" * 32)
+            assert status == 503 and body["code"] == "NRV-E0601", (status, body)
+            listener.wait_for("a failed reconnect",
+                              lambda: listener.total("nerva.api.reconnects", result="failed")
+                              > failed_before, seconds=40)
+        finally:
+            replica.send_signal(signal.SIGCONT)
+        started = time.monotonic()
+        while request(port, "GET", "/healthz", key=None)[0] != 200:
+            assert time.monotonic() - started < 30, "the gateway did not recover"
+            time.sleep(0.25)
+        listener.wait_for("both round trips timed, across the failed reconnect",
+                          lambda: samples() - samples_before >= 2)
 
         # A window later nothing more was refused busy: the sum equals what the script read.
         time.sleep(11)

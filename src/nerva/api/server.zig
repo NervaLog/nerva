@@ -19,6 +19,8 @@ const MemoryBudget = @import("memory_budget.zig");
 const ClientHealth = @import("../client_health.zig").ClientHealth;
 const wire = @import("../wire_code.zig");
 const metrics = @import("metrics.zig");
+const timings = @import("../timings.zig");
+const diagnostic = @import("../diagnostic.zig");
 
 /// The largest request body: a full commit request in JSON is well under this.
 const body_size_max = 4 * 1024 * 1024;
@@ -40,10 +42,14 @@ pub const Options = struct {
     statsd: ?stdx.SocketAddress = null,
     /// The cluster's id, a tag on every metric.
     cluster: u128 = 0,
+    /// What `client` counts; the gateway reports it. It is `client.options.tally`, so that it
+    /// survives the client being replaced.
+    tally: *timings.Tally,
 };
 
 pub fn serve(gpa: std.mem.Allocator, client: *Client, options: Options) !noreturn {
     assert(http_connection.Keys.invalid(options.keys.current, options.keys.next) == null);
+    assert(client.options.tally == options.tally);
     var counters: metrics.Counters = .{};
     var receiver = try http_connection.Receiver.init(gpa, options.listen, .{
         .connections_max = connections_max,
@@ -51,14 +57,22 @@ pub fn serve(gpa: std.mem.Allocator, client: *Client, options: Options) !noretur
         .counters = &counters,
     });
     defer receiver.deinit(gpa);
+
+    // Before the gateway says it listens: one that cannot send its metrics does not start (P176b).
+    var emitter: ?metrics.Emitter = null;
+    if (options.statsd) |address| {
+        emitter = metrics.Emitter.init(address, options.cluster, receiver.listen_address()) catch |err|
+            diagnostic.fail(
+                "NRV-E0010",
+                "api: cannot send statsd to {}: {s}",
+                .{ address, metrics.init_reason(err) },
+                "give --statsd an address this host can send UDP to, or leave it out",
+                .{},
+            );
+    }
+    defer if (emitter) |*sender| sender.deinit();
     log.info("listening on {}", .{receiver.listen_address()});
     if (options.on_listening) |on_listening| on_listening(receiver.listen_address());
-
-    var emitter: ?metrics.Emitter = if (options.statsd) |address|
-        try metrics.Emitter.init(address, options.cluster, receiver.listen_address())
-    else
-        null;
-    defer if (emitter) |*sender| sender.deinit();
     var layouts = CatalogStore.init(client);
     var health = try ClientHealth.init(client);
     // Each request's memory is bounded, and the arena gives back what one large request took
@@ -78,16 +92,17 @@ pub fn serve(gpa: std.mem.Allocator, client: *Client, options: Options) !noretur
         }
         var wake_ms = health.idle_timeout_ms(-1);
         if (emitter) |*sender| {
-            sender.tick(&counters, &client.timings, .{
+            sender.tick(&counters, &options.tally.operations, .{
                 .session = health.state == .ready,
                 .reconnects_ok = health.reconnects_ok,
                 .reconnects_failed = health.reconnects_failed,
                 .lingering_dropped = receiver.lingering_dropped,
+                .connections = receiver.slots_in_use(),
             });
             wake_ms = sender.wait_ms(wake_ms);
         }
         const received = try receiver.next(wake_ms) orelse continue;
-        const requests_before = client.requests_sent;
+        const requests_before = options.tally.requests;
         budget.request_start();
         const arena = budget.allocator();
         // Requests are read from many connections at once (N45). Those already waiting for the
@@ -101,7 +116,16 @@ pub fn serve(gpa: std.mem.Allocator, client: *Client, options: Options) !noretur
             group_count += receiver.take(filter, GroupFilter.accepts, group[1..]);
         }
         if (group_count > 1) {
-            serve_group(arena, client, &health, &layouts, &receiver, &counters, &budget, group[0..group_count]);
+            serve_group(
+                arena,
+                client,
+                &health,
+                &layouts,
+                &receiver,
+                &counters,
+                &budget,
+                group[0..group_count],
+            );
         } else {
             const writes_before = client.writes_sent;
             const reply = serve_request(
@@ -114,8 +138,9 @@ pub fn serve(gpa: std.mem.Allocator, client: *Client, options: Options) !noretur
             ) catch |err| reply_of_error(err, &budget, writes_before, client.writes_sent);
             answer(&receiver, &counters, received, reply);
         }
-        if (client.requests_sent != requests_before) counters.group(group_count);
-        if (health.state == .ready and client.requests_sent != requests_before) health.replied();
+        const asked = options.tally.requests != requests_before;
+        if (asked) counters.group(group_count);
+        if (health.state == .ready and asked) health.replied();
         // `respond` has written the reply: give back what the request took at once, rather than
         // when the next request arrives (#60).
         _ = arena_instance.reset(.{ .retain_with_limit = MemoryBudget.retain_max });
