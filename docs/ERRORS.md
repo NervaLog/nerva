@@ -4,11 +4,12 @@ Every failure a client, an operator or a script can see has a stable code, regis
 (P147c). This follows Zigbox's diagnostics standard (`Zigbox/zigbox`, `DIAGNOSTICS.md`): a code,
 a one-line summary, who is to blame, the cause and a fix. Codes are never reused or renumbered.
 
-**Status, 2026-11-05: commands emit their codes; the wire does in part.**
-- **On the wire:** the replies the `Receiver` itself writes (NRV-E0101, E0102, E0116, E0602) carry
-  `code` and `applied`; every other reply still carries only the identifiers and texts in the
-  "Today" column. Codes reach the rest of `nerva api`'s replies in R4, as a `code` member beside today's `status` or `error`, never in
-  their place.
+**Status, 2026-11-05: commands and the wire emit their codes.**
+- **On the wire (R4 slice 2, P168b):** every non-2xx reply of `nerva api` and `nerva view` carries
+  `"code"` and `"applied"` beside today's `error` or `status`, whose spellings stay. `applied` is
+  `false` (nothing reached the cluster, or the cluster refused it) or `"unknown"` (a write went
+  out and no reply came back: NRV-E0601 and NRV-B0002 only). A replayed commit (200) carries
+  `"code":"NRV-W0201"`. The "Today" column below says which status and text each code is.
 - **In commands:** every `nerva` command failure that Nerva's code reports prints
   `error[NRV-E…]` (or `bug[NRV-B…]`), then a `cause` line (the code's summary) and a `fix` line
   (R5, `src/nerva/diagnostic.zig`; a unit test keeps its table equal to this file). Exit statuses:
@@ -73,7 +74,7 @@ a one-line summary, who is to blame, the cause and a fix. Codes are never reused
 | Code | Summary | Today | Blame | Fix |
 | --- | --- | --- | --- | --- |
 | NRV-E0101 | The request is not valid HTTP | 400 `malformed request`, `request head too large`, with `"applied": false` and `"code": "NRV-E0101"`; then the connection lingers briefly and closes | client | Send HTTP/1.1, one request per connection |
-| NRV-E0102 | The body is larger than 4 MiB | 400 `body too large`, with `"applied": false` and `"code": "NRV-E0102"` (a 413 in R4) | client | Split the request |
+| NRV-E0102 | The body is larger than 4 MiB | 413 `body too large`, with `"applied": false` and `"code": "NRV-E0102"` (was 400 before R4) | client | Split the request |
 | NRV-E0103 | The key is missing or wrong | 401 `invalid key` | client | Send `X-Nerva-Key` |
 | NRV-E0104 | No such route, or not with this method | 404 `not found`, 405 `method not allowed` | client | See README, "JSON API" |
 | NRV-E0105 | The JSON is malformed, or has an unknown or missing member | 400 `malformed JSON`, `unknown field`, `missing field`, `unexpected body` | client | Send exactly the members the route documents |
@@ -84,7 +85,7 @@ a one-line summary, who is to blame, the cause and a fix. Codes are never reused
 | NRV-E0110 | A commit entry is malformed | 400 with `"index"`: `entries must not be empty`, `a put needs value_hex or fields`, `an add has delta or delta_from, not both`, `delta_from must be the index of an earlier add`, `min must not exceed max` and the rest (api.zig:912-1234) | client | The message names the member; the index names the entry |
 | NRV-E0111 | A lookup is malformed | 400 `rows must not be empty`, `a lookup reads rows or records, not both: send two` | client | As the message says |
 | NRV-E0112 | Too many rows or entries for one request | 400 `too many rows or entries for one request` | client | Split it: 8,189 entries per commit |
-| NRV-E0113 | The request needs more memory than one request may use | 413 `request too complex` (128 MiB, N69) | client | Fewer or smaller entries |
+| NRV-E0113 | The request needs more memory than one request may use | 413 `request too complex` (128 MiB, N69), with `"applied"` and `"code"` | client | Fewer or smaller entries |
 | NRV-E0114 | A field needs a layout, or names no field of it | 400 `fields need a layout for the table (PUT /v1/tables/<t>)`, `no such field`, `an add's field must be u64 or i64` | client | Declare the layout first |
 | NRV-E0115 | A field value does not fit its type | 400 `a bool field takes true or false`, `a bytes field takes at most its size in hex`, `a number is out of range` and the rest (catalog.zig) | client | As the message says |
 | NRV-E0116 | The request did not arrive whole within 10 s | `408 {"error":"request not received within 10 s","applied":false,"code":"NRV-E0116"}`, written before the connection closes (`http_connection.zig`, R4 slice 1) | client | Send the whole request at once; nothing was applied |
@@ -96,7 +97,7 @@ These are the replies to `POST /v1/commit`. The identifier is the state machine'
 
 | Code | Summary | Today | Blame | Fix |
 | --- | --- | --- | --- | --- |
-| NRV-W0201 | The key committed earlier; this is its answer | 200 `{"status":"committed","replayed":true,"op":…}` | — | None: this is the success of a resend |
+| NRV-W0201 | The key committed earlier; this is its answer | 200 `{"status":"committed","op":…,"replayed":true,"code":"NRV-W0201"}` | — | None: this is the success of a resend |
 | NRV-E0202 | A read saw an old version | 409 `conflict`, with `index` and the newer `op` | client | Read again, then decide again |
 | NRV-E0203 | An add would cross its bound | 409 `out_of_bounds`, with `index` and the current `value` | client | Ask for less, or send `clamp` |
 | NRV-E0204 | An add names a row that does not exist | 409 `row_absent` | client | Send `create`, or put the row first |
@@ -130,7 +131,7 @@ These are the replies to `POST /v1/commit`. The identifier is the state machine'
 
 | Code | Summary | Today | Blame | Fix |
 | --- | --- | --- | --- | --- |
-| NRV-E0401 | The op asked for is not committed yet | `as_of is not yet committed`, `min_op is not yet committed`: **504** on `/v1/views/<n>`, **400** on `/v1/views/<n>/groups`, `/v1/row` and documents | retry | Wait and ask again. R4 makes it one status |
+| NRV-E0401 | The op asked for is not committed yet | `as_of is not yet committed`, `min_op is not yet committed`: **504** on every route (was 400 on `/v1/views/<n>/groups`, `/v1/row` and documents before R4) | retry | Wait and ask again |
 | NRV-E0402 | No such view, index or ledger | 404 `no such view`, `no such index`, `no such ledger` | client | Declare it first |
 | NRV-E0403 | The view was declared after the op asked for | 404 `the view was declared after as_of` | client | Ask as of a later op |
 | NRV-E0404 | The view or index is still building | 503 `the view is still building`, `index building` | retry | Ask again once built |
@@ -154,11 +155,11 @@ These are the replies to `POST /v1/commit`. The identifier is the state machine'
 
 | Code | Summary | Today | Blame | Fix |
 | --- | --- | --- | --- | --- |
-| NRV-E0601 | The cluster did not answer; the outcome is unknown | 503 `cluster unavailable` (also after eviction or a 30 s timeout) | retry | Resend under the same commit key: it commits at most once. Without a key, read before you write again |
-| NRV-E0602 | The gateway closed a request it could not take | `503 {"error":"busy","applied":false,"code":"NRV-E0602"}`, sent without reading the request: to a connection displaced while it had sent nothing, and to a newcomer when every slot holds a connection that has sent bytes (R4 slice 1; #120). A request complete but not sent within `queue_wait_max` gets it in slice 2 | retry | Nothing was applied: resend, with a pause |
+| NRV-E0601 | The cluster did not answer; the outcome is unknown | `503 {"error":"cluster unavailable","applied":"unknown","code":"NRV-E0601"}` after a write was sent and no reply came back (a timeout or an eviction); `"applied": false` when a read got none | retry | Resend under the same commit key: it commits at most once. Without a key, read before you write again |
+| NRV-E0602 | The gateway closed a request it could not take | `503 {"error":"busy","applied":false,"code":"NRV-E0602"}`, sent without reading the request: to a connection displaced while it had sent nothing, and to a newcomer when every slot holds a connection that has sent bytes (R4 slice 1; #120). A request complete but not taken within `queue_wait_max` (1 s) gets it too | retry | Nothing was applied: resend, with a pause |
 | NRV-E0603 | A client's session was evicted by a newer one | Zig client `error.Evicted`; behind the gateway, NRV-E0601 | retry | Fewer clients than 64 sessions |
 | NRV-E0604 | A gateway or view server could not reach the cluster | `error[NRV-E0604]: api: no reply from the cluster` after the client's 30 s registration timeout, exit 1 (R5 slice 1) | operator | Check `--cluster` and `--addresses`, and that a quorum of replicas is running |
-| NRV-E0605 | The gateway has no cluster session now; the request was not sent | Not yet emitted: today the same `503 cluster unavailable` as NRV-E0601 (server.zig:193). R4 answers it with `"applied": false` (docs/briefs/r4.md) | retry | Resend: nothing was applied. The gateway reconnects on its own, at most every 5 s |
+| NRV-E0605 | The gateway has no cluster session now; the request was not sent | `503 {"error":"cluster unavailable","applied":false,"code":"NRV-E0605"}`: the gateway's client is broken and is being replaced, so nothing was sent; also `/healthz` while it is (with `"session":"reconnecting"`) | retry | Resend: nothing was applied. The gateway reconnects on its own, at most every 5 s |
 
 ## 07xx · Replicas and data files
 
@@ -207,7 +208,7 @@ These are the replies to `POST /v1/commit`. The identifier is the state machine'
 
 | Code | Summary | Today | Blame | Fix |
 | --- | --- | --- | --- | --- |
-| NRV-E1001 | The op asked for is not committed yet | 504 `the op is not committed yet` | retry | As NRV-E0401 |
+| NRV-E1001 | The op asked for is not committed yet | 504 `the op is not committed yet`, with `"applied": false` and `"code": "NRV-E1001"` | retry | As NRV-E0401 |
 | NRV-E1002 | The view does not match its table's layout | 409 `the view does not match its table's layout` | client | Declare the view again under a new name |
 | NRV-W1003 | More changes than `nerva view` keeps; declared views stop here | Logged only (N35) | operator | Read views from the replicas (N52) |
 
@@ -215,8 +216,8 @@ These are the replies to `POST /v1/commit`. The identifier is the state machine'
 
 | Code | Summary | Today | Fix |
 | --- | --- | --- | --- |
-| NRV-B0001 | The gateway hit an internal error | 500 `internal error`, the Zig error only logged (server.zig:116, 206); includes `error.Corrupt` from a missing layout or bad document chunks | Report it with the gateway's log line |
-| NRV-B0002 | The gateway got a commit result it never expects | Today a panic of the gateway (api.zig:1051, 1116; documents_routes.zig) on `kind_invalid`, `field_invalid`, `key_invalid` and the rest: statuses the gateway's own checks should make impossible | Report it; R4 turns the panic into this reply |
+| NRV-B0001 | The gateway hit an internal error | `500 {"error":"internal error","applied":…,"code":"NRV-B0001"}`, the Zig error only logged; `applied` is `"unknown"` if a write had been sent; includes `error.Corrupt` from a missing layout or bad document chunks | Report it with the gateway's log line |
+| NRV-B0002 | The gateway got a commit result it never expects | `500 {"error":"internal error","applied":"unknown","code":"NRV-B0002"}` (it was a panic of the gateway) on `kind_invalid`, `field_invalid`, `key_invalid` and the rest: statuses the gateway's own checks should make impossible. The transaction was sent, so it may have been applied | Report it, with the gateway's log line |
 | NRV-B0003 | A replica stopped on an unknown protocol command | Exit 7, `unknown VSR command, crashing for safety` (#111) | Report it |
 | NRV-B0004 | A `nerva` command hit an error it did not expect | `bug[NRV-B0004]: <command> hit an error it did not expect`, exit 70; the Zig error name only on a `detail` line under `--log-debug` | Report it with the command's output under `--log-debug` |
 

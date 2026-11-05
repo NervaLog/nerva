@@ -222,7 +222,7 @@ def main():
         status, body = request(api, "GET", f"/v1/views/extremes/groups?as_of={declared_op - 1}")
         assert status == 404, (status, body)
         status, body = request(api, "GET", "/v1/views/extremes/groups?as_of=999999999")
-        assert status == 400, (status, body)
+        assert status == 504, (status, body)
 
         # The whole view's routes (N66): an op not yet committed waits for nobody (504), as in
         # `nerva view`; the declaration is at `/definition`; `GET /v1/views` lists the views.

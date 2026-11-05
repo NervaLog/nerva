@@ -17,7 +17,7 @@ Usage: adds.py <path to nerva> [--seed=N]
 import os, random, sys, threading
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from api import Cluster, request  # noqa: E402
+from api import Cluster, plain, request  # noqa: E402
 
 TABLE = 30
 LAYOUT = {"name": "budgets", "fields": [{"name": "available", "type": "u64"},
@@ -104,7 +104,7 @@ def check_bounds(port):
     status, body = commit(port, [
         {"kind": "put", "table": TABLE, "id": "3", "value_hex": "01"},
         add(2, "available", delta=-11, min=0)])
-    assert status == 409 and body == {"status": "out_of_bounds", "index": 1, "value": "10"}, body
+    assert status == 409 and plain(body) == {"status": "out_of_bounds", "index": 1, "value": "10"}, body
     status, body = request(port, "POST", "/v1/lookup", {"rows": [{"table": TABLE, "id": "3"}]})
     assert body["rows"][0]["exists"] is False, body
     status, body = commit(port, [add(2, "available", delta=1, max=10)])
@@ -118,12 +118,12 @@ def check_bounds(port):
     status, body = commit(port, [add(2, "balance", delta=-7)])
     assert status == 200 and body["adds"][0]["value"] == "-7", body
     status, body = commit(port, [add(2, "balance", delta=-5, min=-10)])
-    assert status == 409 and body == {"status": "out_of_bounds", "index": 0, "value": "-7"}, body
+    assert status == 409 and plain(body) == {"status": "out_of_bounds", "index": 0, "value": "-7"}, body
     assert fields(port, 2) == {"available": "0", "held": "0", "balance": "-7"}, fields(port, 2)
 
     # Absent rows.
     status, body = commit(port, [add(4, "available", delta=1)])
-    assert status == 409 and body == {"status": "row_absent", "index": 0}, body
+    assert status == 409 and plain(body) == {"status": "row_absent", "index": 0}, body
 
     # By offset and type, on a table without a layout; several adds to one row.
     status, body = commit(port, [

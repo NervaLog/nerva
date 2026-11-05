@@ -15,7 +15,7 @@ Runs one replica and two API gateways, then:
 - limits: keys of 1024 bytes and values of 512 KiB accepted, written in one transaction and read
   back, one byte more refused (#25); a commit too large for one request refused whole; a `get`
   of more chunks than 256 documents of 64 KiB answers 413, one just under answers 200; `as_of`
-  not yet committed refused;
+  not yet committed answers 504;
 - document rows never appear in `/v1/changes`, and the documents table is refused by the row
   routes;
 - eight threads incrementing one document with read-modify-write through both gateways,
@@ -26,7 +26,7 @@ Usage: documents.py <path to nerva> [--seed=N] [--steps=N]
 import os, random, sys, threading
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from api import Cluster, request  # noqa: E402
+from api import Cluster, plain, request  # noqa: E402
 
 NAMESPACES = ("7", "8")
 KEYS = ["a", "b", "cart/1", "cart/2", "δοκιμή", "k" * 300, "x" * 1024]
@@ -90,7 +90,7 @@ def check_commit(port, rng, model, counts):
         counts["committed"] += 1
     else:
         assert status == 409, (status, body, stale)
-        assert body == {"status": "conflict", "key": stale["key"],
+        assert plain(body) == {"status": "conflict", "key": stale["key"],
                         "version": str(model.version(namespace, stale["key"]))}, (body, stale)
         counts["conflict"] += 1
 
@@ -169,7 +169,7 @@ def check_limits(port, model):
     assert status == 200 and not any(d["exists"] for d in body["documents"]), body
     status, body = request(port, "POST", "/v1/documents/get",
                            {"namespace": "9", "keys": ["a"], "as_of": str(10**15)})
-    assert status == 400 and "not yet committed" in body["error"], body
+    assert status == 504 and "not yet committed" in body["error"], body
     # A get reads at most as many chunks as 256 documents of 64 KiB: 33 of 512 KiB are just
     # over, 32 just under.
     keys = [f"large/{i}" for i in range(33)]

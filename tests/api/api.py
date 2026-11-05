@@ -10,7 +10,7 @@ Runs one replica and two API gateways, then:
 - random lookups against the model;
 - the change feed, paged with random limits, equal to the model's list of writes;
 - every row's history, at random `op_max`, paged, equal to the model's;
-- `/v1/row?as_of=` for random rows and ops, and a refusal for an op not yet committed;
+- `/v1/row?as_of=` for random rows and ops, and a 504 (NRV-E0401) for an op not yet committed;
 - eight threads incrementing one counter with read-modify-write through both gateways,
   retrying on 409: no increment lost;
 - sixteen clients firing commits and lookups at one gateway at once, so that it answers several
@@ -36,7 +36,8 @@ Runs one replica and two API gateways, then:
   where it was (#31), and the largest valid `documents/get` (256 keys of 64 KiB) to answer 200
   (#60);
 - `--trace` to stop at `--trace-size-max` with the replica still serving (#30);
-- 401 without the key, 404 and 405;
+- 401 without the key, 404 and 405; every error reply carries `code` and `applied` (P168b;
+  `tests/errors/wire.py` provokes each code);
 - a gateway given `NERVA_KEY` and `NERVA_KEY_NEXT` accepts either and answers 401 to any other
   key; a `NERVA_KEY_NEXT` that is empty or equals `NERVA_KEY` is refused at start, without
   printing a key (P96).
@@ -66,6 +67,11 @@ def request(port, method, target, body=None, key=KEY):
     connection.close()
     assert response.getheader("content-type") == "application/json", response.getheaders()
     return status, json.loads(text)
+
+
+def plain(body):
+    """A reply without the members every error reply gains beside its own (P168b)."""
+    return {k: v for k, v in body.items() if k not in ("applied", "code")}
 
 
 class Cluster:
@@ -194,7 +200,7 @@ def check_commit(port, rng, model, counts):
         counts["duplicate"] += 1
     else:
         assert status == 409, (status, body, expected)
-        assert body == {"status": "conflict", "index": expected[1], "op": str(expected[2])}, (
+        assert plain(body) == {"status": "conflict", "index": expected[1], "op": str(expected[2])}, (
             body, expected)
         counts["conflict"] += 1
 
@@ -315,7 +321,7 @@ def check_coalesced(port, threads=16, rounds=14):
                 stale = {"kind": "read", "table": 3, "id": str(rows[0]), "op_seen": "1"}
                 status, body = request(port, "POST", "/v1/commit", {"entries": [
                     stale, {"kind": "put", "table": 3, "id": str(rows[2]), "value_hex": "ff"}]})
-                assert status == 409 and body == {
+                assert status == 409 and plain(body) == {
                     "status": "conflict", "index": 0, "op": str(state[rows[0]][0])}, (status, body)
 
                 # Refused as it would alone.
@@ -334,12 +340,12 @@ def check_coalesced(port, threads=16, rounds=14):
                 mine.append(op_keyed)
                 state[rows[2]] = (op_keyed, True, value.ljust(160, "0"))
                 status, body = request(port, "POST", "/v1/commit", keyed)
-                assert (status, body) == (200, {
+                assert (status, plain(body)) == (200, {
                     "status": "committed", "op": str(op_keyed), "replayed": True}), (status, body)
                 other = {"key": key, "entries": [
                     {"kind": "put", "table": 3, "id": str(rows[2]), "value_hex": "aa"}]}
                 status, body = request(port, "POST", "/v1/commit", other)
-                assert (status, body) == (409, {
+                assert (status, plain(body)) == (409, {
                     "status": "key_reused", "op": str(op_keyed)}), (status, body)
 
                 # The meeting place: add one to the counter.
@@ -606,7 +612,8 @@ def check_documents_get_max(port):
 
 
 def check_malformed(port):
-    # Each is refused with 400 (or the connection is dropped), and the gateway still serves.
+    # Each is refused with 400, or 413 for a body too large (or the connection is dropped), and
+    # the gateway still serves.
     for raw in MALFORMED:
         connection = socket.create_connection(("127.0.0.1", port), timeout=10)
         try:
@@ -616,7 +623,8 @@ def check_malformed(port):
             reply = b""
         finally:
             connection.close()
-        assert reply == b"" or reply.startswith(b"HTTP/1.1 400 "), (raw[:60], reply)
+        assert reply == b"" or reply.startswith((b"HTTP/1.1 400 ", b"HTTP/1.1 413 ")), (
+            raw[:60], reply)
         assert request(port, "GET", "/healthz", key=None)[0] == 200, raw[:60]
 
 
@@ -719,7 +727,7 @@ def check_key_rotation(cluster):
     assert request(port, "POST", "/v1/lookup", lookup, key=KEY_NEXT)[0] == 200
     for key in (None, "wrong", KEY + "x", KEY_NEXT[:-1], KEY_NEXT.upper()):
         status, body = request(port, "POST", "/v1/lookup", lookup, key=key)
-        assert status == 401 and body == {"error": "invalid key"}, (key, status, body)
+        assert status == 401 and plain(body) == {"error": "invalid key"}, (key, status, body)
     # The current key alone: the next one is refused.
     assert request(cluster.ports[0], "POST", "/v1/lookup", lookup, key=KEY_NEXT)[0] == 401
 
@@ -744,8 +752,11 @@ def check_stall_recovery(cluster, port):
     replica.send_signal(signal.SIGSTOP)
     try:
         status, body = request(port, "POST", "/v1/lookup", {"rows": [{"table": 1, "id": "0"}]})
-        assert status == 503, (status, body)
-        assert request(port, "GET", "/healthz", key=None)[0] == 503
+        # A read that got no answer: nothing was written, so nothing was applied (NRV-E0601).
+        assert status == 503 and body["code"] == "NRV-E0601" and body["applied"] is False, (
+            status, body)
+        status, body = request(port, "GET", "/healthz", key=None)
+        assert status == 503 and body["code"] == "NRV-E0605", (status, body)
     finally:
         replica.send_signal(signal.SIGCONT)
     deadline = time.monotonic() + 120
@@ -801,7 +812,7 @@ def main():
                     body, key, op)
                 as_of_reads += 1
         status, body = request(ports[0], "GET", f"/v1/row?table=1&id=0&as_of={10**15}")
-        assert status == 400 and "not yet committed" in body["error"], body
+        assert status == 504 and "not yet committed" in body["error"], body
 
         conflicts = counter_race(ports)
         together = check_coalesced(ports[0])

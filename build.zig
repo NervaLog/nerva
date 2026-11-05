@@ -336,7 +336,8 @@ pub fn build(b: *std.Build) !void {
     // zig build test:api: the JSON API, its documents, adds, commit keys (P123), records and
     // indexes (P123b, P123c), then layouts kept between requests (P135), then ledgers, against
     // models, then a cluster and gateway over IPv6 (skipped without it), a gateway given an
-    // address it cannot open (#92), then key rotation through both gateways (NERVA_KEY_NEXT); one
+    // address it cannot open (#92), then key rotation through both gateways (NERVA_KEY_NEXT), a
+    // gateway with more connections than slots (R4), and every code it puts on the wire; one
     // after the other: each runs a cluster.
     var api_previous: ?*std.Build.Step = null;
     for ([_][]const u8{
@@ -350,6 +351,8 @@ pub fn build(b: *std.Build) !void {
         "ipv6.py",
         "addresses.py",
         "keys.py",
+        "busy.py",
+        "../errors/wire.py",
     }) |script| {
         const run_api_test = b.addSystemCommand(&.{ "python3", b.fmt("tests/api/{s}", .{script}) });
         run_api_test.addFileArg(nerva.getEmittedBin());

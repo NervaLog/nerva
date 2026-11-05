@@ -305,7 +305,8 @@ def acknowledged_commits_survive(writer, port):
     for id, (key, op) in sorted(writer.acked.items()):
         status, reply = request(port, "POST", "/v1/commit", put_body(id, key), timeout=60)
         assert status == 200, (id, status, reply)
-        assert reply == {"status": "committed", "op": str(op), "replayed": True}, (id, op, reply)
+        assert reply == {"status": "committed", "op": str(op), "replayed": True,
+                         "code": "NRV-W0201"}, (id, op, reply)
 
 
 def run(nerva, args):

@@ -179,16 +179,28 @@ pub const Options = struct {
     deadline_ns: u64 = 10 * std.time.ns_per_s,
     /// How long a connection that was answered and shut lingers, at most (`linger_ns`).
     linger_ns: u64 = linger_ns_default,
+    /// How many answered connections linger at once, at most `linger_max`.
+    linger_entries_max: u32 = linger_max,
+    /// How long a complete request waits for the caller to take it (`next`, `take`) before it
+    /// is refused `503 busy` (NRV-E0602, `queue_wait_max`).
+    queue_wait_ns: u64 = queue_wait_ns_default,
 };
+
+/// How long a complete request may wait to be taken: past it nothing was applied, and the
+/// client is told to resend (R4, P168b).
+pub const queue_wait_ns_default = std.time.ns_per_s;
 
 /// Connections the kernel queues for `accept` (was Zig's default, 128). Past it the kernel drops
 /// the SYN: the client's connect fails, nothing was sent.
 pub const listen_backlog: u31 = 128;
 /// Connections refused in one wake of the poll loop: no more than can be waiting.
 pub const refusals_per_wake_max: u32 = listen_backlog;
-/// Answered connections that linger at once: one per slot of the gateways (16). A further one is
-/// closed as soon as its reply is written, and counted in `Receiver.lingering_dropped`.
-pub const linger_max = 16;
+/// Answered connections that linger at once: as many as one wake can refuse
+/// (`refusals_per_wake_max`), so that a burst of newcomers is not closed on while it still sends
+/// (a close with a request unread resets the connection, and the client may never read its
+/// reply: R4 slice 2, `tests/api/busy.py`). A further one is closed as soon as its reply is
+/// written, and counted in `Receiver.lingering_dropped`.
+pub const linger_max = refusals_per_wake_max;
 /// How long an answered connection lingers at most: a loopback client's request has arrived by
 /// then.
 pub const linger_ns_default = std.time.ns_per_s;
@@ -247,12 +259,15 @@ pub const Receiver = struct {
         /// A `timer` reading.
         deadline: u64 = 0,
         accepted: u64 = 0,
+        /// A `timer` reading: when the request became complete.
+        completed: u64 = 0,
     };
 
     pub fn init(gpa: std.mem.Allocator, listen: std.net.Address, options: Options) !Receiver {
         assert(options.connections_max > 0);
         assert(options.head_size_max >= 64);
         assert(options.deadline_ns > 0);
+        assert(options.linger_entries_max <= linger_max);
 
         const slots = try gpa.alloc(Slot, options.connections_max);
         errdefer gpa.free(slots);
@@ -321,6 +336,9 @@ pub const Receiver = struct {
         while (true) {
             receiver.expire();
             if (receiver.oldest_complete()) |index| {
+                // With every slot taken, a newcomer waits in the kernel's queue, silent: look
+                // at the listening socket once, so that it is told `busy` now.
+                if (!receiver.slot_free()) _ = try receiver.poll(0, .displace);
                 return receiver.serve(index);
             }
 
@@ -561,20 +579,20 @@ pub const Receiver = struct {
             assert(head_read > size_before);
             for (bytes[size_before..head_read], size_before..) |byte, index| {
                 if (byte == '\n' and (index == 0 or bytes[index - 1] != '\r')) {
-                    return receiver.refuse(slot, "malformed request", "NRV-E0101");
+                    return receiver.refuse(slot, 400, "malformed request", "NRV-E0101");
                 }
             }
             const end = head_end orelse {
                 if (slot.size == receiver.options.head_size_max) {
-                    return receiver.refuse(slot, "request head too large", "NRV-E0101");
+                    return receiver.refuse(slot, 400, "request head too large", "NRV-E0101");
                 }
                 return;
             };
             slot.head_size = @intCast(end + "\r\n\r\n".len);
             const head = head_parse(bytes[0..slot.head_size]) orelse
-                return receiver.refuse(slot, "malformed request", "NRV-E0101");
+                return receiver.refuse(slot, 400, "malformed request", "NRV-E0101");
             if (head.content_length > receiver.options.body_size_max) {
-                return receiver.refuse(slot, "body too large", "NRV-E0102");
+                return receiver.refuse(slot, 413, "body too large", "NRV-E0102");
             }
             slot.head = head;
             // Bytes past the body (a second request) are not the server's to read.
@@ -584,27 +602,32 @@ pub const Receiver = struct {
                     return receiver.close(slot);
             }
         }
-        if (slot.size == slot.head_size + slot.head.?.content_length) slot.state = .complete;
+        if (slot.size == slot.head_size + slot.head.?.content_length) {
+            slot.state = .complete;
+            slot.completed = receiver.timer.read();
+        }
     }
 
-    /// Answers 400 to a request that cannot be served, and shuts the connection (`shut`).
+    /// Answers `status` (400, or 413 for a body too large) to a request that cannot be served,
+    /// and shuts the connection (`shut`).
     fn refuse(
         receiver: *Receiver,
         slot: *Slot,
+        comptime status: u16,
         comptime reason: []const u8,
         comptime code: []const u8,
     ) void {
         log.debug("refused: " ++ reason, .{});
         const body = "{\"error\":\"" ++ reason ++ "\",\"applied\":false,\"code\":\"" ++
             code ++ "\"}";
-        receiver.shut(slot, 400, body);
+        receiver.shut(slot, status, body);
     }
 
-    /// Answers the request in `slot` with `status` and `body` (short, written without waiting),
-    /// ends the reply, and frees the slot. The connection lingers (`linger`): nothing is closed
-    /// without a status line.
+    /// Answers the request in `slot` (still being read, or complete and not yet taken) with
+    /// `status` and `body` (short, written without waiting), ends the reply, and frees the
+    /// slot. The connection lingers (`linger`): nothing is closed without a status line.
     fn shut(receiver: *Receiver, slot: *Slot, status: u16, body: []const u8) void {
-        assert(slot.state == .reading);
+        assert(slot.state == .reading or slot.state == .complete);
         receiver.linger(slot.fd, status, body);
         slot.* = .{ .buffer = slot.buffer };
     }
@@ -626,7 +649,7 @@ pub const Receiver = struct {
         const sent = posix.send(fd, message[0 .. head.len + body.len], send_flags) catch 0;
         if (sent != head.len + body.len) log.debug("refusal: not written whole ({d} bytes)", .{sent});
         posix.shutdown(fd, .send) catch {};
-        if (receiver.lingering_count == linger_max) {
+        if (receiver.lingering_count == receiver.options.linger_entries_max) {
             receiver.lingering_dropped += 1;
             return posix.close(fd);
         }
@@ -713,14 +736,20 @@ pub const Receiver = struct {
         slot.* = .{ .buffer = slot.buffer };
     }
 
-    /// Answers `408` to every connection still reading past its deadline (NRV-E0116), and closes
-    /// the lingering ones past theirs.
+    /// Answers `408` to every connection still reading past its deadline (NRV-E0116), `503 busy`
+    /// to every complete request that has waited `queue_wait_ns` to be taken (NRV-E0602), and
+    /// closes the lingering connections past theirs.
     fn expire(receiver: *Receiver) void {
         const now = receiver.timer.read();
         for (receiver.slots) |*slot| {
             if (slot.state == .reading and now >= slot.deadline) {
                 log.debug("request not received within the deadline", .{});
                 receiver.shut(slot, 408, deadline_body);
+            } else if (slot.state == .complete and
+                now - slot.completed >= receiver.options.queue_wait_ns)
+            {
+                log.debug("request not taken within the queue wait", .{});
+                receiver.shut(slot, 503, busy_body);
             }
         }
         var index: usize = receiver.lingering_count;
@@ -966,7 +995,7 @@ test "Receiver: a body may hold LFs, though the head may not, when both arrive i
     try testing.expect(std.mem.indexOf(u8, reply[0..reply_size], "malformed request") != null);
 }
 
-test "Receiver: malformed and oversized requests are refused with 400" {
+test "Receiver: malformed requests are refused with 400, and a body too large with 413" {
     var receiver = try Receiver.init(
         testing.allocator,
         try std.net.Address.parseIp("127.0.0.1", 0),
@@ -985,16 +1014,16 @@ test "Receiver: malformed and oversized requests are refused with 400" {
         "body too large",
     };
     const codes = [_][]const u8{ "NRV-E0101", "NRV-E0101", "NRV-E0102" };
-    for (cases, replies, codes) |case, expected, code| {
+    const statuses = [_]u16{ 400, 400, 413 };
+    for (cases, replies, codes, statuses) |case, expected, code, status| {
         const client = try test_connect(&receiver);
         defer client.close();
         try client.writeAll(case);
         try testing.expectEqual(null, try receiver.next(100));
         var reply: [256]u8 = undefined;
         const reply_size = try client.readAll(&reply);
-        try testing.expect(std.mem.startsWith(u8, reply[0..reply_size], "HTTP/1.1 400 "));
         try testing.expect(std.mem.indexOf(u8, reply[0..reply_size], expected) != null);
-        try expect_refusal(reply[0..reply_size], 400, code);
+        try expect_refusal(reply[0..reply_size], status, code);
     }
 }
 
@@ -1258,6 +1287,74 @@ test "Receiver: sixteen silent connections and a seventeenth: the oldest is told
     receiver.respond(second, 200, "{}");
 }
 
+fn test_reject_all(_: void, _: *const Request) bool {
+    return false;
+}
+
+test "Receiver: a complete request not taken within the queue wait is refused busy (NRV-E0602)" {
+    var receiver = try Receiver.init(
+        testing.allocator,
+        try std.net.Address.parseIp("127.0.0.1", 0),
+        .{ .connections_max = 4, .body_size_max = 0, .queue_wait_ns = 50 * std.time.ns_per_ms },
+    );
+    defer receiver.deinit(testing.allocator);
+
+    const first = try test_connect(&receiver);
+    defer first.close();
+    try first.writeAll("GET /first HTTP/1.1\r\n\r\n");
+    const second = try test_connect(&receiver);
+    defer second.close();
+    try second.writeAll("GET /second HTTP/1.1\r\n\r\n");
+
+    const received = (try receiver.next(1000)).?;
+    try testing.expectEqualStrings("/first", received.request.target);
+    // Read what has arrived: the second request is complete, and waits for the caller.
+    var none: [1]Received = undefined;
+    for (0..4) |_| _ = receiver.take({}, test_reject_all, &none);
+    std.time.sleep(80 * std.time.ns_per_ms);
+    receiver.respond(received, 200, "{}");
+
+    try testing.expectEqual(null, try receiver.next(0));
+    var reply: [256]u8 = undefined;
+    const reply_size = try second.readAll(&reply);
+    try expect_refusal(reply[0..reply_size], 503, "NRV-E0602");
+    var first_reply: [256]u8 = undefined;
+    const first_size = try first.readAll(&first_reply);
+    try testing.expect(std.mem.startsWith(u8, first_reply[0..first_size], "HTTP/1.1 200 "));
+}
+
+test "Receiver: a newcomer behind complete requests is refused busy while one is taken" {
+    var receiver = try Receiver.init(
+        testing.allocator,
+        try std.net.Address.parseIp("127.0.0.1", 0),
+        .{ .connections_max = 2, .body_size_max = 0 },
+    );
+    defer receiver.deinit(testing.allocator);
+
+    const first = try test_connect(&receiver);
+    defer first.close();
+    try first.writeAll("GET /first HTTP/1.1\r\n\r\n");
+    const second = try test_connect(&receiver);
+    defer second.close();
+    try second.writeAll("GET /second HTTP/1.1\r\n\r\n");
+    var none: [1]Received = undefined;
+    for (0..4) |_| _ = receiver.take({}, test_reject_all, &none);
+    // Both slots hold complete requests; the third connection waits in the kernel's queue.
+    const third = try test_connect(&receiver);
+    defer third.close();
+
+    const received = (try receiver.next(1000)).?;
+    try testing.expectEqualStrings("/first", received.request.target);
+    var reply: [256]u8 = undefined;
+    const reply_size = try third.readAll(&reply);
+    try expect_refusal(reply[0..reply_size], 503, "NRV-E0602");
+    receiver.respond(received, 200, "{}");
+    // The second request, whole and not stale, is still served.
+    const next = (try receiver.next(1000)).?;
+    try testing.expectEqualStrings("/second", next.request.target);
+    receiver.respond(next, 200, "{}");
+}
+
 test "Receiver: a drip is answered 408 at the deadline, though it kept sending (NRV-E0116)" {
     var receiver = try Receiver.init(
         testing.allocator,
@@ -1342,11 +1439,18 @@ test "Receiver: a second Receiver on the same port is refused (#112)" {
     ));
 }
 
-test "Receiver: sixteen connections linger, a seventeenth is closed at once, and all end (linger_max)" {
+const lingering_test_max = 16;
+
+test "Receiver: sixteen connections linger, a seventeenth is closed at once, and all end (linger_entries_max)" {
     var receiver = try Receiver.init(
         testing.allocator,
         try std.net.Address.parseIp("127.0.0.1", 0),
-        .{ .connections_max = 1, .body_size_max = 8, .linger_ns = 300 * std.time.ns_per_ms },
+        .{
+            .connections_max = 1,
+            .body_size_max = 8,
+            .linger_ns = 300 * std.time.ns_per_ms,
+            .linger_entries_max = lingering_test_max,
+        },
     );
     defer receiver.deinit(testing.allocator);
     const holder = try test_partial(&receiver);
@@ -1355,7 +1459,7 @@ test "Receiver: sixteen connections linger, a seventeenth is closed at once, and
 
     // Seventeen newcomers that send nothing and do not close are all refused, and all read
     // their 503; sixteen linger.
-    var newcomers: [linger_max + 1]std.net.Stream = undefined;
+    var newcomers: [lingering_test_max + 1]std.net.Stream = undefined;
     var connected: usize = 0;
     defer for (newcomers[0..connected]) |client| client.close();
     for (&newcomers) |*client| {
@@ -1368,7 +1472,7 @@ test "Receiver: sixteen connections linger, a seventeenth is closed at once, and
         const size = try client.readAll(&reply);
         try expect_refusal(reply[0..size], 503, "NRV-E0602");
     }
-    try testing.expectEqual(linger_max, receiver.lingering_count);
+    try testing.expectEqual(lingering_test_max, receiver.lingering_count);
     try testing.expectEqual(1, receiver.lingering_dropped);
 
     // They are let go after `linger_ns`, closing their end of the connection.
@@ -1376,7 +1480,7 @@ test "Receiver: sixteen connections linger, a seventeenth is closed at once, and
     try testing.expectEqual(0, receiver.lingering_count);
 
     // Sixteen exactly: none is dropped.
-    var again: [linger_max]std.net.Stream = undefined;
+    var again: [lingering_test_max]std.net.Stream = undefined;
     var again_connected: usize = 0;
     defer for (again[0..again_connected]) |client| client.close();
     for (&again) |*client| {
@@ -1384,7 +1488,7 @@ test "Receiver: sixteen connections linger, a seventeenth is closed at once, and
         again_connected += 1;
     }
     try testing.expectEqual(null, try receiver.next(100));
-    try testing.expectEqual(linger_max, receiver.lingering_count);
+    try testing.expectEqual(lingering_test_max, receiver.lingering_count);
     try testing.expectEqual(1, receiver.lingering_dropped);
 }
 

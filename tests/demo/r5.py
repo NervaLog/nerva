@@ -422,7 +422,8 @@ def acknowledged_keys_survive(writer, api):
     for n, op in sorted(writer.acked.items()):
         status, reply = request(api, "POST", "/v1/commit", commit_body(n))
         assert status == 200, (n, status, reply)
-        assert reply == {"status": "committed", "op": str(op), "replayed": True}, (n, op, reply)
+        assert reply == {"status": "committed", "op": str(op), "replayed": True,
+                         "code": "NRV-W0201"}, (n, op, reply)
 
 
 def primary_view(statsd, since, indexes):

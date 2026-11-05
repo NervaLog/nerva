@@ -16,6 +16,7 @@ const http_connection = @import("../http_connection.zig");
 const CatalogStore = @import("catalog_store.zig").CatalogStore;
 const MemoryBudget = @import("memory_budget.zig");
 const ClientHealth = @import("../client_health.zig").ClientHealth;
+const wire = @import("../wire_code.zig");
 
 /// The largest request body: a full commit request in JSON is well under this.
 const body_size_max = 4 * 1024 * 1024;
@@ -74,6 +75,7 @@ pub fn serve(gpa: std.mem.Allocator, client: *Client, options: Options) !noretur
         if (group_count > 1) {
             serve_group(arena, client, &health, &layouts, &receiver, &budget, group[0..group_count]);
         } else {
+            const writes_before = client.writes_sent;
             const reply = serve_request(
                 arena,
                 client,
@@ -81,7 +83,7 @@ pub fn serve(gpa: std.mem.Allocator, client: *Client, options: Options) !noretur
                 &layouts,
                 options,
                 &received.request,
-            ) catch |err| reply_of_error(err, &budget);
+            ) catch |err| reply_of_error(err, &budget, writes_before, client.writes_sent);
             receiver.respond(received, reply.status, reply.body);
         }
         // `respond` has written the reply: give back what the request took at once, rather than
@@ -106,19 +108,40 @@ const GroupFilter = struct {
     }
 };
 
-/// What a request that failed with `err` is answered.
-fn reply_of_error(err: anyerror, budget: *const MemoryBudget) api.Reply {
+/// What a request that failed with `err` is answered, when `Client.writes_sent` was
+/// `writes_before` as it began and is `writes_now` now. The bodies are fixed: the arena may be
+/// what ran out. A request that sent no write was not applied.
+fn reply_of_error(
+    err: anyerror,
+    budget: *const MemoryBudget,
+    writes_before: u64,
+    writes_now: u64,
+) api.Reply {
+    const applied = api.applied_since(writes_before, writes_now);
     if (err == error.OutOfMemory and budget.exceeded) {
         log.warn("request: past its memory budget", .{});
-        return .{ .status = 413, .body = "{\"error\":\"request too complex\"}" };
+        return .{ .status = 413, .body = switch (applied) {
+            inline else => |known| wire.error_body(.E0113, "request too complex", known),
+        } };
     }
     log.warn("request: {}", .{err});
-    return .{ .status = 500, .body = "{\"error\":\"internal error\"}" };
+    return .{ .status = 500, .body = switch (applied) {
+        inline else => |known| wire.error_body(.B0001, "internal error", known),
+    } };
 }
 
+/// The reply to a request that reached a cluster that did not answer (a timeout, an eviction):
+/// unknown if a write was sent (NRV-E0601).
+fn cluster_lost(applied: api.Applied) api.Reply {
+    return .{ .status = 503, .body = switch (applied) {
+        inline else => |known| wire.error_body(.E0601, "cluster unavailable", known),
+    } };
+}
+
+/// The reply to a request while the gateway has no session: nothing was sent (NRV-E0605).
 const cluster_unavailable = api.Reply{
     .status = 503,
-    .body = "{\"error\":\"cluster unavailable\"}",
+    .body = wire.error_body(.E0605, "cluster unavailable", .no),
 };
 
 /// Answers requests that were waiting together (`api.handle_group`), each as it would have been
@@ -139,7 +162,10 @@ fn serve_group(
         member.* = .{ .target = one.request.target, .body = one.request.body };
     }
     const members_used = members[0..received.len];
-    if (!health.ready(client)) {
+    const ready = health.ready(client);
+    // After `ready`: a reconnection starts a client that has sent nothing.
+    const writes_before = client.writes_sent;
+    if (!ready) {
         for (members_used) |*member| member.result = cluster_unavailable;
     } else if (api.handle_group(arena, client, layouts, members_used)) {
         for (members_used) |*member| assert(member.result != null);
@@ -149,8 +175,9 @@ fn serve_group(
             health.broke();
             // The cluster may have changed under the new client: read layouts again (P135).
             layouts.cache_clear();
+            const lost = cluster_lost(api.applied_since(writes_before, client.writes_sent));
             for (members_used) |*member| {
-                if (member.result == null) member.result = cluster_unavailable;
+                if (member.result == null) member.result = lost;
             }
         },
         else => {
@@ -160,7 +187,8 @@ fn serve_group(
         },
     }
     for (members_used, received) |member, one| {
-        const reply = member.result.? catch |err| reply_of_error(err, budget);
+        const reply = member.result.? catch |err|
+            reply_of_error(err, budget, writes_before, client.writes_sent);
         receiver.respond(one, reply.status, reply.body);
     }
 }
@@ -175,22 +203,21 @@ fn serve_request(
 ) !api.Reply {
     const target = request.target;
     if (request.method == .get and std.mem.eql(u8, target, "/healthz")) {
-        if (health.state != .ready) {
-            return .{ .status = 503, .body = "{\"ok\":false,\"error\":\"cluster unavailable\"}" };
-        }
-        return .{ .status = 200, .body = "{\"ok\":true}" };
+        if (health.state != .ready) return unavailable_healthz;
+        return .{ .status = 200, .body = "{\"ok\":true,\"session\":\"ready\"}" };
     }
     const method: api.Method = switch (request.method) {
         .get => .get,
         .post => .post,
         .put => .put,
-        .other => return api.error_reply(arena, 405, "method not allowed"),
+        .other => return api.error_reply(arena, .E0104, 405, "method not allowed", .no),
     };
     if (!http_connection.key_accepted(options.keys, request.key)) {
-        return api.error_reply(arena, 401, "invalid key");
+        return api.error_reply(arena, .E0103, 401, "invalid key", .no);
     }
 
-    if (!health.ready(client)) return api.error_reply(arena, 503, "cluster unavailable");
+    if (!health.ready(client)) return cluster_unavailable;
+    const writes_before = client.writes_sent;
     return api.handle(arena, client, layouts, method, target, request.body) catch |err|
         switch (err) {
             error.Evicted, error.Timeout => {
@@ -198,12 +225,25 @@ fn serve_request(
                 health.broke();
                 // The cluster may have changed under the new client: read layouts again (P135).
                 layouts.cache_clear();
-                return api.error_reply(arena, 503, "cluster unavailable");
+                return cluster_lost(api.applied_since(writes_before, client.writes_sent));
             },
             error.OutOfMemory => return err,
             else => {
                 log.err("{s}: {}", .{ target, err });
-                return api.error_reply(arena, 500, "internal error");
+                return api.error_reply(
+                    arena,
+                    .B0001,
+                    500,
+                    "internal error",
+                    api.applied_since(writes_before, client.writes_sent),
+                );
             },
         };
 }
+
+/// `/healthz` while the gateway has no session: 503 NRV-E0605, as a request for the cluster.
+const unavailable_healthz = api.Reply{
+    .status = 503,
+    .body = "{\"ok\":false,\"error\":\"cluster unavailable\",\"applied\":false," ++
+        "\"code\":\"NRV-E0605\",\"session\":\"reconnecting\"}",
+};
