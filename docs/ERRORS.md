@@ -85,7 +85,7 @@ a one-line summary, who is to blame, the cause and a fix. Codes are never reused
 | NRV-E0109 | A hex value or id has the wrong length or is not hex | 400 `value_hex must be at most 80 bytes of hex`, `a record's id is 16 bytes of hex`, `… is not hex`, `key must be 16 bytes of hex`, `key must not be zero` | client | Rows are 80 bytes, records 448, record ids and keys 16 |
 | NRV-E0110 | A commit entry is malformed | 400 with `"index"`: `entries must not be empty`, `a put needs value_hex or fields`, `an add has delta or delta_from, not both`, `delta_from must be the index of an earlier add`, `min must not exceed max` and the rest (api.zig:912-1234) | client | The message names the member; the index names the entry |
 | NRV-E0111 | A lookup is malformed | 400 `rows must not be empty`, `a lookup reads rows or records, not both: send two` | client | As the message says |
-| NRV-E0112 | Too many rows or entries for one request | 400 `too many rows or entries for one request` | client | Split it: 8,189 entries per commit |
+| NRV-E0112 | Too many rows or entries for one request | 400 `too many rows or entries for one request` | client | Split it: 8,189 entries per commit; under a commit key the key takes one entry, so 8,188 reads and writes, on `/v1/commit` and `/v1/documents/commit` alike |
 | NRV-E0113 | The request needs more memory than one request may use | 413 `request too complex` (128 MiB, N69), with `"applied"` and `"code"` | client | Fewer or smaller entries |
 | NRV-E0114 | A field needs a layout, or names no field of it | 400 `fields need a layout for the table (PUT /v1/tables/<t>)`, `no such field`, `an add's field must be u64 or i64` | client | Declare the layout first |
 | NRV-E0115 | A field value does not fit its type | 400 `a bool field takes true or false`, `a bytes field takes at most its size in hex`, `a number is out of range` and the rest (catalog.zig) | client | As the message says |
@@ -98,14 +98,14 @@ These are the replies to `POST /v1/commit`. The identifier is the state machine'
 
 | Code | Summary | Today | Blame | Fix |
 | --- | --- | --- | --- | --- |
-| NRV-W0201 | The key committed earlier; this is its answer | 200 `{"status":"committed","op":…,"replayed":true,"code":"NRV-W0201"}` | — | None: this is the success of a resend |
+| NRV-W0201 | The key committed earlier; this is its answer | 200 `{"status":"committed","op":…,"replayed":true,"code":"NRV-W0201"}` (also on `/v1/documents/commit`) | — | None: this is the success of a resend |
 | NRV-E0202 | A read saw an old version | 409 `conflict`, with `index` and the newer `op` | client | Read again, then decide again |
 | NRV-E0203 | An add would cross its bound | 409 `out_of_bounds`, with `index` and the current `value` | client | Ask for less, or send `clamp` |
 | NRV-E0204 | An add names a row that does not exist | 409 `row_absent` | client | Send `create`, or put the row first |
 | NRV-E0205 | A conserved field changed other than by a pair | 409 `unpaired`, `conserved_write` | client | Move money only as a pair of adds (README, "Ledgers") |
 | NRV-E0206 | An add changes a field a view filters or groups by | 409 `view_key_field` | client | Change that field with a put |
-| NRV-E0207 | The key was used for a different transaction | 409 `key_reused` | client | A key names one transaction. A new transaction needs a new key |
-| NRV-E0208 | Two keys share their 64-bit hash | 409 `key_collision` | client | Choose a new key (about 3 in 10,000 among 10^8 keys) |
+| NRV-E0207 | The key was used for a different transaction | 409 `key_reused` (also on `/v1/documents/commit`) | client | A key names one transaction. A new transaction needs a new key |
+| NRV-E0208 | Two keys share their 64-bit hash | 409 `key_collision` (also on `/v1/documents/commit`) | client | Choose a new key (about 3 in 10,000 among 10^8 keys) |
 | NRV-E0209 | Two record ids share their 64-bit hash | 409 `id_collision` | client | Choose a new record id |
 | NRV-E0210 | A transaction writes one row twice | 400 `a transaction writes a row at most once (adds aside)` | client | Merge the writes |
 | NRV-E0211 | Views have no room in this op | 503 `views_busy` | retry | Resend under the same key |
