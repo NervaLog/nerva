@@ -261,6 +261,15 @@ work done.
   Whoever delegated checks the diff.
 - **One agent per new task.** Every slice, fix, lookup or review gets a fresh agent; a finished
   one is never resumed for the next task.
+- **A review is recorded on the pull request** (owner). When an Opus reviewer reviews a pull
+  request (a slice, a fix, a second review), its findings go on GitHub as one pull request
+  review, not only in the reviewer's report: a pending review with each finding as an inline
+  comment on its `file:line` (severity MUST, SHOULD or NIT first, then the failure scenario and
+  the evidence), and the verdict and any finding with no line in the review body, submitted as
+  `COMMENT` (the bot cannot approve or request changes on its own pull request). It ends with the
+  attribution footer. The reviewer posts it itself; if it cannot, the supervisor posts its report
+  unchanged. The fixer replies to each comment with the commit that fixes it, or why it does not.
+  A release review keeps its `release-review` issues as well.
 
 ## README and site status (adopted from Zigbox, P147)
 
