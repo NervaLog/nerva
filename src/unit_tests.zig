@@ -40,7 +40,6 @@ comptime {
     _ = @import("nerva/format_test.zig");
     _ = @import("nerva/http_connection.zig");
     _ = @import("nerva/import.zig");
-    _ = @import("nerva/vopr_start.zig");
     _ = @import("nerva/indexes.zig");
     _ = @import("nerva/internal_operations.zig");
     _ = @import("nerva/latency_histogram.zig");
@@ -55,6 +54,7 @@ comptime {
     _ = @import("nerva/view/declared_benchmark.zig");
     _ = @import("nerva/view/server.zig");
     _ = @import("nerva/views.zig");
+    _ = @import("nerva/vopr_start.zig");
     _ = @import("queue.zig");
     _ = @import("stack.zig");
     _ = @import("testing/exhaustigen.zig");
