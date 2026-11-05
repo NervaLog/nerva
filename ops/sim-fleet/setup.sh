@@ -5,6 +5,9 @@
 # 0600. It starts the service only when a token is present. It stops a running service first,
 # so its build never races the service's, and starts it again at the end.
 set -eu
+# This script's directory, resolved before the `cd /` below: run by a relative path, as the
+# README's "Deploy" says, `dirname "$0"` would be read against / (#178).
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 # `su simfleet` keeps the working directory, which simfleet may not be allowed to read.
 cd /
 
@@ -68,7 +71,7 @@ echo "$GITHUB_HOST_KEY" >"$HOME_DIR/known_hosts"
 chown simfleet:simfleet "$HOME_DIR/known_hosts"
 
 if [ ! -f /etc/sim-fleet/fleet.env ]; then
-    cp "$(dirname "$0")/fleet.env.example" /etc/sim-fleet/fleet.env
+    cp "$SCRIPT_DIR/fleet.env.example" /etc/sim-fleet/fleet.env
 fi
 # The remote fleet.env names (a private repository is fetched over SSH with the deploy key).
 REMOTE=$(sed -n 's/^SIM_FLEET_REMOTE=//p' /etc/sim-fleet/fleet.env | tail -n1)
