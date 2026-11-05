@@ -161,6 +161,12 @@ These are the replies to `POST /v1/commit`. The identifier is the state machine'
 | NRV-E0708 | The disk failed a read, a write or an fsync | Today a panic: `latent sector error`, `fsync failure` | operator | Replace the disk, then the replica (R5) |
 | NRV-E0709 | A replica's WAL is damaged | Today a raw `error: WALInvalid` or `WALCorrupt` | operator | Replace the replica (R5) |
 | NRV-E0710 | Not every replica address was given | `all --addresses must be provided` | operator | Give all of them, in replica order |
+| NRV-E0711 | This replica was imported from another export than its peers | Exit 8, `origin_mismatch`: `this replica was imported from export <A>, but <n> of the cluster's <m> replicas announce another` (replica.zig, P90) | operator | Import it again from the cluster's export, or `nerva recover` it with `--origin=` the export its peers announce |
+| NRV-E0712 | `nerva recover`: the other replicas did not commit its requests; they have no quorum | Not yet: R5 (`docs/briefs/r5.md`) | operator | Bring back enough of the other replicas first; with fewer, restore from a backup |
+| NRV-E0713 | `nerva recover`: the replica it would replace still answers at its address | Not yet: R5 | operator | Stop that replica and destroy its data file, then recover again |
+| NRV-E0714 | `nerva recover` needs a cluster of at least three replicas | Not yet: R5 | operator | Restore a smaller cluster from a backup |
+| NRV-E0715 | An earlier `nerva recover` did not finish | Not yet: R5 (`<path>.recovering` is left) | operator | Remove `<path>.recovering`, then recover again |
+| NRV-E0716 | `nerva recover`'s session was evicted before it finished | Not yet: R5 | retry | Run it again; fewer clients than 64 sessions |
 
 ## 08xx · Export and import
 
@@ -173,6 +179,8 @@ These are the replies to `POST /v1/commit`. The identifier is the state machine'
 | NRV-E0805 | The export's version is not one this release imports | Today a raw `import: <input>: VersionUnsupported` | operator | Import with a release that reads it |
 | NRV-E0806 | An earlier import did not finish | `import: <p>.importing is left from an import that did not finish; remove it` | operator | As the message says |
 | NRV-E0807 | The imported data failed its checks | Today a raw `import: Refused` or `ChecksFailed`, with the detail only logged | operator | Read the log lines above. R5 puts the reason in the message |
+| NRV-E0808 | A backup's manifest is missing, malformed, too large or of an unknown version | Not yet: R5 (`nerva restore`) | operator | Give the `.manifest.json` that `nerva backup` wrote beside the backup |
+| NRV-E0809 | A backup does not match its manifest: size, SHA-256, op, version, a view hash or a ledger total | Not yet: R5 (`nerva restore`) | operator | Use the backup the manifest names, or another backup with its own manifest |
 
 ## 09xx · Keys between replicas
 
@@ -196,6 +204,7 @@ These are the replies to `POST /v1/commit`. The identifier is the state machine'
 | NRV-B0001 | The gateway hit an internal error | 500 `internal error`, the Zig error only logged (server.zig:116, 206); includes `error.Corrupt` from a missing layout or bad document chunks | Report it with the gateway's log line |
 | NRV-B0002 | The gateway got a commit result it never expects | Today a panic of the gateway (api.zig:1051, 1116; documents_routes.zig) on `kind_invalid`, `field_invalid`, `key_invalid` and the rest: statuses the gateway's own checks should make impossible | Report it; R4 turns the panic into this reply |
 | NRV-B0003 | A replica stopped on an unknown protocol command | Exit 7, `unknown VSR command, crashing for safety` (#111) | Report it |
+| NRV-B0004 | A `nerva` command hit an error it did not expect | Not yet: R5; today a raw `error: <Name>` or `<command>: <Name>` (nerva_main.zig) | Report it with the command's output under `--log-debug` |
 
 ## What the codes change, and when
 
