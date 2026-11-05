@@ -1,5 +1,5 @@
 ---
-id: PXXX
+id: P188
 date: 2026-11-05
 area: Releases
 amends: P148b
