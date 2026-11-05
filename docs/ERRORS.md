@@ -13,8 +13,8 @@ a one-line summary, who is to blame, the cause and a fix. Codes are never reused
   (R5, `src/nerva/diagnostic.zig`; a unit test keeps its table equal to this file). Exit statuses:
   1 the operator's input, 2 the environment (disk, kernel, file system), 70 Nerva's bug (P149e);
   `nerva start`'s runtime exits (2 to 8) keep their statuses. Still uncoded, and R5's later
-  slices: the vendored flag parser's own errors (NRV-E0001, `error: …`), and the panics and
-  runtime exits of 07xx.
+  slices: the vendored flag parser's own errors (NRV-E0001, `error: …`), and the
+  runtime exits of 07xx (E0707 to E0709, E0711).
 - **Until the wire has them,** this file maps today's texts to codes, so a client can match on a
   code's identifier now and on the code later.
 
@@ -59,8 +59,8 @@ a one-line summary, who is to blame, the cause and a fix. Codes are never reused
 | NRV-E0002 | A flag's value is out of range | `error[NRV-E0002]: <command>: --replica-count must be …`, `--cache-grid …`, `--cache-rows …`, `--commit-stall-probability …`, `--statsd …`, `--trace …`, exit 1 | operator | The message names the bound |
 | NRV-E0003 | `--listen` is not an address | `error[NRV-E0003]: api: --listen must be <ipv4>:<port> or [<ipv6>]:<port>`, same for `view`, exit 1 | operator | Give `host:port`, IPv6 in brackets |
 | NRV-E0004 | An output file already exists | `error[NRV-E0004]: start: --trace <p> exists`, `export: <out> exists`, `import: <path> exists`, exit 1 | operator | Give a new path; Nerva never overwrites |
-| NRV-E0005 | A data file already exists at `format`'s path | `error[NRV-E0005]: format: <path> exists`, exit 1 (`format` only; the pre-flight for `start` and `import` is R5 slice 2) | operator | Choose another path, or remove the old file if it is really unwanted |
-| NRV-E0006 | A data file is missing at `start`'s path | Today a panic, `Path does not exist.` (io/linux.zig:1475) | operator | Run `nerva format` first, or fix the path |
+| NRV-E0005 | A data file already exists at `format`'s path | `error[NRV-E0005]: format: <path> exists`, exit 1 (`format`; `import` says E0004 for its path) | operator | Choose another path, or remove the old file if it is really unwanted |
+| NRV-E0006 | A data file is missing at `start`'s path | `error[NRV-E0006]: start: <path> does not exist`, exit 1 (pre-flight, before the vendored open, which panics `Path does not exist.`) | operator | Run `nerva format` first, or fix the path |
 | NRV-E0007 | A replica, gateway or view server cannot listen | `error[NRV-E0007]: <command>: cannot listen: <reason>`, exit 1 | operator | The port is taken or not allowed, or the host has no socket for that address |
 | NRV-E0008 | `NERVA_KEY` is missing or invalid | `error[NRV-E0008]: api: set NERVA_KEY`, `NERVA_KEY_NEXT is set but empty`, `… equals NERVA_KEY` (http_connection.zig:147-150), exit 1 | operator | Set it; `_NEXT` differs from it during a rotation |
 
@@ -158,13 +158,13 @@ These are the replies to `POST /v1/commit`. The identifier is the state machine'
 
 | Code | Summary | Today | Blame | Fix |
 | --- | --- | --- | --- | --- |
-| NRV-E0701 | The data file was written by another release | Today a panic, `multiversion unsupported` (#95) | operator | Upgrade by export and import (README, "Upgrading a cluster") |
-| NRV-E0702 | The data file is not a Nerva data file, or is damaged | Today a panic: `superblock not found`, `quorum lost` and the rest (superblock.zig:1420) | operator | Check the path; restore from a backup; see R5 |
-| NRV-E0703 | Another process holds the data file | Today a panic, `another process holds the data file lock` | operator | Stop the other replica |
-| NRV-E0704 | The file system cannot do direct IO | Today a panic, after log lines that say "TigerBeetle" | operator | Put the data file on ext4 or XFS |
-| NRV-E0705 | The kernel is older than 5.11 | Today a panic | operator | Upgrade the kernel |
+| NRV-E0701 | The data file was written by another release | `error[NRV-E0701]: start: <path> was written by release X, and this is release Y`, exit 1; nothing is written (pre-flight; closes #95, which was a panic `multiversion unsupported`) | operator | Upgrade by export and import (README, "Upgrading a cluster") |
+| NRV-E0702 | The data file is not a Nerva data file, or is damaged | `error[NRV-E0702]: start: <path> has no usable superblock (<NotFound\|QuorumLost\|…>)`, exit 1; also a path that is not a file (pre-flight, with the vendored `Quorums` on the file's copies) | operator | Check the path; restore from a backup; see R5 |
+| NRV-E0703 | Another process holds the data file | `error[NRV-E0703]: start: another process holds <path>`, exit 1 (pre-flight: `flock` taken and dropped, retried for 250 ms as the vendored open does) | operator | Stop the other replica |
+| NRV-E0704 | The file system cannot do direct IO | `error[NRV-E0704]: start: the file system of <path> does not support direct IO`, exit 2 (pre-flight; `--development` allows it) | operator | Put the data file on ext4 or XFS |
+| NRV-E0705 | The kernel is older than 5.11 | `error[NRV-E0705]: <command>: the kernel is X.Y; Nerva needs 5.11 or newer`, exit 2 (pre-flight, `format`, `start` and `import`) | operator | Upgrade the kernel |
 | NRV-E0706 | The disk is full | Exit 2, `write failed: no space left on device`; commands that write a file (`export`, `import`) print `error[NRV-E0706]`, exit 2 | operator | Free space or grow the volume |
-| NRV-E0707 | The data file outgrew its limit | Exit 4 or 5, which names a `--limit-storage` flag that Nerva does not have | operator | Today: export, then import into a larger file. The message is fixed in R5 |
+| NRV-E0707 | The data file outgrew its limit | Exit 4 or 5; the message names NRV-E0707 and no longer a `--limit-storage` flag that Nerva does not have (vendored text patch, UPSTREAM.md) | operator | None to raise the limit in this release; the message now says so. The limit is the build's `storage_size_limit_default`; export and import do not change it |
 | NRV-E0708 | The disk failed a read, a write or an fsync | Today a panic: `latent sector error`, `fsync failure`; `export` and `import` print `error[NRV-E0708]` for an I/O error on their files, exit 2 | operator | Replace the disk, then the replica (R5) |
 | NRV-E0709 | A replica's WAL is damaged | Today a raw `error: WALInvalid` or `WALCorrupt` | operator | Replace the replica (R5) |
 | NRV-E0710 | Not every replica address was given | `error[NRV-E0710]: start: all --addresses must be provided`, exit 1 | operator | Give all of them, in replica order |

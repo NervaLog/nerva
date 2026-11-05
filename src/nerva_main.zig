@@ -23,6 +23,7 @@ const import_ = @import("nerva/import.zig");
 const recover = @import("nerva/recover.zig");
 const release_peers = @import("nerva/release_peers.zig");
 const peer_auth = @import("nerva/peer_auth.zig");
+const preflight = @import("nerva/preflight.zig");
 
 const IO = @import("io.zig").IO;
 const Tracer = @import("trace.zig").Tracer;
@@ -143,6 +144,7 @@ fn run() !void {
         },
         .import => |*args| {
             log_level_set(args.log_debug);
+            preflight.kernel_check();
             // Before reading the export, which may be large: the data file must be new. The
             // import writes `<path>.importing` and links it to `<path>` once its checks pass,
             // so a failed or killed import never leaves a file a replica would start from (#78).
@@ -207,6 +209,16 @@ fn run() !void {
         },
         inline .format, .start => |*args, tag| {
             log_level_set(args.log_debug);
+
+            // Operator input never reaches a vendored panic: check the kernel, and for `start`
+            // the data file, before the vendored open (R5, P149).
+            preflight.kernel_check();
+            if (tag == .start) preflight.start(gpa, args.path, if (!constants.direct_io)
+                .disabled
+            else if (args.development)
+                .optional
+            else
+                .required);
 
             // Initialise IO before creating any file, so a failure leaves nothing behind.
             var io = try IO.init(if (tag == .format) 2048 else 128, 0);
