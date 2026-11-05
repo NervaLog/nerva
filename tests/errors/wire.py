@@ -231,7 +231,12 @@ def full(port):
     check("NRV-E0116", int(head.split()[1]), json.loads(text), 408, False, "a drip")
 
 
-def cluster_lost(cluster, port):
+def cluster_lost(cluster):
+    # A gateway of its own, with a short request timeout (P168d), its layouts already read.
+    port = cluster.gateway(args=["--request-timeout=1000"])
+    # (Refused as a conserved write, which still reads and keeps the layout.)
+    status, reply = commit(port, [put(port, ACCOUNTS, 9, {"available": "1"})])
+    assert status == 409 and reply["code"] == "NRV-E0205", reply
     replica = cluster.processes[0]
     replica.send_signal(signal.SIGSTOP)
     try:
@@ -266,7 +271,7 @@ def main():
         reads(port)
         documents(port)
         full(port)
-        cluster_lost(cluster, port)
+        cluster_lost(cluster)
         print(f"wire: {len(seen)} codes checked: {' '.join(sorted(c[4:] for c in seen))}")
     finally:
         cluster.close()

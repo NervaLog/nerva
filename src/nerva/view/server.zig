@@ -65,10 +65,14 @@ pub fn serve(gpa: std.mem.Allocator, client: *Client, options: Options) !noretur
     defer arena_instance.deinit();
 
     while (true) {
+        // Before every wait, not only when idle: requests that arrive often (a load balancer
+        // polling `/healthz`) must not keep a broken client from being replaced (#44).
+        if (health.state != .ready) _ = health.ready(client);
         // Requests are read from many connections at once, and served one at a time (N45).
         const received = try receiver.next(health.idle_timeout_ms(idle_poll_ms)) orelse {
             // Idle: keep up with the feed so reads rarely wait, once the client is ready.
             if (health.ready(client)) {
+                // Polling the feed is the probe: a reply to it is the cluster's.
                 _ = follower.poll() catch |err| switch (err) {
                     error.Timeout, error.Evicted => {
                         log.err("following the feed: {}", .{err});
@@ -76,6 +80,7 @@ pub fn serve(gpa: std.mem.Allocator, client: *Client, options: Options) !noretur
                     },
                     else => return err,
                 };
+                if (health.state == .ready) health.replied();
             }
             continue;
         };

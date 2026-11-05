@@ -52,6 +52,7 @@ const CLIArgs = union(enum) {
         cluster: u128,
         addresses: vsr.ClusterAddress,
         listen: []const u8,
+        request_timeout: u32 = request_timeout_default_ms,
         log_debug: bool = false,
     },
 
@@ -59,6 +60,7 @@ const CLIArgs = union(enum) {
         cluster: u128,
         addresses: vsr.ClusterAddress,
         listen: []const u8,
+        request_timeout: u32 = request_timeout_default_ms,
         log_debug: bool = false,
     },
 
@@ -134,10 +136,10 @@ const CLIArgs = union(enum) {
         \\              [--development] [--log-debug] <path>
         \\
         \\  nerva view --cluster=<integer> --addresses=<addresses> --listen=<host:port>
-        \\             [--log-debug]
+        \\             [--request-timeout=<milliseconds>] [--log-debug]
         \\
         \\  nerva api --cluster=<integer> --addresses=<addresses> --listen=<host:port>
-        \\            [--log-debug]
+        \\            [--request-timeout=<milliseconds>] [--log-debug]
         \\
         \\  nerva export --cluster=<integer> --addresses=<addresses> [--as-of=<op>|latest]
         \\               --output=<path> [--log-debug]
@@ -224,6 +226,12 @@ const CLIArgs = union(enum) {
         \\  --statsd=<host:port>
         \\        Send the replica's metrics as statsd over UDP every 10 seconds. The port
         \\        defaults to 8125; a bare port means 127.0.0.1. IPv6 goes in brackets.
+        \\
+        \\  --request-timeout=<milliseconds>
+        \\        view and api: how long a request to the cluster may wait for its reply,
+        \\        1000 to 60000 (default 30000). A gateway answers a request within the
+        \\        queue wait (1 s) plus this plus 1 s, so a client whose own timeout is
+        \\        longer always gets an answer. A request that times out may still commit.
         \\
         \\  --trace=<path>
         \\        Write a JSON trace of the replica's spans to <path> (Perfetto,
@@ -324,6 +332,8 @@ pub const Command = union(enum) {
         cluster: u128,
         addresses: vsr.ClusterAddress,
         listen: std.net.Address,
+        /// How long a cluster request may wait for its reply, in milliseconds.
+        request_timeout_ms: u32,
         log_debug: bool,
     };
 
@@ -331,6 +341,8 @@ pub const Command = union(enum) {
         cluster: u128,
         addresses: vsr.ClusterAddress,
         listen: std.net.Address,
+        /// How long a cluster request may wait for its reply, in milliseconds.
+        request_timeout_ms: u32,
         log_debug: bool,
     };
 
@@ -402,6 +414,8 @@ pub fn parse_args(flags: *stdx.Flags) Command {
             .addresses = view.addresses,
             .listen = listen_parse(view.listen) orelse
                 listen_invalid("view"),
+            .request_timeout_ms = request_timeout_validate(view.request_timeout) catch |err|
+                flag_range("view", err),
             .log_debug = view.log_debug,
         } },
         .api => |api| .{ .api = .{
@@ -409,6 +423,8 @@ pub fn parse_args(flags: *stdx.Flags) Command {
             .addresses = api.addresses,
             .listen = listen_parse(api.listen) orelse
                 listen_invalid("api"),
+            .request_timeout_ms = request_timeout_validate(api.request_timeout) catch |err|
+                flag_range("api", err),
             .log_debug = api.log_debug,
         } },
         .@"export" => |args| .{ .@"export" = export_resolve("export", args) },
@@ -618,7 +634,30 @@ test listen_parse {
     try std.testing.expect(listen_parse("[fe80::1%eth0]:8090") == null);
 }
 
+/// `--request-timeout`, in milliseconds (P168d): the wait for a cluster request's reply, which
+/// bounds how long a gateway takes to answer one (README, "The answer bound").
+pub const request_timeout_min_ms: u32 = 1_000;
+pub const request_timeout_max_ms: u32 = 60_000;
+pub const request_timeout_default_ms: u32 = 30_000;
+
+fn request_timeout_validate(milliseconds: u32) Error!u32 {
+    if (milliseconds < request_timeout_min_ms or milliseconds > request_timeout_max_ms) {
+        return error.RequestTimeoutOutOfRange;
+    }
+    return milliseconds;
+}
+
+test "--request-timeout is 1,000 to 60,000 ms" {
+    try std.testing.expectError(error.RequestTimeoutOutOfRange, request_timeout_validate(999));
+    try std.testing.expectEqual(@as(u32, 1_000), try request_timeout_validate(1_000));
+    try std.testing.expectEqual(@as(u32, 30_000), try request_timeout_validate(request_timeout_default_ms));
+    try std.testing.expectEqual(@as(u32, 60_000), try request_timeout_validate(60_000));
+    try std.testing.expectError(error.RequestTimeoutOutOfRange, request_timeout_validate(60_001));
+    try std.testing.expectError(error.RequestTimeoutOutOfRange, request_timeout_validate(0));
+}
+
 const Error = error{
+    RequestTimeoutOutOfRange,
     ReplicaCountZero,
     ReplicaCountTooLarge,
     ReplicaIndexOutOfRange,
@@ -659,6 +698,10 @@ fn error_message(err: Error) []const u8 {
         error.TracePathEmpty => "--trace must name a file",
         error.TraceSizeMaxWithoutTrace => "--trace-size-max needs --trace",
         error.TraceSizeMaxZero => "--trace-size-max must be positive",
+        error.RequestTimeoutOutOfRange => std.fmt.comptimePrint(
+            "--request-timeout must be {} to {} milliseconds",
+            .{ request_timeout_min_ms, request_timeout_max_ms },
+        ),
         error.CommitStallProbabilityInvalid => "--commit-stall-probability must be a ratio " ++
             "from 0 to 1, such as 1/5",
     };

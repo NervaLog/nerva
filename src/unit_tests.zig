@@ -33,6 +33,7 @@ comptime {
     _ = @import("nerva/catalog.zig");
     _ = @import("nerva/cli.zig");
     _ = @import("nerva/client.zig");
+    _ = @import("nerva/client_health.zig");
     _ = @import("nerva/diagnostic.zig");
     _ = @import("nerva/documents.zig");
     _ = @import("nerva/documents_benchmark.zig");

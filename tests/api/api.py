@@ -92,10 +92,10 @@ class Cluster:
         self.processes.append(process)
         return process
 
-    def gateway(self, env=None):
+    def gateway(self, env=None, args=()):
         env = env if env is not None else {"NERVA_KEY": KEY}
         process = self.spawn([self.nerva, "api", "--cluster=0", f"--addresses={self.address}",
-                              "--listen=127.0.0.1:0"], env={**os.environ, **env})
+                              "--listen=127.0.0.1:0", *args], env={**os.environ, **env})
         return int(process.stdout.readline())
 
     def close(self):
@@ -744,33 +744,74 @@ def check_key_rotation(cluster):
         assert KEY not in result.stderr and KEY_NEXT not in result.stderr, result.stderr
 
 
-def check_stall_recovery(cluster, port):
-    # A cluster stall past the client's timeout (30 s) breaks the gateway's client; the gateway
-    # replaces it once the cluster is back, and /healthz says so meanwhile (#27). It recovers
-    # with only /healthz polled, as a load balancer would, and no request for the cluster (#44).
+def check_stall_recovery(cluster, rounds):
+    # A cluster stall past the client's timeout breaks the gateway's client; the gateway replaces
+    # it once the cluster is back, and /healthz says so meanwhile (#27). It recovers with only
+    # /healthz polled, as a load balancer would, and no request for the cluster (#44). With
+    # --request-timeout=2000 (P168d): a write in flight answers "unknown" within 3.5 s, an idle
+    # gateway's /healthz breaks within the probe interval (5 s) plus the timeout, 7.5 s, and both
+    # recover within 10 s, the write resent under its key committing once.
+    idle = cluster.gateway(args=["--request-timeout=2000"])
+    sender = cluster.gateway(args=["--request-timeout=2000"])
     replica = cluster.processes[0]
-    replica.send_signal(signal.SIGSTOP)
-    try:
-        status, body = request(port, "POST", "/v1/lookup", {"rows": [{"table": 1, "id": "0"}]})
-        # A read that got no answer: nothing was written, so nothing was applied (NRV-E0601).
-        assert status == 503 and body["code"] == "NRV-E0601" and body["applied"] is False, (
-            status, body)
-        status, body = request(port, "GET", "/healthz", key=None)
-        assert status == 503 and body["code"] == "NRV-E0605", (status, body)
-    finally:
-        replica.send_signal(signal.SIGCONT)
-    deadline = time.monotonic() + 120
-    while request(port, "GET", "/healthz", key=None)[0] != 200:
-        assert time.monotonic() < deadline, "/healthz did not recover after the cluster did"
-        time.sleep(1)
-    status, body = request(port, "POST", "/v1/lookup", {"rows": [{"table": 1, "id": "0"}]})
-    assert status == 200, (status, body)
+    for round_ in range(rounds):
+        row = {"kind": "put", "table": 1, "id": str(5_000_000 + round_), "value_hex": "01"}
+        key = f"{round_ + 1:032x}"
+        # Warm the sender's catalog reads, so that the stalled request is the write itself.
+        warm = {"kind": "put", "table": 1, "id": str(6_000_000 + round_), "value_hex": "01"}
+        status, body = request(sender, "POST", "/v1/commit", {"entries": [warm]})
+        assert status == 200, (status, body)
+        replica.send_signal(signal.SIGSTOP)
+        stopped = time.monotonic()
+        try:
+            started = time.monotonic()
+            status, body = request(sender, "POST", "/v1/commit", {"key": key, "entries": [row]})
+            took = time.monotonic() - started
+            # A write that went out and got no answer may have committed (NRV-E0601).
+            assert status == 503 and body["code"] == "NRV-E0601" and body["applied"] == "unknown", (
+                status, body)
+            assert took < 3.5, f"the in-flight write answered after {took:.1f} s"
+            # A read that got no answer: nothing was written, so nothing was applied.
+            status, body = request(sender, "POST", "/v1/lookup", {"rows": [{"table": 1, "id": "0"}]})
+            assert status == 503 and body["code"] == "NRV-E0605" and body["applied"] is False, (
+                status, body)
+            # The idle gateway's /healthz, as a load balancer polls it: 503 by 7.5 s.
+            while True:
+                status, body = request(idle, "GET", "/healthz", key=None)
+                if status == 503:
+                    break
+                assert time.monotonic() - stopped < 7.5, "idle /healthz still 200 after 7.5 s"
+                time.sleep(0.25)
+            assert body["code"] == "NRV-E0605", (status, body)
+            assert time.monotonic() - stopped < 7.5, "idle /healthz took over 7.5 s to say 503"
+        finally:
+            replica.send_signal(signal.SIGCONT)
+        resumed = time.monotonic()
+        for name, port in (("idle", idle), ("sender", sender)):
+            while request(port, "GET", "/healthz", key=None)[0] != 200:
+                assert time.monotonic() - resumed < 10, (
+                    f"the {name} gateway's /healthz did not recover in 10 s (round {round_})")
+                time.sleep(0.25)
+        status, body = request(idle, "GET", "/healthz", key=None)
+        assert body == {"ok": True, "session": "ready"}, body
+        status, body = request(sender, "POST", "/v1/lookup", {"rows": [{"table": 1, "id": "0"}]})
+        assert status == 200, (status, body)
+        status, body = request(sender, "POST", "/v1/commit", {"key": key, "entries": [row]})
+        assert status == 200 and body["status"] == "committed", (status, body)
+        # The first send may have committed: then this is its replay, at the same op.
+        status, again = request(sender, "POST", "/v1/commit", {"key": key, "entries": [row]})
+        assert status == 200 and again["replayed"] is True and again["op"] == body["op"], again
+    # An idle gateway that is not stalled is not broken by probing.
+    time.sleep(6)
+    assert request(idle, "GET", "/healthz", key=None)[0] == 200
 
 
 def main():
     nerva = sys.argv[1]
     seed = next((int(a.split("=")[1]) for a in sys.argv[2:] if a.startswith("--seed=")), 1)
     steps = next((int(a.split("=")[1]) for a in sys.argv[2:] if a.startswith("--steps=")), 600)
+    stall_rounds = next((int(a.split("=")[1]) for a in sys.argv[2:]
+                         if a.startswith("--stall-rounds=")), 3)
     rng = random.Random(seed)
     cluster = Cluster(nerva)
     try:
@@ -825,7 +866,7 @@ def main():
         check_busy(nerva, cluster, ports[0])
         check_trace_refuses_existing(nerva, cluster.tmp)
         trace_size = check_trace_bounded(nerva, cluster.tmp)
-        check_stall_recovery(cluster, ports[1])
+        check_stall_recovery(cluster, stall_rounds)
         check_layouts(ports)
 
         assert request(ports[0], "POST", "/v1/lookup", {"rows": []}, key=None)[0] == 401
