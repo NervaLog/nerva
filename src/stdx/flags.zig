@@ -60,8 +60,16 @@ pub fn deinit(flags: *Flags, gpa: Allocator) void {
     flags.* = undefined;
 }
 
+/// Nerva patch (UPSTREAM.md): when set, `fatal` hands its formatted message to this function
+/// instead of printing it, so that a caller can report the failure with a code. It must not return.
+pub var fatal_hook: ?*const fn (message: []const u8) noreturn = null;
+
 /// Format and print an error message to stderr, then exit with an exit code of 1.
 pub fn fatal(comptime fmt_string: []const u8, args: anytype) noreturn {
+    if (fatal_hook) |hook| {
+        var buffer: [512]u8 = undefined;
+        hook(std.fmt.bufPrint(&buffer, fmt_string, args) catch buffer[0..]);
+    }
     const stderr = std.io.getStdErr().writer();
     stderr.print("error: " ++ fmt_string ++ "\n", args) catch {};
     // NB: this status must match vsr.FatalReason.cli, but it would be wrong for flags to depend on

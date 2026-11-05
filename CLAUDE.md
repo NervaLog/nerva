@@ -4,7 +4,7 @@ Guidance for Claude Code when working in this repository.
 
 **Read first, every session:** [README.md](./README.md) (design),
 [docs/GOALS-1.0.md](./docs/GOALS-1.0.md) (1.0 goals),
-[docs/DECISIONS.md](./docs/DECISIONS.md) and `docs/decisions/` (the decision log; see "Decisions and
+`docs/decisions/` (the decision log; see "Decisions and
 change notes" for how to add to it),
 [UPSTREAM.md](./UPSTREAM.md) (what is vendored), and [docs/TIGER_STYLE.md](./docs/TIGER_STYLE.md)
 (coding style, mandatory).
@@ -108,13 +108,13 @@ own, named by its number.
   ---
   ```
 
-  `area` is one of the section headings in `docs/DECISIONS.md`. `amends` (or `supersedes`) is optional and
+  `area` is one of the areas the existing decision files use. `amends` (or `supersedes`) is optional and
   names the earlier decision this one changes.
-- `docs/DECISIONS.md` is frozen: never edit it. N1 to N83 there keep their numbers and stay in
-  force.
+- N1 to N83 now live one per file in `docs/decisions/` (`N<n>-<slug>.md`) and keep their numbers;
+  `docs/DECISIONS.md` is a pointer. Never edit a merged decision file: amend or supersede it instead.
 - Never edit another pull request's decision file. To change any earlier decision, old or new,
   write a new one with `amends` or `supersedes`. The earlier text stays as it was.
-- Nothing builds an index yet. To learn what has been decided, read `docs/DECISIONS.md` and every file
+- Nothing builds an index yet. To learn what has been decided, read every file
   in `docs/decisions/`.
 
 ### Change notes
