@@ -47,6 +47,10 @@ jobs:
       # `test-all` multiplies the time limit by the number of tests, and the job has one hour.
       - name: Check the inputs
         run: |
+          if [[ "$ARGS" == *$'\n'* || "$ARGS" == *$'\r'* ]]; then
+            echo "::error::args must be one line: a newline would drop everything after it"
+            exit 1
+          fi
           if ! [[ "$ARGS" =~ ^test([[:space:]]+[A-Za-z0-9,._=-]+)*$ ]]; then
             echo "::error::args must be 'test' and options of letters, digits and , . _ = -: '$ARGS'"
             exit 1
@@ -55,6 +59,9 @@ jobs:
           read -r -a words <<< "$ARGS"
           for i in "${!words[@]}"; do
             case "${words[$i]}" in
+              --test-count|--test-count=*)
+                echo "::error::--test-count is refused: the 1200 s --time-limit check cannot bound a multiplied run"
+                exit 1 ;;
               --time-limit) limit=${words[$((i + 1))]:-} ;;
               --time-limit=*) limit=${words[$i]#--time-limit=} ;;
             esac
