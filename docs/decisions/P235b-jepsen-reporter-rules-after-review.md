@@ -19,7 +19,7 @@ Found by the adversarial review of #235. For `ops/jepsen/`:
   124, 125, 126 or 137, means Jepsen started and the test threw (a replica died at setup). It is
   the fingerprint `<workload>|run|crashed`, filed with the end of `jepsen.log`; status `failure`.
   No `jepsen.log` at all (the build, Docker, `lein`) stays the host's. A `jepsen.log` whose last
-  16 KiB shows a host failure (ssh to a node refused, `OutOfMemoryError`, no space left on device,
+  16 KiB shows a host failure (`JSchException`, `Auth fail`, `session is down`, or an ssh or `jepsen.control` line with a refused, timed-out or unroutable connection; never a client's own `Connection refused` to a gateway or replica, which the nemeses cause; `OutOfMemoryError`, no space left on device,
   a Docker error) is the host's, never filed (amended in the second review). Cost: a host failure
   with a signature not on that list is still filed once, and pins the commit at `failure`.
 - **A commit's status only moves up** (error, success, failure), per context, read first from GitHub's own

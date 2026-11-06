@@ -103,8 +103,12 @@ HOST_CODES = {124: "past the night's deadline", 125: "the run could not start",
               126: "the run could not start", 137: "killed by the host (out of memory?)"}
 # What a jepsen.log's end shows when the host failed under a test that had started (ssh to a
 # node refused, the JVM out of heap, the disk full, Docker): the host's, never filed (P235c).
+# A bare "Connection refused" is not one: Jepsen's clients log it to gateways and replicas while
+# the nemeses run, so only ssh and control-plane lines count (P235d).
 HOST_LOG_SIGNATURES = re.compile(
-    r"Connection refused|Connection timed out|No route to host|JSchException|"
+    r"JSchException|Auth fail|session is down|"
+    r"ssh: connect to host [^\n]*(?:Connection refused|Connection timed out|No route to host)|"
+    r"jepsen\.control[^\n]*(?:Connection refused|Connection timed out|No route to host)|"
     r"OutOfMemoryError|No space left on device|Cannot connect to the Docker daemon|"
     r"docker: Error|Error response from daemon", re.IGNORECASE)
 LOG_SIGNATURE_BYTES = 16 * 1024  # jepsen.log's end read to look for them.

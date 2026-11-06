@@ -322,7 +322,9 @@ class HostSignatures(unittest.TestCase):
         for tail in ("com.jcraft.jsch.JSchException: java.net.ConnectException: Connection "
                      "refused (n3:22)\n", "java.lang.OutOfMemoryError: Java heap space\n",
                      "java.io.IOException: No space left on device\n",
-                     "Cannot connect to the Docker daemon at unix:///var/run/docker.sock\n"):
+                     "Cannot connect to the Docker daemon at unix:///var/run/docker.sock\n",
+                     "ssh: connect to host n3 port 22: Connection refused\n",
+                     "WARN jepsen.control - n3 session is down\n"):
             github, _, summary = self.crashed(tail)
             self.assertEqual((github.statuses[0][1], summary["filed"], github.opened),
                              ("error", 0, []), tail)
@@ -331,9 +333,16 @@ class HostSignatures(unittest.TestCase):
         store = Store(self)
         directory = store.test("1", "", with_results=False, code=255, args="--workload retry")
         Path(directory, "jepsen.log").write_text(
-            "Connection refused\n" + "x\n" * rep.LOG_SIGNATURE_BYTES + "replica died\n")
+            "JSchException: Auth fail\n" + "x\n" * rep.LOG_SIGNATURE_BYTES + "replica died\n")
         github, _, summary = night(self, store)
         self.assertEqual((github.statuses[0][1], summary["filed"]), ("failure", 1))
+
+    def test_client_connection_errors_before_a_nerva_crash_are_still_filed(self):
+        client = ("WARN jepsen.client - invoke failed: java.net.ConnectException: Connection "
+                  "refused (http://10.77.0.12:8080)\nConnection timed out\nNo route to host\n")
+        github, _, summary = self.crashed(client * 50 + "ERROR replica 3 exited: assertion\n")
+        self.assertEqual((github.statuses[0][1], summary["filed"]), ("failure", 1))
+        self.assertIn("crashed", github.opened[0][1])
 
     def test_other_crashes_are_still_nervas(self):
         github, _, summary = self.crashed("ERROR replica 3 exited during format\n")
