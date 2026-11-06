@@ -9,7 +9,7 @@ amends: P244
 
 **Decision.** (1) `heal-script` accepts only `iptables -C` exit 1 as "no such rule"; exit 0 or
 any other code (iptables broken: 2, 3, 4) is NRV-E0604 and fails the heal. This corrects P244 (2),
-whose script read every `-C` failure as healed. (2) A node's teardown after the run
+whose script read every `-C` failure as healed. A gateway user that does not exist yet (a fresh node's first `db/cycle!` teardown, before `create-gateway-users!`) can have no rule, and iptables exits 2 parsing its name, so the script prints 0 for it first; the first hosted run on this branch crashed there, an error `-C` only exit 1 had turned from silent into fatal. (2) A node's teardown after the run
 (`teardown-node!`, once `setup!` ran in this DB) logs a failed heal and does not rethrow; it still
 kills everything and removes the data directory. Before a run (`db/cycle!`) it rethrows. (3) The
 final phase's `gateway-heal` carries `:final? true`, so a per-node failure is returned as `:error`

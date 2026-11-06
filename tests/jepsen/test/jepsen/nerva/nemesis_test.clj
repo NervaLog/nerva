@@ -75,7 +75,7 @@
 
 (defn- run-heal
   "Runs `heal-script` for gateway 1 under a stub `iptables` that behaves as `mode`:
-  `gone` (-D then -C exit 1), `deletes` (two -D succeed, then exit 1, -C exit 1), `stuck`
+  `nouser` (no such gateway user), `gone` (-D then -C exit 1), `deletes` (two -D succeed, then exit 1, -C exit 1), `stuck`
   (-D exit 1, -C exit 0), `broken` (everything exit 3). Returns {:exit :out :err}."
   [mode]
   (let [dir  (.toFile (java.nio.file.Files/createTempDirectory
@@ -90,6 +90,9 @@
                    "  -C) [ \"$MODE\" = stuck ] && exit 0; exit 1;;\n"
                    "esac; done; exit 9\n"))
     (.setExecutable ipt true)
+    (let [id (java.io.File. dir "id")]
+      (spit id "#!/bin/sh\n[ \"$MODE\" = nouser ] && exit 1; exit 0\n")
+      (.setExecutable id true))
     (let [r (shell/sh "sh" "-c" (db/heal-script ["10.0.0.1"] 1)
                       :env {"PATH" (str dir ":/usr/bin:/bin") "MODE" mode})]
       {:exit (:exit r), :out (str/trim (:out r)), :err (:err r)})))
@@ -103,6 +106,10 @@
     (let [r (run-heal "stuck")]
       (is (= 1 (:exit r)))
       (is (re-find #"NRV-E0604: gateway 1: the rule to 10.0.0.1 is still in place" (:err r)))))
+  (testing "a gateway user that does not exist yet has no rule (iptables would exit 2 on its name)"
+    (let [r (run-heal "nouser")]
+      (is (= 0 (:exit r)))
+      (is (= "0" (:out r)))))
   (testing "iptables itself broken is not read as healed"
     (let [r (run-heal "broken")]
       (is (= 1 (:exit r)))

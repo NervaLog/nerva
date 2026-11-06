@@ -419,10 +419,13 @@
   each replica node it deletes the rule up to `heal-deletes-max` times, stopping when `iptables
   -D` fails, then asks `iptables -C`. Only `-C` exit 1 means \"no such rule\"; exit 0 (the rule
   is still there) or any other code (iptables itself failed: 2, 3, 4) is NRV-E0604 naming the
-  rule, as `-D` fails both when no rule is left and when iptables is broken. Prints the number
+  rule, as `-D` fails both when no rule is left and when iptables is broken. A gateway user that
+  does not exist yet (a fresh node, before `create-gateway-users!`) can have no rule, and
+  iptables refuses to parse its name (exit 2): the script prints 0 for it. Prints the number
   deleted; exits 1 if any rule is left or could not be checked."
   [nodes index]
-  (str "n=0; left=0; for d in " (str/join " " nodes) "; do"
+  (str "id -u " (gateway-user index) " >/dev/null 2>&1 || { echo 0; exit 0; }; "
+       "n=0; left=0; for d in " (str/join " " nodes) "; do"
        " for i in $(seq " heal-deletes-max "); do"
        " iptables -w -t mangle -D OUTPUT " (gateway-rule index "$d")
        " 2>/dev/null || break; n=$((n+1)); done;"
