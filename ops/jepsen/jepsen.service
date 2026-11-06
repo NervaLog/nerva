@@ -1,0 +1,46 @@
+[Unit]
+Description=Nerva Jepsen nightly (retry and bank under kill, partition and gateway faults)
+Documentation=https://github.com/NervaLog/nerva/blob/main/ops/jepsen/README.md
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+User=jepsen
+Group=jepsen
+SupplementaryGroups=docker
+WorkingDirectory=/var/lib/jepsen
+EnvironmentFile=-/etc/jepsen/jepsen.env
+# systemd reads the token as root and hands the service a private copy under
+# $CREDENTIALS_DIRECTORY. It is not the simulation fleet's (R1, owner question 3).
+LoadCredential=token:/etc/jepsen/token
+# The fleet and Jepsen share the host and never overlap. `+` runs these two as root, outside the
+# sandbox below. ExecStopPost= runs whether the night passed, failed or was killed, so the fleet
+# always comes back; `-` because a host without a fleet has nothing to start.
+ExecStartPre=+-/usr/bin/systemctl stop sim-fleet.service
+ExecStart=/var/lib/jepsen/nerva/ops/jepsen/nightly.sh
+ExecStopPost=+-/usr/bin/systemctl start sim-fleet.service
+# nightly.sh keeps its own 3 h deadline; this bounds a hang of the shell itself.
+TimeoutStartSec=12600
+TimeoutStopSec=120
+Nice=5
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/jepsen
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=true
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=

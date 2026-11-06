@@ -155,7 +155,7 @@ on runners brought up for it. The simulation fleet ([ops/sim-fleet](./ops/sim-fl
 runs the VOPR and the fuzzers on fresh seeds on one host around the clock, at the tip of `main`,
 and files each distinct failure as an issue labelled `sim-fleet` (P147h). [tests/jepsen](./tests/jepsen/README.md) is a Jepsen suite: five
 real nodes, clients through `nerva api`, kills, pauses and partitions, and a history checked
-against what Nerva promises (a declared ledger's conservation, so far); it runs by hand (N82).
+against what Nerva promises (a declared ledger's conservation, so far); it runs by hand (N82), and nightly on the fleet's host once it is up ([ops/jepsen](./ops/jepsen/README.md): a failure is an issue labelled `jepsen`, a valid night a commit status).
 
 Binaries report `<protocol>+<commit>`. The protocol release (`0.0.5` since data files record
 the export they were imported from, P90) is what data files and clients check: a replica refuses

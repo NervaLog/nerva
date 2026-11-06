@@ -198,6 +198,15 @@ The journal shows `building <sha>` when `main` moves and, after each round,
   /tmp/st.json`.
 - After the first real day: the tracker has a comment for it.
 
+## The Jepsen window
+
+The Jepsen nightly ([ops/jepsen](../jepsen/README.md), R1) shares this host. At **01:17 UTC**
+`jepsen.service` stops `sim-fleet.service` (a stop is a clean `SIGTERM`; the loop's state
+survives, so the round in flight is lost and nothing else), runs for about 2.5 h and at most
+3 h, and starts the fleet again, whether the night passed, failed or was killed. A fleet that
+is stopped for the window is normal: its tracker line for that day is late, not missing. Do not
+start the fleet by hand during the window.
+
 ## Limits
 
 - The token files issues and comments; it cannot close, label or delete. Closing and reopening

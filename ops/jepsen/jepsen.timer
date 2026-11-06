@@ -1,0 +1,13 @@
+[Unit]
+Description=Nerva Jepsen nightly, at 01:17 UTC
+Documentation=https://github.com/NervaLog/nerva/blob/main/ops/jepsen/README.md
+
+[Timer]
+OnCalendar=*-*-* 01:17:00 UTC
+# A host that was off at 01:17 runs the night when it comes up.
+Persistent=true
+RandomizedDelaySec=0
+Unit=jepsen.service
+
+[Install]
+WantedBy=timers.target
