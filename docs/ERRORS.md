@@ -117,7 +117,6 @@ These are the replies to `POST /v1/commit`. The identifier is the state machine'
 | NRV-E0210 | A transaction writes one row twice | 400 `a transaction writes a row at most once (adds aside)` | client | Merge the writes |
 | NRV-E0211 | Views have no room in this op | 503 `views_busy` | retry | Resend under the same key |
 | NRV-E0212 | The transaction alone touches too many view groups | 413 `views_too_large` | client | Split the transaction |
-| NRV-E0213 | A layout or view declaration lost 16 attempts in a row to concurrent declarations | `503 {"error":"catalog busy","applied":…,"code":"NRV-E0213"}` on a layout or view declare; the cluster answered every attempt, so the session is kept (#216). `applied` is `false` if no write went out, else `"unknown"`: the counter counts the refused attempts too, though none changed anything | retry | Resend after a pause: the declaration is idempotent. If it repeats, fewer clients should declare the same table or view at once |
 
 ## 03xx · Declarations
 
@@ -135,6 +134,7 @@ These are the replies to `POST /v1/commit`. The identifier is the state machine'
 | NRV-W0310 | The view is declared but not maintained by the replicas | 200 `{"maintained":false,"reason":…}`: views full, extremes full, `min and max are not maintained over records` | client | Read it from `nerva view`, or free a slot |
 | NRV-E0311 | An index declaration is malformed | 400 `an index has at most 3 eq fields`, `the index breaks a rule (an eq key is at most 64 bytes)` and the rest | client | As the message says |
 | NRV-E0312 | An index is declared differently, or there is no room | 409 `different`, `indexes_full`, `table_indexes_full` | client | Choose a new name; 64 indexes, 4 per table |
+| NRV-E0313 | A layout or view declaration lost 16 attempts in a row to concurrent declarations | `503 {"error":"catalog busy","applied":"unknown","code":"NRV-E0313"}` on a layout or view declare; the cluster answered every attempt, so the session is kept (#216). `applied` is always `"unknown"`: each refused attempt counted as a write that went out, though none changed anything, and on the view route the view may already be declared in the state machine | retry | Resend after a pause: a resend writes the catalog document, and the declaration is idempotent. If it repeats, fewer clients should declare the same table or view at once |
 
 ## 04xx · Reads
 

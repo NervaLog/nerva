@@ -386,7 +386,7 @@ class Client:
             check(status == 503 and body.get("code", "").startswith("NRV-E06"),
                   f"neither committed nor refused: {status} {body}")
             check(body.get("applied") in (False, "unknown"), body)
-            check((body["applied"] == "unknown") == (body["code"] == "NRV-E0601"), body)
+            check((body["applied"] == "unknown") == (body["code"] in ("NRV-E0601", "NRV-E0313")), body)
             with self.lock:
                 if body["code"] == "NRV-E0602":
                     self.counts["busy"] += 1
