@@ -44,3 +44,45 @@ its completion carries `:down` and `:pending` as `[node index]` pairs, and
 `lazyfs/recover-checker` (key `:lazyfs`) fails the run with NRV-E0604 on any, or on an
 `:exception`. The change is local to the LazyFS path; the generic "gateways left down by
 `db/start!` are never judged" fix on `claude/jepsen-238-followup` may overlap and can replace it.
+
+## P242c: the fault is sound whether or not LazyFS honours O_DSYNC
+
+The Opus review of this pull request found that P242's claim "the slice's claim is the minority
+fault" does not hold if LazyFS drops `O_DSYNC` writes (#246): a clear then wipes everything the
+replica wrote since it last opened its file (`src/io/linux.zig:1653-1662` fsyncs only at open),
+which is replica amnesia, on one node as on five, and VSR does not tolerate amnesia of a majority.
+Back-to-back minority faults with no catch-up could leave a majority amnesic, and a failure would
+be the harness's. So #246's "the default fault is unaffected" was wrong; the fault is now sound
+either way. Changes:
+
+- **At most a minority is ever behind.** A fault does not act while a node it hit is pending
+  (killed, not restarted) or unsettled (restarted, not seen serving). It first waits for them
+  (`catch-up!`, 30 s) and is recorded `:skipped :not-caught-up` if they have not. "Caught up" is
+  approximate: the replica process alive and every gateway healthy for 5 s (`settle-recovery`).
+  No probe reads the replica's commit_max; filed in the follow-up issue.
+- **The clear is confirmed.** After the clear the op reads LazyFS's unsynced-data report again until
+  it is 0 (`:remaining`), so a fast restart cannot make the "lost" bytes durable first. The report
+  before the clear stays `:unsynced-bytes`.
+- **The replica is judged.** The recovery probes the replica process too (`db/node-health`), not
+  only gateways, which answer through the other replicas. NRV-E0604.
+- **Victims are queued before the kill**, so a fault that throws (the LazyFS pipe timeout) still has
+  them restarted and judged by the final recovery.
+- **Only the final recovery is judged for availability** (`:final? true`, run after the heal). A
+  mid-run recovery starts through `db/start-node-bounded!` (the replica, then `start-gateways!`,
+  whose wait is bounded) and settles for at most 30 s; its outcome is recorded, because a concurrent
+  `kill` or `partition` can remove quorum. The final recovery waits up to 180 s. The settle works
+  whether `db/start!` waits for gateways (today) or returns early (`claude/jepsen-238-followup`,
+  #244): after #244 merges nothing here changes, the probe just sees `:pending` first. If #244's
+  `final-start?` covers this fault, the final gateway start also judges the gateways; this
+  recovery's replica check stays. `lazyfs/package` is listed before `db-package` so its final
+  recovery runs before the final start. When #244 lands, `umount!` goes inside its teardown
+  `finally`, before `rm`.
+- **The verdict counts completions, not invocations** (they are paired by order on the one nemesis
+  process) and is invalid, without a code (the harness, not Nerva, is at fault), when the fault was
+  asked for and: a fault op threw; no final recovery ran; no fault took; none lost a byte; or a
+  clear was not seen to take.
+- The cache comment (128 MiB), the README and the namespace docstring no longer say `O_DSYNC` counts.
+
+What it costs: faults are skipped while a node is slow to return, so a run may apply fewer; a run
+where every fault is skipped is invalid. Until #246 is settled a minority verdict means "Nerva
+survives a replica forgetting its data, one or two at a time".

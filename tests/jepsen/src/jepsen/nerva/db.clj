@@ -303,6 +303,14 @@
   [test]
   (start-outcome (into {} (for [i (range (gateways test c/*host*))] [i (gateway-state i)]))))
 
+(defn node-health
+  "On this node: `node-gateway-outcome` plus `:replica`, `:up` while the replica process is alive
+  and `:dead` otherwise. A gateway answers through the other replicas, so it cannot show that
+  this node's own replica came back; the LazyFS recovery (P242c) judges both."
+  [test]
+  (assoc (node-gateway-outcome test)
+         :replica (if (cu/daemon-running? replica-pidfile) :up :dead)))
+
 (defn settle-states
   "Probes every `:pending` gateway in `states` (index to state) with `probe` in rounds, until
   none is pending or `(now)` passes `deadline`; between rounds it calls `(sleep!)`. The deadline
@@ -409,6 +417,16 @@
                    n      (parse-long (str/trim (c/exec :sh :-c script)))]
              :when (pos? n)]
          index)))
+
+(defn start-node-bounded!
+  "Starts the replica, then the gateways that are not running with `start-gateways!`, whose wait
+  is bounded (`start-settle-s`): a mid-run restart that a concurrent `kill` or `partition` has
+  left without quorum returns instead of retrying for minutes (`start-gateway-until-up!`). The
+  outcome is not returned; the caller probes (`node-health`)."
+  [test]
+  (c/su
+    (start-replica! test)
+    (start-gateways! test)))
 
 (defn kill-all!
   "SIGKILLs the gateways and the replica. The pidfile of a gateway the test did not start is

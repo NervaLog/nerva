@@ -84,17 +84,22 @@ The nemesis draws its targets from the gateways the test runs (`--gateways 2` gi
 With `lose-unfsynced-writes` in `--nemesis`, each node's data directory, `/opt/nerva/data`, is a
 [LazyFS](https://github.com/dsrhaslab/lazyfs) FUSE mount (`jepsen.nerva.lazyfs`, on
 `jepsen.lazyfs`) and the replica's data file is `/opt/nerva/data/replica.nerva`. LazyFS keeps
-every write in its own cache until it is fsynced (a write with `O_DSYNC`, which Nerva uses on every
-write, counts: the kernel turns it into a FUSE fsync); clearing the cache after the replica is dead
-loses exactly the writes the replica never made durable. A `--development` replica runs without
-direct IO (`nerva_main.zig`), which FUSE cannot do. Without the fault the data file is where it was
+every write in its own cache until it is fsynced; clearing the cache after the replica is dead
+loses the writes the replica never made durable. Whether LazyFS counts a write with `O_DSYNC`,
+which Nerva uses on every data-file open, as synced is not established (#246, P242c): if it does
+not, a clear loses everything the replica wrote since it last opened the file, which is replica
+amnesia. So the fault never acts while an earlier victim is down or has not caught up (such a
+fault is recorded `:skipped`), and its verdict (`:lazyfs`) is invalid when no fault lost a byte,
+a clear was not seen to take, a fault op threw, or the final recovery left a gateway or the
+replica down (NRV-E0604). Whether a `--development` replica gets `O_DIRECT` on FUSE is not
+measured (`replica.log` says if the mount refused it). Without the fault the data file is where it was
 and nothing is mounted.
 
 The node image (`node/Dockerfile`) builds LazyFS from one pinned commit (0.3.0, the version
 `jepsen.lazyfs` is written for) in a first stage that fails unless the checkout is exactly that
 commit and the binary finds its libraries; `run.sh` passes `/dev/fuse` to the nodes. The fault's
-op in the history lists `:killed` and `:unsynced-bytes` (what LazyFS held and so lost, by node,
-from its own report), and each node's `lazyfs.log` is in `store/`.
+op in the history lists `:killed`, `:unsynced-bytes` (what LazyFS held and so lost, by node,
+from its own report) and `:remaining` (the report after the clear, 0 when it took), and each node's `lazyfs.log` is in `store/`.
 
 Planned: bit flips, clock faults (on
 separate machines: `nerva` is a static binary, so libfaketime cannot fool it, and containers
