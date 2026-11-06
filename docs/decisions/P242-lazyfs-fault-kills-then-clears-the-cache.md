@@ -82,10 +82,16 @@ either way. Changes:
   recovery runs before the final start. When #244 lands, `umount!` goes inside its teardown
   `finally`, before `rm`.
 - **The verdict counts completions, not invocations** (they are paired by order on the one nemesis
-  process) and is invalid, without a code (the harness, not Nerva, is at fault), when the fault was
+  process) and is `:unknown`, without a code (the harness, not Nerva, is at fault), when the fault was
   asked for and: a fault op threw; no final recovery ran; no fault took; none lost a byte; or a
   clear was not seen to take.
 - The cache comment (128 MiB), the README and the namespace docstring no longer say `O_DSYNC` counts.
+
+Once #244 merges (it makes `nemesis/final-start?` true for this fault too, and registers a separate
+harness-failure code with `:valid? :unknown`), the final gateway start runs after a LazyFS fault and
+`final-start-checker` judges the gateways, so this checker's gateway judging can defer to it; the
+replica check and the harness `:unknown` verdicts stay. NRV-E0604 is used here only for a real
+gateway or replica left down.
 
 What it costs: faults are skipped while a node is slow to return, so a run may apply fewer; a run
 where every fault is skipped is invalid. Until #246 is settled a minority verdict means "Nerva

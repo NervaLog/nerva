@@ -252,7 +252,7 @@
     (let [r (check-recover (history (pair :lose-unfsynced-writes {:nodes ["n1"]}
                                           :exception {:cause "fifo timeout"})
                                     (recover-pair {})))]
-      (is (false? (:valid? r)))
+      (is (= :unknown (:valid? r)) "the harness failed: not a Nerva finding")
       (is (some #{:fault-threw} (:problems r))))
     (let [r (check-recover (history (fault-pair)))]
       (is (some #{:no-final-recover} (:problems r)))))

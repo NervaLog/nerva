@@ -89,9 +89,9 @@ loses the writes the replica never made durable. Whether LazyFS counts a write w
 which Nerva uses on every data-file open, as synced is not established (#246, P242c): if it does
 not, a clear loses everything the replica wrote since it last opened the file, which is replica
 amnesia. So the fault never acts while an earlier victim is down or has not caught up (such a
-fault is recorded `:skipped`), and its verdict (`:lazyfs`) is invalid when no fault lost a byte,
-a clear was not seen to take, a fault op threw, or the final recovery left a gateway or the
-replica down (NRV-E0604). Whether a `--development` replica gets `O_DIRECT` on FUSE is not
+fault is recorded `:skipped`), and its verdict (`:lazyfs`) is `:unknown` when no fault lost a byte,
+a clear was not seen to take or a fault op threw, and invalid with NRV-E0604 when the final
+recovery left a gateway or the replica down. Whether a `--development` replica gets `O_DIRECT` on FUSE is not
 measured (`replica.log` says if the mount refused it). Without the fault the data file is where it was
 and nothing is mounted.
 

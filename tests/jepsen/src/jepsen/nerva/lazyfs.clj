@@ -266,7 +266,8 @@
   `:down` or `:pending`, the replica dead, or did not finish (an `:exception`): a node that
   cannot serve after the restart is an availability finding. Only the final recovery is judged
   for that (`:final? true`): mid-run, a `kill` or `partition` may have removed quorum.
-  Invalid without a code (the harness, not Nerva, is at fault) when the fault was asked for and:
+  `:unknown`, without a code (the harness, not Nerva, is at fault; the run proved nothing), when
+  the fault was asked for and:
   a fault op threw; no final recovery ran; no fault took (`:faults` 0) or none lost a byte
   (`:lost-bytes` 0, so the run proved nothing); or a clear was not seen to take. A fault op
   skipped because an earlier victim had not caught up (`:skipped`) is counted, not judged.
@@ -296,7 +297,9 @@
                        (and asked? (empty? took))           (conj :no-fault-took)
                        (and (seq took) (zero? lost))        (conj :no-bytes-lost)
                        (seq unclear)                        (conj :clear-unconfirmed))]
-        (cond-> {:valid?     (and (empty? judged) (empty? problems))
+        (cond-> {:valid?     (cond (seq judged)   false
+                                   (seq problems) :unknown
+                                   :else          true)
                  :faults     (count took)
                  :skipped    (count skipped)
                  :lost-bytes lost
