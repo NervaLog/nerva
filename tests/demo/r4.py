@@ -19,7 +19,7 @@ last line is `demo-r4: PASS` or `demo-r4: FAIL step N: ...`.
  7  SIGKILL GA while A's callers are mid-commit: only A sees transport errors
  8  a new GA on the same port; A resends every unknown under its key
  9  SIGSTOP all three replicas for 10 s with B sending: 503 unknown within 4 s, healthz 503 within
-    8.5 s, both answer again within 10 s, B resends
+    8.5 s, both answer again within 10 s, B resends (none answers 409)
 10  a 4 MiB + 1 body (413), a future as_of (504), a drip (408), each with "applied": false
 11  every acknowledged key resent through GB answers replayed; the ledger and the view agree
 
@@ -436,7 +436,8 @@ class Client:
             except BaseException as error:  # noqa: BLE001
                 problems.append(repr(error))
 
-        pool = [threading.Thread(target=work, args=(pending[i::threads],)) for i in range(threads)]
+        pool = [threading.Thread(target=work, args=(pending[i::threads],), daemon=True)
+                for i in range(threads)]
         for thread in pool:
             thread.start()
         for thread in pool:
@@ -557,11 +558,12 @@ def step4(demo, a):
         except Exception as error:  # noqa: BLE001
             errors.append(repr(error))
 
-    threads = [threading.Thread(target=caller, args=(i,)) for i in range(CLIENT_THREADS)]
+    threads = [threading.Thread(target=caller, args=(i,), daemon=True) for i in range(CLIENT_THREADS)]
     for thread in threads:
         thread.start()
     for thread in threads:
         thread.join(30)
+        check(not thread.is_alive(), "a busy-probe caller never finished")
     check(not errors, errors[:3])
     check(len(replies) == CLIENT_THREADS, len(replies))
     for status, body, seconds in replies:
@@ -763,6 +765,7 @@ def step9(demo, a, b):
     stop.set()
     for thread in threads:
         thread.join(60)
+        check(not thread.is_alive(), "a step 9 caller never finished")
     check(not errors, errors[:3])
     inflight = [r for r in records if r[0] < stopped < r[1]]  # Sent before, answered after.
     check(inflight, "no request was in flight when the replicas stopped")
@@ -789,9 +792,10 @@ def step9(demo, a, b):
                   and (body["applied"] == "unknown") == (body["code"] == "NRV-E0601"), (status, body))
     count = b.resend_unresolved(b.port)
     check(not b.unresolved, f"{len(b.unresolved)} keys unresolved after the resend")
+    check(b.resent["conflict"] == 0, f"a resend answered 409: {b.resent}")
     say(f"{len(inflight)} in-flight requests answered 503 ({unknown} unknown, NRV-E0601) within {worst:.1f} s; "
         f"GA /healthz 503 (NRV-E0605) after {health['answered']:.1f} s; both ready {recovered:.1f} s "
-        f"after SIGCONT; {count} keys resent", started)
+        f"after SIGCONT; {count} keys resent, none answered 409", started)
 
 
 def step10(demo, a):
@@ -816,7 +820,9 @@ def step10(demo, a):
         status, body = read_reply(connection)
     finally:
         sender.join(60)
+        stuck = sender.is_alive()
         connection.close()
+    check(not stuck, "the oversized-body sender never finished")
     check(status == 413 and body.get("code") == "NRV-E0102" and body.get("applied") is False,
           (status, body))
     status, body = request(port, "GET", f"/v1/row?table={ACCOUNTS}&id=1&as_of={10 ** 12}")
@@ -860,7 +866,7 @@ def step11(demo, a, b):
         except BaseException as error:  # noqa: BLE001
             problems.append(repr(error))
 
-    pool = [threading.Thread(target=work, args=(keys[i::16],)) for i in range(16)]
+    pool = [threading.Thread(target=work, args=(keys[i::16],), daemon=True) for i in range(16)]
     for thread in pool:
         thread.start()
     for thread in pool:

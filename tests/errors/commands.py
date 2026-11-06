@@ -135,7 +135,64 @@ def main():
         check("trace exists", ["start", "--addresses=127.0.0.1:1,127.0.0.1:2,127.0.0.1:3",
                                "--development", "--trace=" + trace, data],
               "NRV-E0004", 1, "--trace")
-
+        # A --statsd address this host cannot send to is the operator's: E0010 naming the flag,
+        # never B0004 (a broadcast address) or E0007 "cannot listen" (no IPv6) (#181, #184).
+        statsd_bad = ["255.255.255.255:8125"]
+        try:
+            socket.socket(socket.AF_INET6, socket.SOCK_DGRAM).close()
+        except OSError:
+            statsd_bad.append("[2001:db8::1]:8125")  # a host without IPv6 has no such socket
+        for statsd in statsd_bad:
+            result = run(nerva, ["start", "--addresses=127.0.0.1:1,127.0.0.1:2,127.0.0.1:3",
+                                 "--development", f"--statsd={statsd}", data], {})
+            expect(result, "NRV-E0010", 1, "start: cannot send statsd to", f"start statsd {statsd}")
+            assert "cannot listen" not in result.stderr and "NRV-B0004" not in result.stderr
+            seen.append("NRV-E0010")
+        # A start that failed must not leave its --trace file behind: the operator fixes the flag
+        # and starts again with the same path, which must not be refused as E0004 (#197).
+        trace_again = os.path.join(tmp, "trace-again")
+        result = run(nerva, ["start", "--addresses=127.0.0.1:1,127.0.0.1:2,127.0.0.1:3",
+                             "--development", "--trace=" + trace_again,
+                             f"--statsd={statsd_bad[0]}", data], {})
+        expect(result, "NRV-E0010", 1, "start: cannot send statsd to", "trace with bad statsd")
+        assert not os.path.exists(trace_again), "the failed start left its trace file"
+        # Every other startup failure removes it too: a held port (NRV-E0007), a missing cluster
+        # key (NRV-E0901) and a missing address (NRV-E0710).
+        with socket.socket() as held:
+            held.bind(("127.0.0.1", 0))
+            held.listen()
+            port = held.getsockname()[1]
+            for label, argv, env, code, text in (
+                ("port held", [f"--addresses=127.0.0.1:{port},127.0.0.1:1,127.0.0.1:2",
+                               "--development"], {}, "NRV-E0007", "cannot listen"),
+                ("no cluster key", ["--addresses=10.0.0.1:1,10.0.0.2:2,10.0.0.3:3"], {},
+                 "NRV-E0901", "NERVA_CLUSTER_KEY"),
+                ("missing address", [f"--addresses=127.0.0.1:{port}", "--development"], {},
+                 "NRV-E0710", "--addresses"),
+            ):
+                path = os.path.join(tmp, "trace-" + label.replace(" ", "-"))
+                result = run(nerva, ["start"] + argv + ["--trace=" + path, data], env)
+                expect(result, code, 1, text, "trace with " + label)
+                assert not os.path.exists(path), f"{label}: the failed start left its trace file"
+                seen.append(code)
+        # A start that gets past replica.open is not refused with E0004 (#197) and its trace file
+        # exists. This does not test the clear itself (the file would exist without it): only the
+        # unit test does.
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            free = [probe.getsockname()[1]]
+        process = subprocess.Popen(
+            [nerva, "start", f"--addresses=127.0.0.1:{free[0]},127.0.0.1:1,127.0.0.1:2",
+             "--development", "--trace=" + trace_again, data],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            time.sleep(3)  # long enough for a replica that can start to be listening
+            assert process.poll() is None, "the replica did not stay running"
+            assert os.path.exists(trace_again), "the running replica has no trace file"
+        finally:
+            process.kill()
+            stderr = process.communicate()[1]
+        assert "NRV-E0004" not in stderr, stderr[-1000:]
 
         # Pre-flight before the vendored open (R5, P149): nothing here may panic or write.
         start = ["start", "--addresses=127.0.0.1:1,127.0.0.1:2,127.0.0.1:3", "--development"]

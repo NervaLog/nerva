@@ -59,6 +59,9 @@ pub fn log_runtime(
     }
 }
 
+/// Removes the `start --trace` file before the default panic handler runs (P208).
+pub const panic = std.debug.FullPanic(diagnostic.panic);
+
 pub const std_options: std.Options = .{
     // Messages are filtered at runtime by `log_level_runtime`.
     .log_level = .debug,
@@ -170,6 +173,11 @@ fn run() !void {
             else
                 null;
             defer if (trace_file) |file| file.close();
+            // Every coded exit from here on (through `diagnostic`) removes the file, or the next
+            // start is refused with NRV-E0004 on it (#197). So does a panic (`panic` above) and
+            // SIGINT or SIGTERM (P208). Not removed: vendored `vsr.fatal` exits (NRV-E0707, say;
+            // #206). `command_start` clears this once `replica.open` has returned.
+            if (trace_file) |file| diagnostic.cleanup_register(args.trace.?, file);
             var trace_file_writer: ?std.fs.File.Writer =
                 if (trace_file) |file| file.writer() else null;
             // Buffered, bounded, and never failing: a trace write error must not panic the
@@ -180,13 +188,26 @@ fn run() !void {
                 null;
             defer if (trace_writer) |*writer| writer.flush();
 
-            var tracer = try Tracer.init(gpa, time, .unknown, if (tag == .start) .{
+            var tracer = Tracer.init(gpa, time, .unknown, if (tag == .start) .{
                 .writer = if (trace_writer) |*writer| writer.writer() else null,
                 .statsd_options = if (args.statsd) |address|
                     .{ .udp = .{ .io = &io, .address = address } }
                 else
                     .log,
-            } else .{});
+            } else .{}) catch |err| {
+                // Only the statsd socket can fail here besides memory: the operator's `--statsd`
+                // names an address this host cannot send to (#181, #184).
+                switch (err) {
+                    error.OutOfMemory => return err,
+                    else => if (tag == .start and args.statsd != null) diagnostic.fail(
+                        "NRV-E0010",
+                        "start: cannot send statsd to {}: {s}",
+                        .{ args.statsd.?.to_std(), metrics.init_reason(err) },
+                        "give --statsd an address this host can send UDP to, or leave it out",
+                        .{},
+                    ) else return err,
+                }
+            };
             defer tracer.deinit(gpa);
 
             var storage = Storage.init(&io, &tracer, .{
@@ -747,6 +768,9 @@ fn command_start(
         ),
         else => |e| return e,
     };
+
+    // Startup succeeded: the trace file is the operator's now, whatever happens later.
+    diagnostic.cleanup_clear();
 
     log.info("{}: allocated {}MiB during replica init", .{
         replica.replica,
