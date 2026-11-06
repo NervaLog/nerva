@@ -28,6 +28,10 @@ OTHER = "fedcba9876543210fedcba9876543210fedcba98"
 VALID = "{:valid? true, :perf {:valid? true}, :timeline {:valid? true}}"
 
 
+HARNESS = ("{:valid? :unknown, :perf {:valid? true}, :gateways {:valid? :unknown, :code "
+           '"NRV-E0607", :final-starts 1, :heal-failures ["boom"]}}')
+
+
 def invalid(checker="workload", name="duplicate", keys=("aaaa",), extra=""):
     examples = " ".join(f'{{:key "{k}", :ops [3 5]}}' for k in keys)
     return (f"{{:valid? false, :perf {{:valid? true}}, :{checker} {{:valid? false, "
@@ -137,6 +141,36 @@ class Statuses(unittest.TestCase):
         self.assertEqual(github.statuses[0][1], "error")
         self.assertEqual(github.opened, [])
         self.assertEqual(summary["filed"], 0)
+
+    def test_a_harness_verdict_is_the_hosts_and_never_filed(self):
+        store = Store(self)
+        store.test("1", HARNESS, args="--workload bank --nemesis gateway")
+        runs, _ = rep.read_night(store.path, store.write_runs())
+        self.assertEqual(runs[0].kind, "host")
+        self.assertIn("NRV-E0607", runs[0].host_reason)
+        github, _, summary = night(self, store)
+        self.assertEqual(github.statuses[0][1], "error")
+        self.assertEqual(github.opened, [])
+        self.assertEqual(summary["filed"], 0)
+
+    def test_a_finding_elsewhere_outranks_a_harness_verdict(self):
+        both = ("{:valid? false, :perf {:valid? true}, :gateways {:valid? :unknown, :code "
+                '"NRV-E0607", :errors ["boom"]}, :protocol {:valid? false, :violations 2, '
+                ":examples [{:op 5}]}}")
+        store = Store(self)
+        store.test("1", both, args="--workload bank --nemesis gateway")
+        github, _, summary = night(self, store)
+        self.assertEqual(github.statuses[0][1], "failure")
+        self.assertEqual(summary["filed"], 1)
+        self.assertEqual(github.opened[0][1], "Jepsen bank: violations (checker protocol)")
+
+    def test_a_gateway_finding_is_still_nervas(self):
+        store = Store(self)
+        store.test("1", HARNESS.replace('"NRV-E0607"', '"NRV-E0604"').replace(
+            ":unknown", "false"), args="--workload bank --nemesis gateway")
+        github, _, summary = night(self, store)
+        self.assertEqual(github.statuses[0][1], "failure")
+        self.assertEqual(summary["filed"], 1)
 
     def test_no_jepsen_at_all_is_the_hosts(self):
         store = Store(self)
@@ -263,7 +297,7 @@ def bank_results(bank="true", source="true", view="true", refusals="true", proto
 
 class NestedCheckers(unittest.TestCase):
     def found(self, text):
-        found, graphs_only = rep.findings_of(rep.parse_edn(text))
+        found, graphs_only, _ = rep.findings_of(rep.parse_edn(text))
         self.assertFalse(graphs_only)
         return [(c, n) for c, n, _ in found]
 

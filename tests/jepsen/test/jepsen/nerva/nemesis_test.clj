@@ -364,6 +364,35 @@
               "returned, not thrown: the checker fails the run")
           (is (= {0 db/gateway-start-tries} @starts)))))))
 
+(deftest a-gateway-whose-probe-threw-does-not-hide-the-others
+  (let [starts (atom {}), kills (atom []), states (atom {0 [:dead], 1 [:up]})]
+    (with-redefs-fn (assoc (fake-gateways states starts kills)
+                           #'db/gateway-state
+                           (fn [i] (if (= 1 i)
+                                     (throw (ex-info "ssh went away" {}))
+                                     (first (get @states i)))))
+      (fn []
+        (binding [c/*host* "n1"]
+          (let [r (db/start-gateways-final! {:nodes ["n1"] :gateways 2})]
+            (is (= [0] (:down r)) "gateway 0 stays down, with its own state")
+            (is (= [] (:up r)))
+            (is (= "gateway 1: ssh went away" (:error r))
+                "gateway 1 is its own error entry")))))))
+
+(declare check-final pair final-op)
+
+(deftest a-probe-error-reaches-the-op-beside-the-states
+  (with-redefs [db/start-gateways-final! (fn [_] {:up [] :down [0] :pending []
+                                                   :error "gateway 1: ssh"})]
+    (let [r (nemesis/act! {} :gateway-start :all true)]
+      (is (= {:hit [] :down [0] :pending [] :error "gateway 1: ssh"} r))
+      (let [c (nemesis/completion {"n1" r})]
+        (is (= [["n1" 0]] (:down c)))
+        (is (= [["n1" "gateway 1: ssh"]] (:error c)))
+        (let [v (check-final (pair (final-op :value (merge {:final? true} c))))]
+          (is (false? (:valid? v)) "a gateway left down is a finding, whatever else threw")
+          (is (= "NRV-E0604" (:code v))))))))
+
 (deftest final-start-waits-for-a-pending-gateway
   (testing "pending, then up: no restart"
     (let [starts (atom {}), kills (atom []), states (atom {0 [:pending]})

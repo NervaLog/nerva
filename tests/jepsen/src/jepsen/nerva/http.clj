@@ -166,12 +166,14 @@
 
 (defn healthy?
   "Whether the gateway at node (and port, `api-port` when omitted) has a cluster session
-  (`/healthz` answers 200)."
+  (`/healthz` answers 200). No reply, or a reply that cannot be read (a body that is not JSON: a
+  gateway bug), is not healthy; only an interrupt propagates (P244e)."
   ([node]
    (healthy? node api-port))
   ([node port]
    (try (= 200 (:status (request! node port "GET" "/healthz" nil probe-timeout-ms)))
-        (catch IOException _ false))))
+        (catch InterruptedException e (throw e))
+        (catch Exception _ false))))
 
 (defn await-healthy!
   "Waits until the gateway at node (and port, `api-port` when omitted) is healthy, at most

@@ -114,10 +114,11 @@
   [test f arg final?]
   (case f
     :gateway-kill      {:hit (db/kill-gateways! arg)}
-    :gateway-start     (let [{:keys [up down pending]} (if final?
-                                                         (db/start-gateways-final! test)
-                                                         (db/start-gateways! test))]
-                         {:hit up, :down down, :pending pending})
+    :gateway-start     (let [{:keys [up down pending error]} (if final?
+                                                               (db/start-gateways-final! test)
+                                                               (db/start-gateways! test))]
+                         (cond-> {:hit up, :down down, :pending pending}
+                           error (assoc :error error)))
     :gateway-partition {:hit (db/partition-gateways! arg)}
     :gateway-heal      {:hit (db/heal-gateways! test)}
     :gateway-pause     {:hit (db/signal-gateways! arg "-STOP")}
@@ -133,7 +134,8 @@
 (defn completion
   "What a completion adds to the op's value: `:hit`, the gateways reached, and for a start
   `:down` (exited) and `:pending` (alive, not answering at the deadline) when there are any
-  (P238); `:error`, `[node message]` pairs, for nodes whose final start threw (P238c)."
+  (P238); `:error`, `[node message]` pairs, for nodes whose final start threw (P238c) or had a
+  gateway whose probe threw, beside that node's other gateways' states (P244e)."
   [hit]
   (let [down    (pairs-of hit :down)
         pending (pairs-of hit :pending)
@@ -145,7 +147,8 @@
 
 (defn act-on-node!
   "`act!` on this node. The final start's exception is caught and returned as `{:error message}`:
-  `c/on-nodes` would rethrow it and drop the other nodes' results (P238c)."
+  `c/on-nodes` would rethrow it and drop the other nodes' results (P238c). (`start-gateways-final!`
+  catches per gateway itself, so this one is for what is left outside a gateway.)"
   [test f arg final?]
   (if final?
     (try (act! test f arg true)

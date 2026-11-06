@@ -18,7 +18,8 @@ Each run is valid, invalid, unknown, or the host's:
   key, its anomaly class; never the seed or the commit); a known fingerprint gets a comment only
   for a commit it has not been reported on, at most COMMENTS_PER_FAILURE_PER_DAY a UTC day; at
   most FAILURES_PER_DAY distinct failures are looked at a day. The status is `failure`;
-- the host's (exit 124 past the night's deadline, 125, 126, 137 the OOM killer, 143 an
+- the host's (a checker's verdict carrying `:code "NRV-E0607"`, the Jepsen harness failing, unless
+  another checker found something: that finding is filed and the harness one is dropped; exit 124 past the night's deadline, 125, 126, 137 the OOM killer, 143 an
   interrupted night, unless a verdict was written: an invalid or unknown one outranks the exit code; a run with no `jepsen.log` at
   all; a night that did not start; graphs that did not draw): counted, status `error`, never an
   issue;
@@ -421,24 +422,32 @@ def failing_leaves(path, value, depth):
     return [(path, verdict, value)]
 
 
+HARNESS_CODE = "NRV-E0607"  # docs/ERRORS.md: the Jepsen harness failed, not Nerva (P244e).
+
+
 def findings_of(results):
-    """[(checker, class, result)] the verdict fails on, and whether only the host's graphs
-    failed. `checker` is a path: `protocol`, `workload`, `workload.source`."""
+    """([(checker, class, result)], graphs_only, harness) the verdict fails on. `graphs_only`:
+    only the host's graphs failed. `harness`: a failing checker carries `:code "NRV-E0607"`, the
+    Jepsen harness's own failure: it is the host's, never a finding, and is dropped from the list
+    whatever else failed (a real finding elsewhere in the run still outranks it).
+    `checker` is a path: `protocol`, `workload`, `workload.source`."""
     failing = []
     for key, value in results.items():
         if isinstance(key, Keyword) and str(key) != "valid?" and isinstance(value, dict):
             for leaf in failing_leaves(str(key), value, 1):
                 failing.append((str(key), *leaf))
-    real = [f for f in failing if f[0] not in HOST_CHECKERS]
+    harness = [f for f in failing if f[0] not in HOST_CHECKERS
+               and isinstance(f[3], dict) and kw(f[3], "code") == HARNESS_CODE]
+    real = [f for f in failing if f[0] not in HOST_CHECKERS and f not in harness]
     if not real:
-        return [], bool(failing)
+        return [], bool(failing) and not harness, bool(harness)
     firm = [f for f in real if f[2] is False] or real
     found = []
     for _, checker, _, value in firm:
         for name in checker_classes(checker, value):
             if len(found) < FINDINGS_MAX:
                 found.append((checker, name, value))
-    return found, False
+    return found, False, bool(harness)
 
 
 def anomaly_ids(subtrees):
@@ -632,7 +641,11 @@ def read_test(run, directory):
     if verdict is True:
         run.kind = "valid"
         return
-    run.findings, graphs_only = findings_of(results)
+    run.findings, graphs_only, harness = findings_of(results)
+    if harness and not run.findings:
+        run.kind = "host"
+        run.host_reason = f"the Jepsen harness failed ({HARNESS_CODE}), not Nerva"
+        return
     if graphs_only or not run.findings:
         run.kind = "host"
         run.host_reason = "Jepsen's graphs did not draw (gnuplot?)" if graphs_only \

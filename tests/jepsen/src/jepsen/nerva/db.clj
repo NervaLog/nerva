@@ -347,29 +347,42 @@
   and, if it exits or stays silent, killed and started with `start-gateway-until-up!`. Bounded as
   that function is, per gateway, gateways in turn. Returns `{:up [...] :down [...] :pending
   [...]}` (`start-outcome`); a gateway that is not up (NRV-E0604) is returned, not thrown, so the
-  node's other gateways and the other nodes keep their results. `nemesis/final-start-checker`
-  makes the run invalid."
+  node's other gateways and the other nodes keep their results. Each gateway is handled in its
+  own `try`: one whose probe or start threw (ssh, the harness) is left out of the states and named
+  in `:error` (`\"gateway N: message\"`, joined with `; `), and the node's other gateways keep
+  their `:up`, `:down` and `:pending`, so a gateway left down is never hidden by another's harness
+  failure (P244e). `nemesis/final-start-checker` judges both."
   [test]
   (let [restart! (fn [index]
                    (cu/stop-daemon! (gateway-pidfile index))
                    (start-gateway-until-up! test index))
-        states   (into {}
-                       (for [index (range (gateways test c/*host*))]
-                         [index (case (gateway-state index)
-                                  :up      :up
-                                  :dead    (start-gateway-until-up! test index)
-                                  :pending (let [s (settle-gateway test index)]
-                                             (if (= :up s) :up (restart! index))))]))]
+        one      (fn [index]
+                   (try [index (case (gateway-state index)
+                                 :up      :up
+                                 :dead    (start-gateway-until-up! test index)
+                                 :pending (let [s (settle-gateway test index)]
+                                            (if (= :up s) :up (restart! index))))]
+                        (catch InterruptedException e (throw e))
+                        (catch Exception e
+                          [index (str "gateway " index ": " (or (.getMessage e) e))])))
+        results  (mapv one (range (gateways test c/*host*)))
+        states   (into {} (remove (comp string? second)) results)
+        errors   (vec (keep (fn [[_ r]] (when (string? r) r)) results))]
     (doseq [[index state] states :when (not= :up state)]
       (warn "NRV-E0604: gateway" index "on" c/*host* "is" (name state) "after the final start"))
-    (start-outcome states)))
+    (doseq [e errors]
+      (warn "NRV-E0607:" e "on" c/*host* "(the probe or the start threw)"))
+    (cond-> (start-outcome states)
+      (seq errors) (assoc :error (str/join "; " errors)))))
 
 (defn signal-script
   "One shell command that sends `signal` to gateway `index`'s pid only if that process is the
-  gateway's own user's (`gateway-user`; `setpriv` drops to it before the exec): the pidfile is
-  read once, so a pid cannot be reused between the check and the signal. A stale pidfile after an
-  NRV-E0604 exit may name a pid another process now has, which this refuses; a pid that is gone
-  fails the command."
+  gateway's own user's (`gateway-user`; `setpriv` drops to it before the exec). The pidfile is
+  read once, so the check and the signal cannot see two pids; but `stat` and `kill` are still
+  two steps, so a pid that exits and is reused in between is signalled (the window is one shell
+  command, and only a process of the gateway's own user passes the check). A stale pidfile after
+  an NRV-E0604 exit may name a pid another user's process now has, which this refuses; a pid that
+  is gone fails the command."
   [index signal]
   (str "p=$(cat " (gateway-pidfile index) ") && [ \"$(stat -c %U /proc/$p)\" = "
        (gateway-user index) " ] && kill " signal " $p"))
@@ -437,8 +450,9 @@
 (defn heal-gateways!
   "Lifts every gateway cut on this node (all indices and replicas, whatever was cut) and
   confirms none is left (`heal-script`); a rule that survives, or iptables failing, throws, which
-  fails the op (`nemesis/final-start-checker` makes the run `:unknown` for it, NRV-E0607).
-  Returns the indices that had a rule."
+  fails the op. Only the final heal (`:final? true`) is judged: `nemesis/final-start-checker`
+  makes the run `:unknown` (NRV-E0607) for it; a mid-run heal that threw is only listed
+  (`:mid-run-heal-failures`). Returns the indices that had a rule."
   [test]
   (vec (for [index (range max-gateways)
              :let [n (parse-long (str/trim (c/exec :sh :-c (heal-script (:nodes test) index))))]

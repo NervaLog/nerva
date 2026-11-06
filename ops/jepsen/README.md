@@ -47,10 +47,10 @@ standard library only (P147i). For each run:
 | valid | `success` | none |
 | invalid or unknown (`results.edn`) | `failure` | one per fingerprint |
 | the test threw: a `jepsen.log` and no `results.edn`, and no host exit code, and no host failure (ssh refused, out of heap, disk full, Docker) at the log's end (`nerva` died at setup, say) | `failure` | one per workload (checker `run`, class `crashed`), with the log's end |
-| the host's (exit 124, 125, 126, 137 or 143 with no verdict written, a build that failed, Docker down, Jepsen never started, graphs that did not draw) | `error` | **never** |
+| the host's (exit 124, 125, 126, 137 or 143 with no verdict written, a build that failed, Docker down, Jepsen never started, graphs that did not draw, a checker's verdict carrying `:code "NRV-E0607"`: the Jepsen harness failed, P244e) | `error` | **never** |
 
 `failure` outranks `error` outranks `success`: a night with one real finding and one host
-failure is `failure`, and the finding is filed. A night that did not run at all (`host-failure`
+failure is `failure`, and the finding is filed. A harness verdict (NRV-E0607) beside a finding in the same run is dropped: the finding is filed, the run is `invalid` or `unknown`. A night that did not run at all (`host-failure`
 in the store) is `error`.
 
 - **Fingerprint:** workload, the failing checker key and its anomaly class (`duplicate`,
