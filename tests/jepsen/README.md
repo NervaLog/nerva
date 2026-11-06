@@ -40,13 +40,15 @@ Options (`lein run test --help` lists Jepsen's own):
 
 | Option | Default | |
 |---|---|---|
-| `--workload` | `bank` | What the clients do and what is checked (below) |
+| `--workload` | `bank` | `bank` or `retry`: what the clients do and what is checked (below) |
 | `--nemesis` | none | Comma-separated faults: `kill`, `pause`, `partition` |
 | `--nemesis-interval` | 10 | Mean seconds between faults |
 | `--rate` | 20 | Requests per second, over all workers |
 | `--time-limit` | 60 | Seconds of requests and faults, before healing |
 | `--recovery-time` | 20 | Seconds between healing and the final reads |
-| `--gateways` | 1 | Gateways per node: 1, or 2 (ports 8080 and 8081; the workload's clients use the first). They listen on `0.0.0.0` with `--listen-remote`, since the control node reaches them over the network |
+| `--drop-reply` | 0.1 | `retry`: the probability that the client discards a `200` and resends it as if it were lost |
+| `--attempts` | 8 | `retry`: attempts per operation (one key) before it ends unresolved |
+| `--gateways` | 1 (2 for `retry`) | Gateways per node: 1, or 2 (on the first three nodes only, as a development replica takes 8 clients; ports 8080 and 8081; `bank`'s clients use the first, `retry`'s use both). They listen on `0.0.0.0` with `--listen-remote`, since the control node reaches them over the network |
 
 ## What a reply means
 
@@ -82,9 +84,26 @@ lookup, so one op) totals what was funded with no field below 0, the source neve
 sum view over the accounts always answers the funded total, and a transfer is refused only as
 `out_of_bounds`.
 
-Planned: `retry` (an application's retry after a `503`: is an add applied twice?), `claim`
-(compare-and-set receipts), `register` (transaction isolation, with Elle), and `feed` (the
-change feed, history as of an op, and view hashes across gateways).
+**`retry`**: what Botpike does after a lost reply (P123): resend a keyed commit, under the same
+key, until the answer is definite. Eight account rows (`balance`, floored at 0) and an unfloored
+source in a declared ledger; an operation is a pay-in of 1 to 30 from the source to one account
+(a pair of adds, no `clamp`, so a pay-in never fails for funds and every commit of it moves
+exactly its amount). Each draws a fresh 128-bit key from Jepsen's random source (`--seed` steers
+it). Replies are lost on purpose: a client timeout of 35 s, or with probability 1/4 a short one
+(50 to 1,999 ms, below the gateways' `--request-timeout=3000`), and `--drop-reply` of the `200`s
+discarded. An attempt that is not definite goes to another gateway of any node, after a backoff,
+up to `--attempts`. The operation is `:ok` with the op of its first `200`, `:fail` if every
+attempt was `applied: false` (or never connected), else `:info`. After healing, every key whose
+operation did not end `:ok` is resent until a `2xx` answers it, and then every account is read
+in one lookup. Checked: `duplicate` (every `200` for a key, a discarded one included, names the
+same op), `balance` (each account holds the sum of the amounts of the keys that committed for
+it, each once, and the source holds minus their total), `applied-lie` (a key whose attempts were
+all `applied: false` is answered first-time, never `replayed`), `key-reused` and `key-collision`
+(the client never changes a key's entries; a collision is reported with its key). A key no
+`2xx` answered even in the final phase makes the result `:unknown`, not invalid.
+
+Planned: `claim` (compare-and-set receipts), `register` (transaction isolation, with Elle), and
+`feed` (the change feed, history as of an op, and view hashes across gateways).
 
 ## On a hosted runner
 

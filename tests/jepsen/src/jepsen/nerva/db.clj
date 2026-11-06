@@ -21,11 +21,21 @@
 (def replica-pidfile (str dir "/replica.pid"))
 (def api-pidfile (str dir "/api.pid"))
 
+(def two-gateway-nodes
+  "With `--gateways 2`, only this many nodes run two: a development replica takes at most 8
+  client connections (`pipeline_prepare_queue_max`, no `--pipeline-requests-limit`), and a
+  gateway is one client on every replica. Ten gateways left the last one unable to connect."
+  3)
+
 (defn gateways
-  "How many `nerva api` gateways each node runs (`--gateways`, 1 or 2): R4's sidecar topology
-  has one per client process, so two gateways share every replica."
-  [test]
-  (:gateways test 1))
+  "How many `nerva api` gateways `node` runs (`--gateways`, 1 or 2): R4's sidecar topology has
+  one per client process, so two gateways share a replica. With 2, only the first
+  `two-gateway-nodes` nodes run two (6 gateways, 2 spare client slots per replica)."
+  [test node]
+  (let [n (:gateways test 1)]
+    (if (and (= 2 n) (<= two-gateway-nodes (.indexOf ^java.util.List (vec (:nodes test)) node)))
+      1
+      n)))
 
 (defn gateway-port
   "Gateway `index` listens on `http/api-port` plus its index."
@@ -108,19 +118,53 @@
                     binary :start (str "--addresses=" (addresses test)) :--development
                     data-file))
 
+(defn start-gateway!
+  "Starts gateway `index` once."
+  [test index]
+  (apply cu/start-daemon!
+         {:logfile           (gateway-log index)
+          :pidfile           (gateway-pidfile index)
+          :chdir             dir
+          :match-executable? false
+          :env               {:NERVA_KEY http/api-key}}
+         (concat [binary :api (str "--cluster=" cluster)
+                  (str "--addresses=" (addresses test))
+                  (str "--listen=0.0.0.0:" (gateway-port index))
+                  :--listen-remote]
+                 (when-let [ms (:request-timeout test)]
+                   [(str "--request-timeout=" ms)]))))
+
+(def gateway-start-tries
+  "A gateway exits (NRV-E0604) when the cluster does not answer within its `--request-timeout`
+  at start, as while the replicas are still starting or cut off. Botpike's supervisor would
+  restart it; the suite does the same, this many times."
+  6)
+
+(def gateway-start-wait-s
+  "How long `start-api!` waits for a started gateway to be healthy or dead."
+  15)
+
 (defn start-api!
   "Starts the test's gateways. The control node reaches them over the network, so they listen
-  on every address and say so: `--listen-remote` (P168, NRV-E0009)."
+  on every address and say so: `--listen-remote` (P168, NRV-E0009). A test's `:request-timeout`
+  (milliseconds) becomes their `--request-timeout`. A gateway that exits at start is started
+  again (`gateway-start-tries`); one that is neither healthy nor dead after
+  `gateway-start-wait-s` is left. Under `partition` a gateway can stay dead: with a 3 s
+  `--request-timeout` its tries are spent in about 18 s, and nothing starts it again until the
+  nemesis's next `:start`; the run then has fewer gateways until then, never wrong results."
   [test]
-  (doseq [index (range (gateways test))]
-    (cu/start-daemon! {:logfile           (gateway-log index)
-                       :pidfile           (gateway-pidfile index)
-                       :chdir             dir
-                       :match-executable? false
-                       :env               {:NERVA_KEY http/api-key}}
-                      binary :api (str "--cluster=" cluster) (str "--addresses=" (addresses test))
-                      (str "--listen=0.0.0.0:" (gateway-port index))
-                      :--listen-remote)))
+  (doseq [index (range (gateways test c/*host*))]
+    (loop [tries 1]
+      (start-gateway! test index)
+      (let [deadline (+ (System/nanoTime) (* gateway-start-wait-s 1000000000))
+            state    (loop []
+                       (cond (http/healthy? c/*host* (gateway-port index)) :up
+                             (not (cu/daemon-running? (gateway-pidfile index))) :dead
+                             (< deadline (System/nanoTime)) :pending
+                             :else (do (Thread/sleep 500) (recur))))]
+        (when (and (= :dead state) (< tries gateway-start-tries))
+          (info "Gateway" index "on" c/*host* "exited at start; starting it again")
+          (recur (inc tries)))))))
 
 (defn kill-all!
   "SIGKILLs the gateways and the replica. The pidfile of a gateway the test did not start is
@@ -149,7 +193,7 @@
                 :--development data-file)
         (start-replica! test)
         (start-api! test))
-      (doseq [index (range (gateways test))]
+      (doseq [index (range (gateways test node))]
         (http/await-healthy! node (gateway-port index) healthy-timeout-s))
       (jepsen/synchronize test)
       (when (= node (jepsen/primary test))
@@ -182,5 +226,5 @@
     db/LogFiles
     (log-files [_ test node]
       (into {replica-log "replica.log"}
-            (for [index (range (gateways test))]
+            (for [index (range (gateways test node))]
               [(gateway-log index) (if (zero? index) "api.log" (str "api-" index ".log"))])))))
