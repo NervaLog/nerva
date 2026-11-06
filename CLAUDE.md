@@ -144,6 +144,16 @@ top of the pull request description (types, wire and on-disk formats, signatures
 then implement it in small steps, running `./zig/zig build check` and the relevant tests between
 each.
 
+- **Jepsen harness changes** run [tests/jepsen/CHECKLIST.md](./tests/jepsen/CHECKLIST.md) before
+  their first review (P250).
+- **Prove a surprising fault-injector result** against a minimal standalone reproduction before
+  you review or fix code built on it (P250).
+- **Cut slices so concurrent pull requests touch different files.** When they must share one, the
+  shared part merges first (P250).
+- **Leave draft as soon as the pull request is coherent,** so CI runs (P250).
+- **Iterate on a Jepsen change with a short smoke:** dispatch `jepsen.yml` with `args` such as
+  `--time-limit 60`. The full default run is for the head that will merge (P250).
+
 ### Stop
 
 Each of these stops the work. Do not go round it, and do not merge.
@@ -248,12 +258,20 @@ work done.
   the code.
 - **Keep noisy output out of context.** Redirect `zig build`, VOPR and test output to a file and
   read only the failing lines.
+- **Check a brief's premises** (what is merged, with `git log`) before handing it to an agent
+  (P250).
+- **Scratch outside the tree.** Downloads, builds of third-party code and scratch files go in the
+  session scratchpad, never in the repository (P250).
+- **One worktree per agent.** Agents that run at once never share a checkout: each works in its
+  own `git worktree` with its own `ZIG_GLOBAL_CACHE_DIR`, and adds files by path, never
+  `git add -A` (P250).
 - **Delegate lookups** (searching the vendored TigerBeetle code, the Zig std) to a read-only agent
   and keep only the answer.
 - **The cheapest model suited to the task** (owner, P148b). Name the model whenever you start an
   agent or session; never let it inherit one by default.
   - **Haiku:** mechanical work fully specified by a pattern (threading an argument through call
-    sites, a rename, a status update, a CI tweak) and read-only lookups.
+    sites, a rename, a status update, a CI tweak), watching CI and auto-merge and other polling
+    (P250), and read-only lookups.
   - **Sonnet:** implementing a slice, its tests, and fixing a review finding.
   - **Opus:** design, briefs, adversarial and release review, and a judgment the cheaper model got
     wrong.
