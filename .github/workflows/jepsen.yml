@@ -117,26 +117,29 @@ jobs:
           # Jepsen exits 0 valid, 1 invalid, 2 unknown, 255 on a crash.
           tests/jepsen/run.sh "$NERVA" "${words[@]}"
 
+      # Searches case-insensitively, for the key and for its first 16 hex characters. The pack
+      # and upload below run only when this step did not fail: a leak is never uploaded.
       - name: The store holds no cluster key
+        id: keyscan
         if: always()
         run: |
           [[ -n "${NERVA_CLUSTER_KEY:-}" ]] || exit 0
           [[ -d tests/jepsen/store ]] || exit 0
-          if grep -rlF -- "$NERVA_CLUSTER_KEY" tests/jepsen/store; then
+          if grep -rliF -e "$NERVA_CLUSTER_KEY" -e "${NERVA_CLUSTER_KEY:0:16}" tests/jepsen/store; then
             echo "::error::the cluster key is in the store (files above): do not share the artifact"
             exit 1
           fi
           echo "No file in store/ holds the run's cluster key" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Pack Jepsen's store
-        if: always()
+        if: always() && steps.keyscan.outcome != 'failure'
         run: |
           if [ -d tests/jepsen/store ]; then
             tar -czf "$RUNNER_TEMP/jepsen-store.tar.gz" -C tests/jepsen store
           fi
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        if: always()
+        if: always() && steps.keyscan.outcome != 'failure'
         with:
           name: jepsen-store
           path: ${{ runner.temp }}/jepsen-store.tar.gz
@@ -157,5 +160,17 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           BRANCH: ${{ github.ref_name }}
+          RUN_SHA: ${{ github.sha }}
+        # Only while the branch still points at this run's commit: a newer push to the same
+        # name (which cancelled this run) holds its own commit, and its run deletes it.
         run: |
-          gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/refs/heads/$BRANCH"
+          ref="repos/$GITHUB_REPOSITORY/git/refs/heads/$BRANCH"
+          if ! head=$(gh api "$ref" --jq .object.sha 2>/dev/null); then
+            echo "Branch $BRANCH is already gone"
+            exit 0
+          fi
+          if [[ "$head" != "$RUN_SHA" ]]; then
+            echo "Branch $BRANCH moved to $head; leaving it for that run"
+            exit 0
+          fi
+          gh api -X DELETE "$ref" 2>&1 || echo "Branch $BRANCH could not be deleted (already gone?)"

@@ -9,9 +9,12 @@
   request failed too. Anything else that does not reach a reply (a reset connection, our
   timeout) leaves a write's outcome unknown: Jepsen's `:info`. A read changes nothing, so a
   read without a reply simply failed. A non-2xx reply without `applied` and `code` is a bug in
-  the gateway's promise and throws, as does a `400` (the test sent something malformed)."
+  the gateway's promise, and a `400` means the test sent something malformed: both complete
+  the op as a protocol violation (`violation`), which `protocol-checker` turns into an invalid
+  run. They do not throw: Jepsen records a thrown op as :info, and nothing would fail."
   (:require [clojure.data.json :as json]
-            [clojure.string :as str])
+            [clojure.string :as str]
+            [jepsen.checker :as checker])
   (:import (java.io IOException)
            (java.net ConnectException URI)
            (java.net.http HttpClient HttpClient$Version HttpConnectTimeoutException HttpRequest
@@ -70,24 +73,38 @@
 (defn outcome
   "What a reply means, read from its body as R4 defines it (README, \"What a reply means\";
   P215d): :ok (any 2xx, a replay included), :refused (`applied: false`, on any status: nothing
-  reached the cluster, or the cluster refused it) or :unknown (`applied: \"unknown\"`: a write
-  went out and no reply came back). A non-2xx reply that does not carry both `applied` and
-  `code` breaks R4's promise and throws: that is a failure of the test."
-  [{:keys [status body] :as reply}]
-  (if (<= 200 (long status) 299)
-    :ok
-    (let [applied (get body "applied")]
-      (cond
-        (not (string? (get body "code")))
-        (throw (ex-info (str status " reply without a code (R4 promises one)") {:reply reply}))
+  reached the cluster, or the cluster refused it), :unknown (`applied: \"unknown\"`: a write
+  went out and no reply came back) or :violation (a `400`, or a non-2xx reply that does not
+  carry both `applied` and `code`: it breaks R4's promise, or the test is wrong)."
+  [{:keys [status body]}]
+  (let [applied (get body "applied")]
+    (cond
+      (<= 200 (long status) 299)      :ok
+      (= 400 (long status))           :violation
+      (not (string? (get body "code"))) :violation
+      (false? applied)                :refused
+      (= "unknown" applied)           :unknown
+      :else                           :violation)))
 
-        (false? applied)    :refused
-        (= "unknown" applied) :unknown
+(defn violation
+  "op, completed for a reply that breaks R4's promise or shows the test is wrong (see
+  `outcome`). :info, because whether a write applied is not known; it carries
+  :protocol-violation, which `protocol-checker` invalidates the run for."
+  [op {:keys [status body]}]
+  (assoc op :type :info
+         :error [:protocol-violation status]
+         :protocol-violation {:http status, :body body}))
 
-        :else
-        (throw (ex-info (str status " reply without a usable applied (R4 promises false or"
-                             " \"unknown\")")
-                        {:reply reply}))))))
+(defn protocol-checker
+  "Invalid when any operation in the history carries :protocol-violation. Composed into every
+  test by core, so no workload wires it by hand."
+  []
+  (reify checker/Checker
+    (check [_ _test history _opts]
+      (let [bad (filter :protocol-violation history)]
+        {:valid?     (empty? bad)
+         :violations (count bad)
+         :examples   (vec (take 10 bad))}))))
 
 (defn replayed?
   "Whether a 2xx reply says the request had already committed: `\"replayed\": true`
@@ -107,11 +124,10 @@
   request (a `409`) is its status as a keyword, which a workload's checker may judge. Any other
   `applied: false` reply (busy, no session, too large, ...) is a definite failure that is no
   refusal of the request: {:code \"NRV-...\", :http 503}. A `400` means the test sent something
-  malformed, and throws."
-  [{:keys [status body] :as reply}]
+  malformed: `outcome` calls it a violation, so it never gets here."
+  [{:keys [status body]}]
   (case (long status)
     409 (keyword (or (get body "status") (get body "error") (get body "code")))
-    400 (throw (ex-info "the test sent a malformed request (400)" {:reply reply}))
     {:code (get body "code"), :http status}))
 
 (defn unknown

@@ -8,10 +8,10 @@
   [status body]
   {:status status, :body body})
 
-(defn thrown-reply?
+(defn violation?
+  "Whether the reply breaks R4's promise (or is a 400): it must invalidate the run, never throw."
   [r]
-  (try (http/outcome r) false
-       (catch clojure.lang.ExceptionInfo _ true)))
+  (= :violation (http/outcome r)))
 
 (deftest a-2xx-is-applied
   (is (= :ok (http/outcome (reply 200 {"op" "7"}))))
@@ -19,10 +19,13 @@
 
 (deftest applied-false-is-a-definite-refusal-on-any-status
   (doseq [[status code] [[409 "NRV-E0201"] [503 "NRV-E0605"] [503 "NRV-E0602"]
-                         [413 "NRV-E0403"] [504 "NRV-E0603"] [400 "NRV-E0101"]
-                         [500 "NRV-B0001"]]]
+                         [413 "NRV-E0403"] [504 "NRV-E0603"] [500 "NRV-B0001"]]]
     (testing (str status " " code)
       (is (= :refused (http/outcome (reply status {"applied" false, "code" code})))))))
+
+(deftest a-400-is-a-violation-whatever-it-says
+  (is (violation? (reply 400 {"applied" false, "code" "NRV-E0101"}))
+      "a 400 means the test sent something malformed"))
 
 (deftest applied-unknown-leaves-a-write-unknown
   (doseq [[status code] [[503 "NRV-E0601"] [500 "NRV-B0002"] [500 "NRV-B0001"]]]
@@ -35,17 +38,17 @@
   (is (= :unknown (http/outcome (reply 500 {"applied" "unknown", "code" "NRV-B0002"})))
       "a 5xx other than 503 can be unknown too"))
 
-(deftest a-reply-that-breaks-r4s-promise-fails-the-test
+(deftest a-reply-that-breaks-r4s-promise-invalidates-the-run
   (testing "no applied and no code"
-    (is (thrown-reply? (reply 503 {"error" "cluster unavailable"})))
-    (is (thrown-reply? (reply 500 nil))))
+    (is (violation? (reply 503 {"error" "cluster unavailable"})))
+    (is (violation? (reply 500 nil))))
   (testing "applied without a code"
-    (is (thrown-reply? (reply 409 {"applied" false}))))
+    (is (violation? (reply 409 {"applied" false}))))
   (testing "a code without applied"
-    (is (thrown-reply? (reply 409 {"code" "NRV-E0201"}))))
+    (is (violation? (reply 409 {"code" "NRV-E0201"}))))
   (testing "an applied that is neither false nor \"unknown\""
-    (is (thrown-reply? (reply 409 {"applied" true, "code" "NRV-E0201"})))
-    (is (thrown-reply? (reply 409 {"applied" "maybe", "code" "NRV-E0201"})))))
+    (is (violation? (reply 409 {"applied" true, "code" "NRV-E0201"})))
+    (is (violation? (reply 409 {"applied" "maybe", "code" "NRV-E0201"})))))
 
 (deftest a-replay-is-a-success-that-names-the-original-op
   (let [r (reply 200 {"op" "42", "replayed" true, "code" "NRV-W0201"})]
@@ -63,10 +66,12 @@
   (is (= {:code "NRV-E0602", :http 503}
          (http/refusal-error (reply 503 {"error" "busy", "applied" false,
                                          "code" "NRV-E0602"})))
-      "busy is a definite failure, not a refusal the checker judges")
-  (is (thrown? clojure.lang.ExceptionInfo
-               (http/refusal-error (reply 400 {"applied" false, "code" "NRV-E0101"})))
-      "a 400 is a malformed request: a bug in the test"))
+      "busy is a definite failure, not a refusal the checker judges"))
+
+(deftest a-violation-completes-as-info-with-the-mark
+  (let [op (http/violation {:f :transfer} (reply 503 nil))]
+    (is (= :info (:type op)) "whether the write applied is not known")
+    (is (:protocol-violation op))))
 
 (deftest no-reply-is-failed-or-unknown
   (is (= :fail (:type (http/no-reply {:f :transfer} true (java.net.ConnectException. "x")))))

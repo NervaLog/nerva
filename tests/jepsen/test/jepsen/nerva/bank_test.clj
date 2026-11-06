@@ -103,3 +103,8 @@
   (is (= :info (:type (http/no-reply {:f :transfer} true (java.io.IOException. "reset")))))
   (is (= :info (:type (http/no-reply {:f :transfer} true
                                      (java.net.http.HttpTimeoutException. "35 s"))))))
+
+(deftest the-protocol-checker-fails-a-marked-history
+  (let [marked (http/violation {:f :transfer} {:status 400, :body nil})]
+    (is (not (valid? (http/protocol-checker) (history good-read marked))))
+    (is (valid? (http/protocol-checker) (history good-read good-view good-transfer)))))
