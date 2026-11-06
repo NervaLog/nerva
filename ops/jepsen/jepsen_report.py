@@ -18,8 +18,8 @@ Each run is valid, invalid, unknown, or the host's:
   key, its anomaly class; never the seed or the commit); a known fingerprint gets a comment only
   for a commit it has not been reported on, at most COMMENTS_PER_FAILURE_PER_DAY a UTC day; at
   most FAILURES_PER_DAY distinct failures are looked at a day. The status is `failure`;
-- the host's (exit 124 past the night's deadline, 125, 126, 137 the OOM killer, unless a verdict
-  was written: an invalid or unknown one outranks the exit code; a run with no `jepsen.log` at
+- the host's (exit 124 past the night's deadline, 125, 126, 137 the OOM killer, 143 an
+  interrupted night, unless a verdict was written: an invalid or unknown one outranks the exit code; a run with no `jepsen.log` at
   all; a night that did not start; graphs that did not draw): counted, status `error`, never an
   issue;
 - crashed: Jepsen started (a `jepsen.log`) and wrote no `results.edn`, and the host did not kill
@@ -98,9 +98,11 @@ assert FAILURES_PER_DAY <= FILED_MAX
 assert HISTORY_BYTES_ISSUE + VERDICT_BYTES + 4096 <= BODY_BYTES_MAX
 
 # Exit codes that are the host's, not the code's: counted, never filed. 124: past the night's
-# deadline (`timeout`); 125, 126: `timeout` or the exec failed; 137: SIGKILL, the OOM killer.
+# deadline (`timeout`); 125, 126: `timeout` or the exec failed; 137: SIGKILL, the OOM killer;
+# 143: the night was interrupted (a systemd stop or timeout; nightly.sh's trap, P240).
 HOST_CODES = {124: "past the night's deadline", 125: "the run could not start",
-              126: "the run could not start", 137: "killed by the host (out of memory?)"}
+              126: "the run could not start", 137: "killed by the host (out of memory?)",
+              143: "interrupted (the unit was stopped or timed out)"}
 # What a jepsen.log's end shows when the host failed under a test that had started (ssh to a
 # node refused, the JVM out of heap, the disk full, Docker): the host's, never filed (P235c).
 # A bare "Connection refused" is not one: Jepsen's clients log it to gateways and replicas while
@@ -584,6 +586,7 @@ class Run:
         self.results_text = ""
         self.findings = []  # (checker, class, subtree)
         self.history_path = None
+        self.history = None  # (lines, cut), read once per run
 
     def summary(self):
         what = f"{self.workload}" + (f" ({self.nemesis})" if self.nemesis else "")
@@ -673,7 +676,7 @@ def read_runs_file(path):
 def settle_run(run, code, tests):
     """The run's kind once its exit code is known (P235b). A verdict that was written
     (invalid or unknown) outranks every exit code. Otherwise: the host's exit codes (124, 125,
-    126, 137) are the host's; no jepsen.log at all means Jepsen never started (the build,
+    126, 137, 143) are the host's; no jepsen.log at all means Jepsen never started (the build,
     Docker): the host's; a jepsen.log and no results.edn means the test threw (nerva died at
     setup, say): Nerva's, fingerprint `<workload>|run|crashed`, with the log's end in the issue."""
     if run.kind in ("invalid", "unknown"):
@@ -747,8 +750,12 @@ def fingerprint_of(key):
 
 def title_of(canary, workload, checker, name):
     if canary:
-        title = f"Jepsen canary {workload}: {name} seen (expected), checker {checker}" \
-            if name != "blind" else f"Jepsen canary {workload}: blind, it saw no duplicate"
+        if name == "blind":
+            title = f"Jepsen canary {workload}: blind, it saw no duplicate"
+        elif name == "crashed":
+            title = f"Jepsen canary {workload}: crashed before a verdict (checker {checker})"
+        else:
+            title = f"Jepsen canary {workload}: {name} seen (expected), checker {checker}"
     else:
         title = f"Jepsen {workload}: {name} (checker {checker})"
     return title[:TITLE_BYTES_MAX - 3] + "..." if len(title) > TITLE_BYTES_MAX else title
@@ -766,7 +773,12 @@ def make_findings(run, canary):
     if run.kind == "invalid" and "duplicate" in names:
         for checker, name, subtree in run.findings:
             out.append(finding(run, True, checker, name, subtree))
-    elif run.kind in ("invalid", "unknown", "valid", "crashed"):
+    elif run.kind == "crashed":
+        # The run threw before it could see anything: a crash, not a blind canary.
+        # The canary's own fingerprint: a test build's crash is not a crash on main (P235).
+        for checker, name, subtree in run.findings:
+            out.append(finding(run, True, checker, name, subtree))
+    elif run.kind in ("invalid", "unknown", "valid"):
         # Whatever else it saw is a real finding; the canary itself saw no duplicate.
         for checker, name, subtree in run.findings:
             out.append(finding(run, False, checker, name, subtree))
@@ -790,7 +802,12 @@ def report_text(item, commit, archive, first):
     run = item["run"]
     canary = item["canary"]
     out = []
-    if first and canary:
+    if first and canary and item["class"] == "crashed":
+        out.append("The Jepsen canary (a build with commit-key deduplication off,"
+                   " ops/jepsen/README.md) **crashed** on `main`: the test threw before it wrote"
+                   " a verdict, so the canary could not show whether Jepsen sees a duplicate."
+                   " This is the canary build's crash, not the nightly's.\n")
+    elif first and canary:
         out.append("The Jepsen canary (a build with commit-key deduplication off,"
                    " ops/jepsen/README.md) ran on `main`. A duplicate is what it **expects**:"
                    " this issue shows the pipeline, and is closed by hand.\n")
@@ -858,7 +875,9 @@ def history_text(item, room):
     if item["subtree"] is None or not run.history_path or room < 1024:
         return ""
     keys, numbers = anomaly_ids([s for _, _, s in run.findings if s is not None])
-    lines, cut = read_history(run.history_path)
+    if run.history is None:
+        run.history = read_history(run.history_path)
+    lines, cut = run.history
     anomalies = anomalous_lines(lines, keys, numbers) if lines else []
     if not anomalies:
         return "\nThe history: no operation could be tied to the verdict's examples.\n"
@@ -1166,10 +1185,17 @@ def night_state(runs, host_failure, canary):
     verdicts = [(run.kind, run) for run in runs]
     total = len(runs)
     if canary:
-        blind = [r for k, r in verdicts if k != "host"
+        crashed = [r for k, r in verdicts if k == "crashed"]
+        blind = [r for k, r in verdicts if k not in ("host", "crashed")
                  and not (k == "invalid" and "duplicate" in {n for _, n, _ in r.findings})]
-        if blind:
-            return "failure", f"canary blind: {len(blind)} of {total} run(s) saw no duplicate"
+        if crashed or blind:
+            parts = []
+            if crashed:
+                parts.append(f"canary crashed: {len(crashed)} of {total} run(s) threw before "
+                             "a verdict")
+            if blind:
+                parts.append(f"canary blind: {len(blind)} of {total} run(s) saw no duplicate")
+            return "failure", "; ".join(parts)
         if "host" in kinds:
             return "error", f"the host's: {kinds.count('host')} of {total} run(s) did not finish"
         return "success", f"canary: Jepsen saw the duplicate in {total} of {total} run(s)"
@@ -1230,8 +1256,15 @@ def ingest(github, state, runs, host_failure, commit, tracker, archive, canary, 
         if posted is not None:
             github.status(commit, state_name, context, description, target)
             record_status(state, commit, context, state_name, today)
-        for fingerprint, group in groups.items():
+        # A group reports its first item's run, and a run's groups are contiguous: free each
+        # run's history after its last group, so the peak is one run's history (P240).
+        last = {id(group[0]["run"]): n for n, group in enumerate(groups.values())
+                if group[0]["run"] is not None}
+        for n, (fingerprint, group) in enumerate(groups.items()):
             report_group(github, state, group[0], seen[fingerprint], commit, archive, summary)
+            run = group[0]["run"]
+            if run is not None and last[id(run)] == n:
+                run.history = None
         if tracker is not None and not day["reported"]:
             note = description if status else (
                 f"{description}; no status posted, the commit is the last the host knew")

@@ -18,10 +18,16 @@ LoadCredential=token:/etc/jepsen/token
 # The fleet and Jepsen share the host and never overlap. `+` runs these two as root, outside the
 # sandbox below. ExecStopPost= runs whether the night passed, failed or was killed, so the fleet
 # always comes back; `-` because a host without a fleet has nothing to start.
+# The first step refuses a night with no token, in one journal line, before the fleet is stopped.
+ExecStartPre=/opt/jepsen/bin/nightly.sh --check-token
 ExecStartPre=+-/usr/bin/systemctl stop sim-fleet.service
-ExecStart=/var/lib/jepsen/nerva/ops/jepsen/nightly.sh
+ExecStart=/opt/jepsen/bin/nightly.sh
 ExecStopPost=+-/usr/bin/systemctl start sim-fleet.service
-# nightly.sh keeps its own 3 h deadline; this bounds a hang of the shell itself.
+# The runner is the copy setup.sh installed under /opt/jepsen/bin (root-owned, and read-only to
+# this unit): the night never runs the tip's ops/jepsen/ (P240).
+# nightly.sh keeps its own 3 h deadline; this bounds a hang of the shell itself. On a stop or this
+# timeout systemd sends TERM, and nightly.sh's trap reports the night as interrupted: up to 20 s
+# for the run to stop and 60 s for the report, so TimeoutStopSec leaves 120 s before the KILL.
 TimeoutStartSec=12600
 TimeoutStopSec=120
 Nice=5

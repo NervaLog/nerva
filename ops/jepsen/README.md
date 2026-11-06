@@ -13,7 +13,7 @@ runs the night when it comes up). The unit stops `sim-fleet.service`, runs `nigh
 user `jepsen`, and starts the fleet again whatever happened (`ExecStartPre=+` and
 `ExecStopPost=+`, root, outside the unit's sandbox). `nightly.sh`:
 
-1. takes `flock` (a second start leaves quietly) and a whole-night deadline of 3 h
+1. takes `flock` once (a second start leaves quietly) and a whole-night deadline of 3 h
    (`JEPSEN_NIGHT_SECONDS`); a run past it is killed and counted as the host's;
 2. fetches `main`, builds `nerva` in ReleaseSafe at the tip (`./zig/zig build -Drelease`);
 3. runs `retry` and then `bank`, each `--nemesis kill,partition,gateway --time-limit 3600` and a
@@ -22,8 +22,19 @@ user `jepsen`, and starts the fleet again whatever happened (`ExecStartPre=+` an
 4. archives the night's `store/` as `/var/lib/jepsen/archive/<date>.tar.zst`, kept 90 days;
 5. calls `python3 -I jepsen_report.py ingest`.
 
-The script runs from a private copy of itself: the checkout it moves to the tip of `main` is the
-one it started from.
+**The runner is never the tip's (P240).** `setup.sh` installs `nightly.sh` and `jepsen_report.py`
+into `/opt/jepsen/bin` (root-owned, readable by `jepsen`, read-only inside the unit) and the unit
+runs that copy. The night fetches `main` into `/var/lib/jepsen/nerva` and builds and tests that
+checkout, the code under test; it never runs the `ops/jepsen/` in it. So a broken `nightly.sh` or
+`jepsen_report.py` on `main` cannot silence a night, and no checkout can wedge the next one. **A
+change to the runner (`nightly.sh`, `jepsen_report.py`, `jepsen.service`, `jepsen.timer`) reaches the
+host only when `setup.sh` runs again**, as root, from a checkout of the commit to install.
+
+A systemd stop or the unit's timeout sends TERM: a trap records the run in flight as exit 143 (or
+a `host-failure` if none had finished) and posts `jepsen/nightly` = `error` (the host's) and the
+tracker's line within about 80 s; `TimeoutStopSec=120` leaves room for that. A second night that
+finds the lock held logs the pid in `nightly.pid`. With no token, `nightly.sh` exits at once with
+one journal line; the unit runs `nightly.sh --check-token` before it stops the fleet.
 
 ## What the reporter does
 
@@ -36,7 +47,7 @@ standard library only (P147i). For each run:
 | valid | `success` | none |
 | invalid or unknown (`results.edn`) | `failure` | one per fingerprint |
 | the test threw: a `jepsen.log` and no `results.edn`, and no host exit code, and no host failure (ssh refused, out of heap, disk full, Docker) at the log's end (`nerva` died at setup, say) | `failure` | one per workload (checker `run`, class `crashed`), with the log's end |
-| the host's (exit 124, 125, 126 or 137 with no verdict written, a build that failed, Docker down, Jepsen never started, graphs that did not draw) | `error` | **never** |
+| the host's (exit 124, 125, 126, 137 or 143 with no verdict written, a build that failed, Docker down, Jepsen never started, graphs that did not draw) | `error` | **never** |
 
 `failure` outranks `error` outranks `success`: a night with one real finding and one host
 failure is `failure`, and the finding is filed. A night that did not run at all (`host-failure`
@@ -56,7 +67,7 @@ in the store) is `error`.
 - **Tracker:** one comment a day on `JEPSEN_TRACKER`: what ran, on which commit, the verdict.
   **A day without one is the alarm.**
 - **`--expect-invalid`:** the canary (slice 8). The status is `jepsen/canary`, `success` only if
-  every run was invalid with a `duplicate`; a run that saw none is `failure` ("canary blind").
+  every run was invalid with a `duplicate`; a run that saw none is `failure` ("canary blind"), and a run that threw before a verdict is `failure` ("canary crashed", filed as a crash with the canary's own fingerprint, not as blind).
   Its fingerprints are its own.
 - **`--dry-run`:** prints what it would write and writes nothing to GitHub. The state file it is
   given is written, so `nightly.sh` gives a dry run one of its own (`state/dry-run.json`).
@@ -77,17 +88,17 @@ OS, creates the token and the tracker issue, runs `setup.sh` as root).
 
 | Need | What |
 | --- | --- |
-| Machine | x86_64, 8 cores / 16 threads, 64 GB, NVMe; **KVM exposed** (`/dev/kvm`, for slice 10 only) |
+| Machine | x86_64, 8 cores / 16 threads, 64 GB, NVMe (P147h's suggestion); **KVM exposed** (`/dev/kvm`, for slice 10 only) |
 | OS | Ubuntu 24.04 LTS, cgroup v2, systemd |
-| Memory for Jepsen | 16 GB during its window: 5 replicas at about 1.33 GiB, 10 gateways, a 4 GB JVM. The fleet is stopped for the window |
+| Memory for Jepsen | 16 GB during its window: 5 replicas at about 1.33 GiB, 10 gateways, a 4 GB JVM. The fleet is stopped for the window, so its `MemoryMax=56G` never overlaps |
 | Time | about 2.5 h a night (two 3,600 s runs, setup, checking), the fleet stopped meanwhile |
 | Docker | Docker Engine, **privileged containers** (iptables in the nodes), the `owner` iptables match, `/dev/fuse` passed to the nodes (slice 9) |
-| Tools | OpenJDK 21, Leiningen 2.12.0 (sha256 pinned by `tests/jepsen/tools.sh`), gnuplot (else every result is `:unknown`), git, python3, zstd; Zig from `./zig/download.sh` |
-| sshd | The host's own sshd for the owner: keys only. The nodes' sshd lives inside the Docker network and is never exposed |
+| Tools | OpenJDK 21 (Ubuntu's), Leiningen 2.12.0 (script and standalone jar, sha256 pinned), gnuplot (else every result is `:unknown`, #106), git, python3, zstd; Zig from `./zig/download.sh` |
+| sshd | The host's own sshd for the owner: keys only. The nodes' sshd lives inside the Docker network and is never exposed; their `authorized_keys` comes from slice 2's `docker exec` |
 | Users | `jepsen`, in the `docker` group (root-equivalent: the host is single-purpose, and the fleet's `simfleet` user and token stay apart) |
 | Disk | 100 GB free for `store/` archives (90 days) and images |
-| Network out | github.com and api.github.com, clojars.org and Maven Central, ziglang.org, Docker Hub and deb.debian.org |
-| GitHub token | A fine-grained PAT on `NervaLog/nerva` only: **Issues read/write, Commit statuses read/write**, metadata read; nothing else. Not the fleet's. Its expiry noted on the tracker issue |
+| Network out | github.com and api.github.com, clojars.org and Maven Central (first `lein deps`), ziglang.org, Docker Hub and deb.debian.org (the node image, by digest) |
+| GitHub token | A fine-grained PAT on `NervaLog/nerva` only: **Issues read/write, Commit statuses read/write**, metadata read; nothing else (the repository is public, so it clones without one). Delivered by systemd `LoadCredential`; its expiry noted on the tracker issue |
 
 ## Deploy
 
@@ -100,11 +111,16 @@ $EDITOR /etc/jepsen/jepsen.env                              # JEPSEN_TRACKER=<is
 systemctl start jepsen.service                              # a night now; journalctl -u jepsen -f
 ```
 
-`setup.sh` installs the packages, creates the user, copies the token to `/etc/jepsen/token`
+To change the runner later (a merged fix to `nightly.sh`, `jepsen_report.py` or the unit): pull
+the commit and run `sh ops/jepsen/setup.sh` again. Nothing else updates it; the night does not.
+
+`setup.sh` installs the packages, creates the user, installs the runner (`nightly.sh`,
+`jepsen_report.py`) into `/opt/jepsen/bin` and the unit and timer into `/etc/systemd/system` from
+the checkout it is run in, copies the token to `/etc/jepsen/token`
 (0600; the unit hands the service a private copy through `LoadCredential`), clones the repository
 to `/var/lib/jepsen/nerva`, fetches the toolchain and Leiningen, runs the reporter's tests, and
-enables the timer. It does not touch the fleet. To see a night without writing to GitHub:
-`sudo -u jepsen /var/lib/jepsen/nerva/ops/jepsen/nightly.sh --dry-run` (sudo drops
+enables the timer only if a token was installed (with none it says so; a timer with no token runs a night that cannot report). It does not touch the fleet. To see a night without writing to GitHub:
+`sudo -u jepsen /opt/jepsen/bin/nightly.sh --dry-run` (sudo drops
 `JEPSEN_DRY_RUN` from the environment; `sudo -u jepsen env JEPSEN_DRY_RUN=1 ...` also works). A dry
 run has a night directory (`nights/<date>-dry`), an archive and a state file of its own, so it
 never touches a real night's. It still runs both workloads (about 2.5 h) and stops nothing: stop
