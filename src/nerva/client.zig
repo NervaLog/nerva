@@ -854,8 +854,8 @@ test "Client: a completed call keeps the request's window (#186)" {
         .timeout = stdx.Duration.ms(1_000),
         .window_end = end,
     };
-    const result = [_]u8{0} ** constants.cache_line_size;
-    const aligned: []align(constants.cache_line_size) const u8 = @alignCast(&result);
+    const result: [constants.cache_line_size]u8 align(constants.cache_line_size) = @splat(0);
+    const aligned: []align(constants.cache_line_size) const u8 = &result;
     Client.on_reply(@intFromPtr(&client), .register, 0, aligned);
     client.round_trip_done(start);
     // A call that re-armed the window for itself would give the next call a fresh `timeout`.
