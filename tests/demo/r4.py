@@ -562,6 +562,7 @@ def step4(demo, a):
         thread.start()
     for thread in threads:
         thread.join(30)
+        check(not thread.is_alive(), "a busy-probe caller never finished")
     check(not errors, errors[:3])
     check(len(replies) == CLIENT_THREADS, len(replies))
     for status, body, seconds in replies:
@@ -763,6 +764,7 @@ def step9(demo, a, b):
     stop.set()
     for thread in threads:
         thread.join(60)
+        check(not thread.is_alive(), "a step 9 caller never finished")
     check(not errors, errors[:3])
     inflight = [r for r in records if r[0] < stopped < r[1]]  # Sent before, answered after.
     check(inflight, "no request was in flight when the replicas stopped")
@@ -817,7 +819,9 @@ def step10(demo, a):
         status, body = read_reply(connection)
     finally:
         sender.join(60)
+        stuck = sender.is_alive()
         connection.close()
+    check(not stuck, "the oversized-body sender never finished")
     check(status == 413 and body.get("code") == "NRV-E0102" and body.get("applied") is False,
           (status, body))
     status, body = request(port, "GET", f"/v1/row?table={ACCOUNTS}&id=1&as_of={10 ** 12}")
