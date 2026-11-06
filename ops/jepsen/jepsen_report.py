@@ -804,22 +804,35 @@ def html_comment_safe(text):
 
 
 REPO_FAILURE_KEY = "nightly|script|unparsable"
+REPO_DIED_KEY = "nightly|script|died"
+REPO_DIED_PREFIX = "stage 2 "  # What nightly.sh writes when the tip's script died unreported.
 
 
 def repo_failure_item(text):
-    """The finding for a tip whose `nightly.sh` does not parse: the repository's defect (P240)."""
-    return {"run": None, "canary": False, "checker": "nightly", "class": "unparsable",
-            "subtree": None, "repo_failure": text, "key": REPO_FAILURE_KEY,
-            "fingerprint": fingerprint_of(REPO_FAILURE_KEY),
-            "title": "Jepsen nightly: ops/jepsen/nightly.sh on main does not parse"}
+    """The finding for a tip whose `nightly.sh` does not parse, or died before it reported: the
+    repository's defect (P240, P240b)."""
+    died = text.startswith(REPO_DIED_PREFIX)
+    key = REPO_DIED_KEY if died else REPO_FAILURE_KEY
+    what = "dies before it reports" if died else "does not parse"
+    return {"run": None, "canary": False, "checker": "nightly",
+            "class": "died" if died else "unparsable",
+            "subtree": None, "repo_failure": text, "key": key,
+            "fingerprint": fingerprint_of(key), "died": died,
+            "title": f"Jepsen nightly: ops/jepsen/nightly.sh on main {what}"}
 
 
 def repo_failure_text(item, commit, first):
-    out = ["The Jepsen nightly (ops/jepsen/README.md) fetched `main` and found that its"
-           " `ops/jepsen/nightly.sh` does not parse (`bash -n`), so **nothing was run**. This is a"
-           " defect in the repository, not the host's.\n" if first
+    died = item["died"]
+    found = ("found that its `ops/jepsen/nightly.sh` exited without reporting the night, so the"
+             " night is reported by the script that fetched it" if died else
+             "found that its `ops/jepsen/nightly.sh` does not parse (`bash -n`), so **nothing was"
+             " run**")
+    out = [f"The Jepsen nightly (ops/jepsen/README.md) fetched `main` and {found}. This is a"
+           " defect in the repository, not the host's. The checkout was put back on the commit it"
+           " came from.\n" if first
            else f"Still failing on commit `{commit}`.\n",
-           f"- **Commit:** `{commit}`", "", "What `bash -n` said:", "", fence(item["repo_failure"])]
+           f"- **Commit:** `{commit}`", "", "What it said:" if died else "What `bash -n` said:",
+           "", fence(item["repo_failure"])]
     text = "\n".join(out) + "\n"
     if first:
         text += (f"\n<!-- jepsen fingerprint: {item['fingerprint']} -->\n"
@@ -1267,8 +1280,9 @@ def ingest(github, state, runs, host_failure, commit, tracker, archive, canary, 
     day["commit"] = commit
     state_name, description = night_state(runs, host_failure, canary)
     if repo_failure is not None:
+        died = repo_failure.startswith(REPO_DIED_PREFIX)
         state_name, description = "failure", "the repository's: ops/jepsen/nightly.sh on this " \
-            "commit does not parse, nothing was run"
+            "commit " + ("dies before it reports" if died else "does not parse, nothing was run")
     summary["status"] = state_name
     posted, why = (None, "no status for this night")
     if status:

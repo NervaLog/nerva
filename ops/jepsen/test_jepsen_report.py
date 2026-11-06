@@ -574,6 +574,18 @@ class RepoFailure(unittest.TestCase):
         self.assertIn("syntax error", github.opened[0][2])
         self.assertIn("not the host's", github.opened[0][2])
 
+    def test_a_tip_that_died_has_its_own_fingerprint_and_title(self):
+        store = Store(self)
+        Path(store.path, "repo-failure").write_text("stage 2 (the tip's nightly.sh) exited 9\nboom\n")
+        runs, host = rep.read_night(store.path, None)
+        github = Recorder()
+        rep.ingest(github, rep.new_state(), runs, host, COMMIT, None, None, False, NOW, "o/r",
+                   lambda m: None, repo_failure=rep.read_repo_failure(store.path))
+        self.assertIn("dies before it reports", github.opened[0][1])
+        self.assertIn("nightly|script|died", github.opened[0][2])
+        self.assertNotEqual(rep.fingerprint_of(rep.REPO_DIED_KEY),
+                            rep.fingerprint_of(rep.REPO_FAILURE_KEY))
+
 
 class Dedup(unittest.TestCase):
     def test_a_known_failure_gets_one_comment_per_commit(self):
@@ -860,12 +872,12 @@ class Nightly(unittest.TestCase):
         with open(jepsen / "nightly.sh", "a") as script:
             script.write(f"# tip {marker}\n")
 
-    def night(self, *flags, remote=None, extra=None):
+    def night(self, *flags, remote=None, extra=None, script=None):
         env = {"PATH": f"{self.bin}:{os.environ['PATH']}", "JEPSEN_HOME": str(self.home),
                "JEPSEN_REMOTE": remote or str(self.remote), "JEPSEN_WORKLOADS": "retry",
                "JEPSEN_NEMESIS": "kill", "JEPSEN_TIME_LIMIT": "1",
                "JEPSEN_NIGHT_SECONDS": "120", "HOME": self.tmp.name, **(extra or {})}
-        return subprocess.run(["bash", str(HERE / "nightly.sh"), *flags], env=env,
+        return subprocess.run(["bash", str(script or HERE / "nightly.sh"), *flags], env=env,
                               capture_output=True, text=True, timeout=120)
 
     def test_a_dry_run_has_a_state_and_a_night_of_its_own(self):
@@ -909,7 +921,7 @@ class Nightly(unittest.TestCase):
         self.assertNotIn("would set status", done.stdout)  # it tested nothing
         self.assertIn("the night did not run: git checkout", done.stdout)
 
-    def test_a_tip_whose_script_does_not_parse_is_reported_as_the_hosts(self):
+    def test_a_tip_whose_script_does_not_parse_is_the_repositorys_failure(self):
         broken = Path(self.tmp.name, "broken")
         shutil.copytree(self.remote, broken)
         with open(broken / "ops/jepsen/nightly.sh", "a") as script:
@@ -953,30 +965,95 @@ class Nightly(unittest.TestCase):
             time.sleep(0.05)
         self.fail("the holder never took the lock")
 
-    def test_the_lock_is_held_while_the_tips_script_runs(self):
+    def push(self, remote, message, edit):
+        """A new commit on `remote` whose nightly.sh is the current one, passed through `edit`."""
+        script = Path(remote, "ops/jepsen/nightly.sh")
+        shutil.copy(HERE / "nightly.sh", script)
+        script.write_text(edit(script.read_text()) + f"# {message}\n")
+        self.git(remote, "add", "-A")
+        self.commit(remote, message)
+
+    def test_the_lock_is_held_by_stage_one_while_the_tips_script_runs(self):
+        # The holder in /proc/locks must be a process other than the tip's script, which has no
+        # fd 9: the lock is stage 1's, so it is never free between the stages.
         probe = Path(self.tmp.name, "probe")
-        run = (f"#!/bin/sh\nflock -n {self.home}/nightly.lock true && echo FREE > {probe} "
-               f"|| echo HELD > {probe}\nexit 0\n")
+        run = ("#!/bin/sh\nino=$(stat -c %i " + str(self.home) + "/nightly.lock)\n"
+               "holder=$(awk -v ino=$ino '$2==\"FLOCK\" {split($6,a,\":\"); if (a[3]==ino) print $5}'"
+               " /proc/locks)\n"
+               "fd=no; [ -e /proc/$PPID/fd/9 ] && fd=yes\n"
+               f"echo \"$holder $PPID $fd\" > {probe}\nexit 0\n")
         Path(self.remote, "tests/jepsen/run.sh").write_text(run)
         self.git(self.remote, "add", "-A")
         self.commit(self.remote, "probe")
         done = self.night("--dry-run")
         self.assertIn("running the tip's nightly.sh", done.stderr)
-        self.assertEqual(probe.read_text().strip(), "HELD", done.stderr)
+        holder, stage2, fd = probe.read_text().split()
+        self.assertTrue(holder.isdigit(), probe.read_text())
+        self.assertNotEqual(holder, stage2)
+        self.assertEqual(fd, "no")
 
     def test_a_second_night_cannot_start_while_the_lock_is_held(self):
         self.holding()
+        (self.home / "nightly.pid").write_text("4242\n")
         done = self.night("--dry-run")
-        self.assertIn("another night is running", done.stderr)
+        self.assertIn("another night is running (pid 4242)", done.stderr)
 
-    def test_the_lock_variable_does_not_skip_the_lock(self):
+    def test_a_forged_stage_two_environment_takes_the_lock_like_stage_one(self):
+        forged = {"JEPSEN_STAGE": "2", "JEPSEN_STAGE1_PID": "1", "JEPSEN_COPY_OF": str(HERE),
+                  "JEPSEN_COPY_PATH": "/nonexistent/copy"}
         self.holding()
-        for extra in ({"JEPSEN_LOCK_HELD": "1"},
-                      {"JEPSEN_LOCK_HELD": "1", "JEPSEN_STAGE": "2",
-                       "JEPSEN_COPY_OF": str(HERE), "JEPSEN_COPY_PATH": "/nonexistent/copy"}):
-            done = self.night("--dry-run", extra=extra)
-            self.assertIn("another night is running", done.stderr, extra)
-            self.assertEqual(list((self.home / "nights").iterdir()), [], extra)
+        done = self.night("--dry-run", extra=forged)
+        self.assertIn("another night is running", done.stderr)
+        self.assertEqual(list((self.home / "nights").iterdir()), [])
+
+    def test_a_forged_stage_two_environment_on_a_free_lock_is_a_whole_night(self):
+        forged = {"JEPSEN_STAGE": "2", "JEPSEN_STAGE1_PID": "1", "JEPSEN_COPY_OF": str(HERE),
+                  "JEPSEN_COPY_PATH": "/nonexistent/copy"}
+        done = self.night("--dry-run", extra=forged)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("would set status", done.stdout)
+
+    def test_a_tip_that_dies_before_it_reports_is_the_repositorys_failure(self):
+        self.assertEqual(self.night("--dry-run").returncode, 0)
+        good = self.git(self.home / "nerva", "rev-parse", "HEAD")
+        self.push(self.remote, "dies", lambda t: t.replace(
+            "set -euo pipefail\n",
+            "set -euo pipefail\n[[ ${JEPSEN_STAGE:-} == 2 ]] && { echo boom >&2; exit 9; }\n", 1))
+        done = self.night("--dry-run", extra={"JEPSEN_TRACKER": "7"})
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("would set status jepsen/nightly = failure", done.stdout)
+        self.assertIn("dies before it reports", done.stdout)
+        self.assertIn("exited 9 without reporting", done.stdout)
+        self.assertIn("boom", done.stdout)
+        self.assertIn("would comment on #7", done.stdout)
+        self.assertNotIn("the host's:", done.stdout)
+        self.assertEqual(self.git(self.home / "nerva", "rev-parse", "HEAD"), good)
+
+    def test_a_broken_tip_does_not_wedge_the_hosts_checkout(self):
+        # The unit runs the checkout's own nightly.sh. A syntax error in a function body near the
+        # top of the tip's script must not stay in the checkout: night 3 still fetches the fix.
+        self.assertEqual(self.night("--dry-run").returncode, 0)
+        clone = self.home / "nerva"
+        good = self.git(clone, "rev-parse", "HEAD")
+        checkout_script = clone / "ops/jepsen/nightly.sh"
+        self.push(self.remote, "broken", lambda t: t.replace(
+            "log() {", "broken() { if then fi (; }\nlog() {", 1))
+        night2 = self.night("--dry-run", extra={"JEPSEN_TRACKER": "7"}, script=checkout_script)
+        self.assertEqual(night2.returncode, 0, night2.stderr)
+        self.assertIn("would set status jepsen/nightly = failure", night2.stdout)
+        self.assertIn("would comment on #7", night2.stdout)
+        self.assertEqual(self.git(clone, "rev-parse", "HEAD"), good)
+        self.push(self.remote, "fixed", lambda t: t)
+        night3 = self.night("--dry-run", extra={"JEPSEN_TRACKER": "7"}, script=checkout_script)
+        self.assertEqual(night3.returncode, 0, night3.stderr)
+        self.assertIn("running the tip's nightly.sh", night3.stderr)
+        self.assertIn("would comment on #7", night3.stdout)
+        self.assertEqual(self.git(clone, "rev-parse", "HEAD"),
+                         self.git(self.remote, "rev-parse", "HEAD"))
+
+    def test_the_readme_says_unit_files_need_setup_to_run_again(self):
+        readme = (HERE / "README.md").read_text()
+        self.assertIn("only when `setup.sh` runs again", " ".join(readme.split()))
 
     def test_no_token_ends_the_night_at_once_before_anything_runs(self):
         Path(self.tmp.name, "empty").write_text("")

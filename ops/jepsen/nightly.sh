@@ -8,7 +8,8 @@
 # A failure of the host (a build that failed, Docker down, a run past the deadline) is written
 # to `host-failure` or the `runs` file and reported as the host's: a status `error`, never an
 # issue. A tip whose own nightly.sh does not parse is the repository's: `repo-failure`, a status
-# `failure` and an issue (P240). The token is a file (the unit's credential); this script never prints it.
+# `failure` and an issue (P240), and so is a tip whose script dies before it reports (P240b).
+# The token is a file (the unit's credential); this script never prints it.
 set -euo pipefail
 
 : "${JEPSEN_HOME:=/var/lib/jepsen}"
@@ -64,26 +65,28 @@ if [[ -z "${JEPSEN_COPY_OF:-}" ]]; then
 fi
 trap 'rm -f "${JEPSEN_COPY_PATH:-}" "${JEPSEN_COPY_PATH:-}.report.py"' EXIT
 here=$JEPSEN_COPY_OF
-stage=${JEPSEN_STAGE:-1}
 night_start=$((SECONDS - ${JEPSEN_ELAPSED:-0}))
 mkdir -p "$JEPSEN_HOME"/{archive,state,nights}
 
+# Stage 2 is the tip's script, run by stage 1 as a child (P240b). It counts only when its parent
+# is the stage 1 that named itself; anything else is stage 1, which takes the lock.
+stage=1
+if [[ "${JEPSEN_STAGE:-}" == 2 && "${JEPSEN_STAGE1_PID:-}" == "$PPID" ]]; then
+  stage=2
+fi
+unset JEPSEN_STAGE1_PID
+
 # One night at a time. A second start (the timer while a run is late, or by hand) leaves quietly.
-# Stage 2 inherits the held descriptor across the re-exec: opening the file again would close
-# fd 9 and release the lock for a moment. The variable is trusted only in stage 2, and only if
-# fd 9 really is the lock file and `flock -n 9` succeeds on it (it does for the holder: the same
-# open file description); anything else takes the lock the normal way (P240).
-if [[ "$stage" == 2 && -n "${JEPSEN_LOCK_HELD:-}" && /proc/self/fd/9 -ef "$JEPSEN_HOME/nightly.lock" ]] \
-   && flock -n 9; then
-  :
-else
+# Stage 1 holds the lock from here until it exits and runs stage 2 as a child with fd 9 closed,
+# so the lock is never free between the stages and no child can outlive it by holding it.
+if ((stage == 1)); then
   exec 9>"$JEPSEN_HOME/nightly.lock"
   if ! flock -n 9; then
-    log "another night is running; leaving"
+    log "another night is running (pid $(cat "$JEPSEN_HOME/nightly.pid" 2> /dev/null || echo unknown)); leaving"
     exit 0
   fi
+  echo "$$" > "$JEPSEN_HOME/nightly.pid"
 fi
-unset JEPSEN_LOCK_HELD
 
 # A dry run has a night, an archive and a state of its own: it never touches the real ones.
 date_utc=${JEPSEN_DATE:-$(date -u +%Y-%m-%d)}
@@ -129,6 +132,13 @@ fetch_tip() {
   fetched=1
   commit=$(git rev-parse HEAD) || { host_failure "git rev-parse failed"; return 1; }
   echo "$commit" > "$night/commit" || { host_failure "cannot write $night/commit"; return 1; }
+}
+
+# Puts the checkout back on the commit it was on before this night moved it (P240b): the unit
+# runs the checkout's nightly.sh, so it must stay a script that ran a night to the end.
+restore_checkout() {
+  [[ -z "$prev" ]] || git -C "$JEPSEN_REPO_DIR" checkout --quiet --detach "$prev" \
+    || log "could not put the checkout back on ${prev:0:12}"
 }
 
 # Builds the checked-out tip.
@@ -179,6 +189,7 @@ commit=""
 fetched=0
 archive="$JEPSEN_HOME/archive/$date_utc$suffix.tar.zst"
 ready=0
+prev=$(git -C "$JEPSEN_REPO_DIR" rev-parse HEAD 2> /dev/null || true)
 if ((stage == 2)); then
   commit=$(cat "$night/commit") && fetched=1 && ready=1
   cd "$JEPSEN_REPO_DIR"
@@ -188,20 +199,33 @@ elif fetch_tip; then
     next=$(mktemp)
     cp "$tip" "$next"
     if ! bash -n "$next" 2> "$night/tip-parse.log"; then
-      # A tip whose script does not parse would die silently at stage 2: keep this script and
-      # its own reporter (the tip's may not take this script's arguments). The defect is the
+      # A tip whose script does not parse could not report: keep this script and its own
+      # reporter (the tip's may not take this script's arguments). The defect is the
       # repository's, not the host's: `repo-failure` makes a status `failure` and an issue.
       rm -f "$next"
       { echo "bash -n said:"; head -c 800 "$night/tip-parse.log"; } > "$night/store/repo-failure"
       log "the tip's ops/jepsen/nightly.sh does not parse; nothing was run: $(head -n 3 "$night/tip-parse.log" | tr '\n' ' ')"
+      restore_checkout
       [[ ! -f "$JEPSEN_COPY_PATH.report.py" ]] || reporter="$JEPSEN_COPY_PATH.report.py"
-      ready=0
     else
-      rm -f "$JEPSEN_COPY_PATH" "$JEPSEN_COPY_PATH.report.py"
       log "running the tip's nightly.sh"
-      JEPSEN_LOCK_HELD=1 JEPSEN_STAGE=2 JEPSEN_DATE=$date_utc \
+      rc=0
+      JEPSEN_STAGE=2 JEPSEN_STAGE1_PID=$$ JEPSEN_DATE=$date_utc \
         JEPSEN_ELAPSED=$((SECONDS - night_start)) JEPSEN_COPY_PATH=$next \
-        JEPSEN_COPY_OF="$JEPSEN_REPO_DIR/ops/jepsen" exec bash "$next" "$@"
+        JEPSEN_COPY_OF="$JEPSEN_REPO_DIR/ops/jepsen" \
+        bash "$next" "$@" 9>&- 2> >(tee -a "$night/stage2.log" >&2) || rc=$?
+      wait
+      rm -f "$next"
+      if [[ -f "$night/reported" ]]; then
+        exit "$rc"
+      fi
+      # It died without reporting (a runtime fault the parse check cannot see): the night is
+      # reported here, as the repository's defect, and the checkout goes back.
+      { echo "stage 2 (the tip's nightly.sh) exited $rc without reporting; its stderr ended:"
+        tail -c 800 "$night/stage2.log" 2> /dev/null || true; } > "$night/store/repo-failure"
+      log "the tip's nightly.sh exited $rc without reporting the night"
+      restore_checkout
+      [[ ! -f "$JEPSEN_COPY_PATH.report.py" ]] || reporter="$JEPSEN_COPY_PATH.report.py"
     fi
   else
     ready=1
@@ -239,3 +263,4 @@ if [[ -z "$commit" ]]; then
   exit 1
 fi
 report
+: > "$night/reported"

@@ -23,7 +23,18 @@ user `jepsen`, and starts the fleet again whatever happened (`ExecStartPre=+` an
 5. calls `python3 -I jepsen_report.py ingest`.
 
 The script runs from a private copy of itself: the checkout it moves to the tip of `main` is the
-one it started from. The lock is held across the re-exec into the tip's own script (the descriptor is inherited), and `JEPSEN_LOCK_HELD` is honoured only in stage 2 and only if fd 9 is the lock file and still locked. A tip whose `nightly.sh` does not parse (`bash -n`) is not run: it is the repository's defect, so the night (reported with stage 1's own reporter) is status `failure` and an issue (`nightly|script|unparsable`), not the host's `error` (P240). With no token, `nightly.sh` exits at once with one journal line; the unit runs `nightly.sh --check-token` before it stops the fleet.
+one it started from. Stage 1 (the checkout's script) takes the lock and holds it until the night
+ends. If the tip's `nightly.sh` differs, stage 1 runs it as a child (stage 2, fd 9 closed) and waits
+for it; stage 2 counts only when its parent is the stage 1 that named itself. The checkout stays on
+the last commit whose night ran to the end: if the tip's script does not parse (`bash -n`), or
+stage 2 exits without having reported, stage 1 puts the checkout back on the commit it started from
+and reports the night itself with its own copy of the reporter. That is the repository's defect, not
+the host's: status `failure` and an issue (`nightly|script|unparsable` or `nightly|script|died`),
+and the tracker's line (P240, P240b). A second night that finds the lock held logs the pid in
+`nightly.pid`. With no token, `nightly.sh` exits at once with one journal line; the unit runs
+`nightly.sh --check-token` before it stops the fleet. The night moves only the checkout: a host
+picks up changes to `jepsen.service` and `jepsen.timer` (the `--check-token` step, say) only when
+`setup.sh` runs again.
 
 ## What the reporter does
 
