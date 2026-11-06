@@ -172,7 +172,7 @@
 
 (defn invoke-keyed
   "An operation for `value` (a key and what it commits): :ok or :fail by `:complete` if an
-  attempt was definite; :fail :refused if every attempt was refused or never sent (the key
+  attempt was definite (a refusal only if no earlier attempt got no answer); :fail :refused if every attempt was refused or never sent (the key
   stays pending, for the final phase); else :info. A violation is the protocol checker's."
   [{:keys [pending drop-reply attempts]} test op ops]
   (let [value (:value op)
@@ -180,13 +180,16 @@
         [tries crashed?] (attempts-or-crash test value ops
                                             {:max-attempts attempts, :drop-reply drop-reply})
         done  (first (filter definite? tries))
+        ;; A refusal after an attempt that got no answer is no answer: the original may still
+        ;; commit (a paused gateway), and Nerva records no key for a refusal.
+        doubtful? (and done (= :refused (:kind done)) (some (comp #{:unknown} :kind) tries))
         base  (assoc op :attempts tries)]
     (cond
       (violation-of tries)
       (do (push-pending! pending value)
           (http/violation base (:reply (violation-of tries))))
 
-      done
+      (and done (not doubtful?))
       ((:complete ops) base done)
 
       (and (not crashed?) (every? (comp #{:refused :not-sent} :kind) tries))

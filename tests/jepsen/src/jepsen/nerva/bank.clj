@@ -21,7 +21,8 @@
   code in `jepsen.nerva.keyed`), and in the same transaction it writes a record in the
   `transfers` record table: id the key, value `from`, `to` (each an index into `accounts`) and
   the requested `amount`. An index by `from` and a `count` view over the table are declared
-  with it. A transfer is answered by a 2xx or by Nerva's own refusal (a 409 with a status);
+  with it. A transfer is answered by a 2xx or by Nerva's own refusal (a 409 with a status), unless an
+  earlier attempt of its key got no answer (the original may commit later: the op ends :info);
   keys that were not are resent after healing, then every record is read through the index.
   Also checked:
   - `:duplicate`  every 2xx for a key, a discarded one included, names the same op;
@@ -50,6 +51,9 @@
 (def transfers-index "transfers_by_from")
 (def transfers-view "transfers_count")
 (def page-limit 500)
+(def scan-pages-max
+  "Pages one index key's scan may take: 100 x 500 records, far above a run's transfers."
+  100)
 (def funding-per-row 100)
 
 (def accounts
@@ -199,9 +203,12 @@
 
 (defn refused?
   "Whether an attempt was refused by Nerva itself (a 409 with its status), which is as definite
-  as a commit: a gateway's own refusal (busy, no session) carries no status."
+  as a commit (`keyed/invoke-keyed` makes it so only if no earlier attempt of the key got no
+  answer). Not a gateway's own refusal (busy, no session: no status), and not a 503
+  `views_busy` or 413 `views_too_large`, which carry a status but say nothing was applied and a
+  resend is safe (R4's contract; `http/refusal-error` keeps the same line)."
   [attempt]
-  (and (= :refused (:kind attempt)) (string? (:status attempt))))
+  (and (= :refused (:kind attempt)) (= 409 (:http attempt)) (string? (:status attempt))))
 
 (defn definite?
   "A transfer is answered by a 2xx the client kept, or by Nerva's refusal of it."
@@ -230,9 +237,12 @@
      :amount (parse-long (str (get fields "amount")))}))
 
 (defn scan-from!
-  "Every record of the index with `from` = i, in pages. Throws unless every page is a 200."
+  "Every record of the index with `from` = i, in pages. Throws unless every page is a 200, if a
+  cursor does not advance, or after `scan-pages-max` pages."
   [node port i]
-  (loop [after nil, found []]
+  (loop [after nil, found [], pages 0]
+    (when (<= scan-pages-max pages)
+      (throw (ex-info "a scan has too many pages" {:pages pages})))
     (let [reply (http/request! node port "POST" (str "/v1/indexes/" transfers-index "/scan")
                                (cond-> {"eq" {"from" i}, "limit" page-limit}
                                  after (assoc "after" after)))]
@@ -240,7 +250,9 @@
         (throw (ex-info "a scan was not answered" {:reply (select-keys reply [:status :body])})))
       (let [found (into found (map parse-record) (get-in reply [:body "records"]))]
         (if-let [next-page (get-in reply [:body "next"])]
-          (recur next-page found)
+          (do (when (= next-page after)
+                (throw (ex-info "a scan's cursor did not advance" {:cursor next-page})))
+              (recur next-page found (inc pages)))
           found)))))
 
 (defn count-view!

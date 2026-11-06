@@ -71,6 +71,8 @@
            opts
            (:test-keys workload)
            {:name      (str "nerva " (name (:workload opts))
+                            (when (and (= :bank (:workload opts)) (false? (:keyed opts)))
+                              " no-keys")
                             (when (seq (:nemesis opts))
                               (str " " (str/join "," (map name (:nemesis opts))))))
             :os        os/noop

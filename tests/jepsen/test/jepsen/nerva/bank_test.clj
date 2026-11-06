@@ -119,9 +119,13 @@
   ([op] (answered op {}))
   ([op more] (merge {:kind :committed, :op op, :gateway "n1:8080"} more)))
 
-(def out-of-bounds {:kind :refused, :http 409, :code "NRV-E0301", :status "out_of_bounds",
+(def out-of-bounds {:kind :refused, :http 409, :code "NRV-E0203", :status "out_of_bounds",
                     :gateway "n1:8080"})
 (def busy {:kind :refused, :http 503, :code "NRV-E0602", :gateway "n1:8080"})
+(def views-busy {:kind :refused, :http 503, :code "NRV-E0211", :status "views_busy",
+                 :gateway "n1:8080"})
+(def views-too-large {:kind :refused, :http 413, :code "NRV-E0212", :status "views_too_large",
+                      :gateway "n1:8080"})
 (def lost {:kind :unknown, :error "java.net.http.HttpTimeoutException", :gateway "n1:8081"})
 
 (defn transfer
@@ -268,14 +272,29 @@
         value  {:key "k", :from [1 "held"], :to [2 "held"], :amount 30, :clamp? false}
         run    (fn [attempts]
                  (let [calls (atom 0)]
+                   (reset! (:pending client) [])
                    (with-redefs [bank/attempt! (fn [& _] (nth attempts (dec (swap! calls inc))))]
                      [(client/invoke! client {:nodes ["n1"]} {:f :transfer, :value value})
                       @(:pending client)])))]
     (testing "a refusal with a status is definite: :fail with that status, nothing pending"
-      (let [[done pending] (run [lost out-of-bounds])]
+      (let [[done pending] (run [busy out-of-bounds])]
         (is (= :fail (:type done)))
         (is (= :out_of_bounds (:error done)))
         (is (empty? pending))))
+    (testing "but not after an attempt that got no answer: the original may commit later"
+      (let [[done pending] (run [lost out-of-bounds])]
+        (is (= :info (:type done)))
+        (is (= :unresolved (:error done)))
+        (is (= [value] pending) "the final phase resends it")))
+    (testing "only a 409 is Nerva's refusal: views_busy (503) and views_too_large (413) are not"
+      (doseq [reply [views-busy views-too-large]]
+        (is (not (bank/refused? reply)) (str (:http reply)))
+        (is (not (bank/definite? reply)))
+        (let [[done pending] (run [reply reply])]
+          (is (= :fail (:type done)))
+          (is (= bank/gateway-refusal (:error done)) "no refusal by Nerva")
+          (is (= [value] pending))))
+      (is (bank/refused? out-of-bounds)))
     (testing "a gateway's refusal is not: the key waits for the final phase"
       (let [[done pending] (run [busy busy])]
         (is (= :fail (:type done)))
@@ -285,6 +304,47 @@
       (let [[done] (run [(answered 12 {:applied 5})])]
         (is (= :ok (:type done)))
         (is (= 12 (:op done)))))))
+
+(deftest a-refusal-after-a-lost-attempt-leaves-room-for-the-original
+  (let [ops [good-read good-view
+             (transfer :info "k1" 30 [lost out-of-bounds])
+             (resolve-op (entry "k1" 30 [out-of-bounds]))]]
+    (testing "the original never committed: no record, all valid"
+      (is (true? (keyed-valid? (conj ops (records-read []))))))
+    (testing "the original committed after the refusal: its record is accounted for"
+      (let [hist (history-of (conj ops (records-read [(record "k1" 30)])))
+            result (bank/analyze-keys hist)]
+        (is (true? (:valid? result)))
+        (is (zero? (:count (:extra result))))
+        (is (zero? (:count (:count-view result))))))
+    (testing "a count view that does not match the records still fails"
+      (is (false? (keyed-valid? (conj ops (assoc (records-read [(record "k1" 30)]) :count 0))))))
+    (testing "the same refusal as the first attempt was definite: a record is then extra"
+      (is (false? (keyed-valid?
+                    [good-read good-view (transfer :fail "k1" 30 [out-of-bounds])
+                     (records-read [(record "k1" 30)])]))))))
+
+(defn scan-reply
+  [records next]
+  {:status 200, :body (cond-> {"records" records} next (assoc "next" next))})
+
+(deftest a-scan-is-bounded
+  (let [rec {"id" "a", "fields" {"from" 0, "to" 1, "amount" "1"}}]
+    (testing "pages are followed to the end"
+      (let [replies [(scan-reply [rec] "c1") (scan-reply [rec] nil)]
+            calls   (atom -1)]
+        (with-redefs [http/request! (fn [& _] (nth replies (swap! calls inc)))]
+          (is (= 2 (count (bank/scan-from! "n1" 8080 0)))))))
+    (testing "a cursor that does not advance throws"
+      (let [replies (atom [(scan-reply [rec] "c1") (scan-reply [rec] "c1")])
+            calls   (atom -1)]
+        (with-redefs [http/request! (fn [& _] (nth @replies (swap! calls inc)))]
+          (is (thrown? clojure.lang.ExceptionInfo (bank/scan-from! "n1" 8080 0))))))
+    (testing "a scan that never ends throws after the page limit"
+      (let [calls (atom 0)]
+        (with-redefs [http/request! (fn [& _] (scan-reply [rec] (str "c" (swap! calls inc))))]
+          (is (thrown? clojure.lang.ExceptionInfo (bank/scan-from! "n1" 8080 0)))
+          (is (= bank/scan-pages-max @calls)))))))
 
 (deftest the-keys-flag-picks-the-workload
   (is (true? (:keyed? (:client (bank/workload {})))) "keys are the default")

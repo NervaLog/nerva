@@ -98,8 +98,10 @@ lost and discarded replies, resends to another gateway, the final phase). The sa
 writes a record in the `transfers` record table (table `0x80000014`; id the key; `from` and `to`
 as indexes of the eight conserved fields, and the requested `amount`), and the bootstrap
 declares an index by `from` and a `count` view over the table. A transfer ends `:ok` on a `2xx`,
-`:fail` with Nerva's status on a refusal (`out_of_bounds`, which no key outlives), `:fail
-:refused` if only gateways refused it, else `:info`; keys without a definite answer are resent
+`:fail` with Nerva's status on a `409` refusal (`out_of_bounds`, which no key outlives, unless
+an earlier attempt of the key got no answer: then the op is `:info` and the key is resent after
+healing, in case the original commits later), `:fail :refused` if only gateways refused it (a
+`503 views_busy` or `413 views_too_large` included), else `:info`; keys without a definite answer are resent
 after healing, and then every record is read through the index (eight `from` keys, paged) and
 the count view. Conservation alone cannot see a duplicate transfer, so also checked: `duplicate`
 (every `2xx` for a key names the same op), `missing` (every key that committed has a record),
@@ -107,7 +109,12 @@ the count view. Conservation alone cannot see a duplicate transfer, so also chec
 `duplicated` and `wrong` (one record per key, with the transfer's `from`, `to` and `amount`), and
 `count-view` (the view equals the records listed, which lie between the committed keys and those
 that may have committed). A key no `2xx` or refusal answered makes the result `:unknown`.
-`--no-keys` is today's run, with no key and no record; `test-all` runs both.
+Records are upserts, so a duplicate apply leaves one record: `bank` catches a duplicate only
+when both `2xx` replies reached the client (`duplicate`). If the first reply is truly lost and a
+broken dedup applies the resend again, conservation, the records and the counts all hold;
+`retry`'s balance check is what covers that, so keyed `bank` is not a duplicate detector on its
+own. `--no-keys` is today's run, with no key and no record; `test-all` runs both, as `nerva bank`
+and `nerva bank no-keys` (the reporter files the latter as workload `bank-no-keys`).
 
 **`retry`**: what Botpike does after a lost reply (P123): resend a keyed commit, under the same
 key, until the answer is definite. Eight account rows (`balance`, floored at 0) and an unfloored
