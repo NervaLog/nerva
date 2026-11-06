@@ -108,24 +108,46 @@
                     binary :start (str "--addresses=" (addresses test)) :--development
                     data-file))
 
+(defn start-gateway!
+  "Starts gateway `index` once."
+  [test index]
+  (apply cu/start-daemon!
+         {:logfile           (gateway-log index)
+          :pidfile           (gateway-pidfile index)
+          :chdir             dir
+          :match-executable? false
+          :env               {:NERVA_KEY http/api-key}}
+         (concat [binary :api (str "--cluster=" cluster)
+                  (str "--addresses=" (addresses test))
+                  (str "--listen=0.0.0.0:" (gateway-port index))
+                  :--listen-remote]
+                 (when-let [ms (:request-timeout test)]
+                   [(str "--request-timeout=" ms)]))))
+
+(def gateway-start-tries
+  "A gateway exits (NRV-E0604) when the cluster does not answer within its `--request-timeout`
+  at start, as while the replicas are still starting or cut off. Botpike's supervisor would
+  restart it; the suite does the same, this many times."
+  6)
+
 (defn start-api!
   "Starts the test's gateways. The control node reaches them over the network, so they listen
   on every address and say so: `--listen-remote` (P168, NRV-E0009). A test's `:request-timeout`
-  (milliseconds) becomes their `--request-timeout`."
+  (milliseconds) becomes their `--request-timeout`. A gateway that exits at start is started
+  again (`gateway-start-tries`); one that is neither healthy nor dead after 8 s is left."
   [test]
   (doseq [index (range (gateways test))]
-    (apply cu/start-daemon!
-           {:logfile           (gateway-log index)
-            :pidfile           (gateway-pidfile index)
-            :chdir             dir
-            :match-executable? false
-            :env               {:NERVA_KEY http/api-key}}
-           (concat [binary :api (str "--cluster=" cluster)
-                    (str "--addresses=" (addresses test))
-                    (str "--listen=0.0.0.0:" (gateway-port index))
-                    :--listen-remote]
-                   (when-let [ms (:request-timeout test)]
-                     [(str "--request-timeout=" ms)])))))
+    (loop [tries 1]
+      (start-gateway! test index)
+      (let [deadline (+ (System/nanoTime) 8000000000)
+            state    (loop []
+                       (cond (http/healthy? c/*host* (gateway-port index)) :up
+                             (not (cu/daemon-running? (gateway-pidfile index))) :dead
+                             (< deadline (System/nanoTime)) :pending
+                             :else (do (Thread/sleep 500) (recur))))]
+        (when (and (= :dead state) (< tries gateway-start-tries))
+          (info "Gateway" index "on" c/*host* "exited at start; starting it again")
+          (recur (inc tries)))))))
 
 (defn kill-all!
   "SIGKILLs the gateways and the replica. The pidfile of a gateway the test did not start is
