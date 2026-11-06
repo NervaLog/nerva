@@ -4,12 +4,17 @@
 # printed, never an argument value) to /etc/jepsen/token, mode 0600. The unit stops the
 # simulation fleet before each night and starts it again after (jepsen.service), so this script
 # does not touch the fleet.
+#
+# It also installs the runner (nightly.sh, jepsen_report.py, the unit and the timer) from the
+# checkout it is run in, into /opt/jepsen/bin and /etc/systemd/system (P240). The night never
+# runs the tip's ops/jepsen/: a change to the runner reaches the host only when this runs again.
 set -eu
 SCRIPT_DIR=$(CDPATH='' cd -P -- "$(dirname -- "$(readlink -f -- "$0")")" && pwd -P)
 cd /
 
 HOME_DIR=/var/lib/jepsen
 CHECKOUT=$HOME_DIR/nerva
+BIN_DIR=/opt/jepsen/bin
 
 TOKEN_SRC=""
 while [ $# -gt 0 ]; do
@@ -64,7 +69,8 @@ fi
 [ -f /etc/jepsen/token ] || install -m 600 /dev/null /etc/jepsen/token
 [ -f /etc/jepsen/jepsen.env ] || cp "$SCRIPT_DIR/jepsen.env.example" /etc/jepsen/jepsen.env
 
-# The checkout the unit runs from; the night moves it to the tip of main itself.
+# The checkout is the code under test (the build and tests/jepsen); the night moves it to the
+# tip of main itself. The runner is not in it: it is installed below.
 if [ ! -d "$CHECKOUT/.git" ]; then
     runuser -u jepsen -- env HOME="$HOME_DIR" \
         git clone --quiet https://github.com/NervaLog/nerva.git "$CHECKOUT"
@@ -73,10 +79,19 @@ fi
 # host shows today and not at 01:17.
 runuser -u jepsen -- env HOME="$HOME_DIR" sh -c "cd '$CHECKOUT' && git fetch --quiet origin main && \
     git checkout --quiet --detach FETCH_HEAD && ./zig/download.sh && tests/jepsen/tools.sh >/dev/null && \
-    python3 -I ops/jepsen/test_jepsen_report.py"
+    python3 -I '$SCRIPT_DIR/test_jepsen_report.py'"
 
-cp "$CHECKOUT/ops/jepsen/jepsen.service" /etc/systemd/system/jepsen.service
-cp "$CHECKOUT/ops/jepsen/jepsen.timer" /etc/systemd/system/jepsen.timer
+# The runner: root-owned, readable by jepsen, and under /opt, which the unit sees read-only. Each
+# file is moved into place, so a night running now keeps the copy it started with.
+mkdir -p "$BIN_DIR"
+for file in nightly.sh jepsen_report.py; do
+    mode=644
+    [ "$file" != nightly.sh ] || mode=755
+    install -m "$mode" "$SCRIPT_DIR/$file" "$BIN_DIR/.$file.new"
+    mv -f "$BIN_DIR/.$file.new" "$BIN_DIR/$file"
+done
+cp "$SCRIPT_DIR/jepsen.service" /etc/systemd/system/jepsen.service
+cp "$SCRIPT_DIR/jepsen.timer" /etc/systemd/system/jepsen.timer
 systemctl daemon-reload
 # A timer enabled with no token runs a whole night that cannot report: enable it only with one.
 if [ -s /etc/jepsen/token ]; then

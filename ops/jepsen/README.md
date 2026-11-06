@@ -13,7 +13,7 @@ runs the night when it comes up). The unit stops `sim-fleet.service`, runs `nigh
 user `jepsen`, and starts the fleet again whatever happened (`ExecStartPre=+` and
 `ExecStopPost=+`, root, outside the unit's sandbox). `nightly.sh`:
 
-1. takes `flock` (a second start leaves quietly) and a whole-night deadline of 3 h
+1. takes `flock` once (a second start leaves quietly) and a whole-night deadline of 3 h
    (`JEPSEN_NIGHT_SECONDS`); a run past it is killed and counted as the host's;
 2. fetches `main`, builds `nerva` in ReleaseSafe at the tip (`./zig/zig build -Drelease`);
 3. runs `retry` and then `bank`, each `--nemesis kill,partition,gateway --time-limit 3600` and a
@@ -22,19 +22,19 @@ user `jepsen`, and starts the fleet again whatever happened (`ExecStartPre=+` an
 4. archives the night's `store/` as `/var/lib/jepsen/archive/<date>.tar.zst`, kept 90 days;
 5. calls `python3 -I jepsen_report.py ingest`.
 
-The script runs from a private copy of itself: the checkout it moves to the tip of `main` is the
-one it started from. Stage 1 (the checkout's script) takes the lock and holds it until the night
-ends. If the tip's `nightly.sh` differs, stage 1 runs it as a child (stage 2, fd 9 closed) and waits
-for it; stage 2 counts only when its parent is the stage 1 that named itself. The checkout stays on
-the last commit whose night ran to the end: if the tip's script does not parse (`bash -n`), or
-stage 2 exits without having reported, stage 1 puts the checkout back on the commit it started from
-and reports the night itself with its own copy of the reporter. That is the repository's defect, not
-the host's: status `failure` and an issue (`nightly|script|unparsable` or `nightly|script|died`),
-and the tracker's line (P240, P240b). A second night that finds the lock held logs the pid in
-`nightly.pid`. With no token, `nightly.sh` exits at once with one journal line; the unit runs
-`nightly.sh --check-token` before it stops the fleet. The night moves only the checkout: a host
-picks up changes to `jepsen.service` and `jepsen.timer` (the `--check-token` step, say) only when
-`setup.sh` runs again.
+**The runner is never the tip's (P240).** `setup.sh` installs `nightly.sh` and `jepsen_report.py`
+into `/opt/jepsen/bin` (root-owned, readable by `jepsen`, read-only inside the unit) and the unit
+runs that copy. The night fetches `main` into `/var/lib/jepsen/nerva` and builds and tests that
+checkout, the code under test; it never runs the `ops/jepsen/` in it. So a broken `nightly.sh` or
+`jepsen_report.py` on `main` cannot silence a night, and no checkout can wedge the next one. **A
+change to the runner (`nightly.sh`, `jepsen_report.py`, `jepsen.service`, `jepsen.timer`) reaches the
+host only when `setup.sh` runs again**, as root, from a checkout of the commit to install.
+
+A systemd stop or the unit's timeout sends TERM: a trap records the run in flight as exit 143 (or
+a `host-failure` if none had finished) and posts `jepsen/nightly` = `error` (the host's) and the
+tracker's line within about 80 s; `TimeoutStopSec=120` leaves room for that. A second night that
+finds the lock held logs the pid in `nightly.pid`. With no token, `nightly.sh` exits at once with
+one journal line; the unit runs `nightly.sh --check-token` before it stops the fleet.
 
 ## What the reporter does
 
@@ -47,7 +47,7 @@ standard library only (P147i). For each run:
 | valid | `success` | none |
 | invalid or unknown (`results.edn`) | `failure` | one per fingerprint |
 | the test threw: a `jepsen.log` and no `results.edn`, and no host exit code, and no host failure (ssh refused, out of heap, disk full, Docker) at the log's end (`nerva` died at setup, say) | `failure` | one per workload (checker `run`, class `crashed`), with the log's end |
-| the host's (exit 124, 125, 126 or 137 with no verdict written, a build that failed, Docker down, Jepsen never started, graphs that did not draw) | `error` | **never** |
+| the host's (exit 124, 125, 126, 137 or 143 with no verdict written, a build that failed, Docker down, Jepsen never started, graphs that did not draw) | `error` | **never** |
 
 `failure` outranks `error` outranks `success`: a night with one real finding and one host
 failure is `failure`, and the finding is filed. A night that did not run at all (`host-failure`
@@ -111,11 +111,16 @@ $EDITOR /etc/jepsen/jepsen.env                              # JEPSEN_TRACKER=<is
 systemctl start jepsen.service                              # a night now; journalctl -u jepsen -f
 ```
 
-`setup.sh` installs the packages, creates the user, copies the token to `/etc/jepsen/token`
+To change the runner later (a merged fix to `nightly.sh`, `jepsen_report.py` or the unit): pull
+the commit and run `sh ops/jepsen/setup.sh` again. Nothing else updates it; the night does not.
+
+`setup.sh` installs the packages, creates the user, installs the runner (`nightly.sh`,
+`jepsen_report.py`) into `/opt/jepsen/bin` and the unit and timer into `/etc/systemd/system` from
+the checkout it is run in, copies the token to `/etc/jepsen/token`
 (0600; the unit hands the service a private copy through `LoadCredential`), clones the repository
 to `/var/lib/jepsen/nerva`, fetches the toolchain and Leiningen, runs the reporter's tests, and
 enables the timer only if a token was installed (with none it says so; a timer with no token runs a night that cannot report). It does not touch the fleet. To see a night without writing to GitHub:
-`sudo -u jepsen /var/lib/jepsen/nerva/ops/jepsen/nightly.sh --dry-run` (sudo drops
+`sudo -u jepsen /opt/jepsen/bin/nightly.sh --dry-run` (sudo drops
 `JEPSEN_DRY_RUN` from the environment; `sudo -u jepsen env JEPSEN_DRY_RUN=1 ...` also works). A dry
 run has a night directory (`nights/<date>-dry`), an archive and a state file of its own, so it
 never touches a real night's. It still runs both workloads (about 2.5 h) and stops nothing: stop

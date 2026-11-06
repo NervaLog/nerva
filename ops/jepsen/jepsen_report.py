@@ -18,8 +18,8 @@ Each run is valid, invalid, unknown, or the host's:
   key, its anomaly class; never the seed or the commit); a known fingerprint gets a comment only
   for a commit it has not been reported on, at most COMMENTS_PER_FAILURE_PER_DAY a UTC day; at
   most FAILURES_PER_DAY distinct failures are looked at a day. The status is `failure`;
-- the host's (exit 124 past the night's deadline, 125, 126, 137 the OOM killer, unless a verdict
-  was written: an invalid or unknown one outranks the exit code; a run with no `jepsen.log` at
+- the host's (exit 124 past the night's deadline, 125, 126, 137 the OOM killer, 143 an
+  interrupted night, unless a verdict was written: an invalid or unknown one outranks the exit code; a run with no `jepsen.log` at
   all; a night that did not start; graphs that did not draw): counted, status `error`, never an
   issue;
 - crashed: Jepsen started (a `jepsen.log`) and wrote no `results.edn`, and the host did not kill
@@ -98,9 +98,11 @@ assert FAILURES_PER_DAY <= FILED_MAX
 assert HISTORY_BYTES_ISSUE + VERDICT_BYTES + 4096 <= BODY_BYTES_MAX
 
 # Exit codes that are the host's, not the code's: counted, never filed. 124: past the night's
-# deadline (`timeout`); 125, 126: `timeout` or the exec failed; 137: SIGKILL, the OOM killer.
+# deadline (`timeout`); 125, 126: `timeout` or the exec failed; 137: SIGKILL, the OOM killer;
+# 143: the night was interrupted (a systemd stop or timeout; nightly.sh's trap, P240).
 HOST_CODES = {124: "past the night's deadline", 125: "the run could not start",
-              126: "the run could not start", 137: "killed by the host (out of memory?)"}
+              126: "the run could not start", 137: "killed by the host (out of memory?)",
+              143: "interrupted (the unit was stopped or timed out)"}
 # What a jepsen.log's end shows when the host failed under a test that had started (ssh to a
 # node refused, the JVM out of heap, the disk full, Docker): the host's, never filed (P235c).
 # A bare "Connection refused" is not one: Jepsen's clients log it to gateways and replicas while
@@ -674,7 +676,7 @@ def read_runs_file(path):
 def settle_run(run, code, tests):
     """The run's kind once its exit code is known (P235b). A verdict that was written
     (invalid or unknown) outranks every exit code. Otherwise: the host's exit codes (124, 125,
-    126, 137) are the host's; no jepsen.log at all means Jepsen never started (the build,
+    126, 137, 143) are the host's; no jepsen.log at all means Jepsen never started (the build,
     Docker): the host's; a jepsen.log and no results.edn means the test threw (nerva died at
     setup, say): Nerva's, fingerprint `<workload>|run|crashed`, with the log's end in the issue."""
     if run.kind in ("invalid", "unknown"):
@@ -693,14 +695,6 @@ def settle_run(run, code, tests):
         run.kind, run.host_reason = "crashed", None
         run.findings = [("run", "crashed", None)]
         run.results_text = tail[-LOG_TAIL_BYTES:]
-
-
-def read_repo_failure(store):
-    """What `bash -n` said about the tip's nightly.sh, or None (file `repo-failure`)."""
-    path = os.path.join(store, "repo-failure")
-    if not os.path.exists(path):
-        return None
-    return read_head(path, 1024).strip() or "nightly.sh does not parse"
 
 
 def read_night(store, runs_file):
@@ -803,47 +797,8 @@ def html_comment_safe(text):
     return text.replace("--", "- -")
 
 
-REPO_FAILURE_KEY = "nightly|script|unparsable"
-REPO_DIED_KEY = "nightly|script|died"
-REPO_DIED_PREFIX = "stage 2 "  # What nightly.sh writes when the tip's script died unreported.
-
-
-def repo_failure_item(text):
-    """The finding for a tip whose `nightly.sh` does not parse, or died before it reported: the
-    repository's defect (P240, P240b)."""
-    died = text.startswith(REPO_DIED_PREFIX)
-    key = REPO_DIED_KEY if died else REPO_FAILURE_KEY
-    what = "dies before it reports" if died else "does not parse"
-    return {"run": None, "canary": False, "checker": "nightly",
-            "class": "died" if died else "unparsable",
-            "subtree": None, "repo_failure": text, "key": key,
-            "fingerprint": fingerprint_of(key), "died": died,
-            "title": f"Jepsen nightly: ops/jepsen/nightly.sh on main {what}"}
-
-
-def repo_failure_text(item, commit, first):
-    died = item["died"]
-    found = ("found that its `ops/jepsen/nightly.sh` exited without reporting the night, so the"
-             " night is reported by the script that fetched it" if died else
-             "found that its `ops/jepsen/nightly.sh` does not parse (`bash -n`), so **nothing was"
-             " run**")
-    out = [f"The Jepsen nightly (ops/jepsen/README.md) fetched `main` and {found}. This is a"
-           " defect in the repository, not the host's. The checkout was put back on the commit it"
-           " came from.\n" if first
-           else f"Still failing on commit `{commit}`.\n",
-           f"- **Commit:** `{commit}`", "", "What it said:" if died else "What `bash -n` said:",
-           "", fence(item["repo_failure"])]
-    text = "\n".join(out) + "\n"
-    if first:
-        text += (f"\n<!-- jepsen fingerprint: {item['fingerprint']} -->\n"
-                 f"<!-- jepsen key: {item['key']} -->\n")
-    return text
-
-
 def report_text(item, commit, archive, first):
     """An issue body (`first`) or a comment: the same facts, the marker only in the body."""
-    if item.get("repo_failure"):
-        return repo_failure_text(item, commit, first)
     run = item["run"]
     canary = item["canary"]
     out = []
@@ -1269,7 +1224,7 @@ def tracker_text(today, commit, runs, host_failure, state_name, description, fil
 
 
 def ingest(github, state, runs, host_failure, commit, tracker, archive, canary, now, repo, log,
-           status=True, repo_failure=None):
+           status=True):
     """Counts the night, sets its status, files or comments, posts the day. Returns a summary
     dict. Stops the writes at the first rate limit or unreachable GitHub."""
     summary = {"filed": 0, "commented": 0, "throttled": 0, "dropped": 0, "forbidden": 0,
@@ -1279,10 +1234,6 @@ def ingest(github, state, runs, host_failure, commit, tracker, archive, canary, 
     day["nights"] += 1
     day["commit"] = commit
     state_name, description = night_state(runs, host_failure, canary)
-    if repo_failure is not None:
-        died = repo_failure.startswith(REPO_DIED_PREFIX)
-        state_name, description = "failure", "the repository's: ops/jepsen/nightly.sh on this " \
-            "commit " + ("dies before it reports" if died else "does not parse, nothing was run")
     summary["status"] = state_name
     posted, why = (None, "no status for this night")
     if status:
@@ -1292,9 +1243,7 @@ def ingest(github, state, runs, host_failure, commit, tracker, archive, canary, 
     if posted is None:
         summary["status"] = f"{state_name} (not posted: {why})"
     items = []
-    if repo_failure is not None:
-        items.append(repo_failure_item(repo_failure))
-    elif host_failure is None:
+    if host_failure is None:
         for run in runs:
             items.extend(make_findings(run, canary))
     groups = {}
@@ -1432,7 +1381,6 @@ def main(argv, now=None):
         return 1
     try:
         runs, host_failure = read_night(args.store, args.runs)
-        repo_failure = read_repo_failure(args.store)
     except BadInput as err:
         log(f"night refused, nothing reported: {err}")
         return 1
@@ -1460,7 +1408,7 @@ def main(argv, now=None):
     try:
         summary = ingest(github, state, runs, host_failure, args.commit, args.tracker,
                          args.archive, args.expect_invalid, now, args.repo, log,
-                         status=not args.no_status, repo_failure=repo_failure)
+                         status=not args.no_status)
     except Exception:
         # Whatever was posted before the fault is remembered, so the next night does not repeat it.
         with contextlib.suppress(OSError):
