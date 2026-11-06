@@ -54,7 +54,8 @@
                       :kill      {:targets [:one :minority :majority :all]}
                       :pause     {:targets [:one :minority :majority]}
                       :partition {:targets [:one :majority :majorities-ring]}}]
-    (combined/compose-packages [(combined/db-package package-opts)
+    (combined/compose-packages [(nemesis/heal-package package-opts)
+                                (combined/db-package package-opts)
                                 (combined/partition-package package-opts)
                                 (nemesis/package package-opts)])))
 

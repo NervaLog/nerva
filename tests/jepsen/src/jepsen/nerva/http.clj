@@ -34,6 +34,11 @@
   request the cluster does not answer comes back as the gateway's `503`, not as ours."
   35000)
 
+(def probe-timeout-ms
+  "How long a `/healthz` probe may take: a paused or cut-off gateway accepts the connection and
+  never answers, and a probe must not wait `timeout-ms` for it."
+  3000)
+
 (def ^:private client
   ;; HTTP/1.1 only: the gateway takes one request per connection and does not upgrade.
   (delay (-> (HttpClient/newBuilder)
@@ -165,7 +170,7 @@
   ([node]
    (healthy? node api-port))
   ([node port]
-   (try (= 200 (:status (request! node port "GET" "/healthz" nil)))
+   (try (= 200 (:status (request! node port "GET" "/healthz" nil probe-timeout-ms)))
         (catch IOException _ false))))
 
 (defn await-healthy!

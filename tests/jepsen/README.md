@@ -70,13 +70,13 @@ status alone:
 | `kill` | SIGKILLs the replica and the gateway on one node, a minority, a majority or all, then restarts them |
 | `pause` | SIGSTOPs the replica (not the gateway) on one node, a minority or a majority, then resumes it |
 | `partition` | iptables: one node isolated, the cluster split into a majority and a minority, or a majorities ring |
-| `gateway-kill` | SIGKILLs one gateway or both on one node, a minority or a majority, the replica left running, then starts them again (with a bounded backoff while one exits at start) |
-| `gateway-partition` | Drops the gateway's traffic to every replica (`iptables -t mangle -A OUTPUT -m owner --uid-owner nerva-gwN -p tcp --dport 3000 -j DROP`); its clients still reach it and wait out its `--request-timeout`. In the mangle table, so a `partition` heal does not lift it |
-| `gateway-pause` | SIGSTOPs the gateway, the replica left running, then SIGCONTs it |
+| `gateway-kill` | SIGKILLs one gateway, one node's gateways, or a minority of nodes' gateways, the replica left running; the undo starts the gateways that are not running, without waiting for them |
+| `gateway-partition` | Drops a gateway's traffic to its own node's replica, to a majority of the replicas, or to all of them (`iptables -t mangle -A OUTPUT -m owner --uid-owner nerva-gwN -p tcp -d REPLICA --dport 3000 -j DROP`, one rule per replica); the gateways are one, one node's, or a minority of nodes'; its clients still reach it and wait out its `--request-timeout`. In the mangle table, so a `partition` heal does not lift it |
+| `gateway-pause` | SIGSTOPs one gateway or one node's gateways, the replica left running, then SIGCONTs them |
 | `gateway` | The three above, mixed; its final phase resumes, heals and starts every gateway |
 
 Each gateway runs as its own Unix user (`nerva-gw0`, `nerva-gw1`) so that iptables can name one.
-A node without the gateway an op names (a fourth node's second gateway) does nothing.
+The nemesis draws its targets from the gateways the test runs (`--gateways 2` gives two only to the first three nodes), so no fault names a gateway that does not exist. The op's value in the history lists the targets (`:gateways`, or `:cut` and `:scope` for a partition), and its completion adds `:hit`, the `[node index]` pairs acted on. In the final phase `gateway-resume` and `gateway-heal` run before the replicas' `start`, and `gateway-start` after it.
 
 Planned: lost unsynced writes (LazyFS) and bit flips, clock faults (on
 separate machines: `nerva` is a static binary, so libfaketime cannot fool it, and containers

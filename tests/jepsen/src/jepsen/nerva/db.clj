@@ -174,7 +174,8 @@
 
 (defn start-gateway-until-up!
   "Starts gateway `index` and waits for it to be healthy or dead; a dead one is started again
-  after a backoff, at most `gateway-start-tries` times in all."
+  after a backoff, at most `gateway-start-tries` times in all. Each probe of `/healthz` takes at
+  most `http/probe-timeout-ms`, so the wait is bounded by `gateway-start-wait-s` per try."
   [test index]
   (loop [tries 1]
     (start-gateway! test index)
@@ -201,52 +202,80 @@
   (doseq [index (range (gateways test c/*host*))]
     (start-gateway-until-up! test index)))
 
-(defn indices
-  "The gateways of this node that `which` (an index, or :all) names."
-  [test which]
-  (let [have (gateways test c/*host*)]
-    (if (= :all which) (range have) (filter #(< % have) [which]))))
+(defn node-gateways
+  "The `[node index]` pairs of the gateways `node` runs: none beyond `gateways`."
+  [test node]
+  (mapv (fn [index] [node index]) (range (gateways test node))))
+
+(defn all-gateways
+  "Every `[node index]` pair the test runs, in node order."
+  [test]
+  (into [] (mapcat #(node-gateways test %)) (:nodes test)))
 
 (defn kill-gateways!
-  "SIGKILLs the gateways `which` names on this node, the replica untouched."
-  [test which]
-  (doseq [index (indices test which)]
-    (cu/stop-daemon! (gateway-pidfile index))))
+  "SIGKILLs gateways `indices` on this node, the replica untouched. Returns `indices`."
+  [indices]
+  (doseq [index indices]
+    (cu/stop-daemon! (gateway-pidfile index)))
+  (vec indices))
 
 (defn start-gateways!
-  "Starts the gateways `which` names on this node (one already running stays)."
-  [test which]
-  (doseq [index (indices test which)]
-    (start-gateway-until-up! test index)))
+  "Starts this node's gateways that are not running, without waiting for them: a paused or
+  cut-off gateway is running and is left alone, and the nemesis stays responsive. Returns the
+  indices started. A gateway that exits at start (NRV-E0604) stays down until the next start."
+  [test]
+  (vec (for [index (range (gateways test c/*host*))
+             :when (not (cu/daemon-running? (gateway-pidfile index)))
+             :let [_ (start-gateway! test index)]]
+         index)))
 
 (defn signal-gateways!
-  "Sends `signal` to the gateways `which` names; a gateway that is gone is not an error."
-  [test which signal]
-  (doseq [index (indices test which)]
-    (try (c/exec :kill signal (c/lit (str "$(cat " (gateway-pidfile index) ")")))
-         (catch Exception e (info "Gateway" index "on" c/*host* "is not running:" (.getMessage e))))))
+  "Sends `signal` to gateways `indices` on this node; a gateway that is gone is not an error.
+  Returns the indices signalled."
+  [indices signal]
+  (vec (for [index indices
+             :when (try (c/exec :kill signal (c/lit (str "$(cat " (gateway-pidfile index) ")")))
+                        true
+                        (catch Exception e
+                          (info "Gateway" index "on" c/*host* "is not running:" (.getMessage e))
+                          false))]
+         index)))
 
 (defn gateway-rule
-  "The iptables arguments (after the table and chain; the table is `mangle`) that drop gateway `index`'s traffic to
-  any replica. In the mangle table: Jepsen's partitioner heals with `iptables -F`, which
-  flushes only the filter table."
-  [index]
-  (str "-m owner --uid-owner " (gateway-user index) " -p tcp --dport " replica-port " -j DROP"))
+  "The iptables arguments (after the table and chain; the table is `mangle`) that drop gateway
+  `index`'s traffic to the replica at `dest`. In the mangle table: Jepsen's partitioner heals
+  with `iptables -F`, which flushes only the filter table."
+  [index dest]
+  (str "-m owner --uid-owner " (gateway-user index) " -p tcp -d " dest " --dport " replica-port
+       " -j DROP"))
 
 (defn partition-gateways!
-  "Cuts the gateways `which` names off from every replica: their clients still reach them."
-  [test which]
-  (doseq [index (indices test which)
-          :let [rule (gateway-rule index)]]
+  "Cuts gateways off from replicas on this node: `cuts` is `[[index [replica-node ...]] ...]`.
+  Their clients still reach them. Returns the indices cut."
+  [cuts]
+  (doseq [[index dests] cuts
+          dest dests
+          :let [rule (gateway-rule index dest)]]
     (c/exec :sh :-c (str "iptables -w -t mangle -C OUTPUT " rule " 2>/dev/null"
-                         " || iptables -w -t mangle -A OUTPUT " rule))))
+                         " || iptables -w -t mangle -A OUTPUT " rule)))
+  (mapv first cuts))
+
+(def heal-deletes-max
+  "At most this many copies of one rule are deleted (each cut adds at most one)."
+  8)
 
 (defn heal-gateways!
-  "Lifts every gateway cut on this node (all indices, whatever `which` was)."
-  []
-  (doseq [index (range max-gateways)]
-    (c/exec :sh :-c (str "while iptables -w -t mangle -D OUTPUT " (gateway-rule index)
-                         " 2>/dev/null; do :; done; true"))))
+  "Lifts every gateway cut on this node (all indices and replicas, whatever was cut). Returns
+  the indices that had a rule."
+  [test]
+  (vec (for [index (range max-gateways)
+             :let [script (str "n=0; for d in " (str/join " " (:nodes test)) "; do"
+                               " for i in $(seq " heal-deletes-max "); do"
+                               " iptables -w -t mangle -D OUTPUT " (gateway-rule index "$d")
+                               " 2>/dev/null || break; n=$((n+1)); done; done; echo $n")
+                   n      (parse-long (str/trim (c/exec :sh :-c script)))]
+             :when (pos? n)]
+         index)))
 
 (defn kill-all!
   "SIGKILLs the gateways and the replica. The pidfile of a gateway the test did not start is
@@ -286,7 +315,7 @@
 
     (teardown! [_ test node]
       (c/su
-        (heal-gateways!)
+        (heal-gateways! test)
         (kill-all!)
         (c/exec :rm :-rf dir)))
 
