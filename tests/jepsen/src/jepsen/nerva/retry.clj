@@ -34,10 +34,9 @@
                     [client :as client]
                     [generator :as gen]
                     [random :as rand]]
-            [jepsen.nerva.db :as db]
-            [jepsen.nerva.http :as http])
-  (:import (java.io IOException)
-           (java.util.concurrent ThreadLocalRandom)))
+            [jepsen.nerva.http :as http]
+            [jepsen.nerva.keyed :as keyed])
+  (:import (java.io IOException)))
 
 (def accounts-table 30)
 (def sources-table 31)
@@ -46,28 +45,7 @@
 (def account-rows (vec (range 1 9)))
 (def max-amount 30)
 
-(def request-timeout-ms
-  "The gateways' `--request-timeout`, in milliseconds: a gateway answers a request the cluster
-  leaves unanswered after this long (3 s), and a short client timeout (below, under 2 s) is
-  shorter than that."
-  3000)
-
-(def short-timeout-probability 0.25)
-(def resolve-deadline-ms
-  "How long the whole final phase (all workers, all keys) tries to get pending keys answered.
-  Keys left when it passes are reported unresolved, so a run with no healthy gateway ends in
-  :unknown within the job's time."
-  180000)
-
-(defn rnd
-  "A uniform double in [0, 1) from the worker's own source: client choices are not seeded."
-  []
-  (.nextDouble (ThreadLocalRandom/current)))
-
-(defn rnd-long
-  "A uniform long in [lo, hi)."
-  [lo hi]
-  (.nextLong (ThreadLocalRandom/current) lo hi))
+(def request-timeout-ms keyed/request-timeout-ms)
 
 ;; ---------------------------------------------------------------------------------------
 ;; The transaction
@@ -85,14 +63,11 @@
   {"key" key, "entries" (pay-entries value)})
 
 (defn pay-value
-  "A fresh pay-in. The key is 128 bits from Jepsen's random source, never zero."
+  "A fresh pay-in, under a fresh key."
   []
-  (let [key (format "%016x%016x" (rand/long) (rand/long))]
-    (if (= key (apply str (repeat 32 \0)))
-      (recur)
-      {:key     key
-       :account (nth account-rows (rand/long (count account-rows)))
-       :amount  (inc (rand/long max-amount))})))
+  {:key     (keyed/fresh-key)
+   :account (nth account-rows (rand/long (count account-rows)))
+   :amount  (inc (rand/long max-amount))})
 
 (defn bootstrap!
   "Layouts and the ledger, once, before the test."
@@ -105,160 +80,30 @@
             {"fields" [{"table" accounts-table, "field" "balance", "floor" "0"}
                        {"table" sources-table, "field" "balance", "floor" nil}]}))
 
-;; ---------------------------------------------------------------------------------------
-;; One attempt
-
 (defn attempt!
-  "Sends the pay-in once to gateway [node port] and says what came of it, as a map with a
-  :kind: :committed (a 2xx; :op, and :replayed? for a replay; :dropped? when the client
-  discarded the reply on purpose), :refused (`applied: false`; :http, :code, :status),
-  :unknown (`applied: \"unknown\"`, or no reply to a request that went out), :not-sent (no
-  connection) or :violation (a reply that breaks R4's promise; :reply)."
-  [[node port] value timeout-ms drop?]
-  (let [base {:gateway (str node ":" port), :timeout-ms timeout-ms}]
-    (try
-      (let [reply (http/request! node port "POST" "/v1/commit" (commit-body value) timeout-ms)
-            body  (:body reply)]
-        (merge base
-               (case (http/outcome reply)
-                 :ok        (merge {:kind :committed} (http/ok-fields reply)
-                                   (when drop? {:dropped? true}))
-                 :refused   {:kind :refused, :http (:status reply), :code (get body "code"),
-                             :status (get body "status")}
-                 :unknown   {:kind :unknown, :http (:status reply), :code (get body "code")}
-                 :violation {:kind :violation, :reply (select-keys reply [:status :body])})))
-      (catch IOException e
-        (merge base (if (http/not-sent? e)
-                      {:kind :not-sent}
-                      {:kind :unknown, :error (.getName (class e))}))))))
+  "Sends the pay-in once to gateway [node port] (`keyed/attempt!`)."
+  [target value timeout-ms drop?]
+  (keyed/attempt! (commit-body value) target timeout-ms drop?))
 
-(defn definite?
-  "Whether an attempt answered its key as far as the client knows: a 2xx it kept."
-  [attempt]
-  (and (= :committed (:kind attempt)) (not (:dropped? attempt))))
+(def ops
+  "What `keyed` takes of this workload: a pay-in is answered by a 2xx it kept."
+  {:attempt!   (fn [target value timeout-ms drop?] (attempt! target value timeout-ms drop?))
+   :entry-keys [:key :account :amount]
+   :complete   (fn [base done]
+                 (cond-> (assoc base :type :ok, :op (:op done))
+                   (:replayed? done) (assoc :replayed? true)))})
 
-(defn targets
-  "Every node's gateways, as [node port]."
-  [test]
-  (vec (for [node (:nodes test), index (range (db/gateways test node))]
-         [node (db/gateway-port index)])))
-
-(defn pick
-  "A gateway other than `previous` when there is another."
-  [targets previous]
-  (let [others (vec (or (seq (remove #{previous} targets)) targets))]
-    (nth others (rnd-long 0 (count others)))))
-
-(defn backoff!
-  "Sleeps before attempt number n + 1: 100 ms doubling to 2 s, jittered."
-  [n]
-  (Thread/sleep (long (* (min 2000 (* 100 (bit-shift-left 1 (min n 10)))) (+ 0.5 (* 0.5 (rnd)))))))
-
-(defn run-attempts!
-  "Sends `value` until an attempt is definite, a reply is a violation, or the budget is spent.
-  With :max-attempts, each attempt may be given a short client timeout and its 200 may be
-  discarded (:drop-reply is the probability). With :deadline-ns (the final phase), the client
-  waits for a healthy gateway and keeps the long timeout. With :deadline-ns (a System/nanoTime
-  value, one for the whole final phase), nothing is sent after it passes. With :sink (a
-  volatile), it always holds the attempts so far, even if this throws. Returns the attempts."
-  [test value {:keys [max-attempts deadline-ns drop-reply sink]}]
-  (let [targets  (targets test)
-        deadline deadline-ns]
-    (loop [attempts [], previous nil]
-      (let [n      (count attempts)
-            target (pick targets previous)]
-        (cond
-          (and deadline (<= deadline (System/nanoTime))) attempts
-          (and deadline (not (apply http/healthy? target)))
-          (do (backoff! (min n 5)) (recur attempts target))
-          :else
-          (let [timeout-ms (if (and max-attempts (< (rnd) short-timeout-probability))
-                             (rnd-long 50 2000)
-                             http/timeout-ms)
-                drop?      (and max-attempts (< (rnd) drop-reply))
-                attempts   (conj attempts (attempt! target value timeout-ms drop?))
-                _          (when sink (vreset! sink attempts))
-                last       (peek attempts)]
-            (cond (or (definite? last) (= :violation (:kind last))) attempts
-                  (if max-attempts (<= max-attempts (count attempts))
-                      (<= deadline (System/nanoTime)))             attempts
-                  :else (do (backoff! (count attempts)) (recur attempts target)))))))))
-
-;; ---------------------------------------------------------------------------------------
-;; The client
-
-(defn push-pending!
-  [pending value]
-  (swap! pending conj value))
-
-(defn pop-pending!
-  "Takes one key to resolve, atomically; nil when none is left."
-  [pending]
-  (let [[old _] (swap-vals! pending #(if (seq %) (pop %) %))]
-    (peek old)))
-
-(defn violation-of
-  [attempts]
-  (first (filter #(= :violation (:kind %)) attempts)))
-
-(defn attempts-or-crash
-  "Runs the attempts for `value`. Returns [attempts crashed?]: if they throw (an interrupt, a
-  reply the code did not expect), the attempts made so far are kept, so a 2xx among them still
-  counts in the duplicate check, and the interrupt is passed on."
-  [test value opts]
-  (let [sink (volatile! [])]
-    (try [(run-attempts! test value (assoc opts :sink sink)) false]
-         (catch Throwable t
-           (when (instance? InterruptedException t)
-             (.interrupt (Thread/currentThread)))
-           [@sink true]))))
+(def phase-deadline! keyed/phase-deadline!)
 
 (defn invoke-pay
-  [{:keys [pending drop-reply attempts]} test op]
-  (let [value (:value op)
-        [tries crashed?] (attempts-or-crash test value
-                                            {:max-attempts attempts, :drop-reply drop-reply})
-        done  (first (filter definite? tries))
-        base  (assoc op :attempts tries)]
-    (cond
-      (violation-of tries)
-      (do (push-pending! pending value)
-          (http/violation base (:reply (violation-of tries))))
-
-      done
-      (cond-> (assoc base :type :ok, :op (:op done))
-        (:replayed? done) (assoc :replayed? true))
-
-      (and (not crashed?) (every? (comp #{:refused :not-sent} :kind) tries))
-      (do (push-pending! pending value)
-          (assoc base :type :fail, :error :refused))
-
-      :else
-      (do (push-pending! pending value)
-          (assoc base :type :info, :error (if crashed? :crashed :unresolved))))))
-
-(defn phase-deadline!
-  "The final phase's one deadline (a System/nanoTime value): set by whichever worker asks first,
-  `ms` after that moment, then the same for every worker and key."
-  [phase ms]
-  (or @phase
-      (let [fresh (+ (System/nanoTime) (* ms 1000000))]
-        (swap! phase #(or % fresh)))))
+  [client test op]
+  (keyed/invoke-keyed client test op ops))
 
 (defn invoke-resolve
   "The final phase: sends every key still pending until a 2xx answers it, or the phase's
-  deadline passes; keys left then are reported with the attempts made (none), unresolved."
-  [{:keys [pending phase]} test op]
-  (loop [entries []]
-    (if-let [value (pop-pending! pending)]
-      (let [tries (run-attempts! test value
-                                 {:deadline-ns (phase-deadline! phase resolve-deadline-ms)})
-            entry (assoc (select-keys value [:key :account :amount]) :attempts tries)]
-        (if-let [bad (violation-of tries)]
-          (http/violation (assoc op :resolved (conj entries entry)) (:reply bad))
-          (recur (conj entries entry))))
-      (assoc op :type (if (every? #(some definite? (:attempts %)) entries) :ok :info)
-             :resolved entries))))
+  deadline passes (`keyed/resolve-pending`)."
+  [client test op]
+  (keyed/resolve-pending client test op ops))
 
 (defn lookup-rows
   [accounts]
@@ -279,9 +124,9 @@
 (defn invoke-read
   "Every account and the source, in one lookup, through any gateway that answers."
   [test op]
-  (let [targets (targets test)]
+  (let [targets (keyed/targets test)]
     (loop [n 0, previous nil]
-      (let [[node port :as target] (pick targets previous)
+      (let [[node port :as target] (keyed/pick targets previous)
             reply (try (http/request! node port "POST" "/v1/lookup"
                                       {"rows" (lookup-rows account-rows)})
                        (catch IOException _ nil))
@@ -292,7 +137,7 @@
                      :value (:balances (read-value (:body reply)))
                      :source (:source (read-value (:body reply))))
               (= :violation outcome) (http/violation op reply)
-              (< n 20) (do (backoff! (min n 5)) (recur (inc n) target))
+              (< n 20) (do (keyed/backoff! (min n 5)) (recur (inc n) target))
               :else (assoc op :type :fail, :error :no-answer))))))
 
 (defrecord Client [pending phase drop-reply attempts]
@@ -311,55 +156,13 @@
 ;; The checker
 
 (defn key-records
-  "Everything the history says about each key: {key {:account :amount :attempts}}, attempts in
-  the order they were sent (the operation's, then the final phase's)."
   [history]
-  (reduce
-    (fn [records {:keys [f type value resolved attempts]}]
-      (let [add (fn [records {:keys [key account amount attempts]}]
-                  (-> records
-                      (update key (fnil identity {:account account, :amount amount}))
-                      (update-in [key :attempts] (fnil into []) attempts)))]
-        (cond
-          (and (= :pay f) (#{:ok :fail :info} type)) (add records (assoc value :attempts attempts))
-          (and (= :resolve f) (#{:ok :info} type))   (reduce add records resolved)
-          :else records)))
-    {}
-    history))
+  (keyed/key-records history :pay))
 
-(defn answers
-  "A key's 2xx replies, a discarded one included."
-  [record]
-  (filter #(= :committed (:kind %)) (:attempts record)))
-
-(defn duplicates
-  "Keys answered at more than one op."
-  [records]
-  (for [[key record] records
-        :let [ops (distinct (map :op (answers record)))]
-        :when (< 1 (count ops))]
-    {:key key, :ops (vec (sort ops))}))
-
-(defn applied-lies
-  "Keys whose first 2xx is a replay although every attempt before it was `applied: false` (or
-  never connected): the gateways said nothing was applied, and something had been."
-  [records]
-  (for [[key record] records
-        :let [attempts (:attempts record)
-              [before from] (split-with #(not= :committed (:kind %)) attempts)
-              first-answer  (first from)]
-        :when (and first-answer
-                   (:replayed? first-answer)
-                   (every? (comp #{:refused :not-sent} :kind) before))]
-    {:key key, :refused-before (count before), :op (:op first-answer)}))
-
-(defn refused-keys
-  "Attempts answered `key_reused` or `key_collision`, by that status."
-  [records status]
-  (for [[key record] records
-        attempt (:attempts record)
-        :when (= status (:status attempt))]
-    {:key key, :gateway (:gateway attempt)}))
+(def answers keyed/answers)
+(def duplicates keyed/duplicates)
+(def applied-lies keyed/applied-lies)
+(def refused-keys keyed/refused-keys)
 
 (defn expected
   "What the final reads must show: [lo hi] per account, and for the source (as :source). lo
