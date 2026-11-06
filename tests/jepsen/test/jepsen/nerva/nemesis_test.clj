@@ -1,0 +1,147 @@
+(ns jepsen.nerva.nemesis-test
+  "The gateway nemesis's shapes: which faults a spec asks for, what the generator emits and
+  what the final generator undoes."
+  (:require [clojure.set :as set]
+            [clojure.test :refer [deftest is testing]]
+            [jepsen.generator :as gen]
+            [jepsen.generator.context :as ctx]
+            [jepsen.nemesis :as n]
+            [jepsen.nemesis.combined :as combined]
+            [jepsen.nerva.core :as core]
+            [jepsen.nerva.db :as db]
+            [jepsen.nerva.nemesis :as nemesis]))
+
+(def test-map {:nodes ["n1" "n2" "n3"], :concurrency 1})
+
+(defn emitted
+  "The first `limit` ops a generator hands the nemesis thread."
+  [generator limit]
+  (let [context (ctx/context test-map)]
+    (loop [g generator, ops [], context context]
+      (if (= limit (count ops))
+        ops
+        (let [[o g'] (gen/op g test-map context)]
+          (cond (nil? o) ops
+                (= :pending o) ops
+                :else (let [o (assoc o :process :nemesis)]
+                        (recur (gen/update g' test-map context o)
+                               (conj ops o)
+                               (ctx/busy-thread context (:time o) :nemesis)))))))))
+
+(defn package [& fault-keys]
+  (nemesis/package {:db nil, :faults (set fault-keys), :interval 0}))
+
+(deftest enabled-faults
+  (is (= nemesis/faults (nemesis/enabled #{:gateway})))
+  (is (= #{:gateway-pause} (nemesis/enabled #{:gateway-pause :kill})))
+  (is (= #{} (nemesis/enabled #{:kill :partition}))))
+
+(deftest no-gateway-fault-no-generator
+  (let [p (package :kill :partition)]
+    (is (nil? (:generator p)))
+    (is (nil? (:final-generator p)))
+    (is (empty? (:perf p)))))
+
+(defn heal-package [& fault-keys]
+  (nemesis/heal-package {:faults (set fault-keys)}))
+
+(deftest gateway-covers-all-three
+  (let [p (package :gateway)]
+    (is (= #{"gateway-kill" "gateway-partition" "gateway-pause"} (set (map :name (:perf p)))))
+    (is (= [:gateway-resume :gateway-heal] (map :f (:final-generator (heal-package :gateway)))))
+    (is (= [:gateway-start] (map :f (:final-generator p))))
+    (is (every? #(= {:gateways :all} (:value %))
+                (concat (:final-generator p) (:final-generator (heal-package :gateway)))))))
+
+(deftest one-fault-only
+  (let [p (package :gateway-partition)]
+    (is (= ["gateway-partition"] (map :name (:perf p))))
+    (is (nil? (:final-generator p)))
+    (is (= [:gateway-heal] (map :f (:final-generator (heal-package :gateway-partition)))))))
+
+(def five {:nodes ["n1" "n2" "n3" "n4" "n5"], :gateways 2})
+
+(deftest node-gateways-respect-the-topology
+  (testing "--gateways 2: only the first three nodes run two"
+    (is (= [["n1" 0] ["n1" 1]] (db/node-gateways five "n1")))
+    (is (= [["n3" 0] ["n3" 1]] (db/node-gateways five "n3")))
+    (is (= [["n4" 0]] (db/node-gateways five "n4")))
+    (is (= [["n5" 0]] (db/node-gateways five "n5")))
+    (is (= 8 (count (db/all-gateways five)))))
+  (testing "--gateways 1: one each"
+    (is (= 5 (count (db/all-gateways (assoc five :gateways 1)))))
+    (is (= [["n1" 0]] (db/node-gateways (assoc five :gateways 1) "n1")))))
+
+(deftest drawn-targets-exist
+  (doseq [gateways [1 2], :let [t (assoc five :gateways gateways)
+                                have (set (db/all-gateways t))]
+          kind [:one :node :minority]
+          _ (range 100)]
+    (let [drawn (nemesis/draw-gateways t kind)]
+      (is (seq drawn))
+      (is (set/subset? (set drawn) have))
+      (is (apply distinct? drawn))
+      (when (= :minority kind)
+        (is (<= (count (distinct (map first drawn))) 2))))))
+
+(deftest cuts-follow-the-scope
+  (let [gws (db/all-gateways five)]
+    (doseq [[node index dests] (nemesis/draw-cuts five gws :own)]
+      (is (= [node] dests)))
+    (is (every? #(= (set (:nodes five)) (set (nth % 2))) (nemesis/draw-cuts five gws :all)))
+    (let [cuts (nemesis/draw-cuts five gws :majority)]
+      (is (= 1 (count (distinct (map #(nth % 2) cuts)))))
+      (is (= 3 (count (nth (first cuts) 2)))))))
+
+(deftest fault-values-name-existing-gateways
+  (let [t (assoc five :gateways 1)
+        have (set (db/all-gateways t))]
+    (doseq [f nemesis/faults, _ (range 100)
+            :let [v (nemesis/fault-value t f)
+                  hit (if (= :gateway-partition f) (map #(vec (take 2 %)) (:cut v)) (:gateways v))]]
+      (is (seq hit))
+      (is (set/subset? (set hit) have))
+      (when (= :gateway-pause f) (is (<= (count hit) 2))))
+    (is (= #{:own :majority :all}
+           (set (repeatedly 200 #(:scope (nemesis/fault-value t :gateway-partition))))))))
+
+(deftest plan-groups-by-node
+  (is (= {"n1" [0 1], "n4" [0]} (nemesis/plan five {:gateways [["n1" 0] ["n1" 1] ["n4" 0]]})))
+  (is (= {"n1" [[0 ["n2"]]]} (nemesis/plan five {:cut [["n1" 0 ["n2"]]]})))
+  (is (= [0 1] (get (nemesis/plan five {:gateways :all}) "n2")))
+  (is (= [0] (get (nemesis/plan five {:gateways :all}) "n4"))))
+
+(deftest combined-final-phase-heals-before-starting
+  (let [opts {:nodes (:nodes five), :nemesis [:kill :partition :gateway], :nemesis-interval 0}
+        ;; n/compose throws on fs that overlap, so building the package shows they are disjoint.
+        pkg  (core/nemesis-package opts (db/db (fn [_ _])))
+        fs   (vec (keep :f (flatten (:final-generator pkg))))
+        at   #(.indexOf ^java.util.List fs %)]
+    (is (every? #(<= 0 (at %)) [:gateway-resume :gateway-heal :start :gateway-start]) (pr-str fs))
+    (is (< (at :gateway-resume) (at :start)))
+    (is (< (at :gateway-heal) (at :start)))
+    (is (< (at :start) (at :gateway-start)))))
+
+(deftest nemesis-fs-are-distinct
+  (let [gw (set (n/fs (nemesis/nemesis)))
+        others (into #{:start :kill :pause :resume :start-partition :stop-partition} [])]
+    (is (= 6 (count gw)))
+    (is (empty? (set/intersection gw others)))))
+
+(deftest core-takes-the-faults
+  (is (every? core/faults [:gateway :gateway-kill :gateway-partition :gateway-pause]))
+  (is (some #{[:gateway]} core/all-nemeses))
+  (is (some #{[:kill :partition :gateway]} core/all-nemeses)))
+
+(deftest backoff-is-bounded
+  (is (= [500 1000 2000 4000 4000 4000] (map db/gateway-backoff-ms (range 1 7))))
+  (is (<= (apply + (map db/gateway-backoff-ms (range 1 db/gateway-start-tries)))
+          30000)))
+
+(deftest gateway-rule-names-the-gateway-user
+  (is (re-find #"--uid-owner nerva-gw1 .*--dport 3000 -j DROP" (db/gateway-rule 1 "10.0.0.1")))
+  (is (not= (db/gateway-rule 0 "10.0.0.1") (db/gateway-rule 1 "10.0.0.1"))))
+
+(deftest gateway-rule-names-the-replica
+  (is (re-find #"-d 10.0.0.2 --dport 3000" (db/gateway-rule 0 "10.0.0.2")))
+  (is (not= (db/gateway-rule 0 "10.0.0.1") (db/gateway-rule 0 "10.0.0.2"))))

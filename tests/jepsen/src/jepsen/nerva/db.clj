@@ -118,8 +118,24 @@
                     binary :start (str "--addresses=" (addresses test)) :--development
                     data-file))
 
+(defn gateway-user
+  "The Unix user gateway `index` runs as, so iptables can name one gateway
+  (`-m owner --uid-owner`) without touching the replica, which runs as root."
+  [index]
+  (str "nerva-gw" index))
+
+(def max-gateways 2)
+
+(defn create-gateway-users!
+  "Creates the gateways' users, once. `useradd` is in the node image's base packages."
+  []
+  (doseq [index (range max-gateways)]
+    (c/exec :sh :-c (str "id -u " (gateway-user index) " > /dev/null 2>&1 || useradd --system "
+                         "--no-create-home --shell /usr/sbin/nologin " (gateway-user index)))))
+
 (defn start-gateway!
-  "Starts gateway `index` once."
+  "Starts gateway `index` once, as its own user: `setpriv` drops to it and execs, so the
+  pidfile names the gateway."
   [test index]
   (apply cu/start-daemon!
          {:logfile           (gateway-log index)
@@ -127,7 +143,9 @@
           :chdir             dir
           :match-executable? false
           :env               {:NERVA_KEY http/api-key}}
-         (concat [binary :api (str "--cluster=" cluster)
+         "/usr/bin/setpriv"
+         (concat [(str "--reuid=" (gateway-user index)) (str "--regid=" (gateway-user index))
+                  "--clear-groups" binary :api (str "--cluster=" cluster)
                   (str "--addresses=" (addresses test))
                   (str "--listen=0.0.0.0:" (gateway-port index))
                   :--listen-remote]
@@ -144,6 +162,34 @@
   "How long `start-api!` waits for a started gateway to be healthy or dead."
   15)
 
+(def gateway-backoff-ms-max
+  "The longest wait between a gateway's starts."
+  4000)
+
+(defn gateway-backoff-ms
+  "How long to wait before start number `tries + 1`: 500 ms, doubling, at most
+  `gateway-backoff-ms-max`. A gateway killed over and over, or cut off, does not spin."
+  [tries]
+  (min gateway-backoff-ms-max (* 500 (bit-shift-left 1 (dec tries)))))
+
+(defn start-gateway-until-up!
+  "Starts gateway `index` and waits for it to be healthy or dead; a dead one is started again
+  after a backoff, at most `gateway-start-tries` times in all. Each probe of `/healthz` takes at
+  most `http/probe-timeout-ms`, so the wait is bounded by `gateway-start-wait-s` per try."
+  [test index]
+  (loop [tries 1]
+    (start-gateway! test index)
+    (let [deadline (+ (System/nanoTime) (* gateway-start-wait-s 1000000000))
+          state    (loop []
+                     (cond (http/healthy? c/*host* (gateway-port index)) :up
+                           (not (cu/daemon-running? (gateway-pidfile index))) :dead
+                           (< deadline (System/nanoTime)) :pending
+                           :else (do (Thread/sleep 500) (recur))))]
+      (when (and (= :dead state) (< tries gateway-start-tries))
+        (info "Gateway" index "on" c/*host* "exited at start; starting it again")
+        (Thread/sleep (long (gateway-backoff-ms tries)))
+        (recur (inc tries))))))
+
 (defn start-api!
   "Starts the test's gateways. The control node reaches them over the network, so they listen
   on every address and say so: `--listen-remote` (P168, NRV-E0009). A test's `:request-timeout`
@@ -154,23 +200,88 @@
   nemesis's next `:start`; the run then has fewer gateways until then, never wrong results."
   [test]
   (doseq [index (range (gateways test c/*host*))]
-    (loop [tries 1]
-      (start-gateway! test index)
-      (let [deadline (+ (System/nanoTime) (* gateway-start-wait-s 1000000000))
-            state    (loop []
-                       (cond (http/healthy? c/*host* (gateway-port index)) :up
-                             (not (cu/daemon-running? (gateway-pidfile index))) :dead
-                             (< deadline (System/nanoTime)) :pending
-                             :else (do (Thread/sleep 500) (recur))))]
-        (when (and (= :dead state) (< tries gateway-start-tries))
-          (info "Gateway" index "on" c/*host* "exited at start; starting it again")
-          (recur (inc tries)))))))
+    (start-gateway-until-up! test index)))
+
+(defn node-gateways
+  "The `[node index]` pairs of the gateways `node` runs: none beyond `gateways`."
+  [test node]
+  (mapv (fn [index] [node index]) (range (gateways test node))))
+
+(defn all-gateways
+  "Every `[node index]` pair the test runs, in node order."
+  [test]
+  (into [] (mapcat #(node-gateways test %)) (:nodes test)))
+
+(defn kill-gateways!
+  "SIGKILLs gateways `indices` on this node, the replica untouched. Returns `indices`."
+  [indices]
+  (doseq [index indices]
+    (cu/stop-daemon! (gateway-pidfile index)))
+  (vec indices))
+
+(defn start-gateways!
+  "Starts this node's gateways that are not running, without waiting for them: a paused or
+  cut-off gateway is running and is left alone, and the nemesis stays responsive. Returns the
+  indices started. A gateway that exits at start (NRV-E0604) stays down until the next start."
+  [test]
+  (vec (for [index (range (gateways test c/*host*))
+             :when (not (cu/daemon-running? (gateway-pidfile index)))
+             :let [_ (start-gateway! test index)]]
+         index)))
+
+(defn signal-gateways!
+  "Sends `signal` to gateways `indices` on this node; a gateway that is gone is not an error.
+  Returns the indices signalled."
+  [indices signal]
+  (vec (for [index indices
+             :when (try (c/exec :kill signal (c/lit (str "$(cat " (gateway-pidfile index) ")")))
+                        true
+                        (catch Exception e
+                          (info "Gateway" index "on" c/*host* "is not running:" (.getMessage e))
+                          false))]
+         index)))
+
+(defn gateway-rule
+  "The iptables arguments (after the table and chain; the table is `mangle`) that drop gateway
+  `index`'s traffic to the replica at `dest`. In the mangle table: Jepsen's partitioner heals
+  with `iptables -F`, which flushes only the filter table."
+  [index dest]
+  (str "-m owner --uid-owner " (gateway-user index) " -p tcp -d " dest " --dport " replica-port
+       " -j DROP"))
+
+(defn partition-gateways!
+  "Cuts gateways off from replicas on this node: `cuts` is `[[index [replica-node ...]] ...]`.
+  Their clients still reach them. Returns the indices cut."
+  [cuts]
+  (doseq [[index dests] cuts
+          dest dests
+          :let [rule (gateway-rule index dest)]]
+    (c/exec :sh :-c (str "iptables -w -t mangle -C OUTPUT " rule " 2>/dev/null"
+                         " || iptables -w -t mangle -A OUTPUT " rule)))
+  (mapv first cuts))
+
+(def heal-deletes-max
+  "At most this many copies of one rule are deleted (each cut adds at most one)."
+  8)
+
+(defn heal-gateways!
+  "Lifts every gateway cut on this node (all indices and replicas, whatever was cut). Returns
+  the indices that had a rule."
+  [test]
+  (vec (for [index (range max-gateways)
+             :let [script (str "n=0; for d in " (str/join " " (:nodes test)) "; do"
+                               " for i in $(seq " heal-deletes-max "); do"
+                               " iptables -w -t mangle -D OUTPUT " (gateway-rule index "$d")
+                               " 2>/dev/null || break; n=$((n+1)); done; done; echo $n")
+                   n      (parse-long (str/trim (c/exec :sh :-c script)))]
+             :when (pos? n)]
+         index)))
 
 (defn kill-all!
   "SIGKILLs the gateways and the replica. The pidfile of a gateway the test did not start is
   harmless: `stop-daemon!` ignores a missing one."
   []
-  (doseq [index (range 2)]
+  (doseq [index (range max-gateways)]
     (cu/stop-daemon! (gateway-pidfile index)))
   (cu/stop-daemon! replica-pidfile))
 
@@ -187,6 +298,7 @@
         (c/upload (:nerva-binary test) binary)
         (c/exec :chmod "+x" binary)
         (install-cluster-key!)
+        (create-gateway-users!)
         (c/exec binary :format (str "--cluster=" cluster)
                 (str "--replica=" (replica-index test node))
                 (str "--replica-count=" (count (:nodes test)))
@@ -203,6 +315,7 @@
 
     (teardown! [_ test node]
       (c/su
+        (heal-gateways! test)
         (kill-all!)
         (c/exec :rm :-rf dir)))
 
