@@ -148,6 +148,13 @@
         (let [done (n/invoke! nemesis five fault-op)]
           (is (= ["n3"] (:killed (:value done)))))))))
 
+(deftest parse-report-reads-both-endings
+  (testing "hosted run 42202316064: a clear leaves no total, LazyFS says everything is synced"
+    (is (= 0 (lazyfs/parse-report "[..] [lazyfs.cmds]: report: all data blocks are synced!")))
+    (is (= 270336 (lazyfs/parse-report
+                    "[..] [lazyfs.cmds]: report: total number of bytes un-fsynced: 270336 bytes.")))
+    (is (nil? (lazyfs/parse-report "")))))
+
 (deftest settle-recovery-waits-for-a-stable-node
   (let [clock  (atom 0)
         opts   {:wait-ms 1000, :stable-ms 300, :now #(deref clock)

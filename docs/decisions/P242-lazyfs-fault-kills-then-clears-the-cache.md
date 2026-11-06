@@ -63,6 +63,10 @@ either way. Changes:
 - **The clear is confirmed.** After the clear the op reads LazyFS's unsynced-data report again until
   it is 0 (`:remaining`), so a fast restart cannot make the "lost" bytes durable first. The report
   before the clear stays `:unsynced-bytes`.
+  Found by hosted run 42202316064 (the first with this check): after a clear LazyFS prints "all data
+  blocks are synced!" and no byte total, which the first version read as no report, so every clear
+  looked unconfirmed. `parse-report` reads both endings. The same cause explains the one `nil` before
+  the clear in run 42200510496 (a restarted node with nothing unsynced).
 - **The replica is judged.** The recovery probes the replica process too (`db/node-health`), not
   only gateways, which answer through the other replicas. NRV-E0604.
 - **Victims are queued before the kill**, so a fault that throws (the LazyFS pipe timeout) still has

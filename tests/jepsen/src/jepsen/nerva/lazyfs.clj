@@ -110,11 +110,23 @@
   "How many times (200 ms apart) `unsynced-bytes` looks for LazyFS's report in its log."
   10)
 
+(def report-pattern
+  "The two lines LazyFS ends a report with: the byte total, or, when nothing is unsynced, that
+  every block is synced (no total is printed then: hosted run 42202316064)."
+  "total number of bytes un-fsynced\\|all data blocks are synced")
+
 (defn report-count
-  "How many `un-fsynced` report lines LazyFS's log holds."
+  "How many report-ending lines LazyFS's log holds."
   [lz]
-  (parse-long (str/trim (c/exec :sh :-c (str "grep -c 'total number of bytes un-fsynced' "
+  (parse-long (str/trim (c/exec :sh :-c (str "grep -c '" report-pattern "' "
                                               (:log-file lz) " || true")))))
+
+(defn parse-report
+  "The bytes a report-ending line says are unsynced: the total, 0 for \"all data blocks are
+  synced\", nil for anything else."
+  [line]
+  (cond (str/includes? line "all data blocks are synced") 0
+        :else (some->> (re-find #"un-fsynced: (\d+)" line) second parse-long)))
 
 (defn unsynced-bytes
   "Asks LazyFS to report the bytes written and not fsynced, and reads the report from its log;
@@ -125,10 +137,8 @@
     (lazyfs/fifo! lz "lazyfs::unsynced-data-report")
     (loop [polls report-wait-polls]
       (if (< before (report-count lz))
-        (some-> (c/exec :sh :-c (str "grep -o 'total number of bytes un-fsynced: [0-9]*' "
-                                     (:log-file lz) " | tail -1 | grep -o '[0-9]*$'"))
-                str/trim
-                parse-long)
+        (parse-report (c/exec :sh :-c (str "grep '" report-pattern "' " (:log-file lz)
+                                           " | tail -1")))
         (when (pos? polls)
           (Thread/sleep 200)
           (recur (dec polls)))))))
