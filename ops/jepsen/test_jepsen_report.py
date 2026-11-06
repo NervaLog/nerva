@@ -62,8 +62,9 @@ class Store:
 
 
 class Recorder:
-    def __init__(self, fail=None, markers=None):
+    def __init__(self, fail=None, markers=None, theirs=None):
         self.opened, self.comments, self.statuses = [], [], []
+        self.theirs = theirs  # What GitHub already shows for the context.
         self.fail = fail or {}
         self.number = 100
         self._markers = markers or {}
@@ -81,6 +82,11 @@ class Recorder:
         if key in self.fail:
             raise self.fail.pop(key)
         self.comments.append((number, body))
+
+    def current_status(self, commit, context):
+        if "read" in self.fail:
+            raise self.fail.pop("read")
+        return self.theirs
 
     def status(self, commit, state, context, description, target_url):
         if "status" in self.fail:
@@ -304,7 +310,94 @@ class ExitCodes(unittest.TestCase):
                          rep.MARKER.search(body).group(1))
 
 
+class HostSignatures(unittest.TestCase):
+    def crashed(self, tail):
+        store = Store(self)
+        directory = store.test("1", "", with_results=False, code=255, args="--workload retry")
+        with open(os.path.join(directory, "jepsen.log"), "a") as log:
+            log.write(tail)
+        return night(self, store)
+
+    def test_host_failures_in_the_log_tail_are_never_filed(self):
+        for tail in ("com.jcraft.jsch.JSchException: java.net.ConnectException: Connection "
+                     "refused (n3:22)\n", "java.lang.OutOfMemoryError: Java heap space\n",
+                     "java.io.IOException: No space left on device\n",
+                     "Cannot connect to the Docker daemon at unix:///var/run/docker.sock\n"):
+            github, _, summary = self.crashed(tail)
+            self.assertEqual((github.statuses[0][1], summary["filed"], github.opened),
+                             ("error", 0, []), tail)
+
+    def test_a_signature_outside_the_tail_does_not_count(self):
+        store = Store(self)
+        directory = store.test("1", "", with_results=False, code=255, args="--workload retry")
+        Path(directory, "jepsen.log").write_text(
+            "Connection refused\n" + "x\n" * rep.LOG_SIGNATURE_BYTES + "replica died\n")
+        github, _, summary = night(self, store)
+        self.assertEqual((github.statuses[0][1], summary["filed"]), ("failure", 1))
+
+    def test_other_crashes_are_still_nervas(self):
+        github, _, summary = self.crashed("ERROR replica 3 exited during format\n")
+        self.assertEqual((github.statuses[0][1], summary["filed"]), ("failure", 1))
+
+
+class GitHubOwnStatus(unittest.TestCase):
+    def test_a_failure_github_shows_is_not_turned_green_with_an_empty_state(self):
+        store = Store(self)
+        store.test("1", VALID)
+        github, state, summary = night(self, store, github=Recorder(theirs="failure"))
+        self.assertEqual(github.statuses, [])
+        self.assertEqual(state["verdicts"], {})
+        self.assertIn("not posted", summary["status"])
+
+    def test_a_timed_out_post_that_github_stored_is_seen_on_the_next_night(self):
+        state = rep.new_state()
+        store = Store(self)
+        store.test("1", invalid())
+        lost = Recorder(fail={"status": rep.GitHubError("unreachable", "no answer")})
+        _, state, _ = night(self, store, github=lost, state=state)
+        store = Store(self)
+        store.test("1", VALID)
+        again, _, _ = night(self, store, github=Recorder(theirs="failure"), state=state,
+                            now=NOW + DAY)
+        self.assertEqual(again.statuses, [])
+
+    def test_a_lower_github_status_is_replaced(self):
+        store = Store(self)
+        store.test("1", VALID)
+        github, _, _ = night(self, store, github=Recorder(theirs="error"))
+        self.assertEqual([s[1] for s in github.statuses], ["success"])
+
+    def test_an_unreadable_status_posts_nothing_and_the_tracker_says_so(self):
+        store = Store(self)
+        store.test("1", VALID)
+        github = Recorder(fail={"read": rep.GitHubError("unreachable", "no answer")})
+        github, _, summary = night(self, store, github=github, tracker=7)
+        self.assertEqual(github.statuses, [])
+        self.assertIn("could not read", summary["status"])
+        self.assertIn("could not read", github.comments[0][1])
+
+    def test_the_read_is_one_bounded_get(self):
+        calls = []
+        client = rep.GitHub("o/r", "t", lambda m: None)
+        client.request = lambda method, path, payload=None: calls.append((method, path)) or {
+            "statuses": [{"context": "x", "state": "error"},
+                         {"context": rep.CONTEXT_NIGHTLY, "state": "failure"}]}
+        self.assertEqual(client.current_status(COMMIT, rep.CONTEXT_NIGHTLY), "failure")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], "GET")
+        self.assertIn("per_page=100", calls[0][1])
+
+
 class StatusesOnlyMoveUp(unittest.TestCase):
+    def test_a_malformed_verdict_is_dropped_on_load(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "s.json")
+            Path(path).write_text(json.dumps({"version": rep.STATE_VERSION, "filed": {},
+                                              "days": {}, "verdicts": {
+                "a:b": {"state": "pending", "day": "d"}, "c:d": 5,
+                "e:f": {"state": "success", "day": "2026-11-01"}}}))
+            self.assertEqual(list(rep.load_state(path)["verdicts"]), ["e:f"])
+
     def run_night(self, test, results, state, code=0, **kwargs):
         store = Store(test)
         store.test("1", results, code=code)

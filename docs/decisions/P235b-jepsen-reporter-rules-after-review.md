@@ -18,12 +18,18 @@ Found by the adversarial review of #235. For `ops/jepsen/`:
 - **A crashed run is Nerva's.** A `jepsen.log` with no `results.edn`, and an exit code that is not
   124, 125, 126 or 137, means Jepsen started and the test threw (a replica died at setup). It is
   the fingerprint `<workload>|run|crashed`, filed with the end of `jepsen.log`; status `failure`.
-  No `jepsen.log` at all (the build, Docker, `lein`) stays the host's. Cost: a Jepsen exception
-  from the host's own trouble (ssh, Docker) is filed once as an issue a person closes.
-- **A commit's status only moves up** (error, success, failure), per context, kept in the state
-  file (`verdicts`, 256 commits). A later night never turns a `failure` green, and a night that
+  No `jepsen.log` at all (the build, Docker, `lein`) stays the host's. A `jepsen.log` whose last
+  16 KiB shows a host failure (ssh to a node refused, `OutOfMemoryError`, no space left on device,
+  a Docker error) is the host's, never filed (amended in the second review). Cost: a host failure
+  with a signature not on that list is still filed once, and pins the commit at `failure`.
+- **A commit's status only moves up** (error, success, failure), per context, read first from GitHub's own
+  status for the commit and context (one GET), and also kept in the state file (`verdicts`, 256
+  commits); the higher rank wins. A later night never turns a `failure` green, and a night that
   could not run never turns a `success` into `error`. A night that could not fetch posts no status
-  (`--no-status`). Cost: a lost state file forgets the ranks until the next night.
+  (`--no-status`). If GitHub's status cannot be read,
+  no status is posted and the tracker line says so. Cost: one more request a night, and a night
+  with an unreadable status posts nothing, even a failure. A malformed `verdicts` entry is dropped
+  on load.
 - **A body never exceeds its bound.** The excerpt's budget counts omission markers and decoding
   and is re-rendered smaller until the rendered text fits; at worst it is left out.
 - **A dry run keeps to itself:** its own state file, night directory and archive; the numbers it

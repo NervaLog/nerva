@@ -23,9 +23,11 @@ Each run is valid, invalid, unknown, or the host's:
   all; a night that did not start; graphs that did not draw): counted, status `error`, never an
   issue;
 - crashed: Jepsen started (a `jepsen.log`) and wrote no `results.edn`, and the host did not kill
-  it: Nerva's. One issue per workload (`<workload>|run|crashed`), with the log's end (P235b).
+  it, and its last 16 KiB shows no host failure (ssh refused, out of heap, disk full, Docker):
+  Nerva's. One issue per workload (`<workload>|run|crashed`), with the log's end (P235b).
 
-A commit's status only moves up (error, success, failure; P235b). `--no-status` posts none.
+A commit's status only moves up (error, success, failure; P235b), judged against GitHub's own
+status for it, read first; unreadable, nothing is posted. `--no-status` posts none.
 
 Then one comment a day on the tracker issue: what ran, on which commit, the verdict.
 
@@ -99,6 +101,13 @@ assert HISTORY_BYTES_ISSUE + VERDICT_BYTES + 4096 <= BODY_BYTES_MAX
 # deadline (`timeout`); 125, 126: `timeout` or the exec failed; 137: SIGKILL, the OOM killer.
 HOST_CODES = {124: "past the night's deadline", 125: "the run could not start",
               126: "the run could not start", 137: "killed by the host (out of memory?)"}
+# What a jepsen.log's end shows when the host failed under a test that had started (ssh to a
+# node refused, the JVM out of heap, the disk full, Docker): the host's, never filed (P235c).
+HOST_LOG_SIGNATURES = re.compile(
+    r"Connection refused|Connection timed out|No route to host|JSchException|"
+    r"OutOfMemoryError|No space left on device|Cannot connect to the Docker daemon|"
+    r"docker: Error|Error response from daemon", re.IGNORECASE)
+LOG_SIGNATURE_BYTES = 16 * 1024  # jepsen.log's end read to look for them.
 # Checkers whose failure is the host's (gnuplot missing, #106), not Nerva's.
 HOST_CHECKERS = ("perf", "timeline")
 # Checker keys that name their anomaly class themselves (bank's checkers, and the records').
@@ -671,9 +680,14 @@ def settle_run(run, code, tests):
     elif not tests:
         run.kind, run.host_reason = "host", f"exit {code} and Jepsen never started"
     elif not has_results:
+        tail = read_tail(os.path.join(tests[0], "jepsen.log"), LOG_SIGNATURE_BYTES)
+        if HOST_LOG_SIGNATURES.search(tail):
+            run.kind, run.findings = "host", []
+            run.host_reason = f"exit {code}, and jepsen.log ends in a host failure"
+            return
         run.kind, run.host_reason = "crashed", None
         run.findings = [("run", "crashed", None)]
-        run.results_text = read_tail(os.path.join(tests[0], "jepsen.log"), LOG_TAIL_BYTES)
+        run.results_text = tail[-LOG_TAIL_BYTES:]
 
 
 def read_night(store, runs_file):
@@ -896,6 +910,9 @@ def load_state(path):
     for key in ("filed", "days", "verdicts"):
         if not isinstance(state.get(key), dict):
             raise Environment(f"the state file {path} has no valid `{key}`")
+    state["verdicts"] = {k: v for k, v in state["verdicts"].items()
+                         if isinstance(v, dict) and v.get("state") in STATUS_RANK
+                         and isinstance(v.get("day"), str)}
     # A dry run once saved the issue numbers it made up (negative): they are not issues.
     state["filed"] = {fp: entry for fp, entry in state["filed"].items()
                       if isinstance(entry, dict) and isinstance(entry.get("issue"), int)
@@ -917,14 +934,24 @@ def save_state(path, state):
     os.replace(temporary, path)
 
 
-def settle_status(state, commit, context, new, today):
-    """The status to post for a commit, or None to leave the one it has (P235b): a commit's
-    status only ever moves up error < success < failure, so a later night on the same commit
-    (or a night that could not run) never turns a failure green or a success into an error."""
+def settle_status(state, github, commit, context, new, today):
+    """(status to post or None, why not). A commit's status only ever moves up error < success
+    < failure (P235b), so a later night on the same commit (or one that could not run) never
+    turns a failure green. The rank is the higher of the state file's and GitHub's own, read
+    first (P235c): a post that timed out after GitHub stored it, or a lost state file, cannot
+    hide it. If GitHub cannot be read, nothing is posted."""
+    rank = -1
     old = state["verdicts"].get(f"{commit}:{context}")
-    if old is not None and STATUS_RANK[old["state"]] >= STATUS_RANK[new]:
-        return None
-    return new
+    if old is not None:
+        rank = STATUS_RANK[old["state"]]
+    try:
+        theirs = github.current_status(commit, context)
+    except GitHubError as err:
+        return None, f"could not read the commit's status from GitHub ({err.kind})"
+    rank = max(rank, STATUS_RANK.get(theirs, -1))
+    if rank >= STATUS_RANK[new]:
+        return None, "the commit keeps a better-ranked one"
+    return new, ""
 
 
 def record_status(state, commit, context, new, today):
@@ -1073,6 +1100,18 @@ class GitHub:
         assert number > 0
         self.request("POST", f"/issues/{number}/comments", {"body": body})
 
+    def current_status(self, commit, context):
+        """GitHub's latest state for the context on the commit, or None: one bounded GET."""
+        assert re.fullmatch(r"[0-9a-f]{40}", commit)
+        reply = self.request("GET", f"/commits/{commit}/status?per_page=100")
+        rows = reply.get("statuses") if isinstance(reply, dict) else None
+        if not isinstance(rows, list):
+            raise GitHubError("refused", "not a combined status")
+        for row in rows:
+            if isinstance(row, dict) and row.get("context") == context:
+                return row.get("state")
+        return None
+
     def status(self, commit, state, context, description, target_url):
         assert state in ("success", "failure", "error")
         payload = {"state": state, "context": context,
@@ -1100,6 +1139,9 @@ class DryRun:
 
     def comment(self, number, body):
         self.out(f"--- would comment on #{number}\n{body}")
+
+    def current_status(self, commit, context):
+        return None
 
     def status(self, commit, state, context, description, target_url):
         self.out(f"--- would set status {context} = {state} on {commit}: {description}"
@@ -1163,11 +1205,13 @@ def ingest(github, state, runs, host_failure, commit, tracker, archive, canary, 
     day["commit"] = commit
     state_name, description = night_state(runs, host_failure, canary)
     summary["status"] = state_name
-    posted = settle_status(state, commit, CONTEXT_CANARY if canary else CONTEXT_NIGHTLY,
-                           state_name, today) if status else None
+    posted, why = (None, "no status for this night")
+    if status:
+        posted, why = settle_status(state, github, commit,
+                                    CONTEXT_CANARY if canary else CONTEXT_NIGHTLY,
+                                    state_name, today)
     if posted is None:
-        summary["status"] = f"{state_name} (not posted: " + (
-            "no status for this night)" if not status else "the commit keeps a better-ranked one)")
+        summary["status"] = f"{state_name} (not posted: {why})"
     items = []
     if host_failure is None:
         for run in runs:
@@ -1187,6 +1231,8 @@ def ingest(github, state, runs, host_failure, commit, tracker, archive, canary, 
         if tracker is not None and not day["reported"]:
             note = description if status else (
                 f"{description}; no status posted, the commit is the last the host knew")
+            if status and posted is None and why.startswith("could not read"):
+                note = f"{description}; no status posted: {why}"
             github.comment(tracker, tracker_text(today, commit, runs, host_failure, state_name,
                                                  note, summary["numbers"]))
             day["reported"] = True

@@ -35,7 +35,7 @@ standard library only (P147i). For each run:
 | --- | --- | --- |
 | valid | `success` | none |
 | invalid or unknown (`results.edn`) | `failure` | one per fingerprint |
-| the test threw: a `jepsen.log` and no `results.edn`, and no host exit code (`nerva` died at setup, say) | `failure` | one per workload (checker `run`, class `crashed`), with the log's end |
+| the test threw: a `jepsen.log` and no `results.edn`, and no host exit code, and no host failure (ssh refused, out of heap, disk full, Docker) at the log's end (`nerva` died at setup, say) | `failure` | one per workload (checker `run`, class `crashed`), with the log's end |
 | the host's (exit 124, 125, 126 or 137 with no verdict written, a build that failed, Docker down, Jepsen never started, graphs that did not draw) | `error` | **never** |
 
 `failure` outranks `error` outranks `success`: a night with one real finding and one host
@@ -62,7 +62,9 @@ in the store) is `error`.
   given is written, so `nightly.sh` gives a dry run one of its own (`state/dry-run.json`).
 - **Statuses only move up** (P235b): error, then success, then failure, per commit and context.
   A later night on the same commit never turns a `failure` green, and a night that could not run
-  never turns a `success` into `error`. A night that failed to fetch posts no status (`--no-status`):
+  never turns a `success` into `error`. The rank is the higher of the state file'"'"'s and GitHub'"'"'s own
+  status for the commit (read before posting); if that read fails, nothing is posted and the tracker
+  line says so (P235b). A night that failed to fetch posts no status (`--no-status`):
   it tested nothing, and the commit it knew is the previous night's. The tracker line says so.
 
 The token is read from a file and never printed or put in an error. Redirects are not followed.
