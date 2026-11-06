@@ -194,9 +194,12 @@
   {"from" (account-index from), "to" (account-index to), "amount" (str amount)})
 
 (defn keyed-entries
-  "A transfer's pair of adds and, after them, its record under the commit key."
+  "A transfer's pair of adds and, after them, its record under the commit key. The record is
+  read as absent (`op_seen` \"0\") before it is put, so a second application of the transfer,
+  which finds the record, is refused `conflict` instead of upserting it unseen (P239d)."
   [{:keys [key] :as value}]
   (conj (transfer-entries value)
+        {"kind" "read", "table" transfers-table, "id" key, "op_seen" "0"}
         {"kind" "put", "table" transfers-table, "id" key, "fields" (record-fields value)}))
 
 (defn attempt!
@@ -372,9 +375,20 @@
   (boolean (or (:info? record)
                (some (comp #{:unknown :violation} :kind) (:attempts record)))))
 
+(defn answered-by-refusal?
+  "Whether a refusal by Nerva answers a key: one with no attempt that got no answer before it,
+  or one of the final phase (`keyed/invoke-keyed` makes the same cut in an operation)."
+  [attempts]
+  (loop [[attempt & more] attempts, doubt? false]
+    (cond (nil? attempt) false
+          (and (refused? attempt) (or (:final? attempt) (not doubt?))) true
+          :else (recur more (or doubt? (= :unknown (:kind attempt)))))))
+
 (defn record-errors
   "What one final read of the records (`read`, an :ok :records op) gets wrong about `records`,
-  the history's {key record}: {:missing :extra :duplicated :wrong :count}, each a vector."
+  the history's {key record}: {:missing :extra :duplicated :wrong :refused-with-record :count},
+  each a vector. :refused-with-record: a record of a key that no 2xx answered although a refusal
+  did; keys are kept forever, so the key's transaction cannot have committed (P239d)."
   [records read]
   (let [found      (:value read)
         by-id      (group-by :id found)
@@ -389,6 +403,10 @@
      :extra      (vec (for [id (sort (keys by-id))
                             :when (not (or (committed id) (possible id)))]
                         {:id id}))
+     :refused-with-record
+     (vec (for [id (sort (keys by-id))
+                :when (and (possible id) (answered-by-refusal? (:attempts (records id))))]
+            {:id id, :statuses (vec (map :status (filter refused? (:attempts (records id)))))}))
      :duplicated (vec (for [[id rs] by-id :when (< 1 (count rs))] {:id id, :records (count rs)}))
      :wrong      (vec (for [r found
                             :when (and (records (:id r)) (not= (wanted (:id r)) r))]
@@ -398,15 +416,6 @@
                                        (<= lo (:count read) hi))
                           [{:view (:count read), :listed (count found), :committed lo,
                             :at-most hi}])))}))
-
-(defn answered-by-refusal?
-  "Whether a refusal by Nerva answers a key: one with no attempt that got no answer before it,
-  or one of the final phase (`keyed/invoke-keyed` makes the same cut in an operation)."
-  [attempts]
-  (loop [[attempt & more] attempts, doubt? false]
-    (cond (nil? attempt) false
-          (and (refused? attempt) (or (:final? attempt) (not doubt?))) true
-          :else (recur more (or doubt? (= :unknown (:kind attempt)))))))
 
 (defn refused-after-commit
   "Keys refused after an attempt of them committed: keys are kept forever, so a resend must
@@ -449,6 +458,8 @@
      :extra      {:count (count (gather :extra)), :examples (vec (take 10 (gather :extra)))}
      :duplicated {:count (count (gather :duplicated)),
                   :examples (vec (take 10 (gather :duplicated)))}
+     :refused-with-record {:count (count (gather :refused-with-record)),
+                           :examples (vec (take 10 (gather :refused-with-record)))}
      :wrong      {:count (count (gather :wrong)), :examples (vec (take 10 (gather :wrong)))}
      :count-view {:count (count (gather :count)), :examples (vec (take 10 (gather :count)))}
      :unresolved {:count (count unresolved), :examples (vec (take 10 unresolved))}}))

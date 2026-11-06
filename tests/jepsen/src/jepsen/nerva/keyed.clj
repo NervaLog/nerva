@@ -211,19 +211,38 @@
 
 (defn resolve-pending
   "The final phase: sends every key still pending until it is answered, or the phase's deadline
-  passes; keys left then are reported with the attempts made (none), unresolved."
+  passes; keys left then are reported with the attempts made (none), unresolved. If anything
+  throws (an interrupt, a reply the code did not expect), the op ends :info with the entries
+  and the attempts made so far, as `invoke-keyed` keeps its own, so a 2xx among them still
+  counts in the duplicate check and a late refusal in the refusal check (P239d)."
   [{:keys [pending phase]} test op ops]
-  (let [definite? (:definite? ops definite?)]
-    (loop [entries []]
-      (if-let [value (pop-pending! pending)]
-        (let [tries (run-attempts! test value ops
-                                   {:deadline-ns (phase-deadline! phase resolve-deadline-ms)})
-              entry (assoc (select-keys value (:entry-keys ops)) :attempts tries)]
-          (if-let [bad (violation-of tries)]
-            (http/violation (assoc op :resolved (conj entries entry)) (:reply bad))
-            (recur (conj entries entry))))
-        (assoc op :type (if (every? #(some definite? (:attempts %)) entries) :ok :info)
-               :resolved entries)))))
+  (let [definite? (:definite? ops definite?)
+        entries   (volatile! [])
+        current   (volatile! nil)]
+    (try
+      (loop []
+        (if-let [value (pop-pending! pending)]
+          (let [sink  (volatile! [])
+                _     (vreset! current [value sink])
+                tries (run-attempts! test value ops
+                                     {:deadline-ns (phase-deadline! phase resolve-deadline-ms)
+                                      :sink        sink})
+                entry (assoc (select-keys value (:entry-keys ops)) :attempts tries)]
+            (vswap! entries conj entry)
+            (vreset! current nil)
+            (if-let [bad (violation-of tries)]
+              (http/violation (assoc op :resolved @entries) (:reply bad))
+              (recur)))
+          (assoc op :type (if (every? #(some definite? (:attempts %)) @entries) :ok :info)
+                 :resolved @entries)))
+      (catch Throwable t
+        (when (instance? InterruptedException t)
+          (.interrupt (Thread/currentThread)))
+        (let [[value sink] @current]
+          (assoc op :type :info, :error :crashed
+                 :resolved (cond-> @entries
+                             value (conj (assoc (select-keys value (:entry-keys ops))
+                                                :attempts @sink)))))))))
 
 ;; ---------------------------------------------------------------------------------------
 ;; What the attempts show

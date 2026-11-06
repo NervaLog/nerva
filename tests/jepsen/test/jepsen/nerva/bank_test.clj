@@ -257,9 +257,12 @@
                  :amount 7, :clamp? true}
         entries (bank/keyed-entries value)]
     (is (= (bank/transfer-entries value) (take 2 entries)) "the adds come first, as a pair")
+    (is (= {"kind" "read", "table" bank/transfers-table, "id" (:key value), "op_seen" "0"}
+           (nth entries 2))
+        "the record is read as absent first, so a second application conflicts")
     (is (= {"kind" "put", "table" bank/transfers-table, "id" (:key value),
             "fields" {"from" 3, "to" 4, "amount" "7"}}
-           (nth entries 2)))
+           (nth entries 3)))
     (is (<= 0x80000000 bank/transfers-table 0xFFFEFFFF) "a record table")))
 
 (deftest an-index-page-parses-into-records
@@ -305,16 +308,20 @@
         (is (= :ok (:type done)))
         (is (= 12 (:op done)))))))
 
-(deftest a-refusal-after-a-lost-attempt-leaves-room-for-the-original
+(deftest a-refusal-after-a-lost-attempt-is-no-answer-but-a-record-is-a-lost-key
   (let [ops [good-read good-view
              (transfer :info "k1" 30 [lost out-of-bounds])
              (resolve-op (entry "k1" 30 [out-of-bounds]))]]
     (testing "the original never committed: no record, all valid"
       (is (true? (keyed-valid? (conj ops (records-read []))))))
-    (testing "the original committed after the refusal: its record is accounted for"
+    (testing "a record of the key is a key the cluster lost: keys are kept forever, so a
+             resend of a committed key replays, and is never refused (P239d)"
       (let [hist (history-of (conj ops (records-read [(record "k1" 30)])))
             result (bank/analyze-keys hist)]
-        (is (true? (:valid? result)))
+        (is (false? (:valid? result)))
+        (is (= 1 (get-in result [:refused-with-record :count])))
+        (is (= [{:id "k1", :statuses ["out_of_bounds" "out_of_bounds"]}]
+               (get-in result [:refused-with-record :examples])) "both refusals")
         (is (zero? (:count (:extra result))))
         (is (zero? (:count (:count-view result))))))
     (testing "a count view that does not match the records still fails"
@@ -362,6 +369,58 @@
                               (transfer :ok "k1" 30 [busy (answered 10 {:dropped? true})
                                                      (answered 10 {:replayed? true})])
                               (records-read [(record "k1" 30)])])))))
+
+(deftest a-refused-key-with-a-record-fails
+  (doseq [[label ops] {"final-phase refusal after lost attempts"
+                       [(transfer :info "k1" 30 [lost lost])
+                        (resolve-op (entry "k1" 30 [out-of-bounds]))]
+                       "operation refusal after a lost attempt, final phase refused too"
+                       [(transfer :info "k1" 30 [lost out-of-bounds])
+                        (resolve-op (entry "k1" 30 [out-of-bounds]))]
+                       "final phase lost, then refused"
+                       [(transfer :info "k1" 30 [lost])
+                        (resolve-op (entry "k1" 30 [lost out-of-bounds]))]}]
+    (testing label
+      (let [result (bank/analyze-keys
+                     (history-of (concat [good-read good-view] ops
+                                         [(records-read [(record "k1" 30)])])))]
+        (is (false? (:valid? result)))
+        (is (= 1 (get-in result [:refused-with-record :count])))))
+    (testing (str label ", without its record")
+      (is (true? (keyed-valid? (concat [good-read good-view] ops [(records-read [])])))))))
+
+(deftest a-conflict-on-the-record-is-a-second-application
+  (is (not (valid? (:checker (bank/workload {}))
+                   (history-of [good-read good-view
+                                (assoc (transfer :fail "k1" 30 [(assoc out-of-bounds :status "conflict")])
+                                       :error :conflict)
+                                (records-read [])])))))
+
+(deftest a-final-phase-that-throws-keeps-its-attempts
+  (let [client (bank/map->Client {:keyed? true, :pending (atom []), :phase (atom nil)
+                                  :drop-reply 0, :attempts 2})
+        value  (fn [k] {:key k, :from [1 "held"], :to [2 "held"], :amount 30, :clamp? false})
+        calls  (atom 0)]
+    (reset! (:pending client) [(value "k2") (value "k1")])
+    (with-redefs [http/healthy? (fn [& _] true)
+                  bank/attempt! (fn [& _]
+                                  (if (= 2 (swap! calls inc))
+                                    (throw (ClassCastException. "an unexpected body"))
+                                    (answered 9)))]
+      (let [done (keyed/resolve-pending client {:nodes ["n1"] :gateways 1}
+                                        {:f :resolve, :type :invoke} bank/ops)]
+        (is (= :info (:type done)))
+        (is (= :crashed (:error done)))
+        (is (= ["k1" "k2"] (sort (map :key (:resolved done)))))
+        (is (= [(answered 9)]
+               (:attempts (first (filter #(= "k1" (:key %)) (:resolved done)))))
+            "the attempt made before the throw is kept")
+        (testing "so a duplicate 2xx in the final phase is judged"
+          (let [hist (history-of [good-read good-view
+                                  (transfer :info "k1" 30 [(answered 5 {:dropped? true}) lost])
+                                  done])]
+            (is (false? (:valid? (bank/analyze-keys hist))))
+            (is (= 1 (get-in (bank/analyze-keys hist) [:duplicate :count])))))))))
 
 (deftest a-final-phase-refusal-is-judged-like-any-other
   (let [bad-resolve (fn [status]

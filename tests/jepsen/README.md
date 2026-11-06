@@ -111,13 +111,12 @@ also checked: `duplicate`
 `count-view` (the view equals the records listed, which lie between the committed keys and those
 that may have committed). A key refused after an attempt of it committed makes the run invalid
 (`refused-after-commit`: keys are kept forever, so a resend replays), and so does a final-phase
-refusal that is not `out_of_bounds`. A key no `2xx` or refusal answered (one after an attempt
+refusal that is not `out_of_bounds`; so does a record of a key that only a refusal answered
+(`refused-with-record`: the key committed, so a refusal means the cluster lost it). A key no `2xx` or refusal answered (one after an attempt
 that got no answer counts only in the final phase) makes the result `:unknown`.
-Records are upserts, so a duplicate apply leaves one record: `bank` catches a duplicate only
-when both `2xx` replies reached the client (`duplicate`). If the first reply is truly lost and a
-broken dedup applies the resend again, conservation, the records and the counts all hold;
-`retry`'s balance check is what covers that, so keyed `bank` is not a duplicate detector on its
-own. `--no-keys` is today's run, with no key and no record; `test-all` runs both, as `nerva bank`
+Each transfer reads its record as absent (`op_seen "0"`) before putting it, so a second
+application of a key (a lost original, then a re-execution) is refused `409 conflict`, which the
+`refusals` checker fails; a duplicate whose two `2xx` replies both arrived is `duplicate`. `--no-keys` is today's run, with no key and no record; `test-all` runs both, as `nerva bank`
 and `nerva bank no-keys` (the reporter files the latter as workload `bank-no-keys`).
 
 **`retry`**: what Botpike does after a lost reply (P123): resend a keyed commit, under the same
