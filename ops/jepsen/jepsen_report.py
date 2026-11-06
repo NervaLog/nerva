@@ -35,7 +35,9 @@ Then one comment a day on the tracker issue: what ran, on which commit, the verd
 `--expect-invalid` is the canary (a build with commit-key deduplication off): an invalid verdict
 with a `duplicate` is what it expects. The issue it files says so and the status is
 `jepsen/canary` = `success`; a verdict without the duplicate means Jepsen cannot see a duplicate
-any more: status `failure` and an issue "canary is blind". `--dry-run` asks GitHub nothing and
+any more: status `failure` and an issue "canary is blind". A run whose only failure is
+NRV-E0607 (the harness failed) produced no duplicate either: it is blind too, the issue naming
+the harness failure, never a silent `error` (P244f). `--dry-run` asks GitHub nothing and
 prints what it would do (it still writes the state file it is given: give it a state of its own).
 
 Exit codes: 0 done, 1 usage or bad input, 2 environment (state file, token, GitHub). Standard
@@ -588,6 +590,7 @@ class Run:
         self.name = None
         self.kind = None  # valid, invalid, unknown or host
         self.host_reason = None
+        self.harness = False  # a checker carried NRV-E0607 (P244f)
         self.workload = "bank"  # the suite's default
         self.nemesis = ""
         self.seed = None
@@ -642,6 +645,7 @@ def read_test(run, directory):
         run.kind = "valid"
         return
     run.findings, graphs_only, harness = findings_of(results)
+    run.harness = harness
     if harness and not run.findings:
         run.kind = "host"
         run.host_reason = f"the Jepsen harness failed ({HARNESS_CODE}), not Nerva"
@@ -791,6 +795,10 @@ def make_findings(run, canary):
         # The canary's own fingerprint: a test build's crash is not a crash on main (P235).
         for checker, name, subtree in run.findings:
             out.append(finding(run, True, checker, name, subtree))
+    elif run.kind == "host" and run.harness:
+        # A harness failure (NRV-E0607) and no real finding: the canary produced no duplicate,
+        # so it is blind whether or not the harness failed (P244f). Filed, never silently `error`.
+        out.append(finding(run, True, "workload", "blind", None))
     elif run.kind in ("invalid", "unknown", "valid"):
         # Whatever else it saw is a real finding; the canary itself saw no duplicate.
         for checker, name, subtree in run.findings:
@@ -833,6 +841,10 @@ def report_text(item, commit, archive, first):
     if item["class"] == "blind":
         out.append("- **Verdict:** the canary run found no `duplicate`: Jepsen cannot see a "
                    "resent key committing twice")
+        if run.harness:
+            out.append(f"- **Also:** the Jepsen harness failed in this run ({HARNESS_CODE}, the "
+                       "host's, not Nerva's), so the canary may be blind only because of it; "
+                       "read `jepsen.log` before blaming the workload checker")
     else:
         out.append(f"- **Checker:** `{item['checker']}`, anomaly `{item['class']}`")
     others = sorted({f"{c}/{n}" for c, n, _ in run.findings} - {f"{item['checker']}/{item['class']}"})
@@ -1199,8 +1211,9 @@ def night_state(runs, host_failure, canary):
     total = len(runs)
     if canary:
         crashed = [r for k, r in verdicts if k == "crashed"]
-        blind = [r for k, r in verdicts if k not in ("host", "crashed")
-                 and not (k == "invalid" and "duplicate" in {n for _, n, _ in r.findings})]
+        blind = [r for k, r in verdicts if (k == "host" and r.harness)
+                 or (k not in ("host", "crashed")
+                     and not (k == "invalid" and "duplicate" in {n for _, n, _ in r.findings}))]
         if crashed or blind:
             parts = []
             if crashed:

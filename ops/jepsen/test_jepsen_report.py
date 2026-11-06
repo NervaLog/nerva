@@ -196,6 +196,33 @@ class Statuses(unittest.TestCase):
         github, _, _ = night(self, blind, canary=True)
         self.assertEqual(github.statuses[0][1], "failure")
 
+    def test_a_canary_with_only_a_harness_failure_is_blind_and_filed(self):
+        store = Store(self)
+        store.test("1", HARNESS, args="--workload bank --nemesis gateway")
+        github, _, summary = night(self, store, canary=True)
+        self.assertEqual(github.statuses[0][1:3], ("failure", "jepsen/canary"))
+        self.assertIn("blind", github.statuses[0][3])
+        self.assertEqual(summary["filed"], 1)
+        self.assertIn("blind", github.opened[0][1])
+        self.assertIn("NRV-E0607", github.opened[0][2])
+
+    def test_a_canary_with_a_harness_failure_and_a_duplicate_saw_it(self):
+        both = invalid().replace(":perf", ':gateways {:valid? :unknown, :code "NRV-E0607"}, :perf')
+        store = Store(self)
+        store.test("1", both, args="--workload bank --nemesis gateway")
+        github, _, _ = night(self, store, canary=True)
+        self.assertEqual(github.statuses[0][1:3], ("success", "jepsen/canary"))
+
+    def test_a_canary_with_a_harness_failure_and_another_finding_is_blind(self):
+        both = ("{:valid? false, :perf {:valid? true}, :gateways {:valid? :unknown, :code "
+                '"NRV-E0607", :errors ["boom"]}, :protocol {:valid? false, :violations 2, '
+                ":examples [{:op 5}]}}")
+        store = Store(self)
+        store.test("1", both, args="--workload bank --nemesis gateway")
+        github, _, summary = night(self, store, canary=True)
+        self.assertEqual(github.statuses[0][1:3], ("failure", "jepsen/canary"))
+        self.assertEqual(summary["filed"], 2)
+
     def test_a_canary_that_threw_is_a_crash_not_blind(self):
         store = Store(self)
         directory = store.test("1", "", with_results=False, code=255, args="--workload retry")

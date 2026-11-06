@@ -459,6 +459,10 @@
     (is (= {:hit [["n1" 0]] :error [["n2" "boom"]]}
            (nemesis/completion {"n1" {:hit [0]} "n2" {:error "boom"}})))))
 
+(deftest an-interrupted-final-start-is-not-swallowed
+  (with-redefs [nemesis/act! (fn [& _] (throw (InterruptedException. "stop")))]
+    (is (thrown? InterruptedException (nemesis/act-on-node! {} :gateway-start :all true)))))
+
 (defn- check-final [history]
   (checker/check (nemesis/final-start-checker) {} history {}))
 

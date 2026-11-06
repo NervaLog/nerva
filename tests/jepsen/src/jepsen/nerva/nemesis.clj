@@ -152,6 +152,7 @@
   [test f arg final?]
   (if final?
     (try (act! test f arg true)
+         (catch InterruptedException e (throw e))
          (catch Exception e
            {:error (or (.getMessage e) (str e))}))
     (act! test f arg false)))
