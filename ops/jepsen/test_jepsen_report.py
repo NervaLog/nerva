@@ -226,6 +226,11 @@ class Fingerprints(unittest.TestCase):
         d = self.fingerprint(self.filed(invalid(checker="bank"), "--workload retry"))
         self.assertEqual(len({a, b, c, d}), 4)
 
+    def test_the_unkeyed_bank_run_has_its_own(self):
+        a = self.fingerprint(self.filed(invalid(), "--workload bank"))
+        b = self.fingerprint(self.filed(invalid(), "--workload bank --no-keys"))
+        self.assertNotEqual(a, b)
+
     def test_the_canary_has_its_own_fingerprints(self):
         store = Store(self)
         store.test("1", invalid())
