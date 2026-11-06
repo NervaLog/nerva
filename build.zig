@@ -202,6 +202,7 @@ pub fn build(b: *std.Build) !void {
     if (b.args) |args| nerva_run.addArgs(args);
     steps.run.dependOn(&nerva_run.step);
     steps.check.dependOn(&nerva.step);
+    steps.check.dependOn(&nerva_keys_off.step);
 
     // zig build test:unit
     const stdx_unit_tests = b.addTest(.{

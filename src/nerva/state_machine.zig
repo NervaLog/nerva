@@ -2918,7 +2918,8 @@ pub fn StateMachineType(comptime Storage: type) type {
         fn write_duplicate(self: *StateMachine, entries: []const WideEntry) ?u32 {
             var count: u32 = 0;
             for (entries, 0..) |*entry, index| {
-                // A key's row is written only when no row is there (`commit_key_failure`).
+                // A key's row is written only when no row is there (`commit_key_failure`), unless
+                // `commit_keys_deduplicate` is off, which overwrites it.
                 if (entry.kind == .read or entry.kind == .key) continue;
                 self.write_keys[count] = .{
                     .key = if (nerva.table_is_record(entry.table))
@@ -2967,7 +2968,8 @@ pub fn StateMachineType(comptime Storage: type) type {
         /// exists, or null. The row is the key's own (`committed_before` if it holds these
         /// entries, else `key_reused`) or another key's (`key_collision`); each reports the op
         /// that wrote the row. Rows of `table_commit_keys` are written only by
-        /// `commit_key_put`, once each, so the row's op is the op its transaction committed at.
+        /// `commit_key_put`, once each (with `commit_keys_deduplicate` off, a resent key writes its
+        /// row again), so the row's op is the op its transaction committed at.
         fn commit_key_failure(self: *StateMachine, entries: []const WideEntry) ?Failure {
             if (entries.len == 0 or entries[0].kind != .key) return null;
             if (!self.commit_keys_deduplicate) return null;
@@ -2993,7 +2995,8 @@ pub fn StateMachineType(comptime Storage: type) type {
         }
 
         /// Writes the key's row of a transaction that commits under a key (it is the first
-        /// entry). The row was absent: `commit_key_failure` found none.
+        /// entry). The row was absent: `commit_key_failure` found none (or
+        /// `commit_keys_deduplicate` is off, and it is overwritten).
         fn commit_key_put(
             self: *StateMachine,
             op: u64,
@@ -5074,6 +5077,7 @@ pub fn StateMachineType(comptime Storage: type) type {
                         .found_object => |row| !row.flags.deleted,
                         .not_found => false,
                     };
+                    // Written once; a keys-off history is refused (`HistoryInvalid`).
                     if (change.table == nerva.table_commit_keys and
                         self.row_version(entry_row_key(&entry)) != 0)
                     {
@@ -5229,7 +5233,9 @@ pub fn StateMachineType(comptime Storage: type) type {
                     if (!live) return error.HistoryInvalid;
                 }
                 if (change.table == nerva.table_commit_keys) {
-                    // Written once: checked as the op goes, as for deletes.
+                    // Written once: checked as the op goes, as for deletes. A history from a
+                    // build with `commit_keys_deduplicate` off may rewrite a row: refused here
+                    // (offline only, never on replay).
                     if (self.row_version(nerva.row_key(change.table, change.id)) != 0) {
                         return error.HistoryInvalid;
                     }

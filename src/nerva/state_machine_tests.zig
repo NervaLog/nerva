@@ -685,6 +685,13 @@ test "commit key off: the views admission counts the second commit" {
             add(5, 1, 8, 10, .{}),
         };
         for (0..2) |_| _ = try context.commit(&.{&keyed});
+        // The second commit's admission, which the op still holds: with deduplication on, the
+        // resent key's groups are not counted or prefetched (it writes nothing); with it off
+        // they are, or an evicted group would be rebuilt from zero.
+        try testing.expectEqual(
+            @as(u32, if (deduplicate) 0 else 1),
+            context.state_machine.view_op_keys.count(),
+        );
         const records = try context.view(.{
             .view_id = declared.view_id,
             .group_hash_min = 0,
