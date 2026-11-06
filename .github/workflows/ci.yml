@@ -7,14 +7,15 @@
 name: CI
 
 on:
-  # Markdown alone (docs, WORKLOG, CHANGELOG) starts nothing (N68); release.yml's call still
-  # runs. The site is NervaLog/nervalog.github.io now (P148).
+  # Markdown alone (docs, CHANGELOG) pushed to main starts nothing (N68); release.yml's call still
+  # runs. A pull request always runs, since the ruleset requires every check on it, but the
+  # `changes` job turns every step of a docs-only one into a no-op (see below). The site is
+  # NervaLog/nervalog.github.io now (P148).
   push:
     branches: [main]
     paths-ignore: ['**.md']
   pull_request:
     branches: [main]
-    paths-ignore: ['**.md']
   workflow_dispatch:
   workflow_call:
 
@@ -55,78 +56,145 @@ env:
     ./zig/download.sh
 
 jobs:
+
+  # Whether the change can affect what CI proves. Markdown alone starts no run on a push to main
+  # (N68), but a pull request must still report every required check, or a docs-only pull request
+  # could never merge. So every job below runs on every pull request, and a docs-only one skips
+  # each step, not the job: a skipped matrix job reports under its bare name, and the required
+  # names (`vopr (1)`, `demo (seats_chaos.py)`) would never appear. Fail closed: if the changed
+  # files cannot be listed, or there are more than the API lists (3000), the answer is `true`.
+  # If `changes` itself fails, every job still runs every step (the `!cancelled()` and
+  # `!= 'false'` conditions), so an empty output never skips a required check.
+  changes:
+    name: changes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      code: ${{ steps.classify.outputs.code }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+
+      - name: Classify the change (.github/scripts/docs_only.sh)
+        id: classify
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          PR: ${{ github.event.pull_request.number }}
+          CHANGED: ${{ github.event.pull_request.changed_files }}
+        run: |
+          code=true
+          if [ "$EVENT" = pull_request ] && [ -n "$PR" ]; then
+            if gh api "repos/${{ github.repository }}/pulls/$PR/files" --paginate \
+                 --jq '.[].filename' > files.txt \
+               && [ -s files.txt ] && [ "$(wc -l < files.txt)" -ge "${CHANGED:-0}" ] \
+               && [ "$(wc -l < files.txt)" -lt 3000 ]; then
+              code=$(.github/scripts/docs_only.sh < files.txt)
+            fi
+          fi
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          echo "code=$code"
+
   # The typecheck builds the nerva binary that the integration, API and view tests run, so it goes
   # with them; the unit tests, the longest step, run alone.
   system:
+    needs: changes
+    if: ${{ !cancelled() }}
     name: check, integration, API, views
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        if: needs.changes.outputs.code != 'false'
         with:
           persist-credentials: false
 
       # GitHub's runners start empty: the pinned toolchain is restored from Actions' cache, keyed by
       # download.sh's hash, where INSTALL_ZIG looks for it (P147e).
       - uses: actions/cache@v4
+        if: needs.changes.outputs.code != 'false'
         with:
           path: ~/.cache/nerva-toolchain
           key: nerva-toolchain-${{ runner.os }}-${{ hashFiles('zig/download.sh') }}
 
       - name: Install the pinned Zig
+        if: needs.changes.outputs.code != 'false'
         run: eval "$INSTALL_ZIG"
 
       - name: Typecheck
+        if: needs.changes.outputs.code != 'false'
         run: ./zig/zig build check
 
       - name: Format
+        if: needs.changes.outputs.code != 'false'
         run: ./zig/zig build test:fmt
 
+      - name: Docs-only classifier (table test)
+        if: needs.changes.outputs.code != 'false'
+        run: .github/scripts/docs_only_test.sh
+
       - name: Release scripts (the bill of materials, N63)
+        if: needs.changes.outputs.code != 'false'
         run: python3 .github/scripts/test_sbom.py
 
       - name: Nightly perf scripts (the comparison, its issues)
+        if: needs.changes.outputs.code != 'false'
         run: |
           python3 perf/nightly/test_compare.py
           python3 perf/nightly/test_file_issue.py
 
       - name: Simulation fleet's reporter (fingerprints, dedup, caps; no network, P147i)
+        if: needs.changes.outputs.code != 'false'
         run: python3 ops/sim-fleet/test_sim_fleet.py
 
       - name: Integration (three real replicas)
+        if: needs.changes.outputs.code != 'false'
         run: ./zig/zig build test:integration
 
       - name: JSON API (against a model)
+        if: needs.changes.outputs.code != 'false'
         run: ./zig/zig build test:api
 
       - name: Declared views (against a model)
+        if: needs.changes.outputs.code != 'false'
         run: ./zig/zig build test:views
 
       - name: Mixed releases (a second nerva, another release string)
+        if: needs.changes.outputs.code != 'false'
         run: ./zig/zig build test:release
 
   unit:
+    needs: changes
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        if: needs.changes.outputs.code != 'false'
         with:
           persist-credentials: false
 
       # GitHub's runners start empty: the pinned toolchain is restored from Actions' cache, keyed by
       # download.sh's hash, where INSTALL_ZIG looks for it (P147e).
       - uses: actions/cache@v4
+        if: needs.changes.outputs.code != 'false'
         with:
           path: ~/.cache/nerva-toolchain
           key: nerva-toolchain-${{ runner.os }}-${{ hashFiles('zig/download.sh') }}
 
       - name: Install the pinned Zig
+        if: needs.changes.outputs.code != 'false'
         run: eval "$INSTALL_ZIG"
 
       # `benchmark.perf: usage example` skips itself where perf_event_open is denied, as on
       # GitHub's runners and Botpike's (jobs run as a user, perf_event_paranoid 2); it fails only
       # where it is allowed without hardware counters (UPSTREAM.md).
       - name: Unit tests
+        if: needs.changes.outputs.code != 'false'
         run: ./zig/zig build test:unit
 
   # Every fuzzer, vendored and Nerva's own, at its smoke size and seed (N46, N53), so a fuzzer that
@@ -134,29 +202,37 @@ jobs:
   # `lsm_segmented_array` logs "too slow for the smoke mode" in Debug; that is a warning, not a
   # failure.
   fuzz:
+    needs: changes
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        if: needs.changes.outputs.code != 'false'
         with:
           persist-credentials: false
 
       # GitHub's runners start empty: the pinned toolchain is restored from Actions' cache, keyed by
       # download.sh's hash, where INSTALL_ZIG looks for it (P147e).
       - uses: actions/cache@v4
+        if: needs.changes.outputs.code != 'false'
         with:
           path: ~/.cache/nerva-toolchain
           key: nerva-toolchain-${{ runner.os }}-${{ hashFiles('zig/download.sh') }}
 
       - name: Install the pinned Zig
+        if: needs.changes.outputs.code != 'false'
         run: eval "$INSTALL_ZIG"
 
       - name: Fuzzers (smoke)
+        if: needs.changes.outputs.code != 'false'
         run: ./zig/zig build fuzz -- smoke
 
   # The demos, three replicas and all, while processes are crashed and restarted: each demo on its
   # own Machine, run exactly as `zig build -Drelease test:demo -- --seconds=75` runs it.
   demo:
+    needs: changes
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
@@ -165,11 +241,13 @@ jobs:
         demo: [seats_chaos.py, canvas_chaos.py]
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        if: needs.changes.outputs.code != 'false'
         with:
           persist-credentials: false
 
       # The list above must stay the one test:demo runs (build.zig).
       - name: Every demo test:demo runs is in the matrix
+        if: needs.changes.outputs.code != 'false'
         run: |
           listed=$(grep -o '"[a-z_]*_chaos\.py"' build.zig | tr -d '"' | sort | tr '\n' ' ')
           if [ "$listed" != "canvas_chaos.py seats_chaos.py " ]; then
@@ -180,41 +258,51 @@ jobs:
       # GitHub's runners start empty: the pinned toolchain is restored from Actions' cache, keyed by
       # download.sh's hash, where INSTALL_ZIG looks for it (P147e).
       - uses: actions/cache@v4
+        if: needs.changes.outputs.code != 'false'
         with:
           path: ~/.cache/nerva-toolchain
           key: nerva-toolchain-${{ runner.os }}-${{ hashFiles('zig/download.sh') }}
 
       - name: Install the pinned Zig
+        if: needs.changes.outputs.code != 'false'
         run: eval "$INSTALL_ZIG"
 
       - name: Build (release)
+        if: needs.changes.outputs.code != 'false'
         run: ./zig/zig build -Drelease
 
       - name: ${{ matrix.demo }} under crashes
+        if: needs.changes.outputs.code != 'false'
         run: python3 tests/demo/${{ matrix.demo }} zig-out/bin/nerva --seconds=75
 
   # R5's demo (docs/demos/r5.md): three replicas, one lost and recovered while writes go on, a
   # backup, a restore drill, a wipe and a restore. Exactly what `./zig/zig build -Drelease demo-r5`
   # runs; its last line is `demo-r5: PASS` or `demo-r5: FAIL step N: ...`.
   demo_r5:
+    needs: changes
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        if: needs.changes.outputs.code != 'false'
         with:
           persist-credentials: false
 
       # GitHub's runners start empty: the pinned toolchain is restored from Actions' cache, keyed by
       # download.sh's hash, where INSTALL_ZIG looks for it (P147e).
       - uses: actions/cache@v4
+        if: needs.changes.outputs.code != 'false'
         with:
           path: ~/.cache/nerva-toolchain
           key: nerva-toolchain-${{ runner.os }}-${{ hashFiles('zig/download.sh') }}
 
       - name: Install the pinned Zig
+        if: needs.changes.outputs.code != 'false'
         run: eval "$INSTALL_ZIG"
 
       - name: demo-r5 (release)
+        if: needs.changes.outputs.code != 'false'
         run: ./zig/zig build -Drelease demo-r5
 
   # R4's demo (docs/demos/r4.md): two clients, each with its own gateway on one three-replica
@@ -222,30 +310,37 @@ jobs:
   # Exactly what `./zig/zig build -Drelease demo-r4` runs; its last line is `demo-r4: PASS` or
   # `demo-r4: FAIL step N: ...`.
   demo_r4:
+    needs: changes
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        if: needs.changes.outputs.code != 'false'
         with:
           persist-credentials: false
 
       # GitHub's runners start empty: the pinned toolchain is restored from Actions' cache, keyed by
       # download.sh's hash, where INSTALL_ZIG looks for it (P147e).
       - uses: actions/cache@v4
+        if: needs.changes.outputs.code != 'false'
         with:
           path: ~/.cache/nerva-toolchain
           key: nerva-toolchain-${{ runner.os }}-${{ hashFiles('zig/download.sh') }}
 
       - name: Install the pinned Zig
+        if: needs.changes.outputs.code != 'false'
         run: eval "$INSTALL_ZIG"
 
       - name: demo-r4 (release)
+        if: needs.changes.outputs.code != 'false'
         run: ./zig/zig build -Drelease demo-r4
 
   # Pull requests: the fixed seeds and one random seed, in Debug. Everything else (pushes to main,
   # the release's run, a dispatch) runs `vopr_main` instead (N74).
   vopr:
-    if: github.event_name == 'pull_request'
+    needs: changes
+    if: ${{ !cancelled() && github.event_name == 'pull_request' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     strategy:
@@ -254,21 +349,25 @@ jobs:
         seed: ['1', '2', '5', 'random']
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        if: needs.changes.outputs.code != 'false'
         with:
           persist-credentials: false
 
       # GitHub's runners start empty: the pinned toolchain is restored from Actions' cache, keyed by
       # download.sh's hash, where INSTALL_ZIG looks for it (P147e).
       - uses: actions/cache@v4
+        if: needs.changes.outputs.code != 'false'
         with:
           path: ~/.cache/nerva-toolchain
           key: nerva-toolchain-${{ runner.os }}-${{ hashFiles('zig/download.sh') }}
 
       - name: Install the pinned Zig
+        if: needs.changes.outputs.code != 'false'
         run: eval "$INSTALL_ZIG"
 
       # A failure replays exactly with `./zig/zig build vopr -- <seed>`.
       - name: VOPR
+        if: needs.changes.outputs.code != 'false'
         run: |
           seed='${{ matrix.seed }}'
           if [ "$seed" = random ]; then seed=$(od -An -N8 -tu8 /dev/urandom | tr -d ' '); fi
@@ -280,8 +379,9 @@ jobs:
   # fuzzing does, N59), about 300 seeds a push. A failing seed stops its lane and prints the
   # command that replays it, in the log and the job summary.
   vopr_main:
+    needs: changes
     name: vopr (main, ${{ matrix.lane }})
-    if: github.event_name != 'pull_request'
+    if: ${{ !cancelled() && github.event_name != 'pull_request' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     strategy:
@@ -290,22 +390,25 @@ jobs:
         lane: [fixed, random-1, random-2, random-3, random-4]
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        if: needs.changes.outputs.code != 'false'
         with:
           persist-credentials: false
 
       # GitHub's runners start empty: the pinned toolchain is restored from Actions' cache, keyed by
       # download.sh's hash, where INSTALL_ZIG looks for it (P147e).
       - uses: actions/cache@v4
+        if: needs.changes.outputs.code != 'false'
         with:
           path: ~/.cache/nerva-toolchain
           key: nerva-toolchain-${{ runner.os }}-${{ hashFiles('zig/download.sh') }}
 
       - name: Install the pinned Zig
+        if: needs.changes.outputs.code != 'false'
         run: eval "$INSTALL_ZIG"
 
       # A failure replays exactly with `./zig/zig build -Drelease vopr -- <seed>`.
       - name: VOPR seeds 1, 2 and 5 (ReleaseSafe)
-        if: matrix.lane == 'fixed'
+        if: needs.changes.outputs.code != 'false' && (matrix.lane == 'fixed')
         run: |
           for seed in 1 2 5; do
             echo "VOPR seed: $seed"
@@ -314,5 +417,5 @@ jobs:
           done
 
       - name: VOPR on random seeds (ReleaseSafe, 6 minutes)
-        if: matrix.lane != 'fixed'
+        if: needs.changes.outputs.code != 'false' && (matrix.lane != 'fixed')
         run: .github/scripts/fuzz_loop.sh vopr nerva 6
