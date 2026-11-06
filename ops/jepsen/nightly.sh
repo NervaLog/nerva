@@ -124,7 +124,7 @@ fetch_tip() {
   cd "$JEPSEN_REPO_DIR" || { host_failure "cannot enter $JEPSEN_REPO_DIR"; return 1; }
   supervise timeout "$(remaining)" git fetch --quiet origin "$JEPSEN_BRANCH" 9>&- \
     || { host_failure "git fetch failed"; return 1; }
-  git checkout --quiet --detach FETCH_HEAD \
+  git checkout --quiet --detach FETCH_HEAD 9>&- \
     || { host_failure "git checkout of the fetched tip failed"; return 1; }
   fetched=1
   commit=$(git rev-parse HEAD) || { host_failure "git rev-parse failed"; return 1; }
@@ -162,11 +162,11 @@ finish_run() {
 # run LABEL ARGS...: one Jepsen run; its store goes to $night/store/LABEL and a line to `runs`.
 run() {
   local code=0
+  run_code=""
   run_label=$1
   shift
   run_began=$SECONDS
   run_args="$*"
-  run_code=""
   rm -rf "$JEPSEN_REPO_DIR/tests/jepsen/store"
   # --kill-after: run.sh's cleanup (removing the containers) gets a minute after the TERM.
   supervise timeout --kill-after=60 "$(remaining)" \
@@ -189,7 +189,7 @@ report() {
   else
     args+=(--repo "$JEPSEN_GH_REPO" --token-file "$JEPSEN_TOKEN_FILE")
   fi
-  timeout "$report_limit" python3 -I "$reporter" "${args[@]}"
+  timeout "$report_limit" python3 -I "$reporter" "${args[@]}" 9>&-
 }
 
 # The commit to report against: the tip if fetched, else the last the host knows (the tracker's
@@ -225,11 +225,18 @@ on_exit() {
   fi
   # An archive cut short is of no use, and nothing else would remove it.
   [[ -z "$archive" ]] || rm -f "$archive.new"
+  local finished=0   # runs on record before the one in flight
+  [[ ! -s "$night/store/runs" ]] || finished=1
   if [[ -n "$run_label" ]] && ! grep -q "^$run_label " "$night/store/runs" 2> /dev/null; then
     # The run's own code once it ended; 143 only if it was still running.
     finish_run "${run_code:-143}"
   fi
-  if ((rc == 143)); then
+  # A host failure makes the night `error` and the reporter skips every finding, so it is
+  # written only when no run had finished. With runs on record they are reported as they are, the
+  # interrupted one as the host's 143 (or its own code), and the end goes to the journal.
+  if ((finished)); then
+    log "the night ended early (exit $rc) with its finished runs on record; reporting them"
+  elif ((rc == 143)); then
     host_failure "the night was interrupted (a systemd stop or timeout) before it finished"
   else
     host_failure "nightly.sh stopped on an error (exit $rc) before it finished (disk full?)"
@@ -242,12 +249,12 @@ on_exit() {
   fi
   exit "$rc"
 }
-trap 'exit 143' TERM INT
-trap on_exit EXIT
-
+# Assigned before the traps: `set -u` is on inside the trap, so a TERM before this would kill it.
 commit=""
 fetched=0
 archive="$JEPSEN_HOME/archive/$date_utc$suffix.tar.zst"
+trap 'exit 143' TERM INT
+trap on_exit EXIT
 if fetch_tip && build_tip; then
   n=0
   for workload in $JEPSEN_WORKLOADS; do

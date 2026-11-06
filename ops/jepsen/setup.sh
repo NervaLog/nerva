@@ -72,14 +72,15 @@ fi
 # The checkout is the code under test (the build and tests/jepsen); the night moves it to the
 # tip of main itself. The runner is not in it: it is installed below. The checkout is only moved
 # under the night's own lock: a night mid-build keeps the commit it started with, so this refuses
-# (exit 75 from flock) while one runs, and can be run again after it.
+# (exit 75 from flock) while one runs, and can be run again after it. `-o` closes the lock's fd in
+# the command, so a detached `git gc --auto` cannot hold the night's lock past setup.
 LOCK=$HOME_DIR/nightly.lock
 # The lock file belongs to jepsen, as the night creates it: never created here by root.
 [ -e "$LOCK" ] || runuser -u jepsen -- touch "$LOCK"
 # The toolchain and Leiningen (tests/jepsen/tools.sh, sha256 pinned) are fetched now, so a broken
 # host shows today and not at 01:17.
 status=0
-flock -n -E 75 "$LOCK" runuser -u jepsen -- env HOME="$HOME_DIR" sh -c "
+flock -n -o -E 75 "$LOCK" runuser -u jepsen -- env HOME="$HOME_DIR" sh -c "
     set -e
     [ -d '$CHECKOUT/.git' ] || git clone --quiet https://github.com/NervaLog/nerva.git '$CHECKOUT'
     cd '$CHECKOUT' && git fetch --quiet origin main && git checkout --quiet --detach FETCH_HEAD &&

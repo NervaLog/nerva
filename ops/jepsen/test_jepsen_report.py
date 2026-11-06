@@ -1019,7 +1019,7 @@ class Nightly(unittest.TestCase):
                 "JEPSEN_NEMESIS": "kill", "JEPSEN_TIME_LIMIT": "1", "HOME": self.tmp.name,
                 **(extra or {})}
 
-    def interrupt(self, hang):
+    def interrupt(self, hang, workloads="retry"):
         """Starts a dry night whose `hang` step (or, None, a run.sh already committed that
         touches `started`) never ends, sends TERM, returns (rc, out, err, secs)."""
         started = Path(self.tmp.name, "started")
@@ -1029,7 +1029,8 @@ class Nightly(unittest.TestCase):
             Path(self.remote, hang).chmod(0o755)
             self.git(self.remote, "add", "-A")
             self.commit(self.remote, "hangs")
-        env = self.env({"JEPSEN_TRACKER": "7", "JEPSEN_NIGHT_SECONDS": "250"})
+        env = self.env({"JEPSEN_TRACKER": "7", "JEPSEN_NIGHT_SECONDS": "250",
+                       "JEPSEN_WORKLOADS": workloads})
         night = subprocess.Popen(["bash", str(self.installed / "nightly.sh"), "--dry-run"],
                                  env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                  text=True)
@@ -1063,6 +1064,25 @@ class Nightly(unittest.TestCase):
         self.assertIn("would comment on #7", out)
         night = next((self.home / "nights").iterdir())
         self.assertIn("interrupted", (night / "store/host-failure").read_text())
+
+    def test_term_after_a_finished_run_keeps_its_finding(self):
+        # retry ends invalid; bank is stopped by TERM. The stop must not hide the finding behind
+        # a host failure (P235): the night is `failure` and the issue is filed.
+        count = Path(self.tmp.name, "count")
+        started = Path(self.tmp.name, "started")
+        first = FAKE_RUN % invalid()
+        run = (f"#!/bin/sh\nif [ -e {count} ]; then touch {started}; exec sleep 300; fi\n"
+               f"touch {count}\n" + first.split("\n", 1)[1])
+        Path(self.remote, "tests/jepsen/run.sh").write_text(run)
+        self.git(self.remote, "add", "-A")
+        self.commit(self.remote, "retry then hang")
+        code, out, err, secs = self.interrupt(None, "retry bank")
+        self.assertEqual(code, 143, err)
+        self.assertIn("would set status jepsen/nightly = failure", out, err)
+        self.assertEqual(out.count("would open issue"), 1, out)
+        night = next((self.home / "nights").iterdir())
+        self.assertFalse((night / "store/host-failure").exists())
+        self.assertRegex((night / "store/runs").read_text(), r"(?m)^2 143 ")
 
     def test_term_during_the_final_report_does_not_report_twice(self):
         # systemd's TERM reaches the reporter too: this wrapper, on its first call, sends TERM to
