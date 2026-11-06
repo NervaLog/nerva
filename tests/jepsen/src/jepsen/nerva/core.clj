@@ -82,6 +82,7 @@
                           :stats      (checker/stats)
                           :exceptions (checker/unhandled-exceptions)
                           :protocol   (http/protocol-checker)
+                          :gateways   (nemesis/final-start-checker)
                           :workload   (:checker workload)})
             :generator (gen/phases
                          (->> (:generator workload)

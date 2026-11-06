@@ -5,7 +5,7 @@
   containers fixed addresses). The binary is uploaded from the control node, so a test runs
   exactly the build it was given."
   (:require [clojure.string :as str]
-            [clojure.tools.logging :refer [info]]
+            [clojure.tools.logging :refer [info warn]]
             [jepsen [control :as c]
                     [core :as jepsen]
                     [db :as db]]
@@ -158,9 +158,31 @@
   restart it; the suite does the same, this many times."
   6)
 
-(def gateway-start-wait-s
-  "How long `start-api!` waits for a started gateway to be healthy or dead."
-  15)
+(def gateway-registration-ms-default
+  "A gateway's `--request-timeout` when the test sets none: 30,000 ms
+  (`request_timeout_default_ms`, src/nerva/cli.zig). The deadline covers a call including the
+  client's registration, so a gateway whose cluster does not answer exits with NRV-E0604 after
+  this long."
+  30000)
+
+(def gateway-wait-margin-s
+  "Seconds a wait lasts beyond the gateway's registration window, so a gateway that is going to
+  exit with NRV-E0604 has done so when the wait ends."
+  5)
+
+(defn gateway-wait-s
+  "How long one wait for a started gateway lasts: its registration window (the test's
+  `:request-timeout`, else `gateway-registration-ms-default`) rounded up to seconds, plus
+  `gateway-wait-margin-s`. Longer than the window, so a wait ends with the gateway up or dead,
+  not merely still registering."
+  [test]
+  (+ gateway-wait-margin-s
+     (long (Math/ceil (/ (or (:request-timeout test) gateway-registration-ms-default) 1000.0)))))
+
+(def gateway-waits-max
+  "How many waits (`gateway-wait-s`) one start gets while the gateway stays alive and does not
+  answer. A pending gateway is waited for, not restarted."
+  2)
 
 (def gateway-backoff-ms-max
   "The longest wait between a gateway's starts."
@@ -172,19 +194,42 @@
   [tries]
   (min gateway-backoff-ms-max (* 500 (bit-shift-left 1 (dec tries)))))
 
+(defn wait-for-gateway
+  "Probes gateway `index` until it answers `/healthz` (`:up`), its process is gone (`:dead`) or
+  `wait-s` seconds have passed with it alive and silent (`:pending`). Each probe takes at most
+  `http/probe-timeout-ms`, so the wait is `wait-s` plus one probe."
+  [index wait-s]
+  (let [deadline (+ (System/nanoTime) (* wait-s 1000000000))]
+    (loop []
+      (cond (http/healthy? c/*host* (gateway-port index)) :up
+            (not (cu/daemon-running? (gateway-pidfile index))) :dead
+            (< deadline (System/nanoTime)) :pending
+            :else (do (Thread/sleep 500) (recur))))))
+
+(defn settle-gateway
+  "`wait-for-gateway`, repeated while the gateway is alive and silent, at most
+  `gateway-waits-max` waits in all: a pending gateway is waited for, never restarted here."
+  [test index]
+  (let [wait-s (gateway-wait-s test)]
+    (loop [waits 1]
+      (let [state (wait-for-gateway index wait-s)]
+        (if (and (= :pending state) (< waits gateway-waits-max))
+          (recur (inc waits))
+          state)))))
+
 (defn start-gateway-until-up!
-  "Starts gateway `index` and waits for it to be healthy or dead; a dead one is started again
-  after a backoff, at most `gateway-start-tries` times in all. Each probe of `/healthz` takes at
-  most `http/probe-timeout-ms`, so the wait is bounded by `gateway-start-wait-s` per try."
+  "Starts gateway `index` and returns `:up`, `:dead` or `:pending`. Each wait is
+  `(gateway-wait-s test)`, longer than the gateway's registration window (30 s by default,
+  cli.zig `request_timeout_default_ms`). A `:pending` gateway is alive: it is waited for again
+  (`settle-gateway`), not restarted. A `:dead` one is started again after a backoff, at most
+  `gateway-start-tries` starts in all. Bound: `gateway-start-tries` x `gateway-waits-max` x
+  (`gateway-wait-s` + a probe) + the backoffs (11.5 s), about 7 minutes at the default; a dead
+  gateway ends its wait at once, so in practice far less. Returns `:dead` or `:pending` when the
+  bounds are spent."
   [test index]
   (loop [tries 1]
     (start-gateway! test index)
-    (let [deadline (+ (System/nanoTime) (* gateway-start-wait-s 1000000000))
-          state    (loop []
-                     (cond (http/healthy? c/*host* (gateway-port index)) :up
-                           (not (cu/daemon-running? (gateway-pidfile index))) :dead
-                           (< deadline (System/nanoTime)) :pending
-                           :else (do (Thread/sleep 500) (recur))))]
+    (let [state (settle-gateway test index)]
       (if (and (= :dead state) (< tries gateway-start-tries))
         (do (info "Gateway" index "on" c/*host* "exited at start; starting it again")
             (Thread/sleep (long (gateway-backoff-ms tries)))
@@ -195,8 +240,8 @@
   "Starts the test's gateways. The control node reaches them over the network, so they listen
   on every address and say so: `--listen-remote` (P168, NRV-E0009). A test's `:request-timeout`
   (milliseconds) becomes their `--request-timeout`. A gateway that exits at start is started
-  again (`gateway-start-tries`); one that is neither healthy nor dead after
-  `gateway-start-wait-s` is left. Under `partition` a gateway can stay dead: with a 3 s
+  again (`gateway-start-tries`); one still alive and silent after `gateway-waits-max` waits
+  is left. Under `partition` a gateway can stay dead: with a 3 s
   `--request-timeout` its tries are spent in about 18 s, and nothing starts it again until the
   nemesis's next `:start`; the run then has fewer gateways until then, never wrong results."
   [test]
@@ -282,20 +327,27 @@
                       :sleep!   #(Thread/sleep 500)}))))
 
 (defn start-gateways-final!
-  "The final phase's start: brings every gateway that is not running up with
-  `start-gateway-until-up!` (bounded retries and backoff), because no start op follows it and a
-  gateway also exits (NRV-E0604) while the replicas that just restarted have not formed a view.
-  Returns `{:up [...] :down [] :pending []}`; throws, naming NRV-E0604, if a gateway never
-  comes up."
+  "The final phase's start: leaves no gateway down, because no start op follows it. Each of this
+  node's gateways is probed (`gateway-state`): `:up` is left; `:dead` is started with
+  `start-gateway-until-up!`; `:pending` (running, not answering) is waited for (`settle-gateway`)
+  and, if it exits or stays silent, killed and started with `start-gateway-until-up!`. Bounded as
+  that function is, per gateway, gateways in turn. Returns `{:up [...] :down [...] :pending
+  [...]}` (`start-outcome`); a gateway that is not up (NRV-E0604) is returned, not thrown, so the
+  node's other gateways and the other nodes keep their results. `nemesis/final-start-checker`
+  makes the run invalid."
   [test]
-  (let [states (into {} (for [index (range (gateways test c/*host*))
-                              :when (not (gateway-running? index))]
-                          [index (start-gateway-until-up! test index)]))
-        failed (vec (sort (for [[i s] states :when (not= :up s)] i)))]
-    (when (seq failed)
-      (throw (ex-info (str "NRV-E0604: gateway(s) " failed " on " c/*host* " did not come up in "
-                           gateway-start-tries " tries")
-                      {:node c/*host* :gateways failed :states states})))
+  (let [restart! (fn [index]
+                   (cu/stop-daemon! (gateway-pidfile index))
+                   (start-gateway-until-up! test index))
+        states   (into {}
+                       (for [index (range (gateways test c/*host*))]
+                         [index (case (gateway-state index)
+                                  :up      :up
+                                  :dead    (start-gateway-until-up! test index)
+                                  :pending (let [s (settle-gateway test index)]
+                                             (if (= :up s) :up (restart! index))))]))]
+    (doseq [[index state] states :when (not= :up state)]
+      (warn "NRV-E0604: gateway" index "on" c/*host* "is" (name state) "after the final start"))
     (start-outcome states)))
 
 (defn signal-gateways!
