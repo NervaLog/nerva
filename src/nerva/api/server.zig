@@ -90,6 +90,9 @@ pub fn serve(gpa: std.mem.Allocator, client: *Client, options: Options) !noretur
         }
         const received = try receiver.next(wake_ms) orelse continue;
         const requests_before = options.tally.requests;
+        // One deadline for everything this request does (#186). Groups are served by one cluster
+        // request each, so they share it.
+        health.window_open(client);
         budget.request_start();
         const arena = budget.allocator();
         // Requests are read from many connections at once (N45). Those already waiting for the
@@ -128,6 +131,7 @@ pub fn serve(gpa: std.mem.Allocator, client: *Client, options: Options) !noretur
         const asked = options.tally.requests != requests_before;
         if (asked) counters.group(group_count);
         if (health.state == .ready and asked) health.replied();
+        health.window_close(client);
         // `respond` has written the reply: give back what the request took at once, rather than
         // when the next request arrives (#60).
         _ = arena_instance.reset(.{ .retain_with_limit = MemoryBudget.retain_max });

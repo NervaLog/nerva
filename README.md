@@ -239,8 +239,8 @@ NERVA_KEY=secret nerva api --cluster=1 --addresses=10.0.0.1:3001,10.0.0.2:3001,1
   busy, NRV-E0602, keeps it): the gateway reconnects on its own and `/healthz` says
   `"session":"ready"` again.
 - **Timeouts.** Set the client's request timeout above the answer bound (below), and
-  `--request-timeout` below the client's. The timeout is per cluster request, so a route that
-  makes several can outlast it ("The answer bound"; #186).
+  `--request-timeout` below the client's. The timeout is one deadline per HTTP request, however
+  many cluster calls it makes ("The answer bound"; #186).
 - **Sessions.** A cluster holds 64 client sessions. Every gateway, `nerva view`, `export`,
   `recover` and Zig client takes one, and a 65th evicts the least recent. Count them before
   adding gateways.
@@ -460,8 +460,8 @@ does not start: `error[NRV-E0010]`, before it says it listens. The socket never 
 kernel does not take is dropped and its lines are counted in `nerva.api.statsd_dropped`, reported in
 the next window (again, if the report's own packet is refused). A series with no events in a window is not
 sent, except the two gauges. The gateway is one thread and sends a window at the top of its loop, so a window
-due while it blocks goes out when the call returns. A blocking call (a reconnect, a cluster request) lasts up to `--request-timeout`, and a request makes up to
-two (a reconnect, then the request), so the gap between windows is at most 10 s + 2 x `--request-timeout`; with the
+due while it blocks goes out when the call returns. A blocking step (an idle probe, or a request with its reconnect) lasts up to `--request-timeout`, and a probe
+and then a request make up to two, so the gap between windows is at most 10 s + 2 x `--request-timeout`; with the
 cluster down it is 10 s + `--request-timeout` (40 s by default, 70 s at most), one blocked reconnect.
 A late window is not lost: counters are deltas of the whole gap, and `session` is the state when it is sent (P176e). `nerva view` sends nothing.
 
@@ -647,14 +647,14 @@ A replayed commit answers `200` with `"replayed":true` and `"code":"NRV-W0201"`.
 4 MiB answers `413`; an op that is not committed yet answers `504`, on every route; a gateway
 without a session answers `503` NRV-E0605, and `/healthz` says `"session":"reconnecting"`.
 
-**The answer bound.** Each cluster request is answered within the queue wait (1 s) plus
-`--request-timeout` plus a margin to write the reply (1 s): 32 s by default. The timeout is per
-cluster request (the client restarts its deadline for every call), not per HTTP request, and some
-routes make several: a commit or lookup whose table layouts are not cached (the cache is cleared
-on every reconnect, so the first commit after one makes at least two), `layout_put` and view
-declares (a read, then a commit), and the `get_ledger` loop. Against a slow cluster such a
-request can take (k+1) times as long. A client whose own timeout is shorter than that may give up
-on a request that still commits. One deadline per HTTP request is tracked in #186.
+**The answer bound.** A request that has arrived whole is answered within the queue wait (1 s) plus
+`--request-timeout` plus a margin to write the reply (1 s): 32 s by default. The timeout is one
+deadline for the whole HTTP request, started when the gateway takes it up: a reconnection, a
+table-layout read before a commit, the read before a `layout_put` or a view declare, and every
+call of the `get_ledger` loop all share it (#186). A call that would pass it fails as a timeout
+(`503`, NRV-E0601, `"applied":"unknown"` if a write had gone out), and the gateway reconnects.
+Requests served together as a group (P143) share the deadline too. A client whose own timeout is
+longer than the bound always gets the gateway's answer.
 
 **Documents** hold values larger than a row: up to 512 KiB under a string key (up to 1024 bytes
 of UTF-8) in a namespace (a `u64`, as a decimal string). Nerva chunks them over rows of a
@@ -812,10 +812,10 @@ used; the sections above say why.
   answers `405` before the key is checked.
 - `--request-timeout=<ms>` (`nerva api` and `nerva view`, 1,000 to 60,000, default 30,000; out
   of range is NRV-E0002): a gateway's cluster session times out a request after it; the gateway
-  then answers `503` until it has reconnected. Each cluster request is answered
+  then answers `503` until it has reconnected. Each request is answered
   within 1 s (the queue wait) + `--request-timeout` + 1 s (32 s by default); the timeout is per
-  cluster request, so routes that make several take longer ("What a reply means"; #186). Set the
-  flag below the client's timeout.
+  HTTP request, however many cluster calls it makes ("What a reply means"; #186). Set the flag
+  below the client's timeout.
 - `--listen` is loopback (`127.0.0.0/8`, `::1`) unless `--listen-remote` is given; `0.0.0.0`,
   `[::]` and IPv4-mapped spellings such as `::ffff:127.0.0.1` are refused with NRV-E0009.
 

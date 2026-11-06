@@ -8,6 +8,8 @@
 const std = @import("std");
 const log = std.log.scoped(.client_health);
 
+const stdx = @import("stdx");
+
 const nerva = @import("../nerva.zig");
 const catalog = @import("catalog.zig");
 const Client = @import("client.zig").Client;
@@ -46,6 +48,8 @@ pub const ClientHealth = struct {
     timer: std.time.Timer,
     allocator: std.mem.Allocator,
     options: Client.Options,
+    /// The open request window (`window_open`), for a client replaced meanwhile.
+    window_end: ?stdx.Instant = null,
 
     pub fn init(client: *const Client) !ClientHealth {
         return .{
@@ -53,6 +57,25 @@ pub const ClientHealth = struct {
             .allocator = client.allocator,
             .options = client.options,
         };
+    }
+
+    /// A request arrived: one deadline, `--request-timeout` from now, for everything it does
+    /// (a reconnection, then its cluster calls), until `window_close` (#186).
+    pub fn window_open(health: *ClientHealth, client: *Client) void {
+        std.debug.assert(health.window_end == null);
+        // A client in `gone` is uninitialized: its window is set when `ready` replaces it.
+        if (health.state == .gone) {
+            var time_os: stdx.TimeOS = .{};
+            health.window_end = time_os.monotonic().add(health.options.timeout);
+        } else {
+            health.window_end = client.window_open();
+        }
+    }
+
+    pub fn window_close(health: *ClientHealth, client: *Client) void {
+        std.debug.assert(health.window_end != null);
+        health.window_end = null;
+        if (health.state != .gone) client.window_close();
     }
 
     pub fn broke(health: *ClientHealth) void {
@@ -69,7 +92,11 @@ pub const ClientHealth = struct {
         const result = switch (health.state) {
             .ready => unreachable,
             .broken => client.reconnect(),
-            .gone => client.init(health.allocator, health.options),
+            .gone => init: {
+                var options = health.options;
+                options.window_end = health.window_end;
+                break :init client.init(health.allocator, options);
+            },
         };
         result catch |err| {
             log.err("reconnecting to the cluster: {}", .{err});

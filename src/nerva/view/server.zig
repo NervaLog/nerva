@@ -86,6 +86,9 @@ pub fn serve(gpa: std.mem.Allocator, client: *Client, options: Options) !noretur
         };
         _ = arena_instance.reset(.retain_capacity);
         const arena = arena_instance.allocator();
+        // One deadline for everything this request does (#186).
+        health.window_open(client);
+        defer health.window_close(client);
         const reply = serve_request(
             arena,
             client,
