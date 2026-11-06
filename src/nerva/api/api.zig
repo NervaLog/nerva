@@ -87,7 +87,6 @@ const wire = @import("../wire_code.zig");
 pub const Code = wire.Code;
 pub const Applied = wire.Applied;
 const layout_cache = @import("layout_cache.zig");
-const server = @import("server.zig");
 
 const Change = nerva.Change;
 const Entry = nerva.Entry;
@@ -2617,11 +2616,11 @@ pub const Writer = struct {
 // ---- Tests ----
 
 const testing = std.testing;
+const server = @import("server.zig");
+const window_remaining_divisor = @import("../client.zig").window_remaining_divisor;
 
 /// An in-memory client with Nerva's semantics for one-transaction requests, to test the
 /// translation without a cluster. `tests/api/api.py` checks the real thing.
-const window_remaining_divisor = @import("../client.zig").window_remaining_divisor;
-
 const FakeClient = struct {
     op: u64 = 0,
     rows: std.AutoArrayHashMapUnmanaged(u128, Version) = .{},
@@ -4162,7 +4161,12 @@ test "api: a group whose send expires has sent nothing, and each member says so 
 
 /// A FakeClient and catalog on one fake clock, table 7 declared, layout 7 not cached, and a
 /// window of `timeout_ns` open: the state of the first commit after a reconnect (#186).
-fn window_fixture(arena: std.mem.Allocator, fake: *FakeClient, layouts: *FakeLayouts, timeout_ns: u64) !void {
+fn window_fixture(
+    arena: std.mem.Allocator,
+    fake: *FakeClient,
+    layouts: *FakeLayouts,
+    timeout_ns: u64,
+) !void {
     fake.* = .{ .allocator = arena };
     layouts.* = .{ .allocator = arena, .client = fake };
     _ = try handle(arena, fake, layouts, .put, "/v1/tables/7", declare_seats);

@@ -158,14 +158,24 @@ fn layout_read(
 
 test "CatalogStore: a layout or view call keeps the request's window and sends nothing past it (#186)" {
     const stdx = @import("stdx");
+    const constants = @import("../../constants.zig");
     var arena_instance = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_instance.deinit();
     const arena = arena_instance.allocator();
     var time_os: stdx.TimeOS = .{};
-    // Only what `ensure_idle` and the size check before it read: an idle client whose window ended a second ago, so any
+    // Only what `ensure_idle` reads: an idle client whose window ended a second ago, so any
     // call it makes is refused before it is queued. A call that gave itself a fresh window
-    // (the (k+1) x timeout of #186) would be sent, which this client cannot do.
+    // (the (k+1) x timeout of #186) would be sent. `client.sending` is already set, so a send
+    // trips `Client.send`'s `assert(client.sending == null)`, a deterministic assertion
+    // failure, after copying into a real request buffer (no undefined memory is touched).
+    const request_bytes = try arena.alignedAlloc(
+        u8,
+        constants.cache_line_size,
+        constants.message_body_size_max,
+    );
     var client: Client = undefined;
+    client.request = @ptrCast(request_bytes.ptr);
+    client.sending = .commit;
     client.state = .idle;
     client.time_os = time_os;
     client.vsr_client.batch_size_limit = 1024;
@@ -193,4 +203,5 @@ test "CatalogStore: a layout or view call keeps the request's window and sends n
     try std.testing.expectEqual(ended.ns, client.options.window_end.?.ns);
     try std.testing.expectEqual(@as(u64, 3), client.writes_sent);
     try std.testing.expectEqual(.idle, client.state);
+    try std.testing.expectEqual(.commit, client.sending.?);
 }
