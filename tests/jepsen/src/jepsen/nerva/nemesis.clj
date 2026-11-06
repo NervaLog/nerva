@@ -107,12 +107,15 @@
 
 (defn act!
   "Does `f` on this node for `arg`; returns `{:hit [index ...]}`, the gateways it reached, and
-  for a start `:down`, the started gateways that did not come up."
-  [test f arg]
+  for a start `:down` (exited at start) and `:pending` (alive, not yet answering). `final?` is
+  the final phase's start, which retries and throws if a gateway never comes up."
+  [test f arg final?]
   (case f
     :gateway-kill      {:hit (db/kill-gateways! arg)}
-    :gateway-start     (let [{:keys [up down]} (db/start-gateways! test)]
-                           {:hit up, :down down})
+    :gateway-start     (let [{:keys [up down pending]} (if final?
+                                                         (db/start-gateways-final! test)
+                                                         (db/start-gateways! test))]
+                         {:hit up, :down down, :pending pending})
     :gateway-partition {:hit (db/partition-gateways! arg)}
     :gateway-heal      {:hit (db/heal-gateways! test)}
     :gateway-pause     {:hit (db/signal-gateways! arg "-STOP")}
@@ -127,11 +130,14 @@
 
 (defn completion
   "What a completion adds to the op's value: `:hit`, the gateways reached, and for a start
-  `:down` when any started gateway did not come up (P237)."
+  `:down` (exited) and `:pending` (alive, not answering at the deadline) when there are any
+  (P238)."
   [hit]
-  (let [down (pairs-of hit :down)]
+  (let [down    (pairs-of hit :down)
+        pending (pairs-of hit :pending)]
     (cond-> {:hit (pairs-of hit :hit)}
-      (seq down) (assoc :down down))))
+      (seq down)    (assoc :down down)
+      (seq pending) (assoc :pending pending))))
 
 (defn nemesis
   "Applies the gateway faults. Every f here is distinct from `combined/db-nemesis`'s and
@@ -149,7 +155,7 @@
             hit  (if (empty? plan)
                    {}
                    (c/on-nodes test (keys plan)
-                               (fn [_ node] (c/su (act! test (:f o) (get plan node))))))]
+                               (fn [_ node] (c/su (act! test (:f o) (get plan node) (boolean (:final? (:value o))))))))]
         (assoc o :value (merge (:value o) (completion hit)))))
 
     (teardown! [_ _])))
@@ -169,27 +175,27 @@
   (filterv (enabled (:faults opts)) order))
 
 (defn undo-ops
-  "Undo ops for `faults`, each on every gateway."
-  [faults]
-  (let [ops (mapv #(op (opposite %) undo-value) faults)]
+  "Undo ops for `faults`, each on every gateway; `final?` marks them as the final phase's."
+  [faults final?]
+  (let [ops (mapv #(op (opposite %) (cond-> undo-value final? (assoc :final? true))) faults)]
     (when (seq ops) ops)))
 
 (defn heal-package
   "Only a final generator: resume and heal. It is listed before `combined/db-package`, whose
   final `:start` waits on every gateway: a paused or cut-off one would hold it up."
   [opts]
-  {:final-generator (undo-ops (filterv #{:gateway-pause :gateway-partition} (used opts)))
+  {:final-generator (undo-ops (filterv #{:gateway-pause :gateway-partition} (used opts)) false)
    :perf            #{}})
 
 (defn package
   "A nemesis package for the gateway faults in `(:faults opts)` (`:gateway`, or any of
-  `faults`). Its final generator starts killed gateways; `heal-package` resumes and heals
+  `faults`). Its final generator starts every gateway that is not running, retrying (`:final? true`); `heal-package` resumes and heals
   first, and it is listed after the replica packages, so gateways start once replicas do."
   [opts]
   (let [used (used opts)]
     {:generator       (when (seq used)
                        (gen/stagger (:interval opts combined/default-interval)
                                     (gen/mix (mapv fault-generator used))))
-     :final-generator (undo-ops (filterv #{:gateway-kill} used))
+     :final-generator (undo-ops (filterv #{:gateway-kill} used) true)
      :nemesis         (nemesis)
      :perf            (into #{} (filter #(contains? (set used) (first (:start %)))) perf)}))

@@ -51,8 +51,9 @@
     (is (= #{"gateway-kill" "gateway-partition" "gateway-pause"} (set (map :name (:perf p)))))
     (is (= [:gateway-resume :gateway-heal] (map :f (:final-generator (heal-package :gateway)))))
     (is (= [:gateway-start] (map :f (:final-generator p))))
-    (is (every? #(= {:gateways :all} (:value %))
-                (concat (:final-generator p) (:final-generator (heal-package :gateway)))))))
+    (is (every? #(= {:gateways :all} (:value %)) (:final-generator (heal-package :gateway))))
+    (is (= [{:gateways :all, :final? true}] (map :value (:final-generator p)))
+        "the final start retries")))
 
 (deftest one-fault-only
   (let [p (package :gateway-partition)]
@@ -163,22 +164,90 @@
       (is (= 2 (count @rules)) "no rule for the gateway that is down")
       (is (= [] (db/partition-gateways! [[0 ["n1"]]]))))))
 
-(deftest start-outcome-counts-only-healthy-gateways
-  (is (= {:up [0] :down [1 2]} (db/start-outcome {0 :up, 1 :dead, 2 :pending})))
-  (is (= {:up [] :down []} (db/start-outcome {}))))
+(deftest start-outcome-keeps-dead-and-pending-apart
+  (is (= {:up [0] :down [1] :pending [2]} (db/start-outcome {0 :up, 1 :dead, 2 :pending})))
+  (is (= {:up [] :down [] :pending []} (db/start-outcome {}))))
 
-(deftest start-reports-a-gateway-that-exited-down
+(defn fake-loop
+  "`settle-states` over a fake clock: each probe advances it by `probe-ms`, each sleep by 500.
+  `script` maps an index to its states, one per probe, the last repeating. Returns
+  `[states probes-by-index]`."
+  [initial script probe-ms deadline-ms]
+  (let [clock  (atom 0)
+        probes (atom {})
+        probe  (fn [i]
+                 (swap! clock + probe-ms)
+                 (let [n (get @probes i 0)]
+                   (swap! probes update i (fnil inc 0))
+                   (let [seq (script i)] (nth seq (min n (dec (count seq)))))))]
+    [(db/settle-states initial probe {:deadline deadline-ms
+                                      :now      (fn [] @clock)
+                                      :sleep!   #(swap! clock + 500)})
+     @probes]))
+
+(deftest settle-re-probes-a-pending-gateway-until-it-is-up
+  (let [[states probes] (fake-loop {0 :pending} {0 [:pending :pending :up]} 100 10000)]
+    (is (= {0 :up} states))
+    (is (= {0 3} probes))))
+
+(deftest settle-ends-a-pending-gateway-that-dies-as-dead
+  (let [[states probes] (fake-loop {0 :pending, 1 :pending} {0 [:pending :dead], 1 [:up]} 100 10000)]
+    (is (= {0 :dead, 1 :up} states))
+    (is (= {0 2, 1 1} probes) "a settled gateway is not probed again")))
+
+(deftest settle-leaves-a-gateway-pending-at-the-deadline
+  (let [[states probes] (fake-loop {0 :pending} {0 [:pending]} 100 2000)]
+    (is (= {0 :pending} states))
+    (is (<= 4 (get probes 0) 6) "re-probed until the deadline, then it stops")
+    (is (= {:up [] :down [] :pending [0]} (db/start-outcome states)))))
+
+(deftest settle-checks-the-deadline-after-a-whole-round
+  (let [[states probes] (fake-loop {0 :pending, 1 :pending} {0 [:pending], 1 [:pending]} 3000 1000)]
+    (is (= {0 :pending, 1 :pending} states))
+    (is (= {0 1, 1 1} probes) "one round, though the first probe already passed the deadline")))
+
+(deftest start-reports-down-and-pending-apart
   (let [started (atom [])]
-    (with-redefs [db/gateway-running? (fn [i] (= 2 i))
+    (with-redefs [db/gateway-running? (fn [i] (= 3 i))
                   db/start-gateway!   (fn [_ i] (swap! started conj i))
-                  db/gateway-state    {0 :up, 1 :dead}
+                  db/start-settle-s   0
+                  db/gateway-state    {0 :up, 1 :dead, 2 :pending}
                   c/*host*            "n1"]
-      (is (= {:up [0] :down [1]} (db/start-gateways! {:nodes ["n1"] :gateways 3})))
-      (is (= [0 1] @started) "the running gateway 2 is left alone"))))
+      (is (= {:up [0] :down [1] :pending [2]}
+             (db/start-gateways! {:nodes ["n1"] :gateways 4})))
+      (is (= [0 1 2] @started) "the running gateway 3 is left alone"))))
 
-(deftest completion-reports-hit-and-down
+(deftest final-start-retries-until-every-gateway-is-up
+  (let [starts (atom {})]
+    (with-redefs [db/gateway-running? (constantly false)
+                  db/start-gateway!   (fn [_ i] (swap! starts update i (fnil inc 0)))
+                  db/gateway-backoff-ms (constantly 0)
+                  c/*host*            "n1"
+                  jepsen.nerva.http/healthy? (fn [_ port] (or (not= port (db/gateway-port 1))
+                                                              (<= 3 (get @starts 1 0))))
+                  jepsen.control.util/daemon-running? (fn [pidfile]
+                                                        (or (not= pidfile (db/gateway-pidfile 1))
+                                                            (<= 3 (get @starts 1 0))))]
+      (is (= {:up [0 1] :down [] :pending []}
+             (db/start-gateways-final! {:nodes ["n1"] :gateways 2})))
+      (is (= {0 1, 1 3} @starts)))))
+
+(deftest final-start-fails-loudly-when-a-gateway-never-comes-up
+  (let [starts (atom 0)]
+    (with-redefs [db/gateway-running? (constantly false)
+                  db/start-gateway!   (fn [_ _] (swap! starts inc))
+                  db/gateway-backoff-ms (constantly 0)
+                  c/*host*            "n1"
+                  jepsen.nerva.http/healthy? (constantly false)
+                  jepsen.control.util/daemon-running? (constantly false)]
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"NRV-E0604"
+                            (db/start-gateways-final! {:nodes ["n1"] :gateways 1})))
+      (is (= db/gateway-start-tries @starts)))))
+
+(deftest completion-reports-hit-down-and-pending
   (is (= {:hit [["n1" 0] ["n2" 1]]}
          (nemesis/completion {"n2" {:hit [1]}, "n1" {:hit [0]}})))
   (is (= {:hit [] } (nemesis/completion {"n1" {:hit []}})))
-  (is (= {:hit [["n1" 0]] :down [["n2" 0]]}
-         (nemesis/completion {"n1" {:hit [0]}, "n2" {:hit [] :down [0]}}))))
+  (is (= {:hit [["n1" 0]] :down [["n2" 0]] :pending [["n3" 1]]}
+         (nemesis/completion {"n1" {:hit [0]}, "n2" {:hit [] :down [0]}
+                              "n3" {:hit [] :down [] :pending [1]}}))))

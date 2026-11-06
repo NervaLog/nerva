@@ -185,10 +185,11 @@
                            (not (cu/daemon-running? (gateway-pidfile index))) :dead
                            (< deadline (System/nanoTime)) :pending
                            :else (do (Thread/sleep 500) (recur))))]
-      (when (and (= :dead state) (< tries gateway-start-tries))
-        (info "Gateway" index "on" c/*host* "exited at start; starting it again")
-        (Thread/sleep (long (gateway-backoff-ms tries)))
-        (recur (inc tries))))))
+      (if (and (= :dead state) (< tries gateway-start-tries))
+        (do (info "Gateway" index "on" c/*host* "exited at start; starting it again")
+            (Thread/sleep (long (gateway-backoff-ms tries)))
+            (recur (inc tries)))
+        state))))
 
 (defn start-api!
   "Starts the test's gateways. The control node reaches them over the network, so they listen
@@ -219,7 +220,8 @@
 
 (defn kill-gateways!
   "SIGKILLs those of gateways `indices` that are running on this node, the replica untouched.
-  Returns the indices it killed: a gateway already down was not reached."
+  Returns the indices it killed: a gateway already down was not reached. \"Running\" is as of the
+  check: a gateway that exits between the check and the kill is still returned."
   [indices]
   (let [reached (filterv gateway-running? indices)]
     (doseq [index reached]
@@ -227,16 +229,18 @@
     reached))
 
 (def start-settle-s
-  "How long `start-gateways!` waits, in all, for the gateways it started to be healthy or dead."
+  "How long `start-gateways!` keeps probing the gateways it started. The deadline is checked
+  after a whole round of probes, so a wait is at most this plus one round (see `settle-states`)."
   10)
 
 (defn start-outcome
   "`states` maps a started gateway's index to `:up`, `:dead` or `:pending`; returns
-  `{:up [...] :down [...]}`, indices sorted. Only a healthy gateway is up: one that exited at
-  start (NRV-E0604, still cut off) or is not yet answering is down."
+  `{:up [...] :down [...] :pending [...]}`, indices sorted. `:up` answers `/healthz`; `:down`
+  exited at start (NRV-E0604, still cut off); `:pending` is alive but did not answer by the
+  deadline and may yet come up. The history never calls a live process down."
   [states]
-  {:up   (vec (sort (for [[i s] states :when (= :up s)] i)))
-   :down (vec (sort (for [[i s] states :when (not= :up s)] i)))})
+  (let [of (fn [k] (vec (sort (for [[i s] states :when (= k s)] i))))]
+    {:up (of :up), :down (of :dead), :pending (of :pending)}))
 
 (defn gateway-state
   "`:up` when gateway `index` answers `/healthz` (a probe takes at most
@@ -246,25 +250,53 @@
         (not (gateway-running? index))                :dead
         :else                                         :pending))
 
+(defn settle-states
+  "Probes every `:pending` gateway in `states` (index to state) with `probe` in rounds, until
+  none is pending or `(now)` passes `deadline`; between rounds it calls `(sleep!)`. The deadline
+  is checked after a round, so the wait is at most the time to the deadline plus one round, and
+  a round probes each pending gateway in turn (each probe: an HTTP probe, then a `ps` over ssh).
+  Returns the final states."
+  [states probe {:keys [deadline now sleep!]}]
+  (loop [states states]
+    (let [states (into {} (for [[i s] states] [i (if (= :pending s) (probe i) s)]))]
+      (if (or (not-any? #{:pending} (vals states)) (< deadline (now)))
+        states
+        (do (sleep!) (recur states))))))
+
 (defn start-gateways!
   "Starts this node's gateways that are not running; a paused or cut-off gateway is running and
-  is left alone. Then waits, at most `start-settle-s` in all, for each to be healthy or dead.
-  Returns `{:up [...] :down [...]}` (P237): a gateway started while still cut off from its
-  replicas exits (NRV-E0604) and is reported down, not started; the next start op starts it
-  again, and the final phase heals the cuts before it starts."
+  is left alone. Then waits (`settle-states`, `start-settle-s` plus one round at most) for each
+  to be healthy or dead. Returns `{:up [...] :down [...] :pending [...]}` (`start-outcome`,
+  P238): a gateway started while still cut off from its replicas exits (NRV-E0604) and is
+  `:down`; one still alive at the deadline is `:pending`. Neither is retried here: the next
+  start op starts the down ones again."
   [test]
-  (let [started  (vec (for [index (range (gateways test c/*host*))
-                            :when (not (gateway-running? index))
-                            :let [_ (start-gateway! test index)]]
-                        index))
-        deadline (+ (System/nanoTime) (* start-settle-s 1000000000))]
-    (loop [states (zipmap started (repeat :pending))]
-      (let [states (into {} (for [[i s] states]
-                              [i (if (= :pending s) (gateway-state i) s)]))]
-        (if (or (not-any? #{:pending} (vals states))
-                (< deadline (System/nanoTime)))
-          (start-outcome states)
-          (do (Thread/sleep 500) (recur states)))))))
+  (let [started (vec (for [index (range (gateways test c/*host*))
+                           :when (not (gateway-running? index))
+                           :let [_ (start-gateway! test index)]]
+                       index))]
+    (start-outcome
+      (settle-states (zipmap started (repeat :pending)) gateway-state
+                     {:deadline (+ (System/nanoTime) (* start-settle-s 1000000000))
+                      :now      #(System/nanoTime)
+                      :sleep!   #(Thread/sleep 500)}))))
+
+(defn start-gateways-final!
+  "The final phase's start: brings every gateway that is not running up with
+  `start-gateway-until-up!` (bounded retries and backoff), because no start op follows it and a
+  gateway also exits (NRV-E0604) while the replicas that just restarted have not formed a view.
+  Returns `{:up [...] :down [] :pending []}`; throws, naming NRV-E0604, if a gateway never
+  comes up."
+  [test]
+  (let [states (into {} (for [index (range (gateways test c/*host*))
+                              :when (not (gateway-running? index))]
+                          [index (start-gateway-until-up! test index)]))
+        failed (vec (sort (for [[i s] states :when (not= :up s)] i)))]
+    (when (seq failed)
+      (throw (ex-info (str "NRV-E0604: gateway(s) " failed " on " c/*host* " did not come up in "
+                           gateway-start-tries " tries")
+                      {:node c/*host* :gateways failed :states states})))
+    (start-outcome states)))
 
 (defn signal-gateways!
   "Sends `signal` to gateways `indices` on this node; a gateway that is gone is not an error.
@@ -288,8 +320,10 @@
 
 (defn partition-gateways!
   "Cuts gateways off from replicas on this node: `cuts` is `[[index [replica-node ...]] ...]`.
-  Their clients still reach them. Only a running gateway is cut, and only it is returned: a
-  gateway that is down was not reached, and a rule for it would cut it off when it restarts."
+  Their clients still reach them. Only a gateway running when checked is cut, and only it is
+  returned: a rule for a gateway that is down would cut it off when it restarts. The check and
+  the rule are two steps, so a gateway that exits in between is still cut and returned; its
+  rule stays until the next heal."
   [cuts]
   (let [reached (filterv (comp gateway-running? first) cuts)]
     (doseq [[index dests] reached
