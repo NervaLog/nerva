@@ -12,7 +12,6 @@ in `docs/ERRORS.md` (00xx) and, like NRV-W1003, is only logged.
 
 **Why.** The review (S4) pointed out that W1003, W0201 and W0310 are coded warnings that are not
 failures, so P147c's rule covers this line too; a script can now match the code. The text is false
-on loopback, so it is not logged there (S5). This amends the first version of this decision, which
-left the line uncoded.
+on loopback, so it is not logged there (S5).
 
 **Cost.** One more registered code. A log scraper must match `NRV-W0010`, not the text.

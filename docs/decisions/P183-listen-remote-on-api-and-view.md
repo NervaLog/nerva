@@ -14,5 +14,8 @@ is given, and both log the same one warning when it is.
 plain HTTP never cross a network, P147g) applies to it unchanged; one rule for both is also simpler
 to document.
 
+**Owner.** On 2026-11-05 the owner answered yes to extending the refusal to `nerva view`.
+
 **Cost.** Anyone running `nerva view` on `0.0.0.0` or `[::]` must also add `--listen-remote` on
 upgrade; the next release's CHANGELOG upgrade step names both commands.
+The step is tracked in CHANGELOG.md, "Unreleased".

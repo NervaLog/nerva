@@ -5,6 +5,16 @@ publishes a version's section as its GitHub release notes, and refuses to releas
 without one. Design reasons are in [docs/DECISIONS.md](./docs/DECISIONS.md); the full log of
 work is [WORKLOG.md](./WORKLOG.md).
 
+## Unreleased
+
+### Upgrade: `nerva api` and `nerva view` serve loopback unless `--listen-remote` (#183)
+
+Both commands now refuse a `--listen` that is not loopback (`127.0.0.0/8`, `::1`) with NRV-E0009.
+If you bind `0.0.0.0` or `[::]`, add `--listen-remote` (it logs NRV-W0010: the key and every reply
+cross the network in plain HTTP), or bind `127.0.0.1` and put the caller beside the gateway.
+Check scripts and fixtures that start either command, and any forwarder (`socat`, a proxy) in
+front of a gateway: a forwarder still reaches a loopback gateway and is the operator's choice.
+
 ## v0.6.1 — 2026-10-21
 
 `nerva api` no longer reads table layouts from the log on every request, so a lookup and a
