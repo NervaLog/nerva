@@ -59,6 +59,9 @@ pub fn log_runtime(
     }
 }
 
+/// Removes the `start --trace` file before the default panic handler runs (P208).
+pub const panic = std.debug.FullPanic(diagnostic.panic);
+
 pub const std_options: std.Options = .{
     // Messages are filtered at runtime by `log_level_runtime`.
     .log_level = .debug,
@@ -171,9 +174,9 @@ fn run() !void {
                 null;
             defer if (trace_file) |file| file.close();
             // Every coded exit from here on (through `diagnostic`) removes the file, or the next
-            // start is refused with NRV-E0004 on it (#197). Not removed: vendored `vsr.fatal`
-            // exits (NRV-E0707, say), panics, and signals during `replica.open`. `command_start`
-            // clears this once `replica.open` has returned.
+            // start is refused with NRV-E0004 on it (#197). So does a panic (`panic` above) and
+            // SIGINT or SIGTERM (P208). Not removed: vendored `vsr.fatal` exits (NRV-E0707, say;
+            // #206). `command_start` clears this once `replica.open` has returned.
             if (trace_file) |file| diagnostic.cleanup_register(args.trace.?, file);
             var trace_file_writer: ?std.fs.File.Writer =
                 if (trace_file) |file| file.writer() else null;
