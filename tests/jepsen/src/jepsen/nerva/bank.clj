@@ -21,16 +21,20 @@
   code in `jepsen.nerva.keyed`), and in the same transaction it writes a record in the
   `transfers` record table: id the key, value `from`, `to` (each an index into `accounts`) and
   the requested `amount`. An index by `from` and a `count` view over the table are declared
-  with it. A transfer is answered by a 2xx or by Nerva's own refusal (a 409 with a status), unless an
-  earlier attempt of its key got no answer (the original may commit later: the op ends :info);
-  keys that were not are resent after healing, then every record is read through the index.
+  with it. A transfer is answered by a 2xx or by Nerva's own refusal (a 409 with a status),
+  unless an earlier attempt of its key got no answer (the original may commit later: the op
+  ends :info); keys that were not are resent after healing, then every record is read through
+  the index.
   Also checked:
+  - `:refused-after-commit`  no key is refused after an attempt of it committed (keys are kept
+                  forever, so a resend replays);
   - `:duplicate`  every 2xx for a key, a discarded one included, names the same op;
   - `:records`    every key that committed has exactly one record, with its `from`, `to` and
                   `amount`, and every record is of a key that committed or may have (an
                   attempt got no answer); the count view equals the records the index lists,
                   and lies between the committed keys and the keys that may have committed.
-  `--no-keys` keeps the unkeyed run, with no record."
+  A refusal in the final phase is judged as one in an operation. `--no-keys` keeps the unkeyed
+  run, with no record."
   (:require [jepsen [checker :as checker]
                     [client :as client]
                     [generator :as gen]]
@@ -331,21 +335,35 @@
   refusal by Nerva."
   :refused)
 
+(defn final-refusals
+  "Nerva's refusals that decided no operation: in the final phase (a :resolve op's attempts) and
+  among the attempts of an operation that ended :info (a doubtful key's). As {:error :key}."
+  [history]
+  (for [op history
+        :let [tries (case (:f op)
+                      :resolve  (when (#{:ok :info} (:type op)) (mapcat :attempts (:resolved op)))
+                      :transfer (when (= :info (:type op)) (:attempts op))
+                      nil)]
+        attempt tries
+        :when (refused? attempt)]
+    {:error (keyword (:status attempt)), :gateway (:gateway attempt)}))
+
 (defn refusal-checker
   "Nerva refuses transfers only for expected reasons. A refusal is a failed transfer whose
-  error is Nerva's status (a keyword); one that was never sent is not a refusal."
+  error is Nerva's status (a keyword); one that was never sent is not a refusal. A refusal in
+  the final phase counts as one in an operation."
   []
   (reify checker/Checker
     (check [_ _test history _opts]
-      (let [refused (->> history
-                         (filter #(and (= :fail (:type %)) (= :transfer (:f %))
-                                       (keyword? (:error %))
-                                       (not= gateway-refusal (:error %)))))
+      (let [refused (concat (->> history
+                                 (filter #(and (= :fail (:type %)) (= :transfer (:f %))
+                                               (keyword? (:error %))
+                                               (not= gateway-refusal (:error %)))))
+                            (final-refusals history))
             bad     (remove (comp expected-refusals :error) refused)]
         {:valid?      (empty? bad)
          :refusals    (frequencies (map :error refused))
          :unexpected  (vec (take 10 bad))}))))
-
 
 (defn maybe-committed?
   "Whether a key with no 2xx may have committed all the same: an attempt got no answer, or its
@@ -381,6 +399,25 @@
                           [{:view (:count read), :listed (count found), :committed lo,
                             :at-most hi}])))}))
 
+(defn answered-by-refusal?
+  "Whether a refusal by Nerva answers a key: one with no attempt that got no answer before it,
+  or one of the final phase (`keyed/invoke-keyed` makes the same cut in an operation)."
+  [attempts]
+  (loop [[attempt & more] attempts, doubt? false]
+    (cond (nil? attempt) false
+          (and (refused? attempt) (or (:final? attempt) (not doubt?))) true
+          :else (recur more (or doubt? (= :unknown (:kind attempt)))))))
+
+(defn refused-after-commit
+  "Keys refused after an attempt of them committed: keys are kept forever, so a resend must
+  replay, and a cluster that refuses it has lost the key."
+  [records]
+  (for [[key record] records
+        :let [after (rest (drop-while #(not= :committed (:kind %)) (:attempts record)))
+              refusals (filter refused? after)]
+        :when (seq refusals)]
+    {:key key, :statuses (vec (map :status refusals))}))
+
 (defn analyze-keys
   "The keyed checks of a history: one op per key (:duplicate) and the records (:records), as
   the namespace doc says. Invalid on any error; :unknown when a key was never answered, or
@@ -392,10 +429,12 @@
         errors     (map (partial record-errors records) reads)
         gather     (fn [k] (vec (mapcat k errors)))
         unresolved (vec (for [[k r] records
-                              :when (and (empty? (keyed/answers r))
-                                         (not-any? refused? (:attempts r)))]
+                              :when (not (or (seq (keyed/answers r))
+                                             (answered-by-refusal? (:attempts r))))]
                           {:key k}))
-        broken?    (or (seq duplicate) (some #(some seq (vals %)) errors))]
+        refused-late (vec (refused-after-commit records))
+        broken?    (or (seq duplicate) (seq refused-late)
+                       (some #(some seq (vals %)) errors))]
     {:valid?     (cond broken? false
                        (or (seq unresolved) (empty? reads)) :unknown
                        :else true)
@@ -405,6 +444,7 @@
      :reads      (count reads)
      :records    (:count (last reads))
      :duplicate  {:count (count duplicate), :examples (vec (take 10 duplicate))}
+     :refused-after-commit {:count (count refused-late), :examples (vec (take 10 refused-late))}
      :missing    {:count (count (gather :missing)), :examples (vec (take 10 (gather :missing)))}
      :extra      {:count (count (gather :extra)), :examples (vec (take 10 (gather :extra)))}
      :duplicated {:count (count (gather :duplicated)),

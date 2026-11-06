@@ -172,8 +172,9 @@
 
 (defn invoke-keyed
   "An operation for `value` (a key and what it commits): :ok or :fail by `:complete` if an
-  attempt was definite (a refusal only if no earlier attempt got no answer); :fail :refused if every attempt was refused or never sent (the key
-  stays pending, for the final phase); else :info. A violation is the protocol checker's."
+  attempt was definite (a refusal only if no earlier attempt got no answer); :fail :refused if
+  every attempt was refused or never sent (the key stays pending, for the final phase); else
+  :info. A violation is the protocol checker's."
   [{:keys [pending drop-reply attempts]} test op ops]
   (let [value (:value op)
         definite? (:definite? ops definite?)
@@ -229,8 +230,9 @@
 
 (defn key-records
   "Everything the history says about each key: {key {<its value without :key> :attempts}},
-  attempts in the order they were sent (the operation's, then the final phase's), and
-  :info? true when its operation ended :info. `f` names the operations that send keys."
+  attempts in the order they were sent (the operation's, then the final phase's, which carry
+  :final? true), and :info? true when its operation ended :info. `f` names the operations
+  that send keys."
   [history f]
   (reduce
     (fn [records {op-f :f, :keys [type value resolved attempts]}]
@@ -242,7 +244,11 @@
           (and (= f op-f) (#{:ok :fail :info} type))
           (cond-> (add records (assoc value :attempts attempts))
             (= :info type) (assoc-in [(:key value) :info?] true))
-          (and (= :resolve op-f) (#{:ok :info} type)) (reduce add records resolved)
+          (and (= :resolve op-f) (#{:ok :info} type))
+          (reduce (fn [records entry]
+                    (add records
+                         (update entry :attempts (partial mapv #(assoc % :final? true)))))
+                  records resolved)
           :else records)))
     {}
     history))

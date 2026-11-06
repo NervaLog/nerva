@@ -324,6 +324,64 @@
                     [good-read good-view (transfer :fail "k1" 30 [out-of-bounds])
                      (records-read [(record "k1" 30)])]))))))
 
+(deftest a-doubtful-key-the-final-phase-never-answered-is-unknown
+  (let [doubtful (transfer :info "k1" 30 [lost out-of-bounds])
+        unanswered {:f :resolve, :type :info, :resolved [(entry "k1" 30 [])]}]
+    (testing "a refusal after an attempt with no answer does not resolve the key"
+      (doseq [read [(records-read []) (records-read [(record "k1" 30)])]]
+        (let [result (bank/analyze-keys
+                       (history-of [good-read good-view doubtful unanswered read]))]
+          (is (= :unknown (:valid? result)))
+          (is (= [{:key "k1"}] (get-in result [:unresolved :examples]))))))
+    (testing "the final phase's own refusal does"
+      (is (true? (keyed-valid? [good-read good-view doubtful
+                                (resolve-op (entry "k1" 30 [out-of-bounds]))
+                                (records-read [])]))))
+    (testing "and so does a refusal with no attempt before it that got no answer"
+      (is (true? (keyed-valid? [good-read good-view
+                                (transfer :fail "k1" 30 [busy out-of-bounds])
+                                (records-read [])]))))))
+
+(deftest a-key-refused-after-it-committed-fails
+  (testing "a dropped 200, then a resend refused"
+    (let [ops [good-read good-view
+               (transfer :fail "k1" 30 [(answered 10 {:dropped? true}) out-of-bounds])
+               (records-read [(record "k1" 30)])]
+          result (bank/analyze-keys (history-of ops))]
+      (is (false? (:valid? result)))
+      (is (= 1 (get-in result [:refused-after-commit :count])))
+      (is (= [{:key "k1", :statuses ["out_of_bounds"]}]
+             (get-in result [:refused-after-commit :examples])))))
+  (testing "a final-phase refusal of a key that committed"
+    (is (false? (keyed-valid? [good-read good-view
+                               (transfer :info "k1" 30 [(answered 10 {:dropped? true}) lost])
+                               (resolve-op (entry "k1" 30 [out-of-bounds]))
+                               (records-read [(record "k1" 30)])]))))
+  (testing "a refusal before the commit, or a replay after it, is fine"
+    (is (true? (keyed-valid? [good-read good-view
+                              (transfer :ok "k1" 30 [busy (answered 10 {:dropped? true})
+                                                     (answered 10 {:replayed? true})])
+                              (records-read [(record "k1" 30)])])))))
+
+(deftest a-final-phase-refusal-is-judged-like-any-other
+  (let [bad-resolve (fn [status]
+                      (resolve-op (entry "k4" 7 [(assoc out-of-bounds :status status)])))
+        check       (fn [ops] (valid? (bank/refusal-checker) (history-of ops)))]
+    (testing "out_of_bounds is expected"
+      (is (check [good-read (transfer :fail "k4" 7 [busy busy]) (bad-resolve "out_of_bounds")])))
+    (testing "unpaired, key_reused and conflict are not"
+      (doseq [status ["unpaired" "key_reused" "conflict"]]
+        (is (not (check [good-read (transfer :fail "k4" 7 [busy busy]) (bad-resolve status)]))
+            status)))
+    (testing "nor is one among a doubtful operation's attempts"
+      (is (not (check [good-read
+                       (transfer :info "k4" 7 [lost (assoc out-of-bounds :status "unpaired")])]))))
+    (testing "the whole workload checker fails on it"
+      (is (not (valid? (:checker (bank/workload {}))
+                       (history-of [good-read good-view
+                                    (transfer :fail "k4" 7 [busy busy])
+                                    (bad-resolve "unpaired") (records-read [])])))))))
+
 (defn scan-reply
   [records next]
   {:status 200, :body (cond-> {"records" records} next (assoc "next" next))})

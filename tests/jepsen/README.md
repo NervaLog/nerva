@@ -101,14 +101,18 @@ declares an index by `from` and a `count` view over the table. A transfer ends `
 `:fail` with Nerva's status on a `409` refusal (`out_of_bounds`, which no key outlives, unless
 an earlier attempt of the key got no answer: then the op is `:info` and the key is resent after
 healing, in case the original commits later), `:fail :refused` if only gateways refused it (a
-`503 views_busy` or `413 views_too_large` included), else `:info`; keys without a definite answer are resent
-after healing, and then every record is read through the index (eight `from` keys, paged) and
-the count view. Conservation alone cannot see a duplicate transfer, so also checked: `duplicate`
+`503 views_busy` or `413 views_too_large` included), else `:info`; keys without a definite
+answer are resent after healing, and then every record is read through the index (eight
+`from` keys, paged) and the count view. Conservation alone cannot see a duplicate transfer, so
+also checked: `duplicate`
 (every `2xx` for a key names the same op), `missing` (every key that committed has a record),
 `extra` (every record is of a key that committed, or may have: an attempt got no answer),
 `duplicated` and `wrong` (one record per key, with the transfer's `from`, `to` and `amount`), and
 `count-view` (the view equals the records listed, which lie between the committed keys and those
-that may have committed). A key no `2xx` or refusal answered makes the result `:unknown`.
+that may have committed). A key refused after an attempt of it committed makes the run invalid
+(`refused-after-commit`: keys are kept forever, so a resend replays), and so does a final-phase
+refusal that is not `out_of_bounds`. A key no `2xx` or refusal answered (one after an attempt
+that got no answer counts only in the final phase) makes the result `:unknown`.
 Records are upserts, so a duplicate apply leaves one record: `bank` catches a duplicate only
 when both `2xx` replies reached the client (`duplicate`). If the first reply is truly lost and a
 broken dedup applies the resend again, conservation, the records and the counts all hold;
