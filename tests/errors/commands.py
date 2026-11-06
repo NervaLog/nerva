@@ -148,7 +148,24 @@ def main():
             expect(result, "NRV-E0010", 1, "start: cannot send statsd to", f"start statsd {statsd}")
             assert "cannot listen" not in result.stderr and "NRV-B0004" not in result.stderr
             seen.append("NRV-E0010")
-
+        # A start that failed must not leave its --trace file behind: the operator fixes the flag
+        # and starts again with the same path, which must not be refused as E0004 (#197).
+        trace_again = os.path.join(tmp, "trace-again")
+        result = run(nerva, ["start", "--addresses=127.0.0.1:1,127.0.0.1:2,127.0.0.1:3",
+                             "--development", "--trace=" + trace_again,
+                             f"--statsd={statsd_bad[0]}", data], {})
+        expect(result, "NRV-E0010", 1, "start: cannot send statsd to", "trace with bad statsd")
+        assert not os.path.exists(trace_again), "the failed start left its trace file"
+        process = subprocess.Popen(
+            [nerva, "start", "--addresses=127.0.0.1:1,127.0.0.1:2,127.0.0.1:3", "--development",
+             "--trace=" + trace_again, data], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True)
+        try:
+            time.sleep(3)  # long enough for E0004, which is raised before anything else runs
+        finally:
+            process.kill()
+            stderr = process.communicate()[1]
+        assert "NRV-E0004" not in stderr, stderr[-1000:]
 
         # Pre-flight before the vendored open (R5, P149): nothing here may panic or write.
         start = ["start", "--addresses=127.0.0.1:1,127.0.0.1:2,127.0.0.1:3", "--development"]
