@@ -695,6 +695,14 @@ def settle_run(run, code, tests):
         run.results_text = tail[-LOG_TAIL_BYTES:]
 
 
+def read_repo_failure(store):
+    """What `bash -n` said about the tip's nightly.sh, or None (file `repo-failure`)."""
+    path = os.path.join(store, "repo-failure")
+    if not os.path.exists(path):
+        return None
+    return read_head(path, 1024).strip() or "nightly.sh does not parse"
+
+
 def read_night(store, runs_file):
     """(runs, night host failure or None)."""
     if not os.path.isdir(store):
@@ -748,8 +756,12 @@ def fingerprint_of(key):
 
 def title_of(canary, workload, checker, name):
     if canary:
-        title = f"Jepsen canary {workload}: {name} seen (expected), checker {checker}" \
-            if name != "blind" else f"Jepsen canary {workload}: blind, it saw no duplicate"
+        if name == "blind":
+            title = f"Jepsen canary {workload}: blind, it saw no duplicate"
+        elif name == "crashed":
+            title = f"Jepsen canary {workload}: crashed before a verdict (checker {checker})"
+        else:
+            title = f"Jepsen canary {workload}: {name} seen (expected), checker {checker}"
     else:
         title = f"Jepsen {workload}: {name} (checker {checker})"
     return title[:TITLE_BYTES_MAX - 3] + "..." if len(title) > TITLE_BYTES_MAX else title
@@ -769,8 +781,9 @@ def make_findings(run, canary):
             out.append(finding(run, True, checker, name, subtree))
     elif run.kind == "crashed":
         # The run threw before it could see anything: a crash, not a blind canary.
+        # The canary's own fingerprint: a test build's crash is not a crash on main (P235).
         for checker, name, subtree in run.findings:
-            out.append(finding(run, False, checker, name, subtree))
+            out.append(finding(run, True, checker, name, subtree))
     elif run.kind in ("invalid", "unknown", "valid"):
         # Whatever else it saw is a real finding; the canary itself saw no duplicate.
         for checker, name, subtree in run.findings:
@@ -790,12 +803,43 @@ def html_comment_safe(text):
     return text.replace("--", "- -")
 
 
+REPO_FAILURE_KEY = "nightly|script|unparsable"
+
+
+def repo_failure_item(text):
+    """The finding for a tip whose `nightly.sh` does not parse: the repository's defect (P240)."""
+    return {"run": None, "canary": False, "checker": "nightly", "class": "unparsable",
+            "subtree": None, "repo_failure": text, "key": REPO_FAILURE_KEY,
+            "fingerprint": fingerprint_of(REPO_FAILURE_KEY),
+            "title": "Jepsen nightly: ops/jepsen/nightly.sh on main does not parse"}
+
+
+def repo_failure_text(item, commit, first):
+    out = ["The Jepsen nightly (ops/jepsen/README.md) fetched `main` and found that its"
+           " `ops/jepsen/nightly.sh` does not parse (`bash -n`), so **nothing was run**. This is a"
+           " defect in the repository, not the host's.\n" if first
+           else f"Still failing on commit `{commit}`.\n",
+           f"- **Commit:** `{commit}`", "", "What `bash -n` said:", "", fence(item["repo_failure"])]
+    text = "\n".join(out) + "\n"
+    if first:
+        text += (f"\n<!-- jepsen fingerprint: {item['fingerprint']} -->\n"
+                 f"<!-- jepsen key: {item['key']} -->\n")
+    return text
+
+
 def report_text(item, commit, archive, first):
     """An issue body (`first`) or a comment: the same facts, the marker only in the body."""
+    if item.get("repo_failure"):
+        return repo_failure_text(item, commit, first)
     run = item["run"]
     canary = item["canary"]
     out = []
-    if first and canary:
+    if first and canary and item["class"] == "crashed":
+        out.append("The Jepsen canary (a build with commit-key deduplication off,"
+                   " ops/jepsen/README.md) **crashed** on `main`: the test threw before it wrote"
+                   " a verdict, so the canary could not show whether Jepsen sees a duplicate."
+                   " This is the canary build's crash, not the nightly's.\n")
+    elif first and canary:
         out.append("The Jepsen canary (a build with commit-key deduplication off,"
                    " ops/jepsen/README.md) ran on `main`. A duplicate is what it **expects**:"
                    " this issue shows the pipeline, and is closed by hand.\n")
@@ -1212,7 +1256,7 @@ def tracker_text(today, commit, runs, host_failure, state_name, description, fil
 
 
 def ingest(github, state, runs, host_failure, commit, tracker, archive, canary, now, repo, log,
-           status=True):
+           status=True, repo_failure=None):
     """Counts the night, sets its status, files or comments, posts the day. Returns a summary
     dict. Stops the writes at the first rate limit or unreachable GitHub."""
     summary = {"filed": 0, "commented": 0, "throttled": 0, "dropped": 0, "forbidden": 0,
@@ -1222,6 +1266,9 @@ def ingest(github, state, runs, host_failure, commit, tracker, archive, canary, 
     day["nights"] += 1
     day["commit"] = commit
     state_name, description = night_state(runs, host_failure, canary)
+    if repo_failure is not None:
+        state_name, description = "failure", "the repository's: ops/jepsen/nightly.sh on this " \
+            "commit does not parse, nothing was run"
     summary["status"] = state_name
     posted, why = (None, "no status for this night")
     if status:
@@ -1231,7 +1278,9 @@ def ingest(github, state, runs, host_failure, commit, tracker, archive, canary, 
     if posted is None:
         summary["status"] = f"{state_name} (not posted: {why})"
     items = []
-    if host_failure is None:
+    if repo_failure is not None:
+        items.append(repo_failure_item(repo_failure))
+    elif host_failure is None:
         for run in runs:
             items.extend(make_findings(run, canary))
     groups = {}
@@ -1244,8 +1293,15 @@ def ingest(github, state, runs, host_failure, commit, tracker, archive, canary, 
         if posted is not None:
             github.status(commit, state_name, context, description, target)
             record_status(state, commit, context, state_name, today)
-        for fingerprint, group in groups.items():
+        # A group reports its first item's run, and a run's groups are contiguous: free each
+        # run's history after its last group, so the peak is one run's history (P240).
+        last = {id(group[0]["run"]): n for n, group in enumerate(groups.values())
+                if group[0]["run"] is not None}
+        for n, (fingerprint, group) in enumerate(groups.items()):
             report_group(github, state, group[0], seen[fingerprint], commit, archive, summary)
+            run = group[0]["run"]
+            if run is not None and last[id(run)] == n:
+                run.history = None
         if tracker is not None and not day["reported"]:
             note = description if status else (
                 f"{description}; no status posted, the commit is the last the host knew")
@@ -1362,6 +1418,7 @@ def main(argv, now=None):
         return 1
     try:
         runs, host_failure = read_night(args.store, args.runs)
+        repo_failure = read_repo_failure(args.store)
     except BadInput as err:
         log(f"night refused, nothing reported: {err}")
         return 1
@@ -1389,7 +1446,7 @@ def main(argv, now=None):
     try:
         summary = ingest(github, state, runs, host_failure, args.commit, args.tracker,
                          args.archive, args.expect_invalid, now, args.repo, log,
-                         status=not args.no_status)
+                         status=not args.no_status, repo_failure=repo_failure)
     except Exception:
         # Whatever was posted before the fault is remembered, so the next night does not repeat it.
         with contextlib.suppress(OSError):

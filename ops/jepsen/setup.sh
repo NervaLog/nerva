@@ -82,6 +82,8 @@ systemctl daemon-reload
 if [ -s /etc/jepsen/token ]; then
     systemctl enable jepsen.timer
 else
+    # A timer #235 enabled on a host with no token would still stop the fleet every night.
+    systemctl disable --now jepsen.timer || true
     echo "jepsen: no token installed, so the timer is not enabled; put the token in" \
         "/etc/jepsen/token (README.md), then: systemctl enable --now jepsen.timer" >&2
 fi

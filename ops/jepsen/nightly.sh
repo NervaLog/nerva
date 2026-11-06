@@ -7,7 +7,8 @@
 #
 # A failure of the host (a build that failed, Docker down, a run past the deadline) is written
 # to `host-failure` or the `runs` file and reported as the host's: a status `error`, never an
-# issue. The token is a file (the unit's credential); this script never prints it.
+# issue. A tip whose own nightly.sh does not parse is the repository's: `repo-failure`, a status
+# `failure` and an issue (P240). The token is a file (the unit's credential); this script never prints it.
 set -euo pipefail
 
 : "${JEPSEN_HOME:=/var/lib/jepsen}"
@@ -34,6 +35,21 @@ if [[ "${1:-}" == "--dry-run" ]]; then
 fi
 export JEPSEN_DRY_RUN
 
+# The night cannot report without a token: say so at once, before anything is stopped or run.
+# The unit calls `nightly.sh --check-token` first, ahead of the step that stops the fleet.
+check_token() {
+  [[ -n "$JEPSEN_DRY_RUN" || -s "$JEPSEN_TOKEN_FILE" ]] && return 0
+  log "no token: $JEPSEN_TOKEN_FILE is missing or empty; no night was run (README.md, setup)"
+  return 1
+}
+if [[ "${1:-}" == "--check-token" ]]; then
+  check_token
+  exit $?
+fi
+if [[ -z "${JEPSEN_COPY_OF:-}" ]]; then
+  check_token || exit 1
+fi
+
 # This file lives in the checkout the night then moves to the tip of main, and bash reads a
 # script as it runs: run a private copy, so the checkout cannot change the script under it.
 # Stage 1 fetches the tip; if the tip's nightly.sh differs from this one, stage 2 is a private
@@ -41,10 +57,12 @@ export JEPSEN_DRY_RUN
 if [[ -z "${JEPSEN_COPY_OF:-}" ]]; then
   copy=$(mktemp)
   cp "${BASH_SOURCE[0]}" "$copy"
-  JEPSEN_STAGE=1 JEPSEN_COPY_OF=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd) \
-    JEPSEN_COPY_PATH=$copy exec bash "$copy" "$@"
+  # Stage 1's reporter too: it is the one that reports a tip whose script does not parse.
+  src=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+  [[ ! -f "$src/jepsen_report.py" ]] || cp "$src/jepsen_report.py" "$copy.report.py"
+  JEPSEN_STAGE=1 JEPSEN_COPY_OF=$src JEPSEN_COPY_PATH=$copy exec bash "$copy" "$@"
 fi
-trap 'rm -f "${JEPSEN_COPY_PATH:-}"' EXIT
+trap 'rm -f "${JEPSEN_COPY_PATH:-}" "${JEPSEN_COPY_PATH:-}.report.py"' EXIT
 here=$JEPSEN_COPY_OF
 stage=${JEPSEN_STAGE:-1}
 night_start=$((SECONDS - ${JEPSEN_ELAPSED:-0}))
@@ -52,14 +70,20 @@ mkdir -p "$JEPSEN_HOME"/{archive,state,nights}
 
 # One night at a time. A second start (the timer while a run is late, or by hand) leaves quietly.
 # Stage 2 inherits the held descriptor across the re-exec: opening the file again would close
-# fd 9 and release the lock for a moment.
-if [[ -z "${JEPSEN_LOCK_HELD:-}" ]]; then
+# fd 9 and release the lock for a moment. The variable is trusted only in stage 2, and only if
+# fd 9 really is the lock file and `flock -n 9` succeeds on it (it does for the holder: the same
+# open file description); anything else takes the lock the normal way (P240).
+if [[ "$stage" == 2 && -n "${JEPSEN_LOCK_HELD:-}" && /proc/self/fd/9 -ef "$JEPSEN_HOME/nightly.lock" ]] \
+   && flock -n 9; then
+  :
+else
   exec 9>"$JEPSEN_HOME/nightly.lock"
   if ! flock -n 9; then
     log "another night is running; leaving"
     exit 0
   fi
 fi
+unset JEPSEN_LOCK_HELD
 
 # A dry run has a night, an archive and a state of its own: it never touches the real ones.
 date_utc=${JEPSEN_DATE:-$(date -u +%Y-%m-%d)}
@@ -147,9 +171,10 @@ report() {
   else
     args+=(--repo "$JEPSEN_GH_REPO" --token-file "$JEPSEN_TOKEN_FILE")
   fi
-  python3 -I "$here/jepsen_report.py" "${args[@]}"
+  python3 -I "$reporter" "${args[@]}"
 }
 
+reporter="$here/jepsen_report.py"
 commit=""
 fetched=0
 archive="$JEPSEN_HOME/archive/$date_utc$suffix.tar.zst"
@@ -162,14 +187,17 @@ elif fetch_tip; then
   if [[ -f "$tip" ]] && ! cmp -s "$tip" "${BASH_SOURCE[0]}"; then
     next=$(mktemp)
     cp "$tip" "$next"
-    if ! bash -n "$next" 2> /dev/null; then
-      # A tip whose script does not parse would die silently at stage 2: keep this script,
-      # which reports the night as the host's (status error) and the tracker line.
+    if ! bash -n "$next" 2> "$night/tip-parse.log"; then
+      # A tip whose script does not parse would die silently at stage 2: keep this script and
+      # its own reporter (the tip's may not take this script's arguments). The defect is the
+      # repository's, not the host's: `repo-failure` makes a status `failure` and an issue.
       rm -f "$next"
-      host_failure "the tip's ops/jepsen/nightly.sh does not parse (bash -n); nothing was run"
+      { echo "bash -n said:"; head -c 800 "$night/tip-parse.log"; } > "$night/store/repo-failure"
+      log "the tip's ops/jepsen/nightly.sh does not parse; nothing was run: $(head -n 3 "$night/tip-parse.log" | tr '\n' ' ')"
+      [[ ! -f "$JEPSEN_COPY_PATH.report.py" ]] || reporter="$JEPSEN_COPY_PATH.report.py"
       ready=0
     else
-      rm -f "$JEPSEN_COPY_PATH"
+      rm -f "$JEPSEN_COPY_PATH" "$JEPSEN_COPY_PATH.report.py"
       log "running the tip's nightly.sh"
       JEPSEN_LOCK_HELD=1 JEPSEN_STAGE=2 JEPSEN_DATE=$date_utc \
         JEPSEN_ELAPSED=$((SECONDS - night_start)) JEPSEN_COPY_PATH=$next \

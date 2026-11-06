@@ -18,6 +18,8 @@ LoadCredential=token:/etc/jepsen/token
 # The fleet and Jepsen share the host and never overlap. `+` runs these two as root, outside the
 # sandbox below. ExecStopPost= runs whether the night passed, failed or was killed, so the fleet
 # always comes back; `-` because a host without a fleet has nothing to start.
+# The first step refuses a night with no token, in one journal line, before the fleet is stopped.
+ExecStartPre=/var/lib/jepsen/nerva/ops/jepsen/nightly.sh --check-token
 ExecStartPre=+-/usr/bin/systemctl stop sim-fleet.service
 ExecStart=/var/lib/jepsen/nerva/ops/jepsen/nightly.sh
 ExecStopPost=+-/usr/bin/systemctl start sim-fleet.service

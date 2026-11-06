@@ -9,6 +9,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -171,6 +172,17 @@ class Statuses(unittest.TestCase):
         self.assertEqual(summary["filed"], 1)
         self.assertIn("crashed", github.opened[0][1])
         self.assertNotIn("blind", github.opened[0][1])
+        self.assertIn("Jepsen canary", github.opened[0][1])
+        body = github.opened[0][2]
+        self.assertIn("canary", body.split("\n")[0])
+        self.assertNotIn("found this on `main`", body)
+        self.assertIn("-Dtest-commit-keys=off", body)
+        # Its fingerprint is not the nightly's crash of the same workload.
+        plain = Store(self)
+        plain.test("1", "", with_results=False, code=255, args="--workload retry")
+        nightly, _, _ = night(self, plain)
+        self.assertNotEqual(rep.MARKER.search(body).group(1),
+                            rep.MARKER.search(nightly.opened[0][2]).group(1))
 
 
 class Fingerprints(unittest.TestCase):
@@ -523,6 +535,46 @@ class DryRunState(unittest.TestCase):
             self.assertEqual(list(rep.load_state(path)["filed"]), ["b" * 32])
 
 
+class HistoryMemory(unittest.TestCase):
+    def test_one_runs_history_is_live_at_a_time(self):
+        store = Store(self)
+        for label, workload in (("1", "retry"), ("2", "bank")):
+            store.test(label, invalid(), args=f"--workload {workload}",
+                       history=['{:index 0, :type :ok, :key "aaaa", :f :pay}'])
+        runs, host = rep.read_night(store.path, store.write_runs())
+        live = []
+        real = rep.read_history
+
+        def watching(path):
+            live.append(sum(1 for r in runs if r.history is not None))
+            return real(path)
+
+        rep.read_history = watching
+        self.addCleanup(setattr, rep, "read_history", real)
+        rep.ingest(Recorder(), rep.new_state(), runs, host, COMMIT, None, None, False, NOW,
+                   "o/r", lambda m: None)
+        self.assertEqual(len(live), 2)
+        self.assertEqual(max(live), 0)
+        self.assertTrue(all(r.history is None for r in runs))
+
+
+class RepoFailure(unittest.TestCase):
+    def test_an_unparsable_tip_is_a_failure_with_its_own_issue(self):
+        store = Store(self)
+        Path(store.path, "repo-failure").write_text("bash -n said:\nline 9: syntax error\n")
+        runs, host = rep.read_night(store.path, None)
+        repo = rep.read_repo_failure(store.path)
+        github = Recorder()
+        summary = rep.ingest(github, rep.new_state(), runs, host, COMMIT, None, None, False,
+                             NOW, "o/r", lambda m: None, repo_failure=repo)
+        self.assertEqual(github.statuses[0][1:3], ("failure", "jepsen/nightly"))
+        self.assertIn("repository's", github.statuses[0][3])
+        self.assertEqual(summary["filed"], 1)
+        self.assertIn("does not parse", github.opened[0][1])
+        self.assertIn("syntax error", github.opened[0][2])
+        self.assertIn("not the host's", github.opened[0][2])
+
+
 class Dedup(unittest.TestCase):
     def test_a_known_failure_gets_one_comment_per_commit(self):
         store = Store(self)
@@ -868,26 +920,86 @@ class Nightly(unittest.TestCase):
         self.assertNotIn("running the tip's nightly.sh", done.stderr)
         self.assertIn("does not parse", done.stderr)
         self.assertNotIn("run 1", done.stderr)
-        self.assertIn("would set status", done.stdout)
-        self.assertIn("error", done.stdout)
+        self.assertIn("would set status jepsen/nightly = failure", done.stdout)
+        self.assertIn("the repository's", done.stdout)
+        self.assertIn("would open issue", done.stdout)
+        self.assertIn("ops/jepsen/nightly.sh on main does not parse", done.stdout)
+        self.assertNotIn("the host's:", done.stdout)
         self.assertEqual(done.returncode, 0, done.stderr)
 
-    def test_the_lock_is_taken_once_and_held_across_the_re_exec(self):
-        log = Path(self.tmp.name, "flock.log")
-        real = shutil.which("flock")
-        (self.bin / "flock").write_text(
-            f"#!/bin/sh\nprintf 'x\\n' >> {log}\nexec {real} \"$@\"\n")
-        (self.bin / "flock").chmod(0o755)
+    def test_the_old_script_reports_with_its_own_reporter_when_the_tip_does_not_parse(self):
+        broken = Path(self.tmp.name, "broken")
+        shutil.copytree(self.remote, broken)
+        with open(broken / "ops/jepsen/nightly.sh", "a") as script:
+            script.write("if then fi (\n")
+        # The tip's reporter refuses every argument: only the stage-1 copy can report.
+        (broken / "ops/jepsen/jepsen_report.py").write_text("import sys\nsys.exit(7)\n")
+        self.git(broken, "add", "-A")
+        self.commit(broken, "broken")
+        done = self.night("--dry-run", remote=str(broken))
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("would open issue", done.stdout)
+
+    def holding(self):
+        """A process holding the night's lock, as a running night does."""
+        self.home.mkdir(parents=True, exist_ok=True)
+        holder = subprocess.Popen(["flock", str(self.home / "nightly.lock"), "sleep", "60"])
+        self.addCleanup(holder.kill)
+        lock = self.home / "nightly.lock"
+        for _ in range(100):
+            probe = subprocess.run(["flock", "-n", str(lock), "true"])
+            if probe.returncode != 0:
+                return
+            time.sleep(0.05)
+        self.fail("the holder never took the lock")
+
+    def test_the_lock_is_held_while_the_tips_script_runs(self):
+        probe = Path(self.tmp.name, "probe")
+        run = (f"#!/bin/sh\nflock -n {self.home}/nightly.lock true && echo FREE > {probe} "
+               f"|| echo HELD > {probe}\nexit 0\n")
+        Path(self.remote, "tests/jepsen/run.sh").write_text(run)
+        self.git(self.remote, "add", "-A")
+        self.commit(self.remote, "probe")
         done = self.night("--dry-run")
         self.assertIn("running the tip's nightly.sh", done.stderr)
-        self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertEqual(len(log.read_text().splitlines()), 1)
+        self.assertEqual(probe.read_text().strip(), "HELD", done.stderr)
+
+    def test_a_second_night_cannot_start_while_the_lock_is_held(self):
+        self.holding()
+        done = self.night("--dry-run")
+        self.assertIn("another night is running", done.stderr)
+
+    def test_the_lock_variable_does_not_skip_the_lock(self):
+        self.holding()
+        for extra in ({"JEPSEN_LOCK_HELD": "1"},
+                      {"JEPSEN_LOCK_HELD": "1", "JEPSEN_STAGE": "2",
+                       "JEPSEN_COPY_OF": str(HERE), "JEPSEN_COPY_PATH": "/nonexistent/copy"}):
+            done = self.night("--dry-run", extra=extra)
+            self.assertIn("another night is running", done.stderr, extra)
+            self.assertEqual(list((self.home / "nights").iterdir()), [], extra)
+
+    def test_no_token_ends_the_night_at_once_before_anything_runs(self):
+        Path(self.tmp.name, "empty").write_text("")
+        done = self.night(extra={"JEPSEN_TOKEN_FILE": str(Path(self.tmp.name, "empty"))})
+        self.assertEqual(done.returncode, 1)
+        self.assertEqual(done.stderr.count("jepsen-nightly:"), 1)
+        self.assertIn("no token", done.stderr)
+        self.assertFalse((self.home / "nerva").exists())
+        check = self.night("--check-token",
+                           extra={"JEPSEN_TOKEN_FILE": str(Path(self.tmp.name, "empty"))})
+        self.assertEqual(check.returncode, 1)
+
+    def test_the_unit_checks_the_token_before_it_stops_the_fleet(self):
+        unit = (HERE / "jepsen.service").read_text()
+        check = unit.index("nightly.sh --check-token")
+        self.assertLess(check, unit.index("systemctl stop sim-fleet"))
+        self.assertEqual(unit[:check].splitlines()[-1].split("=")[0], "ExecStartPre")
 
 
 class SetupScript(unittest.TestCase):
     """setup.sh with root, apt, systemctl and /etc faked: the timer needs a token."""
 
-    def setup(self, token):
+    def setup(self, token, enabled=False):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         root = Path(tmp.name)
@@ -897,7 +1009,13 @@ class SetupScript(unittest.TestCase):
             (bin_dir / name).write_text("#!/bin/sh\nexit 0\n")
             (bin_dir / name).chmod(0o755)
         (bin_dir / "id").write_text('#!/bin/sh\n[ "$1" = -u ] && echo 0\nexit 0\n')
-        (bin_dir / "systemctl").write_text(f'#!/bin/sh\necho "$@" >> {root}/systemctl.log\n')
+        state = root / "timer-enabled"
+        if enabled:
+            state.write_text("1")
+        (bin_dir / "systemctl").write_text(
+            f'#!/bin/sh\necho "$@" >> {root}/systemctl.log\n'
+            f'case "$*" in "enable jepsen.timer") echo 1 > {state};; '
+            f'"disable --now jepsen.timer") rm -f {state};; esac\n')
         for name in ("id", "systemctl"):
             (bin_dir / name).chmod(0o755)
         (root / "etc/systemd/system").mkdir(parents=True)
@@ -915,6 +1033,7 @@ class SetupScript(unittest.TestCase):
             args = ["--token-file", str(root / "tok")]
         done = subprocess.run(["sh", str(script), *args], capture_output=True, text=True,
                               env={"PATH": f"{bin_dir}:{os.environ['PATH']}"}, timeout=60)
+        self.timer_enabled = state.exists()
         calls = (root / "systemctl.log").read_text() if (root / "systemctl.log").exists() else ""
         return done, calls
 
@@ -928,6 +1047,12 @@ class SetupScript(unittest.TestCase):
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertIn("enable jepsen.timer", calls)
         self.assertNotIn("no token installed", done.stderr)
+
+    def test_a_timer_already_enabled_is_disabled_when_there_is_no_token(self):
+        done, calls = self.setup(token=False, enabled=True)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("disable --now jepsen.timer", calls)
+        self.assertEqual(self.timer_enabled, False)
 
 
 if __name__ == "__main__":

@@ -23,7 +23,7 @@ user `jepsen`, and starts the fleet again whatever happened (`ExecStartPre=+` an
 5. calls `python3 -I jepsen_report.py ingest`.
 
 The script runs from a private copy of itself: the checkout it moves to the tip of `main` is the
-one it started from. The lock is held across the re-exec into the tip's own script (the descriptor is inherited), and a tip whose `nightly.sh` does not parse (`bash -n`) is not run: the night is reported as the host's, status `error`.
+one it started from. The lock is held across the re-exec into the tip's own script (the descriptor is inherited), and `JEPSEN_LOCK_HELD` is honoured only in stage 2 and only if fd 9 is the lock file and still locked. A tip whose `nightly.sh` does not parse (`bash -n`) is not run: it is the repository's defect, so the night (reported with stage 1's own reporter) is status `failure` and an issue (`nightly|script|unparsable`), not the host's `error` (P240). With no token, `nightly.sh` exits at once with one journal line; the unit runs `nightly.sh --check-token` before it stops the fleet.
 
 ## What the reporter does
 
@@ -56,7 +56,7 @@ in the store) is `error`.
 - **Tracker:** one comment a day on `JEPSEN_TRACKER`: what ran, on which commit, the verdict.
   **A day without one is the alarm.**
 - **`--expect-invalid`:** the canary (slice 8). The status is `jepsen/canary`, `success` only if
-  every run was invalid with a `duplicate`; a run that saw none is `failure` ("canary blind"), and a run that threw before a verdict is `failure` ("canary crashed", filed as a crash, not as blind).
+  every run was invalid with a `duplicate`; a run that saw none is `failure` ("canary blind"), and a run that threw before a verdict is `failure` ("canary crashed", filed as a crash with the canary's own fingerprint, not as blind).
   Its fingerprints are its own.
 - **`--dry-run`:** prints what it would write and writes nothing to GitHub. The state file it is
   given is written, so `nightly.sh` gives a dry run one of its own (`state/dry-run.json`).
