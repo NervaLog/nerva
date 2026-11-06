@@ -51,6 +51,7 @@ pub const Code = enum {
     E0309,
     E0311,
     E0312,
+    E0313,
     E0401,
     E0402,
     E0403,

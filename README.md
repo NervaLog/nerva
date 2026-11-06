@@ -643,9 +643,12 @@ Every reply that is not `2xx` carries `"applied"` and a `"code"` (docs/ERRORS.md
 | `applied` | Meaning | Client |
 |---|---|---|
 | `false` | Nothing reached the cluster, or the cluster refused it | Safe to resend, after fixing the request or waiting for the cause to pass |
-| `"unknown"` | A write went out and no reply came back (`503` NRV-E0601, `500` NRV-B0002, and `500` NRV-B0001 when a write had been sent) | The write may have committed: resend a `/v1/commit` only under its `key`, or read to find out |
+| `"unknown"` | A write went out and no reply came back (`503` NRV-E0601, `503` NRV-E0313, `500` NRV-B0002, and `500` NRV-B0001 when a write had been sent) | The write may have committed: resend a `/v1/commit` only under its `key`, or read to find out |
 
-A replayed commit answers `200` with `"replayed":true` and `"code":"NRV-W0201"`. A body over
+A layout or view declaration that loses 16 attempts in a row to concurrent declarations answers
+`503` `catalog busy`, NRV-E0313, with `"applied"` always `"unknown"` (the refused attempts count as writes, and the view
+may already be declared): the cluster answered each, so the gateway keeps its session.
+Resend after a pause. A replayed commit answers `200` with `"replayed":true` and `"code":"NRV-W0201"`. A body over
 4 MiB answers `413`; an op that is not committed yet answers `504`, on every route; a gateway
 without a session answers `503` NRV-E0605, and `/healthz` says `"session":"reconnecting"`.
 
