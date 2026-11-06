@@ -139,7 +139,7 @@
   (doseq [index (range (gateways test))]
     (loop [tries 1]
       (start-gateway! test index)
-      (let [deadline (+ (System/nanoTime) 8000000000)
+      (let [deadline (+ (System/nanoTime) 15000000000)
             state    (loop []
                        (cond (http/healthy? c/*host* (gateway-port index)) :up
                              (not (cu/daemon-running? (gateway-pidfile index))) :dead

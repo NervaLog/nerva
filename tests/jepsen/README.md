@@ -90,7 +90,7 @@ source in a declared ledger; an operation is a pay-in of 1 to 30 from the source
 (a pair of adds, no `clamp`, so a pay-in never fails for funds and every commit of it moves
 exactly its amount). Each draws a fresh 128-bit key from Jepsen's random source (`--seed` steers
 it). Replies are lost on purpose: a client timeout of 35 s, or with probability 1/4 a short one
-(50 to 1,999 ms, below the gateways' `--request-timeout=3000`), and `--drop-reply` of the `200`s
+(50 to 1,999 ms, below the gateways' `--request-timeout=10000`), and `--drop-reply` of the `200`s
 discarded. An attempt that is not definite goes to another gateway of any node, after a backoff,
 up to `--attempts`. The operation is `:ok` with the op of its first `200`, `:fail` if every
 attempt was `applied: false` (or never connected), else `:info`. After healing, every key whose
