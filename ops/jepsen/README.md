@@ -32,8 +32,10 @@ host only when `setup.sh` runs again**, as root, from a checkout of the commit t
 
 Any end that is not the end of the script (a systemd stop or the unit's timeout, which send TERM;
 a Ctrl-C; a `set -e` abort such as a full disk) goes through one `EXIT` trap: it records the run in
-flight (as exit 143 only if it was still running), writes a `host-failure` and posts
-`jepsen/nightly` = `error` (the host's) and the tracker's line within about 80 s, once;
+flight (as exit 143 only if it was still running) and gives every workload that never ran a 143
+line, so the night is never `success`. It writes a `host-failure` only when no run had finished (a
+finished run's finding is reported as it is: `failure` and its issue), and posts `jepsen/nightly`
+(`error`, or `failure`) and the tracker's line within about 80 s, once;
 `TimeoutStopSec=120` leaves room for that. A stop during the final report is not reported again
 (the reporter may have filed an issue; a second report could file it twice). `docker info` is
 bounded to 60 s. A second night that finds the lock held logs the pid in `nightly.pid` and exits

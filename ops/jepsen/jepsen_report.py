@@ -1175,7 +1175,7 @@ class DryRun:
 # Ingest.
 
 
-def night_state(runs, host_failure, canary):
+def night_state(runs, host_failure, canary, expected=()):
     """(commit status state, description) for the night."""
     if host_failure is not None:
         return "error", f"the host's: {host_failure}"
@@ -1184,6 +1184,7 @@ def night_state(runs, host_failure, canary):
     kinds = [run.kind for run in runs]
     verdicts = [(run.kind, run) for run in runs]
     total = len(runs)
+    missing = [w for w in expected if w not in {run.workload for run in runs}]
     if canary:
         crashed = [r for k, r in verdicts if k == "crashed"]
         blind = [r for k, r in verdicts if k not in ("host", "crashed")
@@ -1196,6 +1197,8 @@ def night_state(runs, host_failure, canary):
             if blind:
                 parts.append(f"canary blind: {len(blind)} of {total} run(s) saw no duplicate")
             return "failure", "; ".join(parts)
+        if missing:
+            return "error", f"the host's: no run of {', '.join(missing)}"
         if "host" in kinds:
             return "error", f"the host's: {kinds.count('host')} of {total} run(s) did not finish"
         return "success", f"canary: Jepsen saw the duplicate in {total} of {total} run(s)"
@@ -1203,6 +1206,8 @@ def night_state(runs, host_failure, canary):
     if bad:
         return "failure", f"{len(bad)} of {total} run(s) invalid or unknown: " + ", ".join(
             sorted({r.workload for r in bad}))
+    if missing:
+        return "error", f"the host's: no run of {', '.join(missing)}"
     if "host" in kinds:
         return "error", f"the host's: {kinds.count('host')} of {total} run(s) did not finish"
     return "success", f"{total} of {total} run(s) valid: " + ", ".join(
@@ -1224,7 +1229,7 @@ def tracker_text(today, commit, runs, host_failure, state_name, description, fil
 
 
 def ingest(github, state, runs, host_failure, commit, tracker, archive, canary, now, repo, log,
-           status=True):
+           status=True, expected=()):
     """Counts the night, sets its status, files or comments, posts the day. Returns a summary
     dict. Stops the writes at the first rate limit or unreachable GitHub."""
     summary = {"filed": 0, "commented": 0, "throttled": 0, "dropped": 0, "forbidden": 0,
@@ -1233,7 +1238,7 @@ def ingest(github, state, runs, host_failure, commit, tracker, archive, canary, 
     day = day_of(state, today)
     day["nights"] += 1
     day["commit"] = commit
-    state_name, description = night_state(runs, host_failure, canary)
+    state_name, description = night_state(runs, host_failure, canary, expected)
     summary["status"] = state_name
     posted, why = (None, "no status for this night")
     if status:
@@ -1360,6 +1365,9 @@ def main(argv, now=None):
     cmd.add_argument("--expect-invalid", action="store_true")
     cmd.add_argument("--dry-run", action="store_true")
     cmd.add_argument("--no-status", action="store_true")
+    cmd.add_argument("--expect-workloads", default="",
+                     help="space-separated workloads the night must have run; a night missing "
+                          "one is never `success`")
     args = parser.parse_args(argv)
     now = int(time.time()) if now is None else now
 
@@ -1408,7 +1416,7 @@ def main(argv, now=None):
     try:
         summary = ingest(github, state, runs, host_failure, args.commit, args.tracker,
                          args.archive, args.expect_invalid, now, args.repo, log,
-                         status=not args.no_status)
+                         status=not args.no_status, expected=args.expect_workloads.split())
     except Exception:
         # Whatever was posted before the fault is remembered, so the next night does not repeat it.
         with contextlib.suppress(OSError):

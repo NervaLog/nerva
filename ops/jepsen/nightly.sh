@@ -12,8 +12,10 @@
 #
 # A failure of the host (a build that failed, Docker down, a run past the deadline, a systemd
 # stop or timeout, a `set -e` abort such as a full disk) is written to `host-failure` or the
-# `runs` file and reported as the host's, once: a status `error`, never an issue. The token is a file (the unit's credential); this script
-# never prints it.
+# `runs` file and reported as the host's, once: a status `error`. A `host-failure` is written only
+# when no run had finished (a finished run's finding is reported as it is, P235), and a workload
+# that never ran gets a 143 line, so an interrupted night is never `success`. The token is a file
+# (the unit's credential); this script never prints it.
 set -euo pipefail
 
 : "${JEPSEN_HOME:=/var/lib/jepsen}"
@@ -183,6 +185,7 @@ report() {
   ((fetched)) || args+=(--no-status)
   [[ -z "$archive" ]] || args+=(--archive "$archive")
   [[ -z "$JEPSEN_TRACKER" ]] || args+=(--tracker "$JEPSEN_TRACKER")
+  [[ -z "$JEPSEN_WORKLOADS" ]] || args+=(--expect-workloads "$JEPSEN_WORKLOADS")
   [[ -z "$JEPSEN_EXPECT_INVALID" ]] || args+=(--expect-invalid)
   if [[ -n "$JEPSEN_DRY_RUN" ]]; then
     args+=(--dry-run)
@@ -225,11 +228,23 @@ on_exit() {
   fi
   # An archive cut short is of no use, and nothing else would remove it.
   [[ -z "$archive" ]] || rm -f "$archive.new"
-  local finished=0   # runs on record before the one in flight
-  [[ ! -s "$night/store/runs" ]] || finished=1
+  # A run has finished if one is on record, or the one in flight returned its code (its line is
+  # written just below, with that code).
+  local finished=0
+  { [[ -s "$night/store/runs" ]] || [[ -n "$run_code" ]]; } && finished=1
   if [[ -n "$run_label" ]] && ! grep -q "^$run_label " "$night/store/runs" 2> /dev/null; then
     # The run's own code once it ended; 143 only if it was still running.
     finish_run "${run_code:-143}"
+  fi
+  # A workload with no line never ran: it is the host's 143, so a night cut short between two runs
+  # cannot read as `success` (the reporter checks the same list, --expect-workloads).
+  if ((finished)); then
+    local n=0 workload
+    for workload in $JEPSEN_WORKLOADS; do
+      n=$((n + 1))
+      grep -q "^$n " "$night/store/runs" 2> /dev/null ||
+        echo "$n 143 0 test --workload $workload" >> "$night/store/runs"
+    done
   fi
   # A host failure makes the night `error` and the reporter skips every finding, so it is
   # written only when no run had finished. With runs on record they are reported as they are, the
@@ -246,6 +261,8 @@ on_exit() {
   report_limit=60
   if [[ -n "$commit" ]]; then
     report || log "the report of the night failed (exit $?)"
+  else
+    log "no commit is known (the first fetch failed); nothing can be reported"
   fi
   exit "$rc"
 }

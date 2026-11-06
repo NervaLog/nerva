@@ -107,6 +107,23 @@ def night(test, store, github=None, state=None, commit=COMMIT, now=NOW, tracker=
     return github, state, summary
 
 
+class ExpectedWorkloads(unittest.TestCase):
+    def test_a_night_missing_a_workload_is_never_success(self):
+        store = Store(self)
+        store.test("1", VALID)
+        runs, host = rep.read_night(store.path, store.write_runs())
+        self.assertEqual(rep.night_state(runs, host, False, ["retry"])[0], "success")
+        state, why = rep.night_state(runs, host, False, ["retry", "bank"])
+        self.assertEqual(state, "error")
+        self.assertIn("bank", why)
+
+    def test_a_finding_outranks_a_missing_workload(self):
+        store = Store(self)
+        store.test("1", invalid())
+        runs, host = rep.read_night(store.path, store.write_runs())
+        self.assertEqual(rep.night_state(runs, host, False, ["retry", "bank"])[0], "failure")
+
+
 class Statuses(unittest.TestCase):
     def test_a_valid_night_is_success(self):
         store = Store(self)
@@ -1084,6 +1101,40 @@ class Nightly(unittest.TestCase):
         self.assertFalse((night / "store/host-failure").exists())
         self.assertRegex((night / "store/runs").read_text(), r"(?m)^2 143 ")
 
+    def test_a_finished_run_not_yet_on_record_keeps_its_finding(self):
+        # retry ends invalid and TERM arrives as its store is moved, before its line is written:
+        # the run's own code is recorded and the finding is reported, not hidden (P235).
+        shim = Path(self.bin, "mv")
+        shim.write_text(f'#!/bin/sh\ncase "$*" in *tests/jepsen/store*) kill -TERM $PPID;; esac\n'
+                        f'exec {shutil.which("mv")} "$@"\n')
+        shim.chmod(0o755)
+        done = self.night("--dry-run", extra={"JEPSEN_TRACKER": "7",
+                                              "JEPSEN_WORKLOADS": "retry bank"})
+        self.assertEqual(done.returncode, 143, done.stderr)
+        self.assertIn("would set status jepsen/nightly = failure", done.stdout, done.stderr)
+        self.assertEqual(done.stdout.count("would open issue"), 1, done.stdout)
+        night = next((self.home / "nights").iterdir())
+        self.assertFalse((night / "store/host-failure").exists())
+        self.assertRegex((night / "store/runs").read_text(), r"(?m)^1 0 ")
+
+    def test_term_between_two_runs_is_never_success(self):
+        # run 1 is valid; TERM arrives before run 2 starts. bank never ran: it is the host's 143.
+        Path(self.remote, "tests/jepsen/run.sh").write_text(FAKE_RUN % VALID)
+        self.git(self.remote, "add", "-A")
+        self.commit(self.remote, "valid")
+        shim = Path(self.bin, "od")
+        count = Path(self.tmp.name, "od-count")
+        shim.write_text(f'#!/bin/sh\nif [ -e {count} ]; then kill -TERM "$(cat {self.home}/nightly.pid)"; '
+                        f'sleep 5; fi\ntouch {count}\nexec {shutil.which("od")} "$@"\n')
+        shim.chmod(0o755)
+        done = self.night("--dry-run", extra={"JEPSEN_TRACKER": "7",
+                                              "JEPSEN_WORKLOADS": "retry bank"})
+        self.assertEqual(done.returncode, 143, done.stderr)
+        self.assertNotIn("= success", done.stdout, done.stderr)
+        self.assertIn("would set status jepsen/nightly = error", done.stdout, done.stderr)
+        night = next((self.home / "nights").iterdir())
+        self.assertRegex((night / "store/runs").read_text(), r"(?m)^2 143 .*--workload bank")
+
     def test_term_during_the_final_report_does_not_report_twice(self):
         # systemd's TERM reaches the reporter too: this wrapper, on its first call, sends TERM to
         # the night's bash (its grandparent, past `timeout`) and dies unsaved, as a killed
@@ -1116,7 +1167,7 @@ class Nightly(unittest.TestCase):
         self.assertEqual(done.stdout.count("would set status jepsen/nightly = error"), 1,
                          done.stderr)
         self.assertEqual(done.stdout.count("would comment on #7"), 1)
-        self.assertIn("stopped on an error", done.stderr)
+        self.assertIn("ended early (exit 1)", done.stderr)
         self.assertNotIn("would open issue", done.stdout)
 
     def test_docker_info_that_hangs_is_the_hosts_failure_not_a_lost_night(self):
@@ -1192,15 +1243,23 @@ class Nightly(unittest.TestCase):
 class SetupScript(unittest.TestCase):
     """setup.sh with root, apt, systemctl and /etc faked: the timer needs a token."""
 
-    def setup(self, token, enabled=False, umask=None, hold=False):
+    def setup(self, token, enabled=False, umask=None, hold=False, git75=False):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         root = Path(tmp.name)
         bin_dir = root / "bin"
         bin_dir.mkdir()
-        for name in ("apt-get", "usermod", "useradd", "runuser"):
+        for name in ("apt-get", "usermod", "useradd"):
             (bin_dir / name).write_text("#!/bin/sh\nexit 0\n")
             (bin_dir / name).chmod(0o755)
+        # runuser runs nothing, except that jepsen's tests also change the checkout setup.sh is run
+        # from (the night does), and `exec` (a file) makes it run the command, as root would.
+        (bin_dir / "runuser").write_text(
+            "#!/bin/sh\nshift 3\n"
+            f'case "$*" in *test_jepsen_report.py*) echo "# changed" >> {root}/nightly.sh;; esac\n'
+            f'[ -e {root}/exec-runuser ] && case "$*" in *test_jepsen_report.py*) ;; '
+            '*) exec "$@";; esac\nexit 0\n')
+        (bin_dir / "runuser").chmod(0o755)
         (bin_dir / "id").write_text('#!/bin/sh\n[ "$1" = -u ] && echo 0\nexit 0\n')
         state = root / "timer-enabled"
         if enabled:
@@ -1217,6 +1276,10 @@ class SetupScript(unittest.TestCase):
         for name in ("nightly.sh", "jepsen_report.py", "jepsen.service", "jepsen.timer"):
             shutil.copy(HERE / name, root / name)
         self.root = root
+        if git75:
+            (root / "exec-runuser").write_text("1")
+            (bin_dir / "git").write_text("#!/bin/sh\nexit 75\n")
+            (bin_dir / "git").chmod(0o755)
         text = (HERE / "setup.sh").read_text().replace("/etc/", f"{root}/etc/")
         text = text.replace("/opt/jepsen", f"{root}/opt/jepsen")
         text = text.replace("/var/lib/jepsen", str(home))
@@ -1275,6 +1338,20 @@ class SetupScript(unittest.TestCase):
         self.assertEqual(done.returncode, 1, done.stderr)
         self.assertIn("a night is running", done.stderr)
         self.assertFalse((self.root / "opt/jepsen/bin/nightly.sh").exists())
+
+    def test_a_75_from_the_checkout_step_is_not_a_night_running(self):
+        done, _ = self.setup(token=True, git75=True)
+        self.assertEqual(done.returncode, 1, done.stderr)
+        self.assertNotIn("a night is running", done.stderr)
+        self.assertFalse((self.root / "opt/jepsen/bin/nightly.sh").exists())
+
+    def test_the_runner_installed_is_the_copy_that_was_tested(self):
+        # The test run changes the checkout's nightly.sh (a night moving it to the tip).
+        done, _ = self.setup(token=True)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("# changed", (self.root / "nightly.sh").read_text())
+        installed = (self.root / "opt/jepsen/bin/nightly.sh").read_text()
+        self.assertEqual(installed, (HERE / "nightly.sh").read_text())
 
     def test_a_timer_already_enabled_is_disabled_when_there_is_no_token(self):
         done, calls = self.setup(token=False, enabled=True)

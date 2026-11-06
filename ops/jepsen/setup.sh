@@ -69,6 +69,15 @@ fi
 [ -f /etc/jepsen/token ] || install -m 600 /dev/null /etc/jepsen/token
 [ -f /etc/jepsen/jepsen.env ] || cp "$SCRIPT_DIR/jepsen.env.example" /etc/jepsen/jepsen.env
 
+# The reporter's tests run as jepsen from a copy it can read: the checkout setup.sh is run in may
+# be under /root, or made with a umask that hides it. The copy is made before the checkout step
+# and is what is tested and installed below, so the commit installed is the commit tested (P240).
+STAGE=$(mktemp -d)
+trap 'rm -rf "$STAGE"' EXIT
+cp -R "$SCRIPT_DIR/." "$STAGE"
+chmod -R a+rX "$STAGE"
+chmod 755 "$STAGE"
+
 # The checkout is the code under test (the build and tests/jepsen); the night moves it to the
 # tip of main itself. The runner is not in it: it is installed below. The checkout is only moved
 # under the night's own lock: a night mid-build keeps the commit it started with, so this refuses
@@ -79,12 +88,14 @@ LOCK=$HOME_DIR/nightly.lock
 [ -e "$LOCK" ] || runuser -u jepsen -- touch "$LOCK"
 # The toolchain and Leiningen (tests/jepsen/tools.sh, sha256 pinned) are fetched now, so a broken
 # host shows today and not at 01:17.
+# Any failure inside is mapped to 1, so the 75 is only flock's: a night holds the lock.
 status=0
-flock -n -o -E 75 "$LOCK" runuser -u jepsen -- env HOME="$HOME_DIR" sh -c "
+# shellcheck disable=SC2016 # the scripts are run by the shells it starts, not expanded here
+flock -n -o -E 75 "$LOCK" runuser -u jepsen -- env HOME="$HOME_DIR" sh -c 'sh -c "$0" _ "$1" || exit 1' '
     set -e
-    [ -d '$CHECKOUT/.git' ] || git clone --quiet https://github.com/NervaLog/nerva.git '$CHECKOUT'
-    cd '$CHECKOUT' && git fetch --quiet origin main && git checkout --quiet --detach FETCH_HEAD &&
-        ./zig/download.sh && tests/jepsen/tools.sh >/dev/null" || status=$?
+    [ -d "$1/.git" ] || git clone --quiet https://github.com/NervaLog/nerva.git "$1"
+    cd "$1" && git fetch --quiet origin main && git checkout --quiet --detach FETCH_HEAD &&
+        ./zig/download.sh && tests/jepsen/tools.sh >/dev/null' "$CHECKOUT" || status=$?
 if [ "$status" -eq 75 ]; then
     echo "setup.sh: a night is running (it holds $LOCK); nothing was changed from the" \
         "checkout step on. Run setup.sh again when it ends (journalctl -u jepsen -f)" >&2
@@ -93,13 +104,7 @@ elif [ "$status" -ne 0 ]; then
     exit "$status"
 fi
 
-# The reporter's tests run as jepsen from a copy it can read: the checkout setup.sh is run in may
-# be under /root, or made with a umask that hides it. The copy is what is installed below.
-STAGE=$(mktemp -d)
-trap 'rm -rf "$STAGE"' EXIT
-cp -R "$SCRIPT_DIR/." "$STAGE"
-chmod -R a+rX "$STAGE"
-chmod 755 "$STAGE"
+# The reporter's tests, on the copy that is installed.
 runuser -u jepsen -- env HOME="$HOME_DIR" python3 -I "$STAGE/test_jepsen_report.py"
 
 # The runner: root-owned, readable by jepsen, and under /opt, which the unit sees read-only. The
@@ -109,11 +114,11 @@ install -d -m 755 /opt/jepsen "$BIN_DIR"
 for file in nightly.sh jepsen_report.py; do
     mode=644
     [ "$file" != nightly.sh ] || mode=755
-    install -m "$mode" "$SCRIPT_DIR/$file" "$BIN_DIR/.$file.new"
+    install -m "$mode" "$STAGE/$file" "$BIN_DIR/.$file.new"
     mv -f "$BIN_DIR/.$file.new" "$BIN_DIR/$file"
 done
-install -m 644 "$SCRIPT_DIR/jepsen.service" /etc/systemd/system/jepsen.service
-install -m 644 "$SCRIPT_DIR/jepsen.timer" /etc/systemd/system/jepsen.timer
+install -m 644 "$STAGE/jepsen.service" /etc/systemd/system/jepsen.service
+install -m 644 "$STAGE/jepsen.timer" /etc/systemd/system/jepsen.timer
 systemctl daemon-reload
 # A timer enabled with no token runs a whole night that cannot report: enable it only with one.
 if [ -s /etc/jepsen/token ]; then
