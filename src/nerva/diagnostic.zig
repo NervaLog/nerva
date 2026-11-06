@@ -138,48 +138,152 @@ pub fn render(
 }
 
 /// A file this run created that must not outlive a failed startup: `start --trace` (#197). One
-/// path, the identity of the file it was created as, and the path's bytes. One thread.
-var cleanup_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+/// path, the identity of the file it was created as, and the path's bytes. One thread. The buffer
+/// has a byte past the longest path, always 0, so a signal handler can pass it to `unlink`.
+const cleanup_path_buffer_size = std.fs.max_path_bytes + 1;
+var cleanup_path_buffer: [cleanup_path_buffer_size]u8 = [_]u8{0} ** cleanup_path_buffer_size;
 var cleanup_path_length: usize = 0;
 var cleanup_inode: std.posix.ino_t = 0;
 var cleanup_device: std.posix.dev_t = 0;
 
+/// SIGINT and SIGTERM, while a file is registered (P208).
+const cleanup_signals = [_]u6{ std.posix.SIG.INT, std.posix.SIG.TERM };
+/// What each signal did before `cleanup_register`; restored by `cleanup_clear`. A signal that was
+/// ignored (a shell's `&`, `nohup`) gets no handler, so that it stays ignored.
+var cleanup_signal_saved: [cleanup_signals.len]std.posix.Sigaction = undefined;
+var cleanup_signal_installed: [cleanup_signals.len]bool = [_]bool{false} ** cleanup_signals.len;
+/// Set by the first panic, so a panic inside the cleanup does not run it again (P208).
+var cleanup_panicking: bool = false;
+
 /// Records `path`, which `file` was just created at, to be removed if the command exits through
-/// `fail`, `fail_file`, `unexpected` or `fail_error` (every coded exit through this module) before
-/// `cleanup_clear`. Exits that do not pass through here leave the file: vendored `vsr.fatal` exits
-/// (NRV-E0707, for example), panics, and signals during `replica.open`.
+/// `fail`, `fail_file`, `unexpected` or `fail_error` (every coded exit through this module), a
+/// panic (`panic`), or SIGINT or SIGTERM, before `cleanup_clear`. A vendored `vsr.fatal` exit
+/// (NRV-E0707, for example) leaves the file (#206, option 2).
 pub fn cleanup_register(path: []const u8, file: std.fs.File) void {
     assert(cleanup_path_length == 0);
-    assert(path.len > 0 and path.len <= cleanup_path_buffer.len);
+    assert(path.len > 0 and path.len <= std.fs.max_path_bytes);
     const stat = std.posix.fstat(file.handle) catch |err| {
         std.fs.cwd().deleteFile(path) catch {};
         fail_file(path, err);
     };
     @memcpy(cleanup_path_buffer[0..path.len], path);
-    cleanup_path_length = path.len;
+    cleanup_path_buffer[path.len] = 0;
     cleanup_inode = stat.ino;
     cleanup_device = stat.dev;
+    cleanup_path_length = path.len;
+    cleanup_signals_install();
 }
 
 /// The command got past startup: the file is the operator's now.
 pub fn cleanup_clear() void {
+    // Registration first: a signal between the two steps must not unlink the operator's file.
     cleanup_path_length = 0;
+    cleanup_signals_restore();
+}
+
+fn cleanup_signals_install() void {
+    const action: std.posix.Sigaction = .{
+        .handler = .{ .handler = cleanup_signal_handler },
+        // Neither signal interrupts the other's handler.
+        .mask = cleanup_signal_mask(),
+        .flags = 0,
+    };
+    for (cleanup_signals, 0..) |signal, index| {
+        if (cleanup_signal_installed[index]) continue;
+        std.posix.sigaction(signal, null, &cleanup_signal_saved[index]);
+        if (cleanup_signal_saved[index].handler.handler == std.posix.SIG.IGN) continue;
+        std.posix.sigaction(signal, &action, null);
+        cleanup_signal_installed[index] = true;
+    }
+}
+
+fn cleanup_signals_restore() void {
+    for (cleanup_signals, 0..) |signal, index| {
+        if (!cleanup_signal_installed[index]) continue;
+        std.posix.sigaction(signal, &cleanup_signal_saved[index], null);
+        cleanup_signal_installed[index] = false;
+    }
+}
+
+fn cleanup_signal_mask() std.posix.sigset_t {
+    var mask = std.posix.empty_sigset;
+    for (cleanup_signals) |signal| std.os.linux.sigaddset(&mask, signal);
+    return mask;
+}
+
+/// Async-signal-safe: system calls on the fixed buffer only, no allocation, no logging, no error
+/// reporting. Removes the registered file if it is still the one this run created. Returns whether
+/// it unlinked. Does not clear the registration: the command is about to die.
+fn cleanup_unlink_raw() bool {
+    const length = cleanup_path_length;
+    if (length == 0) return false;
+    const path: [*:0]const u8 = @ptrCast(&cleanup_path_buffer);
+    assert(cleanup_path_buffer[length] == 0);
+    var stat: std.os.linux.Stat = undefined;
+    const AT = std.os.linux.AT;
+    const stat_result = std.os.linux.fstatat(AT.FDCWD, path, &stat, AT.SYMLINK_NOFOLLOW);
+    if (std.os.linux.E.init(stat_result) != .SUCCESS) return false;
+    if (stat.ino != cleanup_inode or stat.dev != cleanup_device) return false;
+    return std.os.linux.E.init(std.os.linux.unlink(path)) == .SUCCESS;
+}
+
+/// SIGINT or SIGTERM while the trace file is registered (P208): remove it, then die of the same
+/// signal, so the exit status still says so. Async-signal-safe (`cleanup_unlink_raw`, `sigaction`,
+/// `raise`). The signal is blocked until the handler returns, so the re-raised default action
+/// runs then.
+fn cleanup_signal_handler(signal: i32) callconv(.c) void {
+    _ = cleanup_unlink_raw();
+    const default: std.posix.Sigaction = .{
+        .handler = .{ .handler = std.posix.SIG.DFL },
+        .mask = std.posix.empty_sigset,
+        .flags = 0,
+    };
+    std.posix.sigaction(@intCast(signal), &default, null);
+    std.posix.raise(@intCast(signal)) catch {};
+}
+
+/// Whether this is the first panic: only the first runs the cleanup (P208).
+fn cleanup_panic_enter() bool {
+    if (cleanup_panicking) return false;
+    cleanup_panicking = true;
+    return true;
+}
+
+/// The program's panic handler (P208): removes the registered file, then the default handler
+/// prints the message and the stack trace as it would have. A panic inside the cleanup, or any
+/// later one, goes straight to the default handler.
+pub fn panic(message: []const u8, first_trace_addr: ?usize) noreturn {
+    if (cleanup_panic_enter()) cleanup_run();
+    std.debug.defaultPanic(message, first_trace_addr);
 }
 
 /// Removes the registered file, unless something else has taken its path since (another inode),
 /// in which case it is not ours to remove. The guard is check-then-act, not atomic: a file put at
 /// the path between the check and the unlink is still removed (Linux has no unlink-if-inode). A
-/// removal that fails is NRV-W0011.
+/// removal that fails is NRV-W0011. The registration stays until the removal is done, so a signal
+/// that interrupts it still removes the file.
 fn cleanup_run() void {
     if (cleanup_path_length == 0) return;
+    defer cleanup_path_length = 0;
+    if (cleanup_remove()) |err| cleanup_warn(cleanup_path_buffer[0..cleanup_path_length], err);
+}
+
+/// The decision of `cleanup_run`, apart from its logging: removes the registered file if it is
+/// ours, and returns the error that makes it NRV-W0011, or null when the file is gone or not ours.
+fn cleanup_remove() ?anyerror {
+    assert(cleanup_path_length > 0);
     const path = cleanup_path_buffer[0..cleanup_path_length];
-    cleanup_path_length = 0;
-    const stat = std.posix.fstatat(std.posix.AT.FDCWD, path, std.posix.AT.SYMLINK_NOFOLLOW) catch |err| switch (err) {
-        error.FileNotFound => return, // Already gone.
-        else => return cleanup_warn(path, err),
+    const stat = std.posix.fstatat(
+        std.posix.AT.FDCWD,
+        path,
+        std.posix.AT.SYMLINK_NOFOLLOW,
+    ) catch |err| switch (err) {
+        error.FileNotFound => return null, // Already gone.
+        else => return err,
     };
-    if (stat.ino != cleanup_inode or stat.dev != cleanup_device) return;
-    std.fs.cwd().deleteFile(path) catch |err| cleanup_warn(path, err);
+    if (stat.ino != cleanup_inode or stat.dev != cleanup_device) return null;
+    std.fs.cwd().deleteFile(path) catch |err| return err;
+    return null;
 }
 
 fn cleanup_warn(path: []const u8, err: anyerror) void {
@@ -202,6 +306,7 @@ fn cleanup_reason(err: anyerror) []const u8 {
         error.NameTooLong,
         error.ReadOnlyFileSystem,
         => file_reason(err),
+        error.SymLinkLoop => "a symbolic link in its path loops",
         else => "the system refused",
     };
 }
@@ -342,29 +447,34 @@ test "cleanup removes the file it registered and only that file" {
 
     const file = try std.fs.cwd().createFile(path, .{ .exclusive = true });
     cleanup_register(path, file);
+    defer cleanup_clear();
     file.close();
+    try testing.expectEqual(@as(?anyerror, null), cleanup_remove());
     cleanup_run();
     try testing.expectError(error.FileNotFound, tmp.dir.access("trace", .{}));
 
     // The path now names a different file: not ours, so it stays.
     const first = try std.fs.cwd().createFile(path, .{ .exclusive = true });
     cleanup_register(path, first);
+    defer cleanup_clear();
     try tmp.dir.deleteFile("trace");
     (try tmp.dir.createFile("trace", .{})).close();
     first.close();
+    try testing.expectEqual(@as(?anyerror, null), cleanup_remove());
     cleanup_run();
     try tmp.dir.access("trace", .{});
 
     // Cleared: nothing is removed.
     const third = try std.fs.cwd().createFile(path, .{ .truncate = false });
     cleanup_register(path, third);
+    defer cleanup_clear();
     third.close();
     cleanup_clear();
     cleanup_run();
     try tmp.dir.access("trace", .{});
 }
 
-test "cleanup warns and leaves the file when a parent became a regular file" {
+test "cleanup: a parent that became a file is not an error, a path that cannot be removed is" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -375,14 +485,43 @@ test "cleanup warns and leaves the file when a parent became a regular file" {
     try tmp.dir.makeDir("d");
     const file = try std.fs.cwd().createFile(path, .{ .exclusive = true });
     cleanup_register(path, file);
+    defer cleanup_clear();
     file.close();
     try tmp.dir.rename("d", "d2");
     (try tmp.dir.createFile("d", .{})).close();
-    // fstatat returns NotDir: NRV-W0011, and the file at its new place is untouched.
+    // `fstatat` answers FileNotFound for NotDir: gone from where we put it, nothing to warn about,
+    // and the file at its new place is untouched.
+    try testing.expectEqual(@as(?anyerror, null), cleanup_remove());
     cleanup_run();
     try tmp.dir.access("d2/trace", .{});
     try testing.expectEqual(@as(usize, 0), cleanup_path_length);
-    try testing.expectEqualStrings("a parent of it is not a directory", cleanup_reason(error.NotDir));
+
+    // The warning's own case, which holds for root too: the registered identity is a directory's,
+    // so the check passes and `unlink` refuses it.
+    const path_dir = try std.fmt.bufPrint(&path_buffer, "{s}/d2", .{dir});
+    var directory = try tmp.dir.openDir("d2", .{});
+    defer directory.close();
+    cleanup_register(path_dir, .{ .handle = directory.fd });
+    try testing.expectEqual(@as(?anyerror, error.IsDir), cleanup_remove());
+    cleanup_run();
+    try tmp.dir.access("d2/trace", .{});
+    cleanup_clear();
+
+    // And the check's own: a symbolic link that points at itself, as a parent of the path.
+    try tmp.dir.symLink("loop", "loop", .{});
+    const path_loop = try std.fmt.bufPrint(&path_buffer, "{s}/loop/trace", .{dir});
+    cleanup_register(path_loop, .{ .handle = directory.fd });
+    try testing.expectEqual(@as(?anyerror, error.SymLinkLoop), cleanup_remove());
+    cleanup_run();
+    try testing.expectEqualStrings("it is a directory", cleanup_reason(error.IsDir));
+    try testing.expectEqualStrings(
+        "a parent of it is not a directory",
+        cleanup_reason(error.NotDir),
+    );
+    try testing.expectEqualStrings(
+        "a symbolic link in its path loops",
+        cleanup_reason(error.SymLinkLoop),
+    );
     try testing.expectEqualStrings("the system refused", cleanup_reason(error.FileBusy));
 }
 
@@ -471,4 +610,163 @@ test "diagnostic: the table agrees with docs/ERRORS.md" {
         const summary_end = std.mem.indexOfPos(u8, text, summary_start, " | ").?;
         try testing.expectEqualStrings(candidate.summary, text[summary_start..summary_end]);
     }
+}
+
+test "cleanup: the panic guard lets only the first panic run the cleanup" {
+    cleanup_panicking = false;
+    defer cleanup_panicking = false;
+    try testing.expect(cleanup_panic_enter());
+    try testing.expect(!cleanup_panic_enter());
+    try testing.expect(!cleanup_panic_enter());
+}
+
+test "cleanup: the signal path unlinks by the fixed buffer, and only our file" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = try tmp.dir.realpath(".", &buffer);
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, "{s}/trace", .{dir});
+
+    // Nothing registered: nothing happens, whatever is at the path.
+    cleanup_clear();
+    try testing.expect(!cleanup_unlink_raw());
+
+    const file = try std.fs.cwd().createFile(path, .{ .exclusive = true });
+    cleanup_register(path, file);
+    defer cleanup_clear();
+    file.close();
+    try testing.expectEqual(@as(u8, 0), cleanup_path_buffer[path.len]);
+    try testing.expect(cleanup_unlink_raw());
+    try testing.expectError(error.FileNotFound, tmp.dir.access("trace", .{}));
+    try testing.expect(!cleanup_unlink_raw()); // Already gone.
+
+    // Another file at the path is not ours.
+    cleanup_clear();
+    const first = try std.fs.cwd().createFile(path, .{ .exclusive = true });
+    cleanup_register(path, first);
+    defer cleanup_clear();
+    try tmp.dir.deleteFile("trace");
+    (try tmp.dir.createFile("trace", .{})).close();
+    first.close();
+    try testing.expect(!cleanup_unlink_raw());
+    try tmp.dir.access("trace", .{});
+    cleanup_clear();
+}
+
+/// How long the parent waits for a forked test child: a child that spins or deadlocks is killed
+/// and the test fails, instead of hanging and leaking a process.
+const cleanup_child_wait_ms_max = 10_000;
+const cleanup_child_poll_ms = 10;
+
+/// In the forked child: take the signals the test relies on out of whatever the test binary
+/// inherited (ignored, blocked), and silence stderr (the panic test prints a trace).
+fn cleanup_child_prepare() void {
+    var default = std.mem.zeroes(std.posix.Sigaction);
+    default.handler.handler = std.posix.SIG.DFL;
+    var mask = std.posix.empty_sigset;
+    const signals = [_]u6{ std.posix.SIG.INT, std.posix.SIG.TERM };
+    for (signals) |signal| {
+        std.posix.sigaction(signal, &default, null);
+        std.os.linux.sigaddset(&mask, signal);
+    }
+    std.posix.sigprocmask(std.posix.SIG.UNBLOCK, &mask, null);
+    const null_fd = std.posix.open("/dev/null", .{ .ACCMODE = .WRONLY }, 0) catch std.posix.exit(3);
+    std.posix.dup2(null_fd, std.posix.STDERR_FILENO) catch std.posix.exit(3);
+}
+
+/// Forks a child that registers `trace` in `dir`, then runs `act`; returns how the child ended.
+fn cleanup_child(dir: std.fs.Dir, comptime act: fn () void) !u32 {
+    const pid = try std.posix.fork();
+    if (pid == 0) {
+        cleanup_child_prepare();
+        const file = dir.createFile("trace", .{ .exclusive = true }) catch std.posix.exit(3);
+        var buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const path = dir.realpath("trace", &buffer) catch std.posix.exit(3);
+        cleanup_register(path, file);
+        act();
+        std.posix.exit(4); // Not reached: `act` must kill the process.
+    }
+    var waited_ms: u64 = 0;
+    while (waited_ms < cleanup_child_wait_ms_max) : (waited_ms += cleanup_child_poll_ms) {
+        const result = std.posix.waitpid(pid, std.posix.W.NOHANG);
+        if (result.pid == pid) return result.status;
+        assert(result.pid == 0);
+        std.Thread.sleep(cleanup_child_poll_ms * std.time.ns_per_ms);
+    }
+    std.posix.kill(pid, std.posix.SIG.KILL) catch {};
+    _ = std.posix.waitpid(pid, 0);
+    return error.ChildDidNotEnd;
+}
+
+fn cleanup_child_term() void {
+    std.posix.raise(std.posix.SIG.TERM) catch {};
+}
+
+fn cleanup_child_int() void {
+    std.posix.raise(std.posix.SIG.INT) catch {};
+}
+
+fn cleanup_child_panic() void {
+    panic("cleanup test panic", null);
+}
+
+test "cleanup: SIGTERM and SIGINT remove the file and still kill the process" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const term = try cleanup_child(tmp.dir, cleanup_child_term);
+    try testing.expect(std.posix.W.IFSIGNALED(term));
+    try testing.expectEqual(@as(u32, std.posix.SIG.TERM), std.posix.W.TERMSIG(term));
+    try testing.expectError(error.FileNotFound, tmp.dir.access("trace", .{}));
+
+    const interrupt = try cleanup_child(tmp.dir, cleanup_child_int);
+    try testing.expect(std.posix.W.IFSIGNALED(interrupt));
+    try testing.expectEqual(@as(u32, std.posix.SIG.INT), std.posix.W.TERMSIG(interrupt));
+    try testing.expectError(error.FileNotFound, tmp.dir.access("trace", .{}));
+}
+
+test "cleanup: a panic removes the file and still ends the process abnormally" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const status = try cleanup_child(tmp.dir, cleanup_child_panic);
+    try testing.expect(std.posix.W.IFSIGNALED(status));
+    try testing.expectEqual(@as(u32, std.posix.SIG.ABRT), std.posix.W.TERMSIG(status));
+    try testing.expectError(error.FileNotFound, tmp.dir.access("trace", .{}));
+}
+
+test "cleanup: handlers are installed while registered and restored after" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = try tmp.dir.realpath(".", &buffer);
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, "{s}/trace", .{dir});
+
+    cleanup_clear();
+    // SIGINT ignored beforehand stays ignored; SIGTERM is taken over and given back.
+    var ignore = std.mem.zeroes(std.posix.Sigaction);
+    ignore.handler.handler = std.posix.SIG.IGN;
+    var before_int: std.posix.Sigaction = undefined;
+    var before_term: std.posix.Sigaction = undefined;
+    std.posix.sigaction(std.posix.SIG.INT, &ignore, &before_int);
+    std.posix.sigaction(std.posix.SIG.TERM, null, &before_term);
+    defer std.posix.sigaction(std.posix.SIG.INT, &before_int, null);
+
+    const file = try std.fs.cwd().createFile(path, .{ .exclusive = true });
+    cleanup_register(path, file);
+    defer cleanup_clear();
+    file.close();
+    var now: std.posix.Sigaction = undefined;
+    std.posix.sigaction(std.posix.SIG.TERM, null, &now);
+    try testing.expectEqual(@intFromPtr(&cleanup_signal_handler), @intFromPtr(now.handler.handler));
+    std.posix.sigaction(std.posix.SIG.INT, null, &now);
+    try testing.expectEqual(@intFromPtr(std.posix.SIG.IGN), @intFromPtr(now.handler.handler));
+
+    cleanup_clear();
+    std.posix.sigaction(std.posix.SIG.TERM, null, &now);
+    try testing.expectEqual(
+        @intFromPtr(before_term.handler.handler),
+        @intFromPtr(now.handler.handler),
+    );
+    try tmp.dir.deleteFile("trace");
 }
