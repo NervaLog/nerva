@@ -41,6 +41,10 @@ const data_file_size_min = @import("vsr/superblock.zig").data_file_size_min;
 
 const MiB = stdx.MiB;
 
+/// False only in the test build `-Dtest-commit-keys=off` (R1): `start` then lets a resent key
+/// commit again. Set by `build.zig` for this binary alone; the state machine's default is true.
+const commit_keys_deduplicate = @import("nerva_options").commit_keys_deduplicate;
+
 /// The runtime maximum log level: `.info`, or `.debug` with `--log-debug`.
 pub var log_level_runtime: std.log.Level = .info;
 
@@ -90,7 +94,10 @@ fn run() !void {
     diagnostic.command = @tagName(command);
     switch (command) {
         .version => {
-            try std.io.getStdOut().writer().print("Nerva version {}\n", .{constants.semver});
+            try std.io.getStdOut().writer().print("Nerva version {}{s}\n", .{
+                constants.semver,
+                if (commit_keys_deduplicate) "" else "+keys-off",
+            });
             return;
         },
         .view => |*args| {
@@ -138,6 +145,20 @@ fn run() !void {
             // Operator input never reaches a vendored panic: check the kernel, and for `start`
             // the data file, before the vendored open (R5, P149).
             preflight.kernel_check();
+            // A build that lets a resent key commit again is a test's (R1): nothing opens
+            // without `--development`, and the warning comes before the data file is opened.
+            if (tag == .start and !commit_keys_deduplicate) {
+                if (!args.development) diagnostic.fail(
+                    "NRV-E0717",
+                    "start: this build has commit-key deduplication off " ++
+                        "(-Dtest-commit-keys=off); it runs only with --development",
+                    .{},
+                    "start a release build, or pass --development in a test",
+                    .{},
+                );
+                log.warn("NRV-W0701 start: commit-key deduplication is off: " ++
+                    "a resent key commits again", .{});
+            }
             if (tag == .start) preflight.start(gpa, args.path, if (!constants.direct_io)
                 .disabled
             else if (args.development)
@@ -738,6 +759,7 @@ fn command_start(
             .lsm_forest_compaction_block_count = args.lsm_forest_compaction_block_count,
             .lsm_forest_node_count = args.lsm_forest_node_count,
             .cache_entries_rows = args.cache_rows_count,
+            .commit_keys_deduplicate = commit_keys_deduplicate,
         },
         .message_bus_options = .{
             .configuration = args.addresses.slice(),

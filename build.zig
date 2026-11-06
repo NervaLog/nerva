@@ -7,6 +7,7 @@ const Query = std.Target.Query;
 
 const VoprStateMachine = enum { nerva, testing };
 const VoprLog = enum { short, full };
+const TestCommitKeys = enum { on, off };
 
 // Nerva has no client releases yet; every build is "the" release.
 // 0.0.5: data files record the export they were imported from, and pings and pongs carry it
@@ -126,6 +127,12 @@ pub fn build(b: *std.Build) !void {
             "vopr-log",
             "Log only state transitions (short) or everything (full).",
         ) orelse .short,
+        .test_commit_keys = b.option(
+            TestCommitKeys,
+            "test-commit-keys",
+            "off: a test `nerva` that commits a resent key again; it starts only with " ++
+                "--development (R1)",
+        ) orelse .on,
         .print_exe = b.option(
             bool,
             "print-exe",
@@ -179,8 +186,18 @@ pub fn build(b: *std.Build) !void {
         .vsr_options = vsr_options,
         .target = target,
         .mode = mode,
+        .commit_keys_deduplicate = options.test_commit_keys == .on,
     });
     b.installArtifact(nerva);
+    // The same build with deduplication off, for `tests/errors/commands.py` (R1). Never
+    // installed; when `-Dtest-commit-keys=off`, `nerva` itself is that build.
+    const nerva_keys_off = nerva_executable(b, .{
+        .stdx_module = stdx_module,
+        .vsr_options = vsr_options,
+        .target = target,
+        .mode = mode,
+        .commit_keys_deduplicate = false,
+    });
     const nerva_run = b.addRunArtifact(nerva);
     if (b.args) |args| nerva_run.addArgs(args);
     steps.run.dependOn(&nerva_run.step);
@@ -320,6 +337,7 @@ pub fn build(b: *std.Build) !void {
     // The coded failures of every command, from the real binary (R5, P147c).
     const run_errors_test = b.addSystemCommand(&.{ "python3", "tests/errors/commands.py" });
     run_errors_test.addFileArg(nerva.getEmittedBin());
+    run_errors_test.addFileArg(nerva_keys_off.getEmittedBin());
     run_errors_test.setCwd(b.path("."));
     run_errors_test.has_side_effects = true;
     run_errors_test.step.dependOn(&run_integration_tests.step);
@@ -533,6 +551,7 @@ fn nerva_executable(b: *std.Build, options: struct {
     vsr_options: *std.Build.Step.Options,
     target: std.Build.ResolvedTarget,
     mode: std.builtin.OptimizeMode,
+    commit_keys_deduplicate: bool = true,
 }) *std.Build.Step.Compile {
     const nerva = b.addExecutable(.{
         .name = "nerva",
@@ -548,6 +567,10 @@ fn nerva_executable(b: *std.Build, options: struct {
         b.createModule(.{ .root_source_file = b.path("src/abi.zig") }),
     );
     nerva.root_module.addOptions("vsr_options", options.vsr_options);
+    // Only this binary's `start` can turn commit-key deduplication off (R1).
+    const nerva_options = b.addOptions();
+    nerva_options.addOption(bool, "commit_keys_deduplicate", options.commit_keys_deduplicate);
+    nerva.root_module.addOptions("nerva_options", nerva_options);
     // Keep stack traces in release builds.
     nerva.root_module.omit_frame_pointer = false;
     return nerva;

@@ -147,6 +147,10 @@ pub fn StateMachineType(comptime Storage: type) type {
                 RecordsGroove.ObjectsCache.Cache.value_count_max_multiple,
             cache_entries_index_entries: u32 =
                 IndexEntriesGroove.ObjectsCache.Cache.value_count_max_multiple,
+            /// False only in a test build (`-Dtest-commit-keys=off`, R1): a key's row is then
+            /// treated as absent, so a resent key commits again and its put overwrites the row.
+            /// Nothing else changes: the data file, the row and the wire are the same.
+            commit_keys_deduplicate: bool = true,
         };
 
         /// The row cache holds a multiple of this many rows (its set size), and at least one.
@@ -598,6 +602,8 @@ pub fn StateMachineType(comptime Storage: type) type {
         /// `groups_per_op_max` for this `batch_size_limit`: the distinct groups an op may write,
         /// and the rows a pulse backfills (N52).
         group_writes_limit: u32,
+        /// `Options.commit_keys_deduplicate`: false only in a test build.
+        commit_keys_deduplicate: bool,
         forest: Forest,
 
         prefetch_timestamp: u64 = 0,
@@ -799,6 +805,7 @@ pub fn StateMachineType(comptime Storage: type) type {
             self.* = .{
                 .batch_size_limit = options.batch_size_limit,
                 .group_writes_limit = groups_limit,
+                .commit_keys_deduplicate = options.commit_keys_deduplicate,
                 .member_writes_limit = members_limit,
                 .index_entry_writes_limit = index_entries_limit,
                 .index_scan_entries = undefined,
@@ -1064,6 +1071,7 @@ pub fn StateMachineType(comptime Storage: type) type {
             self.* = .{
                 .batch_size_limit = self.batch_size_limit,
                 .group_writes_limit = self.group_writes_limit,
+                .commit_keys_deduplicate = self.commit_keys_deduplicate,
                 .forest = self.forest,
                 .changes_scan_buffer = self.changes_scan_buffer,
                 .record_changes_scan_buffer = self.record_changes_scan_buffer,
@@ -2962,6 +2970,7 @@ pub fn StateMachineType(comptime Storage: type) type {
         /// `commit_key_put`, once each, so the row's op is the op its transaction committed at.
         fn commit_key_failure(self: *StateMachine, entries: []const WideEntry) ?Failure {
             if (entries.len == 0 or entries[0].kind != .key) return null;
+            if (!self.commit_keys_deduplicate) return null;
             // An invalid key entry is reported by the static checks.
             if (nerva.wide_entry_validate(&entries[0]) != null) return null;
             const row = switch (self.forest.grooves.rows.get(commit_key_row(&entries[0]))) {
@@ -3005,7 +3014,9 @@ pub fn StateMachineType(comptime Storage: type) type {
                 .value = @splat(0),
             };
             entry.value[0..nerva.value_size].* = std.mem.toBytes(stored);
-            assert(self.row_version(commit_key_row(&entries[0])) == 0);
+            // Without deduplication (a test build) the row may be there: the put overwrites it.
+            assert(!self.commit_keys_deduplicate or
+                self.row_version(commit_key_row(&entries[0])) == 0);
             self.row_put(op, timestamp, &entry, entry.row_value());
         }
 
@@ -3551,7 +3562,7 @@ pub fn StateMachineType(comptime Storage: type) type {
             self.view_txn_keys.clearRetainingCapacity();
             self.view_txn_members.clearRetainingCapacity();
             // A transaction whose key's row exists writes nothing (`commit_key_failure`).
-            if (entries.len > 0 and entries[0].kind == .key and
+            if (self.commit_keys_deduplicate and entries.len > 0 and entries[0].kind == .key and
                 self.forest.grooves.rows.get(commit_key_row(&entries[0])) == .found_object)
             {
                 return .fits;

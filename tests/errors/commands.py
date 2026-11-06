@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Every coded failure a `nerva` command can report, from the real binary (R5, P147c).
 
-Usage: commands.py <nerva>
+Usage: commands.py <nerva> [<nerva built with -Dtest-commit-keys=off>]
 
 For each code a command emits (docs/ERRORS.md, 00xx, 06xx, 08xx, 09xx), triggers it and checks
 the first line (`error[NRV-…]: …`), the `cause` and `fix` lines, the exit status, and that no
@@ -62,10 +62,11 @@ def expect(result, code, status, text, label):
 
 def main():
     nerva = os.path.abspath(sys.argv[1])
+    nerva_off = os.path.abspath(sys.argv[2]) if len(sys.argv) > 2 else None
     tmp = tempfile.mkdtemp(prefix="nerva-errors-")
     seen = []
 
-    def check(label, argv, code, status, text, env=None, timeout=120):
+    def check(label, argv, code, status, text, env=None, timeout=120, nerva=nerva):
         seen.append(expect(run(nerva, argv, env, timeout), code, status, text, label))
 
     try:
@@ -176,6 +177,42 @@ def main():
             fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
             check("start locked file", start + [data], "NRV-E0703", 1, "another process holds")
         assert sha(data) == before
+
+        # The test build with commit-key deduplication off (R1): E0717 without --development,
+        # W0701 before the data file is opened with it, `+keys-off` in `version`; a release
+        # build has none of the three.
+        version = run(nerva, ["version"])
+        assert version.returncode == 0 and "keys-off" not in version.stdout, version.stdout
+        if nerva_off:
+            version_off = run(nerva_off, ["version"])
+            assert version_off.returncode == 0 and \
+                version_off.stdout.strip().endswith("+keys-off"), version_off.stdout
+            before = sha(data)
+            check("start keys off without development",
+                  ["start", "--addresses=127.0.0.1:1,127.0.0.1:2,127.0.0.1:3", data],
+                  "NRV-E0717", 1, "commit-key deduplication off", nerva=nerva_off)
+            assert sha(data) == before
+            assert "-Dtest-commit-keys=off" in run(
+                nerva_off, ["start", "--addresses=127.0.0.1:1,127.0.0.1:2,127.0.0.1:3", data]
+            ).stderr
+            for binary, warnings in ((nerva_off, 1), (nerva, 0)):
+                one = os.path.join(tmp, f"one-{warnings}.nerva")
+                assert run(binary, ["format", "--cluster=0", "--replica=0", "--replica-count=1",
+                                    "--development", one]).returncode == 0
+                process = subprocess.Popen(
+                    [binary, "start", "--addresses=0", "--development", one],
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    text=True)
+                try:
+                    assert int(process.stdout.readline()) > 0, warnings
+                finally:
+                    process.kill()
+                    stderr = process.communicate()[1]
+                assert stderr.count("NRV-W0701") == warnings, (warnings, stderr)
+                assert stderr.count("a resent key commits again") == warnings, stderr
+                assert not diagnostic_lines(subprocess.CompletedProcess([], 0, "", stderr)), \
+                    stderr
+            seen.append("NRV-W0701")
 
         # import
         junk = os.path.join(tmp, "junk")
