@@ -78,7 +78,13 @@ runuser -u jepsen -- env HOME="$HOME_DIR" sh -c "cd '$CHECKOUT' && git fetch --q
 cp "$CHECKOUT/ops/jepsen/jepsen.service" /etc/systemd/system/jepsen.service
 cp "$CHECKOUT/ops/jepsen/jepsen.timer" /etc/systemd/system/jepsen.timer
 systemctl daemon-reload
-systemctl enable jepsen.timer
+# A timer enabled with no token runs a whole night that cannot report: enable it only with one.
+if [ -s /etc/jepsen/token ]; then
+    systemctl enable jepsen.timer
+else
+    echo "jepsen: no token installed, so the timer is not enabled; put the token in" \
+        "/etc/jepsen/token (README.md), then: systemctl enable --now jepsen.timer" >&2
+fi
 
 # Keep the journal from filling the disk (the fleet's drop-in sets the same value).
 mkdir -p /etc/systemd/journald.conf.d
@@ -89,7 +95,4 @@ if [ -s /etc/jepsen/token ]; then
     systemctl start jepsen.timer
     echo "jepsen: the timer is on (01:17 UTC); systemctl list-timers jepsen.timer"
     echo "jepsen: to run a night now: systemctl start jepsen.service; journalctl -u jepsen -f"
-else
-    echo "jepsen: installed, not started. Put the token in /etc/jepsen/token (README.md)," >&2
-    echo "then: systemctl start jepsen.timer" >&2
 fi

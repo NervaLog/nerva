@@ -159,6 +159,19 @@ class Statuses(unittest.TestCase):
         github, _, _ = night(self, blind, canary=True)
         self.assertEqual(github.statuses[0][1], "failure")
 
+    def test_a_canary_that_threw_is_a_crash_not_blind(self):
+        store = Store(self)
+        directory = store.test("1", "", with_results=False, code=255, args="--workload retry")
+        with open(os.path.join(directory, "jepsen.log"), "a") as log:
+            log.write("ERROR the replica 3 exited during format\n")
+        github, _, summary = night(self, store, canary=True)
+        self.assertEqual(github.statuses[0][1:3], ("failure", "jepsen/canary"))
+        self.assertIn("crashed", github.statuses[0][3])
+        self.assertNotIn("blind", github.statuses[0][3])
+        self.assertEqual(summary["filed"], 1)
+        self.assertIn("crashed", github.opened[0][1])
+        self.assertNotIn("blind", github.opened[0][1])
+
 
 class Fingerprints(unittest.TestCase):
     def filed(self, results, args="--workload retry --time-limit 300"):
@@ -308,6 +321,25 @@ class ExitCodes(unittest.TestCase):
         again, _, _ = night(self, store)
         self.assertEqual(rep.MARKER.search(again.opened[0][2]).group(1),
                          rep.MARKER.search(body).group(1))
+
+
+class HistoryRead(unittest.TestCase):
+    def test_the_history_is_read_once_per_run_however_many_findings(self):
+        store = Store(self)
+        results = ("{:valid? false, :workload {:valid? false, :duplicate {:count 1, :examples "
+                   '[{:key "aaaa", :ops [3 5]}]}, :balance {:count 1, :examples [{:key "bbbb"}]}}}')
+        store.test("1", results, history=[f"{{:index {i}, :key \"aaaa\"}}" for i in range(10)])
+        real, calls = rep.read_history, []
+
+        def counting(path):
+            calls.append(path)
+            return real(path)
+
+        rep.read_history = counting
+        self.addCleanup(setattr, rep, "read_history", real)
+        github, _, _ = night(self, store)
+        self.assertGreaterEqual(len(github.opened), 2)
+        self.assertEqual(len(calls), 1)
 
 
 class HostSignatures(unittest.TestCase):
@@ -824,6 +856,78 @@ class Nightly(unittest.TestCase):
         self.assertNotIn("run 1", done.stderr)
         self.assertNotIn("would set status", done.stdout)  # it tested nothing
         self.assertIn("the night did not run: git checkout", done.stdout)
+
+    def test_a_tip_whose_script_does_not_parse_is_reported_as_the_hosts(self):
+        broken = Path(self.tmp.name, "broken")
+        shutil.copytree(self.remote, broken)
+        with open(broken / "ops/jepsen/nightly.sh", "a") as script:
+            script.write("if then fi (\n")
+        self.git(broken, "add", "-A")
+        self.commit(broken, "broken")
+        done = self.night("--dry-run", remote=str(broken))
+        self.assertNotIn("running the tip's nightly.sh", done.stderr)
+        self.assertIn("does not parse", done.stderr)
+        self.assertNotIn("run 1", done.stderr)
+        self.assertIn("would set status", done.stdout)
+        self.assertIn("error", done.stdout)
+        self.assertEqual(done.returncode, 0, done.stderr)
+
+    def test_the_lock_is_taken_once_and_held_across_the_re_exec(self):
+        log = Path(self.tmp.name, "flock.log")
+        real = shutil.which("flock")
+        (self.bin / "flock").write_text(
+            f"#!/bin/sh\nprintf 'x\\n' >> {log}\nexec {real} \"$@\"\n")
+        (self.bin / "flock").chmod(0o755)
+        done = self.night("--dry-run")
+        self.assertIn("running the tip's nightly.sh", done.stderr)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(len(log.read_text().splitlines()), 1)
+
+
+class SetupScript(unittest.TestCase):
+    """setup.sh with root, apt, systemctl and /etc faked: the timer needs a token."""
+
+    def setup(self, token):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        bin_dir = root / "bin"
+        bin_dir.mkdir()
+        for name in ("apt-get", "usermod", "useradd", "runuser"):
+            (bin_dir / name).write_text("#!/bin/sh\nexit 0\n")
+            (bin_dir / name).chmod(0o755)
+        (bin_dir / "id").write_text('#!/bin/sh\n[ "$1" = -u ] && echo 0\nexit 0\n')
+        (bin_dir / "systemctl").write_text(f'#!/bin/sh\necho "$@" >> {root}/systemctl.log\n')
+        for name in ("id", "systemctl"):
+            (bin_dir / name).chmod(0o755)
+        (root / "etc/systemd/system").mkdir(parents=True)
+        home = root / "var/lib/jepsen"
+        (home / "nerva/.git").mkdir(parents=True)
+        shutil.copytree(HERE, home / "nerva/ops/jepsen")
+        text = (HERE / "setup.sh").read_text().replace("/etc/", f"{root}/etc/")
+        text = text.replace("/var/lib/jepsen", str(home))
+        script = root / "setup.sh"
+        script.write_text(text)
+        shutil.copy(HERE / "jepsen.env.example", root / "jepsen.env.example")
+        args = []
+        if token:
+            Path(root, "tok").write_text("secret\n")
+            args = ["--token-file", str(root / "tok")]
+        done = subprocess.run(["sh", str(script), *args], capture_output=True, text=True,
+                              env={"PATH": f"{bin_dir}:{os.environ['PATH']}"}, timeout=60)
+        calls = (root / "systemctl.log").read_text() if (root / "systemctl.log").exists() else ""
+        return done, calls
+
+    def test_the_timer_is_enabled_only_with_a_token(self):
+        done, calls = self.setup(token=False)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertNotIn("enable jepsen.timer", calls)
+        self.assertNotIn("start jepsen.timer", calls)
+        self.assertEqual(done.stderr.count("no token installed"), 1)
+        done, calls = self.setup(token=True)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("enable jepsen.timer", calls)
+        self.assertNotIn("no token installed", done.stderr)
 
 
 if __name__ == "__main__":

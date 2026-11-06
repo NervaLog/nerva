@@ -51,10 +51,14 @@ night_start=$((SECONDS - ${JEPSEN_ELAPSED:-0}))
 mkdir -p "$JEPSEN_HOME"/{archive,state,nights}
 
 # One night at a time. A second start (the timer while a run is late, or by hand) leaves quietly.
-exec 9>"$JEPSEN_HOME/nightly.lock"
-if ! flock -n 9; then
-  log "another night is running; leaving"
-  exit 0
+# Stage 2 inherits the held descriptor across the re-exec: opening the file again would close
+# fd 9 and release the lock for a moment.
+if [[ -z "${JEPSEN_LOCK_HELD:-}" ]]; then
+  exec 9>"$JEPSEN_HOME/nightly.lock"
+  if ! flock -n 9; then
+    log "another night is running; leaving"
+    exit 0
+  fi
 fi
 
 # A dry run has a night, an archive and a state of its own: it never touches the real ones.
@@ -158,12 +162,22 @@ elif fetch_tip; then
   if [[ -f "$tip" ]] && ! cmp -s "$tip" "${BASH_SOURCE[0]}"; then
     next=$(mktemp)
     cp "$tip" "$next"
-    rm -f "$JEPSEN_COPY_PATH"
-    log "running the tip's nightly.sh"
-    JEPSEN_STAGE=2 JEPSEN_DATE=$date_utc JEPSEN_ELAPSED=$((SECONDS - night_start)) JEPSEN_COPY_PATH=$next \
-      JEPSEN_COPY_OF="$JEPSEN_REPO_DIR/ops/jepsen" exec bash "$next" "$@"
+    if ! bash -n "$next" 2> /dev/null; then
+      # A tip whose script does not parse would die silently at stage 2: keep this script,
+      # which reports the night as the host's (status error) and the tracker line.
+      rm -f "$next"
+      host_failure "the tip's ops/jepsen/nightly.sh does not parse (bash -n); nothing was run"
+      ready=0
+    else
+      rm -f "$JEPSEN_COPY_PATH"
+      log "running the tip's nightly.sh"
+      JEPSEN_LOCK_HELD=1 JEPSEN_STAGE=2 JEPSEN_DATE=$date_utc \
+        JEPSEN_ELAPSED=$((SECONDS - night_start)) JEPSEN_COPY_PATH=$next \
+        JEPSEN_COPY_OF="$JEPSEN_REPO_DIR/ops/jepsen" exec bash "$next" "$@"
+    fi
+  else
+    ready=1
   fi
-  ready=1
 fi
 if ((ready)) && build_tip; then
   n=0

@@ -584,6 +584,7 @@ class Run:
         self.results_text = ""
         self.findings = []  # (checker, class, subtree)
         self.history_path = None
+        self.history = None  # (lines, cut), read once per run
 
     def summary(self):
         what = f"{self.workload}" + (f" ({self.nemesis})" if self.nemesis else "")
@@ -766,7 +767,11 @@ def make_findings(run, canary):
     if run.kind == "invalid" and "duplicate" in names:
         for checker, name, subtree in run.findings:
             out.append(finding(run, True, checker, name, subtree))
-    elif run.kind in ("invalid", "unknown", "valid", "crashed"):
+    elif run.kind == "crashed":
+        # The run threw before it could see anything: a crash, not a blind canary.
+        for checker, name, subtree in run.findings:
+            out.append(finding(run, False, checker, name, subtree))
+    elif run.kind in ("invalid", "unknown", "valid"):
         # Whatever else it saw is a real finding; the canary itself saw no duplicate.
         for checker, name, subtree in run.findings:
             out.append(finding(run, False, checker, name, subtree))
@@ -858,7 +863,9 @@ def history_text(item, room):
     if item["subtree"] is None or not run.history_path or room < 1024:
         return ""
     keys, numbers = anomaly_ids([s for _, _, s in run.findings if s is not None])
-    lines, cut = read_history(run.history_path)
+    if run.history is None:
+        run.history = read_history(run.history_path)
+    lines, cut = run.history
     anomalies = anomalous_lines(lines, keys, numbers) if lines else []
     if not anomalies:
         return "\nThe history: no operation could be tied to the verdict's examples.\n"
@@ -1166,10 +1173,17 @@ def night_state(runs, host_failure, canary):
     verdicts = [(run.kind, run) for run in runs]
     total = len(runs)
     if canary:
-        blind = [r for k, r in verdicts if k != "host"
+        crashed = [r for k, r in verdicts if k == "crashed"]
+        blind = [r for k, r in verdicts if k not in ("host", "crashed")
                  and not (k == "invalid" and "duplicate" in {n for _, n, _ in r.findings})]
-        if blind:
-            return "failure", f"canary blind: {len(blind)} of {total} run(s) saw no duplicate"
+        if crashed or blind:
+            parts = []
+            if crashed:
+                parts.append(f"canary crashed: {len(crashed)} of {total} run(s) threw before "
+                             "a verdict")
+            if blind:
+                parts.append(f"canary blind: {len(blind)} of {total} run(s) saw no duplicate")
+            return "failure", "; ".join(parts)
         if "host" in kinds:
             return "error", f"the host's: {kinds.count('host')} of {total} run(s) did not finish"
         return "success", f"canary: Jepsen saw the duplicate in {total} of {total} run(s)"

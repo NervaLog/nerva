@@ -23,7 +23,7 @@ user `jepsen`, and starts the fleet again whatever happened (`ExecStartPre=+` an
 5. calls `python3 -I jepsen_report.py ingest`.
 
 The script runs from a private copy of itself: the checkout it moves to the tip of `main` is the
-one it started from.
+one it started from. The lock is held across the re-exec into the tip's own script (the descriptor is inherited), and a tip whose `nightly.sh` does not parse (`bash -n`) is not run: the night is reported as the host's, status `error`.
 
 ## What the reporter does
 
@@ -56,7 +56,7 @@ in the store) is `error`.
 - **Tracker:** one comment a day on `JEPSEN_TRACKER`: what ran, on which commit, the verdict.
   **A day without one is the alarm.**
 - **`--expect-invalid`:** the canary (slice 8). The status is `jepsen/canary`, `success` only if
-  every run was invalid with a `duplicate`; a run that saw none is `failure` ("canary blind").
+  every run was invalid with a `duplicate`; a run that saw none is `failure` ("canary blind"), and a run that threw before a verdict is `failure` ("canary crashed", filed as a crash, not as blind).
   Its fingerprints are its own.
 - **`--dry-run`:** prints what it would write and writes nothing to GitHub. The state file it is
   given is written, so `nightly.sh` gives a dry run one of its own (`state/dry-run.json`).
@@ -77,17 +77,17 @@ OS, creates the token and the tracker issue, runs `setup.sh` as root).
 
 | Need | What |
 | --- | --- |
-| Machine | x86_64, 8 cores / 16 threads, 64 GB, NVMe; **KVM exposed** (`/dev/kvm`, for slice 10 only) |
+| Machine | x86_64, 8 cores / 16 threads, 64 GB, NVMe (P147h's suggestion); **KVM exposed** (`/dev/kvm`, for slice 10 only) |
 | OS | Ubuntu 24.04 LTS, cgroup v2, systemd |
-| Memory for Jepsen | 16 GB during its window: 5 replicas at about 1.33 GiB, 10 gateways, a 4 GB JVM. The fleet is stopped for the window |
+| Memory for Jepsen | 16 GB during its window: 5 replicas at about 1.33 GiB, 10 gateways, a 4 GB JVM. The fleet is stopped for the window, so its `MemoryMax=56G` never overlaps |
 | Time | about 2.5 h a night (two 3,600 s runs, setup, checking), the fleet stopped meanwhile |
 | Docker | Docker Engine, **privileged containers** (iptables in the nodes), the `owner` iptables match, `/dev/fuse` passed to the nodes (slice 9) |
-| Tools | OpenJDK 21, Leiningen 2.12.0 (sha256 pinned by `tests/jepsen/tools.sh`), gnuplot (else every result is `:unknown`), git, python3, zstd; Zig from `./zig/download.sh` |
-| sshd | The host's own sshd for the owner: keys only. The nodes' sshd lives inside the Docker network and is never exposed |
+| Tools | OpenJDK 21 (Ubuntu's), Leiningen 2.12.0 (script and standalone jar, sha256 pinned), gnuplot (else every result is `:unknown`, #106), git, python3, zstd; Zig from `./zig/download.sh` |
+| sshd | The host's own sshd for the owner: keys only. The nodes' sshd lives inside the Docker network and is never exposed; their `authorized_keys` comes from slice 2's `docker exec` |
 | Users | `jepsen`, in the `docker` group (root-equivalent: the host is single-purpose, and the fleet's `simfleet` user and token stay apart) |
 | Disk | 100 GB free for `store/` archives (90 days) and images |
-| Network out | github.com and api.github.com, clojars.org and Maven Central, ziglang.org, Docker Hub and deb.debian.org |
-| GitHub token | A fine-grained PAT on `NervaLog/nerva` only: **Issues read/write, Commit statuses read/write**, metadata read; nothing else. Not the fleet's. Its expiry noted on the tracker issue |
+| Network out | github.com and api.github.com, clojars.org and Maven Central (first `lein deps`), ziglang.org, Docker Hub and deb.debian.org (the node image, by digest) |
+| GitHub token | A fine-grained PAT on `NervaLog/nerva` only: **Issues read/write, Commit statuses read/write**, metadata read; nothing else (the repository is public, so it clones without one). Delivered by systemd `LoadCredential`; its expiry noted on the tracker issue |
 
 ## Deploy
 
@@ -103,7 +103,7 @@ systemctl start jepsen.service                              # a night now; journ
 `setup.sh` installs the packages, creates the user, copies the token to `/etc/jepsen/token`
 (0600; the unit hands the service a private copy through `LoadCredential`), clones the repository
 to `/var/lib/jepsen/nerva`, fetches the toolchain and Leiningen, runs the reporter's tests, and
-enables the timer. It does not touch the fleet. To see a night without writing to GitHub:
+enables the timer only if a token was installed (with none it says so; a timer with no token runs a night that cannot report). It does not touch the fleet. To see a night without writing to GitHub:
 `sudo -u jepsen /var/lib/jepsen/nerva/ops/jepsen/nightly.sh --dry-run` (sudo drops
 `JEPSEN_DRY_RUN` from the environment; `sudo -u jepsen env JEPSEN_DRY_RUN=1 ...` also works). A dry
 run has a night directory (`nights/<date>-dry`), an archive and a state file of its own, so it
