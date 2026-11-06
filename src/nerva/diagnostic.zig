@@ -251,7 +251,10 @@ fn cleanup_panic_enter() bool {
 
 /// The program's panic handler (P208): removes the registered file, then the default handler
 /// prints the message and the stack trace as it would have. A panic inside the cleanup, or any
-/// later one, goes straight to the default handler.
+/// later one, goes straight to the default handler. The cleanup runs first on purpose: the file
+/// must be gone even if printing the message hangs or is killed (a closed pipe, a full terminal),
+/// and the cleanup writes nothing unless a removal fails (NRV-W0011), so no message precedes the
+/// panic's own.
 pub fn panic(message: []const u8, first_trace_addr: ?usize) noreturn {
     if (cleanup_panic_enter()) cleanup_run();
     std.debug.defaultPanic(message, first_trace_addr);
@@ -673,10 +676,18 @@ fn cleanup_child_prepare() void {
     std.posix.sigprocmask(std.posix.SIG.UNBLOCK, &mask, null);
     const null_fd = std.posix.open("/dev/null", .{ .ACCMODE = .WRONLY }, 0) catch std.posix.exit(3);
     std.posix.dup2(null_fd, std.posix.STDERR_FILENO) catch std.posix.exit(3);
+    if (null_fd != std.posix.STDERR_FILENO) std.posix.close(null_fd);
 }
 
 /// Forks a child that registers `trace` in `dir`, then runs `act`; returns how the child ended.
 fn cleanup_child(dir: std.fs.Dir, comptime act: fn () void) !u32 {
+    // A test runner started with SIGCHLD ignored makes std's `waitpid` fail with ECHILD, which std
+    // treats as unreachable: take the default action for the fork and put the old one back.
+    var default = std.mem.zeroes(std.posix.Sigaction);
+    default.handler.handler = std.posix.SIG.DFL;
+    var inherited: std.posix.Sigaction = undefined;
+    std.posix.sigaction(std.posix.SIG.CHLD, &default, &inherited);
+    defer std.posix.sigaction(std.posix.SIG.CHLD, &inherited, null);
     const pid = try std.posix.fork();
     if (pid == 0) {
         cleanup_child_prepare();
@@ -694,8 +705,9 @@ fn cleanup_child(dir: std.fs.Dir, comptime act: fn () void) !u32 {
         assert(result.pid == 0);
         std.Thread.sleep(cleanup_child_poll_ms * std.time.ns_per_ms);
     }
-    std.posix.kill(pid, std.posix.SIG.KILL) catch {};
-    _ = std.posix.waitpid(pid, 0);
+    std.posix.kill(pid, std.posix.SIG.KILL) catch unreachable; // Our own unreaped child.
+    const reaped = std.posix.waitpid(pid, 0);
+    assert(reaped.pid == pid);
     return error.ChildDidNotEnd;
 }
 
