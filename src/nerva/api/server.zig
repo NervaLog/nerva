@@ -382,5 +382,8 @@ test "a group member's reply carries its own applied (P195b)" {
         .result = error.Timeout,
         .applied = .unknown,
     };
-    try std.testing.expectEqualStrings(cluster_lost(.unknown).body, member_reply(lost, &budget).body);
+    try std.testing.expectEqualStrings(
+        cluster_lost(.unknown).body,
+        member_reply(lost, &budget).body,
+    );
 }
