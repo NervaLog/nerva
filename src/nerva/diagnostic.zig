@@ -724,6 +724,12 @@ fn cleanup_child_panic() void {
     panic("cleanup test panic", null);
 }
 
+const cleanup_child_exit_code = 7;
+
+fn cleanup_child_exit() void {
+    std.posix.exit(cleanup_child_exit_code);
+}
+
 test "cleanup: SIGTERM and SIGINT remove the file and still kill the process" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -745,6 +751,26 @@ test "cleanup: a panic removes the file and still ends the process abnormally" {
     try testing.expect(std.posix.W.IFSIGNALED(status));
     try testing.expectEqual(@as(u32, std.posix.SIG.ABRT), std.posix.W.TERMSIG(status));
     try testing.expectError(error.FileNotFound, tmp.dir.access("trace", .{}));
+}
+
+test "cleanup: the child helper takes SIGCHLD to the default for the fork and restores it" {
+    // With SIGCHLD ignored, std's `waitpid` fails with ECHILD: the status coming back proves the
+    // default action was in force during the fork; SIG_IGN again afterwards proves the restore.
+    var ignore = std.mem.zeroes(std.posix.Sigaction);
+    ignore.handler.handler = std.posix.SIG.IGN;
+    var original: std.posix.Sigaction = undefined;
+    std.posix.sigaction(std.posix.SIG.CHLD, &ignore, &original);
+    defer std.posix.sigaction(std.posix.SIG.CHLD, &original, null);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const status = try cleanup_child(tmp.dir, cleanup_child_exit);
+    try testing.expect(std.posix.W.IFEXITED(status));
+    try testing.expectEqual(@as(u32, cleanup_child_exit_code), std.posix.W.EXITSTATUS(status));
+
+    var after: std.posix.Sigaction = undefined;
+    std.posix.sigaction(std.posix.SIG.CHLD, null, &after);
+    try testing.expect(after.handler.handler == std.posix.SIG.IGN);
 }
 
 test "cleanup: handlers are installed while registered and restored after" {
