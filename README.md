@@ -651,9 +651,12 @@ without a session answers `503` NRV-E0605, and `/healthz` says `"session":"recon
 `--request-timeout` plus a margin to write the reply (1 s): 32 s by default. The timeout is one
 deadline for the whole HTTP request, started when the gateway takes it up: a reconnection, a
 table-layout read before a commit, the read before a `layout_put` or a view declare, and every
-call of the `get_ledger` loop all share it (#186). A call that would pass it fails as a timeout
-(`503`, NRV-E0601, `"applied":"unknown"` if a write had gone out), and the gateway reconnects.
-Requests served together as a group (P143) share the deadline too. A client whose own timeout is
+call of the `get_ledger` loop all share it (#186). A call sent that passes it fails as a timeout
+(`503`, NRV-E0601, `"applied":"unknown"` if a write had gone out), and the gateway reconnects. A
+call the window has already passed is not sent: `503` NRV-E0606, `"applied":false` (`"unknown"`
+only if an earlier call of the request wrote), and the session is kept. `nerva view` catching up
+with a long feed does so across requests: each runs until its window ends, answers NRV-E0606, and
+the next goes on from the cursor. Requests served together as a group (P143) share the deadline too. A client whose own timeout is
 longer than the bound always gets the gateway's answer.
 
 **Documents** hold values larger than a row: up to 512 KiB under a string key (up to 1024 bytes

@@ -68,6 +68,7 @@ pub const Code = enum {
     E0601,
     E0602,
     E0605,
+    E0606,
     E1001,
     E1002,
     B0001,

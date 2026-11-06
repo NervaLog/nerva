@@ -340,7 +340,7 @@ fn settle(member: *Member, arena: std.mem.Allocator, result: anytype) !void {
         member.result = reply;
     } else |err| {
         const any: anyerror = err;
-        if (any == error.Timeout or any == error.Evicted) return err;
+        if (any == error.Timeout or any == error.Evicted or any == error.Expired) return err;
         member.result = refuse(arena, err);
     }
 }
@@ -360,7 +360,7 @@ fn settle(member: *Member, arena: std.mem.Allocator, result: anytype) !void {
 ///   (`commit_wide` among `commit`s, a lookup of records), or is the only one left, runs alone
 ///   through `handle`.
 ///
-/// `error.Timeout` and `error.Evicted` (from anywhere) are returned, with every member that
+/// `error.Timeout`, `error.Evicted` and `error.Expired` (from anywhere) are returned, with every member that
 /// had no answer yet left null: none has an answer, as none would have had alone.
 pub fn handle_group(
     arena: std.mem.Allocator,
@@ -2633,7 +2633,7 @@ const FakeClient = struct {
     const Version = struct { op: u64, exists: bool, value: [value_size]u8 };
     const RecordVersion = struct { op: u64, exists: bool, value: [nerva.record_value_size]u8 };
 
-    pub const Error = error{ TooManyEvents, OutOfMemory, Timeout };
+    pub const Error = error{ TooManyEvents, OutOfMemory, Timeout, Expired };
 
     pub fn batches_fit(fake: *const FakeClient, comptime operation: nerva.Operation, counts: []const u32) bool {
         _ = operation;

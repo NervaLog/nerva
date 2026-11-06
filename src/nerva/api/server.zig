@@ -203,6 +203,14 @@ fn cluster_lost(applied: api.Applied) api.Reply {
     } };
 }
 
+/// The reply to a request whose window passed before a call could be sent (NRV-E0606): the
+/// session is intact. Unknown if an earlier call of the same request sent a write.
+fn request_expired(applied: api.Applied) api.Reply {
+    return .{ .status = 503, .body = switch (applied) {
+        inline else => |known| wire.error_body(.E0606, "request deadline passed", known),
+    } };
+}
+
 /// The reply to a request while the gateway has no session: nothing was sent (NRV-E0605).
 const cluster_unavailable = api.Reply{
     .status = 503,
@@ -236,6 +244,12 @@ fn serve_group(
     } else if (api.handle_group(arena, client, layouts, members_used)) {
         for (members_used) |*member| assert(member.result != null);
     } else |err| switch (err) {
+        error.Expired => {
+            const expired = request_expired(api.applied_since(writes_before, client.writes_sent));
+            for (members_used) |*member| {
+                if (member.result == null) member.result = expired;
+            }
+        },
         error.Evicted, error.Timeout => {
             log.err("{s}: {}", .{ members_used[0].target, err });
             health.broke();
@@ -286,6 +300,9 @@ fn serve_request(
     const writes_before = client.writes_sent;
     return api.handle(arena, client, layouts, method, target, request.body) catch |err|
         switch (err) {
+            error.Expired => return request_expired(
+                api.applied_since(writes_before, client.writes_sent),
+            ),
             error.Evicted, error.Timeout => {
                 log.err("{s}: {}", .{ target, err });
                 health.broke();
@@ -313,3 +330,17 @@ const unavailable_healthz = api.Reply{
     .body = "{\"ok\":false,\"error\":\"cluster unavailable\",\"applied\":false," ++
         "\"code\":\"NRV-E0605\",\"session\":\"reconnecting\"}",
 };
+
+test "a request whose window passed is answered NRV-E0606, applied false unless a write went out" {
+    const none = request_expired(.no);
+    try std.testing.expectEqual(@as(u16, 503), none.status);
+    try std.testing.expectEqualStrings(
+        "{\"error\":\"request deadline passed\",\"applied\":false,\"code\":\"NRV-E0606\"}",
+        none.body,
+    );
+    // Not the 503 of a lost session, which the metrics count as refused (E0605).
+    try std.testing.expect(!std.mem.eql(u8, none.body, cluster_unavailable.body));
+    try std.testing.expect(!metrics.reply_unknown(none.status, none.body));
+    const sent = request_expired(.unknown);
+    try std.testing.expect(metrics.reply_unknown(sent.status, sent.body));
+}

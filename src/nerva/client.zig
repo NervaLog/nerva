@@ -1,6 +1,6 @@
 //! A blocking Nerva client: one VSR session, one request in flight, all memory allocated in
 //! `init`. Each call drives the client's own event loop until the reply arrives, the session is
-//! evicted, or `Options.timeout` passes.
+//! evicted, or `Options.timeout` passes (or, inside a `window_open`, the window ends).
 //!
 //! After `error.Timeout` the request may still commit; the client must not be used again
 //! (only `deinit`).
@@ -71,8 +71,12 @@ pub const Client = struct {
     pub const Error = error{
         /// The cluster evicted this client's session; create a new client.
         Evicted,
-        /// No reply within `Options.timeout`. The request may still commit.
+        /// No reply within `Options.timeout` (or by the window's end). The request may still
+        /// commit.
         Timeout,
+        /// The request's window (`window_open`) was spent before this call was sent: nothing was
+        /// sent and the session is as it was.
+        Expired,
         /// More events than fit in one request.
         TooManyEvents,
     };
@@ -646,6 +650,13 @@ pub const Client = struct {
     }
 
     fn ensure_idle(client: *Client) Error!void {
+        // Before anything is queued: a call that has no time left is not sent (#186), so its
+        // write is known not to have gone, and the session is kept.
+        if (client.state == .idle) {
+            if (client.options.window_end) |end| {
+                if (client.time_os.monotonic().ns > end.ns) return error.Expired;
+            }
+        }
         switch (client.state) {
             .idle => {},
             .evicted => return error.Evicted,
@@ -820,4 +831,28 @@ test "Client: one window bounds every call in it, not each call (#186)" {
     try std.testing.expectError(error.Timeout, client.init(std.testing.allocator, options));
     const total = begin.elapsed(time_os.monotonic());
     try std.testing.expect(total.ns < 2 * std.time.ns_per_s);
+}
+
+test "Client: a call whose window is spent is not sent, and the session stays usable (#186)" {
+    var time_os: stdx.TimeOS = .{};
+    // Only the fields `ensure_idle` reads: an idle client, whose window ended a second ago.
+    var client: Client = undefined;
+    client.state = .idle;
+    client.time_os = time_os;
+    client.writes_sent = 7;
+    client.options = .{
+        .cluster = 0,
+        .addresses = &.{},
+        .timeout = stdx.Duration.ms(1_000),
+        .window_end = .{ .ns = time_os.monotonic().ns - std.time.ns_per_s },
+    };
+    try std.testing.expectError(error.Expired, client.ensure_idle());
+    // Nothing was queued: still idle, no write counted, so the gateway answers `applied: false`
+    // and does not break the session.
+    try std.testing.expectEqual(.idle, client.state);
+    try std.testing.expectEqual(@as(u64, 7), client.writes_sent);
+    // With time left (or no window) the same client takes a call.
+    client.options.window_end = time_os.monotonic().add(stdx.Duration.ms(60_000));
+    try client.ensure_idle();
+    try std.testing.expectEqual(.waiting, client.state);
 }

@@ -30,6 +30,7 @@ comptime {
     _ = @import("nerva/api/layout_cache.zig");
     _ = @import("nerva/api/memory_budget.zig");
     _ = @import("nerva/api/metrics.zig");
+    _ = @import("nerva/api/server.zig");
     _ = @import("nerva/backup.zig");
     _ = @import("nerva/catalog.zig");
     _ = @import("nerva/cli.zig");
