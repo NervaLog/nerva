@@ -45,7 +45,7 @@ one journal line; the unit runs `nightly.sh --check-token` before it stops the f
 ## What the reporter does
 
 `jepsen_report.py ingest --store DIR --commit SHA --state FILE [--runs FILE] [--archive PATH]
-[--tracker N] [--expect-invalid] [--no-status] [--dry-run] [--repo OWNER/NAME --token-file FILE]`. Python 3,
+[--tracker N] [--expect-workloads "W1 W2"] [--expect-invalid] [--no-status] [--dry-run] [--repo OWNER/NAME --token-file FILE]`. Python 3,
 standard library only (P147i). For each run:
 
 | Run | Status `jepsen/nightly` | Issue |

@@ -3,6 +3,7 @@
 
     jepsen_report.py ingest --commit SHA --store DIR --state FILE [--archive PATH]
                             [--runs FILE] [--expect-invalid] [--no-status]
+                            [--expect-workloads "W1 W2"]
                             [--repo OWNER/NAME --token-file FILE] [--tracker N] [--dry-run]
 
 Reads one night that `nightly.sh` wrote under DIR: `runs` (one line per Jepsen run:
@@ -30,6 +31,9 @@ A commit's status only moves up (error, success, failure; P235b), judged against
 status for it, read first; unreadable, nothing is posted. `--no-status` posts none.
 
 Then one comment a day on the tracker issue: what ran, on which commit, the verdict.
+
+`--expect-workloads "W1 W2"` names the workloads the night must have run: a night missing one
+of them is `error`, never `success` (a run whose workload cannot be read counts for none).
 
 `--expect-invalid` is the canary (a build with commit-key deduplication off): an invalid verdict
 with a `duplicate` is what it expects. The issue it files says so and the status is
@@ -580,6 +584,7 @@ class Run:
         self.kind = None  # valid, invalid, unknown or host
         self.host_reason = None
         self.workload = "bank"  # the suite's default
+        self.workload_read = False  # False: `workload` is only the default, not what the run did
         self.nemesis = ""
         self.seed = None
         self.reproduce = None
@@ -606,6 +611,7 @@ def read_test(run, directory):
         words = ["lein", "run"] + run.args
     if words is not None:
         run.workload = option(words, "workload") or run.workload
+        run.workload_read = run.workload_read or bool(option(words, "workload"))
         run.nemesis = option(words, "nemesis") or ""
         run.seed = option(words, "seed")
         run.reproduce = " ".join(shlex.quote(w) for w in reproduce_words(words))
@@ -724,6 +730,7 @@ def read_night(store, runs_file):
             else:
                 words = ["lein", "run"] + args
                 run.workload = option(words, "workload") or run.workload
+                run.workload_read = bool(option(words, "workload"))
                 run.nemesis = option(words, "nemesis") or ""
             settle_run(run, code, tests)
             runs.append(run)
@@ -1184,7 +1191,7 @@ def night_state(runs, host_failure, canary, expected=()):
     kinds = [run.kind for run in runs]
     verdicts = [(run.kind, run) for run in runs]
     total = len(runs)
-    missing = [w for w in expected if w not in {run.workload for run in runs}]
+    missing = [w for w in expected if w not in {run.workload for run in runs if run.workload_read}]
     if canary:
         crashed = [r for k, r in verdicts if k == "crashed"]
         blind = [r for k, r in verdicts if k not in ("host", "crashed")

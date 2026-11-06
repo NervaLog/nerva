@@ -117,6 +117,17 @@ class ExpectedWorkloads(unittest.TestCase):
         self.assertEqual(state, "error")
         self.assertIn("bank", why)
 
+    def test_a_run_whose_workload_cannot_be_read_does_not_count_as_bank(self):
+        # No `--workload` anywhere: the run is `bank` only by default, so it must not stand in
+        # for a bank run the night never made.
+        store = Store(self)
+        store.test("1", VALID, args="--time-limit 300")
+        runs, host = rep.read_night(store.path, store.write_runs())
+        self.assertEqual(runs[0].workload, "bank")
+        state, why = rep.night_state(runs, host, False, ["bank"])
+        self.assertEqual(state, "error")
+        self.assertIn("bank", why)
+
     def test_a_finding_outranks_a_missing_workload(self):
         store = Store(self)
         store.test("1", invalid())
@@ -857,6 +868,9 @@ class Nightly(unittest.TestCase):
         self.bin.mkdir()
         (self.bin / "docker").write_text("#!/bin/sh\nexit 0\n")
         (self.bin / "docker").chmod(0o755)
+        if not shutil.which("zstd"):  # tar --zstd needs it; gzip stands in where it is not installed
+            (self.bin / "zstd").write_text("#!/bin/sh\nexec gzip \"$@\"\n")
+            (self.bin / "zstd").chmod(0o755)
         # The runner as setup.sh installs it: the night runs this copy, never the tip's.
         self.installed = root / "installed"
         self.installed.mkdir()
@@ -1100,6 +1114,33 @@ class Nightly(unittest.TestCase):
         night = next((self.home / "nights").iterdir())
         self.assertFalse((night / "store/host-failure").exists())
         self.assertRegex((night / "store/runs").read_text(), r"(?m)^2 143 ")
+        # The cut-short night still archives the run that finished, and the report names it.
+        archives = list((self.home / "archive").glob("*.tar.zst"))
+        self.assertEqual(len(archives), 1, err)
+        self.assertIn(str(archives[0]), out)
+
+    def test_an_early_end_after_a_failed_build_keeps_the_real_reason(self):
+        Path(self.remote, "zig/zig").write_text("#!/bin/sh\nexit 1\n")
+        self.git(self.remote, "add", "-A")
+        self.commit(self.remote, "broken build")
+        shim = Path(self.bin, "tar")  # TERM arrives while the (empty) night is archived
+        shim.write_text(f'#!/bin/sh\nkill -TERM "$(cat {self.home}/nightly.pid)"; sleep 5\n')
+        shim.chmod(0o755)
+        done = self.night("--dry-run", extra={"JEPSEN_TRACKER": "7"})
+        self.assertEqual(done.returncode, 143, done.stderr)
+        night = next((self.home / "nights").iterdir())
+        reason = (night / "store/host-failure").read_text()
+        self.assertIn("the build of", reason)
+        self.assertNotIn("interrupted", reason)
+        self.assertIn("would set status jepsen/nightly = error", done.stdout, done.stderr)
+
+    def test_a_reporter_that_exits_2_is_not_called_a_second_report(self):
+        Path(self.installed, "jepsen_report.py").write_text("import sys\nsys.exit(2)\n")
+        done = self.night("--dry-run", extra={"JEPSEN_TRACKER": "7"})
+        self.assertEqual(done.returncode, 2, done.stderr)
+        self.assertIn("the reporter exited 2", done.stderr)
+        self.assertIn("rate limit or GitHub unreachable", done.stderr)
+        self.assertNotIn("not reporting it twice", done.stderr)
 
     def test_a_finished_run_not_yet_on_record_keeps_its_finding(self):
         # retry ends invalid and TERM arrives as its store is moved, before its line is written:
