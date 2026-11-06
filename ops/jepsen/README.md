@@ -28,14 +28,15 @@ one it started from.
 ## What the reporter does
 
 `jepsen_report.py ingest --store DIR --commit SHA --state FILE [--runs FILE] [--archive PATH]
-[--tracker N] [--expect-invalid] [--dry-run] [--repo OWNER/NAME --token-file FILE]`. Python 3,
+[--tracker N] [--expect-invalid] [--no-status] [--dry-run] [--repo OWNER/NAME --token-file FILE]`. Python 3,
 standard library only (P147i). For each run:
 
 | Run | Status `jepsen/nightly` | Issue |
 | --- | --- | --- |
 | valid | `success` | none |
 | invalid or unknown (`results.edn`) | `failure` | one per fingerprint |
-| the host's (exit 124, 125, 126 or 137, a build that failed, Docker down, no `results.edn`, graphs that did not draw) | `error` | **never** |
+| the test threw: a `jepsen.log` and no `results.edn`, and no host exit code (`nerva` died at setup, say) | `failure` | one per workload (checker `run`, class `crashed`), with the log's end |
+| the host's (exit 124, 125, 126 or 137 with no verdict written, a build that failed, Docker down, Jepsen never started, graphs that did not draw) | `error` | **never** |
 
 `failure` outranks `error` outranks `success`: a night with one real finding and one host
 failure is `failure`, and the finding is filed. A night that did not run at all (`host-failure`
@@ -57,7 +58,12 @@ in the store) is `error`.
 - **`--expect-invalid`:** the canary (slice 8). The status is `jepsen/canary`, `success` only if
   every run was invalid with a `duplicate`; a run that saw none is `failure` ("canary blind").
   Its fingerprints are its own.
-- **`--dry-run`:** prints what it would write and writes nothing to GitHub.
+- **`--dry-run`:** prints what it would write and writes nothing to GitHub. The state file it is
+  given is written, so `nightly.sh` gives a dry run one of its own (`state/dry-run.json`).
+- **Statuses only move up** (P235b): error, then success, then failure, per commit and context.
+  A later night on the same commit never turns a `failure` green, and a night that could not run
+  never turns a `success` into `error`. A night that failed to fetch posts no status (`--no-status`):
+  it tested nothing, and the commit it knew is the previous night's. The tracker line says so.
 
 The token is read from a file and never printed or put in an error. Redirects are not followed.
 Tests: `python3 -I ops/jepsen/test_jepsen_report.py`.
@@ -96,12 +102,16 @@ systemctl start jepsen.service                              # a night now; journ
 (0600; the unit hands the service a private copy through `LoadCredential`), clones the repository
 to `/var/lib/jepsen/nerva`, fetches the toolchain and Leiningen, runs the reporter's tests, and
 enables the timer. It does not touch the fleet. To see a night without writing to GitHub:
-`JEPSEN_DRY_RUN=1 sudo -u jepsen JEPSEN_HOME=/var/lib/jepsen /var/lib/jepsen/nerva/ops/jepsen/nightly.sh`
-(it still stops nothing: stop the fleet by hand first).
+`sudo -u jepsen /var/lib/jepsen/nerva/ops/jepsen/nightly.sh --dry-run` (sudo drops
+`JEPSEN_DRY_RUN` from the environment; `sudo -u jepsen env JEPSEN_DRY_RUN=1 ...` also works). A dry
+run has a night directory (`nights/<date>-dry`), an archive and a state file of its own, so it
+never touches a real night's. It still runs both workloads (about 2.5 h) and stops nothing: stop
+the fleet by hand first.
 
 ## Limits
 
 - Not run on a host yet (slice 7). Verified in a cloud session: the reporter's tests, a dry run
-  against the stores of two hosted runs, `shellcheck`, and `systemd-analyze verify`.
+  against the stores of two hosted runs, `shellcheck`, and `systemd-analyze verify`. Bank's `results.edn` shape in the tests is built from `bank.clj`'s checker composition: no
+  hosted run of `bank` existed to copy it from.
 - A run cannot be replayed from its seed: the seed steers Jepsen's generators and the faults
   interleave with real time (N82, P215c).

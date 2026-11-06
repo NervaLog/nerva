@@ -6,6 +6,8 @@ import importlib.util
 import io
 import json
 import os
+import shutil
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -127,11 +129,12 @@ class Statuses(unittest.TestCase):
         self.assertEqual(github.opened, [])
         self.assertEqual(summary["filed"], 0)
 
-    def test_a_missing_results_file_is_the_hosts(self):
+    def test_no_jepsen_at_all_is_the_hosts(self):
         store = Store(self)
-        store.test("1", "", with_results=False)
+        store.host("1", 1)
         runs, _ = rep.read_night(store.path, store.write_runs())
         self.assertEqual(runs[0].kind, "host")
+        self.assertIn("never started", runs[0].host_reason)
 
     def test_a_night_that_did_not_run_is_error(self):
         store = Store(self)
@@ -185,6 +188,205 @@ class Fingerprints(unittest.TestCase):
         body = self.filed(invalid(), "--workload retry --nodes 10.0.0.1 --seed 9")
         self.assertIn("--workload retry", body)
         self.assertNotIn("10.0.0.1", body)
+
+
+# The shapes Jepsen really prints. `retry` is the slice 3 hosted run 42173915710 (trimmed);
+# bank's `:workload` is `checker/compose` of :bank :source :view :refusals (bank.clj), itself
+# under core.clj's `:workload`, beside :protocol; jepsen.tests.bank's own result is
+# {:valid? :read-count :error-count :first-error :errors {:wrong-total {...}}}.
+RETRY_REAL = """{:perf {:latency-graph {:valid? true}, :rate-graph {:valid? true}, :valid? true},
+ :timeline {:valid? true},
+ :stats {:valid? true, :count 5983, :by-f {:pay {:valid? true, :count 5973}}},
+ :exceptions {:valid? true},
+ :protocol {:valid? true, :violations 0, :examples []},
+ :workload {:duplicate {:count 613, :examples [{:key "dad07594c7e9ff54aae1c51e40e077c9",
+                                                :ops [2759 2766]}]},
+            :key-reused {:count 0, :examples []}, :valid? false,
+            :applied-lie {:count 0, :examples []}, :unresolved {:count 0, :examples []},
+            :dropped 613, :replayed 0, :committed 5973,
+            :balance {:count 0, :examples []}, :keys 5973, :reads 5,
+            :key-collision {:count 0, :examples []}},
+ :valid? false}
+"""
+
+
+def bank_results(bank="true", source="true", view="true", refusals="true", protocol="true"):
+    bad_bank = ("{:valid? false, :read-count 9, :error-count 1, :first-error {:type :wrong-total,"
+                " :total 399, :op {:index 7}}, :errors {:wrong-total {:count 1, :first {:index 7}}}}")
+    parts = {"bank": bad_bank if bank == "false" else "{:valid? true, :read-count 9, :error-count 0,"
+             " :first-error nil, :errors {}}",
+             "source": f"{{:valid? {source}, :expected -400, :errors []}}",
+             "view": f"{{:valid? {view}, :answers 4, :errors []}}",
+             "refusals": f"{{:valid? {refusals}, :refusals {{:out_of_bounds 3}}, :unexpected []}}"}
+    inner = ", ".join(f":{k} {v}" for k, v in parts.items())
+    ok = all(v == "true" for v in (bank, source, view, refusals))
+    proto = "{:valid? true, :violations 0, :examples []}" if protocol == "true" else \
+        "{:valid? false, :violations 2, :examples [{:op 5}]}"
+    valid = "true" if ok and protocol == "true" else "false"
+    return (f"{{:perf {{:valid? true}}, :timeline {{:valid? true}}, :stats {{:valid? true}},"
+            f" :exceptions {{:valid? true}}, :protocol {proto},"
+            f" :workload {{{inner}, :valid? {'true' if ok else 'false'}}}, :valid? {valid}}}")
+
+
+class NestedCheckers(unittest.TestCase):
+    def found(self, text):
+        found, graphs_only = rep.findings_of(rep.parse_edn(text))
+        self.assertFalse(graphs_only)
+        return [(c, n) for c, n, _ in found]
+
+    def test_the_real_retry_shape_names_workload_duplicate(self):
+        self.assertEqual(self.found(RETRY_REAL), [("workload", "duplicate")])
+
+    def test_a_bank_conservation_failure_names_the_leaf(self):
+        self.assertEqual(self.found(bank_results(source="false")),
+                         [("workload.source", "conservation")])
+        self.assertEqual(self.found(bank_results(bank="false")),
+                         [("workload.bank", "conservation")])
+        self.assertEqual(self.found(bank_results(view="false")),
+                         [("workload.view", "conservation")])
+
+    def test_a_bank_refusal_regression_is_not_a_conservation_break(self):
+        self.assertEqual(self.found(bank_results(refusals="false")),
+                         [("workload.refusals", "refusal")])
+
+    def test_a_protocol_failure_has_its_violations_class(self):
+        self.assertEqual(self.found(bank_results(protocol="false")), [("protocol", "violations")])
+
+    def test_distinct_bank_failures_are_distinct_issues(self):
+        bodies = []
+        for kind in ("source", "refusals", "view"):
+            store = Store(self)
+            store.test("1", bank_results(**{kind: "false"}), args="--workload bank")
+            github, _, summary = night(self, store)
+            bodies.append(github.opened[0][2])
+        self.assertEqual(len({rep.MARKER.search(b).group(1) for b in bodies}), 3)
+
+    def test_two_failures_in_one_run_are_two_findings(self):
+        found = self.found(bank_results(source="false", refusals="false"))
+        self.assertEqual(set(found), {("workload.source", "conservation"),
+                                      ("workload.refusals", "refusal")})
+
+
+class ExitCodes(unittest.TestCase):
+    def test_an_invalid_verdict_outranks_a_deadline_exit(self):
+        for code in (124, 137):
+            store = Store(self)
+            store.test("1", invalid(), code=code)
+            github, _, summary = night(self, store)
+            self.assertEqual(summary["filed"], 1)
+            self.assertEqual(github.statuses[0][1], "failure")
+
+    def test_a_host_exit_with_a_valid_verdict_is_still_the_hosts(self):
+        store = Store(self)
+        store.test("1", VALID, code=137)
+        github, _, summary = night(self, store)
+        self.assertEqual(github.statuses[0][1], "error")
+        self.assertEqual(summary["filed"], 0)
+
+    def test_a_host_exit_with_no_results_is_the_hosts(self):
+        store = Store(self)
+        store.test("1", "", with_results=False, code=124)
+        github, _, summary = night(self, store)
+        self.assertEqual((github.statuses[0][1], summary["filed"]), ("error", 0))
+
+    def test_a_test_that_threw_is_nervas_and_is_filed_with_the_log_end(self):
+        store = Store(self)
+        directory = store.test("1", "", with_results=False, code=255, args="--workload bank")
+        with open(os.path.join(directory, "jepsen.log"), "a") as log:
+            log.write("ERROR the replica 3 exited during format\n")
+        github, _, summary = night(self, store)
+        self.assertEqual((github.statuses[0][1], summary["filed"]), ("failure", 1))
+        title, body = github.opened[0][1], github.opened[0][2]
+        self.assertIn("crashed", title)
+        self.assertIn("replica 3 exited during format", body)
+        again, _, _ = night(self, store)
+        self.assertEqual(rep.MARKER.search(again.opened[0][2]).group(1),
+                         rep.MARKER.search(body).group(1))
+
+
+class StatusesOnlyMoveUp(unittest.TestCase):
+    def run_night(self, test, results, state, code=0, **kwargs):
+        store = Store(test)
+        store.test("1", results, code=code)
+        return night(test, store, state=state, **kwargs)
+
+    def test_a_later_success_does_not_replace_a_failure(self):
+        state = rep.new_state()
+        first, state, _ = self.run_night(self, invalid(), state)
+        second, state, summary = self.run_night(self, VALID, state, now=NOW + DAY)
+        self.assertEqual([s[1] for s in first.statuses], ["failure"])
+        self.assertEqual(second.statuses, [])
+        self.assertIn("not posted", summary["status"])
+
+    def test_a_host_error_does_not_replace_a_success(self):
+        state = rep.new_state()
+        _, state, _ = self.run_night(self, VALID, state)
+        second, state, _ = self.run_night(self, "", state, code=137, now=NOW + DAY)
+        self.assertEqual(second.statuses, [])
+
+    def test_a_success_replaces_an_error_and_a_failure_replaces_a_success(self):
+        state = rep.new_state()
+        for results, code, want in (("", 137, "error"), (VALID, 0, "success"),
+                                    (invalid(), 0, "failure")):
+            github, state, _ = self.run_night(self, results, state, code=code)
+            self.assertEqual([s[1] for s in github.statuses], [want])
+
+    def test_another_commit_has_its_own_status(self):
+        state = rep.new_state()
+        _, state, _ = self.run_night(self, invalid(), state)
+        second, state, _ = self.run_night(self, VALID, state, commit=OTHER)
+        self.assertEqual([s[1] for s in second.statuses], ["success"])
+
+    def test_a_failed_post_is_not_remembered(self):
+        state = rep.new_state()
+        github = Recorder(fail={"status": rep.GitHubError("unreachable", "no answer")})
+        _, state, _ = self.run_night(self, VALID, state, github=github)
+        again, state, _ = self.run_night(self, VALID, state)
+        self.assertEqual([s[1] for s in again.statuses], ["success"])
+
+    def test_no_status_posts_none_and_remembers_none(self):
+        store = Store(self)
+        store.host("1", 137)
+        runs, host = rep.read_night(store.path, store.write_runs())
+        github, state = Recorder(), rep.new_state()
+        rep.ingest(github, state, runs, host, COMMIT, None, None, False, NOW, "o/r",
+                   lambda m: None, status=False)
+        self.assertEqual(github.statuses, [])
+        self.assertEqual(state["verdicts"], {})
+
+    def test_an_old_state_file_without_verdicts_loads(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "s.json")
+            Path(path).write_text('{"version": 1, "filed": {}, "days": {}}')
+            self.assertEqual(rep.load_state(path)["verdicts"], {})
+
+    def test_the_verdicts_are_bounded(self):
+        state = rep.new_state()
+        for i in range(rep.VERDICTS_MAX + 20):
+            rep.record_status(state, f"{i:040x}", rep.CONTEXT_NIGHTLY, "success", f"d{i:04}")
+        self.assertEqual(len(state["verdicts"]), rep.VERDICTS_MAX)
+
+
+class DryRunState(unittest.TestCase):
+    def test_a_dry_run_leaves_nothing_in_a_state_file_it_could_poison(self):
+        store = Store(self)
+        store.test("1", invalid())
+        store.write_runs()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "s.json")
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(rep.main(["ingest", "--dry-run", "--store", store.path,
+                                           "--commit", COMMIT, "--state", path], now=NOW), 0)
+            self.assertEqual(rep.load_state(path)["filed"], {})
+
+    def test_negative_numbers_in_an_old_state_are_dropped_on_load(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "s.json")
+            state = rep.new_state()
+            state["filed"]["a" * 32] = {"issue": -1, "first_commit": "", "last_commit": ""}
+            state["filed"]["b" * 32] = {"issue": 7, "first_commit": "", "last_commit": ""}
+            Path(path).write_text(json.dumps(state))
+            self.assertEqual(list(rep.load_state(path)["filed"]), ["b" * 32])
 
 
 class Dedup(unittest.TestCase):
@@ -291,6 +493,76 @@ class Bounds(unittest.TestCase):
         self.assertLessEqual(len(github.opened[0][2].encode()), rep.BODY_BYTES_MAX)
 
 
+class BodyBound(unittest.TestCase):
+    def filed_body(self, results, history, args="--workload retry"):
+        store = Store(self)
+        store.test("1", results, history=history, args=args)
+        github, _, _ = night(self, store)
+        return github.opened[0][2]
+
+    def test_many_sparse_anomalies_stay_under_the_bound(self):
+        # 1,334 isolated anomalous lines: the omission markers were not charged to the budget.
+        keys = tuple(f"{i:032x}" for i in range(1334))
+        history = []
+        for i in range(1334):
+            history.append(f'{{:index {i * 3}, :type :ok, :key "{keys[i]}", :f :pay}}')
+            history.extend(f'{{:index {i * 3 + j}, :type :ok, :f :read, :pad "{"p" * 150}"}}'
+                           for j in (1, 2))
+        body = self.filed_body(invalid(keys=keys), history)
+        self.assertLessEqual(len(body.encode()), rep.BODY_BYTES_MAX)
+        excerpt = body[body.index("The history"):]
+        self.assertLessEqual(len(excerpt.encode()), rep.HISTORY_BYTES_ISSUE + 1024)
+
+    def test_ten_keys_five_hundred_times_with_a_big_verdict(self):
+        keys = tuple(f"{i:032x}" for i in range(10))
+        history = [f'{{:index {i}, :type :ok, :key "{keys[i % 10]}", :f :pay, :pad "{"x" * 90}"}}'
+                   for i in range(5000)]
+        body = self.filed_body(invalid(keys=keys, extra=', :pad "' + "v" * 20_000 + '"'), history)
+        self.assertLessEqual(len(body.encode()), rep.BODY_BYTES_MAX)
+        self.assertIn("jepsen fingerprint", body)
+
+    def test_invalid_utf8_in_a_history_is_charged_as_decoded(self):
+        keys = ("a" * 32,)
+        store = Store(self)
+        directory = store.test("1", invalid(keys=keys), history=[])
+        bad = b'{:index %d, :key "' + keys[0].encode() + b'", :pad "' + b"\xff" * 1400 + b'"}\n'
+        with open(os.path.join(directory, "history.edn"), "wb") as file:
+            for i in range(400):
+                file.write(bad % i)
+        github, _, _ = night(self, store)
+        self.assertLessEqual(len(github.opened[0][2].encode()), rep.BODY_BYTES_MAX)
+
+    def test_an_oversize_part_is_cut_not_asserted(self):
+        item = {"run": rep.Run("1"), "canary": False, "checker": "workload", "class": "x",
+                "subtree": None, "key": "k", "fingerprint": "f" * 32, "title": "t"}
+        item["run"].results_text = "v" * 10
+        original = rep.VERDICT_BYTES
+        try:
+            rep.VERDICT_BYTES = 10 * rep.BODY_BYTES_MAX  # a bound that was raised by mistake
+            item["run"].results_text = "v" * (2 * rep.BODY_BYTES_MAX)
+            text = rep.report_text(item, COMMIT, None, first=True)
+        finally:
+            rep.VERDICT_BYTES = original
+        self.assertLessEqual(len(text.encode()), rep.BODY_BYTES_MAX)
+        self.assertIn("jepsen fingerprint", text)
+
+    def test_a_fault_after_the_status_still_saves_the_state(self):
+        store = Store(self)
+        store.test("1", invalid())
+        store.write_runs()
+        original = rep.report_text
+        rep.report_text = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                path = os.path.join(tmp, "s.json")
+                with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(RuntimeError):
+                    rep.main(["ingest", "--dry-run", "--store", store.path, "--commit", COMMIT,
+                              "--state", path], now=NOW)
+                self.assertIn(f"{COMMIT}:jepsen/nightly", rep.load_state(path)["verdicts"])
+        finally:
+            rep.report_text = original
+
+
 class Files(unittest.TestCase):
     def test_a_bad_state_file_is_an_error_not_empty(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -342,6 +614,114 @@ class Files(unittest.TestCase):
             with self.assertRaises(rep.Environment) as caught:
                 rep.read_token(path)
             self.assertNotIn("two", str(caught.exception))
+
+
+FAKE_RUN = """#!/bin/sh
+# A fake tests/jepsen/run.sh: one invalid retry store, as Jepsen leaves it.
+mkdir -p tests/jepsen/store/t/2026-11-02T01:00:00Z
+cd tests/jepsen/store/t/2026-11-02T01:00:00Z || exit 9
+printf 'Command line:\\nlein run test --workload retry --seed 1\\n' > jepsen.log
+cat > results.edn <<'EDN'
+%s
+EDN
+: > history.edn
+exit 0
+"""
+
+
+@unittest.skipUnless(shutil.which("git") and shutil.which("flock"), "needs git and flock")
+class Nightly(unittest.TestCase):
+    """nightly.sh against a local remote, with the build, Docker and Jepsen faked."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+        self.home = root / "home"
+        self.remote = root / "remote"
+        self.bin = root / "bin"
+        self.bin.mkdir()
+        (self.bin / "docker").write_text("#!/bin/sh\nexit 0\n")
+        (self.bin / "docker").chmod(0o755)
+        self.write_remote_tree(self.remote, "one")
+        self.git(self.remote, "init", "-q", "-b", "main")
+        self.git(self.remote, "add", "-A")
+        self.commit(self.remote, "one")
+
+    def git(self, cwd, *args):
+        return subprocess.run(["git", "-C", str(cwd), *args], check=True,
+                              capture_output=True, text=True).stdout.strip()
+
+    def commit(self, cwd, message):
+        self.git(cwd, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", message)
+
+    def write_remote_tree(self, path, marker, results=None):
+        for name, text in {
+            "zig/download.sh": "#!/bin/sh\nexit 0\n",
+            "zig/zig": "#!/bin/sh\nexit 0\n",
+            "tests/jepsen/run.sh": FAKE_RUN % (results or invalid()),
+            "marker": marker + "\n",
+        }.items():
+            target = Path(path, name)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(text)
+            if name != "marker":
+                target.chmod(0o755)
+        jepsen = Path(path, "ops/jepsen")
+        jepsen.mkdir(parents=True, exist_ok=True)
+        shutil.copy(HERE / "jepsen_report.py", jepsen / "jepsen_report.py")
+        shutil.copy(HERE / "nightly.sh", jepsen / "nightly.sh")
+        with open(jepsen / "nightly.sh", "a") as script:
+            script.write(f"# tip {marker}\n")
+
+    def night(self, *flags, remote=None, extra=None):
+        env = {"PATH": f"{self.bin}:{os.environ['PATH']}", "JEPSEN_HOME": str(self.home),
+               "JEPSEN_REMOTE": remote or str(self.remote), "JEPSEN_WORKLOADS": "retry",
+               "JEPSEN_NEMESIS": "kill", "JEPSEN_TIME_LIMIT": "1",
+               "JEPSEN_NIGHT_SECONDS": "120", "HOME": self.tmp.name, **(extra or {})}
+        return subprocess.run(["bash", str(HERE / "nightly.sh"), *flags], env=env,
+                              capture_output=True, text=True, timeout=120)
+
+    def test_a_dry_run_has_a_state_and_a_night_of_its_own(self):
+        done = self.night("--dry-run")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        state = self.home / "state"
+        self.assertTrue((state / "dry-run.json").exists())
+        self.assertFalse((state / "state.json").exists())
+        self.assertEqual([p.name.endswith("-dry") for p in (self.home / "nights").iterdir()],
+                         [True])
+        self.assertIn("would open issue", done.stdout)
+        self.assertEqual(rep.load_state(str(state / "dry-run.json"))["filed"], {})
+
+    def test_the_environment_variable_does_the_same_as_the_flag(self):
+        done = self.night(extra={"JEPSEN_DRY_RUN": "1"})
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertFalse((self.home / "state" / "state.json").exists())
+
+    def test_the_tips_own_script_runs_when_it_differs(self):
+        done = self.night("--dry-run")
+        self.assertIn("running the tip's nightly.sh", done.stderr)
+
+    def test_a_failed_fetch_posts_no_status(self):
+        self.assertEqual(self.night("--dry-run").returncode, 0)
+        self.git(self.home / "nerva", "remote", "set-url", "origin", str(Path(self.tmp.name, "gone")))
+        done = self.night("--dry-run")
+        self.assertIn("git fetch failed", done.stderr)
+        self.assertNotIn("would set status", done.stdout)
+        self.assertEqual(done.returncode, 0, done.stderr)
+
+    def test_a_failed_checkout_aborts_the_night_as_the_hosts(self):
+        self.assertEqual(self.night("--dry-run").returncode, 0)
+        clone = self.home / "nerva"
+        self.write_remote_tree(self.remote, "two")
+        self.git(self.remote, "add", "-A")
+        self.commit(self.remote, "two")
+        (clone / "marker").write_text("local edit\n")  # conflicts with the incoming change
+        done = self.night("--dry-run")
+        self.assertIn("git checkout of the fetched tip failed", done.stderr)
+        self.assertNotIn("run 1", done.stderr)
+        self.assertNotIn("would set status", done.stdout)  # it tested nothing
+        self.assertIn("the night did not run: git checkout", done.stdout)
 
 
 if __name__ == "__main__":

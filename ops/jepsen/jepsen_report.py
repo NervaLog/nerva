@@ -2,7 +2,7 @@
 """The Jepsen nightly's reporter (ops/jepsen/README.md, R1 slice 6, P215, P215c).
 
     jepsen_report.py ingest --commit SHA --store DIR --state FILE [--archive PATH]
-                            [--runs FILE] [--expect-invalid]
+                            [--runs FILE] [--expect-invalid] [--no-status]
                             [--repo OWNER/NAME --token-file FILE] [--tracker N] [--dry-run]
 
 Reads one night that `nightly.sh` wrote under DIR: `runs` (one line per Jepsen run:
@@ -18,9 +18,14 @@ Each run is valid, invalid, unknown, or the host's:
   key, its anomaly class; never the seed or the commit); a known fingerprint gets a comment only
   for a commit it has not been reported on, at most COMMENTS_PER_FAILURE_PER_DAY a UTC day; at
   most FAILURES_PER_DAY distinct failures are looked at a day. The status is `failure`;
-- the host's (exit 124 past the night's deadline, 125, 126, 137 the OOM killer; a run that left
-  no `results.edn`; a night that did not start; graphs that did not draw): counted, status
-  `error`, never an issue.
+- the host's (exit 124 past the night's deadline, 125, 126, 137 the OOM killer, unless a verdict
+  was written: an invalid or unknown one outranks the exit code; a run with no `jepsen.log` at
+  all; a night that did not start; graphs that did not draw): counted, status `error`, never an
+  issue;
+- crashed: Jepsen started (a `jepsen.log`) and wrote no `results.edn`, and the host did not kill
+  it: Nerva's. One issue per workload (`<workload>|run|crashed`), with the log's end (P235b).
+
+A commit's status only moves up (error, success, failure; P235b). `--no-status` posts none.
 
 Then one comment a day on the tracker issue: what ran, on which commit, the verdict.
 
@@ -35,6 +40,7 @@ library only. The tooling's own messages are not NRV codes (P215c).
 """
 
 import argparse
+import contextlib
 import datetime
 import hashlib
 import json
@@ -56,19 +62,24 @@ STATE_VERSION = 1
 RUNS_MAX = 64  # Lines of `runs`.
 TESTS_MAX = 256  # Test directories read.
 FINDINGS_MAX = 64  # (checker, class) pairs of one run.
+FINDINGS_DEPTH_MAX = 4  # Composed checkers walked into.
 EDN_BYTES_MAX = 4 * 1024 * 1024  # results.edn.
 EDN_DEPTH_MAX = 64
+LOG_TAIL_BYTES = 4 * 1024  # jepsen.log's end, for a run that died.
 LOG_HEAD_BYTES = 64 * 1024  # jepsen.log: only its first lines (the command line) are read.
 HISTORY_BYTES_MAX = 2 * 1024 * 1024 * 1024
 HISTORY_LINES_MAX = 20_000_000
 HISTORY_CONTEXT = 50  # Operations of context on each side of an anomalous one (P215c).
 HISTORY_BYTES_ISSUE = 48 * 1024  # The excerpt in an issue (P215c).
+HISTORY_FIT_TRIES = 8  # Times an excerpt is re-rendered smaller to fit.
 HISTORY_LINE_BYTES = 1500  # A history line is cut here in an excerpt.
 ANOMALIES_MAX = 4096
 VERDICT_BYTES = 6 * 1024  # results.edn in an issue.
 BODY_BYTES_MAX = 60_000  # GitHub's limit is 65,536 characters.
 TITLE_BYTES_MAX = 120
 FILED_MAX = 2048
+VERDICTS_MAX = 256  # Commits whose status is remembered.
+STATUS_RANK = {"error": 0, "success": 1, "failure": 2}
 DAYS_KEPT = 31
 FAILURES_PER_DAY = 16  # Distinct failures looked at a UTC day.
 COMMENTS_PER_FAILURE_PER_DAY = 4
@@ -289,6 +300,16 @@ def read_head(path, limit):
         return ""
 
 
+def read_tail(path, limit):
+    try:
+        with open(path, "rb") as file:
+            file.seek(0, os.SEEK_END)
+            file.seek(max(0, file.tell() - limit))
+            return file.read(limit).decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+
 def command_of(log_head):
     """The `lein run ...` line Jepsen logs first, as words, or None."""
     match = re.search(r"Command line:\n(lein run .*)", log_head)
@@ -329,12 +350,20 @@ def reproduce_words(words):
     return out
 
 
+def leaf_name(path):
+    return path.rsplit(".", 1)[-1]
+
+
 def checker_classes(checker, result):
-    """The anomaly classes of a failing checker's result."""
-    if checker in CHECKER_CLASS:
-        return [CHECKER_CLASS[checker]]
+    """The anomaly classes of a failing (leaf) checker's result. `checker` is its path
+    (`workload.source`); the table is keyed by its last key."""
+    if leaf_name(checker) in CHECKER_CLASS:
+        return [CHECKER_CLASS[leaf_name(checker)]]
     classes = []
     if isinstance(result, dict):
+        violations = kw(result, "violations")
+        if isinstance(violations, int) and not isinstance(violations, bool) and violations > 0:
+            classes.append("violations")  # the protocol checker: a count at its own level
         for key, value in result.items():
             if not isinstance(key, Keyword) or not isinstance(value, dict):
                 continue
@@ -357,20 +386,40 @@ def checker_classes(checker, result):
     return seen
 
 
+def failing_leaves(path, value, depth):
+    """[(path, verdict, result)]: the checkers below `value` that fail. A checker composed of
+    checkers (Jepsen's `compose`, as `:workload` is for bank) is walked into, so the leaf that
+    failed (`workload.source`) is named, not the composition; a result with no failing
+    `:valid?` child is a leaf itself."""
+    verdict = is_valid(kw(value, "valid?"))
+    if verdict is True:
+        return []
+    children = [(k, v) for k, v in value.items()
+                if isinstance(k, Keyword) and str(k) != "valid?" and isinstance(v, dict)
+                and kw(v, "valid?") is not None]
+    if children and depth < FINDINGS_DEPTH_MAX:
+        below = []
+        for k, v in children:
+            below.extend(failing_leaves(f"{path}.{k}", v, depth + 1))
+        if below:
+            return below
+    return [(path, verdict, value)]
+
+
 def findings_of(results):
-    """[(checker, class)] the verdict fails on, and the node of the result they came from."""
+    """[(checker, class, result)] the verdict fails on, and whether only the host's graphs
+    failed. `checker` is a path: `protocol`, `workload`, `workload.source`."""
     failing = []
     for key, value in results.items():
         if isinstance(key, Keyword) and str(key) != "valid?" and isinstance(value, dict):
-            verdict = is_valid(kw(value, "valid?"))
-            if verdict is not True:
-                failing.append((str(key), verdict, value))
+            for leaf in failing_leaves(str(key), value, 1):
+                failing.append((str(key), *leaf))
     real = [f for f in failing if f[0] not in HOST_CHECKERS]
     if not real:
         return [], bool(failing)
-    firm = [f for f in real if f[1] is False] or real
+    firm = [f for f in real if f[2] is False] or real
     found = []
-    for checker, _, value in firm:
+    for _, checker, _, value in firm:
         for name in checker_classes(checker, value):
             if len(found) < FINDINGS_MAX:
                 found.append((checker, name, value))
@@ -433,24 +482,51 @@ def anomalous_lines(lines, keys, numbers):
     return found
 
 
+def render_line(line):
+    """One history line as it is shown: cut at HISTORY_LINE_BYTES, decoded (a bad byte may
+    become 3), and with no fence in it."""
+    if len(line) > HISTORY_LINE_BYTES:
+        text = line[:HISTORY_LINE_BYTES].decode("utf-8", "replace") + " ..."
+    else:
+        text = line.decode("utf-8", "replace")
+    return text.replace("```", "'''")
+
+
+def omitted_marker(count):
+    return f"... {count} operations omitted ..."
+
+
+def excerpt_cost(lines, positions, rendered):
+    """The bytes of render_excerpt(positions): lines, omission markers and newlines."""
+    total = 0
+    previous = None
+    for position in positions:
+        if previous is not None and position != previous + 1:
+            total += len(omitted_marker(position - previous - 1)) + 1
+        if position not in rendered:
+            rendered[position] = len(render_line(lines[position]).encode()) + 1
+        total += rendered[position]
+        previous = position
+    return total
+
+
 def select_lines(lines, anomalies, budget):
     """Positions to show: the anomalous ones with HISTORY_CONTEXT lines on each side, the context
-    shrunk until the excerpt fits the budget; returns (positions, radius, all_anomalies_shown)."""
-    def cost(position):
-        return min(len(lines[position]), HISTORY_LINE_BYTES) + 1
-
+    shrunk until the excerpt fits the budget; returns (positions, radius, all_anomalies_shown).
+    The cost is that of the rendered excerpt: markers and decoding included."""
+    rendered = {}
     for radius in (HISTORY_CONTEXT, 20, 10, 5, 2, 1, 0):
         shown = set()
         for position in anomalies:
             shown.update(range(max(0, position - radius), min(len(lines), position + radius + 1)))
-        if sum(cost(p) for p in shown) <= budget:
-            return sorted(shown), radius, True
-    kept, used = [], 0
+        ordered = sorted(shown)
+        if excerpt_cost(lines, ordered, rendered) <= budget:
+            return ordered, radius, True
+    kept = []
     for position in anomalies:
-        if used + cost(position) > budget:
+        if excerpt_cost(lines, kept + [position], rendered) > budget:
             break
         kept.append(position)
-        used += cost(position)
     return kept, 0, False
 
 
@@ -459,11 +535,8 @@ def render_excerpt(lines, positions):
     previous = None
     for position in positions:
         if previous is not None and position != previous + 1:
-            out.append(f"... {position - previous - 1} operations omitted ...")
-        line = lines[position].decode("utf-8", "replace")
-        if len(lines[position]) > HISTORY_LINE_BYTES:
-            line = lines[position][:HISTORY_LINE_BYTES].decode("utf-8", "replace") + " ..."
-        out.append(line.replace("```", "'''"))
+            out.append(omitted_marker(position - previous - 1))
+        out.append(render_line(lines[position]))
         previous = position
     return "\n".join(out)
 
@@ -552,13 +625,15 @@ def read_test(run, directory):
     run.kind = "invalid" if verdict is False else "unknown"
 
 
-def find_tests(root):
+def find_tests(root, started=False):
     """Test directories (`<root>/.../<test>/<time>/results.edn`) below root, symlinks not
-    followed (`latest` and `current` point at a test already listed)."""
+    followed (`latest` and `current` point at a test already listed). With `started`, a
+    directory with a `jepsen.log` and no `results.edn` counts too: Jepsen began and died."""
     found = []
     for base, dirs, files in os.walk(root, followlinks=False):
         dirs.sort()
-        if "results.edn" in files and "jepsen.log" in files and not os.path.islink(base):
+        if ("results.edn" in files or started) and "jepsen.log" in files \
+                and not os.path.islink(base):
             found.append(base)
             dirs[:] = []
         if len(found) > TESTS_MAX:
@@ -582,6 +657,25 @@ def read_runs_file(path):
     return runs
 
 
+def settle_run(run, code, tests):
+    """The run's kind once its exit code is known (P235b). A verdict that was written
+    (invalid or unknown) outranks every exit code. Otherwise: the host's exit codes (124, 125,
+    126, 137) are the host's; no jepsen.log at all means Jepsen never started (the build,
+    Docker): the host's; a jepsen.log and no results.edn means the test threw (nerva died at
+    setup, say): Nerva's, fingerprint `<workload>|run|crashed`, with the log's end in the issue."""
+    if run.kind in ("invalid", "unknown"):
+        return
+    has_results = bool(tests) and os.path.exists(os.path.join(tests[0], "results.edn"))
+    if code in HOST_CODES:
+        run.kind, run.host_reason, run.findings = "host", HOST_CODES[code], []
+    elif not tests:
+        run.kind, run.host_reason = "host", f"exit {code} and Jepsen never started"
+    elif not has_results:
+        run.kind, run.host_reason = "crashed", None
+        run.findings = [("run", "crashed", None)]
+        run.results_text = read_tail(os.path.join(tests[0], "jepsen.log"), LOG_TAIL_BYTES)
+
+
 def read_night(store, runs_file):
     """(runs, night host failure or None)."""
     if not os.path.isdir(store):
@@ -602,27 +696,15 @@ def read_night(store, runs_file):
         for label, code, seconds, args in lines:
             run = Run(label)
             run.exit_code, run.seconds, run.args = code, seconds, args
-            tests = find_tests(os.path.join(store, label)) if os.path.isdir(
-                os.path.join(store, label)) else []
-            if code in HOST_CODES:
-                run.kind, run.host_reason = "host", HOST_CODES[code]
-                if tests:
-                    run.dir = tests[0]
-                    words = command_of(read_head(os.path.join(tests[0], "jepsen.log"),
-                                                 LOG_HEAD_BYTES)) or ["lein", "run"] + args
-                    run.workload = option(words, "workload") or run.workload
-                    run.nemesis = option(words, "nemesis") or ""
-                else:
-                    words = ["lein", "run"] + args
-                    run.workload = option(words, "workload") or run.workload
-                    run.nemesis = option(words, "nemesis") or ""
-            elif tests:
+            where = os.path.join(store, label)
+            tests = find_tests(where, started=True) if os.path.isdir(where) else []
+            if tests:
                 read_test(run, tests[0])
             else:
-                run.kind, run.host_reason = "host", f"exit {code} and no results.edn"
                 words = ["lein", "run"] + args
                 run.workload = option(words, "workload") or run.workload
                 run.nemesis = option(words, "nemesis") or ""
+            settle_run(run, code, tests)
             runs.append(run)
         return runs, failure
     for directory in find_tests(store):
@@ -658,7 +740,7 @@ def make_findings(run, canary):
     """The failures to report for a run: dicts with fingerprint, title, class, checker."""
     out = []
     if not canary:
-        if run.kind in ("invalid", "unknown"):
+        if run.kind in ("invalid", "unknown", "crashed"):
             for checker, name, subtree in run.findings:
                 out.append((checker, name, subtree))
         return [finding(run, canary, c, n, s) for c, n, s in out]
@@ -666,7 +748,7 @@ def make_findings(run, canary):
     if run.kind == "invalid" and "duplicate" in names:
         for checker, name, subtree in run.findings:
             out.append(finding(run, True, checker, name, subtree))
-    elif run.kind in ("invalid", "unknown", "valid"):
+    elif run.kind in ("invalid", "unknown", "valid", "crashed"):
         # Whatever else it saw is a real finding; the canary itself saw no duplicate.
         for checker, name, subtree in run.findings:
             out.append(finding(run, False, checker, name, subtree))
@@ -725,7 +807,13 @@ def report_text(item, commit, archive, first):
                          + (" -Dtest-commit-keys=off" if canary else "")
                          + f" && tests/jepsen/run.sh zig-out/bin/nerva {run.reproduce}"))
     verdict = bounded_text(run.results_text, VERDICT_BYTES)
-    if verdict:
+    if verdict and run.kind == "crashed":
+        out.append("")
+        out.append("The test died before it wrote a verdict (no `results.edn`): Jepsen threw, e.g."
+                   " `nerva` died while the test set it up. The end of `jepsen.log`:")
+        out.append("")
+        out.append(fence(verdict))
+    elif verdict:
         out.append("")
         out.append(f"Verdict (`results.edn`, at most {VERDICT_BYTES // 1024} KiB):")
         out.append("")
@@ -736,12 +824,18 @@ def report_text(item, commit, archive, first):
         tail = (f"\n<!-- jepsen fingerprint: {item['fingerprint']} -->\n"
                 f"<!-- jepsen key: {html_comment_safe(item['key'])} -->\n")
     room = min(HISTORY_BYTES_ISSUE, BODY_BYTES_MAX - len(text.encode()) - len(tail.encode()) - 1024)
-    text += history_text(item, room) + tail
-    assert len(text.encode()) <= BODY_BYTES_MAX
-    return text
+    text += history_text(item, room)
+    if len((text + tail).encode()) > BODY_BYTES_MAX:
+        # Cannot happen while the parts above are bounded; if one grows, cut the body, never die.
+        keep = BODY_BYTES_MAX - len(tail.encode()) - 64
+        text = text.encode()[:keep].decode("utf-8", "ignore") + "\n... (cut at the size bound)\n"
+    return text + tail
 
 
 def history_text(item, room):
+    """The history excerpt, at most `room` bytes as rendered (fence and note included): the
+    budget is lowered until the rendered text fits, and the excerpt is left out, with a line
+    saying so, rather than exceed it."""
     run = item["run"]
     if item["subtree"] is None or not run.history_path or room < 1024:
         return ""
@@ -750,13 +844,22 @@ def history_text(item, room):
     anomalies = anomalous_lines(lines, keys, numbers) if lines else []
     if not anomalies:
         return "\nThe history: no operation could be tied to the verdict's examples.\n"
-    positions, radius, complete = select_lines(lines, anomalies, room - 512)
-    note = f"{len(anomalies)} anomalous operations, {radius} operations of context on each side" \
-        if complete else f"the first {len(positions)} of {len(anomalies)} anomalous operations, " \
-        "no context (the excerpt budget)"
-    return (f"\nThe history (`history.edn`, {note}; at most {HISTORY_BYTES_ISSUE // 1024} KiB"
-            + ("; the file was read only up to its bound" if cut else "") + "):\n\n"
-            + fence(render_excerpt(lines, positions)) + "\n")
+    budget = room - 512
+    for _ in range(HISTORY_FIT_TRIES):
+        if budget < 256:
+            break
+        positions, radius, complete = select_lines(lines, anomalies, budget)
+        note = f"{len(anomalies)} anomalous operations, {radius} operations of context on each " \
+            "side" if complete else f"the first {len(positions)} of {len(anomalies)} anomalous " \
+            "operations, no context (the excerpt budget)"
+        text = (f"\nThe history (`history.edn`, {note}; at most {HISTORY_BYTES_ISSUE // 1024} KiB"
+                + ("; the file was read only up to its bound" if cut else "") + "):\n\n"
+                + fence(render_excerpt(lines, positions)) + "\n")
+        over = len(text.encode()) - room
+        if over <= 0:
+            return text
+        budget -= over + 64
+    return "\nThe history: the excerpt would not fit the issue's size bound; see the store.\n"
 
 
 # ------------------------------------------------------------------------------------------------
@@ -768,7 +871,7 @@ def ymd(now):
 
 
 def new_state():
-    return {"version": STATE_VERSION, "filed": {}, "days": {}}
+    return {"version": STATE_VERSION, "filed": {}, "days": {}, "verdicts": {}}
 
 
 def load_state(path):
@@ -789,9 +892,14 @@ def load_state(path):
         raise Environment(f"the state file {path} is not JSON: {err}")
     if not isinstance(state, dict) or state.get("version") != STATE_VERSION:
         raise Environment(f"the state file {path} is not version {STATE_VERSION}")
-    for key in ("filed", "days"):
+    state.setdefault("verdicts", {})  # Added after the first state files: optional.
+    for key in ("filed", "days", "verdicts"):
         if not isinstance(state.get(key), dict):
             raise Environment(f"the state file {path} has no valid `{key}`")
+    # A dry run once saved the issue numbers it made up (negative): they are not issues.
+    state["filed"] = {fp: entry for fp, entry in state["filed"].items()
+                      if isinstance(entry, dict) and isinstance(entry.get("issue"), int)
+                      and entry["issue"] > 0}
     if len(state["filed"]) > FILED_MAX:
         raise Environment(f"the state file {path} remembers more than {FILED_MAX} failures")
     return state
@@ -807,6 +915,25 @@ def save_state(path, state):
         file.flush()
         os.fsync(file.fileno())
     os.replace(temporary, path)
+
+
+def settle_status(state, commit, context, new, today):
+    """The status to post for a commit, or None to leave the one it has (P235b): a commit's
+    status only ever moves up error < success < failure, so a later night on the same commit
+    (or a night that could not run) never turns a failure green or a success into an error."""
+    old = state["verdicts"].get(f"{commit}:{context}")
+    if old is not None and STATUS_RANK[old["state"]] >= STATUS_RANK[new]:
+        return None
+    return new
+
+
+def record_status(state, commit, context, new, today):
+    """Remembers a status that GitHub accepted."""
+    verdicts = state["verdicts"]
+    verdicts[f"{commit}:{context}"] = {"state": new, "day": today}
+    while len(verdicts) > VERDICTS_MAX:
+        oldest = min(verdicts, key=lambda k: (verdicts[k]["day"], k))
+        del verdicts[oldest]
 
 
 def day_of(state, today):
@@ -832,6 +959,7 @@ def see(day, fingerprint):
 
 
 def remember(state, fingerprint, number, first_commit, last_commit):
+    assert number > 0
     if fingerprint not in state["filed"] and len(state["filed"]) >= FILED_MAX:
         oldest = min(state["filed"], key=lambda fp: state["filed"][fp]["issue"])
         del state["filed"][oldest]
@@ -999,7 +1127,7 @@ def night_state(runs, host_failure, canary):
         if "host" in kinds:
             return "error", f"the host's: {kinds.count('host')} of {total} run(s) did not finish"
         return "success", f"canary: Jepsen saw the duplicate in {total} of {total} run(s)"
-    bad = [r for k, r in verdicts if k in ("invalid", "unknown")]
+    bad = [r for k, r in verdicts if k in ("invalid", "unknown", "crashed")]
     if bad:
         return "failure", f"{len(bad)} of {total} run(s) invalid or unknown: " + ", ".join(
             sorted({r.workload for r in bad}))
@@ -1023,7 +1151,8 @@ def tracker_text(today, commit, runs, host_failure, state_name, description, fil
     return "\n".join(out) + "\n"
 
 
-def ingest(github, state, runs, host_failure, commit, tracker, archive, canary, now, repo, log):
+def ingest(github, state, runs, host_failure, commit, tracker, archive, canary, now, repo, log,
+           status=True):
     """Counts the night, sets its status, files or comments, posts the day. Returns a summary
     dict. Stops the writes at the first rate limit or unreachable GitHub."""
     summary = {"filed": 0, "commented": 0, "throttled": 0, "dropped": 0, "forbidden": 0,
@@ -1034,6 +1163,11 @@ def ingest(github, state, runs, host_failure, commit, tracker, archive, canary, 
     day["commit"] = commit
     state_name, description = night_state(runs, host_failure, canary)
     summary["status"] = state_name
+    posted = settle_status(state, commit, CONTEXT_CANARY if canary else CONTEXT_NIGHTLY,
+                           state_name, today) if status else None
+    if posted is None:
+        summary["status"] = f"{state_name} (not posted: " + (
+            "no status for this night)" if not status else "the commit keeps a better-ranked one)")
     items = []
     if host_failure is None:
         for run in runs:
@@ -1045,12 +1179,16 @@ def ingest(github, state, runs, host_failure, commit, tracker, archive, canary, 
     context = CONTEXT_CANARY if canary else CONTEXT_NIGHTLY
     target = None
     try:
-        github.status(commit, state_name, context, description, target)
+        if posted is not None:
+            github.status(commit, state_name, context, description, target)
+            record_status(state, commit, context, state_name, today)
         for fingerprint, group in groups.items():
             report_group(github, state, group[0], seen[fingerprint], commit, archive, summary)
         if tracker is not None and not day["reported"]:
+            note = description if status else (
+                f"{description}; no status posted, the commit is the last the host knew")
             github.comment(tracker, tracker_text(today, commit, runs, host_failure, state_name,
-                                                 description, summary["numbers"]))
+                                                 note, summary["numbers"]))
             day["reported"] = True
             summary["tracker"] = True
     except GitHubError as err:
@@ -1094,7 +1232,8 @@ def report_group(github, state, item, seen, commit, archive, summary):
 def open_item(github, state, item, commit, archive, summary):
     assert item["fingerprint"] not in state["filed"]
     number = github.open(item["title"], report_text(item, commit, archive, first=True))
-    remember(state, item["fingerprint"], number, commit, commit)
+    if number > 0:  # a dry run's made-up numbers are never remembered
+        remember(state, item["fingerprint"], number, commit, commit)
     summary["filed"] += 1
     summary["numbers"].append(number)
 
@@ -1137,6 +1276,7 @@ def main(argv, now=None):
     cmd.add_argument("--tracker", type=int)
     cmd.add_argument("--expect-invalid", action="store_true")
     cmd.add_argument("--dry-run", action="store_true")
+    cmd.add_argument("--no-status", action="store_true")
     args = parser.parse_args(argv)
     now = int(time.time()) if now is None else now
 
@@ -1182,8 +1322,15 @@ def main(argv, now=None):
             return 2
         source = "a dry run reads no issues" if args.dry_run else "issue markers"
         log(f"the state file was missing: rebuilt from {len(state['filed'])} ({source})")
-    summary = ingest(github, state, runs, host_failure, args.commit, args.tracker, args.archive,
-                     args.expect_invalid, now, args.repo, log)
+    try:
+        summary = ingest(github, state, runs, host_failure, args.commit, args.tracker,
+                         args.archive, args.expect_invalid, now, args.repo, log,
+                         status=not args.no_status)
+    except Exception:
+        # Whatever was posted before the fault is remembered, so the next night does not repeat it.
+        with contextlib.suppress(OSError):
+            save_state(args.state, state)
+        raise
     try:
         save_state(args.state, state)
     except OSError as err:

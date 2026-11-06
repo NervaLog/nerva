@@ -27,17 +27,27 @@ set -euo pipefail
 
 log() { echo "jepsen-nightly: $*" >&2; }
 
+# `--dry-run` is `JEPSEN_DRY_RUN=1` (sudo drops the variable; a flag survives it).
+if [[ "${1:-}" == "--dry-run" ]]; then
+  JEPSEN_DRY_RUN=1
+  shift
+fi
+export JEPSEN_DRY_RUN
+
 # This file lives in the checkout the night then moves to the tip of main, and bash reads a
 # script as it runs: run a private copy, so the checkout cannot change the script under it.
+# Stage 1 fetches the tip; if the tip's nightly.sh differs from this one, stage 2 is a private
+# copy of the tip's, so the script and the reporter it calls are always the same commit's.
 if [[ -z "${JEPSEN_COPY_OF:-}" ]]; then
   copy=$(mktemp)
   cp "${BASH_SOURCE[0]}" "$copy"
-  JEPSEN_COPY_OF=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd) JEPSEN_COPY_PATH=$copy \
-    exec bash "$copy" "$@"
+  JEPSEN_STAGE=1 JEPSEN_COPY_OF=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd) \
+    JEPSEN_COPY_PATH=$copy exec bash "$copy" "$@"
 fi
 trap 'rm -f "${JEPSEN_COPY_PATH:-}"' EXIT
 here=$JEPSEN_COPY_OF
-night_start=$SECONDS
+stage=${JEPSEN_STAGE:-1}
+night_start=$((SECONDS - ${JEPSEN_ELAPSED:-0}))
 mkdir -p "$JEPSEN_HOME"/{archive,state,nights}
 
 # One night at a time. A second start (the timer while a run is late, or by hand) leaves quietly.
@@ -47,11 +57,21 @@ if ! flock -n 9; then
   exit 0
 fi
 
-date_utc=$(date -u +%Y-%m-%d)
-night="$JEPSEN_HOME/nights/$date_utc"
-rm -rf "$night"
-mkdir -p "$night/store"
-: > "$night/store/runs"
+# A dry run has a night, an archive and a state of its own: it never touches the real ones.
+date_utc=${JEPSEN_DATE:-$(date -u +%Y-%m-%d)}
+suffix=""
+state_file="$JEPSEN_HOME/state/state.json"
+if [[ -n "$JEPSEN_DRY_RUN" ]]; then
+  suffix="-dry"
+  state_file="$JEPSEN_HOME/state/dry-run.json"
+fi
+night="$JEPSEN_HOME/nights/$date_utc$suffix"
+if ((stage == 1)); then
+  rm -rf "$night"
+  [[ -z "$suffix" ]] || rm -f "$state_file"
+  mkdir -p "$night/store"
+  : > "$night/store/runs"
+fi
 
 # Seconds left in the night, never below 1 (`timeout 0` means no limit).
 remaining() {
@@ -65,19 +85,27 @@ host_failure() {
   log "the host's: $1"
 }
 
-# Fetches and builds the tip of main; sets $commit. Returns 1, with host-failure written, if it
-# cannot.
-prepare() {
+# Fetches the tip of main and checks it out; sets $commit and $fetched. Returns 1, with
+# host-failure written, if it cannot. Every step is checked by hand: `set -e` is off in a
+# function called from a condition.
+fetch_tip() {
   if [[ ! -d "$JEPSEN_REPO_DIR/.git" ]]; then
     timeout "$(remaining)" git clone --quiet "$JEPSEN_REMOTE" "$JEPSEN_REPO_DIR" \
       || { host_failure "git clone failed"; return 1; }
   fi
-  cd "$JEPSEN_REPO_DIR"
+  cd "$JEPSEN_REPO_DIR" || { host_failure "cannot enter $JEPSEN_REPO_DIR"; return 1; }
   timeout "$(remaining)" git fetch --quiet origin "$JEPSEN_BRANCH" \
     || { host_failure "git fetch failed"; return 1; }
-  git checkout --quiet --detach FETCH_HEAD
-  commit=$(git rev-parse HEAD)
-  echo "$commit" > "$night/commit"
+  git checkout --quiet --detach FETCH_HEAD \
+    || { host_failure "git checkout of the fetched tip failed"; return 1; }
+  fetched=1
+  commit=$(git rev-parse HEAD) || { host_failure "git rev-parse failed"; return 1; }
+  echo "$commit" > "$night/commit" || { host_failure "cannot write $night/commit"; return 1; }
+}
+
+# Builds the checked-out tip.
+build_tip() {
+  cd "$JEPSEN_REPO_DIR" || { host_failure "cannot enter $JEPSEN_REPO_DIR"; return 1; }
   if ! { timeout "$(remaining)" ./zig/download.sh \
          && timeout "$(remaining)" ./zig/zig build -Drelease; } > "$night/build.log" 2>&1; then
     host_failure "the build of $commit failed (build.log on the host)"
@@ -104,7 +132,9 @@ run() {
 }
 
 report() {
-  local args=(ingest --store "$night/store" --commit "$commit" --state "$JEPSEN_HOME/state/state.json")
+  local args=(ingest --store "$night/store" --commit "$commit" --state "$state_file")
+  # A night that did not fetch the tip tested nothing: no status on the commit it knew before.
+  ((fetched)) || args+=(--no-status)
   [[ -z "$archive" ]] || args+=(--archive "$archive")
   [[ -z "$JEPSEN_TRACKER" ]] || args+=(--tracker "$JEPSEN_TRACKER")
   [[ -z "$JEPSEN_EXPECT_INVALID" ]] || args+=(--expect-invalid)
@@ -117,8 +147,25 @@ report() {
 }
 
 commit=""
-archive="$JEPSEN_HOME/archive/$date_utc.tar.zst"
-if prepare; then
+fetched=0
+archive="$JEPSEN_HOME/archive/$date_utc$suffix.tar.zst"
+ready=0
+if ((stage == 2)); then
+  commit=$(cat "$night/commit") && fetched=1 && ready=1
+  cd "$JEPSEN_REPO_DIR"
+elif fetch_tip; then
+  tip="$JEPSEN_REPO_DIR/ops/jepsen/nightly.sh"
+  if [[ -f "$tip" ]] && ! cmp -s "$tip" "${BASH_SOURCE[0]}"; then
+    next=$(mktemp)
+    cp "$tip" "$next"
+    rm -f "$JEPSEN_COPY_PATH"
+    log "running the tip's nightly.sh"
+    JEPSEN_STAGE=2 JEPSEN_DATE=$date_utc JEPSEN_ELAPSED=$((SECONDS - night_start)) JEPSEN_COPY_PATH=$next \
+      JEPSEN_COPY_OF="$JEPSEN_REPO_DIR/ops/jepsen" exec bash "$next" "$@"
+  fi
+  ready=1
+fi
+if ((ready)) && build_tip; then
   n=0
   for workload in $JEPSEN_WORKLOADS; do
     n=$((n + 1))
@@ -128,7 +175,8 @@ if prepare; then
   done
 fi
 if [[ -z "$commit" ]]; then
-  # Even a night that could not fetch is reported, against the last commit the host knows.
+  # Even a night that could not fetch is reported (the tracker's line), against the last commit
+  # the host knows, and with no status: it tested nothing.
   commit=$(git -C "$JEPSEN_REPO_DIR" rev-parse HEAD 2> /dev/null || true)
 fi
 
