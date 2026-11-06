@@ -16,11 +16,17 @@
             [jepsen.nemesis.combined :as combined]
             [jepsen.nerva [bank :as bank]
                           [db :as db]
-                          [http :as http]])
+                          [http :as http]
+                          [retry :as retry]])
   (:gen-class))
 
 (def workloads
-  {:bank bank/workload})
+  {:bank  bank/workload
+   :retry retry/workload})
+
+(def default-gateways
+  "Gateways per node when --gateways is not given: `retry` resends to another gateway."
+  {:bank 1, :retry 2})
 
 (def faults
   "The faults --nemesis may name."
@@ -54,6 +60,7 @@
   "A test map from CLI options."
   [opts]
   (let [workload ((workloads (:workload opts)) opts)
+        opts     (assoc opts :gateways (or (:gateways opts) (default-gateways (:workload opts))))
         db       (db/db (:bootstrap workload))
         package  (nemesis-package opts db)]
     (merge tests/noop-test
@@ -102,10 +109,17 @@
    [nil "--recovery-time SECONDS" "Seconds between healing and the final reads."
     :default  20
     :parse-fn parse-long]
-   [nil "--gateways N" "Gateways per node: 1, or 2 (ports 8080 and 8081), as R4's sidecars."
-    :default  1
+   [nil "--gateways N" "Gateways per node: 1, or 2 (ports 8080 and 8081), as R4's sidecars. Default: 2 for retry, else 1."
     :parse-fn parse-long
     :validate [#{1 2} "Must be 1 or 2"]]
+   [nil "--drop-reply P" "retry: the probability that the client discards a 200 and resends."
+    :default  0.1
+    :parse-fn parse-double
+    :validate [#(<= 0 % 1) "Must be between 0 and 1"]]
+   [nil "--attempts N" "retry: attempts per operation before it ends unresolved."
+    :default  8
+    :parse-fn parse-long
+    :validate [pos? "Must be positive"]]
    [nil "--nerva-binary PATH" "The nerva binary to install on every node."
     :default "../../zig-out/bin/nerva"]])
 

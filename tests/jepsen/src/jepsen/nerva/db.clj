@@ -110,17 +110,22 @@
 
 (defn start-api!
   "Starts the test's gateways. The control node reaches them over the network, so they listen
-  on every address and say so: `--listen-remote` (P168, NRV-E0009)."
+  on every address and say so: `--listen-remote` (P168, NRV-E0009). A test's `:request-timeout`
+  (milliseconds) becomes their `--request-timeout`."
   [test]
   (doseq [index (range (gateways test))]
-    (cu/start-daemon! {:logfile           (gateway-log index)
-                       :pidfile           (gateway-pidfile index)
-                       :chdir             dir
-                       :match-executable? false
-                       :env               {:NERVA_KEY http/api-key}}
-                      binary :api (str "--cluster=" cluster) (str "--addresses=" (addresses test))
-                      (str "--listen=0.0.0.0:" (gateway-port index))
-                      :--listen-remote)))
+    (apply cu/start-daemon!
+           {:logfile           (gateway-log index)
+            :pidfile           (gateway-pidfile index)
+            :chdir             dir
+            :match-executable? false
+            :env               {:NERVA_KEY http/api-key}}
+           (concat [binary :api (str "--cluster=" cluster)
+                    (str "--addresses=" (addresses test))
+                    (str "--listen=0.0.0.0:" (gateway-port index))
+                    :--listen-remote]
+                   (when-let [ms (:request-timeout test)]
+                     [(str "--request-timeout=" ms)])))))
 
 (defn kill-all!
   "SIGKILLs the gateways and the replica. The pidfile of a gateway the test did not start is

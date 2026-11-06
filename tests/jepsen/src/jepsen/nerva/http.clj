@@ -43,10 +43,13 @@
 
 (defn request!
   "Sends one request to node's gateway. Returns {:status int, :body parsed JSON or nil}.
-  Throws an IOException when no reply arrives. With a port, sends it to that gateway."
+  Throws an IOException when no reply arrives. With a port, sends it to that gateway; with a
+  timeout (milliseconds), gives up on the reply after that long instead of `timeout-ms`."
   ([node method path body]
    (request! node api-port method path body))
   ([node port method path body]
+   (request! node port method path body timeout-ms))
+  ([node port method path body timeout-ms]
    (let [publisher (if (nil? body)
                      (HttpRequest$BodyPublishers/noBody)
                      (HttpRequest$BodyPublishers/ofString (json/write-str body)))
