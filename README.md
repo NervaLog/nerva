@@ -432,7 +432,9 @@ statsd format with DogStatsD tags (`|#cluster:…,replica:N`). `--trace=<path>` 
 trace for [Perfetto](https://ui.perfetto.dev) or `chrome://tracing` to a new file (it refuses
 an existing one); tracing slows the replica, so use it to diagnose, not to time. The trace is
 written 64 KiB at a time and stops at `--trace-size-max` (default 1 GiB), or if writing it fails,
-with a warning in the log; the replica runs on (N71). The metrics most useful for performance work:
+with a warning in the log; the replica runs on (N71). A `--statsd` address this host cannot send to
+(no route to it, or a broadcast address) refuses the start with `error[NRV-E0010]`, before the
+replica's vendored open. The metrics most useful for performance work:
 
 | Metric | What it measures |
 |---|---|
