@@ -65,11 +65,6 @@ jobs:
   ci:
     needs: version
     uses: ./.github/workflows/ci.yml
-    # ci.yml's `changes` job asks for pull-requests: read; a called workflow cannot hold more
-    # than its caller grants.
-    permissions:
-      contents: read
-      pull-requests: read
 
   release:
     needs: [version, ci]
