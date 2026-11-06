@@ -17,3 +17,7 @@ cause keeps ERRORS.md short.
 **Cost.** The code's wording now covers two commands; the first words of the line (`start:` or
 `api:`) tell them apart. Any non-memory error from the tracer's setup with `--statsd` set is
 reported this way, which is right today because only the statsd socket can fail there.
+
+Unlike the gateway, `start` also refuses an address the host has no route to ("the network is
+unreachable"): the vendored `StatsD.init_udp` connects its socket. Tolerating that needs a
+vendored patch and is left to its own issue.
