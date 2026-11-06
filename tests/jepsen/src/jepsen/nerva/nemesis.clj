@@ -184,34 +184,49 @@
     {:name "gateway-pause", :start #{:gateway-pause}, :stop #{:gateway-resume}
      :color "#A0E9C4"}})
 
+(defn final-starts
+  "The final phase's `gateway-start` ops in `history`, paired by process: `{:done [completion
+  ...], :open [invocation ...]}`. Jepsen emits a nemesis invocation and its completion both as
+  `:info`, and a completion keeps the invocation's `:value`, so the first final start of a
+  process is an invocation and the next one its completion. An invocation left without one
+  (the run ended, or the history was cut) is `:open`."
+  [history]
+  (let [r (reduce (fn [{:keys [open] :as acc} o]
+                    (let [p (:process o)]
+                      (if (contains? open p)
+                        (-> acc (update :done conj o) (update :open dissoc p))
+                        (assoc-in acc [:open p] o))))
+                  {:open {}, :done []}
+                  (filter #(and (= :gateway-start (:f %)) (:final? (:value %))) history))]
+    {:done (:done r), :open (vec (vals (:open r)))}))
+
 (defn final-start-checker
   "Invalid when the final phase's `gateway-start` (`:final? true`) left a gateway not up or did
-  not finish: a completion with an `:exception` (Jepsen turns a throw into an `:info` op that
-  its own checkers count as valid), a non-empty `:down` or `:pending`, or an `:error` (a node
-  whose start threw). The result names the gateways and NRV-E0604: a gateway that cannot reach
-  the cluster after the heal and the replicas' restart is a Nerva availability finding (P238c)."
+  not finish: an invocation with no completion, or a completion with an `:exception` (Jepsen
+  turns a throw into an `:info` op that its own checkers count as valid), a non-empty `:down` or
+  `:pending`, or an `:error` (a node whose start threw). `:final-starts` counts completions.
+  The result names the gateways and NRV-E0604: a gateway that cannot reach the cluster after the
+  heal and the replicas' restart is a Nerva availability finding (P238c, P244)."
   []
   (reify checker/Checker
     (check [_ _test history _opts]
-      (let [finals   (filter #(and (= :gateway-start (:f %))
-                                   (not= :invoke (:type %))
-                                   (:final? (:value %)))
-                             history)
+      (let [{:keys [done open]} (final-starts history)
             bad      (filter #(or (:exception %)
                                   (seq (:down (:value %)))
                                   (seq (:pending (:value %)))
                                   (seq (:error (:value %))))
-                             finals)
+                             done)
             gateways (vec (distinct (mapcat #(concat (:down (:value %)) (:pending (:value %)))
                                             bad)))]
-        (cond-> {:valid?       (empty? bad)
-                 :final-starts (count finals)}
-          (seq bad) (assoc :code       "NRV-E0604"
-                           :gateways   gateways
-                           :errors     (vec (mapcat #(:error (:value %)) bad))
-                           :exceptions (vec (keep #(let [e (:exception %)]
-                                                        (and e (or (:cause e) (str e))))
-                                                  bad))))))))
+        (cond-> {:valid?       (and (empty? bad) (empty? open))
+                 :final-starts (count done)}
+          (seq open) (assoc :code "NRV-E0604" :incomplete (count open))
+          (seq bad)  (assoc :code       "NRV-E0604"
+                            :gateways   gateways
+                            :errors     (vec (mapcat #(:error (:value %)) bad))
+                            :exceptions (vec (keep #(let [e (:exception %)]
+                                                         (and e (or (:cause e) (str e))))
+                                                   bad))))))))
 
 (def order
   "The faults in the order their undos run: resume, heal, then start."
@@ -228,6 +243,12 @@
   (let [ops (mapv #(op (opposite %) (cond-> undo-value final? (assoc :final? true))) faults)]
     (when (seq ops) ops)))
 
+(defn final-start?
+  "Whether the final phase starts and judges every gateway: when the run can leave one down, by
+  `gateway-kill` or by the replica `kill` nemesis (whose `:start` only settles briefly, P244)."
+  [opts]
+  (boolean (or (some #{:gateway-kill} (used opts)) (contains? (:faults opts) :kill))))
+
 (defn heal-package
   "Only a final generator: resume and heal. It is listed before `combined/db-package`, whose
   final `:start` waits on every gateway: a paused or cut-off one would hold it up."
@@ -237,7 +258,8 @@
 
 (defn package
   "A nemesis package for the gateway faults in `(:faults opts)` (`:gateway`, or any of
-  `faults`). Its final generator starts every gateway that is not up, retrying
+  `faults`). Its final generator, when the run can leave a gateway down (`final-start?`: also
+  under the replica `kill` nemesis), starts every gateway that is not up, retrying
   (`:final? true`); `heal-package` resumes and heals first, and it is listed after the replica
   packages, so gateways start once replicas do."
   [opts]
@@ -245,6 +267,6 @@
     {:generator       (when (seq used)
                        (gen/stagger (:interval opts combined/default-interval)
                                     (gen/mix (mapv fault-generator used))))
-     :final-generator (undo-ops (filterv #{:gateway-kill} used) true)
+     :final-generator (when (final-start? opts) (undo-ops [:gateway-kill] true))
      :nemesis         (nemesis)
      :perf            (into #{} (filter #(contains? (set used) (first (:start %)))) perf)}))
