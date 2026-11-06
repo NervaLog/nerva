@@ -135,6 +135,19 @@ def main():
         check("trace exists", ["start", "--addresses=127.0.0.1:1,127.0.0.1:2,127.0.0.1:3",
                                "--development", "--trace=" + trace, data],
               "NRV-E0004", 1, "--trace")
+        # A --statsd address this host cannot send to is the operator's: E0010 naming the flag,
+        # never B0004 (a broadcast address) or E0007 "cannot listen" (no IPv6) (#181, #184).
+        statsd_bad = ["255.255.255.255:8125"]
+        try:
+            socket.socket(socket.AF_INET6, socket.SOCK_DGRAM).close()
+        except OSError:
+            statsd_bad.append("[2001:db8::1]:8125")  # a host without IPv6 has no such socket
+        for statsd in statsd_bad:
+            result = run(nerva, ["start", "--addresses=127.0.0.1:1,127.0.0.1:2,127.0.0.1:3",
+                                 "--development", f"--statsd={statsd}", data], {})
+            expect(result, "NRV-E0010", 1, "start: cannot send statsd to", f"start statsd {statsd}")
+            assert "cannot listen" not in result.stderr and "NRV-B0004" not in result.stderr
+            seen.append("NRV-E0010")
 
 
         # Pre-flight before the vendored open (R5, P149): nothing here may panic or write.
