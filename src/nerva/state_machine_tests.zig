@@ -46,7 +46,12 @@ const Context = struct {
     forest_busy: bool = false,
     superblock_context: SuperBlock.Context = undefined,
 
-    fn init(context: *Context, arena: std.mem.Allocator, batch_size_limit: u32) !void {
+    fn init(
+        context: *Context,
+        arena: std.mem.Allocator,
+        batch_size_limit: u32,
+        commit_keys_deduplicate: bool,
+    ) !void {
         context.* = .{
             .arena = arena,
             .storage = try fixtures.init_storage(arena, .{
@@ -72,6 +77,7 @@ const Context = struct {
         try context.state_machine.init(arena, context.time_sim.interface(), &context.grid, .{
             .batch_size_limit = batch_size_limit,
             .lsm_forest_node_count = 1024,
+            .commit_keys_deduplicate = commit_keys_deduplicate,
         });
         context.forest_busy = true;
         context.state_machine.open(forest_callback);
@@ -448,7 +454,14 @@ fn context_init(arena: *std.heap.ArenaAllocator) !*Context {
 /// A state machine whose clients send batches of at most `batch_size_limit` bytes.
 fn context_init_sized(arena: *std.heap.ArenaAllocator, batch_size_limit: u32) !*Context {
     const context = try arena.allocator().create(Context);
-    try context.init(arena.allocator(), batch_size_limit);
+    try context.init(arena.allocator(), batch_size_limit, true);
+    return context;
+}
+
+/// A state machine of the test build `-Dtest-commit-keys=off` (R1): a resent key commits again.
+fn context_init_keys_off(arena: *std.heap.ArenaAllocator) !*Context {
+    const context = try arena.allocator().create(Context);
+    try context.init(arena.allocator(), constants.message_body_size_max, false);
     return context;
 }
 
@@ -620,6 +633,79 @@ test "commit: invalid entries abort the transaction" {
     // Nothing was applied by any of the above.
     try testing.expectEqual(@as(u64, 0), (try context.lookup(1, 1)).op);
     try testing.expectEqual(@as(usize, 1), (try context.changes(0, 10)).len); // Just `end`.
+}
+
+test "commit key off: a resent transaction commits again, at a later op" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const context = try context_init_keys_off(&arena);
+
+    const key: u128 = 0x0123_4567_89ab_cdef_0123_4567_89ab_cdef;
+    const transaction = [_]Entry{
+        nerva.commit_key_entry(key),
+        add(1, 1, 0, 5, .{ .create = true }),
+    };
+    const first = try context.commit(&.{&transaction});
+    try expect_statuses(first[0], &.{ .ok, .ok });
+    const second = try context.commit(&.{&transaction});
+    try expect_statuses(second[0], &.{ .ok, .ok });
+    try testing.expect(second[0][0].op > first[0][0].op);
+    try testing.expectEqual(@as(u64, 10), field(try context.lookup(1, 1), 0));
+
+    // The key's row holds the second op, and is otherwise the row a first commit writes.
+    const row = try context.lookup(nerva.table_commit_keys, nerva.commit_key_id(key));
+    try testing.expect(row.flags.exists);
+    try testing.expectEqual(second[0][0].op, row.op);
+    const stored = std.mem.bytesToValue(nerva.CommitKey, &row.value);
+    try testing.expectEqual(key, stored.key);
+    try testing.expectEqual(@as(u32, 1), stored.entry_count);
+
+    // Twice in one request: both commit, at two ops.
+    const twice = try context.commit(&.{ &transaction, &transaction });
+    try expect_statuses(twice[0], &.{ .ok, .ok });
+    try expect_statuses(twice[1], &.{ .ok, .ok });
+    try testing.expectEqual(@as(u64, 20), field(try context.lookup(1, 1), 0));
+}
+
+test "commit key off: the views admission counts the second commit" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    inline for (.{ true, false }) |deduplicate| {
+        const context = if (deduplicate)
+            try context_init(&arena)
+        else
+            try context_init_keys_off(&arena);
+        const declared = try context.declare(revenue_view("revenue"));
+        try testing.expectEqual(nerva.DeclareStatus.created, declared.status);
+        try expect_statuses((try context.commit(&.{&.{seat(1, 1, 0, true)}}))[0], &.{.ok});
+        try testing.expect(context.pulse_until_ready() > 0);
+
+        const keyed = [_]Entry{
+            nerva.commit_key_entry(77),
+            add(5, 1, 8, 10, .{}),
+        };
+        for (0..2) |_| _ = try context.commit(&.{&keyed});
+        // The second commit's admission, which the op still holds: with deduplication on, the
+        // resent key's groups are not counted or prefetched (it writes nothing); with it off
+        // they are, or an evicted group would be rebuilt from zero.
+        try testing.expectEqual(
+            @as(u32, if (deduplicate) 0 else 1),
+            context.state_machine.view_op_keys.count(),
+        );
+        const records = try context.view(.{
+            .view_id = declared.view_id,
+            .group_hash_min = 0,
+            .limit = 10,
+        });
+        try testing.expectEqual(nerva.ViewState.ready, records[0].state);
+        // One group (section 1): the price summed is 10 once, 20 if the key committed twice.
+        try testing.expectEqual(@as(usize, 2), records.len);
+        try testing.expectEqual(@as(u64, 1), records[1].count);
+        try testing.expectEqual(
+            @as(i128, if (deduplicate) 10 else 20),
+            std.mem.readInt(i128, &records[1].sums[1], .little),
+        );
+    }
 }
 
 test "commit key: a resent transaction commits once, at its first op" {
