@@ -176,8 +176,9 @@ pub fn cleanup_register(path: []const u8, file: std.fs.File) void {
 
 /// The command got past startup: the file is the operator's now.
 pub fn cleanup_clear() void {
-    cleanup_signals_restore();
+    // Registration first: a signal between the two steps must not unlink the operator's file.
     cleanup_path_length = 0;
+    cleanup_signals_restore();
 }
 
 fn cleanup_signals_install() void {
@@ -305,6 +306,7 @@ fn cleanup_reason(err: anyerror) []const u8 {
         error.NameTooLong,
         error.ReadOnlyFileSystem,
         => file_reason(err),
+        error.SymLinkLoop => "a symbolic link in its path loops",
         else => "the system refused",
     };
 }
@@ -513,6 +515,10 @@ test "cleanup: a parent that became a file is not an error, a path that cannot b
     cleanup_run();
     try testing.expectEqualStrings("it is a directory", cleanup_reason(error.IsDir));
     try testing.expectEqualStrings("a parent of it is not a directory", cleanup_reason(error.NotDir));
+    try testing.expectEqualStrings(
+        "a symbolic link in its path loops",
+        cleanup_reason(error.SymLinkLoop),
+    );
     try testing.expectEqualStrings("the system refused", cleanup_reason(error.FileBusy));
 }
 
@@ -643,6 +649,55 @@ test "cleanup: the signal path unlinks by the fixed buffer, and only our file" {
     try testing.expect(!cleanup_unlink_raw());
     try tmp.dir.access("trace", .{});
     cleanup_clear();
+}
+
+/// Forks a child that registers `trace` in `dir`, then runs `act`; returns how the child ended.
+fn cleanup_child(dir: std.fs.Dir, comptime act: fn () void) !u32 {
+    const pid = try std.posix.fork();
+    if (pid == 0) {
+        const file = dir.createFile("trace", .{ .exclusive = true }) catch std.posix.exit(3);
+        var buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const path = dir.realpath("trace", &buffer) catch std.posix.exit(3);
+        cleanup_register(path, file);
+        act();
+        std.posix.exit(4); // Not reached: `act` must kill the process.
+    }
+    return std.posix.waitpid(pid, 0).status;
+}
+
+fn cleanup_child_term() void {
+    std.posix.raise(std.posix.SIG.TERM) catch {};
+}
+
+fn cleanup_child_int() void {
+    std.posix.raise(std.posix.SIG.INT) catch {};
+}
+
+fn cleanup_child_panic() void {
+    panic("cleanup test panic", null);
+}
+
+test "cleanup: SIGTERM and SIGINT remove the file and still kill the process" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const term = try cleanup_child(tmp.dir, cleanup_child_term);
+    try testing.expect(std.posix.W.IFSIGNALED(term));
+    try testing.expectEqual(@as(u32, std.posix.SIG.TERM), std.posix.W.TERMSIG(term));
+    try testing.expectError(error.FileNotFound, tmp.dir.access("trace", .{}));
+
+    const interrupt = try cleanup_child(tmp.dir, cleanup_child_int);
+    try testing.expect(std.posix.W.IFSIGNALED(interrupt));
+    try testing.expectEqual(@as(u32, std.posix.SIG.INT), std.posix.W.TERMSIG(interrupt));
+    try testing.expectError(error.FileNotFound, tmp.dir.access("trace", .{}));
+}
+
+test "cleanup: a panic removes the file and still ends the process abnormally" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const status = try cleanup_child(tmp.dir, cleanup_child_panic);
+    try testing.expect(std.posix.W.IFSIGNALED(status));
+    try testing.expectEqual(@as(u32, std.posix.SIG.ABRT), std.posix.W.TERMSIG(status));
+    try testing.expectError(error.FileNotFound, tmp.dir.access("trace", .{}));
 }
 
 test "cleanup: handlers are installed while registered and restored after" {
