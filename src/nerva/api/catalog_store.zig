@@ -15,118 +15,126 @@ const LayoutCache = @import("layout_cache.zig").LayoutCache;
 const Cached = @import("layout_cache.zig").Cached;
 const ViewPut = @import("api.zig").ViewPut;
 
-/// A declaration that keeps conflicting with others is refused after this many attempts.
+/// A declaration that keeps conflicting with others is refused after this many attempts, with
+/// `error.CatalogBusy`: the cluster answered every attempt, so it is no `Timeout` (#216).
 const attempts_max = 16;
 
-pub const CatalogStore = struct {
-    transaction: documents.Transaction,
-    /// Layouts kept between requests (P135); see `api.zig`, "Layouts".
-    cache: LayoutCache = .{},
+/// The catalog over the cluster client.
+pub const CatalogStore = CatalogStoreType(Client);
 
-    pub fn init(client: *Client) CatalogStore {
-        return .{ .transaction = .{
-            .client = client,
-            .table = catalog.table_catalog,
-            .namespace = 0,
-        } };
-    }
+/// The catalog over a client of type `ClientType` (`Client`, or a stub in tests).
+pub fn CatalogStoreType(comptime ClientType: type) type {
+    return struct {
+        const Self = @This();
+        transaction: documents.TransactionType(ClientType),
+        /// Layouts kept between requests (P135); see `api.zig`, "Layouts".
+        cache: LayoutCache = .{},
 
-    /// The layout of `table` as kept from an earlier read, a copy in `arena`.
-    pub fn layout_cached(self: *CatalogStore, arena: std.mem.Allocator, table: u32) !?Cached {
-        return self.cache.find(arena, table);
-    }
-
-    /// Reads the layout of `table` from the log, and keeps it if there is one.
-    pub fn layout_fresh(self: *CatalogStore, arena: std.mem.Allocator, table: u32) !LayoutRead {
-        self.transaction.begin(arena);
-        const layout_ = try layout_read(&self.transaction, arena, table);
-        const version = self.transaction.version(try layout_key(arena, table));
-        if (layout_) |*found| self.cache.store(table, version, found) else self.cache.forget(table);
-        return .{ .layout = layout_, .version = version };
-    }
-
-    /// The row of the catalog whose op is the version of `table`'s layout.
-    pub fn layout_probe(_: *const CatalogStore, table: u32) nerva.RowKey {
-        assert(table != 0 and table < catalog.tables_reserved_min);
-        var key: [32]u8 = undefined;
-        const text = std.fmt.bufPrint(&key, "table.{}", .{table}) catch unreachable;
-        return .{ .id = documents.row_id(0, text), .table = catalog.table_catalog };
-    }
-
-    /// Forgets everything kept: the cluster client was replaced.
-    pub fn cache_clear(self: *CatalogStore) void {
-        self.cache.clear();
-    }
-
-    pub fn layout(self: *CatalogStore, arena: std.mem.Allocator, table: u32) !?catalog.Layout {
-        self.transaction.begin(arena);
-        return layout_read(&self.transaction, arena, table);
-    }
-
-    pub fn layout_put(
-        self: *CatalogStore,
-        arena: std.mem.Allocator,
-        table: u32,
-        new: *const catalog.Layout,
-    ) !LayoutPut {
-        const key = try layout_key(arena, table);
-        const document = try catalog.layout_render(arena, new);
-        for (0..attempts_max) |_| {
-            self.transaction.begin(arena);
-            const old = try layout_read(&self.transaction, arena, table);
-            const outcome: LayoutPut = if (old == null)
-                .created
-            else if (!catalog.layout_extends(&old.?, new))
-                .incompatible
-            else if (old.?.fields.len == new.fields.len)
-                .unchanged
-            else
-                .extended;
-            if (outcome == .incompatible or outcome == .unchanged) return outcome;
-
-            try self.transaction.put(key, document);
-            switch (try self.transaction.commit()) {
-                .committed => {
-                    self.cache.forget(table);
-                    return outcome;
-                },
-                .conflict => log.info("table {}: layout conflict, retrying", .{table}),
-            }
+        pub fn init(client: *ClientType) Self {
+            return .{ .transaction = .{
+                .client = client,
+                .table = catalog.table_catalog,
+                .namespace = 0,
+            } };
         }
-        return error.Timeout;
-    }
 
-    pub fn view(self: *CatalogStore, arena: std.mem.Allocator, name: []const u8) !?catalog.View {
-        self.transaction.begin(arena);
-        return view_read(&self.transaction, arena, name);
-    }
-
-    pub fn view_put(
-        self: *CatalogStore,
-        arena: std.mem.Allocator,
-        name: []const u8,
-        new: *const catalog.View,
-    ) !ViewPut {
-        const key = try std.fmt.allocPrint(arena, "view.{s}", .{name});
-        const document = try catalog.view_render(arena, new);
-        for (0..attempts_max) |_| {
-            self.transaction.begin(arena);
-            if (try view_read(&self.transaction, arena, name)) |old| {
-                const same = std.mem.eql(u8, try catalog.view_render(arena, &old), document);
-                return if (same) .unchanged else .different;
-            }
-            try self.transaction.put(key, document);
-            switch (try self.transaction.commit()) {
-                .committed => return .created,
-                .conflict => log.info("view {s}: conflict, retrying", .{name}),
-            }
+        /// The layout of `table` as kept from an earlier read, a copy in `arena`.
+        pub fn layout_cached(self: *Self, arena: std.mem.Allocator, table: u32) !?Cached {
+            return self.cache.find(arena, table);
         }
-        return error.Timeout;
-    }
-};
+
+        /// Reads the layout of `table` from the log, and keeps it if there is one.
+        pub fn layout_fresh(self: *Self, arena: std.mem.Allocator, table: u32) !LayoutRead {
+            self.transaction.begin(arena);
+            const layout_ = try layout_read(&self.transaction, arena, table);
+            const version = self.transaction.version(try layout_key(arena, table));
+            if (layout_) |*found| self.cache.store(table, version, found) else self.cache.forget(table);
+            return .{ .layout = layout_, .version = version };
+        }
+
+        /// The row of the catalog whose op is the version of `table`'s layout.
+        pub fn layout_probe(_: *const Self, table: u32) nerva.RowKey {
+            assert(table != 0 and table < catalog.tables_reserved_min);
+            var key: [32]u8 = undefined;
+            const text = std.fmt.bufPrint(&key, "table.{}", .{table}) catch unreachable;
+            return .{ .id = documents.row_id(0, text), .table = catalog.table_catalog };
+        }
+
+        /// Forgets everything kept: the cluster client was replaced.
+        pub fn cache_clear(self: *Self) void {
+            self.cache.clear();
+        }
+
+        pub fn layout(self: *Self, arena: std.mem.Allocator, table: u32) !?catalog.Layout {
+            self.transaction.begin(arena);
+            return layout_read(&self.transaction, arena, table);
+        }
+
+        pub fn layout_put(
+            self: *Self,
+            arena: std.mem.Allocator,
+            table: u32,
+            new: *const catalog.Layout,
+        ) !LayoutPut {
+            const key = try layout_key(arena, table);
+            const document = try catalog.layout_render(arena, new);
+            for (0..attempts_max) |_| {
+                self.transaction.begin(arena);
+                const old = try layout_read(&self.transaction, arena, table);
+                const outcome: LayoutPut = if (old == null)
+                    .created
+                else if (!catalog.layout_extends(&old.?, new))
+                    .incompatible
+                else if (old.?.fields.len == new.fields.len)
+                    .unchanged
+                else
+                    .extended;
+                if (outcome == .incompatible or outcome == .unchanged) return outcome;
+
+                try self.transaction.put(key, document);
+                switch (try self.transaction.commit()) {
+                    .committed => {
+                        self.cache.forget(table);
+                        return outcome;
+                    },
+                    .conflict => log.info("table {}: layout conflict, retrying", .{table}),
+                }
+            }
+            return error.CatalogBusy;
+        }
+
+        pub fn view(self: *Self, arena: std.mem.Allocator, name: []const u8) !?catalog.View {
+            self.transaction.begin(arena);
+            return view_read(&self.transaction, arena, name);
+        }
+
+        pub fn view_put(
+            self: *Self,
+            arena: std.mem.Allocator,
+            name: []const u8,
+            new: *const catalog.View,
+        ) !ViewPut {
+            const key = try std.fmt.allocPrint(arena, "view.{s}", .{name});
+            const document = try catalog.view_render(arena, new);
+            for (0..attempts_max) |_| {
+                self.transaction.begin(arena);
+                if (try view_read(&self.transaction, arena, name)) |old| {
+                    const same = std.mem.eql(u8, try catalog.view_render(arena, &old), document);
+                    return if (same) .unchanged else .different;
+                }
+                try self.transaction.put(key, document);
+                switch (try self.transaction.commit()) {
+                    .committed => return .created,
+                    .conflict => log.info("view {s}: conflict, retrying", .{name}),
+                }
+            }
+            return error.CatalogBusy;
+        }
+    };
+}
 
 fn view_read(
-    transaction: *documents.Transaction,
+    transaction: anytype,
     arena: std.mem.Allocator,
     name: []const u8,
 ) !?catalog.View {
@@ -143,7 +151,7 @@ fn layout_key(arena: std.mem.Allocator, table: u32) ![]const u8 {
 }
 
 fn layout_read(
-    transaction: *documents.Transaction,
+    transaction: anytype,
     arena: std.mem.Allocator,
     table: u32,
 ) !?catalog.Layout {
@@ -204,4 +212,53 @@ test "CatalogStore: a layout or view call keeps the request's window and sends n
     try std.testing.expectEqual(@as(u64, 3), client.writes_sent);
     try std.testing.expectEqual(.idle, client.state);
     try std.testing.expectEqual(.commit, client.sending.?);
+}
+
+/// A client whose every commit conflicts, to show how often the store tries (#216).
+const ConflictClient = struct {
+    commits: u32 = 0,
+    vsr_client: struct { batch_size_limit: ?u32 } = .{
+        .batch_size_limit = @import("../../constants.zig").message_body_size_max,
+    },
+
+    pub fn lookup_rows(_: *ConflictClient, keys: []const nerva.RowKey, results: []nerva.RowValue) !void {
+        for (keys, results) |key, *result| {
+            result.* = .{
+                .id = key.id,
+                .table = key.table,
+                .flags = .{ .exists = false },
+                .op = 0,
+                .op_read = 1,
+                .value = @splat(0),
+            };
+        }
+    }
+
+    pub fn row_as_of(_: *ConflictClient, _: u32, _: u64, _: u64) !?nerva.Change {
+        unreachable; // Every document is absent: no tail is read.
+    }
+
+    pub fn commit(client: *ConflictClient, _: []const nerva.Entry, results: []nerva.EntryResult) !void {
+        client.commits += 1;
+        for (results) |*result| result.* = .{ .status = .conflict, .op = 0 };
+    }
+};
+
+test "CatalogStore: 16 conflicts in a row are error.CatalogBusy, not a timeout (#216)" {
+    var arena_instance = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_instance.deinit();
+    const arena = arena_instance.allocator();
+    var client: ConflictClient = .{};
+    var store = CatalogStoreType(ConflictClient).init(&client);
+    const layout_new: catalog.Layout = .{ .name = "seats", .fields = &.{} };
+    try std.testing.expectError(error.CatalogBusy, store.layout_put(arena, 7, &layout_new));
+    try std.testing.expectEqual(@as(u32, attempts_max), client.commits);
+    const view_new: catalog.View = .{
+        .table = 7,
+        .where = &.{},
+        .group_by = &.{},
+        .aggregates = &.{.{ .function = .count, .field = null }},
+    };
+    try std.testing.expectError(error.CatalogBusy, store.view_put(arena, "v", &view_new));
+    try std.testing.expectEqual(@as(u32, 2 * attempts_max), client.commits);
 }

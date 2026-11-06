@@ -205,6 +205,16 @@ fn cluster_lost(applied: api.Applied) api.Reply {
     } };
 }
 
+/// The reply to a request whose catalog write lost every attempt to concurrent declarations
+/// (NRV-E0213): the cluster answered each, so the session is intact. `applied` is the write
+/// counter's: each attempt was a write that went out and was refused, so a request that
+/// reached the cluster says `unknown`, as for any request that sent a write.
+fn catalog_busy(applied: api.Applied) api.Reply {
+    return .{ .status = 503, .body = switch (applied) {
+        inline else => |known| wire.error_body(.E0213, "catalog busy", known),
+    } };
+}
+
 /// The reply to a request whose window passed before a call could be sent (NRV-E0606): the
 /// session is intact. Unknown if an earlier call of the same request sent a write.
 fn request_expired(applied: api.Applied) api.Reply {
@@ -306,13 +316,20 @@ fn serve_request(
     const writes_before = client.writes_sent;
     return api.handle(arena, client, layouts, method, target, request.body) catch |err| {
         if (err != error.Expired and err != error.OutOfMemory) log.err("{s}: {}", .{ target, err });
-        if (err == error.Evicted or err == error.Timeout) {
+        if (breaks_session(err)) {
             health.broke();
             // The cluster may have changed under the new client: read layouts again (P135).
             layouts.cache_clear();
         }
         return failure_reply(arena, err, writes_before, client.writes_sent);
     };
+}
+
+/// Whether `err` means a cluster call went out and got no answer, so the session is dropped and
+/// replaced. A catalog write that lost its attempts to others (`error.CatalogBusy`) was answered
+/// every time: the session is healthy (#216).
+fn breaks_session(err: anyerror) bool {
+    return err == error.Evicted or err == error.Timeout;
 }
 
 /// The reply to a request whose handling failed with `err`, when the client had sent
@@ -326,6 +343,7 @@ pub fn failure_reply(
     const applied = api.applied_since(writes_before, writes_now);
     switch (err) {
         error.Expired => return request_expired(applied),
+        error.CatalogBusy => return catalog_busy(applied),
         error.Evicted, error.Timeout => return cluster_lost(applied),
         error.OutOfMemory => return err,
         else => return api.error_reply(arena, .B0001, 500, "internal error", applied),
@@ -388,4 +406,29 @@ test "a group member's reply carries its own applied (P195b)" {
         cluster_lost(.unknown).body,
         member_reply(lost, &budget).body,
     );
+}
+
+test "a catalog write that kept conflicting is NRV-E0213, 503, and keeps the session (#216)" {
+    var arena_instance = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_instance.deinit();
+    const arena = arena_instance.allocator();
+    // 16 conflicting commits went out: the write counter moved, so the outcome is unknown.
+    const sent = try failure_reply(arena, error.CatalogBusy, 3, 19);
+    try std.testing.expectEqual(@as(u16, 503), sent.status);
+    try std.testing.expectEqualStrings(
+        "{\"error\":\"catalog busy\",\"applied\":\"unknown\",\"code\":\"NRV-E0213\"}",
+        sent.body,
+    );
+    // Not the cluster-unavailable reply of a timeout, which is NRV-E0601.
+    try std.testing.expect(!std.mem.eql(u8, sent.body, cluster_lost(.unknown).body));
+    const unsent = try failure_reply(arena, error.CatalogBusy, 3, 3);
+    try std.testing.expectEqualStrings(
+        "{\"error\":\"catalog busy\",\"applied\":false,\"code\":\"NRV-E0213\"}",
+        unsent.body,
+    );
+    // The gateway drops its session for a lost call only.
+    try std.testing.expect(!breaks_session(error.CatalogBusy));
+    try std.testing.expect(breaks_session(error.Timeout));
+    try std.testing.expect(breaks_session(error.Evicted));
+    try std.testing.expect(!breaks_session(error.Expired));
 }

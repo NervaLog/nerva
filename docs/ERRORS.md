@@ -117,6 +117,7 @@ These are the replies to `POST /v1/commit`. The identifier is the state machine'
 | NRV-E0210 | A transaction writes one row twice | 400 `a transaction writes a row at most once (adds aside)` | client | Merge the writes |
 | NRV-E0211 | Views have no room in this op | 503 `views_busy` | retry | Resend under the same key |
 | NRV-E0212 | The transaction alone touches too many view groups | 413 `views_too_large` | client | Split the transaction |
+| NRV-E0213 | A layout or view declaration lost 16 attempts in a row to concurrent declarations | `503 {"error":"catalog busy","applied":…,"code":"NRV-E0213"}` on a layout or view declare; the cluster answered every attempt, so the session is kept (#216). `applied` is `false` if no write went out, else `"unknown"`: the counter counts the refused attempts too, though none changed anything | retry | Resend after a pause: the declaration is idempotent. If it repeats, fewer clients should declare the same table or view at once |
 
 ## 03xx · Declarations
 
