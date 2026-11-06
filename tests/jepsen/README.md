@@ -46,9 +46,10 @@ Options (`lein run test --help` lists Jepsen's own):
 | `--rate` | 20 | Requests per second, over all workers |
 | `--time-limit` | 60 | Seconds of requests and faults, before healing |
 | `--recovery-time` | 20 | Seconds between healing and the final reads |
-| `--drop-reply` | 0.1 | `retry`: the probability that the client discards a `200` and resends it as if it were lost |
-| `--attempts` | 8 | `retry`: attempts per operation (one key) before it ends unresolved |
-| `--gateways` | 1 (2 for `retry`) | Gateways per node: 1, or 2 (on the first three nodes only, as a development replica takes 8 clients; ports 8080 and 8081; `bank`'s clients use the first, `retry`'s use both). They listen on `0.0.0.0` with `--listen-remote`, since the control node reaches them over the network |
+| `--keys` / `--no-keys` | `--keys` | `bank`: send each transfer under a commit key with a record, retried as `retry`'s are, or unkeyed as before |
+| `--drop-reply` | 0.1 | Keyed workloads (`retry`, `bank --keys`): the probability that the client discards a `200` and resends it as if it were lost |
+| `--attempts` | 8 | Keyed workloads: attempts per operation (one key) before it ends unresolved |
+| `--gateways` | 1 (2 for `retry` and `bank --keys`) | Gateways per node: 1, or 2 (on the first three nodes only, as a development replica takes 8 clients; ports 8080 and 8081; `bank --no-keys`'s clients use the first, keyed workloads' use both). They listen on `0.0.0.0` with `--listen-remote`, since the control node reaches them over the network |
 
 ## What a reply means
 
@@ -90,6 +91,23 @@ between any two of the eight conserved fields (half of them clamped). Checked: e
 lookup, so one op) totals what was funded with no field below 0, the source never moves, a
 sum view over the accounts always answers the funded total, and a transfer is refused only as
 `out_of_bounds`.
+
+With `--keys` (the default), each transfer is sent as Botpike sends one. It carries a fresh
+128-bit key and is retried exactly as `retry` retries (`keyed.clj` holds the code both share:
+lost and discarded replies, resends to another gateway, the final phase). The same transaction
+writes a record in the `transfers` record table (table `0x80000014`; id the key; `from` and `to`
+as indexes of the eight conserved fields, and the requested `amount`), and the bootstrap
+declares an index by `from` and a `count` view over the table. A transfer ends `:ok` on a `2xx`,
+`:fail` with Nerva's status on a refusal (`out_of_bounds`, which no key outlives), `:fail
+:refused` if only gateways refused it, else `:info`; keys without a definite answer are resent
+after healing, and then every record is read through the index (eight `from` keys, paged) and
+the count view. Conservation alone cannot see a duplicate transfer, so also checked: `duplicate`
+(every `2xx` for a key names the same op), `missing` (every key that committed has a record),
+`extra` (every record is of a key that committed, or may have: an attempt got no answer),
+`duplicated` and `wrong` (one record per key, with the transfer's `from`, `to` and `amount`), and
+`count-view` (the view equals the records listed, which lie between the committed keys and those
+that may have committed). A key no `2xx` or refusal answered makes the result `:unknown`.
+`--no-keys` is today's run, with no key and no record; `test-all` runs both.
 
 **`retry`**: what Botpike does after a lost reply (P123): resend a keyed commit, under the same
 key, until the answer is definite. Eight account rows (`balance`, floored at 0) and an unfloored
