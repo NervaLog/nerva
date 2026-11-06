@@ -15,8 +15,9 @@
   (lazyfs/package {:faults #{lazyfs/fault}, :interval 0, :dir "/opt/nerva", :nodes (:nodes five)}))
 
 (deftest fault-values
-  (let [vs (repeatedly 300 #(lazyfs/fault-value five))]
+  (let [vs (repeatedly 300 #(lazyfs/fault-value (assoc five :lazyfs-all-nodes true)))]
     (is (= #{:minority :all} (set (map :scope vs))))
+    (is (= #{:minority} (set (map :scope (repeatedly 100 #(lazyfs/fault-value five))))))
     (doseq [v vs]
       (case (:scope v)
         :minority (do (is (<= 1 (count (:nodes v)) 2))

@@ -70,9 +70,11 @@
   [dir]
   {(:log-file (lazyfs-map dir)) "lazyfs.log"})
 
-(def scopes
-  "A minority of the nodes, or the whole cluster after a quorum crash."
-  [:minority :all])
+(defn scopes
+  "`:minority` always; `:all` (the whole cluster after a quorum crash) only when the test sets
+  `:lazyfs-all-nodes`."
+  [test]
+  (if (:lazyfs-all-nodes test) [:minority :all] [:minority]))
 
 (defn minority-size-max
   "The most nodes of `n` that are a minority: 2 of 5."
@@ -81,10 +83,10 @@
 
 (defn fault-value
   "A fresh op value against `test`: `:minority` loses writes on 1 to a minority of nodes;
-  `:all` crashes a majority first, then the rest, and loses writes on every node."
+  `:all` (opt in) crashes a majority first, then the rest, and loses writes on every node."
   [test]
   (let [nodes (vec (:nodes test))
-        scope (rand/nth scopes)]
+        scope (rand/nth (scopes test))]
     (case scope
       :minority {:scope :minority
                  :nodes (vec (take (rand/nth (vec (range 1 (inc (minority-size-max (count nodes))))))
