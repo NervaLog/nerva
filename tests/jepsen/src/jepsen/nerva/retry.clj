@@ -47,13 +47,16 @@
 (def max-amount 30)
 
 (def request-timeout-ms
-  "The gateways' `--request-timeout`: an unanswered request is answered by the gateway within
-  about 5 s, and a short client timeout (below) is shorter than that."
+  "The gateways' `--request-timeout`, in milliseconds: a gateway answers a request the cluster
+  leaves unanswered after this long (3 s), and a short client timeout (below, under 2 s) is
+  shorter than that."
   3000)
 
 (def short-timeout-probability 0.25)
 (def resolve-deadline-ms
-  "How long the final phase tries to get one key answered."
+  "How long the whole final phase (all workers, all keys) tries to get pending keys answered.
+  Keys left when it passes are reported unresolved, so a run with no healthy gateway ends in
+  :unknown within the job's time."
   180000)
 
 (defn rnd
@@ -154,23 +157,27 @@
 (defn run-attempts!
   "Sends `value` until an attempt is definite, a reply is a violation, or the budget is spent.
   With :max-attempts, each attempt may be given a short client timeout and its 200 may be
-  discarded (:drop-reply is the probability). With :deadline-ms (the final phase), the client
-  waits for a healthy gateway and keeps the long timeout. Returns the attempts."
-  [test value {:keys [max-attempts deadline-ms drop-reply]}]
+  discarded (:drop-reply is the probability). With :deadline-ns (the final phase), the client
+  waits for a healthy gateway and keeps the long timeout. With :deadline-ns (a System/nanoTime
+  value, one for the whole final phase), nothing is sent after it passes. With :sink (a
+  volatile), it always holds the attempts so far, even if this throws. Returns the attempts."
+  [test value {:keys [max-attempts deadline-ns drop-reply sink]}]
   (let [targets  (targets test)
-        deadline (when deadline-ms (+ (System/nanoTime) (* deadline-ms 1000000)))]
+        deadline deadline-ns]
     (loop [attempts [], previous nil]
       (let [n      (count attempts)
             target (pick targets previous)]
-        (if (and deadline (not (apply http/healthy? target)))
-          (if (< (System/nanoTime) deadline)
-            (do (backoff! (min n 5)) (recur attempts target))
-            attempts)
+        (cond
+          (and deadline (<= deadline (System/nanoTime))) attempts
+          (and deadline (not (apply http/healthy? target)))
+          (do (backoff! (min n 5)) (recur attempts target))
+          :else
           (let [timeout-ms (if (and max-attempts (< (rnd) short-timeout-probability))
                              (rnd-long 50 2000)
                              http/timeout-ms)
                 drop?      (and max-attempts (< (rnd) drop-reply))
                 attempts   (conj attempts (attempt! target value timeout-ms drop?))
+                _          (when sink (vreset! sink attempts))
                 last       (peek attempts)]
             (cond (or (definite? last) (= :violation (:kind last))) attempts
                   (if max-attempts (<= max-attempts (count attempts))
@@ -194,10 +201,23 @@
   [attempts]
   (first (filter #(= :violation (:kind %)) attempts)))
 
+(defn attempts-or-crash
+  "Runs the attempts for `value`. Returns [attempts crashed?]: if they throw (an interrupt, a
+  reply the code did not expect), the attempts made so far are kept, so a 2xx among them still
+  counts in the duplicate check, and the interrupt is passed on."
+  [test value opts]
+  (let [sink (volatile! [])]
+    (try [(run-attempts! test value (assoc opts :sink sink)) false]
+         (catch Throwable t
+           (when (instance? InterruptedException t)
+             (.interrupt (Thread/currentThread)))
+           [@sink true]))))
+
 (defn invoke-pay
   [{:keys [pending drop-reply attempts]} test op]
   (let [value (:value op)
-        tries (run-attempts! test value {:max-attempts attempts, :drop-reply drop-reply})
+        [tries crashed?] (attempts-or-crash test value
+                                            {:max-attempts attempts, :drop-reply drop-reply})
         done  (first (filter definite? tries))
         base  (assoc op :attempts tries)]
     (cond
@@ -209,20 +229,30 @@
       (cond-> (assoc base :type :ok, :op (:op done))
         (:replayed? done) (assoc :replayed? true))
 
-      (every? (comp #{:refused :not-sent} :kind) tries)
+      (and (not crashed?) (every? (comp #{:refused :not-sent} :kind) tries))
       (do (push-pending! pending value)
           (assoc base :type :fail, :error :refused))
 
       :else
       (do (push-pending! pending value)
-          (assoc base :type :info, :error :unresolved)))))
+          (assoc base :type :info, :error (if crashed? :crashed :unresolved))))))
+
+(defn phase-deadline!
+  "The final phase's one deadline (a System/nanoTime value): set by whichever worker asks first,
+  `ms` after that moment, then the same for every worker and key."
+  [phase ms]
+  (or @phase
+      (let [fresh (+ (System/nanoTime) (* ms 1000000))]
+        (swap! phase #(or % fresh)))))
 
 (defn invoke-resolve
-  "The final phase: sends every key still pending until a 2xx answers it."
-  [{:keys [pending]} test op]
+  "The final phase: sends every key still pending until a 2xx answers it, or the phase's
+  deadline passes; keys left then are reported with the attempts made (none), unresolved."
+  [{:keys [pending phase]} test op]
   (loop [entries []]
     (if-let [value (pop-pending! pending)]
-      (let [tries (run-attempts! test value {:deadline-ms resolve-deadline-ms})
+      (let [tries (run-attempts! test value
+                                 {:deadline-ns (phase-deadline! phase resolve-deadline-ms)})
             entry (assoc (select-keys value [:key :account :amount]) :attempts tries)]
         (if-let [bad (violation-of tries)]
           (http/violation (assoc op :resolved (conj entries entry)) (:reply bad))
@@ -265,7 +295,7 @@
               (< n 20) (do (backoff! (min n 5)) (recur (inc n) target))
               :else (assoc op :type :fail, :error :no-answer))))))
 
-(defrecord Client [pending drop-reply attempts]
+(defrecord Client [pending phase drop-reply attempts]
   client/Client
   (open! [this _test _node] this)
   (setup! [_ _test])
@@ -395,6 +425,7 @@
 (defn workload
   [opts]
   {:client          (map->Client {:pending    (atom [])
+                                  :phase      (atom nil)
                                   :drop-reply (:drop-reply opts 0.1)
                                   :attempts   (:attempts opts 8)})
    :bootstrap       bootstrap!

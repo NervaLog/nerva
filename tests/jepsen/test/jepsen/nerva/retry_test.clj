@@ -131,3 +131,38 @@
     (is (nil? (get from "clamp")))
     (is (= 0 (get to "delta_from")))
     (is (= "3" (get to "id")))))
+
+(deftest the-final-phase-has-one-deadline-for-all-keys
+  (let [phase    (atom nil)
+        pending  (atom [{:key "a", :account 1, :amount 1}
+                        {:key "b", :account 2, :amount 2}
+                        {:key "c", :account 3, :amount 3}])
+        client   (retry/map->Client {:pending pending, :phase phase})
+        test-map {:nodes ["n1"]}
+        started  (System/nanoTime)]
+    (reset! phase (dec started))
+    (let [done (retry/invoke-resolve client test-map {:f :resolve})]
+      (is (= :info (:type done)))
+      (is (= ["c" "b" "a"] (map :key (:resolved done))))
+      (is (every? empty? (map :attempts (:resolved done))))
+      (is (< (- (System/nanoTime) started) 1000000000)))
+    (testing "the first asker sets the deadline, the rest read it"
+      (let [fresh (atom nil)
+            first-deadline (retry/phase-deadline! fresh 1000)]
+        (is (= first-deadline (retry/phase-deadline! fresh 5)))))))
+
+(deftest a-crash-in-the-attempts-keeps-them-and-the-key
+  (let [pending (atom [])
+        client  (retry/map->Client {:pending pending, :phase (atom nil), :drop-reply 0,
+                                    :attempts 8})
+        calls   (atom 0)
+        value   {:key "k", :account 1, :amount 5}]
+    (with-redefs [retry/attempt! (fn [& _]
+                                   (if (= 1 (swap! calls inc))
+                                     (answered 7 {:dropped? true})
+                                     (throw (ClassCastException. "not an object"))))]
+      (let [done (retry/invoke-pay client {:nodes ["n1"]} {:f :pay, :value value})]
+        (is (= :info (:type done)))
+        (is (= :crashed (:error done)))
+        (is (= [7] (map :op (:attempts done))))
+        (is (= [value] @pending))))))
