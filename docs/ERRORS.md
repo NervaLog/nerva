@@ -190,6 +190,8 @@ These are the replies to `POST /v1/commit`. The identifier is the state machine'
 | NRV-E0714 | `nerva recover` needs a cluster of at least three replicas | `error[NRV-E0714]`, exit 1: `recover: --replica-count=<n> is too small` (`recover.zig`) | operator | Restore a smaller cluster from a backup |
 | NRV-E0715 | An earlier `nerva recover` did not finish | `error[NRV-E0715]`, exit 1: `an earlier recover did not finish: <path>.recovering is left` (`recover.zig`) | operator | Remove `<path>.recovering`, then recover again |
 | NRV-E0716 | `nerva recover`'s session was evicted before it finished | `error[NRV-E0716]`, exit 1: `the cluster evicted this session before it finished` (`recover.zig`; no test triggers it) | retry | Run it again; fewer clients than 64 sessions |
+| NRV-E0717 | A test build with commit-key deduplication off was started without `--development` | `error[NRV-E0717]: start: this build has commit-key deduplication off (-Dtest-commit-keys=off); it runs only with --development`, exit 1; nothing is opened (`nerva_main.zig`, before the pre-flight; only a build made with `-Dtest-commit-keys=off` can say it) | operator | Pass `--development` in the test, or run a release build |
+| NRV-W0701 | Commit-key deduplication is off (a test build): a resent key commits again | Logged once by `start` before it opens the data file: `warning: NRV-W0701 start: commit-key deduplication is off: a resent key commits again`; the replica starts, and `nerva version` ends in `+keys-off` | operator | None: only a test build (`-Dtest-commit-keys=off`, R1) has it, and every replica of its cluster must be that build |
 
 ## 08xx · Export and import
 
