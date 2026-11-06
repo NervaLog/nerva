@@ -17,6 +17,7 @@
             [jepsen.nerva [bank :as bank]
                           [db :as db]
                           [http :as http]
+                          [nemesis :as nemesis]
                           [retry :as retry]])
   (:gen-class))
 
@@ -30,11 +31,11 @@
 
 (def faults
   "The faults --nemesis may name."
-  #{:kill :pause :partition})
+  #{:kill :pause :partition :gateway :gateway-kill :gateway-partition :gateway-pause})
 
 (def all-nemeses
   "What test-all runs, each for every workload."
-  [[] [:kill] [:pause] [:partition] [:kill :partition]])
+  [[] [:kill] [:pause] [:partition] [:gateway] [:kill :partition] [:kill :partition :gateway]])
 
 (defn parse-faults
   [spec]
@@ -54,7 +55,8 @@
                       :pause     {:targets [:one :minority :majority]}
                       :partition {:targets [:one :majority :majorities-ring]}}]
     (combined/compose-packages [(combined/db-package package-opts)
-                                (combined/partition-package package-opts)])))
+                                (combined/partition-package package-opts)
+                                (nemesis/package package-opts)])))
 
 (defn nerva-test
   "A test map from CLI options."
@@ -96,7 +98,7 @@
     :default  :bank
     :parse-fn keyword
     :validate [workloads (str "Must be one of " (str/join ", " (map name (keys workloads))))]]
-   [nil "--nemesis FAULTS" "Comma-separated faults: kill, pause, partition."
+   [nil "--nemesis FAULTS" "Comma-separated faults: kill, pause, partition, gateway (= gateway-kill, gateway-partition, gateway-pause)."
     :default  []
     :parse-fn parse-faults
     :validate [(partial every? faults) (str "Faults are " (str/join ", " (map name faults)))]]

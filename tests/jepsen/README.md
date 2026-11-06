@@ -41,7 +41,7 @@ Options (`lein run test --help` lists Jepsen's own):
 | Option | Default | |
 |---|---|---|
 | `--workload` | `bank` | `bank` or `retry`: what the clients do and what is checked (below) |
-| `--nemesis` | none | Comma-separated faults: `kill`, `pause`, `partition` |
+| `--nemesis` | none | Comma-separated faults: `kill`, `pause`, `partition`, `gateway` (= `gateway-kill`, `gateway-partition`, `gateway-pause`, each also nameable alone) |
 | `--nemesis-interval` | 10 | Mean seconds between faults |
 | `--rate` | 20 | Requests per second, over all workers |
 | `--time-limit` | 60 | Seconds of requests and faults, before healing |
@@ -70,8 +70,15 @@ status alone:
 | `kill` | SIGKILLs the replica and the gateway on one node, a minority, a majority or all, then restarts them |
 | `pause` | SIGSTOPs the replica (not the gateway) on one node, a minority or a majority, then resumes it |
 | `partition` | iptables: one node isolated, the cluster split into a majority and a minority, or a majorities ring |
+| `gateway-kill` | SIGKILLs one gateway or both on one node, a minority or a majority, the replica left running, then starts them again (with a bounded backoff while one exits at start) |
+| `gateway-partition` | Drops the gateway's traffic to every replica (`iptables -t mangle -A OUTPUT -m owner --uid-owner nerva-gwN -p tcp --dport 3000 -j DROP`); its clients still reach it and wait out its `--request-timeout`. In the mangle table, so a `partition` heal does not lift it |
+| `gateway-pause` | SIGSTOPs the gateway, the replica left running, then SIGCONTs it |
+| `gateway` | The three above, mixed; its final phase resumes, heals and starts every gateway |
 
-Planned: killing gateways alone, lost unsynced writes (LazyFS) and bit flips, clock faults (on
+Each gateway runs as its own Unix user (`nerva-gw0`, `nerva-gw1`) so that iptables can name one.
+A node without the gateway an op names (a fourth node's second gateway) does nothing.
+
+Planned: lost unsynced writes (LazyFS) and bit flips, clock faults (on
 separate machines: `nerva` is a static binary, so libfaketime cannot fool it, and containers
 share one clock), and rolling upgrades.
 

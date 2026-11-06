@@ -118,8 +118,24 @@
                     binary :start (str "--addresses=" (addresses test)) :--development
                     data-file))
 
+(defn gateway-user
+  "The Unix user gateway `index` runs as, so iptables can name one gateway
+  (`-m owner --uid-owner`) without touching the replica, which runs as root."
+  [index]
+  (str "nerva-gw" index))
+
+(def max-gateways 2)
+
+(defn create-gateway-users!
+  "Creates the gateways' users, once. `useradd` is in the node image's base packages."
+  []
+  (doseq [index (range max-gateways)]
+    (c/exec :sh :-c (str "id -u " (gateway-user index) " > /dev/null 2>&1 || useradd --system "
+                         "--no-create-home --shell /usr/sbin/nologin " (gateway-user index)))))
+
 (defn start-gateway!
-  "Starts gateway `index` once."
+  "Starts gateway `index` once, as its own user: `setpriv` drops to it and execs, so the
+  pidfile names the gateway."
   [test index]
   (apply cu/start-daemon!
          {:logfile           (gateway-log index)
@@ -127,7 +143,9 @@
           :chdir             dir
           :match-executable? false
           :env               {:NERVA_KEY http/api-key}}
-         (concat [binary :api (str "--cluster=" cluster)
+         "/usr/bin/setpriv"
+         (concat [(str "--reuid=" (gateway-user index)) (str "--regid=" (gateway-user index))
+                  "--clear-groups" binary :api (str "--cluster=" cluster)
                   (str "--addresses=" (addresses test))
                   (str "--listen=0.0.0.0:" (gateway-port index))
                   :--listen-remote]
@@ -144,6 +162,33 @@
   "How long `start-api!` waits for a started gateway to be healthy or dead."
   15)
 
+(def gateway-backoff-ms-max
+  "The longest wait between a gateway's starts."
+  4000)
+
+(defn gateway-backoff-ms
+  "How long to wait before start number `tries + 1`: 500 ms, doubling, at most
+  `gateway-backoff-ms-max`. A gateway killed over and over, or cut off, does not spin."
+  [tries]
+  (min gateway-backoff-ms-max (* 500 (bit-shift-left 1 (dec tries)))))
+
+(defn start-gateway-until-up!
+  "Starts gateway `index` and waits for it to be healthy or dead; a dead one is started again
+  after a backoff, at most `gateway-start-tries` times in all."
+  [test index]
+  (loop [tries 1]
+    (start-gateway! test index)
+    (let [deadline (+ (System/nanoTime) (* gateway-start-wait-s 1000000000))
+          state    (loop []
+                     (cond (http/healthy? c/*host* (gateway-port index)) :up
+                           (not (cu/daemon-running? (gateway-pidfile index))) :dead
+                           (< deadline (System/nanoTime)) :pending
+                           :else (do (Thread/sleep 500) (recur))))]
+      (when (and (= :dead state) (< tries gateway-start-tries))
+        (info "Gateway" index "on" c/*host* "exited at start; starting it again")
+        (Thread/sleep (long (gateway-backoff-ms tries)))
+        (recur (inc tries))))))
+
 (defn start-api!
   "Starts the test's gateways. The control node reaches them over the network, so they listen
   on every address and say so: `--listen-remote` (P168, NRV-E0009). A test's `:request-timeout`
@@ -154,23 +199,60 @@
   nemesis's next `:start`; the run then has fewer gateways until then, never wrong results."
   [test]
   (doseq [index (range (gateways test c/*host*))]
-    (loop [tries 1]
-      (start-gateway! test index)
-      (let [deadline (+ (System/nanoTime) (* gateway-start-wait-s 1000000000))
-            state    (loop []
-                       (cond (http/healthy? c/*host* (gateway-port index)) :up
-                             (not (cu/daemon-running? (gateway-pidfile index))) :dead
-                             (< deadline (System/nanoTime)) :pending
-                             :else (do (Thread/sleep 500) (recur))))]
-        (when (and (= :dead state) (< tries gateway-start-tries))
-          (info "Gateway" index "on" c/*host* "exited at start; starting it again")
-          (recur (inc tries)))))))
+    (start-gateway-until-up! test index)))
+
+(defn indices
+  "The gateways of this node that `which` (an index, or :all) names."
+  [test which]
+  (let [have (gateways test c/*host*)]
+    (if (= :all which) (range have) (filter #(< % have) [which]))))
+
+(defn kill-gateways!
+  "SIGKILLs the gateways `which` names on this node, the replica untouched."
+  [test which]
+  (doseq [index (indices test which)]
+    (cu/stop-daemon! (gateway-pidfile index))))
+
+(defn start-gateways!
+  "Starts the gateways `which` names on this node (one already running stays)."
+  [test which]
+  (doseq [index (indices test which)]
+    (start-gateway-until-up! test index)))
+
+(defn signal-gateways!
+  "Sends `signal` to the gateways `which` names; a gateway that is gone is not an error."
+  [test which signal]
+  (doseq [index (indices test which)]
+    (try (c/exec :kill signal (c/lit (str "$(cat " (gateway-pidfile index) ")")))
+         (catch Exception e (info "Gateway" index "on" c/*host* "is not running:" (.getMessage e))))))
+
+(defn gateway-rule
+  "The iptables arguments (after the table and chain; the table is `mangle`) that drop gateway `index`'s traffic to
+  any replica. In the mangle table: Jepsen's partitioner heals with `iptables -F`, which
+  flushes only the filter table."
+  [index]
+  (str "-m owner --uid-owner " (gateway-user index) " -p tcp --dport " replica-port " -j DROP"))
+
+(defn partition-gateways!
+  "Cuts the gateways `which` names off from every replica: their clients still reach them."
+  [test which]
+  (doseq [index (indices test which)
+          :let [rule (gateway-rule index)]]
+    (c/exec :sh :-c (str "iptables -w -t mangle -C OUTPUT " rule " 2>/dev/null"
+                         " || iptables -w -t mangle -A OUTPUT " rule))))
+
+(defn heal-gateways!
+  "Lifts every gateway cut on this node (all indices, whatever `which` was)."
+  []
+  (doseq [index (range max-gateways)]
+    (c/exec :sh :-c (str "while iptables -w -t mangle -D OUTPUT " (gateway-rule index)
+                         " 2>/dev/null; do :; done; true"))))
 
 (defn kill-all!
   "SIGKILLs the gateways and the replica. The pidfile of a gateway the test did not start is
   harmless: `stop-daemon!` ignores a missing one."
   []
-  (doseq [index (range 2)]
+  (doseq [index (range max-gateways)]
     (cu/stop-daemon! (gateway-pidfile index)))
   (cu/stop-daemon! replica-pidfile))
 
@@ -187,6 +269,7 @@
         (c/upload (:nerva-binary test) binary)
         (c/exec :chmod "+x" binary)
         (install-cluster-key!)
+        (create-gateway-users!)
         (c/exec binary :format (str "--cluster=" cluster)
                 (str "--replica=" (replica-index test node))
                 (str "--replica-count=" (count (:nodes test)))
@@ -203,6 +286,7 @@
 
     (teardown! [_ test node]
       (c/su
+        (heal-gateways!)
         (kill-all!)
         (c/exec :rm :-rf dir)))
 
