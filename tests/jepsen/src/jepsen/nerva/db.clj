@@ -335,7 +335,7 @@
   [test]
   (let [{:keys [down pending] :as outcome} (start-gateways! test)]
     (when (seq down)
-      (warn "NRV-E0604: gateways" down "on" c/*host* "exited at start; the final start retries"))
+      (warn "Gateways" down "on" c/*host* "exited at start (the gateway's NRV-E0604); the final start retries"))
     (when (seq pending)
       (warn "Gateways" pending "on" c/*host* "were not answering at the deadline"))
     outcome))
@@ -364,12 +364,22 @@
       (warn "NRV-E0604: gateway" index "on" c/*host* "is" (name state) "after the final start"))
     (start-outcome states)))
 
+(defn gateway-owned?
+  "Whether the pid in gateway `index`'s pidfile is a live process of the gateway's own user
+  (`gateway-user`; `setpriv` drops to it before the exec). A stale pidfile after an NRV-E0604
+  exit may name a pid another process now has, which this refuses; one that is gone is false."
+  [index]
+  (try (= (gateway-user index)
+          (str/trim (c/exec :stat :-c "%U" (c/lit (str "/proc/$(cat " (gateway-pidfile index)
+                                                       ")")))))
+       (catch Exception _ false)))
+
 (defn signal-gateways!
-  "Sends `signal` to those of gateways `indices` that are running on this node (a stale pidfile
-  after an NRV-E0604 exit may name a reused pid, which must not be signalled); a gateway that is
-  gone is not an error. Returns the indices signalled. \"Running\" is as of the check."
+  "Sends `signal` to those of gateways `indices` whose pidfile names a live process of the
+  gateway's own user (`gateway-owned?`), so a reused pid is not signalled and counted; a gateway
+  that is gone is not an error. Returns the indices signalled. Ownership is as of the check."
   [indices signal]
-  (vec (for [index (filterv gateway-running? indices)
+  (vec (for [index (filterv gateway-owned? indices)
              :when (try (c/exec :kill signal (c/lit (str "$(cat " (gateway-pidfile index) ")")))
                         true
                         (catch Exception e
@@ -407,21 +417,24 @@
 (defn heal-script
   "The shell script that lifts every gateway cut for gateway `index` on a node of `nodes`: for
   each replica node it deletes the rule up to `heal-deletes-max` times, stopping when `iptables
-  -D` fails, then confirms with `iptables -C` that no copy is left. Prints the number deleted;
-  exits 1, saying NRV-E0604 and which rule is left, if one is. `-D` fails both when no rule is left and when
-  iptables itself fails; only `-C` tells them apart."
+  -D` fails, then asks `iptables -C`. Only `-C` exit 1 means \"no such rule\"; exit 0 (the rule
+  is still there) or any other code (iptables itself failed: 2, 3, 4) is NRV-E0604 naming the
+  rule, as `-D` fails both when no rule is left and when iptables is broken. Prints the number
+  deleted; exits 1 if any rule is left or could not be checked."
   [nodes index]
   (str "n=0; left=0; for d in " (str/join " " nodes) "; do"
        " for i in $(seq " heal-deletes-max "); do"
        " iptables -w -t mangle -D OUTPUT " (gateway-rule index "$d")
        " 2>/dev/null || break; n=$((n+1)); done;"
-       " if iptables -w -t mangle -C OUTPUT " (gateway-rule index "$d") " 2>/dev/null; then"
-       " echo \"NRV-E0604: gateway " index " is still cut off from $d after the heal\" >&2; left=1; fi;"
+       " iptables -w -t mangle -C OUTPUT " (gateway-rule index "$d") " 2>/dev/null; rc=$?;"
+       " if [ $rc -ne 1 ]; then echo \"NRV-E0604: gateway " index ": the rule to $d is still in"
+       " place or cannot be checked after the heal (iptables -C exit $rc)\" >&2; left=1; fi;"
        " done; [ $left = 0 ] || exit 1; echo $n"))
 
 (defn heal-gateways!
   "Lifts every gateway cut on this node (all indices and replicas, whatever was cut) and
-  confirms none is left (`heal-script`); a rule that survives throws, which fails the op.
+  confirms none is left (`heal-script`); a rule that survives, or iptables failing, throws, which
+  fails the op (`nemesis/final-start-checker` fails the run for it, NRV-E0604).
   Returns the indices that had a rule."
   [test]
   (vec (for [index (range max-gateways)
@@ -437,60 +450,74 @@
     (cu/stop-daemon! (gateway-pidfile index)))
   (cu/stop-daemon! replica-pidfile))
 
+(defn teardown-node!
+  "A node's teardown: heals the gateways, then kills everything and removes the data directory
+  even if the heal threw. `after-run?` (setup ran in this DB): a heal failure is logged, not
+  rethrown, because Jepsen runs this in a `finally` around the run and a throw would skip the
+  analysis and lose the verdict; the final phase's heal op carries it to the checker (P244c).
+  Before a run (`db/cycle!`) it is rethrown: a node that cannot be cleaned must not start."
+  [test after-run?]
+  (try (heal-gateways! test)
+       (catch Exception e
+         (if after-run?
+           (warn "NRV-E0604: the gateway heal at teardown failed on" c/*host* ":" (.getMessage e))
+           (throw e)))
+       (finally
+         (kill-all!)
+         (c/exec :rm :-rf dir))))
+
 (defn db
   "A Nerva DB. bootstrap is (fn [test node]), run once, against one node's gateway, after every
   gateway is healthy and before any client starts: the workload's layouts, ledgers, views and
   initial rows."
   [bootstrap]
-  (reify
-    db/DB
-    (setup! [_ test node]
-      (c/su
-        (c/exec :mkdir :-p dir)
-        (c/upload (:nerva-binary test) binary)
-        (c/exec :chmod "+x" binary)
-        (install-cluster-key!)
-        (create-gateway-users!)
-        (c/exec binary :format (str "--cluster=" cluster)
-                (str "--replica=" (replica-index test node))
-                (str "--replica-count=" (count (:nodes test)))
-                :--development data-file)
-        (start-replica! test)
-        (start-api! test))
-      (doseq [index (range (gateways test node))]
-        (http/await-healthy! node (gateway-port index) healthy-timeout-s))
-      (jepsen/synchronize test)
-      (when (= node (jepsen/primary test))
-        (info "Bootstrapping the workload through" node)
-        (bootstrap test node))
-      (jepsen/synchronize test))
+  (let [ran? (atom false)]
+    (reify
+      db/DB
+      (setup! [_ test node]
+        (reset! ran? true)
+        (c/su
+          (c/exec :mkdir :-p dir)
+          (c/upload (:nerva-binary test) binary)
+          (c/exec :chmod "+x" binary)
+          (install-cluster-key!)
+          (create-gateway-users!)
+          (c/exec binary :format (str "--cluster=" cluster)
+                  (str "--replica=" (replica-index test node))
+                  (str "--replica-count=" (count (:nodes test)))
+                  :--development data-file)
+          (start-replica! test)
+          (start-api! test))
+        (doseq [index (range (gateways test node))]
+          (http/await-healthy! node (gateway-port index) healthy-timeout-s))
+        (jepsen/synchronize test)
+        (when (= node (jepsen/primary test))
+          (info "Bootstrapping the workload through" node)
+          (bootstrap test node))
+        (jepsen/synchronize test))
 
-    (teardown! [_ test node]
-      (c/su
-        (try (heal-gateways! test)
-             (finally
-               (kill-all!)
-               (c/exec :rm :-rf dir)))))
+      (teardown! [_ test node]
+        (c/su (teardown-node! test @ran?)))
 
-    db/Kill
-    (kill! [_ test node]
-      (c/su (kill-all!)))
+      db/Kill
+      (kill! [_ test node]
+        (c/su (kill-all!)))
 
-    (start! [_ test node]
-      (c/su
-        (start-replica! test)
-        (restart-api! test)))
+      (start! [_ test node]
+        (c/su
+          (start-replica! test)
+          (restart-api! test)))
 
-    ;; A pause stops the replica alone: its gateway goes on taking requests that time out.
-    db/Pause
-    (pause! [_ test node]
-      (c/su (c/exec :kill :-STOP (c/lit (str "$(cat " replica-pidfile ")")))))
+      ;; A pause stops the replica alone: its gateway goes on taking requests that time out.
+      db/Pause
+      (pause! [_ test node]
+        (c/su (c/exec :kill :-STOP (c/lit (str "$(cat " replica-pidfile ")")))))
 
-    (resume! [_ test node]
-      (c/su (c/exec :kill :-CONT (c/lit (str "$(cat " replica-pidfile ")")))))
+      (resume! [_ test node]
+        (c/su (c/exec :kill :-CONT (c/lit (str "$(cat " replica-pidfile ")")))))
 
-    db/LogFiles
-    (log-files [_ test node]
-      (into {replica-log "replica.log"}
-            (for [index (range (gateways test node))]
-              [(gateway-log index) (if (zero? index) "api.log" (str "api-" index ".log"))])))))
+      db/LogFiles
+      (log-files [_ test node]
+        (into {replica-log "replica.log"}
+              (for [index (range (gateways test node))]
+                [(gateway-log index) (if (zero? index) "api.log" (str "api-" index ".log"))]))))))

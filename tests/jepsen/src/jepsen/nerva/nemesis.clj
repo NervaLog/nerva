@@ -200,17 +200,35 @@
                   (filter #(and (= :gateway-start (:f %)) (:final? (:value %))) history))]
     {:done (:done r), :open (vec (vals (:open r)))}))
 
+(declare final-start?)
+
+(defn heal-failures
+  "The completions of `gateway-heal` ops in `history` that failed: with an `:exception` (a
+  mid-run heal, which Jepsen turns into an `:info` op that its own checkers count as valid) or
+  an `:error` (the final phase's heal, `:final? true`, whose per-node throw is returned so the
+  other nodes keep their results). An invocation has neither."
+  [history]
+  (filter #(and (= :gateway-heal (:f %))
+                (or (:exception %) (seq (:error (:value %)))))
+          history))
+
 (defn final-start-checker
-  "Invalid when the final phase's `gateway-start` (`:final? true`) left a gateway not up or did
-  not finish: an invocation with no completion, or a completion with an `:exception` (Jepsen
-  turns a throw into an `:info` op that its own checkers count as valid), a non-empty `:down` or
-  `:pending`, or an `:error` (a node whose start threw). `:final-starts` counts completions.
-  The result names the gateways and NRV-E0604: a gateway that cannot reach the cluster after the
-  heal and the replicas' restart is a Nerva availability finding (P238c, P244)."
+  "Invalid when the gateways were not left up and healed: the final phase's `gateway-start`
+  (`:final? true`) left a gateway not up or did not finish (an invocation with no completion, or
+  a completion with an `:exception`, a non-empty `:down` or `:pending`, or an `:error`); or the
+  test expected that start (`final-start?` over the test's `:nemesis-faults`) and it never
+  completed (`:expected 1`); or any `gateway-heal` failed (`heal-failures`; with
+  `gateway-partition` alone no final start would show a gateway left cut). `:final-starts` counts
+  completions. The result carries NRV-E0604 and names the gateways: one that cannot reach the
+  cluster after the heal and the replicas' restart is a Nerva availability finding (P238c, P244,
+  P244c)."
   []
   (reify checker/Checker
-    (check [_ _test history _opts]
+    (check [_ test history _opts]
       (let [{:keys [done open]} (final-starts history)
+            expected (final-start? {:faults (:nemesis-faults test)})
+            missing  (and expected (not= 1 (count done)))
+            heals    (heal-failures history)
             bad      (filter #(or (:exception %)
                                   (seq (:down (:value %)))
                                   (seq (:pending (:value %)))
@@ -218,9 +236,17 @@
                              done)
             gateways (vec (distinct (mapcat #(concat (:down (:value %)) (:pending (:value %)))
                                             bad)))]
-        (cond-> {:valid?       (and (empty? bad) (empty? open))
+        (cond-> {:valid?       (and (empty? bad) (empty? open) (empty? heals) (not missing))
                  :final-starts (count done)}
+          expected   (assoc :expected 1)
+          missing    (assoc :code "NRV-E0604")
           (seq open) (assoc :code "NRV-E0604" :incomplete (count open))
+          (seq heals) (assoc :code       "NRV-E0604"
+                             :heal-failures
+                             (vec (for [h heals]
+                                    (if-let [e (:exception h)]
+                                      (or (:cause e) (str e))
+                                      (vec (:error (:value h)))))))
           (seq bad)  (assoc :code       "NRV-E0604"
                             :gateways   gateways
                             :errors     (vec (mapcat #(:error (:value %)) bad))
@@ -250,11 +276,19 @@
   (boolean (or (some #{:gateway-kill} (used opts)) (contains? (:faults opts) :kill))))
 
 (defn heal-package
-  "Only a final generator: resume and heal. It is listed before `combined/db-package`, whose
-  final `:start` waits on every gateway: a paused or cut-off one would hold it up."
+  "Only a final generator: resume and heal (the heal is `:final? true`: its per-node failure
+  is returned, not thrown, and `final-start-checker` fails the run for it). It is listed before
+  `combined/db-package`, whose final `:start` waits on every gateway: a paused or cut-off one
+  would hold it up."
   [opts]
-  {:final-generator (undo-ops (filterv #{:gateway-pause :gateway-partition} (used opts)) false)
-   :perf            #{}})
+  (let [faults (filterv #{:gateway-pause :gateway-partition} (used opts))
+        ops    (mapv #(op (opposite %)
+                          (cond-> undo-value
+                            ;; the heal's failure is the checker's to judge (P244c)
+                            (= :gateway-partition %) (assoc :final? true)))
+                     faults)]
+    {:final-generator (when (seq ops) ops)
+     :perf            #{}}))
 
 (defn package
   "A nemesis package for the gateway faults in `(:faults opts)` (`:gateway`, or any of

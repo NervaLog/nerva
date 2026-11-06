@@ -1,7 +1,9 @@
 (ns jepsen.nerva.nemesis-test
   "The gateway nemesis's shapes: which faults a spec asks for, what the generator emits and
   what the final generator undoes."
-  (:require [clojure.set :as set]
+  (:require [clojure.java.shell :as shell]
+            [clojure.set :as set]
+            [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [jepsen.checker :as checker]
             [jepsen.control :as c]
@@ -71,9 +73,68 @@
     (is (re-find #"exit 1" script) "a rule that is left fails the heal")
     (is (re-find #"10.0.0.1 10.0.0.2" script))))
 
+(defn- run-heal
+  "Runs `heal-script` for gateway 1 under a stub `iptables` that behaves as `mode`:
+  `gone` (-D then -C exit 1), `deletes` (two -D succeed, then exit 1, -C exit 1), `stuck`
+  (-D exit 1, -C exit 0), `broken` (everything exit 3). Returns {:exit :out :err}."
+  [mode]
+  (let [dir  (.toFile (java.nio.file.Files/createTempDirectory
+                        "stub" (make-array java.nio.file.attribute.FileAttribute 0)))
+        ipt  (java.io.File. dir "iptables")
+        cnt  (java.io.File. dir "count")]
+    (spit ipt (str "#!/bin/sh\n"
+                   "case \"$MODE\" in broken) exit 3;; esac\n"
+                   "for a in \"$@\"; do case $a in\n"
+                   "  -D) if [ \"$MODE\" = deletes ]; then c=$(cat " cnt " 2>/dev/null || echo 0);"
+                   " [ $c -lt 2 ] && { echo $((c+1)) > " cnt "; exit 0; }; fi; exit 1;;\n"
+                   "  -C) [ \"$MODE\" = stuck ] && exit 0; exit 1;;\n"
+                   "esac; done; exit 9\n"))
+    (.setExecutable ipt true)
+    (let [r (shell/sh "sh" "-c" (db/heal-script ["10.0.0.1"] 1)
+                      :env {"PATH" (str dir ":/usr/bin:/bin") "MODE" mode})]
+      {:exit (:exit r), :out (str/trim (:out r)), :err (:err r)})))
+
+(deftest heal-script-runs-against-iptables
+  (testing "no rule left: healed, nothing deleted"
+    (is (= {:exit 0 :out "0"} (select-keys (run-heal "gone") [:exit :out]))))
+  (testing "rules deleted, then gone: counts them"
+    (is (= {:exit 0 :out "2"} (select-keys (run-heal "deletes") [:exit :out]))))
+  (testing "a rule that cannot be deleted fails with NRV-E0604"
+    (let [r (run-heal "stuck")]
+      (is (= 1 (:exit r)))
+      (is (re-find #"NRV-E0604: gateway 1: the rule to 10.0.0.1 is still in place" (:err r)))))
+  (testing "iptables itself broken is not read as healed"
+    (let [r (run-heal "broken")]
+      (is (= 1 (:exit r)))
+      (is (re-find #"NRV-E0604.*cannot be checked.*exit 3" (:err r))))))
+
+(deftest teardown-heals-and-cleans-up
+  (let [calls (atom [])
+        boom  (fn [_] (throw (ex-info "iptables broke" {})))]
+    (with-redefs [db/heal-gateways! boom
+                  db/kill-all!      #(swap! calls conj :kill)
+                  jepsen.control/exec* (fn [& _] (swap! calls conj :rm) "")]
+      (testing "after a run the failure is logged, never rethrown: analysis must run"
+        (is (nil? (db/teardown-node! {} true)))
+        (is (= [:kill :rm] @calls) "the node is still cleaned"))
+      (reset! calls [])
+      (testing "before a run (cycle!) it is rethrown, after the cleanup"
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"iptables broke"
+                              (db/teardown-node! {} false)))
+        (is (= [:kill :rm] @calls))))))
+
+(deftest ownership-guards-a-reused-pid
+  (let [owner (fn [out] (fn [& _] out))]
+    (with-redefs [jepsen.control/exec* (owner "nerva-gw1")]
+      (is (true? (db/gateway-owned? 1)) "the gateway's own user"))
+    (with-redefs [jepsen.control/exec* (owner "root")]
+      (is (false? (db/gateway-owned? 1)) "a pid some other process now has"))
+    (with-redefs [jepsen.control/exec* (fn [& _] (throw (ex-info "no such pid" {})))]
+      (is (false? (db/gateway-owned? 1)) "a pid that is gone"))))
+
 (deftest signal-skips-gateways-that-are-not-running
   (let [sent (atom [])]
-    (with-redefs [db/gateway-running?        #(= 1 %)
+    (with-redefs [db/gateway-owned?          #(= 1 %)
                   jepsen.control/exec*       (fn [& args] (swap! sent conj args) "")]
       (is (= [1] (db/signal-gateways! [0 1] "-STOP")))
       (is (= 1 (count @sent)) "only the running gateway was signalled"))))
@@ -85,8 +146,10 @@
   (let [p (package :gateway)]
     (is (= #{"gateway-kill" "gateway-partition" "gateway-pause"} (set (map :name (:perf p)))))
     (is (= [:gateway-resume :gateway-heal] (map :f (:final-generator (heal-package :gateway)))))
+    (is (= [nil true] (map #(:final? (:value %)) (:final-generator (heal-package :gateway))))
+        "only the heal is judged by the checker")
     (is (= [:gateway-start] (map :f (:final-generator p))))
-    (is (every? #(= {:gateways :all} (:value %)) (:final-generator (heal-package :gateway))))
+    (is (every? #(= :all (:gateways (:value %))) (:final-generator (heal-package :gateway))))
     (is (= [{:gateways :all, :final? true}] (map :value (:final-generator p)))
         "the final start retries")))
 
@@ -415,6 +478,43 @@
   (testing "a node whose start threw"
     (is (false? (:valid? (check-final (pair (final-op :value {:final? true :hit []
                                                               :error [["n1" "ssh"]]}))))))))
+
+(deftest a-failed-heal-fails-the-run
+  (let [heal (fn [& {:as extra}] (merge {:type :info :f :gateway-heal :process :nemesis
+                                         :value {:gateways :all}} extra))]
+    (testing "no heal, or a clean one, no final start expected: valid"
+      (is (true? (:valid? (check-final []))))
+      (is (true? (:valid? (check-final [(heal) (heal :value {:gateways :all :final? true
+                                                             :hit []})])))))
+    (testing "the final heal's per-node error (gateway-partition alone has no final start)"
+      (let [r (check-final [(heal :value {:gateways :all :final? true})
+                            (heal :value {:gateways :all :final? true :hit []
+                                          :error [["n1" "NRV-E0604: gateway 0 ..."]]})])]
+        (is (false? (:valid? r)))
+        (is (= "NRV-E0604" (:code r)))
+        (is (= [[["n1" "NRV-E0604: gateway 0 ..."]]] (:heal-failures r)))))
+    (testing "a mid-run heal that threw"
+      (let [r (check-final [(heal :exception {:cause "boom"})])]
+        (is (false? (:valid? r)))
+        (is (= ["boom"] (:heal-failures r)))))))
+
+(deftest an-expected-final-start-that-never-ran-fails-the-run
+  (let [check (fn [faults h] (checker/check (nemesis/final-start-checker)
+                                            {:nemesis-faults faults} h {}))]
+    (doseq [faults [#{:kill} #{:gateway} #{:gateway-kill} #{:kill :partition}]]
+      (let [r (check faults [])]
+        (is (false? (:valid? r)) (str faults))
+        (is (= 0 (:final-starts r)))
+        (is (= 1 (:expected r)))
+        (is (= "NRV-E0604" (:code r)))))
+    (is (true? (:valid? (check #{:kill} (pair (final-op))))) "it ran")
+    (is (true? (:valid? (check #{:partition} []))) "nothing to expect without a kill")
+    (is (true? (:valid? (check #{:gateway-pause :gateway-partition} []))))))
+
+(deftest the-test-map-carries-the-faults
+  (let [t (core/nerva-test {:workload :bank, :nemesis [:kill :partition], :time-limit 1
+                            :rate 1, :recovery-time 1})]
+    (is (= #{:kill :partition} (:nemesis-faults t)))))
 
 (deftest every-workload-composes-the-final-start-checker
   (doseq [workload [:bank :retry]]
