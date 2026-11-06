@@ -364,26 +364,26 @@
       (warn "NRV-E0604: gateway" index "on" c/*host* "is" (name state) "after the final start"))
     (start-outcome states)))
 
-(defn gateway-owned?
-  "Whether the pid in gateway `index`'s pidfile is a live process of the gateway's own user
-  (`gateway-user`; `setpriv` drops to it before the exec). A stale pidfile after an NRV-E0604
-  exit may name a pid another process now has, which this refuses; one that is gone is false."
-  [index]
-  (try (= (gateway-user index)
-          (str/trim (c/exec :stat :-c "%U" (c/lit (str "/proc/$(cat " (gateway-pidfile index)
-                                                       ")")))))
-       (catch Exception _ false)))
+(defn signal-script
+  "One shell command that sends `signal` to gateway `index`'s pid only if that process is the
+  gateway's own user's (`gateway-user`; `setpriv` drops to it before the exec): the pidfile is
+  read once, so a pid cannot be reused between the check and the signal. A stale pidfile after an
+  NRV-E0604 exit may name a pid another process now has, which this refuses; a pid that is gone
+  fails the command."
+  [index signal]
+  (str "p=$(cat " (gateway-pidfile index) ") && [ \"$(stat -c %U /proc/$p)\" = "
+       (gateway-user index) " ] && kill " signal " $p"))
 
 (defn signal-gateways!
   "Sends `signal` to those of gateways `indices` whose pidfile names a live process of the
-  gateway's own user (`gateway-owned?`), so a reused pid is not signalled and counted; a gateway
-  that is gone is not an error. Returns the indices signalled. Ownership is as of the check."
+  gateway's own user (`signal-script`), so a reused pid is not signalled and counted; a gateway
+  that is gone is not an error. Returns the indices signalled."
   [indices signal]
-  (vec (for [index (filterv gateway-owned? indices)
-             :when (try (c/exec :kill signal (c/lit (str "$(cat " (gateway-pidfile index) ")")))
+  (vec (for [index indices
+             :when (try (c/exec :sh :-c (signal-script index signal))
                         true
                         (catch Exception e
-                          (info "Gateway" index "on" c/*host* "is not running:" (.getMessage e))
+                          (info "Gateway" index "on" c/*host* "was not signalled:" (.getMessage e))
                           false))]
          index)))
 
@@ -418,7 +418,7 @@
   "The shell script that lifts every gateway cut for gateway `index` on a node of `nodes`: for
   each replica node it deletes the rule up to `heal-deletes-max` times, stopping when `iptables
   -D` fails, then asks `iptables -C`. Only `-C` exit 1 means \"no such rule\"; exit 0 (the rule
-  is still there) or any other code (iptables itself failed: 2, 3, 4) is NRV-E0604 naming the
+  is still there) or any other code (iptables itself failed: 2, 3, 4) is NRV-E0607 naming the
   rule, as `-D` fails both when no rule is left and when iptables is broken. A gateway user that
   does not exist yet (a fresh node, before `create-gateway-users!`) can have no rule, and
   iptables refuses to parse its name (exit 2): the script prints 0 for it. Prints the number
@@ -430,14 +430,14 @@
        " iptables -w -t mangle -D OUTPUT " (gateway-rule index "$d")
        " 2>/dev/null || break; n=$((n+1)); done;"
        " iptables -w -t mangle -C OUTPUT " (gateway-rule index "$d") " 2>/dev/null; rc=$?;"
-       " if [ $rc -ne 1 ]; then echo \"NRV-E0604: gateway " index ": the rule to $d is still in"
+       " if [ $rc -ne 1 ]; then echo \"NRV-E0607: gateway " index ": the rule to $d is still in"
        " place or cannot be checked after the heal (iptables -C exit $rc)\" >&2; left=1; fi;"
        " done; [ $left = 0 ] || exit 1; echo $n"))
 
 (defn heal-gateways!
   "Lifts every gateway cut on this node (all indices and replicas, whatever was cut) and
   confirms none is left (`heal-script`); a rule that survives, or iptables failing, throws, which
-  fails the op (`nemesis/final-start-checker` fails the run for it, NRV-E0604).
+  fails the op (`nemesis/final-start-checker` makes the run `:unknown` for it, NRV-E0607).
   Returns the indices that had a rule."
   [test]
   (vec (for [index (range max-gateways)
@@ -463,7 +463,7 @@
   (try (heal-gateways! test)
        (catch Exception e
          (if after-run?
-           (warn "NRV-E0604: the gateway heal at teardown failed on" c/*host* ":" (.getMessage e))
+           (warn "NRV-E0607: the gateway heal at teardown failed on" c/*host* ":" (.getMessage e))
            (throw e)))
        (finally
          (kill-all!)

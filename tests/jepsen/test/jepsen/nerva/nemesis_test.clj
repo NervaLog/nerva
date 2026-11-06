@@ -102,10 +102,10 @@
     (is (= {:exit 0 :out "0"} (select-keys (run-heal "gone") [:exit :out]))))
   (testing "rules deleted, then gone: counts them"
     (is (= {:exit 0 :out "2"} (select-keys (run-heal "deletes") [:exit :out]))))
-  (testing "a rule that cannot be deleted fails with NRV-E0604"
+  (testing "a rule that cannot be deleted fails with NRV-E0607"
     (let [r (run-heal "stuck")]
       (is (= 1 (:exit r)))
-      (is (re-find #"NRV-E0604: gateway 1: the rule to 10.0.0.1 is still in place" (:err r)))))
+      (is (re-find #"NRV-E0607: gateway 1: the rule to 10.0.0.1 is still in place" (:err r)))))
   (testing "a gateway user that does not exist yet has no rule (iptables would exit 2 on its name)"
     (let [r (run-heal "nouser")]
       (is (= 0 (:exit r)))
@@ -113,7 +113,7 @@
   (testing "iptables itself broken is not read as healed"
     (let [r (run-heal "broken")]
       (is (= 1 (:exit r)))
-      (is (re-find #"NRV-E0604.*cannot be checked.*exit 3" (:err r))))))
+      (is (re-find #"NRV-E0607.*cannot be checked.*exit 3" (:err r))))))
 
 (deftest teardown-heals-and-cleans-up
   (let [calls (atom [])
@@ -130,21 +130,20 @@
                               (db/teardown-node! {} false)))
         (is (= [:kill :rm] @calls))))))
 
-(deftest ownership-guards-a-reused-pid
-  (let [owner (fn [out] (fn [& _] out))]
-    (with-redefs [jepsen.control/exec* (owner "nerva-gw1")]
-      (is (true? (db/gateway-owned? 1)) "the gateway's own user"))
-    (with-redefs [jepsen.control/exec* (owner "root")]
-      (is (false? (db/gateway-owned? 1)) "a pid some other process now has"))
-    (with-redefs [jepsen.control/exec* (fn [& _] (throw (ex-info "no such pid" {})))]
-      (is (false? (db/gateway-owned? 1)) "a pid that is gone"))))
+(deftest signal-checks-ownership-and-reads-the-pidfile-once
+  (let [script (db/signal-script 1 "-STOP")]
+    (is (= 1 (count (re-seq #"cat " script))) "one read of the pidfile")
+    (is (re-find #"= nerva-gw1 \] && kill -STOP \$p$" script) "the owner is checked before the kill")))
 
-(deftest signal-skips-gateways-that-are-not-running
+(deftest signal-skips-gateways-that-are-not-owned-or-gone
   (let [sent (atom [])]
-    (with-redefs [db/gateway-owned?          #(= 1 %)
-                  jepsen.control/exec*       (fn [& args] (swap! sent conj args) "")]
+    (with-redefs [jepsen.control/exec* (fn [& args]
+                                         (swap! sent conj args)
+                                         (when (re-find #"nerva-gw0" (str args))
+                                           (throw (ex-info "not ours" {})))
+                                         "")]
       (is (= [1] (db/signal-gateways! [0 1] "-STOP")))
-      (is (= 1 (count @sent)) "only the running gateway was signalled"))))
+      (is (= 2 (count @sent)) "one command per gateway, nothing else"))))
 
 (defn heal-package [& fault-keys]
   (nemesis/heal-package {:faults (set fault-keys)}))
@@ -450,15 +449,15 @@
     (let [r (check-final (pair (final-op)))]
       (is (true? (:valid? r)))
       (is (= 1 (:final-starts r)))))
-  (testing "an invocation with no completion is invalid"
+  (testing "an invocation with no completion is a harness failure"
     (let [r (check-final [(first (pair (final-op)))])]
-      (is (false? (:valid? r)))
+      (is (= :unknown (:valid? r)))
       (is (= 0 (:final-starts r)))
       (is (= 1 (:incomplete r)))
-      (is (= "NRV-E0604" (:code r)))))
+      (is (= "NRV-E0607" (:code r)))))
   (testing "a completed start followed by one that never finished"
     (let [h (concat (pair (final-op)) [(first (pair (final-op)))])]
-      (is (false? (:valid? (check-final h))))
+      (is (= :unknown (:valid? (check-final h))))
       (is (= 1 (:final-starts (check-final h)))))))
 
 (deftest final-start-checker
@@ -468,10 +467,10 @@
     (is (true? (:valid? (check-final [{:type :info :f :gateway-start
                                        :value {:down [["n1" 0]]}}])))
         "a main-phase start may leave a gateway down"))
-  (testing "an exception"
+  (testing "an exception is the harness, not Nerva"
     (let [r (check-final (pair (final-op :exception {:cause "boom"})))]
-      (is (false? (:valid? r)))
-      (is (= "NRV-E0604" (:code r)))
+      (is (= :unknown (:valid? r)))
+      (is (= "NRV-E0607" (:code r)))
       (is (= ["boom"] (:exceptions r)))))
   (testing "a gateway down"
     (let [r (check-final (pair (final-op :value {:final? true :hit [] :down [["n2" 1]]})))]
@@ -482,9 +481,15 @@
     (let [r (check-final (pair (final-op :value {:final? true :hit [] :pending [["n3" 0]]})))]
       (is (false? (:valid? r)))
       (is (= [["n3" 0]] (:gateways r)))))
-  (testing "a node whose start threw"
-    (is (false? (:valid? (check-final (pair (final-op :value {:final? true :hit []
-                                                              :error [["n1" "ssh"]]}))))))))
+  (testing "a node whose start threw is the harness"
+    (let [r (check-final (pair (final-op :value {:final? true :hit [] :error [["n1" "ssh"]]})))]
+      (is (= :unknown (:valid? r)))
+      (is (= "NRV-E0607" (:code r)))))
+  (testing "a gateway down wins over a harness failure"
+    (let [r (check-final (concat (pair (final-op :value {:final? true :hit [] :down [["n2" 1]]
+                                                         :error [["n1" "ssh"]]}))))]
+      (is (false? (:valid? r)))
+      (is (= "NRV-E0604" (:code r))))))
 
 (deftest a-failed-heal-fails-the-run
   (let [heal (fn [& {:as extra}] (merge {:type :info :f :gateway-heal :process :nemesis
@@ -493,30 +498,42 @@
       (is (true? (:valid? (check-final []))))
       (is (true? (:valid? (check-final [(heal) (heal :value {:gateways :all :final? true
                                                              :hit []})])))))
-    (testing "the final heal's per-node error (gateway-partition alone has no final start)"
+    (testing "the final heal's per-node error is the harness (gateway-partition alone has no final start)"
       (let [r (check-final [(heal :value {:gateways :all :final? true})
                             (heal :value {:gateways :all :final? true :hit []
-                                          :error [["n1" "NRV-E0604: gateway 0 ..."]]})])]
-        (is (false? (:valid? r)))
-        (is (= "NRV-E0604" (:code r)))
-        (is (= [[["n1" "NRV-E0604: gateway 0 ..."]]] (:heal-failures r)))))
-    (testing "a mid-run heal that threw"
-      (let [r (check-final [(heal :exception {:cause "boom"})])]
-        (is (false? (:valid? r)))
-        (is (= ["boom"] (:heal-failures r)))))))
+                                          :error [["n1" "NRV-E0607: gateway 0 ..."]]})])]
+        (is (= :unknown (:valid? r)))
+        (is (= "NRV-E0607" (:code r)))
+        (is (= [[["n1" "NRV-E0607: gateway 0 ..."]]] (:heal-failures r)))))
+    (testing "a final heal that threw"
+      (let [r (check-final [(heal :value {:gateways :all :final? true} :exception {:cause "boom"})])]
+        (is (= :unknown (:valid? r)))
+        (is (= ["boom"] (:heal-failures r)))))
+    (testing "a mid-run heal that threw is reported, not judged, when the final heal is clean"
+      (let [r (check-final [(heal :exception {:cause "boom"})
+                            (heal :value {:gateways :all :final? true :hit []})])]
+        (is (true? (:valid? r)))
+        (is (= ["boom"] (:mid-run-heal-failures r)))
+        (is (nil? (:code r)))))))
 
 (deftest an-expected-final-start-that-never-ran-fails-the-run
   (let [check (fn [faults h] (checker/check (nemesis/final-start-checker)
                                             {:nemesis-faults faults} h {}))]
-    (doseq [faults [#{:kill} #{:gateway} #{:gateway-kill} #{:kill :partition}]]
+    (doseq [faults [#{:kill} #{:gateway} #{:gateway-kill} #{:kill :partition} #{:lose-unfsynced-writes}]]
       (let [r (check faults [])]
-        (is (false? (:valid? r)) (str faults))
+        (is (= :unknown (:valid? r)) (str faults))
         (is (= 0 (:final-starts r)))
         (is (= 1 (:expected r)))
-        (is (= "NRV-E0604" (:code r)))))
+        (is (= "NRV-E0607" (:code r)))))
     (is (true? (:valid? (check #{:kill} (pair (final-op))))) "it ran")
     (is (true? (:valid? (check #{:partition} []))) "nothing to expect without a kill")
     (is (true? (:valid? (check #{:gateway-pause :gateway-partition} []))))))
+
+(deftest replica-restarting-faults-get-the-final-start
+  (doseq [f [:kill :lose-unfsynced-writes]]
+    (is (true? (nemesis/final-start? {:faults #{f}})) (str f))
+    (is (= [:gateway-start] (map :f (:final-generator (package f)))) (str f)))
+  (is (false? (nemesis/final-start? {:faults #{:partition}}))))
 
 (deftest the-test-map-carries-the-faults
   (let [t (core/nerva-test {:workload :bank, :nemesis [:kill :partition], :time-limit 1
@@ -531,7 +548,11 @@
           ;; the same composition the test's :checker is: its :valid? is the merge of the keys'
           r   (checker/check (checker/compose {:stats (checker/unbridled-optimism)
                                                :gateways gws})
+                             {} (pair (final-op :value {:final? true :hit [] :down [["n1" 0]]})) {})
+          u   (checker/check (checker/compose {:stats (checker/unbridled-optimism)
+                                               :gateways gws})
                              {} (pair (final-op :exception {:cause "boom"})) {})]
       (is (some? gws) "a key of the test's top-level checker")
       (is (false? (:valid? (:gateways r))))
-      (is (false? (:valid? r)) "the top-level :valid?, which jepsen_report.py reads"))))
+      (is (false? (:valid? r)) "the top-level :valid?, which jepsen_report.py reads")
+      (is (= :unknown (:valid? u)) "a harness failure is not a pass at the top level"))))

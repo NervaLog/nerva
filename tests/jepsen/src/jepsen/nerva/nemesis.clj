@@ -212,47 +212,52 @@
                 (or (:exception %) (seq (:error (:value %)))))
           history))
 
+(defn- failure-text
+  [h]
+  (if-let [e (:exception h)]
+    (or (:cause e) (str e))
+    (vec (:error (:value h)))))
+
 (defn final-start-checker
-  "Invalid when the gateways were not left up and healed: the final phase's `gateway-start`
-  (`:final? true`) left a gateway not up or did not finish (an invocation with no completion, or
-  a completion with an `:exception`, a non-empty `:down` or `:pending`, or an `:error`); or the
-  test expected that start (`final-start?` over the test's `:nemesis-faults`) and it never
-  completed (`:expected 1`); or any `gateway-heal` failed (`heal-failures`; with
-  `gateway-partition` alone no final start would show a gateway left cut). `:final-starts` counts
-  completions. The result carries NRV-E0604 and names the gateways: one that cannot reach the
-  cluster after the heal and the replicas' restart is a Nerva availability finding (P238c, P244,
-  P244c)."
+  "Judges that the gateways were left up and healed. Invalid (`:valid? false`, NRV-E0604, a
+  Nerva availability finding) when the final phase's `gateway-start` (`:final? true`) left a
+  gateway `:down` or `:pending`, named in `:gateways`. `:unknown` (NRV-E0607, the Jepsen harness
+  failed, which says nothing about Nerva) when that start did not finish (an invocation with no
+  completion, `:incomplete`), threw (`:exceptions`, `:errors`), was expected (`final-start?` over
+  the test's `:nemesis-faults`) and never completed (`:expected 1`), or the final phase's
+  `gateway-heal` (`:final? true`) failed (`:heal-failures`; with `gateway-partition` alone no
+  final start would show a gateway left cut). A mid-run heal that failed is reported as
+  `:mid-run-heal-failures` and does not change the verdict: the final heal confirms no rule is
+  left. A finding wins over a harness failure. `:final-starts` counts completions (P238c, P244,
+  P244c, P244d)."
   []
   (reify checker/Checker
     (check [_ test history _opts]
       (let [{:keys [done open]} (final-starts history)
             expected (final-start? {:faults (:nemesis-faults test)})
             missing  (and expected (not= 1 (count done)))
-            heals    (heal-failures history)
-            bad      (filter #(or (:exception %)
-                                  (seq (:down (:value %)))
-                                  (seq (:pending (:value %)))
-                                  (seq (:error (:value %))))
-                             done)
+            heals    (group-by #(boolean (:final? (:value %))) (heal-failures history))
+            final-heals (get heals true)
+            mid-heals   (get heals false)
+            findings (filter #(or (seq (:down (:value %))) (seq (:pending (:value %)))) done)
+            broken   (filter #(or (:exception %) (seq (:error (:value %)))) done)
             gateways (vec (distinct (mapcat #(concat (:down (:value %)) (:pending (:value %)))
-                                            bad)))]
-        (cond-> {:valid?       (and (empty? bad) (empty? open) (empty? heals) (not missing))
+                                            findings)))
+            harness? (boolean (or (seq broken) (seq open) (seq final-heals) missing))]
+        (cond-> {:valid?       (cond (seq findings) false
+                                     harness?       :unknown
+                                     :else          true)
                  :final-starts (count done)}
-          expected   (assoc :expected 1)
-          missing    (assoc :code "NRV-E0604")
-          (seq open) (assoc :code "NRV-E0604" :incomplete (count open))
-          (seq heals) (assoc :code       "NRV-E0604"
-                             :heal-failures
-                             (vec (for [h heals]
-                                    (if-let [e (:exception h)]
-                                      (or (:cause e) (str e))
-                                      (vec (:error (:value h)))))))
-          (seq bad)  (assoc :code       "NRV-E0604"
-                            :gateways   gateways
-                            :errors     (vec (mapcat #(:error (:value %)) bad))
-                            :exceptions (vec (keep #(let [e (:exception %)]
-                                                         (and e (or (:cause e) (str e))))
-                                                   bad))))))))
+          expected      (assoc :expected 1)
+          (seq mid-heals) (assoc :mid-run-heal-failures (mapv failure-text mid-heals))
+          harness?      (assoc :code "NRV-E0607")
+          (seq open)    (assoc :incomplete (count open))
+          (seq final-heals) (assoc :heal-failures (mapv failure-text final-heals))
+          (seq broken)  (assoc :errors     (vec (mapcat #(:error (:value %)) broken))
+                               :exceptions (vec (keep #(let [e (:exception %)]
+                                                            (and e (or (:cause e) (str e))))
+                                                      broken)))
+          (seq findings) (assoc :code "NRV-E0604" :gateways gateways))))))
 
 (def order
   "The faults in the order their undos run: resume, heal, then start."
@@ -269,11 +274,17 @@
   (let [ops (mapv #(op (opposite %) (cond-> undo-value final? (assoc :final? true))) faults)]
     (when (seq ops) ops)))
 
+(def replica-restarting-faults
+  "The nemeses that kill replicas and bring them back through `db/start!`, which only settles
+  briefly (P244): the replica `kill`, and the LazyFS `lose-unfsynced-writes` of draft #242."
+  #{:kill :lose-unfsynced-writes})
+
 (defn final-start?
   "Whether the final phase starts and judges every gateway: when the run can leave one down, by
-  `gateway-kill` or by the replica `kill` nemesis (whose `:start` only settles briefly, P244)."
+  `gateway-kill` or by a nemesis that restarts replicas (`replica-restarting-faults`)."
   [opts]
-  (boolean (or (some #{:gateway-kill} (used opts)) (contains? (:faults opts) :kill))))
+  (boolean (or (some #{:gateway-kill} (used opts))
+               (some replica-restarting-faults (:faults opts)))))
 
 (defn heal-package
   "Only a final generator: resume and heal (the heal is `:final? true`: its per-node failure
