@@ -180,13 +180,24 @@ fn run() !void {
                 null;
             defer if (trace_writer) |*writer| writer.flush();
 
-            var tracer = try Tracer.init(gpa, time, .unknown, if (tag == .start) .{
+            var tracer = Tracer.init(gpa, time, .unknown, if (tag == .start) .{
                 .writer = if (trace_writer) |*writer| writer.writer() else null,
                 .statsd_options = if (args.statsd) |address|
                     .{ .udp = .{ .io = &io, .address = address } }
                 else
                     .log,
-            } else .{});
+            } else .{}) catch |err| switch (err) {
+                // Only the statsd socket can fail here besides memory: the operator's `--statsd`
+                // names an address this host cannot send to (#181, #184).
+                error.OutOfMemory => return err,
+                else => if (tag == .start and args.statsd != null) diagnostic.fail(
+                    "NRV-E0010",
+                    "start: cannot send statsd to {}: {s}",
+                    .{ args.statsd.?.to_std(), metrics.init_reason(err) },
+                    "give --statsd an address this host can send UDP to, or leave it out",
+                    .{},
+                ) else return err,
+            };
             defer tracer.deinit(gpa);
 
             var storage = Storage.init(&io, &tracer, .{

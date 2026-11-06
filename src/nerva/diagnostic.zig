@@ -45,7 +45,7 @@ pub const table = [_]Entry{
     .{ .code = "NRV-E0007", .summary = "A replica, gateway or view server cannot listen", .exit = exit_operator },
     .{ .code = "NRV-E0008", .summary = "`NERVA_KEY` is missing or invalid", .exit = exit_operator },
     .{ .code = "NRV-E0009", .summary = "`--listen` is not loopback and `--listen-remote` was not given", .exit = exit_operator },
-    .{ .code = "NRV-E0010", .summary = "A gateway cannot send its metrics to `--statsd`", .exit = exit_operator },
+    .{ .code = "NRV-E0010", .summary = "A replica or gateway cannot send its metrics to `--statsd`", .exit = exit_operator },
     .{ .code = "NRV-E0604", .summary = "A gateway or view server could not reach the cluster", .exit = exit_operator },
     .{ .code = "NRV-E0701", .summary = "The data file was written by another release", .exit = exit_operator },
     .{ .code = "NRV-E0702", .summary = "The data file is not a Nerva data file, or is damaged", .exit = exit_operator },
