@@ -170,8 +170,10 @@ fn run() !void {
             else
                 null;
             defer if (trace_file) |file| file.close();
-            // Any startup failure from here on removes the file, or the next start is refused
-            // with NRV-E0004 on it (#197). `command_start` clears this once the replica listens.
+            // Every coded exit from here on (through `diagnostic`) removes the file, or the next
+            // start is refused with NRV-E0004 on it (#197). Not removed: vendored `vsr.fatal`
+            // exits (NRV-E0707, say), panics, and signals during `replica.open`. `command_start`
+            // clears this once `replica.open` has returned.
             if (trace_file) |file| diagnostic.cleanup_register(args.trace.?, file);
             var trace_file_writer: ?std.fs.File.Writer =
                 if (trace_file) |file| file.writer() else null;

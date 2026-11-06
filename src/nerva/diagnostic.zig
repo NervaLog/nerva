@@ -145,7 +145,9 @@ var cleanup_inode: std.posix.ino_t = 0;
 var cleanup_device: std.posix.dev_t = 0;
 
 /// Records `path`, which `file` was just created at, to be removed if the command exits through
-/// `fail`, `fail_file`, `unexpected` or `fail_error` before `cleanup_clear`.
+/// `fail`, `fail_file`, `unexpected` or `fail_error` (every coded exit through this module) before
+/// `cleanup_clear`. Exits that do not pass through here leave the file: vendored `vsr.fatal` exits
+/// (NRV-E0707, for example), panics, and signals during `replica.open`.
 pub fn cleanup_register(path: []const u8, file: std.fs.File) void {
     assert(cleanup_path_length == 0);
     assert(path.len > 0 and path.len <= cleanup_path_buffer.len);
@@ -165,12 +167,14 @@ pub fn cleanup_clear() void {
 }
 
 /// Removes the registered file, unless something else has taken its path since (another inode),
-/// in which case it is not ours to remove. A removal that fails is NRV-W0011.
+/// in which case it is not ours to remove. The guard is check-then-act, not atomic: a file put at
+/// the path between the check and the unlink is still removed (Linux has no unlink-if-inode). A
+/// removal that fails is NRV-W0011.
 fn cleanup_run() void {
     if (cleanup_path_length == 0) return;
     const path = cleanup_path_buffer[0..cleanup_path_length];
     cleanup_path_length = 0;
-    const stat = std.posix.fstatat(std.posix.AT.FDCWD, path, 0) catch |err| switch (err) {
+    const stat = std.posix.fstatat(std.posix.AT.FDCWD, path, std.posix.AT.SYMLINK_NOFOLLOW) catch |err| switch (err) {
         error.FileNotFound => return, // Already gone.
         else => return cleanup_warn(path, err),
     };
@@ -183,8 +187,23 @@ fn cleanup_warn(path: []const u8, err: anyerror) void {
         "before the next start, which refuses an existing file (NRV-E0004)", .{
         command,
         path,
-        file_reason(err),
+        cleanup_reason(err),
     });
+}
+
+/// `file_reason` for the errors a removal commonly hits; anything else is "the system refused".
+fn cleanup_reason(err: anyerror) []const u8 {
+    return switch (err) {
+        error.FileNotFound,
+        error.AccessDenied,
+        error.PermissionDenied,
+        error.IsDir,
+        error.NotDir,
+        error.NameTooLong,
+        error.ReadOnlyFileSystem,
+        => file_reason(err),
+        else => "the system refused",
+    };
 }
 
 fn print_and_exit(block: []const u8, status: u8) noreturn {
@@ -343,6 +362,28 @@ test "cleanup removes the file it registered and only that file" {
     cleanup_clear();
     cleanup_run();
     try tmp.dir.access("trace", .{});
+}
+
+test "cleanup warns and leaves the file when a parent became a regular file" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = try tmp.dir.realpath(".", &buffer);
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, "{s}/d/trace", .{dir});
+
+    try tmp.dir.makeDir("d");
+    const file = try std.fs.cwd().createFile(path, .{ .exclusive = true });
+    cleanup_register(path, file);
+    file.close();
+    try tmp.dir.rename("d", "d2");
+    (try tmp.dir.createFile("d", .{})).close();
+    // fstatat returns NotDir: NRV-W0011, and the file at its new place is untouched.
+    cleanup_run();
+    try tmp.dir.access("d2/trace", .{});
+    try testing.expectEqual(@as(usize, 0), cleanup_path_length);
+    try testing.expectEqualStrings("a parent of it is not a directory", cleanup_reason(error.NotDir));
+    try testing.expectEqualStrings("the system refused", cleanup_reason(error.FileBusy));
 }
 
 fn expect_render(

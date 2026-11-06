@@ -175,7 +175,9 @@ def main():
                 expect(result, code, 1, text, "trace with " + label)
                 assert not os.path.exists(path), f"{label}: the failed start left its trace file"
                 seen.append(code)
-        # A start that works keeps its trace file: it is the operator's.
+        # A start that gets past replica.open is not refused with E0004 (#197) and its trace file
+        # exists. This does not test the clear itself (the file would exist without it): only the
+        # unit test does.
         with socket.socket() as probe:
             probe.bind(("127.0.0.1", 0))
             free = [probe.getsockname()[1]]
