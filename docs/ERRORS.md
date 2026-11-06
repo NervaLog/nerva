@@ -10,6 +10,10 @@ a one-line summary, who is to blame, the cause and a fix. Codes are never reused
   `false` (nothing reached the cluster, or the cluster refused it) or `"unknown"` (a write went
   out and no reply came back: NRV-E0601, NRV-B0002, and NRV-B0001 when a write had been sent). A replayed commit (200) carries
   `"code":"NRV-W0201"`. The "Today" column below says which status and text each code is.
+- **Provoked by the R4 demo (R4 slice 7):** `tests/demo/r4.py` (`zig build demo-r4`) reads NRV-E0007
+  and NRV-E0009 from `nerva api`'s exit, and NRV-E0602, NRV-E0601, NRV-E0605, NRV-E0102,
+  NRV-E0401 and NRV-E0116 from the wire, each with its `applied`, on a real three-replica
+  cluster. Until `demo_r4` is green in CI on `main`, this is built, not demonstrated.
 - **In commands:** every `nerva` command failure that Nerva's code reports prints
   `error[NRV-E…]` (or `bug[NRV-B…]`), then a `cause` line (the code's summary) and a `fix` line
   (R5, `src/nerva/diagnostic.zig`; a unit test keeps its table equal to this file). Exit statuses:
