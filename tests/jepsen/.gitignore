@@ -4,3 +4,4 @@
 /.ssh/
 /.lein-*
 /.nrepl-port
+/.tools/

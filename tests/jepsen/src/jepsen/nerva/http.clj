@@ -1,15 +1,20 @@
 (ns jepsen.nerva.http
   "JSON over HTTP to `nerva api`, and what a reply means for a Jepsen operation.
 
-  A reply is definite or not. `200` applied the request at the op it names; `409` applied
-  nothing (a conflict, `out_of_bounds`, `unpaired`, ...: README, JSON API). A connection that
-  was never made (refused, or timed out connecting) sent nothing, so its request failed too.
-  Anything else that does not reach a reply (a reset connection, our timeout) and a `503` (the
-  gateway lost its cluster session, maybe after the commit went out) leave a write's outcome
-  unknown: Jepsen's `:info`. A read changes nothing, so a read without a reply simply failed.
-  A `400` means the test sent something malformed: that is a bug in the test, and throws."
+  A reply is definite or not, and its body says which (R4, P215d). A `2xx` applied the request
+  at the op it names (`\"replayed\": true` when a resent key had already committed). Any other
+  reply carries `applied`: `false` means nothing was applied (a conflict, `out_of_bounds`, a
+  gateway without a session, ...), `\"unknown\"` means a write went out and no reply came back.
+  A connection that was never made (refused, or timed out connecting) sent nothing, so its
+  request failed too. Anything else that does not reach a reply (a reset connection, our
+  timeout) leaves a write's outcome unknown: Jepsen's `:info`. A read changes nothing, so a
+  read without a reply simply failed. A non-2xx reply without `applied` and `code` is a bug in
+  the gateway's promise, and a `400` means the test sent something malformed: both complete
+  the op as a protocol violation (`violation`), which `protocol-checker` turns into an invalid
+  run. They do not throw: Jepsen records a thrown op as :info, and nothing would fail."
   (:require [clojure.data.json :as json]
-            [clojure.string :as str])
+            [clojure.string :as str]
+            [jepsen.checker :as checker])
   (:import (java.io IOException)
            (java.net ConnectException URI)
            (java.net.http HttpClient HttpClient$Version HttpConnectTimeoutException HttpRequest
@@ -66,14 +71,64 @@
     (:body reply)))
 
 (defn outcome
-  "What a reply means: :ok (applied), :refused (nothing applied), or :unknown (the gateway
-  could not say). Throws on any other status: the test sent something it should not have."
-  [{:keys [status body] :as reply}]
+  "What a reply means, read from its body as R4 defines it (README, \"What a reply means\";
+  P215d): :ok (any 2xx, a replay included), :refused (`applied: false`, on any status: nothing
+  reached the cluster, or the cluster refused it), :unknown (`applied: \"unknown\"`: a write
+  went out and no reply came back) or :violation (a `400`, or a non-2xx reply that does not
+  carry both `applied` and `code`: it breaks R4's promise, or the test is wrong)."
+  [{:keys [status body]}]
+  (let [applied (get body "applied")]
+    (cond
+      (<= 200 (long status) 299)      :ok
+      (= 400 (long status))           :violation
+      (not (string? (get body "code"))) :violation
+      (false? applied)                :refused
+      (= "unknown" applied)           :unknown
+      :else                           :violation)))
+
+(defn violation
+  "op, completed for a reply that breaks R4's promise or shows the test is wrong (see
+  `outcome`). :info, because whether a write applied is not known; it carries
+  :protocol-violation, which `protocol-checker` invalidates the run for."
+  [op {:keys [status body]}]
+  (assoc op :type :info
+         :error [:protocol-violation status]
+         :protocol-violation {:http status, :body body}))
+
+(defn protocol-checker
+  "Invalid when any operation in the history carries :protocol-violation. Composed into every
+  test by core, so no workload wires it by hand."
+  []
+  (reify checker/Checker
+    (check [_ _test history _opts]
+      (let [bad (filter :protocol-violation history)]
+        {:valid?     (empty? bad)
+         :violations (count bad)
+         :examples   (vec (take 10 bad))}))))
+
+(defn replayed?
+  "Whether a 2xx reply says the request had already committed: `\"replayed\": true`
+  (NRV-W0201). Its `op` is the original commit's."
+  [{:keys [body]}]
+  (true? (get body "replayed")))
+
+(defn ok-fields
+  "The fields an :ok completion takes from its 2xx reply: the `:op` it names, and
+  `:replayed? true` when it was a replay."
+  [{:keys [body] :as reply}]
+  (cond-> {:op (parse-long (str (get body "op")))}
+    (replayed? reply) (assoc :replayed? true)))
+
+(defn refusal-error
+  "The :error of a :fail completion for a :refused reply. Nerva's own refusal of a well-formed
+  request (a `409`) is its status as a keyword, which a workload's checker may judge. Any other
+  `applied: false` reply (busy, no session, too large, ...) is a definite failure that is no
+  refusal of the request: {:code \"NRV-...\", :http 503}. A `400` means the test sent something
+  malformed: `outcome` calls it a violation, so it never gets here."
+  [{:keys [status body]}]
   (case (long status)
-    200     :ok
-    409     :refused
-    (503 504) :unknown
-    (throw (ex-info (str "unexpected reply " status) {:reply reply}))))
+    409 (keyword (or (get body "status") (get body "error") (get body "code")))
+    {:code (get body "code"), :http status}))
 
 (defn unknown
   "op, completed for a request whose outcome is unknown: :info for a write, :fail for a read."

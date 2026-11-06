@@ -15,7 +15,8 @@
             [jepsen.checker.timeline :as timeline]
             [jepsen.nemesis.combined :as combined]
             [jepsen.nerva [bank :as bank]
-                          [db :as db]])
+                          [db :as db]
+                          [http :as http]])
   (:gen-class))
 
 (def workloads
@@ -70,6 +71,7 @@
                           :timeline   (timeline/html)
                           :stats      (checker/stats)
                           :exceptions (checker/unhandled-exceptions)
+                          :protocol   (http/protocol-checker)
                           :workload   (:checker workload)})
             :generator (gen/phases
                          (->> (:generator workload)

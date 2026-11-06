@@ -100,8 +100,9 @@
       :ok      (let [{:keys [balances source]} (read-value body)]
                  (assoc op :type :ok, :value balances, :source source,
                         :op (parse-long (get body "op"))))
-      :refused (assoc op :type :fail, :error (keyword (get body "status")))
-      :unknown (http/unknown op false :unavailable))))
+      :refused (assoc op :type :fail, :error (http/refusal-error reply))
+      :unknown (http/unknown op false :unavailable)
+      :violation (http/violation op reply))))
 
 (defn invoke-transfer
   [node op]
@@ -111,8 +112,9 @@
       :ok      (assoc op :type :ok
                       :applied (- (parse-long (get-in body ["adds" 0 "applied"])))
                       :op (parse-long (get body "op")))
-      :refused (assoc op :type :fail, :error (keyword (get body "status")))
-      :unknown (http/unknown op true :unavailable))))
+      :refused (assoc op :type :fail, :error (http/refusal-error reply))
+      :unknown (http/unknown op true :unavailable)
+      :violation (http/violation op reply))))
 
 (defn invoke-view
   [node op]
@@ -125,8 +127,9 @@
                                            (parse-long (get group field))))
                         :groups (count groups)
                         :op (parse-long (get body "op"))))
-      :refused (assoc op :type :fail, :error (keyword (get body "status")))
-      :unknown (http/unknown op false :unavailable))))
+      :refused (assoc op :type :fail, :error (http/refusal-error reply))
+      :unknown (http/unknown op false :unavailable)
+      :violation (http/violation op reply))))
 
 (defrecord Client [node]
   client/Client
