@@ -156,12 +156,37 @@ def main():
                              f"--statsd={statsd_bad[0]}", data], {})
         expect(result, "NRV-E0010", 1, "start: cannot send statsd to", "trace with bad statsd")
         assert not os.path.exists(trace_again), "the failed start left its trace file"
+        # Every other startup failure removes it too: a held port (NRV-E0007), a missing cluster
+        # key (NRV-E0901) and a missing address (NRV-E0710).
+        with socket.socket() as held:
+            held.bind(("127.0.0.1", 0))
+            held.listen()
+            port = held.getsockname()[1]
+            for label, argv, env, code, text in (
+                ("port held", [f"--addresses=127.0.0.1:{port},127.0.0.1:1,127.0.0.1:2",
+                               "--development"], {}, "NRV-E0007", "cannot listen"),
+                ("no cluster key", ["--addresses=10.0.0.1:1,10.0.0.2:2,10.0.0.3:3"], {},
+                 "NRV-E0901", "NERVA_CLUSTER_KEY"),
+                ("missing address", [f"--addresses=127.0.0.1:{port}", "--development"], {},
+                 "NRV-E0710", "--addresses"),
+            ):
+                path = os.path.join(tmp, "trace-" + label.replace(" ", "-"))
+                result = run(nerva, ["start"] + argv + ["--trace=" + path, data], env)
+                expect(result, code, 1, text, "trace with " + label)
+                assert not os.path.exists(path), f"{label}: the failed start left its trace file"
+                seen.append(code)
+        # A start that works keeps its trace file: it is the operator's.
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            free = [probe.getsockname()[1]]
         process = subprocess.Popen(
-            [nerva, "start", "--addresses=127.0.0.1:1,127.0.0.1:2,127.0.0.1:3", "--development",
-             "--trace=" + trace_again, data], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True)
+            [nerva, "start", f"--addresses=127.0.0.1:{free[0]},127.0.0.1:1,127.0.0.1:2",
+             "--development", "--trace=" + trace_again, data],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
-            time.sleep(3)  # long enough for E0004, which is raised before anything else runs
+            time.sleep(3)  # long enough for a replica that can start to be listening
+            assert process.poll() is None, "the replica did not stay running"
+            assert os.path.exists(trace_again), "the running replica has no trace file"
         finally:
             process.kill()
             stderr = process.communicate()[1]

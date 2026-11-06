@@ -170,6 +170,9 @@ fn run() !void {
             else
                 null;
             defer if (trace_file) |file| file.close();
+            // Any startup failure from here on removes the file, or the next start is refused
+            // with NRV-E0004 on it (#197). `command_start` clears this once the replica listens.
+            if (trace_file) |file| diagnostic.cleanup_register(args.trace.?, file);
             var trace_file_writer: ?std.fs.File.Writer =
                 if (trace_file) |file| file.writer() else null;
             // Buffered, bounded, and never failing: a trace write error must not panic the
@@ -187,9 +190,6 @@ fn run() !void {
                 else
                     .log,
             } else .{}) catch |err| {
-                // Startup ends here: remove the trace file this run created, or the next start
-                // fails with NRV-E0004 on it (#197).
-                trace_file_discard(if (tag == .start) args.trace else null);
                 // Only the statsd socket can fail here besides memory: the operator's `--statsd`
                 // names an address this host cannot send to (#181, #184).
                 switch (err) {
@@ -223,10 +223,7 @@ fn run() !void {
                     "give a new path, or remove the old file if it is really unwanted",
                     .{},
                 ),
-                else => {
-                    trace_file_discard(if (tag == .start) args.trace else null);
-                    return err;
-                },
+                else => return err,
             };
             defer storage.deinit();
 
@@ -237,19 +234,6 @@ fn run() !void {
             }
         },
     }
-}
-
-/// Removes the `--trace` file this run created, when startup fails before any span is worth
-/// keeping. Only called after `createFile(.exclusive)` succeeded, so it never deletes a file
-/// that existed before (that refusal is NRV-E0004). A failed removal leaves the file.
-fn trace_file_discard(path: ?[]const u8) void {
-    const trace_path = path orelse return;
-    std.fs.cwd().deleteFile(trace_path) catch |err| {
-        log.warn("start: could not remove the empty trace file {s}: {s}", .{
-            trace_path,
-            @errorName(err),
-        });
-    };
 }
 
 fn command_format(
@@ -779,6 +763,9 @@ fn command_start(
         ),
         else => |e| return e,
     };
+
+    // Startup succeeded: the trace file is the operator's now, whatever happens later.
+    diagnostic.cleanup_clear();
 
     log.info("{}: allocated {}MiB during replica init", .{
         replica.replica,
