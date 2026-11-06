@@ -27,7 +27,8 @@ ExecStopPost=+-/usr/bin/systemctl start sim-fleet.service
 # this unit): the night never runs the tip's ops/jepsen/ (P240).
 # nightly.sh keeps its own 3 h deadline; this bounds a hang of the shell itself. On a stop or this
 # timeout systemd sends TERM, and nightly.sh's trap reports the night as interrupted: up to 20 s
-# for the run to stop and 60 s for the report, so TimeoutStopSec leaves 120 s before the KILL.
+# for the run to stop, 30 s for the archive and 60 s for the report (110 s), so TimeoutStopSec
+# leaves 120 s before the KILL.
 TimeoutStartSec=12600
 TimeoutStopSec=120
 Nice=5

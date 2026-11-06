@@ -35,7 +35,7 @@ a Ctrl-C; a `set -e` abort such as a full disk) goes through one `EXIT` trap: it
 flight (as exit 143 only if it was still running) and gives every workload that never ran a 143
 line, so the night is never `success`. It writes a `host-failure` only when no run had finished (a
 finished run's finding is reported as it is: `failure` and its issue), and posts `jepsen/nightly`
-(`error`, or `failure`) and the tracker's line within about 80 s, once, after archiving the runs
+(`error`, or `failure`) and the tracker's line within about 110 s (the run's stop 20 s, the archive 30 s, the report 60 s), once, after archiving the runs
 that finished (an issue then names an archive that outlives the night's directory). The first
 host-failure reason stands: a failed build is not rewritten as "interrupted";
 `TimeoutStopSec=120` leaves room for that. A stop during the final report is not reported again

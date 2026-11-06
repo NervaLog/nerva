@@ -1256,7 +1256,8 @@ class Nightly(unittest.TestCase):
         script = (HERE / "nightly.sh").read_text()
         child = int(re.search(r"seq (\d+)", script).group(1))
         limit = int(re.search(r"report_limit=(\d+)\n  if", script).group(1))
-        self.assertGreater(stop, child + limit)
+        archive = int(re.search(r"make_archive (\d+)\n", script).group(1))
+        self.assertGreater(stop, child + archive + limit)
 
     def test_the_readme_says_the_runner_changes_only_when_setup_runs_again(self):
         readme = " ".join((HERE / "README.md").read_text().split())

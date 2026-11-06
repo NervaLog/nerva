@@ -185,10 +185,14 @@ run() {
 }
 
 # Archives the night's store at $archive, so the issues can name it. A failed archive is logged
-# and $archive is emptied: the findings are reported without its path.
+# and $archive is emptied: the findings are reported without its path. $1 is a time limit in
+# seconds, given only on the early-exit path (the stop budget); the normal night's has none.
 archived=0     # 1 once the archive is in place
 make_archive() {
-  if ! supervise timeout 30 tar --zstd -C "$night" -cf "$archive.new" store 2> /dev/null 9>&-; then
+  [[ -n "$archive" ]] || return 0
+  local limit=()
+  [[ -z "${1:-}" ]] || limit=(timeout "$1")
+  if ! supervise "${limit[@]}" tar --zstd -C "$night" -cf "$archive.new" store 2> /dev/null 9>&-; then
     rm -f "$archive.new"
     archive=""
     log "the archive could not be written"
@@ -226,8 +230,8 @@ known_commit() {
 # systemd stop or timeout or a Ctrl-C (TERM, INT: `exit 143`), a `set -e` abort (a full disk, say)
 # or an unset variable. The night is reported once, as the host's `error` with the tracker's line,
 # within seconds: the run in flight is recorded (143 only if it was still running), a
-# `host-failure` is written, and the reporter gets 60 s. The unit's TimeoutStopSec leaves room
-# (child 20 s + reporter 60 s).
+# `host-failure` is written, the archive gets 30 s and the reporter 60 s. The unit's TimeoutStopSec
+# leaves room (child 20 s + archive 30 s + reporter 60 s = 110 s).
 night_over=0   # 1 once the night is reported or nothing more is owed
 reporting=0    # 1 from the start of the final report: a second one could file its issues twice
 on_exit() {
@@ -239,7 +243,7 @@ on_exit() {
   night_over=1
   if ((reporting)); then
     if ((rc == 2)); then
-      log "the reporter exited 2 (state file, token, a rate limit or GitHub unreachable; its lines are above): the report did not finish; it is not run again, as it may have filed issues"
+      log "the reporter exited 2 (a usage error, the state file, token, a rate limit or GitHub unreachable; its lines are above): the report did not finish; it is not run again, as it may have filed issues"
     else
       log "the night's report did not finish (exit $rc); not reporting it twice"
     fi
@@ -286,7 +290,7 @@ on_exit() {
   if ((archived)); then
     :
   elif ((finished)); then
-    make_archive
+    make_archive 30
   else
     archive=""
   fi
