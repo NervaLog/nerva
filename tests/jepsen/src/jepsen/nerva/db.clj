@@ -140,16 +140,23 @@
   restart it; the suite does the same, this many times."
   6)
 
+(def gateway-start-wait-s
+  "How long `start-api!` waits for a started gateway to be healthy or dead."
+  15)
+
 (defn start-api!
   "Starts the test's gateways. The control node reaches them over the network, so they listen
   on every address and say so: `--listen-remote` (P168, NRV-E0009). A test's `:request-timeout`
   (milliseconds) becomes their `--request-timeout`. A gateway that exits at start is started
-  again (`gateway-start-tries`); one that is neither healthy nor dead after 8 s is left."
+  again (`gateway-start-tries`); one that is neither healthy nor dead after
+  `gateway-start-wait-s` is left. Under `partition` a gateway can stay dead: with a 3 s
+  `--request-timeout` its tries are spent in about 18 s, and nothing starts it again until the
+  nemesis's next `:start`; the run then has fewer gateways until then, never wrong results."
   [test]
   (doseq [index (range (gateways test c/*host*))]
     (loop [tries 1]
       (start-gateway! test index)
-      (let [deadline (+ (System/nanoTime) 15000000000)
+      (let [deadline (+ (System/nanoTime) (* gateway-start-wait-s 1000000000))
             state    (loop []
                        (cond (http/healthy? c/*host* (gateway-port index)) :up
                              (not (cu/daemon-running? (gateway-pidfile index))) :dead
