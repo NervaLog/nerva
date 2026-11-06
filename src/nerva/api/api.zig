@@ -4114,6 +4114,51 @@ test "api: a group whose send expires has sent nothing, and each member says so 
     try testing.expectEqual(@as(u64, 0), fake.writes_sent);
 }
 
+test "api: a commit whose layout read used the window is refused unsent, applied false (#186)" {
+    var arena_instance = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_instance.deinit();
+    const arena = arena_instance.allocator();
+    var fake: FakeClient = .{ .allocator = arena };
+    var layouts: FakeLayouts = .{ .allocator = arena, .client = &fake };
+    const declare =
+        \\{"name":"seats","fields":[{"name":"section","type":"u8"}]}
+    ;
+    _ = try handle(arena, &fake, &layouts, .put, "/v1/tables/7", declare);
+    // The window has run out by the time the second call of the request (the commit, after its
+    // layout read) would start: the client refuses it before sending.
+    fake.expire_from_write = fake.writes_sent + 1;
+    const writes_before = fake.writes_sent;
+    const reads_before = layouts.reads;
+    layouts.cache.forget(7);
+    try testing.expectError(error.Expired, handle(arena, &fake, &layouts, .post, "/v1/commit",
+        \\{"entries":[{"kind":"put","table":7,"id":"1","fields":{"section":2}}]}
+    ));
+    try testing.expect(layouts.reads > reads_before);
+    try testing.expectEqual(writes_before, fake.writes_sent);
+    try testing.expectEqual(Applied.no, applied_since(writes_before, fake.writes_sent));
+}
+
+test "api: a commit that is sent and then passes the window is never applied false (#186)" {
+    var arena_instance = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_instance.deinit();
+    const arena = arena_instance.allocator();
+    var fake: FakeClient = .{ .allocator = arena };
+    var layouts: FakeLayouts = .{ .allocator = arena, .client = &fake };
+    const declare =
+        \\{"name":"seats","fields":[{"name":"section","type":"u8"}]}
+    ;
+    _ = try handle(arena, &fake, &layouts, .put, "/v1/tables/7", declare);
+    // The layout read answered; the commit went out and the window ended before its reply.
+    fake.timeout_from_write = fake.writes_sent + 1;
+    const writes_before = fake.writes_sent;
+    layouts.cache.forget(7);
+    try testing.expectError(error.Timeout, handle(arena, &fake, &layouts, .post, "/v1/commit",
+        \\{"entries":[{"kind":"put","table":7,"id":"1","fields":{"section":2}}]}
+    ));
+    try testing.expectEqual(writes_before + 1, fake.writes_sent);
+    try testing.expectEqual(Applied.unknown, applied_since(writes_before, fake.writes_sent));
+}
+
 test "api: a views_busy send again that expires keeps the answers that came back (P195b)" {
     var arena_instance = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_instance.deinit();
