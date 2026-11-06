@@ -17,6 +17,7 @@
             [jepsen.nerva [bank :as bank]
                           [db :as db]
                           [http :as http]
+                          [lazyfs :as lazyfs]
                           [nemesis :as nemesis]
                           [retry :as retry]])
   (:gen-class))
@@ -31,7 +32,8 @@
 
 (def faults
   "The faults --nemesis may name."
-  #{:kill :pause :partition :gateway :gateway-kill :gateway-partition :gateway-pause})
+  #{:kill :pause :partition :gateway :gateway-kill :gateway-partition :gateway-pause
+    lazyfs/fault})
 
 (def all-nemeses
   "What test-all runs, each for every workload."
@@ -51,10 +53,14 @@
                       :nodes     (:nodes opts)
                       :faults    (set (:nemesis opts))
                       :interval  (:nemesis-interval opts)
+                      :dir       db/dir
+                      :node-probe  db/node-health
+                      :start-mid!  db/start-node-bounded!
                       :kill      {:targets [:one :minority :majority :all]}
                       :pause     {:targets [:one :minority :majority]}
                       :partition {:targets [:one :majority :majorities-ring]}}]
     (combined/compose-packages [(nemesis/heal-package package-opts)
+                                (lazyfs/package package-opts)
                                 (combined/db-package package-opts)
                                 (combined/partition-package package-opts)
                                 (nemesis/package package-opts)])))
@@ -63,7 +69,9 @@
   "A test map from CLI options."
   [opts]
   (let [workload ((workloads (:workload opts)) opts)
-        opts     (assoc opts :gateways (or (:gateways opts) (default-gateways (:workload opts))))
+        opts     (assoc opts
+                        :gateways (or (:gateways opts) (default-gateways (:workload opts)))
+                        :lazyfs   (contains? (set (:nemesis opts)) lazyfs/fault))
         db       (db/db (:bootstrap workload))
         package  (nemesis-package opts db)]
     (merge tests/noop-test
@@ -83,6 +91,7 @@
                           :exceptions (checker/unhandled-exceptions)
                           :protocol   (http/protocol-checker)
                           :gateways   (nemesis/final-start-checker)
+                          :lazyfs     (lazyfs/recover-checker)
                           :workload   (:checker workload)})
             :generator (gen/phases
                          (->> (:generator workload)
@@ -100,7 +109,7 @@
     :default  :bank
     :parse-fn keyword
     :validate [workloads (str "Must be one of " (str/join ", " (map name (keys workloads))))]]
-   [nil "--nemesis FAULTS" "Comma-separated faults: kill, pause, partition, gateway (= gateway-kill, gateway-partition, gateway-pause)."
+   [nil "--nemesis FAULTS" "Comma-separated faults: kill, pause, partition, gateway (= gateway-kill, gateway-partition, gateway-pause), lose-unfsynced-writes (LazyFS)."
     :default  []
     :parse-fn parse-faults
     :validate [(partial every? faults) (str "Faults are " (str/join ", " (map name faults)))]]
@@ -124,6 +133,7 @@
     :default  8
     :parse-fn parse-long
     :validate [pos? "Must be positive"]]
+   [nil "--lazyfs-all-nodes" "lose-unfsynced-writes: also lose writes on every node after a quorum crash. Off: LazyFS likely drops the replica's O_DSYNC writes, so the whole cluster would come back empty (#246, docs/demos/r1.md)."]
    [nil "--nerva-binary PATH" "The nerva binary to install on every node."
     :default "../../zig-out/bin/nerva"]])
 
