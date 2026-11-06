@@ -19,7 +19,7 @@ last line is `demo-r4: PASS` or `demo-r4: FAIL step N: ...`.
  7  SIGKILL GA while A's callers are mid-commit: only A sees transport errors
  8  a new GA on the same port; A resends every unknown under its key
  9  SIGSTOP all three replicas for 10 s with B sending: 503 unknown within 4 s, healthz 503 within
-    8.5 s, both answer again within 10 s, B resends
+    8.5 s, both answer again within 10 s, B resends (none answers 409)
 10  a 4 MiB + 1 body (413), a future as_of (504), a drip (408), each with "applied": false
 11  every acknowledged key resent through GB answers replayed; the ledger and the view agree
 
@@ -789,9 +789,10 @@ def step9(demo, a, b):
                   and (body["applied"] == "unknown") == (body["code"] == "NRV-E0601"), (status, body))
     count = b.resend_unresolved(b.port)
     check(not b.unresolved, f"{len(b.unresolved)} keys unresolved after the resend")
+    check(b.resent["conflict"] == 0, f"a resend answered 409: {b.resent}")
     say(f"{len(inflight)} in-flight requests answered 503 ({unknown} unknown, NRV-E0601) within {worst:.1f} s; "
         f"GA /healthz 503 (NRV-E0605) after {health['answered']:.1f} s; both ready {recovered:.1f} s "
-        f"after SIGCONT; {count} keys resent", started)
+        f"after SIGCONT; {count} keys resent, none answered 409", started)
 
 
 def step10(demo, a):
