@@ -22,6 +22,11 @@ client only a resend. A fraction of the existing timeout needs no new constant t
 **Also (issue #205).** An explicit `min_op` or `as_of` that the view has already reached reads
 nothing from the feed, so it never gets NRV-E0606; a test now holds it so.
 
+**Left as it is.** A `views_busy` member whose send again expires is `unknown`, though that
+send never went out (`Client` refuses before queueing) and its busy answer was a refusal.
+`applied` is the group's write count taken at exit; a per-member override would be correct but
+`unknown` is the safe direction, and a retry with the same key is safe either way.
+
 **Cost.** A request whose first call starts with under a sixteenth of the window left, for
 instance after a slow reconnection, is refused where it might have just fit. A call that is sent
 and still passes the window is NRV-E0601, as before.
