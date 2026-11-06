@@ -151,6 +151,10 @@ jobs:
         if: needs.changes.outputs.code != 'false'
         run: python3 ops/sim-fleet/test_sim_fleet.py
 
+      - name: Jepsen nightly's reporter (fingerprints, dedup, caps, bounds; no network)
+        if: needs.changes.outputs.code != 'false'
+        run: python3 -I ops/jepsen/test_jepsen_report.py
+
       - name: Integration (three real replicas)
         if: needs.changes.outputs.code != 'false'
         run: ./zig/zig build test:integration
