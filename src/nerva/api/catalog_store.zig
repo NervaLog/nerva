@@ -155,3 +155,53 @@ fn layout_read(
         error.Invalid => error.Corrupt,
     };
 }
+
+test "CatalogStore: a layout or view call keeps the request's window and sends nothing past it (#186)" {
+    const stdx = @import("stdx");
+    const constants = @import("../../constants.zig");
+    var arena_instance = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_instance.deinit();
+    const arena = arena_instance.allocator();
+    var time_os: stdx.TimeOS = .{};
+    // Only what `ensure_idle` reads: an idle client whose window ended a second ago, so any
+    // call it makes is refused before it is queued. A call that gave itself a fresh window
+    // (the (k+1) x timeout of #186) would be sent. `client.sending` is already set, so a send
+    // trips `Client.send`'s `assert(client.sending == null)`, a deterministic assertion
+    // failure, after copying into a real request buffer (no undefined memory is touched).
+    const request_bytes = try arena.alignedAlloc(
+        u8,
+        constants.cache_line_size,
+        constants.message_body_size_max,
+    );
+    var client: Client = undefined;
+    client.request = @ptrCast(request_bytes.ptr);
+    client.sending = .commit;
+    client.state = .idle;
+    client.time_os = time_os;
+    client.vsr_client.batch_size_limit = 1024;
+    client.writes_sent = 3;
+    const ended: stdx.Instant = .{ .ns = time_os.monotonic().ns - std.time.ns_per_s };
+    client.options = .{
+        .cluster = 0,
+        .addresses = &.{},
+        .timeout = stdx.Duration.ms(1_000),
+        .window_end = ended,
+    };
+    var store = CatalogStore.init(&client);
+    const layout_new: catalog.Layout = .{ .name = "seats", .fields = &.{} };
+    try std.testing.expectError(error.Expired, store.layout_fresh(arena, 7));
+    try std.testing.expectError(error.Expired, store.layout(arena, 7));
+    try std.testing.expectError(error.Expired, store.layout_put(arena, 7, &layout_new));
+    const view_new: catalog.View = .{
+        .table = 7,
+        .where = &.{},
+        .group_by = &.{},
+        .aggregates = &.{.{ .function = .count, .field = null }},
+    };
+    try std.testing.expectError(error.Expired, store.view(arena, "v"));
+    try std.testing.expectError(error.Expired, store.view_put(arena, "v", &view_new));
+    try std.testing.expectEqual(ended.ns, client.options.window_end.?.ns);
+    try std.testing.expectEqual(@as(u64, 3), client.writes_sent);
+    try std.testing.expectEqual(.idle, client.state);
+    try std.testing.expectEqual(.commit, client.sending.?);
+}

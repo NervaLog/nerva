@@ -703,12 +703,7 @@ pub const Client = struct {
         };
         while (true) {
             switch (client.state) {
-                .idle => {
-                    // Saturates past 4.29 s, which a primary still records as a slow round trip.
-                    client.latency_previous_ns =
-                        std.math.lossyCast(u32, start.elapsed(client.time_os.monotonic()).ns);
-                    return;
-                },
+                .idle => return client.round_trip_done(start),
                 .evicted => return error.Evicted,
                 .registering, .waiting => {},
                 .timed_out => unreachable,
@@ -740,6 +735,15 @@ pub const Client = struct {
         // At least 1 ns: `run_once` always waits (a zero wait is `IO.run`'s job).
         const wait_ns: u63 = @intCast(@max(wait_until.ns -| now.ns, 1));
         try client.io.run_once(wait_ns);
+    }
+
+    /// A completed call: records its latency for the next header. It leaves
+    /// `options.window_end` alone, so the next call in the request shares the window (#186).
+    fn round_trip_done(client: *Client, start: stdx.Instant) void {
+        assert(client.state == .idle);
+        // Saturates past 4.29 s, which a primary still records as a slow round trip.
+        client.latency_previous_ns =
+            std.math.lossyCast(u32, start.elapsed(client.time_os.monotonic()).ns);
     }
 
     fn on_register(user_data: u128, result: *const vsr.RegisterResult) void {
@@ -830,6 +834,33 @@ test "Client: what a gateway tallied survives a registration that fails" {
     try std.testing.expectEqual(@as(u64, 1), commits.count);
     try std.testing.expectEqual(@as(u64, 2_000), commits.sum);
     try std.testing.expectEqual(@as(u64, 3), tally.requests);
+}
+
+test "Client: a completed call keeps the request's window (#186)" {
+    var time_os: stdx.TimeOS = .{};
+    const start = time_os.monotonic();
+    const end = start.add(stdx.Duration.ms(500));
+    // Only the fields `on_reply` and `round_trip_done` read: a call that has been answered.
+    var reply: Body align(constants.cache_line_size) = undefined;
+    var client: Client = undefined;
+    client.state = .waiting;
+    client.reply = &reply;
+    client.reply_size = null;
+    client.time_os = time_os;
+    client.latency_previous_ns = 0;
+    client.options = .{
+        .cluster = 0,
+        .addresses = &.{},
+        .timeout = stdx.Duration.ms(1_000),
+        .window_end = end,
+    };
+    const result: [constants.cache_line_size]u8 align(constants.cache_line_size) = @splat(0);
+    const aligned: []align(constants.cache_line_size) const u8 = &result;
+    Client.on_reply(@intFromPtr(&client), .register, 0, aligned);
+    client.round_trip_done(start);
+    // A call that re-armed the window for itself would give the next call a fresh `timeout`.
+    try std.testing.expectEqual(end.ns, client.options.window_end.?.ns);
+    try std.testing.expectEqual(end.ns, client.deadline(start).ns);
 }
 
 test "Client: one window bounds every call in it, not each call (#186)" {
