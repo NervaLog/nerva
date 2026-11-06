@@ -436,7 +436,8 @@ class Client:
             except BaseException as error:  # noqa: BLE001
                 problems.append(repr(error))
 
-        pool = [threading.Thread(target=work, args=(pending[i::threads],)) for i in range(threads)]
+        pool = [threading.Thread(target=work, args=(pending[i::threads],), daemon=True)
+                for i in range(threads)]
         for thread in pool:
             thread.start()
         for thread in pool:
@@ -557,7 +558,7 @@ def step4(demo, a):
         except Exception as error:  # noqa: BLE001
             errors.append(repr(error))
 
-    threads = [threading.Thread(target=caller, args=(i,)) for i in range(CLIENT_THREADS)]
+    threads = [threading.Thread(target=caller, args=(i,), daemon=True) for i in range(CLIENT_THREADS)]
     for thread in threads:
         thread.start()
     for thread in threads:
@@ -865,7 +866,7 @@ def step11(demo, a, b):
         except BaseException as error:  # noqa: BLE001
             problems.append(repr(error))
 
-    pool = [threading.Thread(target=work, args=(keys[i::16],)) for i in range(16)]
+    pool = [threading.Thread(target=work, args=(keys[i::16],), daemon=True) for i in range(16)]
     for thread in pool:
         thread.start()
     for thread in pool:
