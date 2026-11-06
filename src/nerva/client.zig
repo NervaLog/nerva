@@ -797,8 +797,8 @@ test "Client: a reply after the timeout is dropped (#42)" {
     var client: Client = undefined;
     client.state = .timed_out;
     client.reply_size = null;
-    const result = [_]u8{0} ** constants.cache_line_size;
-    const aligned: []align(constants.cache_line_size) const u8 = @alignCast(&result);
+    const result: [constants.cache_line_size]u8 align(constants.cache_line_size) = @splat(0);
+    const aligned: []align(constants.cache_line_size) const u8 = &result;
     Client.on_reply(@intFromPtr(&client), .register, 0, aligned);
     try std.testing.expectEqual(.timed_out, client.state);
     try std.testing.expectEqual(null, client.reply_size);
