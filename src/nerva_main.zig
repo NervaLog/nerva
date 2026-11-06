@@ -186,17 +186,22 @@ fn run() !void {
                     .{ .udp = .{ .io = &io, .address = address } }
                 else
                     .log,
-            } else .{}) catch |err| switch (err) {
+            } else .{}) catch |err| {
+                // Startup ends here: remove the trace file this run created, or the next start
+                // fails with NRV-E0004 on it (#197).
+                trace_file_discard(if (tag == .start) args.trace else null);
                 // Only the statsd socket can fail here besides memory: the operator's `--statsd`
                 // names an address this host cannot send to (#181, #184).
-                error.OutOfMemory => return err,
-                else => if (tag == .start and args.statsd != null) diagnostic.fail(
-                    "NRV-E0010",
-                    "start: cannot send statsd to {}: {s}",
-                    .{ args.statsd.?.to_std(), metrics.init_reason(err) },
-                    "give --statsd an address this host can send UDP to, or leave it out",
-                    .{},
-                ) else return err,
+                switch (err) {
+                    error.OutOfMemory => return err,
+                    else => if (tag == .start and args.statsd != null) diagnostic.fail(
+                        "NRV-E0010",
+                        "start: cannot send statsd to {}: {s}",
+                        .{ args.statsd.?.to_std(), metrics.init_reason(err) },
+                        "give --statsd an address this host can send UDP to, or leave it out",
+                        .{},
+                    ) else return err,
+                }
             };
             defer tracer.deinit(gpa);
 
@@ -218,7 +223,10 @@ fn run() !void {
                     "give a new path, or remove the old file if it is really unwanted",
                     .{},
                 ),
-                else => return err,
+                else => {
+                    trace_file_discard(if (tag == .start) args.trace else null);
+                    return err;
+                },
             };
             defer storage.deinit();
 
@@ -229,6 +237,19 @@ fn run() !void {
             }
         },
     }
+}
+
+/// Removes the `--trace` file this run created, when startup fails before any span is worth
+/// keeping. Only called after `createFile(.exclusive)` succeeded, so it never deletes a file
+/// that existed before (that refusal is NRV-E0004). A failed removal leaves the file.
+fn trace_file_discard(path: ?[]const u8) void {
+    const trace_path = path orelse return;
+    std.fs.cwd().deleteFile(trace_path) catch |err| {
+        log.warn("start: could not remove the empty trace file {s}: {s}", .{
+            trace_path,
+            @errorName(err),
+        });
+    };
 }
 
 fn command_format(
