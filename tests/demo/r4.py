@@ -771,6 +771,7 @@ def step9(demo, a, b):
     check(inflight, "no request was in flight when the replicas stopped")
     worst = 0.0
     unknown = 0
+    refused = 0
     for sent, answered, status, body in inflight:
         if status in (200, 409):  # Answered while the signals were still being delivered.
             check(answered - stopped < 0.5, f"{status} answered {answered - stopped:.2f} s after the stop")
@@ -778,22 +779,23 @@ def step9(demo, a, b):
         # A request sent to the cluster is unknown (E0601); one still waiting to be sent is not.
         check(status == 503 and (
             (body.get("code") == "NRV-E0601" and body.get("applied") == "unknown")
-            or (body.get("code") in ("NRV-E0605", "NRV-E0602") and body.get("applied") is False)),
+            or (body.get("code") in ("NRV-E0605", "NRV-E0602", "NRV-E0606") and body.get("applied") is False)),
             (status, body))
         unknown += body.get("applied") == "unknown"
+        refused += body.get("code") == "NRV-E0606"
         worst = max(worst, answered - stopped)
     check(unknown > 0, "no in-flight request was answered unknown")
     check(worst <= 4.0, f"an in-flight request waited {worst:.1f} s after the stop")
     for sent, answered, status, body in records:
         check(status in (200, 409) or (status == 503 and body.get("code") in
-              ("NRV-E0601", "NRV-E0605", "NRV-E0602")), (status, body))
+              ("NRV-E0601", "NRV-E0605", "NRV-E0602", "NRV-E0606")), (status, body))
         if status == 503:  # Unknown exactly when the request may have reached the cluster.
             check(body.get("applied") in (False, "unknown")
                   and (body["applied"] == "unknown") == (body["code"] == "NRV-E0601"), (status, body))
     count = b.resend_unresolved(b.port)
     check(not b.unresolved, f"{len(b.unresolved)} keys unresolved after the resend")
     check(b.resent["conflict"] == 0, f"a resend answered 409: {b.resent}")
-    say(f"{len(inflight)} in-flight requests answered 503 ({unknown} unknown, NRV-E0601) within {worst:.1f} s; "
+    say(f"{len(inflight)} in-flight requests answered 503 ({unknown} unknown, NRV-E0601; {refused} refused, NRV-E0606) within {worst:.1f} s; "
         f"GA /healthz 503 (NRV-E0605) after {health['answered']:.1f} s; both ready {recovered:.1f} s "
         f"after SIGCONT; {count} keys resent, none answered 409", started)
 
