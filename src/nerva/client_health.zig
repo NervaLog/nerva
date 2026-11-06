@@ -8,6 +8,8 @@
 const std = @import("std");
 const log = std.log.scoped(.client_health);
 
+const stdx = @import("stdx");
+
 const nerva = @import("../nerva.zig");
 const catalog = @import("catalog.zig");
 const Client = @import("client.zig").Client;
@@ -46,6 +48,8 @@ pub const ClientHealth = struct {
     timer: std.time.Timer,
     allocator: std.mem.Allocator,
     options: Client.Options,
+    /// The open request window (`window_open`), for a client replaced meanwhile.
+    window_end: ?stdx.Instant = null,
 
     pub fn init(client: *const Client) !ClientHealth {
         return .{
@@ -53,6 +57,32 @@ pub const ClientHealth = struct {
             .allocator = client.allocator,
             .options = client.options,
         };
+    }
+
+    /// A request arrived: one deadline, `--request-timeout` from now, for everything it does
+    /// (a reconnection, then its cluster calls), until `window_close` (#186).
+    pub fn window_open(health: *ClientHealth, client: *Client) void {
+        std.debug.assert(health.window_end == null);
+        // A client in `gone` is uninitialized: its window is set when `ready` replaces it.
+        if (health.state == .gone) {
+            var time_os: stdx.TimeOS = .{};
+            health.window_end = time_os.monotonic().add(health.options.timeout);
+        } else {
+            health.window_end = client.window_open();
+        }
+    }
+
+    /// The options of a new client, with the request's window if one is open.
+    fn options_in_window(health: *const ClientHealth) Client.Options {
+        var options = health.options;
+        options.window_end = health.window_end;
+        return options;
+    }
+
+    pub fn window_close(health: *ClientHealth, client: *Client) void {
+        std.debug.assert(health.window_end != null);
+        health.window_end = null;
+        if (health.state != .gone) client.window_close();
     }
 
     pub fn broke(health: *ClientHealth) void {
@@ -69,7 +99,7 @@ pub const ClientHealth = struct {
         const result = switch (health.state) {
             .ready => unreachable,
             .broken => client.reconnect(),
-            .gone => client.init(health.allocator, health.options),
+            .gone => client.init(health.allocator, health.options_in_window()),
         };
         result catch |err| {
             log.err("reconnecting to the cluster: {}", .{err});
@@ -99,6 +129,7 @@ pub const ClientHealth = struct {
         const keys = [1]nerva.RowKey{.{ .id = 0, .table = catalog.table_catalog }};
         var values: [1]nerva.RowValue = undefined;
         client.lookup_rows(&keys, &values) catch |err| switch (err) {
+            error.Expired => unreachable, // A probe runs between requests: no window is open.
             error.Timeout, error.Evicted => {
                 log.err("probing the cluster: {}", .{err});
                 health.broke();
@@ -144,4 +175,85 @@ test "a probe is due after the interval, and never wakes sooner than 1 ms" {
     try std.testing.expectEqual(@as(i32, 1), probe_wait_ms(health_probe_interval_ns - 1));
     try std.testing.expectEqual(@as(i32, 1), probe_wait_ms(health_probe_interval_ns));
     try std.testing.expectEqual(@as(i32, 1), probe_wait_ms(10 * health_probe_interval_ns));
+}
+
+/// A client with only what `window_open` and `window_close` read: it is not connected.
+fn client_stub(options: Client.Options) Client {
+    var client: Client = undefined;
+    client.state = .idle;
+    client.sending = null;
+    client.time_os = .{};
+    client.options = options;
+    return client;
+}
+
+const dead_address = [_]stdx.SocketAddress{.{ .ip = .@"127.0.0.1", .port = 1 }};
+
+test "a window is opened and closed in a live or a broken session (#186)" {
+    const options: Client.Options = .{
+        .cluster = 0,
+        .addresses = &dead_address,
+        .timeout = stdx.Duration.ms(20_000),
+    };
+    var client = client_stub(options);
+    var health: ClientHealth = .{
+        .timer = try std.time.Timer.start(),
+        .allocator = std.testing.allocator,
+        .options = options,
+    };
+    // `broken` takes the same path as `ready`: the client is initialized and holds the window,
+    // which `reconnect` carries over with the rest of its options.
+    for ([_]@TypeOf(health.state){ .ready, .broken }) |state| {
+        health.state = state;
+        health.window_open(&client);
+        try std.testing.expect(health.window_end != null);
+        try std.testing.expectEqual(health.window_end.?.ns, client.options.window_end.?.ns);
+        health.window_close(&client);
+        try std.testing.expect(health.window_end == null);
+        try std.testing.expect(client.options.window_end == null);
+    }
+}
+
+test "a window opened over a client that is gone is shared by its reconnections (#186)" {
+    const options: Client.Options = .{
+        .cluster = 0,
+        .addresses = &dead_address,
+        .timeout = stdx.Duration.ms(600),
+    };
+    var client = client_stub(options);
+    var health: ClientHealth = .{
+        .state = .gone,
+        .timer = try std.time.Timer.start(),
+        .allocator = std.testing.allocator,
+        .options = options,
+    };
+    var time_os: stdx.TimeOS = .{};
+
+    health.window_open(&client);
+    try std.testing.expect(health.window_end != null);
+    // What `ready` hands `Client.init` (it logs a failure as an error, which a test may not).
+    const in_window = health.options_in_window();
+    try std.testing.expectEqual(health.window_end.?.ns, in_window.window_end.?.ns);
+    const begin = time_os.monotonic();
+    var replacement: Client = undefined;
+    try std.testing.expectError(
+        error.Timeout,
+        replacement.init(std.testing.allocator, in_window),
+    );
+    try std.testing.expect(begin.elapsed(time_os.monotonic()).ns >= 500 * std.time.ns_per_ms);
+    // A second attempt in the same window finds it spent: it gives up at once, not after a
+    // timeout of its own.
+    const second = time_os.monotonic();
+    try std.testing.expectError(
+        error.Timeout,
+        replacement.init(std.testing.allocator, health.options_in_window()),
+    );
+    try std.testing.expect(second.elapsed(time_os.monotonic()).ns < 300 * std.time.ns_per_ms);
+    // `gone` has no client to close: only the health's window.
+    health.window_close(&client);
+    try std.testing.expect(health.window_end == null);
+    try std.testing.expect(health.options_in_window().window_end == null);
+    // The next request opens a new one.
+    health.window_open(&client);
+    health.window_close(&client);
 }

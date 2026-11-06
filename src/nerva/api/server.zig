@@ -90,6 +90,9 @@ pub fn serve(gpa: std.mem.Allocator, client: *Client, options: Options) !noretur
         }
         const received = try receiver.next(wake_ms) orelse continue;
         const requests_before = options.tally.requests;
+        // One deadline for everything this request does (#186). Groups are served by one cluster
+        // request each, so they share it.
+        health.window_open(client);
         budget.request_start();
         const arena = budget.allocator();
         // Requests are read from many connections at once (N45). Those already waiting for the
@@ -122,12 +125,17 @@ pub fn serve(gpa: std.mem.Allocator, client: *Client, options: Options) !noretur
                 &layouts,
                 options,
                 &received.request,
-            ) catch |err| reply_of_error(err, &budget, writes_before, client.writes_sent);
+            ) catch |err| reply_of_error(
+                err,
+                &budget,
+                api.applied_since(writes_before, client.writes_sent),
+            );
             answer(&receiver, &counters, received, reply);
         }
         const asked = options.tally.requests != requests_before;
         if (asked) counters.group(group_count);
         if (health.state == .ready and asked) health.replied();
+        health.window_close(client);
         // `respond` has written the reply: give back what the request took at once, rather than
         // when the next request arrives (#60).
         _ = arena_instance.reset(.{ .retain_with_limit = MemoryBudget.retain_max });
@@ -169,16 +177,14 @@ const GroupFilter = struct {
     }
 };
 
-/// What a request that failed with `err` is answered, when `Client.writes_sent` was
-/// `writes_before` as it began and is `writes_now` now. The bodies are fixed: the arena may be
-/// what ran out. A request that sent no write was not applied.
+/// What a request that failed with `err` is answered, `applied` saying whether it sent a write
+/// (`api.applied_since`, or the member's own in a group). The bodies are fixed: the arena may be
+/// what ran out.
 fn reply_of_error(
     err: anyerror,
     budget: *const MemoryBudget,
-    writes_before: u64,
-    writes_now: u64,
+    applied: api.Applied,
 ) api.Reply {
-    const applied = api.applied_since(writes_before, writes_now);
     if (err == error.OutOfMemory and budget.exceeded) {
         log.warn("request: past its memory budget", .{});
         return .{ .status = 413, .body = switch (applied) {
@@ -196,6 +202,14 @@ fn reply_of_error(
 fn cluster_lost(applied: api.Applied) api.Reply {
     return .{ .status = 503, .body = switch (applied) {
         inline else => |known| wire.error_body(.E0601, "cluster unavailable", known),
+    } };
+}
+
+/// The reply to a request whose window passed before a call could be sent (NRV-E0606): the
+/// session is intact. Unknown if an earlier call of the same request sent a write.
+fn request_expired(applied: api.Applied) api.Reply {
+    return .{ .status = 503, .body = switch (applied) {
+        inline else => |known| wire.error_body(.E0606, "request deadline passed", known),
     } };
 }
 
@@ -225,21 +239,23 @@ fn serve_group(
     }
     const members_used = members[0..received.len];
     const ready = health.ready(client);
-    // After `ready`: a reconnection starts a client that has sent nothing.
-    const writes_before = client.writes_sent;
     if (!ready) {
         for (members_used) |*member| member.result = cluster_unavailable;
     } else if (api.handle_group(arena, client, layouts, members_used)) {
         for (members_used) |*member| assert(member.result != null);
     } else |err| switch (err) {
+        error.Expired => {
+            for (members_used) |*member| {
+                if (member.result == null) member.result = error.Expired;
+            }
+        },
         error.Evicted, error.Timeout => {
             log.err("{s}: {}", .{ members_used[0].target, err });
             health.broke();
             // The cluster may have changed under the new client: read layouts again (P135).
             layouts.cache_clear();
-            const lost = cluster_lost(api.applied_since(writes_before, client.writes_sent));
             for (members_used) |*member| {
-                if (member.result == null) member.result = lost;
+                if (member.result == null) member.result = err;
             }
         },
         else => {
@@ -249,8 +265,11 @@ fn serve_group(
         },
     }
     for (members_used, received) |member, one| {
-        const reply = member.result.? catch |err|
-            reply_of_error(err, budget, writes_before, client.writes_sent);
+        const reply = member.result.? catch |err| switch (err) {
+            error.Expired => request_expired(member.applied),
+            error.Evicted, error.Timeout => cluster_lost(member.applied),
+            else => reply_of_error(err, budget, member.applied),
+        };
         answer(receiver, counters, one, reply);
     }
 }
@@ -282,6 +301,9 @@ fn serve_request(
     const writes_before = client.writes_sent;
     return api.handle(arena, client, layouts, method, target, request.body) catch |err|
         switch (err) {
+            error.Expired => return request_expired(
+                api.applied_since(writes_before, client.writes_sent),
+            ),
             error.Evicted, error.Timeout => {
                 log.err("{s}: {}", .{ target, err });
                 health.broke();
@@ -309,3 +331,17 @@ const unavailable_healthz = api.Reply{
     .body = "{\"ok\":false,\"error\":\"cluster unavailable\",\"applied\":false," ++
         "\"code\":\"NRV-E0605\",\"session\":\"reconnecting\"}",
 };
+
+test "a request whose window passed is answered NRV-E0606, applied false unless a write went out" {
+    const none = request_expired(.no);
+    try std.testing.expectEqual(@as(u16, 503), none.status);
+    try std.testing.expectEqualStrings(
+        "{\"error\":\"request deadline passed\",\"applied\":false,\"code\":\"NRV-E0606\"}",
+        none.body,
+    );
+    // Not the 503 of a lost session, which the metrics count as refused (E0605).
+    try std.testing.expect(!std.mem.eql(u8, none.body, cluster_unavailable.body));
+    try std.testing.expect(!metrics.reply_unknown(none.status, none.body));
+    const sent = request_expired(.unknown);
+    try std.testing.expect(metrics.reply_unknown(sent.status, sent.body));
+}

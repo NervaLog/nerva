@@ -234,9 +234,11 @@ const CLIArgs = union(enum) {
         \\
         \\  --request-timeout=<milliseconds>
         \\        view and api: how long a request to the cluster may wait for its reply,
-        \\        1000 to 60000 (default 30000). A gateway answers a request within the
-        \\        queue wait (1 s) plus this plus 1 s, so a client whose own timeout is
-        \\        longer always gets an answer. A request that times out may still commit.
+        \\        1000 to 60000 (default 30000): one deadline for the whole request, not for
+        \\        each cluster call it makes. A gateway answers a request within the queue
+        \\        wait (1 s) plus this plus 1 s, so a client whose own timeout is longer
+        \\        always gets an answer. A request that times out may still commit; one that
+        \\        runs out of time before a call is sent is refused NRV-E0606, unsent.
         \\
         \\  --trace=<path>
         \\        Write a JSON trace of the replica's spans to <path> (Perfetto,
@@ -694,8 +696,8 @@ test listen_parse {
     try std.testing.expect(listen_parse("[fe80::1%eth0]:8090") == null);
 }
 
-/// `--request-timeout`, in milliseconds (P168d): the wait for a cluster request's reply, which
-/// bounds how long a gateway takes to answer one (README, "The answer bound").
+/// `--request-timeout`, in milliseconds (P168d, P195): the one deadline for an HTTP request's
+/// cluster calls, which bounds how long a gateway takes to answer one (README, "The answer bound").
 pub const request_timeout_min_ms: u32 = 1_000;
 pub const request_timeout_max_ms: u32 = 60_000;
 pub const request_timeout_default_ms: u32 = 30_000;

@@ -86,6 +86,9 @@ pub fn serve(gpa: std.mem.Allocator, client: *Client, options: Options) !noretur
         };
         _ = arena_instance.reset(.retain_capacity);
         const arena = arena_instance.allocator();
+        // One deadline for everything this request does (#186).
+        health.window_open(client);
+        defer health.window_close(client);
         const reply = serve_request(
             arena,
             client,
@@ -134,6 +137,9 @@ fn serve_request(
         return failed(404, .E0104, "not found");
     if (!health.ready(client)) return unavailable;
     return serve_declared(arena, follower, views, declared) catch |err| switch (err) {
+        // The window passed while the view caught up with the feed (or before a page was
+        // sent): the session is intact and the cursor kept, so the next request goes on.
+        error.Expired => return expired,
         error.Timeout, error.Evicted => {
             log.err("{s}: {}", .{ target, err });
             health.broke();
@@ -147,6 +153,8 @@ fn serve_request(
 const unavailable = failed(503, .E0605, "cluster unavailable");
 /// The request reached a cluster that did not answer. A read, so not applied (NRV-E0601).
 const lost = failed(503, .E0601, "cluster unavailable");
+/// The request's window passed before the view was up to date; a read, so not applied (NRV-E0606).
+const expired = failed(503, .E0606, "request deadline passed");
 const unavailable_healthz: Reply = .{
     .status = 503,
     .body = "{\"ok\":false,\"error\":\"cluster unavailable\",\"applied\":false," ++
@@ -267,4 +275,12 @@ test declared_target {
     try testing.expectEqual(null, declared_target("/v1/views/1abc"));
     try testing.expectEqual(null, declared_target("/v1/views/revenue/x"));
     try testing.expectEqual(null, declared_target("/v1/tables/1"));
+}
+
+test "a view read whose window passed is NRV-E0606, a read that was not applied" {
+    try std.testing.expectEqual(@as(u16, 503), expired.status);
+    try std.testing.expectEqualStrings(
+        "{\"error\":\"request deadline passed\",\"applied\":false,\"code\":\"NRV-E0606\"}",
+        expired.body,
+    );
 }

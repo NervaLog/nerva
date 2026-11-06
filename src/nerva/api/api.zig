@@ -289,6 +289,10 @@ pub const Member = struct {
     body: []const u8,
     /// Set by `handle_group`. A member left null when it returns an error was not answered.
     result: ?(anyerror!Reply) = null,
+    /// Set by `handle_group`, also when it returns an error: whether a write of this member
+    /// went out (`unknown`), or nothing of it did (`no`). Not the group's: a member that was not
+    /// sent is not `unknown` because another was.
+    applied: Applied = .no,
 };
 
 /// Whether a request may be answered by `handle_group`: the routes whose requests are one
@@ -340,7 +344,7 @@ fn settle(member: *Member, arena: std.mem.Allocator, result: anytype) !void {
         member.result = reply;
     } else |err| {
         const any: anyerror = err;
-        if (any == error.Timeout or any == error.Evicted) return err;
+        if (any == error.Timeout or any == error.Evicted or any == error.Expired) return err;
         member.result = refuse(arena, err);
     }
 }
@@ -360,8 +364,11 @@ fn settle(member: *Member, arena: std.mem.Allocator, result: anytype) !void {
 ///   (`commit_wide` among `commit`s, a lookup of records), or is the only one left, runs alone
 ///   through `handle`.
 ///
-/// `error.Timeout` and `error.Evicted` (from anywhere) are returned, with every member that
-/// had no answer yet left null: none has an answer, as none would have had alone.
+/// `error.Timeout`, `error.Evicted` and `error.Expired` (from anywhere) are returned, with every
+/// member that had no answer yet left null. Each member's `applied` says whether a write of its
+/// own went out. A member whose `views_busy` send again expires has `result = error.Expired` and
+/// `applied = unknown` (its first batch went out); the members after it are tried in turn, and
+/// those whose answers came back keep them.
 pub fn handle_group(
     arena: std.mem.Allocator,
     client: anytype,
@@ -416,6 +423,10 @@ pub fn handle_group(
 
     if (selected_count >= 2) {
         const batched = selected[0..selected_count];
+        const writes_before = client.writes_sent;
+        defer for (batched) |index| {
+            members[index].applied = applied_since(writes_before, client.writes_sent);
+        };
         try group_send(arena, client, operation.?, states, batched);
         for (batched) |index| {
             const member = &members[index];
@@ -426,9 +437,14 @@ pub fn handle_group(
                     // budget: it was never judged. Alone it commits or is too large.
                     for (commit_.results_sent) |result| {
                         if (result.status != .views_busy) continue;
-                        try commit_send(arena, client, commit_);
+                        commit_send(arena, client, commit_) catch |err| {
+                            if (err != error.Expired) return err;
+                            member.result = error.Expired;
+                            state.what = .answered;
+                        };
                         break;
                     }
+                    if (member.result != null) continue;
                     try settle(member, arena, commit_reply(arena, commit_));
                 },
                 .lookup => |*lookup_| {
@@ -443,6 +459,8 @@ pub fn handle_group(
     // Whoever is left runs alone, as a single request does.
     for (members, states) |*member, *state| {
         if (state.what == .answered) continue;
+        const writes_before = client.writes_sent;
+        defer member.applied = applied_since(writes_before, client.writes_sent);
         try settle(member, arena, handle(arena, client, layouts, .post, member.target, member.body));
     }
 }
@@ -2629,11 +2647,14 @@ const FakeClient = struct {
     /// Requests of a write received, as `Client.writes_sent` counts them: it counts one that
     /// then times out.
     writes_sent: u64 = 0,
+    /// From this write of a write on (counting from 1), a request is refused `Expired` before it
+    /// is sent, as a client does once the request's window has passed.
+    expire_from_write: u64 = std.math.maxInt(u64),
 
     const Version = struct { op: u64, exists: bool, value: [value_size]u8 };
     const RecordVersion = struct { op: u64, exists: bool, value: [nerva.record_value_size]u8 };
 
-    pub const Error = error{ TooManyEvents, OutOfMemory, Timeout };
+    pub const Error = error{ TooManyEvents, OutOfMemory, Timeout, Expired };
 
     pub fn batches_fit(fake: *const FakeClient, comptime operation: nerva.Operation, counts: []const u32) bool {
         _ = operation;
@@ -2668,6 +2689,7 @@ const FakeClient = struct {
         var counts: [group_max]u32 = undefined;
         for (transactions, counts[0..transactions.len]) |batch, *count| count.* = @intCast(batch.len);
         if (!fake.batches_fit(.commit, counts[0..transactions.len])) return error.TooManyEvents;
+        if (fake.writes_sent + 1 >= fake.expire_from_write) return error.Expired;
         fake.writes_sent += 1;
         if (fake.timeout_next) return error.Timeout;
         fake.requests += 1;
@@ -2686,6 +2708,7 @@ const FakeClient = struct {
         var counts: [group_max]u32 = undefined;
         for (transactions, counts[0..transactions.len]) |batch, *count| count.* = @intCast(batch.len);
         if (!fake.batches_fit(.commit_wide, counts[0..transactions.len])) return error.TooManyEvents;
+        if (fake.writes_sent + 1 >= fake.expire_from_write) return error.Expired;
         fake.writes_sent += 1;
         if (fake.timeout_next) return error.Timeout;
         fake.requests += 1;
@@ -2729,6 +2752,7 @@ const FakeClient = struct {
 
     pub fn commit(fake: *FakeClient, entries: []const Entry, results: []EntryResult) Error!void {
         if (entries.len > fake.lookup_max) return error.TooManyEvents;
+        if (fake.writes_sent + 1 >= fake.expire_from_write) return error.Expired;
         fake.writes_sent += 1;
         fake.requests += 1;
         fake.op += 1;
@@ -4064,6 +4088,79 @@ test "api: a transaction refused views_busy is sent again alone, and the caller 
         ));
         try testing.expect(std.mem.indexOf(u8, found.body, "\"exists\":true") != null);
     }
+}
+
+test "api: a group whose send expires has sent nothing, and each member says so (P195b)" {
+    var arena_instance = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_instance.deinit();
+    const arena = arena_instance.allocator();
+    var fake: FakeClient = .{ .allocator = arena, .expire_from_write = 1 };
+    var layouts: FakeLayouts = .{ .allocator = arena };
+    const members = try arena.alloc(Member, group_seed.len);
+    for (members, group_seed) |*member, body| member.* = .{ .target = "/v1/commit", .body = body };
+    try testing.expectError(error.Expired, handle_group(arena, &fake, &layouts, members));
+    for (members) |member| {
+        try testing.expect(member.result == null);
+        try testing.expectEqual(Applied.no, member.applied);
+    }
+    try testing.expectEqual(@as(u64, 0), fake.writes_sent);
+}
+
+test "api: a views_busy send again that expires keeps the answers that came back (P195b)" {
+    var arena_instance = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_instance.deinit();
+    const arena = arena_instance.allocator();
+    // Write 1 is the group's request; writes 2 on expire.
+    var fake: FakeClient = .{ .allocator = arena, .busy_from = 2, .expire_from_write = 2 };
+    var layouts: FakeLayouts = .{ .allocator = arena };
+    const bodies = [_][]const u8{
+        \\{"entries":[{"kind":"put","table":1,"id":"1","value_hex":"01"}]}
+        ,
+        \\{"entries":[{"kind":"put","table":1,"id":"2","value_hex":"02"}]}
+        ,
+        \\{"entries":[{"kind":"put","table":1,"id":"3","value_hex":"03"}]}
+        ,
+        \\{"entries":[{"kind":"put","table":1,"id":"4","value_hex":"04"}]}
+    };
+    const members = try arena.alloc(Member, bodies.len);
+    for (members, bodies) |*member, body| member.* = .{ .target = "/v1/commit", .body = body };
+    try handle_group(arena, &fake, &layouts, members);
+    for (members[0..2]) |member| {
+        // Committed with the group: its answer is kept, not reported as not sent.
+        const reply = try member.result.?;
+        try testing.expect(std.mem.startsWith(u8, reply.body, "{\"status\":\"committed\""));
+    }
+    for (members[2..]) |member| {
+        // Its batch went out, so it is not `no`; its send again did not.
+        try testing.expectError(error.Expired, member.result.?);
+        try testing.expectEqual(Applied.unknown, member.applied);
+    }
+    try testing.expectEqual(@as(u64, 1), fake.writes_sent);
+}
+
+test "api: a member sent alone after the group expires is not sent, and the group keeps its answers (P195b)" {
+    var arena_instance = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_instance.deinit();
+    const arena = arena_instance.allocator();
+    // Two one-entry transactions travel together; the third does not fit and runs alone.
+    var fake: FakeClient = .{ .allocator = arena, .batch_events_max = 2, .expire_from_write = 2 };
+    var layouts: FakeLayouts = .{ .allocator = arena };
+    const bodies = [_][]const u8{
+        \\{"entries":[{"kind":"put","table":1,"id":"1","value_hex":"01"}]}
+        ,
+        \\{"entries":[{"kind":"put","table":1,"id":"2","value_hex":"02"}]}
+        ,
+        \\{"entries":[{"kind":"put","table":1,"id":"3","value_hex":"03"}]}
+    };
+    const members = try arena.alloc(Member, bodies.len);
+    for (members, bodies) |*member, body| member.* = .{ .target = "/v1/commit", .body = body };
+    try testing.expectError(error.Expired, handle_group(arena, &fake, &layouts, members));
+    for (members[0..2]) |member| {
+        const reply = try member.result.?;
+        try testing.expect(std.mem.startsWith(u8, reply.body, "{\"status\":\"committed\""));
+    }
+    try testing.expect(members[2].result == null);
+    try testing.expectEqual(Applied.no, members[2].applied);
 }
 
 test "api: transactions under one key in one request answer as they would one after another (P123, P143)" {
