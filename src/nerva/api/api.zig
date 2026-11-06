@@ -364,11 +364,11 @@ fn settle(member: *Member, arena: std.mem.Allocator, result: anytype) !void {
 ///   (`commit_wide` among `commit`s, a lookup of records), or is the only one left, runs alone
 ///   through `handle`.
 ///
-/// `error.Timeout`, `error.Evicted` and `error.Expired` (from anywhere) are returned, with every member that
-/// had no answer yet left null: none has an answer, as none would have had alone. A member whose
-/// `views_busy` send again expires has `result = error.Expired` and `applied = unknown` (its
-/// first batch went out), and the members after it are tried in turn: those whose answers came
-/// back keep them.
+/// `error.Timeout`, `error.Evicted` and `error.Expired` (from anywhere) are returned, with every
+/// member that had no answer yet left null. Each member's `applied` says whether a write of its
+/// own went out. A member whose `views_busy` send again expires has `result = error.Expired` and
+/// `applied = unknown` (its first batch went out); the members after it are tried in turn, and
+/// those whose answers came back keep them.
 pub fn handle_group(
     arena: std.mem.Allocator,
     client: anytype,
