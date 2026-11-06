@@ -48,7 +48,7 @@
 
 (def request-timeout-ms
   "The gateways' `--request-timeout`: an unanswered request is answered by the gateway within
-  about 5 s, and a short client timeout (below) is shorter than that."
+  about 10 s, and a short client timeout (below) is shorter than that."
   10000)
 
 (def short-timeout-probability 0.25)
