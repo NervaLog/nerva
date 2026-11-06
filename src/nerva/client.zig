@@ -52,6 +52,12 @@ pub const batches_max = 16;
 /// Changes per `get_history` call in `row_as_of`.
 const history_page_limit = 64;
 
+/// `Options.timeout` over this is the time a window must have left for a call to be sent.
+pub const window_remaining_divisor = 16;
+comptime {
+    assert(window_remaining_divisor > 1);
+}
+
 pub const Client = struct {
     pub const Options = struct {
         cluster: u128,
@@ -74,8 +80,9 @@ pub const Client = struct {
         /// No reply within `Options.timeout` (or by the window's end). The request may still
         /// commit.
         Timeout,
-        /// The request's window (`window_open`) was spent before this call was sent: nothing was
-        /// sent and the session is as it was.
+        /// The request's window (`window_open`) was spent, or had less than a sixteenth of
+        /// `Options.timeout` left (P209), before this call was sent: nothing was sent and the
+        /// session is as it was.
         Expired,
         /// More events than fit in one request.
         TooManyEvents,
@@ -187,6 +194,19 @@ pub const Client = struct {
     pub fn window_close(client: *Client) void {
         assert(client.options.window_end != null);
         client.options.window_end = null;
+    }
+
+    /// The least time a request's window must have left for a call to be sent: a sixteenth of
+    /// `Options.timeout` (P209). A round trip to a healthy cluster takes a few ticks; a call
+    /// started with less than this left would most likely time out, break the session and leave
+    /// the write's outcome unknown, where refusing it (`Expired`) costs the client a resend.
+    fn window_remaining_min(client: *const Client) stdx.Duration {
+        const remaining: stdx.Duration = .{
+            .ns = client.options.timeout.ns / window_remaining_divisor,
+        };
+        assert(remaining.ns > 0);
+        assert(remaining.ns < client.options.timeout.ns);
+        return remaining;
     }
 
     /// When the call that began at `start` gives up. A window opened before the call ends no
@@ -650,11 +670,12 @@ pub const Client = struct {
     }
 
     fn ensure_idle(client: *Client) Error!void {
-        // Before anything is queued: a call that has no time left is not sent (#186), so its
-        // write is known not to have gone, and the session is kept.
+        // Before anything is queued: a call that has too little time left is not sent (#186,
+        // #205), so its write is known not to have gone, and the session is kept.
         if (client.state == .idle) {
             if (client.options.window_end) |end| {
-                if (client.time_os.monotonic().ns > end.ns) return error.Expired;
+                const now = client.time_os.monotonic();
+                if (now.ns +| client.window_remaining_min().ns > end.ns) return error.Expired;
             }
         }
         switch (client.state) {
@@ -851,6 +872,17 @@ test "Client: a call whose window is spent is not sent, and the session stays us
     // and does not break the session.
     try std.testing.expectEqual(.idle, client.state);
     try std.testing.expectEqual(@as(u64, 7), client.writes_sent);
+    // Just under a sixteenth of the timeout left (62.5 ms of 1 s; 50 ms left): refused, though
+    // not yet passed. A divisor of 40 (25 ms) would send it.
+    client.options.window_end = time_os.monotonic().add(stdx.Duration.ms(50));
+    try std.testing.expectError(error.Expired, client.ensure_idle());
+    try std.testing.expectEqual(.idle, client.state);
+    try std.testing.expectEqual(@as(u64, 7), client.writes_sent);
+    // Just over it (120 ms left): sent. A divisor of 1 (1 s) would refuse it.
+    client.options.window_end = time_os.monotonic().add(stdx.Duration.ms(120));
+    try client.ensure_idle();
+    try std.testing.expectEqual(.waiting, client.state);
+    client.state = .idle;
     // With time left (or no window) the same client takes a call.
     client.options.window_end = time_os.monotonic().add(stdx.Duration.ms(60_000));
     try client.ensure_idle();

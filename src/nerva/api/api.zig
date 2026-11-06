@@ -364,10 +364,11 @@ fn settle(member: *Member, arena: std.mem.Allocator, result: anytype) !void {
 ///   (`commit_wide` among `commit`s, a lookup of records), or is the only one left, runs alone
 ///   through `handle`.
 ///
-/// `error.Timeout`, `error.Evicted` and `error.Expired` (from anywhere) are returned, with every
-/// member that had no answer yet left null. Each member's `applied` says whether a write of its
-/// own went out. A member whose `views_busy` send again expires has `result = error.Expired` and
-/// `applied = unknown` (its first batch went out); the members after it are tried in turn, and
+/// `error.Timeout`, `error.Evicted` and `error.Expired` from a call are returned, with every
+/// member that had no answer yet left null; an `Expired` from a `views_busy` send again is the
+/// exception (below). Each member's `applied` says whether a write of its own went out. A member
+/// whose `views_busy` send again expires has `result = error.Expired` and `applied = unknown`
+/// (its first batch went out): `handle_group` goes on, trying the members after it in turn, and
 /// those whose answers came back keep them.
 pub fn handle_group(
     arena: std.mem.Allocator,
@@ -2650,6 +2651,8 @@ const FakeClient = struct {
     /// From this write of a write on (counting from 1), a request is refused `Expired` before it
     /// is sent, as a client does once the request's window has passed.
     expire_from_write: u64 = std.math.maxInt(u64),
+    /// From this write of a write on (counting from 1), a request is sent and then times out.
+    timeout_from_write: u64 = std.math.maxInt(u64),
 
     const Version = struct { op: u64, exists: bool, value: [value_size]u8 };
     const RecordVersion = struct { op: u64, exists: bool, value: [nerva.record_value_size]u8 };
@@ -2691,7 +2694,9 @@ const FakeClient = struct {
         if (!fake.batches_fit(.commit, counts[0..transactions.len])) return error.TooManyEvents;
         if (fake.writes_sent + 1 >= fake.expire_from_write) return error.Expired;
         fake.writes_sent += 1;
-        if (fake.timeout_next) return error.Timeout;
+        if (fake.timeout_next or fake.writes_sent >= fake.timeout_from_write) {
+            return error.Timeout;
+        }
         fake.requests += 1;
         fake.op += 1;
         for (transactions, results, 0..) |entries, result, index| {
@@ -2710,7 +2715,9 @@ const FakeClient = struct {
         if (!fake.batches_fit(.commit_wide, counts[0..transactions.len])) return error.TooManyEvents;
         if (fake.writes_sent + 1 >= fake.expire_from_write) return error.Expired;
         fake.writes_sent += 1;
-        if (fake.timeout_next) return error.Timeout;
+        if (fake.timeout_next or fake.writes_sent >= fake.timeout_from_write) {
+            return error.Timeout;
+        }
         fake.requests += 1;
         fake.op += 1;
         for (transactions, results, 0..) |entries, result, index| {
@@ -2754,6 +2761,7 @@ const FakeClient = struct {
         if (entries.len > fake.lookup_max) return error.TooManyEvents;
         if (fake.writes_sent + 1 >= fake.expire_from_write) return error.Expired;
         fake.writes_sent += 1;
+        if (fake.writes_sent >= fake.timeout_from_write) return error.Timeout;
         fake.requests += 1;
         fake.op += 1;
         try fake.commit_at(fake.op, entries, results);
@@ -4126,9 +4134,11 @@ test "api: a views_busy send again that expires keeps the answers that came back
     for (members, bodies) |*member, body| member.* = .{ .target = "/v1/commit", .body = body };
     try handle_group(arena, &fake, &layouts, members);
     for (members[0..2]) |member| {
-        // Committed with the group: its answer is kept, not reported as not sent.
+        // Committed with the group: its answer is kept, not reported as not sent, and its write
+        // went out, so a reply built from it says `unknown` if the request fails later.
         const reply = try member.result.?;
         try testing.expect(std.mem.startsWith(u8, reply.body, "{\"status\":\"committed\""));
+        try testing.expectEqual(Applied.unknown, member.applied);
     }
     for (members[2..]) |member| {
         // Its batch went out, so it is not `no`; its send again did not.
@@ -4136,6 +4146,40 @@ test "api: a views_busy send again that expires keeps the answers that came back
         try testing.expectEqual(Applied.unknown, member.applied);
     }
     try testing.expectEqual(@as(u64, 1), fake.writes_sent);
+}
+
+test "api: a views_busy send again that times out is unknown for the whole group (P195b)" {
+    var arena_instance = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_instance.deinit();
+    const arena = arena_instance.allocator();
+    // Write 1 is the group's request; write 2, the send again of the first busy member, is sent
+    // and then times out.
+    var fake: FakeClient = .{ .allocator = arena, .busy_from = 2, .timeout_from_write = 2 };
+    var layouts: FakeLayouts = .{ .allocator = arena };
+    const bodies = [_][]const u8{
+        \\{"entries":[{"kind":"put","table":1,"id":"1","value_hex":"01"}]}
+        ,
+        \\{"entries":[{"kind":"put","table":1,"id":"2","value_hex":"02"}]}
+        ,
+        \\{"entries":[{"kind":"put","table":1,"id":"3","value_hex":"03"}]}
+        ,
+        \\{"entries":[{"kind":"put","table":1,"id":"4","value_hex":"04"}]}
+    };
+    const members = try arena.alloc(Member, bodies.len);
+    for (members, bodies) |*member, body| member.* = .{ .target = "/v1/commit", .body = body };
+    try testing.expectError(error.Timeout, handle_group(arena, &fake, &layouts, members));
+    // The send again went out: the cluster may have applied it, and every member's write is in
+    // the count. Members that had an answer keep it; the rest have none.
+    try testing.expectEqual(@as(u64, 2), fake.writes_sent);
+    for (members[0..2]) |member| {
+        const reply = try member.result.?;
+        try testing.expect(std.mem.startsWith(u8, reply.body, "{\"status\":\"committed\""));
+        try testing.expectEqual(Applied.unknown, member.applied);
+    }
+    for (members[2..]) |member| {
+        try testing.expect(member.result == null);
+        try testing.expectEqual(Applied.unknown, member.applied);
+    }
 }
 
 test "api: a member sent alone after the group expires is not sent, and the group keeps its answers (P195b)" {

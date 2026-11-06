@@ -9,18 +9,18 @@ const assert = std.debug.assert;
 
 const constants = @import("../../constants.zig");
 const nerva = @import("../../nerva.zig");
-const Client = @import("../client.zig").Client;
 
 const Change = nerva.Change;
 
 /// Changes per `get_changes` call.
 pub const page_limit = 1024;
 
-pub fn FollowerType(comptime View: type) type {
+/// `ClientT` is `Client`, or a stand-in with its `get_changes` (tests).
+pub fn FollowerType(comptime View: type, comptime ClientT: type) type {
     return struct {
         const Follower = @This();
 
-        client: *Client,
+        client: *ClientT,
         view: *View,
         /// The next `get_changes` cursor.
         cursor: u64 = 0,
@@ -30,7 +30,7 @@ pub fn FollowerType(comptime View: type) type {
         pending: std.ArrayListUnmanaged(Change) = .{},
         page: []Change,
 
-        pub fn init(allocator: std.mem.Allocator, client: *Client, view: *View) !Follower {
+        pub fn init(allocator: std.mem.Allocator, client: *ClientT, view: *View) !Follower {
             const page = try allocator.alloc(Change, page_limit + 1);
             errdefer allocator.free(page);
             var pending: std.ArrayListUnmanaged(Change) = .{};

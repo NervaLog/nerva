@@ -265,13 +265,18 @@ fn serve_group(
         },
     }
     for (members_used, received) |member, one| {
-        const reply = member.result.? catch |err| switch (err) {
-            error.Expired => request_expired(member.applied),
-            error.Evicted, error.Timeout => cluster_lost(member.applied),
-            else => reply_of_error(err, budget, member.applied),
-        };
-        answer(receiver, counters, one, reply);
+        answer(receiver, counters, one, member_reply(member, budget));
     }
+}
+
+/// A group member's reply: its answer, or the 503 it would have had alone, with the `applied` of
+/// its own writes (not the group's).
+fn member_reply(member: api.Member, budget: *const MemoryBudget) api.Reply {
+    return member.result.? catch |err| switch (err) {
+        error.Expired => request_expired(member.applied),
+        error.Evicted, error.Timeout => cluster_lost(member.applied),
+        else => reply_of_error(err, budget, member.applied),
+    };
 }
 
 fn serve_request(
@@ -344,4 +349,41 @@ test "a request whose window passed is answered NRV-E0606, applied false unless 
     try std.testing.expect(!metrics.reply_unknown(none.status, none.body));
     const sent = request_expired(.unknown);
     try std.testing.expect(metrics.reply_unknown(sent.status, sent.body));
+}
+
+test "a group member's reply carries its own applied (P195b)" {
+    var budget = MemoryBudget.init(std.testing.allocator, MemoryBudget.limit_default);
+    const target = "/v1/commit";
+    // A views_busy send again that expired: its batch went out.
+    const sent: api.Member = .{
+        .target = target,
+        .body = "",
+        .result = error.Expired,
+        .applied = .unknown,
+    };
+    try std.testing.expectEqualStrings(
+        request_expired(.unknown).body,
+        member_reply(sent, &budget).body,
+    );
+    // Nothing of it went out, though another member's did.
+    const unsent: api.Member = .{
+        .target = target,
+        .body = "",
+        .result = error.Expired,
+        .applied = .no,
+    };
+    const reply = member_reply(unsent, &budget);
+    try std.testing.expectEqualStrings(request_expired(.no).body, reply.body);
+    try std.testing.expect(!std.mem.eql(u8, reply.body, request_expired(.unknown).body));
+    // A timeout is the other 503, with the same rule.
+    const lost: api.Member = .{
+        .target = target,
+        .body = "",
+        .result = error.Timeout,
+        .applied = .unknown,
+    };
+    try std.testing.expectEqualStrings(
+        cluster_lost(.unknown).body,
+        member_reply(lost, &budget).body,
+    );
 }
