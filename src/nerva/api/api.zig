@@ -87,6 +87,7 @@ const wire = @import("../wire_code.zig");
 pub const Code = wire.Code;
 pub const Applied = wire.Applied;
 const layout_cache = @import("layout_cache.zig");
+const server = @import("server.zig");
 
 const Change = nerva.Change;
 const Entry = nerva.Entry;
@@ -2619,6 +2620,8 @@ const testing = std.testing;
 
 /// An in-memory client with Nerva's semantics for one-transaction requests, to test the
 /// translation without a cluster. `tests/api/api.py` checks the real thing.
+const window_remaining_divisor = @import("../client.zig").window_remaining_divisor;
+
 const FakeClient = struct {
     op: u64 = 0,
     rows: std.AutoArrayHashMapUnmanaged(u128, Version) = .{},
@@ -2653,11 +2656,47 @@ const FakeClient = struct {
     expire_from_write: u64 = std.math.maxInt(u64),
     /// From this write of a write on (counting from 1), a request is sent and then times out.
     timeout_from_write: u64 = std.math.maxInt(u64),
+    /// The request's window, as `Client.Options` has it: `timeout_ns` is `--request-timeout`
+    /// (0: no clock), `window_end_ns` the absolute end, `now_ns` the fake clock. Every cluster
+    /// call, a layout read included, costs `cost_ns` of it.
+    timeout_ns: u64 = 0,
+    window_end_ns: u64 = 0,
+    now_ns: u64 = 0,
+    cost_ns: u64 = 0,
 
     const Version = struct { op: u64, exists: bool, value: [value_size]u8 };
     const RecordVersion = struct { op: u64, exists: bool, value: [nerva.record_value_size]u8 };
 
     pub const Error = error{ TooManyEvents, OutOfMemory, Timeout, Expired };
+
+    /// Opens the request's window of `timeout_ns` at the fake clock, as the gateway does once.
+    fn window_open(fake: *FakeClient, timeout_ns: u64) void {
+        assert(timeout_ns >= window_remaining_divisor);
+        fake.timeout_ns = timeout_ns;
+        fake.window_end_ns = fake.now_ns + timeout_ns;
+    }
+
+    /// Before a call is sent: refused `Expired` when less than `timeout / 16` of the window is
+    /// left, as `Client.ensure_idle` does. No clock: always sent.
+    fn call_begin(fake: *const FakeClient) Error!void {
+        if (fake.timeout_ns == 0) return;
+        const min = fake.timeout_ns / window_remaining_divisor;
+        if (fake.now_ns + min > fake.window_end_ns) return error.Expired;
+    }
+
+    /// After a call was sent: it takes `cost_ns`, and a reply past the window is a `Timeout`.
+    fn call_end(fake: *FakeClient) Error!void {
+        if (fake.timeout_ns == 0) return;
+        fake.now_ns += fake.cost_ns;
+        if (fake.now_ns > fake.window_end_ns) return error.Timeout;
+    }
+
+    /// A read of the catalog from the cluster, which one layout read of a request is. It is not
+    /// counted in `requests`, which the tests of batching count.
+    fn read_call(fake: *FakeClient) Error!void {
+        try fake.call_begin();
+        try fake.call_end();
+    }
 
     pub fn batches_fit(fake: *const FakeClient, comptime operation: nerva.Operation, counts: []const u32) bool {
         _ = operation;
@@ -2692,11 +2731,13 @@ const FakeClient = struct {
         var counts: [group_max]u32 = undefined;
         for (transactions, counts[0..transactions.len]) |batch, *count| count.* = @intCast(batch.len);
         if (!fake.batches_fit(.commit, counts[0..transactions.len])) return error.TooManyEvents;
+        try fake.call_begin();
         if (fake.writes_sent + 1 >= fake.expire_from_write) return error.Expired;
         fake.writes_sent += 1;
         if (fake.timeout_next or fake.writes_sent >= fake.timeout_from_write) {
             return error.Timeout;
         }
+        try fake.call_end();
         fake.requests += 1;
         fake.op += 1;
         for (transactions, results, 0..) |entries, result, index| {
@@ -2713,11 +2754,13 @@ const FakeClient = struct {
         var counts: [group_max]u32 = undefined;
         for (transactions, counts[0..transactions.len]) |batch, *count| count.* = @intCast(batch.len);
         if (!fake.batches_fit(.commit_wide, counts[0..transactions.len])) return error.TooManyEvents;
+        try fake.call_begin();
         if (fake.writes_sent + 1 >= fake.expire_from_write) return error.Expired;
         fake.writes_sent += 1;
         if (fake.timeout_next or fake.writes_sent >= fake.timeout_from_write) {
             return error.Timeout;
         }
+        try fake.call_end();
         fake.requests += 1;
         fake.op += 1;
         for (transactions, results, 0..) |entries, result, index| {
@@ -2759,9 +2802,11 @@ const FakeClient = struct {
 
     pub fn commit(fake: *FakeClient, entries: []const Entry, results: []EntryResult) Error!void {
         if (entries.len > fake.lookup_max) return error.TooManyEvents;
+        try fake.call_begin();
         if (fake.writes_sent + 1 >= fake.expire_from_write) return error.Expired;
         fake.writes_sent += 1;
         if (fake.writes_sent >= fake.timeout_from_write) return error.Timeout;
+        try fake.call_end();
         fake.requests += 1;
         fake.op += 1;
         try fake.commit_at(fake.op, entries, results);
@@ -3043,6 +3088,7 @@ const FakeLayouts = struct {
 
     pub fn layout_fresh(fake: *FakeLayouts, _: std.mem.Allocator, table: u32) !LayoutRead {
         fake.reads += 1;
+        if (fake.client) |client| try client.read_call();
         const found = fake.map.get(table);
         const version = if (fake.client) |client|
             if (client.rows.get(nerva.row_key(catalog.table_catalog, table))) |row_| row_.op else 0
@@ -4114,49 +4160,77 @@ test "api: a group whose send expires has sent nothing, and each member says so 
     try testing.expectEqual(@as(u64, 0), fake.writes_sent);
 }
 
-test "api: a commit whose layout read used the window is refused unsent, applied false (#186)" {
-    var arena_instance = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena_instance.deinit();
-    const arena = arena_instance.allocator();
-    var fake: FakeClient = .{ .allocator = arena };
-    var layouts: FakeLayouts = .{ .allocator = arena, .client = &fake };
-    const declare =
-        \\{"name":"seats","fields":[{"name":"section","type":"u8"}]}
-    ;
-    _ = try handle(arena, &fake, &layouts, .put, "/v1/tables/7", declare);
-    // The window has run out by the time the second call of the request (the commit, after its
-    // layout read) would start: the client refuses it before sending.
-    fake.expire_from_write = fake.writes_sent + 1;
-    const writes_before = fake.writes_sent;
-    const reads_before = layouts.reads;
+/// A FakeClient and catalog on one fake clock, table 7 declared, layout 7 not cached, and a
+/// window of `timeout_ns` open: the state of the first commit after a reconnect (#186).
+fn window_fixture(arena: std.mem.Allocator, fake: *FakeClient, layouts: *FakeLayouts, timeout_ns: u64) !void {
+    fake.* = .{ .allocator = arena };
+    layouts.* = .{ .allocator = arena, .client = fake };
+    _ = try handle(arena, fake, layouts, .put, "/v1/tables/7", declare_seats);
     layouts.cache.forget(7);
-    try testing.expectError(error.Expired, handle(arena, &fake, &layouts, .post, "/v1/commit",
-        \\{"entries":[{"kind":"put","table":7,"id":"1","fields":{"section":2}}]}
-    ));
-    try testing.expect(layouts.reads > reads_before);
-    try testing.expectEqual(writes_before, fake.writes_sent);
-    try testing.expectEqual(Applied.no, applied_since(writes_before, fake.writes_sent));
+    fake.window_open(timeout_ns);
 }
 
-test "api: a commit that is sent and then passes the window is never applied false (#186)" {
+const declare_seats =
+    \\{"name":"seats","fields":[{"name":"section","type":"u8"}]}
+;
+
+const commit_seat =
+    \\{"entries":[{"kind":"put","table":7,"id":"1","fields":{"section":2}}]}
+;
+
+test "api: a layout read and a commit share one window: the commit is refused unsent (#186)" {
     var arena_instance = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_instance.deinit();
     const arena = arena_instance.allocator();
-    var fake: FakeClient = .{ .allocator = arena };
-    var layouts: FakeLayouts = .{ .allocator = arena, .client = &fake };
-    const declare =
-        \\{"name":"seats","fields":[{"name":"section","type":"u8"}]}
-    ;
-    _ = try handle(arena, &fake, &layouts, .put, "/v1/tables/7", declare);
-    // The layout read answered; the commit went out and the window ended before its reply.
-    fake.timeout_from_write = fake.writes_sent + 1;
+    var fake: FakeClient = undefined;
+    var layouts: FakeLayouts = undefined;
+    const timeout: u64 = 1600;
+    // The layout read takes 95% of the window: less than a sixteenth is left for the commit.
+    try window_fixture(arena, &fake, &layouts, timeout);
+    fake.cost_ns = timeout * 95 / 100;
     const writes_before = fake.writes_sent;
-    layouts.cache.forget(7);
-    try testing.expectError(error.Timeout, handle(arena, &fake, &layouts, .post, "/v1/commit",
-        \\{"entries":[{"kind":"put","table":7,"id":"1","fields":{"section":2}}]}
-    ));
+    const refused = handle(arena, &fake, &layouts, .post, "/v1/commit", commit_seat);
+    try testing.expectError(error.Expired, refused);
+    try testing.expectEqual(@as(u32, 1), layouts.reads);
+    try testing.expectEqual(writes_before, fake.writes_sent);
+    // The reply the gateway gives: NRV-E0606, nothing written.
+    const reply = try server.failure_reply(arena, error.Expired, writes_before, fake.writes_sent);
+    try testing.expect(std.mem.indexOf(u8, reply.body, "\"code\":\"NRV-E0606\"") != null);
+    try testing.expect(std.mem.indexOf(u8, reply.body, "\"applied\":false") != null);
+    // The same commit with its layout cached has the whole window and goes out.
+    try window_fixture(arena, &fake, &layouts, timeout);
+    fake.cost_ns = timeout * 95 / 100;
+    _ = try layouts.layout_fresh(arena, 7);
+    fake.window_open(timeout);
+    const cached = try handle(arena, &fake, &layouts, .post, "/v1/commit", commit_seat);
+    try testing.expectEqual(@as(u16, 200), cached.status);
+}
+
+test "api: a layout read and a commit that is sent past the shared window time out (#186)" {
+    var arena_instance = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_instance.deinit();
+    const arena = arena_instance.allocator();
+    var fake: FakeClient = undefined;
+    var layouts: FakeLayouts = undefined;
+    const timeout: u64 = 1600;
+    // 60% each: the commit starts with 40% left, is sent, and its reply is past the window.
+    try window_fixture(arena, &fake, &layouts, timeout);
+    fake.cost_ns = timeout * 60 / 100;
+    const writes_before = fake.writes_sent;
+    const sent = handle(arena, &fake, &layouts, .post, "/v1/commit", commit_seat);
+    try testing.expectError(error.Timeout, sent);
     try testing.expectEqual(writes_before + 1, fake.writes_sent);
-    try testing.expectEqual(Applied.unknown, applied_since(writes_before, fake.writes_sent));
+    // The reply the gateway gives: NRV-E0601, and the write's outcome is unknown, never false.
+    const reply = try server.failure_reply(arena, error.Timeout, writes_before, fake.writes_sent);
+    try testing.expect(std.mem.indexOf(u8, reply.body, "\"code\":\"NRV-E0601\"") != null);
+    try testing.expect(std.mem.indexOf(u8, reply.body, "\"applied\":\"unknown\"") != null);
+    // One such call alone fits the window.
+    try window_fixture(arena, &fake, &layouts, timeout);
+    fake.cost_ns = timeout * 60 / 100;
+    _ = try layouts.layout_fresh(arena, 7);
+    fake.window_open(timeout);
+    const alone = try handle(arena, &fake, &layouts, .post, "/v1/commit", commit_seat);
+    try testing.expectEqual(@as(u16, 200), alone.status);
 }
 
 test "api: a views_busy send again that expires keeps the answers that came back (P195b)" {

@@ -304,30 +304,32 @@ fn serve_request(
 
     if (!health.ready(client)) return cluster_unavailable;
     const writes_before = client.writes_sent;
-    return api.handle(arena, client, layouts, method, target, request.body) catch |err|
-        switch (err) {
-            error.Expired => return request_expired(
-                api.applied_since(writes_before, client.writes_sent),
-            ),
-            error.Evicted, error.Timeout => {
-                log.err("{s}: {}", .{ target, err });
-                health.broke();
-                // The cluster may have changed under the new client: read layouts again (P135).
-                layouts.cache_clear();
-                return cluster_lost(api.applied_since(writes_before, client.writes_sent));
-            },
-            error.OutOfMemory => return err,
-            else => {
-                log.err("{s}: {}", .{ target, err });
-                return api.error_reply(
-                    arena,
-                    .B0001,
-                    500,
-                    "internal error",
-                    api.applied_since(writes_before, client.writes_sent),
-                );
-            },
-        };
+    return api.handle(arena, client, layouts, method, target, request.body) catch |err| {
+        if (err != error.Expired and err != error.OutOfMemory) log.err("{s}: {}", .{ target, err });
+        if (err == error.Evicted or err == error.Timeout) {
+            health.broke();
+            // The cluster may have changed under the new client: read layouts again (P135).
+            layouts.cache_clear();
+        }
+        return failure_reply(arena, err, writes_before, client.writes_sent);
+    };
+}
+
+/// The reply to a request whose handling failed with `err`, when the client had sent
+/// `writes_before` writes before it and `writes_now` after: `applied` is what those say.
+pub fn failure_reply(
+    arena: std.mem.Allocator,
+    err: anyerror,
+    writes_before: u64,
+    writes_now: u64,
+) !api.Reply {
+    const applied = api.applied_since(writes_before, writes_now);
+    switch (err) {
+        error.Expired => return request_expired(applied),
+        error.Evicted, error.Timeout => return cluster_lost(applied),
+        error.OutOfMemory => return err,
+        else => return api.error_reply(arena, .B0001, 500, "internal error", applied),
+    }
 }
 
 /// `/healthz` while the gateway has no session: 503 NRV-E0605, as a request for the cluster.
