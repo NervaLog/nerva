@@ -125,7 +125,11 @@ pub fn serve(gpa: std.mem.Allocator, client: *Client, options: Options) !noretur
                 &layouts,
                 options,
                 &received.request,
-            ) catch |err| reply_of_error(err, &budget, writes_before, client.writes_sent);
+            ) catch |err| reply_of_error(
+                err,
+                &budget,
+                api.applied_since(writes_before, client.writes_sent),
+            );
             answer(&receiver, &counters, received, reply);
         }
         const asked = options.tally.requests != requests_before;
@@ -173,16 +177,14 @@ const GroupFilter = struct {
     }
 };
 
-/// What a request that failed with `err` is answered, when `Client.writes_sent` was
-/// `writes_before` as it began and is `writes_now` now. The bodies are fixed: the arena may be
-/// what ran out. A request that sent no write was not applied.
+/// What a request that failed with `err` is answered, `applied` saying whether it sent a write
+/// (`api.applied_since`, or the member's own in a group). The bodies are fixed: the arena may be
+/// what ran out.
 fn reply_of_error(
     err: anyerror,
     budget: *const MemoryBudget,
-    writes_before: u64,
-    writes_now: u64,
+    applied: api.Applied,
 ) api.Reply {
-    const applied = api.applied_since(writes_before, writes_now);
     if (err == error.OutOfMemory and budget.exceeded) {
         log.warn("request: past its memory budget", .{});
         return .{ .status = 413, .body = switch (applied) {
@@ -237,17 +239,14 @@ fn serve_group(
     }
     const members_used = members[0..received.len];
     const ready = health.ready(client);
-    // After `ready`: a reconnection starts a client that has sent nothing.
-    const writes_before = client.writes_sent;
     if (!ready) {
         for (members_used) |*member| member.result = cluster_unavailable;
     } else if (api.handle_group(arena, client, layouts, members_used)) {
         for (members_used) |*member| assert(member.result != null);
     } else |err| switch (err) {
         error.Expired => {
-            const expired = request_expired(api.applied_since(writes_before, client.writes_sent));
             for (members_used) |*member| {
-                if (member.result == null) member.result = expired;
+                if (member.result == null) member.result = error.Expired;
             }
         },
         error.Evicted, error.Timeout => {
@@ -255,9 +254,8 @@ fn serve_group(
             health.broke();
             // The cluster may have changed under the new client: read layouts again (P135).
             layouts.cache_clear();
-            const lost = cluster_lost(api.applied_since(writes_before, client.writes_sent));
             for (members_used) |*member| {
-                if (member.result == null) member.result = lost;
+                if (member.result == null) member.result = err;
             }
         },
         else => {
@@ -267,8 +265,11 @@ fn serve_group(
         },
     }
     for (members_used, received) |member, one| {
-        const reply = member.result.? catch |err|
-            reply_of_error(err, budget, writes_before, client.writes_sent);
+        const reply = member.result.? catch |err| switch (err) {
+            error.Expired => request_expired(member.applied),
+            error.Evicted, error.Timeout => cluster_lost(member.applied),
+            else => reply_of_error(err, budget, member.applied),
+        };
         answer(receiver, counters, one, reply);
     }
 }
