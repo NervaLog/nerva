@@ -106,15 +106,32 @@
                                       {} (:gateways v))))
 
 (defn act!
-  "Does `f` on this node for `arg`; returns the gateway indices it acted on."
+  "Does `f` on this node for `arg`; returns `{:hit [index ...]}`, the gateways it reached, and
+  for a start `:down`, the started gateways that did not come up."
   [test f arg]
   (case f
-    :gateway-kill      (db/kill-gateways! arg)
-    :gateway-start     (db/start-gateways! test)
-    :gateway-partition (db/partition-gateways! arg)
-    :gateway-heal      (db/heal-gateways! test)
-    :gateway-pause     (db/signal-gateways! arg "-STOP")
-    :gateway-resume    (db/signal-gateways! arg "-CONT")))
+    :gateway-kill      {:hit (db/kill-gateways! arg)}
+    :gateway-start     (let [{:keys [up down]} (db/start-gateways! test)]
+                           {:hit up, :down down})
+    :gateway-partition {:hit (db/partition-gateways! arg)}
+    :gateway-heal      {:hit (db/heal-gateways! test)}
+    :gateway-pause     {:hit (db/signal-gateways! arg "-STOP")}
+    :gateway-resume    {:hit (db/signal-gateways! arg "-CONT")}))
+
+(defn pairs-of
+  "The sorted `[node index]` pairs for `k` over `hit`, a map of node to `act!`'s result."
+  [hit k]
+  (vec (for [[node r] (sort-by key hit)
+             index (get r k)]
+         [node index])))
+
+(defn completion
+  "What a completion adds to the op's value: `:hit`, the gateways reached, and for a start
+  `:down` when any started gateway did not come up (P237)."
+  [hit]
+  (let [down (pairs-of hit :down)]
+    (cond-> {:hit (pairs-of hit :hit)}
+      (seq down) (assoc :down down))))
 
 (defn nemesis
   "Applies the gateway faults. Every f here is distinct from `combined/db-nemesis`'s and
@@ -133,9 +150,7 @@
                    {}
                    (c/on-nodes test (keys plan)
                                (fn [_ node] (c/su (act! test (:f o) (get plan node))))))]
-        (assoc o :value (assoc (:value o) :hit (vec (for [[node indices] (sort-by key hit)
-                                                          index indices]
-                                                      [node index]))))))
+        (assoc o :value (merge (:value o) (completion hit)))))
 
     (teardown! [_ _])))
 

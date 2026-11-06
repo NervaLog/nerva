@@ -212,22 +212,59 @@
   [test]
   (into [] (mapcat #(node-gateways test %)) (:nodes test)))
 
+(defn gateway-running?
+  "Whether gateway `index` on this node has a live process (a paused one has)."
+  [index]
+  (cu/daemon-running? (gateway-pidfile index)))
+
 (defn kill-gateways!
-  "SIGKILLs gateways `indices` on this node, the replica untouched. Returns `indices`."
+  "SIGKILLs those of gateways `indices` that are running on this node, the replica untouched.
+  Returns the indices it killed: a gateway already down was not reached."
   [indices]
-  (doseq [index indices]
-    (cu/stop-daemon! (gateway-pidfile index)))
-  (vec indices))
+  (let [reached (filterv gateway-running? indices)]
+    (doseq [index reached]
+      (cu/stop-daemon! (gateway-pidfile index)))
+    reached))
+
+(def start-settle-s
+  "How long `start-gateways!` waits, in all, for the gateways it started to be healthy or dead."
+  10)
+
+(defn start-outcome
+  "`states` maps a started gateway's index to `:up`, `:dead` or `:pending`; returns
+  `{:up [...] :down [...]}`, indices sorted. Only a healthy gateway is up: one that exited at
+  start (NRV-E0604, still cut off) or is not yet answering is down."
+  [states]
+  {:up   (vec (sort (for [[i s] states :when (= :up s)] i)))
+   :down (vec (sort (for [[i s] states :when (not= :up s)] i)))})
+
+(defn gateway-state
+  "`:up` when gateway `index` answers `/healthz` (a probe takes at most
+  `http/probe-timeout-ms`), `:dead` when its process is gone, else `:pending`."
+  [index]
+  (cond (http/healthy? c/*host* (gateway-port index)) :up
+        (not (gateway-running? index))                :dead
+        :else                                         :pending))
 
 (defn start-gateways!
-  "Starts this node's gateways that are not running, without waiting for them: a paused or
-  cut-off gateway is running and is left alone, and the nemesis stays responsive. Returns the
-  indices started. A gateway that exits at start (NRV-E0604) stays down until the next start."
+  "Starts this node's gateways that are not running; a paused or cut-off gateway is running and
+  is left alone. Then waits, at most `start-settle-s` in all, for each to be healthy or dead.
+  Returns `{:up [...] :down [...]}` (P237): a gateway started while still cut off from its
+  replicas exits (NRV-E0604) and is reported down, not started; the next start op starts it
+  again, and the final phase heals the cuts before it starts."
   [test]
-  (vec (for [index (range (gateways test c/*host*))
-             :when (not (cu/daemon-running? (gateway-pidfile index)))
-             :let [_ (start-gateway! test index)]]
-         index)))
+  (let [started  (vec (for [index (range (gateways test c/*host*))
+                            :when (not (gateway-running? index))
+                            :let [_ (start-gateway! test index)]]
+                        index))
+        deadline (+ (System/nanoTime) (* start-settle-s 1000000000))]
+    (loop [states (zipmap started (repeat :pending))]
+      (let [states (into {} (for [[i s] states]
+                              [i (if (= :pending s) (gateway-state i) s)]))]
+        (if (or (not-any? #{:pending} (vals states))
+                (< deadline (System/nanoTime)))
+          (start-outcome states)
+          (do (Thread/sleep 500) (recur states)))))))
 
 (defn signal-gateways!
   "Sends `signal` to gateways `indices` on this node; a gateway that is gone is not an error.
@@ -251,14 +288,16 @@
 
 (defn partition-gateways!
   "Cuts gateways off from replicas on this node: `cuts` is `[[index [replica-node ...]] ...]`.
-  Their clients still reach them. Returns the indices cut."
+  Their clients still reach them. Only a running gateway is cut, and only it is returned: a
+  gateway that is down was not reached, and a rule for it would cut it off when it restarts."
   [cuts]
-  (doseq [[index dests] cuts
-          dest dests
-          :let [rule (gateway-rule index dest)]]
-    (c/exec :sh :-c (str "iptables -w -t mangle -C OUTPUT " rule " 2>/dev/null"
-                         " || iptables -w -t mangle -A OUTPUT " rule)))
-  (mapv first cuts))
+  (let [reached (filterv (comp gateway-running? first) cuts)]
+    (doseq [[index dests] reached
+            dest dests
+            :let [rule (gateway-rule index dest)]]
+      (c/exec :sh :-c (str "iptables -w -t mangle -C OUTPUT " rule " 2>/dev/null"
+                           " || iptables -w -t mangle -A OUTPUT " rule)))
+    (mapv first reached)))
 
 (def heal-deletes-max
   "At most this many copies of one rule are deleted (each cut adds at most one)."

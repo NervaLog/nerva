@@ -3,6 +3,7 @@
   what the final generator undoes."
   (:require [clojure.set :as set]
             [clojure.test :refer [deftest is testing]]
+            [jepsen.control :as c]
             [jepsen.generator :as gen]
             [jepsen.generator.context :as ctx]
             [jepsen.nemesis :as n]
@@ -145,3 +146,39 @@
 (deftest gateway-rule-names-the-replica
   (is (re-find #"-d 10.0.0.2 --dport 3000" (db/gateway-rule 0 "10.0.0.2")))
   (is (not= (db/gateway-rule 0 "10.0.0.1") (db/gateway-rule 0 "10.0.0.2"))))
+
+(deftest kill-reaches-only-running-gateways
+  (let [killed (atom [])]
+    (with-redefs [db/gateway-running? #{0 2}
+                  jepsen.control.util/stop-daemon! (fn [pidfile] (swap! killed conj pidfile))]
+      (is (= [0 2] (db/kill-gateways! [0 1 2])))
+      (is (= 2 (count @killed)))
+      (is (= [] (db/kill-gateways! [1]))))))
+
+(deftest partition-cuts-only-running-gateways
+  (let [rules (atom [])]
+    (with-redefs [db/gateway-running? #{1}
+                  jepsen.control/exec (fn [& args] (swap! rules conj args))]
+      (is (= [1] (db/partition-gateways! [[0 ["n1"]] [1 ["n1" "n2"]]])))
+      (is (= 2 (count @rules)) "no rule for the gateway that is down")
+      (is (= [] (db/partition-gateways! [[0 ["n1"]]]))))))
+
+(deftest start-outcome-counts-only-healthy-gateways
+  (is (= {:up [0] :down [1 2]} (db/start-outcome {0 :up, 1 :dead, 2 :pending})))
+  (is (= {:up [] :down []} (db/start-outcome {}))))
+
+(deftest start-reports-a-gateway-that-exited-down
+  (let [started (atom [])]
+    (with-redefs [db/gateway-running? (fn [i] (= 2 i))
+                  db/start-gateway!   (fn [_ i] (swap! started conj i))
+                  db/gateway-state    {0 :up, 1 :dead}
+                  c/*host*            "n1"]
+      (is (= {:up [0] :down [1]} (db/start-gateways! {:nodes ["n1"] :gateways 3})))
+      (is (= [0 1] @started) "the running gateway 2 is left alone"))))
+
+(deftest completion-reports-hit-and-down
+  (is (= {:hit [["n1" 0] ["n2" 1]]}
+         (nemesis/completion {"n2" {:hit [1]}, "n1" {:hit [0]}})))
+  (is (= {:hit [] } (nemesis/completion {"n1" {:hit []}})))
+  (is (= {:hit [["n1" 0]] :down [["n2" 0]]}
+         (nemesis/completion {"n1" {:hit [0]}, "n2" {:hit [] :down [0]}}))))
