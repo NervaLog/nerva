@@ -21,11 +21,21 @@
 (def replica-pidfile (str dir "/replica.pid"))
 (def api-pidfile (str dir "/api.pid"))
 
+(def two-gateway-nodes
+  "With `--gateways 2`, only this many nodes run two: a development replica takes at most 8
+  client connections (`pipeline_prepare_queue_max`, no `--pipeline-requests-limit`), and a
+  gateway is one client on every replica. Ten gateways left the last one unable to connect."
+  3)
+
 (defn gateways
-  "How many `nerva api` gateways each node runs (`--gateways`, 1 or 2): R4's sidecar topology
-  has one per client process, so two gateways share every replica."
-  [test]
-  (:gateways test 1))
+  "How many `nerva api` gateways `node` runs (`--gateways`, 1 or 2): R4's sidecar topology has
+  one per client process, so two gateways share a replica. With 2, only the first
+  `two-gateway-nodes` nodes run two (6 gateways, 2 spare client slots per replica)."
+  [test node]
+  (let [n (:gateways test 1)]
+    (if (and (= 2 n) (<= two-gateway-nodes (.indexOf ^java.util.List (vec (:nodes test)) node)))
+      1
+      n)))
 
 (defn gateway-port
   "Gateway `index` listens on `http/api-port` plus its index."
@@ -136,7 +146,7 @@
   (milliseconds) becomes their `--request-timeout`. A gateway that exits at start is started
   again (`gateway-start-tries`); one that is neither healthy nor dead after 8 s is left."
   [test]
-  (doseq [index (range (gateways test))]
+  (doseq [index (range (gateways test c/*host*))]
     (loop [tries 1]
       (start-gateway! test index)
       (let [deadline (+ (System/nanoTime) 15000000000)
@@ -176,7 +186,7 @@
                 :--development data-file)
         (start-replica! test)
         (start-api! test))
-      (doseq [index (range (gateways test))]
+      (doseq [index (range (gateways test node))]
         (http/await-healthy! node (gateway-port index) healthy-timeout-s))
       (jepsen/synchronize test)
       (when (= node (jepsen/primary test))
@@ -209,5 +219,5 @@
     db/LogFiles
     (log-files [_ test node]
       (into {replica-log "replica.log"}
-            (for [index (range (gateways test))]
+            (for [index (range (gateways test node))]
               [(gateway-log index) (if (zero? index) "api.log" (str "api-" index ".log"))])))))

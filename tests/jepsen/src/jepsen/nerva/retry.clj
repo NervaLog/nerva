@@ -48,8 +48,8 @@
 
 (def request-timeout-ms
   "The gateways' `--request-timeout`: an unanswered request is answered by the gateway within
-  about 10 s, and a short client timeout (below) is shorter than that."
-  10000)
+  about 5 s, and a short client timeout (below) is shorter than that."
+  3000)
 
 (def short-timeout-probability 0.25)
 (def resolve-deadline-ms
@@ -137,7 +137,7 @@
 (defn targets
   "Every node's gateways, as [node port]."
   [test]
-  (vec (for [node (:nodes test), index (range (db/gateways test))]
+  (vec (for [node (:nodes test), index (range (db/gateways test node))]
          [node (db/gateway-port index)])))
 
 (defn pick

@@ -17,13 +17,15 @@ Also taken: a client's discarded `200` is kept in the history as an attempt of k
 with `dropped? true`, naming its op. Without it, a duplicate with the first reply discarded
 (the case the teeth run produces) could be seen only as a wrong balance, not as the `duplicate`
 the brief expects. And `--gateways` has no fixed default: `retry` takes 2, `bank` 1, and the
-`retry` gateways start with `--request-timeout=10000` (brief: short client timeouts below it).
+`retry` gateways start with `--request-timeout=3000` (brief: short client timeouts below it).
 
 The reason: each follows from the brief's checks and teeth. What it costs: a `:fail` operation's
 effect can appear later in the history (the final phase commits it), so Jepsen's `:fail` means
 "refused at the time", not "never applied"; only `retry/checker` reads these histories.
 
-The gateway timeout is 10000 ms, not 3000: a gateway registers with the cluster at start within
-the same bound, and on the hosted runner (10 gateways and 5 replicas on 4 vCPU) a 3 s bound made a
-gateway exit with NRV-E0604 on all six starts while the cluster was still electing a primary
-(run 42167113764). The setup restart loop stays, and waits up to 15 s per start.
+`--gateways 2` runs two gateways only on the first three nodes (six in all). A `--development`
+replica takes at most 8 client connections (`pipeline_prepare_queue_max`; the `--development`
+profile sets `pipeline_requests_limit` to 0), and each gateway is a client on every replica: with
+ten, the last gateway to start was closed by all five replicas and exited with NRV-E0604 on
+every restart (hosted runs 42167113764 and 42167830114; not the 3 s timeout, as first thought).
+The setup restart loop stays.
