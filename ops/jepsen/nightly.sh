@@ -11,8 +11,8 @@
 # host when setup.sh runs again.
 #
 # A failure of the host (a build that failed, Docker down, a run past the deadline, a systemd
-# stop or timeout) is written to `host-failure` or the `runs` file and reported as the host's: a
-# status `error`, never an issue. The token is a file (the unit's credential); this script
+# stop or timeout, a `set -e` abort such as a full disk) is written to `host-failure` or the
+# `runs` file and reported as the host's, once: a status `error`, never an issue. The token is a file (the unit's credential); this script
 # never prints it.
 set -euo pipefail
 
@@ -62,13 +62,15 @@ reporter="$here/jepsen_report.py"
 night_start=$SECONDS
 mkdir -p "$JEPSEN_HOME"/{archive,state,nights}
 
-# One night at a time. A second start (the timer while a run is late, or by hand) leaves quietly.
+# One night at a time. A second start (by hand, say) leaves, and fails, with the holder's pid.
 # This process takes the lock once and keeps it to its exit; the long children get fd 9 closed,
 # so none can outlive the night holding it.
 exec 9>"$JEPSEN_HOME/nightly.lock"
 if ! flock -n 9; then
-  log "another night is running (pid $(cat "$JEPSEN_HOME/nightly.pid" 2> /dev/null || echo unknown)); leaving"
-  exit 0
+  # Not 0: a real night that finds a dry run's lock (the README suggests one by hand) would end
+  # with the fleet stopped, no status and no tracker line, and the unit shown as a success.
+  log "another night is running (pid $(cat "$JEPSEN_HOME/nightly.pid" 2> /dev/null || echo unknown)); this start did nothing (exit 75, the unit fails)"
+  exit 75
 fi
 echo "$$" > "$JEPSEN_HOME/nightly.pid"
 
@@ -137,16 +139,19 @@ build_tip() {
     host_failure "the build of $commit failed (build.log on the host)"
     return 1
   fi
-  docker info > /dev/null 2>&1 || { host_failure "Docker is not answering"; return 1; }
+  # Bounded: a wedged dockerd must not hold the lock and the stopped fleet until the unit's timeout.
+  supervise timeout 60 docker info > /dev/null 2>&1 9>&- \
+    || { host_failure "Docker is not answering"; return 1; }
 }
 
-# The run in flight, for the trap: label, start and arguments.
-run_label="" run_began=0 run_args=""
+# The run in flight, for the trap: label, start and arguments; and the code it ended with, once
+# `supervise` returned it (empty while it runs).
+run_label="" run_began=0 run_args="" run_code=""
 
 # Moves the run's store into the night and writes its line to `runs`.
 finish_run() {
   local code=$1
-  if [[ -d "$JEPSEN_REPO_DIR/tests/jepsen/store" ]]; then
+  if [[ -d "$JEPSEN_REPO_DIR/tests/jepsen/store" && ! -e "$night/store/$run_label" ]]; then
     mv "$JEPSEN_REPO_DIR/tests/jepsen/store" "$night/store/$run_label"
   fi
   echo "$run_label $code $((SECONDS - run_began)) $run_args" >> "$night/store/runs"
@@ -161,11 +166,13 @@ run() {
   shift
   run_began=$SECONDS
   run_args="$*"
+  run_code=""
   rm -rf "$JEPSEN_REPO_DIR/tests/jepsen/store"
   # --kill-after: run.sh's cleanup (removing the containers) gets a minute after the TERM.
   supervise timeout --kill-after=60 "$(remaining)" \
     "$JEPSEN_REPO_DIR/tests/jepsen/run.sh" "$JEPSEN_REPO_DIR/zig-out/bin/nerva" "$@" \
     > "$night/run-$run_label.log" 2>&1 9>&- || code=$?
+  run_code=$code
   finish_run "$code"
 }
 
@@ -191,31 +198,52 @@ known_commit() {
   [[ -n "$commit" ]] || commit=$(git -C "$JEPSEN_REPO_DIR" rev-parse HEAD 2> /dev/null || true)
 }
 
-# A systemd stop or timeout (TERM), or a Ctrl-C: report the night as the host's within seconds,
-# as an interrupted night: the run in flight is recorded as exit 143, or host-failure if none
-# had finished. The unit's TimeoutStopSec leaves room for this (child 20 s + reporter 60 s).
-interrupted() {
+# Any end of the night that is not the end of the script comes here, from the EXIT trap: a
+# systemd stop or timeout or a Ctrl-C (TERM, INT: `exit 143`), a `set -e` abort (a full disk, say)
+# or an unset variable. The night is reported once, as the host's `error` with the tracker's line,
+# within seconds: the run in flight is recorded (143 only if it was still running), a
+# `host-failure` is written, and the reporter gets 60 s. The unit's TimeoutStopSec leaves room
+# (child 20 s + reporter 60 s).
+night_over=0   # 1 once the night is reported or nothing more is owed
+reporting=0    # 1 from the start of the final report: a second one could file its issues twice
+archived=0     # 1 once the archive is in place
+on_exit() {
+  local rc=$?
   trap '' TERM INT
+  set +e
   exec >&7 2>&8
-  log "interrupted (TERM or INT); reporting the night as the host's"
+  ((night_over)) && exit "$rc"
+  night_over=1
+  if ((reporting)); then
+    log "the night's report did not finish (exit $rc); not reporting it twice"
+    exit "$rc"
+  fi
+  log "the night ended early (exit $rc); reporting it as the host's"
   if ((child != 0)); then
-    kill -TERM "$child" 2> /dev/null || true
+    kill -TERM "$child" 2> /dev/null
     for _ in $(seq 20); do kill -0 "$child" 2> /dev/null || break; sleep 1; done
   fi
-  if [[ -n "$run_label" ]]; then
-    finish_run 143
-  elif [[ ! -s "$night/store/runs" ]]; then
-    host_failure "the night was interrupted (a systemd stop or timeout) before any run finished"
+  # An archive cut short is of no use, and nothing else would remove it.
+  [[ -z "$archive" ]] || rm -f "$archive.new"
+  if [[ -n "$run_label" ]] && ! grep -q "^$run_label " "$night/store/runs" 2> /dev/null; then
+    # The run's own code once it ended; 143 only if it was still running.
+    finish_run "${run_code:-143}"
+  fi
+  if ((rc == 143)); then
+    host_failure "the night was interrupted (a systemd stop or timeout) before it finished"
+  else
+    host_failure "nightly.sh stopped on an error (exit $rc) before it finished (disk full?)"
   fi
   known_commit
-  archive=""
+  ((archived)) || archive=""
   report_limit=60
   if [[ -n "$commit" ]]; then
-    report || log "the report of the interrupted night failed (exit $?)"
+    report || log "the report of the night failed (exit $?)"
   fi
-  exit 143
+  exit "$rc"
 }
-trap interrupted TERM INT
+trap 'exit 143' TERM INT
+trap on_exit EXIT
 
 commit=""
 fetched=0
@@ -239,12 +267,16 @@ if ! supervise tar --zstd -C "$night" -cf "$archive.new" store 2> /dev/null 9>&-
   log "the archive could not be written"
 else
   mv "$archive.new" "$archive"
+  archived=1
   find "$JEPSEN_HOME/archive" -name '*.tar.zst' -mtime +"$JEPSEN_KEEP_DAYS" -delete
 fi
 find "$JEPSEN_HOME/nights" -mindepth 1 -maxdepth 1 -mtime +7 -exec rm -rf {} +
 
 if [[ -z "$commit" ]]; then
   log "no commit is known (the first fetch failed); nothing can be reported"
+  night_over=1
   exit 1
 fi
+reporting=1
 report
+night_over=1

@@ -13,7 +13,7 @@ runs the night when it comes up). The unit stops `sim-fleet.service`, runs `nigh
 user `jepsen`, and starts the fleet again whatever happened (`ExecStartPre=+` and
 `ExecStopPost=+`, root, outside the unit's sandbox). `nightly.sh`:
 
-1. takes `flock` once (a second start leaves quietly) and a whole-night deadline of 3 h
+1. takes `flock` once (a second start, by hand say, logs the holder's pid and exits 75, so the unit shows as failed) and a whole-night deadline of 3 h
    (`JEPSEN_NIGHT_SECONDS`); a run past it is killed and counted as the host's;
 2. fetches `main`, builds `nerva` in ReleaseSafe at the tip (`./zig/zig build -Drelease`);
 3. runs `retry` and then `bank`, each `--nemesis kill,partition,gateway --time-limit 3600` and a
@@ -30,10 +30,14 @@ checkout, the code under test; it never runs the `ops/jepsen/` in it. So a broke
 change to the runner (`nightly.sh`, `jepsen_report.py`, `jepsen.service`, `jepsen.timer`) reaches the
 host only when `setup.sh` runs again**, as root, from a checkout of the commit to install.
 
-A systemd stop or the unit's timeout sends TERM: a trap records the run in flight as exit 143 (or
-a `host-failure` if none had finished) and posts `jepsen/nightly` = `error` (the host's) and the
-tracker's line within about 80 s; `TimeoutStopSec=120` leaves room for that. A second night that
-finds the lock held logs the pid in `nightly.pid`. With no token, `nightly.sh` exits at once with
+Any end that is not the end of the script (a systemd stop or the unit's timeout, which send TERM;
+a Ctrl-C; a `set -e` abort such as a full disk) goes through one `EXIT` trap: it records the run in
+flight (as exit 143 only if it was still running), writes a `host-failure` and posts
+`jepsen/nightly` = `error` (the host's) and the tracker's line within about 80 s, once;
+`TimeoutStopSec=120` leaves room for that. A stop during the final report is not reported again
+(the reporter may have filed an issue; a second report could file it twice). `docker info` is
+bounded to 60 s. A second night that finds the lock held logs the pid in `nightly.pid` and exits
+75; `setup.sh` takes the same lock for the checkout and refuses while a night runs. With no token, `nightly.sh` exits at once with
 one journal line; the unit runs `nightly.sh --check-token` before it stops the fleet.
 
 ## What the reporter does
@@ -73,7 +77,7 @@ in the store) is `error`.
   given is written, so `nightly.sh` gives a dry run one of its own (`state/dry-run.json`).
 - **Statuses only move up** (P235b): error, then success, then failure, per commit and context.
   A later night on the same commit never turns a `failure` green, and a night that could not run
-  never turns a `success` into `error`. The rank is the higher of the state file'"'"'s and GitHub'"'"'s own
+  never turns a `success` into `error`. The rank is the higher of the state file's and GitHub's own
   status for the commit (read before posting); if that read fails, nothing is posted and the tracker
   line says so (P235b). A night that failed to fetch posts no status (`--no-status`):
   it tested nothing, and the commit it knew is the previous night's. The tracker line says so.
@@ -128,7 +132,8 @@ the fleet by hand first.
 
 ## Limits
 
-- Not run on a host yet (slice 7). Verified in a cloud session: the reporter's tests, a dry run
+- Not run on a host yet (slice 7). **A runner change needs `setup.sh` run again on the host**
+  (P240): merging it changes nothing there until then. Verified in a cloud session: the reporter's tests, a dry run
   against the stores of two hosted runs, `shellcheck`, and `systemd-analyze verify`. Bank's `results.edn` shape in the tests is built from `bank.clj`'s checker composition: no
   hosted run of `bank` existed to copy it from.
 - A run cannot be replayed from its seed: the seed steers Jepsen's generators and the faults

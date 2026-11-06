@@ -572,6 +572,19 @@ class Interrupted(unittest.TestCase):
                    lambda m: None)
         self.assertEqual(github.statuses[0][1:3], ("error", "jepsen/nightly"))
 
+    def test_exit_143_with_a_log_and_no_results_is_the_hosts_not_a_crash(self):
+        # The case the trap makes: Jepsen had started (a jepsen.log) and was stopped.
+        store = Store(self)
+        store.test("1", "", code=143, with_results=False)
+        runs, host = rep.read_night(store.write_runs() and store.path, None)
+        self.assertEqual(runs[0].kind, "host")
+        self.assertEqual(runs[0].findings, [])
+        github = Recorder()
+        rep.ingest(github, rep.new_state(), runs, host, COMMIT, None, None, False, NOW, "o/r",
+                   lambda m: None)
+        self.assertEqual(github.opened, [])
+        self.assertEqual(github.statuses[0][1:3], ("error", "jepsen/nightly"))
+
 
 class Dedup(unittest.TestCase):
     def test_a_known_failure_gets_one_comment_per_commit(self):
@@ -1000,18 +1013,23 @@ class Nightly(unittest.TestCase):
         self.assertIn("would comment on #7", done.stdout)
         self.assertIn("would set status", done.stdout)
 
+    def env(self, extra=None):
+        return {"PATH": f"{self.bin}:{os.environ['PATH']}", "JEPSEN_HOME": str(self.home),
+                "JEPSEN_REMOTE": str(self.remote), "JEPSEN_WORKLOADS": "retry",
+                "JEPSEN_NEMESIS": "kill", "JEPSEN_TIME_LIMIT": "1", "HOME": self.tmp.name,
+                **(extra or {})}
+
     def interrupt(self, hang):
-        """Starts a dry night whose `hang` step never ends, sends TERM, returns (rc, out, secs)."""
+        """Starts a dry night whose `hang` step (or, None, a run.sh already committed that
+        touches `started`) never ends, sends TERM, returns (rc, out, err, secs)."""
         started = Path(self.tmp.name, "started")
-        step = f"#!/bin/sh\ntouch {started}\nexec sleep 300\n"
-        Path(self.remote, hang).write_text(step)
-        Path(self.remote, hang).chmod(0o755)
-        self.git(self.remote, "add", "-A")
-        self.commit(self.remote, "hangs")
-        env = {"PATH": f"{self.bin}:{os.environ['PATH']}", "JEPSEN_HOME": str(self.home),
-               "JEPSEN_REMOTE": str(self.remote), "JEPSEN_WORKLOADS": "retry",
-               "JEPSEN_NEMESIS": "kill", "JEPSEN_TIME_LIMIT": "1", "JEPSEN_TRACKER": "7",
-               "JEPSEN_NIGHT_SECONDS": "250", "HOME": self.tmp.name}
+        if hang:
+            step = f"#!/bin/sh\ntouch {started}\nexec sleep 300\n"
+            Path(self.remote, hang).write_text(step)
+            Path(self.remote, hang).chmod(0o755)
+            self.git(self.remote, "add", "-A")
+            self.commit(self.remote, "hangs")
+        env = self.env({"JEPSEN_TRACKER": "7", "JEPSEN_NIGHT_SECONDS": "250"})
         night = subprocess.Popen(["bash", str(self.installed / "nightly.sh"), "--dry-run"],
                                  env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                  text=True)
@@ -1045,6 +1063,78 @@ class Nightly(unittest.TestCase):
         self.assertIn("would comment on #7", out)
         night = next((self.home / "nights").iterdir())
         self.assertIn("interrupted", (night / "store/host-failure").read_text())
+
+    def test_term_during_the_final_report_does_not_report_twice(self):
+        # systemd's TERM reaches the reporter too: this wrapper, on its first call, sends TERM to
+        # the night's bash (its grandparent, past `timeout`) and dies unsaved, as a killed
+        # reporter does. The trap must not run a second report.
+        calls = Path(self.tmp.name, "calls")
+        Path(self.installed, "jepsen_report.py").write_text(
+            "import os, signal\n"
+            f"calls = {str(calls)!r}\n"
+            "n = len(open(calls).read().split()) if os.path.exists(calls) else 0\n"
+            "open(calls, 'a').write('call\\n')\n"
+            "if n == 0:\n"
+            "    ppid = int(open(f'/proc/{os.getppid()}/stat').read().rsplit(')', 1)[1].split()[1])\n"
+            "    os.kill(ppid, signal.SIGTERM)\n"
+            "    os.kill(os.getpid(), signal.SIGKILL)\n"
+            "print('would set status jepsen/nightly')\n")
+        done = self.night("--dry-run", extra={"JEPSEN_TRACKER": "7"})
+        self.assertEqual(calls.read_text().split(), ["call"], done.stderr)
+        self.assertEqual(done.returncode, 143, done.stderr)
+        self.assertIn("not reporting it twice", done.stderr)
+
+    def test_a_set_e_abort_reports_the_night_once_as_the_hosts(self):
+        # `mv` of the finished run's store fails (the disk is full, say): the night still ends
+        # in one status `error` and the tracker's line, never silently.
+        shim = Path(self.bin, "mv")
+        shim.write_text(f'#!/bin/sh\ncase "$*" in *tests/jepsen/store*) exit 1;; esac\n'
+                        f'exec {shutil.which("mv")} "$@"\n')
+        shim.chmod(0o755)
+        done = self.night("--dry-run", extra={"JEPSEN_TRACKER": "7"})
+        self.assertNotEqual(done.returncode, 0)
+        self.assertEqual(done.stdout.count("would set status jepsen/nightly = error"), 1,
+                         done.stderr)
+        self.assertEqual(done.stdout.count("would comment on #7"), 1)
+        self.assertIn("stopped on an error", done.stderr)
+        self.assertNotIn("would open issue", done.stdout)
+
+    def test_docker_info_that_hangs_is_the_hosts_failure_not_a_lost_night(self):
+        docker = Path(self.bin, "docker")
+        docker.write_text("#!/bin/sh\nexec sleep 300\n")
+        # `timeout 60` is the script's: shorten it by shadowing `timeout` for docker only.
+        shim = Path(self.bin, "timeout")
+        shim.write_text(f'#!/bin/sh\n[ "$1" = 60 ] && shift && set -- 1 "$@"\n'
+                        f'exec {shutil.which("timeout")} "$@"\n')
+        shim.chmod(0o755)
+        began = time.monotonic()
+        done = self.night("--dry-run", extra={"JEPSEN_TRACKER": "7"})
+        self.assertLess(time.monotonic() - began, 60)
+        self.assertIn("Docker is not answering", done.stderr)
+        self.assertIn("would set status jepsen/nightly = error", done.stdout)
+
+    def test_a_real_night_that_finds_the_lock_held_exits_75(self):
+        self.holding()
+        token = Path(self.tmp.name, "token")
+        token.write_text("secret\n")
+        done = self.night(extra={"JEPSEN_TOKEN_FILE": str(token)})
+        self.assertEqual(done.returncode, 75, done.stderr)
+        self.assertIn("another night is running", done.stderr)
+
+    def test_an_interrupted_run_with_a_log_and_no_results_is_not_a_crash(self):
+        # Jepsen had started (a jepsen.log) and the stop killed it: the host's, no issue.
+        run = ("#!/bin/sh\nd=tests/jepsen/store/t/2026-11-02T01:00:00Z\nmkdir -p $d\n"
+               "echo 'lein run test --workload retry' > $d/jepsen.log\n"
+               f"touch {self.tmp.name}/started\nexec sleep 300\n")
+        Path(self.remote, "tests/jepsen/run.sh").write_text(run)
+        self.git(self.remote, "add", "-A")
+        self.commit(self.remote, "log")
+        code, out, err, _ = self.interrupt(None)
+        self.assertEqual(code, 143, err)
+        self.assertIn("would set status jepsen/nightly = error", out)
+        self.assertNotIn("would open issue", out)
+        self.assertRegex(next((self.home / "nights").iterdir()).joinpath("store/runs").read_text(),
+                         r"^1 143 ")
 
     def test_the_unit_runs_the_installed_copy_and_leaves_room_for_the_trap(self):
         unit = (HERE / "jepsen.service").read_text()
@@ -1082,7 +1172,7 @@ class Nightly(unittest.TestCase):
 class SetupScript(unittest.TestCase):
     """setup.sh with root, apt, systemctl and /etc faked: the timer needs a token."""
 
-    def setup(self, token, enabled=False):
+    def setup(self, token, enabled=False, umask=None, hold=False):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         root = Path(tmp.name)
@@ -1117,8 +1207,14 @@ class SetupScript(unittest.TestCase):
         if token:
             Path(root, "tok").write_text("secret\n")
             args = ["--token-file", str(root / "tok")]
-        done = subprocess.run(["sh", str(script), *args], capture_output=True, text=True,
-                              env={"PATH": f"{bin_dir}:{os.environ['PATH']}"}, timeout=60)
+        if hold:
+            holder = subprocess.Popen(["flock", str(home / "nightly.lock"), "sleep", "60"])
+            self.addCleanup(holder.kill)
+            time.sleep(0.5)
+        done = subprocess.run(
+            ["sh", str(script), *args], capture_output=True, text=True,
+            env={"PATH": f"{bin_dir}:{os.environ['PATH']}"}, timeout=60,
+            preexec_fn=(lambda: os.umask(umask)) if umask is not None else None)
         self.timer_enabled = state.exists()
         calls = (root / "systemctl.log").read_text() if (root / "systemctl.log").exists() else ""
         return done, calls
@@ -1145,6 +1241,20 @@ class SetupScript(unittest.TestCase):
                          ["jepsen_report.py", "nightly.sh"])
         unit = (self.root / "etc/systemd/system/jepsen.service").read_text()
         self.assertEqual(unit, (HERE / "jepsen.service").read_text())
+
+    def test_the_runner_directories_are_readable_whatever_the_umask(self):
+        done, _ = self.setup(token=True, umask=0o077)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        for path in ("opt/jepsen", "opt/jepsen/bin"):
+            self.assertEqual((self.root / path).stat().st_mode & 0o777, 0o755, path)
+        for name in ("nightly.sh", "jepsen_report.py"):
+            self.assertTrue((self.root / "opt/jepsen/bin" / name).stat().st_mode & 0o004)
+
+    def test_setup_does_not_move_the_checkout_while_a_night_holds_the_lock(self):
+        done, calls = self.setup(token=True, hold=True)
+        self.assertEqual(done.returncode, 1, done.stderr)
+        self.assertIn("a night is running", done.stderr)
+        self.assertFalse((self.root / "opt/jepsen/bin/nightly.sh").exists())
 
     def test_a_timer_already_enabled_is_disabled_when_there_is_no_token(self):
         done, calls = self.setup(token=False, enabled=True)
