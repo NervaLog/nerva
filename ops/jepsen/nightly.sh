@@ -97,7 +97,13 @@ remaining() {
   echo "$left"
 }
 
+# The first reason stands: a later end (a TERM during the archive, say) must not replace the
+# real cause (a build that failed) with a vaguer one.
 host_failure() {
+  if [[ -s "$night/store/host-failure" ]]; then
+    log "the host's: $1 (not recorded; the first reason stands: $(head -n 1 "$night/store/host-failure"))"
+    return 0
+  fi
   echo "$1" > "$night/store/host-failure"
   log "the host's: $1"
 }
@@ -178,6 +184,25 @@ run() {
   finish_run "$code"
 }
 
+# Archives the night's store at $archive, so the issues can name it. A failed archive is logged
+# and $archive is emptied: the findings are reported without its path. $1 is a time limit in
+# seconds, given only on the early-exit path (the stop budget); the normal night's has none.
+archived=0     # 1 once the archive is in place
+make_archive() {
+  [[ -n "$archive" ]] || return 0
+  local limit=()
+  [[ -z "${1:-}" ]] || limit=(timeout "$1")
+  if ! supervise "${limit[@]}" tar --zstd -C "$night" -cf "$archive.new" store 2> /dev/null 9>&-; then
+    rm -f "$archive.new"
+    archive=""
+    log "the archive could not be written"
+    return 0
+  fi
+  mv "$archive.new" "$archive"
+  archived=1
+  find "$JEPSEN_HOME/archive" -name '*.tar.zst' -mtime +"$JEPSEN_KEEP_DAYS" -delete
+}
+
 report_limit=900  # Seconds the reporter may take; the trap shortens it.
 report() {
   local args=(ingest --store "$night/store" --commit "$commit" --state "$state_file")
@@ -205,11 +230,10 @@ known_commit() {
 # systemd stop or timeout or a Ctrl-C (TERM, INT: `exit 143`), a `set -e` abort (a full disk, say)
 # or an unset variable. The night is reported once, as the host's `error` with the tracker's line,
 # within seconds: the run in flight is recorded (143 only if it was still running), a
-# `host-failure` is written, and the reporter gets 60 s. The unit's TimeoutStopSec leaves room
-# (child 20 s + reporter 60 s).
+# `host-failure` is written, the archive gets 30 s and the reporter 60 s. The unit's TimeoutStopSec
+# leaves room (child 20 s + archive 30 s + reporter 60 s = 110 s).
 night_over=0   # 1 once the night is reported or nothing more is owed
 reporting=0    # 1 from the start of the final report: a second one could file its issues twice
-archived=0     # 1 once the archive is in place
 on_exit() {
   local rc=$?
   trap '' TERM INT
@@ -218,7 +242,11 @@ on_exit() {
   ((night_over)) && exit "$rc"
   night_over=1
   if ((reporting)); then
-    log "the night's report did not finish (exit $rc); not reporting it twice"
+    if ((rc == 2)); then
+      log "the reporter exited 2 (a usage error, the state file, token, a rate limit or GitHub unreachable; its lines are above): the report did not finish; it is not run again, as it may have filed issues"
+    else
+      log "the night's report did not finish (exit $rc); not reporting it twice"
+    fi
     exit "$rc"
   fi
   log "the night ended early (exit $rc); reporting it as the host's"
@@ -257,7 +285,15 @@ on_exit() {
     host_failure "nightly.sh stopped on an error (exit $rc) before it finished (disk full?)"
   fi
   known_commit
-  ((archived)) || archive=""
+  # A night cut short still archives the runs that finished, so an issue filed for one names an
+  # archive that outlives the night's directory (7 days); a night with none has nothing to keep.
+  if ((archived)); then
+    :
+  elif ((finished)); then
+    make_archive 30
+  else
+    archive=""
+  fi
   report_limit=60
   if [[ -n "$commit" ]]; then
     report || log "the report of the night failed (exit $?)"
@@ -283,17 +319,8 @@ if fetch_tip && build_tip; then
 fi
 known_commit
 
-# Archive first, so the issues can name it. A failed archive is logged, and the findings are
-# reported without its path (it must not hide them behind a host failure).
-if ! supervise tar --zstd -C "$night" -cf "$archive.new" store 2> /dev/null 9>&-; then
-  rm -f "$archive.new"
-  archive=""
-  log "the archive could not be written"
-else
-  mv "$archive.new" "$archive"
-  archived=1
-  find "$JEPSEN_HOME/archive" -name '*.tar.zst' -mtime +"$JEPSEN_KEEP_DAYS" -delete
-fi
+# Archive first, so the issues can name it (a failed archive must not hide them behind a host failure).
+make_archive
 find "$JEPSEN_HOME/nights" -mindepth 1 -maxdepth 1 -mtime +7 -exec rm -rf {} +
 
 if [[ -z "$commit" ]]; then
