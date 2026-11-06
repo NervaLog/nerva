@@ -12,10 +12,12 @@ Markdown pushed to `main` still starts nothing). A `changes` job lists the pull 
 (`gh api .../pulls/<n>/files --paginate`) and `.github/scripts/docs_only.sh` prints `code=false`
 only when every file ends in `.md` and none is read by a build or test (today `docs/ERRORS.md`,
 read by three unit tests, and `UPSTREAM.md`, read by the bill-of-materials script). Every other job
-`needs: changes` and still runs; each of its steps has `if: needs.changes.outputs.code == 'true'`,
-so a docs-only pull request reports all nine required checks green in seconds. It fails closed:
-if the listing fails, is empty, or is truncated (3000 files), `code=true`. `release.yml`'s `ci`
-call grants `pull-requests: read`, which a called workflow needs for the `changes` job.
+`needs: changes` and still runs (`if: ${{ !cancelled() }}`); each of its steps has
+`if: needs.changes.outputs.code != 'false'`, so a docs-only pull request reports all nine required
+checks green in seconds. It fails closed: if the `changes` job itself fails, every job still runs
+every step; if the listing fails, is empty, or is truncated (3000 files), `code=true`.
+`release.yml`'s `ci` call grants `pull-requests: read`, which a called workflow needs for the
+`changes` job.
 
 **Reason.** N68 assumed no check was required on `main`. The ruleset now requires nine, so a
 Markdown-only pull request never started them and could not merge (#191). A job-level `if` would
