@@ -17,6 +17,7 @@
             [jepsen.nerva [bank :as bank]
                           [db :as db]
                           [http :as http]
+                          [lazyfs :as lazyfs]
                           [nemesis :as nemesis]
                           [retry :as retry]])
   (:gen-class))
@@ -31,7 +32,8 @@
 
 (def faults
   "The faults --nemesis may name."
-  #{:kill :pause :partition :gateway :gateway-kill :gateway-partition :gateway-pause})
+  #{:kill :pause :partition :gateway :gateway-kill :gateway-partition :gateway-pause
+    lazyfs/fault})
 
 (def all-nemeses
   "What test-all runs, each for every workload."
@@ -51,19 +53,23 @@
                       :nodes     (:nodes opts)
                       :faults    (set (:nemesis opts))
                       :interval  (:nemesis-interval opts)
+                      :dir       db/dir
                       :kill      {:targets [:one :minority :majority :all]}
                       :pause     {:targets [:one :minority :majority]}
                       :partition {:targets [:one :majority :majorities-ring]}}]
     (combined/compose-packages [(nemesis/heal-package package-opts)
                                 (combined/db-package package-opts)
                                 (combined/partition-package package-opts)
-                                (nemesis/package package-opts)])))
+                                (nemesis/package package-opts)
+                                (lazyfs/package package-opts)])))
 
 (defn nerva-test
   "A test map from CLI options."
   [opts]
   (let [workload ((workloads (:workload opts)) opts)
-        opts     (assoc opts :gateways (or (:gateways opts) (default-gateways (:workload opts))))
+        opts     (assoc opts
+                        :gateways (or (:gateways opts) (default-gateways (:workload opts)))
+                        :lazyfs   (contains? (set (:nemesis opts)) lazyfs/fault))
         db       (db/db (:bootstrap workload))
         package  (nemesis-package opts db)]
     (merge tests/noop-test
@@ -100,7 +106,7 @@
     :default  :bank
     :parse-fn keyword
     :validate [workloads (str "Must be one of " (str/join ", " (map name (keys workloads))))]]
-   [nil "--nemesis FAULTS" "Comma-separated faults: kill, pause, partition, gateway (= gateway-kill, gateway-partition, gateway-pause)."
+   [nil "--nemesis FAULTS" "Comma-separated faults: kill, pause, partition, gateway (= gateway-kill, gateway-partition, gateway-pause), lose-unfsynced-writes (LazyFS)."
     :default  []
     :parse-fn parse-faults
     :validate [(partial every? faults) (str "Faults are " (str/join ", " (map name faults)))]]

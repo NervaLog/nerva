@@ -10,7 +10,8 @@
                     [core :as jepsen]
                     [db :as db]]
             [jepsen.control.util :as cu]
-            [jepsen.nerva.http :as http]))
+            [jepsen.nerva.http :as http]
+            [jepsen.nerva.lazyfs :as lazyfs]))
 
 (def dir "/opt/nerva")
 (def binary (str dir "/nerva"))
@@ -116,7 +117,7 @@
                      ;; never logged.
                      :env               (str "NERVA_CLUSTER_KEY=\"$(cat " cluster-key-file ")\"")}
                     binary :start (str "--addresses=" (addresses test)) :--development
-                    data-file))
+                    (lazyfs/data-file test dir data-file)))
 
 (defn gateway-user
   "The Unix user gateway `index` runs as, so iptables can name one gateway
@@ -424,10 +425,11 @@
         (c/exec :chmod "+x" binary)
         (install-cluster-key!)
         (create-gateway-users!)
+        (when (lazyfs/enabled? test) (lazyfs/mount! dir))
         (c/exec binary :format (str "--cluster=" cluster)
                 (str "--replica=" (replica-index test node))
                 (str "--replica-count=" (count (:nodes test)))
-                :--development data-file)
+                :--development (lazyfs/data-file test dir data-file))
         (start-replica! test)
         (start-api! test))
       (doseq [index (range (gateways test node))]
@@ -442,6 +444,7 @@
       (c/su
         (heal-gateways! test)
         (kill-all!)
+        (when (lazyfs/enabled? test) (lazyfs/umount! dir))
         (c/exec :rm :-rf dir)))
 
     db/Kill
@@ -463,6 +466,7 @@
 
     db/LogFiles
     (log-files [_ test node]
-      (into {replica-log "replica.log"}
+      (into (merge {replica-log "replica.log"}
+                   (when (lazyfs/enabled? test) (lazyfs/log-files dir)))
             (for [index (range (gateways test node))]
               [(gateway-log index) (if (zero? index) "api.log" (str "api-" index ".log"))])))))
