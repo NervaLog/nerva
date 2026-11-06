@@ -392,7 +392,8 @@
 (deftest a-conflict-on-the-record-is-a-second-application
   (is (not (valid? (:checker (bank/workload {}))
                    (history-of [good-read good-view
-                                (assoc (transfer :fail "k1" 30 [(assoc out-of-bounds :status "conflict")])
+                                (assoc (transfer :fail "k1" 30
+                                                [(assoc out-of-bounds :status "conflict")])
                                        :error :conflict)
                                 (records-read [])])))))
 
