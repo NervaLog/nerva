@@ -3,6 +3,8 @@
   what the final generator undoes."
   (:require [clojure.set :as set]
             [clojure.test :refer [deftest is testing]]
+            [jepsen.checker :as checker]
+            [jepsen.control :as c]
             [jepsen.generator :as gen]
             [jepsen.generator.context :as ctx]
             [jepsen.nemesis :as n]
@@ -50,8 +52,9 @@
     (is (= #{"gateway-kill" "gateway-partition" "gateway-pause"} (set (map :name (:perf p)))))
     (is (= [:gateway-resume :gateway-heal] (map :f (:final-generator (heal-package :gateway)))))
     (is (= [:gateway-start] (map :f (:final-generator p))))
-    (is (every? #(= {:gateways :all} (:value %))
-                (concat (:final-generator p) (:final-generator (heal-package :gateway)))))))
+    (is (every? #(= {:gateways :all} (:value %)) (:final-generator (heal-package :gateway))))
+    (is (= [{:gateways :all, :final? true}] (map :value (:final-generator p)))
+        "the final start retries")))
 
 (deftest one-fault-only
   (let [p (package :gateway-partition)]
@@ -145,3 +148,227 @@
 (deftest gateway-rule-names-the-replica
   (is (re-find #"-d 10.0.0.2 --dport 3000" (db/gateway-rule 0 "10.0.0.2")))
   (is (not= (db/gateway-rule 0 "10.0.0.1") (db/gateway-rule 0 "10.0.0.2"))))
+
+(deftest kill-reaches-only-running-gateways
+  (let [killed (atom [])]
+    (with-redefs [db/gateway-running? #{0 2}
+                  jepsen.control.util/stop-daemon! (fn [pidfile] (swap! killed conj pidfile))]
+      (is (= [0 2] (db/kill-gateways! [0 1 2])))
+      (is (= 2 (count @killed)))
+      (is (= [] (db/kill-gateways! [1]))))))
+
+(deftest partition-cuts-only-running-gateways
+  (let [rules (atom [])]
+    (with-redefs [db/gateway-running? #{1}
+                  jepsen.control/exec (fn [& args] (swap! rules conj args))]
+      (is (= [1] (db/partition-gateways! [[0 ["n1"]] [1 ["n1" "n2"]]])))
+      (is (= 2 (count @rules)) "no rule for the gateway that is down")
+      (is (= [] (db/partition-gateways! [[0 ["n1"]]]))))))
+
+(deftest start-outcome-keeps-dead-and-pending-apart
+  (is (= {:up [0] :down [1] :pending [2]} (db/start-outcome {0 :up, 1 :dead, 2 :pending})))
+  (is (= {:up [] :down [] :pending []} (db/start-outcome {}))))
+
+(defn fake-loop
+  "`settle-states` over a fake clock: each probe advances it by `probe-ms`, each sleep by 500.
+  `script` maps an index to its states, one per probe, the last repeating. Returns
+  `[states probes-by-index]`."
+  [initial script probe-ms deadline-ms]
+  (let [clock  (atom 0)
+        probes (atom {})
+        probe  (fn [i]
+                 (swap! clock + probe-ms)
+                 (let [n (get @probes i 0)]
+                   (swap! probes update i (fnil inc 0))
+                   (let [seq (script i)] (nth seq (min n (dec (count seq)))))))]
+    [(db/settle-states initial probe {:deadline deadline-ms
+                                      :now      (fn [] @clock)
+                                      :sleep!   #(swap! clock + 500)})
+     @probes]))
+
+(deftest settle-re-probes-a-pending-gateway-until-it-is-up
+  (let [[states probes] (fake-loop {0 :pending} {0 [:pending :pending :up]} 100 10000)]
+    (is (= {0 :up} states))
+    (is (= {0 3} probes))))
+
+(deftest settle-ends-a-pending-gateway-that-dies-as-dead
+  (let [[states probes] (fake-loop {0 :pending, 1 :pending}
+                                   {0 [:pending :dead], 1 [:up]} 100 10000)]
+    (is (= {0 :dead, 1 :up} states))
+    (is (= {0 2, 1 1} probes) "a settled gateway is not probed again")))
+
+(deftest settle-leaves-a-gateway-pending-at-the-deadline
+  (let [[states probes] (fake-loop {0 :pending} {0 [:pending]} 100 2000)]
+    (is (= {0 :pending} states))
+    (is (<= 4 (get probes 0) 6) "re-probed until the deadline, then it stops")
+    (is (= {:up [] :down [] :pending [0]} (db/start-outcome states)))))
+
+(deftest settle-checks-the-deadline-after-a-whole-round
+  (let [[states probes] (fake-loop {0 :pending, 1 :pending} {0 [:pending], 1 [:pending]} 3000 1000)]
+    (is (= {0 :pending, 1 :pending} states))
+    (is (= {0 1, 1 1} probes) "one round, though the first probe already passed the deadline")))
+
+(deftest start-reports-down-and-pending-apart
+  (let [started (atom [])]
+    (with-redefs [db/gateway-running? (fn [i] (= 3 i))
+                  db/start-gateway!   (fn [_ i] (swap! started conj i))
+                  db/start-settle-s   0
+                  db/gateway-state    {0 :up, 1 :dead, 2 :pending}
+                  c/*host*            "n1"]
+      (is (= {:up [0] :down [1] :pending [2]}
+             (db/start-gateways! {:nodes ["n1"] :gateways 4})))
+      (is (= [0 1 2] @started) "the running gateway 3 is left alone"))))
+
+(defn- fake-gateways
+  "Redefs for a node `n1` whose gateway `i` is in `(states i)`; a `:pending` one answers once
+  `(up? i)`; `starts` and `kills` count what the code does."
+  [states starts kills]
+  {#'db/start-gateway!      (fn [_ i] (swap! starts update i (fnil inc 0)))
+   #'db/gateway-backoff-ms  (constantly 0)
+   #'db/gateway-wait-s      (constantly 0)
+   #'db/gateway-state       (fn [i] (first (get @states i)))
+   #'jepsen.control.util/stop-daemon! (fn [pidfile] (swap! kills conj pidfile))
+   #'jepsen.nerva.http/healthy?
+   (fn [_ port] (= :up (first (get @states (- port (db/gateway-port 0))))))
+   #'jepsen.control.util/daemon-running?
+   (fn [pidfile] (not= :dead (first (get @states (if (= pidfile (db/gateway-pidfile 0)) 0 1)))))})
+
+(deftest final-start-retries-until-every-gateway-is-up
+  (let [starts (atom {}), kills (atom [])
+        ;; gateway 1 is dead until its third start, then up
+        states (atom {})
+        fakes  (assoc (fake-gateways states starts kills)
+                      #'db/start-gateway!
+                      (fn [_ i]
+                        (swap! starts update i (fnil inc 0))
+                        (swap! states assoc i
+                               [(if (<= (if (= 1 i) 3 1) (get @starts i)) :up :dead)])))]
+    (reset! states {0 [:dead], 1 [:dead]})
+    (with-redefs-fn (assoc fakes #'db/gateway-state (fn [i] (first (get @states i))))
+      (fn []
+        (binding [c/*host* "n1"]
+          (is (= {:up [0 1] :down [] :pending []}
+                 (db/start-gateways-final! {:nodes ["n1"] :gateways 2})))
+          (is (= {0 1, 1 3} @starts)))))))
+
+(deftest final-start-reports-a-gateway-that-never-comes-up
+  (let [starts (atom {}), kills (atom []), states (atom {0 [:dead]})]
+    (with-redefs-fn (fake-gateways states starts kills)
+      (fn []
+        (binding [c/*host* "n1"]
+          (is (= {:up [] :down [0] :pending []}
+                 (db/start-gateways-final! {:nodes ["n1"] :gateways 1}))
+              "returned, not thrown: the checker fails the run")
+          (is (= {0 db/gateway-start-tries} @starts)))))))
+
+(deftest final-start-waits-for-a-pending-gateway
+  (testing "pending, then up: no restart"
+    (let [starts (atom {}), kills (atom []), states (atom {0 [:pending]})
+          probes (atom 0)]
+      (with-redefs-fn (assoc (fake-gateways states starts kills)
+                             #'db/wait-for-gateway
+                             (fn [_ _] (swap! probes inc) :up))
+        (fn []
+          (binding [c/*host* "n1"]
+            (is (= {:up [0] :down [] :pending []}
+                   (db/start-gateways-final! {:nodes ["n1"] :gateways 1})))
+            (is (= {} @starts))
+            (is (empty? @kills)))))))
+  (testing "pending, then exits: started again"
+    (let [starts (atom {}), kills (atom []), states (atom {0 [:pending]})]
+      (with-redefs-fn (assoc (fake-gateways states starts kills)
+                             #'db/wait-for-gateway (let [n (atom 0)]
+                                                     (fn [_ _] (if (= 1 (swap! n inc)) :dead :up)))
+                             #'db/start-gateway!
+                             (fn [_ i]
+                               (swap! starts update i (fnil inc 0))
+                               (swap! states assoc i [:up])))
+        (fn []
+          (binding [c/*host* "n1"]
+            (is (= {:up [0] :down [] :pending []}
+                   (db/start-gateways-final! {:nodes ["n1"] :gateways 1})))
+            (is (= {0 1} @starts))))))))
+
+(deftest start-retry-waits-for-a-pending-gateway-instead-of-restarting-it
+  (let [starts (atom 0), waits (atom [:pending :up])]
+    (with-redefs [db/start-gateway!   (fn [_ _] (swap! starts inc))
+                  db/wait-for-gateway (fn [_ _] (let [s (first @waits)] (swap! waits rest) s))
+                  db/gateway-wait-s   (constantly 0)]
+      (is (= :up (db/start-gateway-until-up! {} 0)))
+      (is (= 1 @starts) "one start: the pending wait was repeated"))
+    (reset! waits (repeat :pending))
+    (reset! starts 0)
+    (with-redefs [db/start-gateway!   (fn [_ _] (swap! starts inc))
+                  db/wait-for-gateway (fn [_ _] (let [s (first @waits)] (swap! waits rest) s))
+                  db/gateway-wait-s   (constantly 0)]
+      (is (= :pending (db/start-gateway-until-up! {} 0)))
+      (is (= 1 @starts) "still one start; bounded by gateway-waits-max"))))
+
+(deftest a-wait-is-longer-than-the-registration-window
+  (is (= 35 (db/gateway-wait-s {})) "the 30 s default plus the margin")
+  (is (= 8 (db/gateway-wait-s {:request-timeout 3000}))))
+
+(deftest final-op-routes-to-the-final-start
+  (let [calls (atom [])]
+    (with-redefs [db/start-gateways!       (fn [_] (swap! calls conj :plain)
+                                             {:up [0] :down [] :pending []})
+                  db/start-gateways-final! (fn [_] (swap! calls conj :final)
+                                             {:up [0] :down [] :pending []})]
+      (is (= {:hit [0] :down [] :pending []} (nemesis/act! {} :gateway-start :all false)))
+      (is (= {:hit [0] :down [] :pending []} (nemesis/act! {} :gateway-start :all true)))
+      (is (= [:plain :final] @calls)))))
+
+(deftest a-final-start-that-throws-keeps-the-other-nodes
+  (with-redefs [nemesis/act! (fn [_ _ arg _] (if (= :bad arg)
+                                               (throw (ex-info "boom" {}))
+                                               {:hit [0]}))]
+    (is (= {:error "boom"} (nemesis/act-on-node! {} :gateway-start :bad true)))
+    (is (= {:hit [0]} (nemesis/act-on-node! {} :gateway-start :ok true)))
+    (is (= {:hit [["n1" 0]] :error [["n2" "boom"]]}
+           (nemesis/completion {"n1" {:hit [0]} "n2" {:error "boom"}})))))
+
+(defn- check-final [history]
+  (checker/check (nemesis/final-start-checker) {} history {}))
+
+(defn- final-op [& {:as extra}]
+  (merge {:type :info, :f :gateway-start, :process :nemesis
+          :value {:gateways :all, :final? true, :hit [["n1" 0]]}}
+         extra))
+
+(deftest final-start-checker
+  (testing "valid: every gateway up, or no final start at all"
+    (is (true? (:valid? (check-final [(final-op)]))))
+    (is (true? (:valid? (check-final []))))
+    (is (true? (:valid? (check-final [{:type :info :f :gateway-start
+                                       :value {:down [["n1" 0]]}}])))
+        "a main-phase start may leave a gateway down"))
+  (testing "an exception"
+    (let [r (check-final [(final-op :exception {:cause "boom"})])]
+      (is (false? (:valid? r)))
+      (is (= "NRV-E0604" (:code r)))
+      (is (= ["boom"] (:exceptions r)))))
+  (testing "a gateway down"
+    (let [r (check-final [(final-op :value {:final? true :hit [] :down [["n2" 1]]})])]
+      (is (false? (:valid? r)))
+      (is (= [["n2" 1]] (:gateways r)))
+      (is (= "NRV-E0604" (:code r)))))
+  (testing "a gateway pending"
+    (let [r (check-final [(final-op :value {:final? true :hit [] :pending [["n3" 0]]})])]
+      (is (false? (:valid? r)))
+      (is (= [["n3" 0]] (:gateways r)))))
+  (testing "a node whose start threw"
+    (is (false? (:valid? (check-final [(final-op :value {:final? true :hit []
+                                                         :error [["n1" "ssh"]]})]))))))
+
+(deftest every-workload-composes-the-final-start-checker
+  (doseq [workload [:bank :retry]]
+    (let [t   (core/nerva-test {:workload workload, :nemesis [:gateway], :time-limit 1
+                                :rate 1, :recovery-time 1})
+          gws (:gateways (:checkers (:checker t)))
+          ;; the same composition the test's :checker is: its :valid? is the merge of the keys'
+          r   (checker/check (checker/compose {:stats (checker/unbridled-optimism)
+                                               :gateways gws})
+                             {} [(final-op :exception {:cause "boom"})] {})]
+      (is (some? gws) "a key of the test's top-level checker")
+      (is (false? (:valid? (:gateways r))))
+      (is (false? (:valid? r)) "the top-level :valid?, which jepsen_report.py reads"))))
