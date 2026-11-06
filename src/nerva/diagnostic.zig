@@ -514,7 +514,10 @@ test "cleanup: a parent that became a file is not an error, a path that cannot b
     try testing.expectEqual(@as(?anyerror, error.SymLinkLoop), cleanup_remove());
     cleanup_run();
     try testing.expectEqualStrings("it is a directory", cleanup_reason(error.IsDir));
-    try testing.expectEqualStrings("a parent of it is not a directory", cleanup_reason(error.NotDir));
+    try testing.expectEqualStrings(
+        "a parent of it is not a directory",
+        cleanup_reason(error.NotDir),
+    );
     try testing.expectEqualStrings(
         "a symbolic link in its path loops",
         cleanup_reason(error.SymLinkLoop),
@@ -651,10 +654,32 @@ test "cleanup: the signal path unlinks by the fixed buffer, and only our file" {
     cleanup_clear();
 }
 
+/// How long the parent waits for a forked test child: a child that spins or deadlocks is killed
+/// and the test fails, instead of hanging and leaking a process.
+const cleanup_child_wait_ms_max = 10_000;
+const cleanup_child_poll_ms = 10;
+
+/// In the forked child: take the signals the test relies on out of whatever the test binary
+/// inherited (ignored, blocked), and silence stderr (the panic test prints a trace).
+fn cleanup_child_prepare() void {
+    var default = std.mem.zeroes(std.posix.Sigaction);
+    default.handler.handler = std.posix.SIG.DFL;
+    var mask = std.posix.empty_sigset;
+    const signals = [_]u6{ std.posix.SIG.INT, std.posix.SIG.TERM };
+    for (signals) |signal| {
+        std.posix.sigaction(signal, &default, null);
+        std.os.linux.sigaddset(&mask, signal);
+    }
+    std.posix.sigprocmask(std.posix.SIG.UNBLOCK, &mask, null);
+    const null_fd = std.posix.open("/dev/null", .{ .ACCMODE = .WRONLY }, 0) catch std.posix.exit(3);
+    std.posix.dup2(null_fd, std.posix.STDERR_FILENO) catch std.posix.exit(3);
+}
+
 /// Forks a child that registers `trace` in `dir`, then runs `act`; returns how the child ended.
 fn cleanup_child(dir: std.fs.Dir, comptime act: fn () void) !u32 {
     const pid = try std.posix.fork();
     if (pid == 0) {
+        cleanup_child_prepare();
         const file = dir.createFile("trace", .{ .exclusive = true }) catch std.posix.exit(3);
         var buffer: [std.fs.max_path_bytes]u8 = undefined;
         const path = dir.realpath("trace", &buffer) catch std.posix.exit(3);
@@ -662,7 +687,16 @@ fn cleanup_child(dir: std.fs.Dir, comptime act: fn () void) !u32 {
         act();
         std.posix.exit(4); // Not reached: `act` must kill the process.
     }
-    return std.posix.waitpid(pid, 0).status;
+    var waited_ms: u64 = 0;
+    while (waited_ms < cleanup_child_wait_ms_max) : (waited_ms += cleanup_child_poll_ms) {
+        const result = std.posix.waitpid(pid, std.posix.W.NOHANG);
+        if (result.pid == pid) return result.status;
+        assert(result.pid == 0);
+        std.Thread.sleep(cleanup_child_poll_ms * std.time.ns_per_ms);
+    }
+    std.posix.kill(pid, std.posix.SIG.KILL) catch {};
+    _ = std.posix.waitpid(pid, 0);
+    return error.ChildDidNotEnd;
 }
 
 fn cleanup_child_term() void {
