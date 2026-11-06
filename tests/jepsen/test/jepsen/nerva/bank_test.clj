@@ -98,15 +98,6 @@
     (is (= 10 (balances [1 "held"])))
     (is (nil? (balances [4 "available"])) "an absent row reads as nil, which the checker flags")))
 
-(deftest replies-map-to-outcomes
-  (is (= :ok (http/outcome {:status 200})))
-  (is (= :refused (http/outcome {:status 409})))
-  (is (= :unknown (http/outcome {:status 503})))
-  (is (= :unknown (http/outcome {:status 504})))
-  (is (thrown? clojure.lang.ExceptionInfo (http/outcome {:status 400})))
-  (is (= :info (:type (http/unknown {:f :transfer} true :x))))
-  (is (= :fail (:type (http/unknown {:f :read} false :x)))))
-
 (deftest a-request-never-sent-failed
   (is (= :fail (:type (http/no-reply {:f :transfer} true (java.net.ConnectException. "refused")))))
   (is (= :info (:type (http/no-reply {:f :transfer} true (java.io.IOException. "reset")))))

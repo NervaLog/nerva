@@ -9,8 +9,10 @@ or a unit test before it is fixed.
 
 ## Running it
 
-Needs Docker (with privileged containers, for iptables), a JDK (21) and
-[Leiningen](https://leiningen.org).
+Needs Docker (with privileged containers, for iptables), `ssh-keygen`, gnuplot (for the perf
+graphs: without it a result is `:unknown`), and a JDK (21). Leiningen is `$LEIN`, else `lein` on
+PATH, else the pinned 2.12.0 that `tools.sh` downloads into `.tools/` (both files sha256-checked;
+`run.sh` does this by itself).
 
 ```bash
 ./zig/zig build -Drelease                       # zig-out/bin/nerva, the build under test
@@ -21,9 +23,16 @@ lein test                                        # the checkers, against hand-wr
 lein run serve                                   # browse store/ at http://localhost:8080
 ```
 
+Replicas authenticate each other with `NERVA_CLUSTER_KEY` (P102): the suite passes the control
+node's `$NERVA_CLUSTER_KEY` (at least 32 bytes) to every replica, or, if it is unset, a fresh
+random key for the run. It reaches a node over stdin into a mode `600` file that the replica's
+start command reads, so it is in no command line, in no log and not in `store/`.
+
 `run.sh` starts five Debian containers at `10.77.0.11` to `10.77.0.15` (`node/Dockerfile`),
 each with sshd and nothing else; the test uploads the given `nerva`, formats a replica and
-starts it and a gateway on every node, and removes the containers when it ends. Each test's
+starts it and a gateway on every node, and removes the containers when it ends. The SSH key is
+copied into each node with `docker exec` and owned by root: a mounted file keeps its owner on the
+host, and sshd refuses it. Each test's
 history, analysis (`results.edn`), latency and rate graphs, and every node's `replica.log`
 and `api.log` land in `store/`.
 
@@ -41,12 +50,16 @@ Options (`lein run test --help` lists Jepsen's own):
 
 ## What a reply means
 
-`200` applied the request; `409` applied nothing, and neither does a request whose connection
-was never made (refused, or timed out connecting). Any other missing reply (a reset, the
-client's 35 s timeout), or a `503` (the gateway lost its cluster session, perhaps after the
-commit went out), leaves a write's outcome unknown
-(Jepsen's `:info`: it may or may not have happened, and the checkers allow both). A read
-without a reply changed nothing, so it simply failed. A `400` is a bug in the test.
+The suite reads a reply's body as R4 defines it (README, "What a reply means"; P215d), not the
+status alone:
+
+| Reply | Outcome |
+|---|---|
+| `2xx` | Applied: `:ok`. With `"replayed": true` (NRV-W0201) the request had already committed: `:ok`, `:replayed? true`, and the `op` is the original commit's |
+| any other status with `"applied": false` | Definite: `:fail`. A `409` is Nerva refusing a well-formed request (its status is the `:error` a checker judges); any other (busy, no session, too large) is `{:code .., :http ..}`, which no checker takes for a refusal |
+| `"applied": "unknown"` | A write may have committed: `:info`. A read: `:fail` |
+| no reply (a reset, the client's 35 s timeout) | A write: `:info`. A read: `:fail`. A connection never made (refused, or timed out connecting) sent nothing: `:fail` |
+| a non-2xx without both `applied` and `code`, or a `400` | A failure of the test: R4 promises both, and a `400` means the test sent a malformed request |
 
 ## Faults
 
@@ -72,3 +85,19 @@ sum view over the accounts always answers the funded total, and a transfer is re
 Planned: `retry` (an application's retry after a `503`: is an add applied twice?), `claim`
 (compare-and-set receipts), `register` (transaction isolation, with Elle), and `feed` (the
 change feed, history as of an op, and view hashes across gateways).
+
+## On a hosted runner
+
+`.github/workflows/jepsen.yml` runs the suite on GitHub's `ubuntu-24.04` runner, so a workload,
+nemesis or checker runs for real before the R2 host exists. Push a commit to a scratch branch
+named `jepsen/<slice>-<slug>` (`git push origin HEAD:jepsen/s2-footing`) or dispatch it:
+
+| Input | Default | |
+|---|---|---|
+| `args` | `test --workload bank --nemesis kill,partition --time-limit 300` | The `lein run` arguments: `test` and options, `--time-limit` at most 1200. A push runs the default |
+| `teeth` | `false` | Test the build with commit-key deduplication off (`-Dtest-commit-keys=off`, R1 slice 1). Fails at once, saying so, on a commit whose `build.zig` lacks that option |
+
+It builds `nerva` ReleaseSafe, runs `lein test` and then `run.sh` with a fresh `NERVA_CLUSTER_KEY`,
+fails if any file in `store/` holds that key, and uploads `store/` as the `jepsen-store` artifact
+(14 days). A scratch branch is deleted when the run ends; push a new commit to the same name to
+run again. The workflow never files an issue.
