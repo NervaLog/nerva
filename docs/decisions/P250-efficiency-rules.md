@@ -7,7 +7,7 @@ amends: P148b
 
 # Efficiency rules for agents and Jepsen work
 
-**Decision.** Eight rules, from the review rounds on #238, #239, #242, #244 and #249.
+**Decision.** Nine rules, from the review rounds on #238, #239, #242, #244 and #249.
 
 a. A Jepsen harness change runs `tests/jepsen/CHECKLIST.md` before its first review. (#244 took
    five fix rounds and #239 three reviews, mostly on the same kinds of finding.)
@@ -29,6 +29,9 @@ g. Agents write downloads, builds of third-party code and scratch files outside 
 h. Watching CI, auto-merge of a pull request and other polling go to a Haiku agent, not to the
    supervisor's model. (Supervisor turns were spent on status checks.) This amends P148b's list of
    what Haiku does.
+i. Agents that run at once never share a checkout: each gets its own `git worktree` and Zig cache,
+   and adds files by path, never `git add -A`. (Two agents shared one checkout and one swept the
+   other's files into its commit.)
 
 **Reason.** Each is in parentheses. The cost of a review round is a fresh session and a hosted run.
 

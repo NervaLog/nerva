@@ -262,6 +262,9 @@ work done.
   (P250).
 - **Scratch outside the tree.** Downloads, builds of third-party code and scratch files go in the
   session scratchpad, never in the repository (P250).
+- **One worktree per agent.** Agents that run at once never share a checkout: each works in its
+  own `git worktree` with its own `ZIG_GLOBAL_CACHE_DIR`, and adds files by path, never
+  `git add -A` (P250).
 - **Delegate lookups** (searching the vendored TigerBeetle code, the Zig std) to a read-only agent
   and keep only the answer.
 - **The cheapest model suited to the task** (owner, P148b). Name the model whenever you start an
