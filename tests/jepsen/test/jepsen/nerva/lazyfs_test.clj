@@ -2,6 +2,7 @@
   "The lose-unfsynced-writes fault's shapes: what it draws, the order it acts in, what its undo
   starts, and that it composes with the other packages."
   (:require [clojure.test :refer [deftest is testing]]
+            [jepsen.checker :as checker]
             [jepsen.generator :as gen]
             [jepsen.generator.context :as ctx]
             [jepsen.nemesis :as n]
@@ -58,11 +59,12 @@
 
 (deftest acts-in-order-and-recovers-what-it-killed
   (let [calls   (atom [])
-        nemesis (lazyfs/nemesis "/opt/nerva")]
+        nemesis (lazyfs/nemesis "/opt/nerva" nil)]
     (with-redefs [lazyfs/kill!    (fn [_ nodes] (swap! calls conj [:kill nodes]) (vec nodes))
                   lazyfs/lose!    (fn [_ _ nodes] (swap! calls conj [:lose nodes])
                                     (zipmap nodes (repeat 4096)))
-                  lazyfs/recover! (fn [_ nodes] (swap! calls conj [:recover nodes]) (vec nodes))]
+                  lazyfs/recover! (fn [_ nodes _] (swap! calls conj [:recover nodes])
+                                    {:nodes (vec nodes), :down [], :pending []})]
       (let [done (n/invoke! nemesis five
                             {:type :info, :f :lose-unfsynced-writes
                              :value {:scope :all, :crash ["n4" "n1" "n5"], :nodes (:nodes five)}})]
@@ -84,6 +86,37 @@
       (is (= [:lose ["n2"]] (last @calls)))
       (let [done (n/invoke! nemesis five {:type :info, :f :lazyfs-recover})]
         (is (= ["n2"] (:started (:value done))))))))
+
+(deftest recover-reports-the-gateways-it-left-down
+  (let [nemesis (lazyfs/nemesis "/opt/nerva" nil)]
+    (with-redefs [lazyfs/recover! (fn [_ nodes _] {:nodes nodes, :down [["n2" 1]], :pending [["n3" 0]]})]
+      (let [done (n/invoke! nemesis five {:type :info, :f :lazyfs-recover})]
+        (is (= [["n2" 1]] (:down (:value done))))
+        (is (= [["n3" 0]] (:pending (:value done))))))))
+
+(defn- check-recover [history]
+  (checker/check (lazyfs/recover-checker) {} history {}))
+
+(defn- recover-op [& {:as extra}]
+  (merge {:type :info, :f :lazyfs-recover, :process :nemesis
+          :value {:started ["n1"], :down [], :pending []}}
+         extra))
+
+(deftest recover-checker
+  (testing "a LazyFS-only history with every gateway up passes"
+    (let [r (check-recover [(recover-op)])]
+      (is (true? (:valid? r)))
+      (is (= 1 (:recovers r)))))
+  (testing "no recover at all is valid, with nothing judged"
+    (is (= 0 (:recovers (check-recover [])))))
+  (testing "a gateway left down fails with NRV-E0604"
+    (let [r (check-recover [(recover-op :value {:started ["n2"] :down [["n2" 1]] :pending []})])]
+      (is (false? (:valid? r)))
+      (is (= "NRV-E0604" (:code r)))
+      (is (= [["n2" 1]] (:gateways r)))))
+  (testing "a gateway left pending, or an exception, fails"
+    (is (false? (:valid? (check-recover [(recover-op :value {:pending [["n3" 0]]})]))))
+    (is (false? (:valid? (check-recover [(recover-op :exception {:cause "boom"})]))))))
 
 (deftest data-file-follows-the-fault
   (is (= "/opt/nerva/data/replica.nerva" (lazyfs/data-file {:lazyfs true} "/opt/nerva" "/x")))

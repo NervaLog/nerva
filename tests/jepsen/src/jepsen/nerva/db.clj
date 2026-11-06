@@ -296,6 +296,13 @@
         (not (gateway-running? index))                :dead
         :else                                         :pending))
 
+(defn node-gateway-outcome
+  "On this node, whether each of its gateways answers now: `(start-outcome ...)` of
+  `gateway-state` for every index. For a caller that restarted the node through `db/start!`
+  (the LazyFS recovery, P242b), which reports no outcome of its own."
+  [test]
+  (start-outcome (into {} (for [i (range (gateways test c/*host*))] [i (gateway-state i)]))))
+
 (defn settle-states
   "Probes every `:pending` gateway in `states` (index to state) with `probe` in rounds, until
   none is pending or `(now)` passes `deadline`; between rounds it calls `(sleep!)`. The deadline

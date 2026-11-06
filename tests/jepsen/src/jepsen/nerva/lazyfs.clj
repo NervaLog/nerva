@@ -18,7 +18,8 @@
   `jepsen.nerva.db`."
   (:require [clojure.string :as str]
             [clojure.tools.logging :refer [info]]
-            [jepsen [control :as c]
+            [jepsen [checker :as checker]
+                    [control :as c]
                     [db :as db]
                     [generator :as gen]
                     [nemesis :as n]
@@ -140,10 +141,38 @@
                              bytes))))
 
 (defn recover!
-  "Starts the replica and gateways on `nodes` through the test's DB; returns `nodes`."
-  [test nodes]
-  (c/on-nodes test nodes (fn [test node] (db/start! (:db test) test node)))
-  (vec nodes))
+  "Starts the replica and gateways on `nodes` through the test's DB, then asks `probe` (called
+  on the node, `(probe test)`, returns `{:up :down :pending}` of gateway indices) which gateways
+  answer. Returns `{:nodes nodes, :down [[node index]...], :pending [...]}`; with no `probe`
+  the last two are empty. `db/start!` reports no outcome, so without this a gateway the
+  recovery left down would never be judged (P242b)."
+  [test nodes probe]
+  (let [outcomes (c/on-nodes test nodes
+                             (fn [test node]
+                               (db/start! (:db test) test node)
+                               (when probe (probe test))))
+        pairs    (fn [k] (vec (for [n (sort (keys outcomes)), i (get-in outcomes [n k])]
+                                [n i])))]
+    {:nodes (vec nodes), :down (pairs :down), :pending (pairs :pending)}))
+
+(defn recover-checker
+  "Invalid when a `:lazyfs-recover` completion left a gateway `:down` or `:pending`, or did not
+  finish (an `:exception`). NRV-E0604, as `nemesis/final-start-checker` for the gateway
+  nemesis: a gateway that cannot reach the cluster after the replicas' restart is an
+  availability finding. Valid with no recover at all; `:recovers` counts the ones judged."
+  []
+  (reify checker/Checker
+    (check [_ _test history _opts]
+      (let [done (filter #(and (= :lazyfs-recover (:f %)) (not= :invoke (:type %))) history)
+            bad  (filter #(or (:exception %)
+                              (seq (:down (:value %)))
+                              (seq (:pending (:value %))))
+                         done)]
+        (cond-> {:valid? (empty? bad), :recovers (count done)}
+          (seq bad) (assoc :code     "NRV-E0604"
+                           :gateways (vec (distinct (mapcat #(concat (:down (:value %))
+                                                                     (:pending (:value %)))
+                                                            bad)))))))))
 
 (defn invoke-fault
   "Applies a fault op's value: kill, then lose. A `:crash` majority dies before the rest."
@@ -159,7 +188,7 @@
   "Applies `fault` and `:lazyfs-recover`. `dir` is the node's Nerva directory. The nodes the
   fault killed and nothing has started yet are `pending` (at most the test's nodes); a recover
   starts those."
-  [dir]
+  [dir probe]
   (let [lz      (lazyfs-map dir)
         pending (atom #{})]
     (reify
@@ -178,9 +207,9 @@
 
           :lazyfs-recover
           (let [nodes (vec (sort @pending))]
-            (recover! test nodes)
-            (swap! pending #(reduce disj % nodes))
-            (assoc o :value {:started nodes}))))
+            (let [r (recover! test nodes probe)]
+              (swap! pending #(reduce disj % nodes))
+              (assoc o :value {:started nodes, :down (:down r), :pending (:pending r)})))))
 
       (teardown! [_ _]))))
 
@@ -189,7 +218,7 @@
 
 (defn package
   "A nemesis package for `fault`; its generator is empty unless `(:faults opts)` has it. `opts`
-  also holds `:dir` (the node's Nerva directory). Its final generator starts every node the
+  also holds `:dir` (the node's Nerva directory) and `:gateway-probe` (`db/node-gateway-outcome`; core wires it, as `lazyfs` cannot require `db`). Its final generator starts every node the
   fault killed."
   [opts]
   (let [on? (contains? (:faults opts) fault)]
@@ -200,5 +229,5 @@
                                         {:type :info, :f fault, :value (fault-value test)})
                                       (fn [_ _] {:type :info, :f :lazyfs-recover}))))
      :final-generator (when on? [{:type :info, :f :lazyfs-recover}])
-     :nemesis         (nemesis (:dir opts))
+     :nemesis         (nemesis (:dir opts) (:gateway-probe opts))
      :perf            (if on? perf #{})}))

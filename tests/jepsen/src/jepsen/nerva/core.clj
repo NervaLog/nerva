@@ -54,6 +54,7 @@
                       :faults    (set (:nemesis opts))
                       :interval  (:nemesis-interval opts)
                       :dir       db/dir
+                      :gateway-probe db/node-gateway-outcome
                       :kill      {:targets [:one :minority :majority :all]}
                       :pause     {:targets [:one :minority :majority]}
                       :partition {:targets [:one :majority :majorities-ring]}}]
@@ -89,6 +90,7 @@
                           :exceptions (checker/unhandled-exceptions)
                           :protocol   (http/protocol-checker)
                           :gateways   (nemesis/final-start-checker)
+                          :lazyfs     (lazyfs/recover-checker)
                           :workload   (:checker workload)})
             :generator (gen/phases
                          (->> (:generator workload)
@@ -130,7 +132,7 @@
     :default  8
     :parse-fn parse-long
     :validate [pos? "Must be positive"]]
-   [nil "--lazyfs-all-nodes" "lose-unfsynced-writes: also lose writes on every node after a quorum crash. Off: a replica run with --development has no O_DSYNC, so Nerva never syncs, and the whole cluster would lose committed state (docs/demos/r1.md)."]
+   [nil "--lazyfs-all-nodes" "lose-unfsynced-writes: also lose writes on every node after a quorum crash. Off: LazyFS likely drops the replica's O_DSYNC writes, so the whole cluster would come back empty (#246, docs/demos/r1.md)."]
    [nil "--nerva-binary PATH" "The nerva binary to install on every node."
     :default "../../zig-out/bin/nerva"]])
 

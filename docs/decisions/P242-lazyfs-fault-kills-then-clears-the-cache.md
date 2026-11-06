@@ -18,15 +18,29 @@ Why: clearing the cache under a running replica is not a failure a disk makes (t
 read data that never was); a power cut kills the process and loses what was not durable. "All
 nodes after a quorum crash" is read as the whole cluster losing power, with the majority dying
 first, since that is the case where every ack a client saw must already be durable on a quorum.
-A replica the suite runs with `--development` (FUSE has no `O_DIRECT`) opens its data file
-without `O_DIRECT` or `O_DSYNC` and never calls fsync, so LazyFS holds every byte since format as
-unsynced. The first hosted run with `:all` (retry, 300 s) showed it: after the whole-cluster
-loss every replica restarted empty (NRV-E0114 from the gateways, 2489 protocol violations).
-That is the test mode's contract, not a Nerva bug, so `:all` is off by default and the slice's
-claim is the minority fault: a node that loses its writes is repaired from its peers. Whole-cluster
-loss needs a replica that syncs; recorded in `docs/demos/r1.md`. The data file moves into the
+The first hosted run with `:all` (retry, 300 s, run 42191880007) showed a problem: after the
+whole-cluster loss every replica restarted empty (NRV-E0114 from the gateways, 2489 protocol
+violations). The replica sets `O_DSYNC` on every data-file open in every mode
+(`src/io/linux.zig:1454-1458`); `--development` only makes `O_DIRECT` optional (FUSE has none),
+and `src/storage.zig:473-480` skips fsync because writes are `O_DSYNC`. The most likely cause,
+not established, is that LazyFS does not treat `O_DSYNC` writes as synced and drops them on
+`lose-unfsynced-writes`. It is tracked in #246 (confirm with strace and LazyFS's log, then make
+LazyFS honour `O_DSYNC` in the test image; no Nerva change). Until then `:all` is off by default
+(`--lazyfs-all-nodes` opts in) and the slice's claim is the minority fault: a node that loses
+its writes is repaired from its peers. Recorded in `docs/demos/r1.md`. The data file moves into the
 mount only when the fault is asked for, so other runs are unchanged.
 
 What it costs: the node image builds LazyFS (a few minutes per run on a runner). LazyFS's own
 build downloads toml11 v3.7.1 and spdlog 1.10.0 by tag and URL, not hash. The fault does not
 gate R1 (P215e).
+
+## P242b: the recovery judges the gateways it restarts
+
+The fault restarts nodes through `db/kill!` and `db/start!`, which report no `:up` or `:down`, so
+`nemesis/final-start-checker` never saw them and a run with only this fault passed the gateway
+check with `:final-starts 0`. Now `:lazyfs-recover` probes each restarted node's gateways
+(`db/node-gateway-outcome`, passed in as `:gateway-probe` because `lazyfs` cannot require `db`),
+its completion carries `:down` and `:pending` as `[node index]` pairs, and
+`lazyfs/recover-checker` (key `:lazyfs`) fails the run with NRV-E0604 on any, or on an
+`:exception`. The change is local to the LazyFS path; the generic "gateways left down by
+`db/start!` are never judged" fix on `claude/jepsen-238-followup` may overlap and can replace it.
