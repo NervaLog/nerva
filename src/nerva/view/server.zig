@@ -21,6 +21,7 @@ const FollowerType = @import("follower.zig").FollowerType;
 const DeclaredViews = @import("declared.zig").DeclaredViews;
 const ClientHealth = @import("../client_health.zig").ClientHealth;
 const wire = @import("../wire_code.zig");
+const nerva = @import("../../nerva.zig");
 
 /// A fixed error reply: nothing a view server does changes the cluster (it only reads).
 fn failed(comptime status: u16, comptime code: wire.Code, comptime reason: []const u8) Reply {
@@ -32,7 +33,7 @@ const connections_max = 16;
 /// How long to wait for a connection before reading the feed again, when idle.
 const idle_poll_ms = 50;
 
-const Follower = FollowerType(DeclaredViews);
+const Follower = FollowerType(DeclaredViews, Client);
 
 pub const Options = struct {
     listen: std.net.Address,
@@ -116,7 +117,7 @@ fn serve_request(
     arena: std.mem.Allocator,
     client: *Client,
     health: *ClientHealth,
-    follower: *Follower,
+    follower: anytype,
     views: *DeclaredViews,
     options: Options,
     request: *const http_connection.Request,
@@ -184,7 +185,7 @@ fn declared_target(target: []const u8) ?DeclaredTarget {
 
 fn serve_declared(
     arena: std.mem.Allocator,
-    follower: *Follower,
+    follower: anytype,
     declared: *const DeclaredViews,
     target: DeclaredTarget,
 ) !Reply {
@@ -283,4 +284,110 @@ test "a view read whose window passed is NRV-E0606, a read that was not applied"
         "{\"error\":\"request deadline passed\",\"applied\":false,\"code\":\"NRV-E0606\"}",
         expired.body,
     );
+}
+
+/// A feed of three ops, one per page, that stops answering `Expired` after `calls_allowed` pages,
+/// as a `Client` does once a request's window has passed (P195b).
+const FakeFeed = struct {
+    calls_allowed: u32,
+    /// The `timestamp_min` of every call that was answered, in order.
+    cursors: [8]u64 = @splat(0),
+    answered: u32 = 0,
+
+    const ops = 3;
+
+    pub fn get_changes(
+        feed: *FakeFeed,
+        filter: nerva.ChangesFilter,
+        out: []nerva.Change,
+    ) Client.Error!usize {
+        if (feed.calls_allowed == 0) return error.Expired;
+        feed.calls_allowed -= 1;
+        feed.cursors[feed.answered] = filter.timestamp_min;
+        feed.answered += 1;
+        // The cursor is the number of pages read; the table is reserved, so no view takes it.
+        const page = filter.timestamp_min;
+        assert(page < ops);
+        const op = page + 1;
+        out[0] = .{
+            .id = op,
+            .table = catalog_table_unused,
+            .kind = .put,
+            .flags = .{},
+            .op = op,
+            .timestamp = op,
+            .value = @splat(0),
+        };
+        out[1] = .{
+            .id = 0,
+            .table = 0,
+            .kind = .end,
+            .flags = .{ .more = op < ops },
+            .op = ops,
+            .timestamp = op,
+            .value = @splat(0),
+        };
+        return 2;
+    }
+
+    const catalog_table_unused: u32 = nerva.tables_reserved_min + 1;
+};
+
+fn request_get(target: []const u8) http_connection.Request {
+    return .{ .method = .get, .target = target, .key = "k", .body = "" };
+}
+
+test "view: a catch-up the window ends is NRV-E0606, and the next request resumes from the cursor" {
+    var arena_instance = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_instance.deinit();
+    const arena = arena_instance.allocator();
+
+    var views = DeclaredViews.init(std.testing.allocator);
+    defer views.deinit();
+    var feed: FakeFeed = .{ .calls_allowed = 2 };
+    const FakeFollower = FollowerType(DeclaredViews, FakeFeed);
+    var follower = try FakeFollower.init(std.testing.allocator, &feed, &views);
+    defer follower.deinit(std.testing.allocator);
+    // Never dereferenced: a health that is `ready` does not touch its client.
+    var client: Client = undefined;
+    var health: ClientHealth = .{
+        .timer = try std.time.Timer.start(),
+        .allocator = std.testing.allocator,
+        .options = .{ .cluster = 0, .addresses = &.{}, .timeout = .{ .ns = std.time.ns_per_s } },
+    };
+    const options: Options = .{ .listen = undefined, .keys = .{ .current = "k" } };
+
+    // The window ends after two pages: E0606, no write, the session kept, the cursor kept.
+    const first = request_get("/v1/views/x?min_op=3");
+    const refused = try serve_request(arena, &client, &health, &follower, &views, options, &first);
+    try std.testing.expectEqual(@as(u16, 503), refused.status);
+    try std.testing.expectEqualStrings(expired.body, refused.body);
+    try std.testing.expectEqual(.ready, health.state);
+    try std.testing.expectEqual(@as(u64, 2), follower.cursor);
+    try std.testing.expectEqual(@as(u64, 1), follower.watermark);
+
+    // The next request, with a fresh window, reads from the cursor to the end of the feed.
+    feed.calls_allowed = 5;
+    const second = request_get("/v1/views");
+    const listed = try serve_request(arena, &client, &health, &follower, &views, options, &second);
+    try std.testing.expectEqual(@as(u16, 200), listed.status);
+    try std.testing.expectEqual(@as(u64, 3), follower.watermark);
+    try std.testing.expectEqual(@as(u32, 3), feed.answered);
+    try std.testing.expectEqualSlices(u64, &.{ 0, 1, 2 }, feed.cursors[0..3]);
+
+    // A read of an op the view has already reached asks the feed for nothing: it cannot be
+    // E0606 (the feed would answer it), whatever is left of the window (#205).
+    feed.calls_allowed = 0;
+    const reached = [_][]const u8{
+        "/v1/views/x?min_op=3",
+        "/v1/views/x?as_of=2",
+        "/v1/views/x?min_op=1",
+    };
+    for (reached) |target| {
+        const read = request_get(target);
+        const reply = try serve_request(arena, &client, &health, &follower, &views, options, &read);
+        // Past the wait, so only the view's own answer is left: it does not exist.
+        try std.testing.expectEqual(@as(u16, 404), reply.status);
+    }
+    try std.testing.expectEqual(@as(u32, 3), feed.answered);
 }
