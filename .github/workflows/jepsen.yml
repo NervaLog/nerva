@@ -78,12 +78,13 @@ jobs:
               exit 1
             fi
             ./zig/zig build -Drelease -Dtest-commit-keys=off -p zig-out-teeth
-            echo "NERVA=$PWD/zig-out-teeth/bin/nerva" >> "$GITHUB_ENV"
+            nerva=$PWD/zig-out-teeth/bin/nerva
           else
             ./zig/zig build -Drelease
-            echo "NERVA=$PWD/zig-out/bin/nerva" >> "$GITHUB_ENV"
+            nerva=$PWD/zig-out/bin/nerva
           fi
-          "$NERVA" version
+          echo "NERVA=$nerva" >> "$GITHUB_ENV"
+          "$nerva" version
 
       # The runner has Temurin 21 and Docker. ssh-keygen is there; gnuplot is not, and without
       # it Jepsen's perf graphs, and so the whole result, are :unknown.
