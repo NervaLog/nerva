@@ -1,0 +1,495 @@
+{
+ "overall": "pass",
+ "commits": {
+  "baseline": "36d897b06d3c605aa18c093c4a173b4ba2f9490a",
+  "candidate": "bcd62d58dabca0b9cefc6a6f26ff2a33619fa296"
+ },
+ "health": {
+  "iops": 23572,
+  "mib_s": 92.1
+ },
+ "errors": [],
+ "metrics": [
+  {
+   "metric": "load botpike/b1/c1 ops/s",
+   "status": "pass",
+   "baseline": 322.4,
+   "candidate": 275.0,
+   "worse_by": 0.0082,
+   "worse_by_rounds": [
+    0.1608,
+    -0.0853,
+    0.0082
+   ],
+   "threshold": 0.1
+  },
+  {
+   "metric": "load botpike/b1/c1 p50 \u00b5s",
+   "status": "pass",
+   "baseline": 1087,
+   "candidate": 1087,
+   "worse_by": 0.0,
+   "worse_by_rounds": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "threshold": 0.15
+  },
+  {
+   "metric": "load botpike/b1/c1 p99 \u00b5s",
+   "status": "pass",
+   "baseline": 139263,
+   "candidate": 172031,
+   "worse_by": 0.0,
+   "worse_by_rounds": [
+    0.2353,
+    -0.0882,
+    0.0
+   ],
+   "threshold": 0.25
+  },
+  {
+   "metric": "load botpike/b1/c12 ops/s",
+   "status": "pass",
+   "baseline": 1522.8,
+   "candidate": 1524.0,
+   "worse_by": -0.0146,
+   "worse_by_rounds": [
+    -0.087,
+    0.0016,
+    -0.0146
+   ],
+   "threshold": 0.1
+  },
+  {
+   "metric": "load botpike/b1/c12 p50 \u00b5s",
+   "status": "pass",
+   "baseline": 3455,
+   "candidate": 3583,
+   "worse_by": 0.037,
+   "worse_by_rounds": [
+    0.037,
+    0.0,
+    0.037
+   ],
+   "threshold": 0.15
+  },
+  {
+   "metric": "load botpike/b1/c12 p99 \u00b5s",
+   "status": "improved",
+   "baseline": 237567,
+   "candidate": 180223,
+   "worse_by": -0.4444,
+   "worse_by_rounds": [
+    -0.4565,
+    -0.4444,
+    -0.2414
+   ],
+   "threshold": 0.25
+  },
+  {
+   "metric": "load c1/b1 ops/s",
+   "status": "pass",
+   "baseline": 249.3,
+   "candidate": 252.0,
+   "worse_by": -0.006,
+   "worse_by_rounds": [
+    -0.006,
+    -0.0207,
+    0.0221
+   ],
+   "threshold": 0.1
+  },
+  {
+   "metric": "load c1/b1 p50 \u00b5s",
+   "status": "pass",
+   "baseline": 30719,
+   "candidate": 30719,
+   "worse_by": 0.0,
+   "worse_by_rounds": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "threshold": 0.15
+  },
+  {
+   "metric": "load c1/b1 p99 \u00b5s",
+   "status": "pass",
+   "baseline": 61439,
+   "candidate": 61439,
+   "worse_by": 0.0,
+   "worse_by_rounds": [
+    0.0,
+    -0.1176,
+    0.0
+   ],
+   "threshold": 0.25
+  },
+  {
+   "metric": "load c1/b64 ops/s",
+   "status": "pass",
+   "baseline": 247.0,
+   "candidate": 250.6,
+   "worse_by": -0.0174,
+   "worse_by_rounds": [
+    -0.0174,
+    -0.0193,
+    -0.0004
+   ],
+   "threshold": 0.1
+  },
+  {
+   "metric": "load c1/b64 p50 \u00b5s",
+   "status": "pass",
+   "baseline": 31743,
+   "candidate": 30719,
+   "worse_by": -0.0323,
+   "worse_by_rounds": [
+    -0.0323,
+    -0.0323,
+    0.0
+   ],
+   "threshold": 0.15
+  },
+  {
+   "metric": "load c1/b64 p99 \u00b5s",
+   "status": "pass",
+   "baseline": 61439,
+   "candidate": 61439,
+   "worse_by": 0.0,
+   "worse_by_rounds": [
+    0.0,
+    0.0,
+    0.0667
+   ],
+   "threshold": 0.25
+  },
+  {
+   "metric": "load c2/b1 ops/s",
+   "status": "pass",
+   "baseline": 120.0,
+   "candidate": 123.0,
+   "worse_by": -0.0284,
+   "worse_by_rounds": [
+    -0.0284,
+    0.0092,
+    -0.0692
+   ],
+   "threshold": 0.1
+  },
+  {
+   "metric": "load c2/b1 p50 \u00b5s",
+   "status": "pass",
+   "baseline": 69631,
+   "candidate": 63487,
+   "worse_by": -0.0323,
+   "worse_by_rounds": [
+    -0.0882,
+    0.0,
+    -0.0323
+   ],
+   "threshold": 0.15
+  },
+  {
+   "metric": "load c2/b1 p99 \u00b5s",
+   "status": "pass",
+   "baseline": 118783,
+   "candidate": 114687,
+   "worse_by": 0.0,
+   "worse_by_rounds": [
+    0.0345,
+    0.0,
+    -0.0667
+   ],
+   "threshold": 0.25
+  },
+  {
+   "metric": "load c3/b1 ops/s",
+   "status": "pass",
+   "baseline": 58.6,
+   "candidate": 56.4,
+   "worse_by": 0.0375,
+   "worse_by_rounds": [
+    -0.0085,
+    0.0428,
+    0.0375
+   ],
+   "threshold": 0.1
+  },
+  {
+   "metric": "load c3/b1 p50 \u00b5s",
+   "status": "pass",
+   "baseline": 81919,
+   "candidate": 81919,
+   "worse_by": 0.0,
+   "worse_by_rounds": [
+    -0.1304,
+    0.0,
+    0.0
+   ],
+   "threshold": 0.15
+  },
+  {
+   "metric": "load c3/b1 p99 \u00b5s",
+   "status": "pass",
+   "baseline": 851967,
+   "candidate": 851967,
+   "worse_by": 0.0,
+   "worse_by_rounds": [
+    0.1304,
+    -0.0345,
+    0.0
+   ],
+   "threshold": 0.25
+  },
+  {
+   "metric": "load c3_adds/b1 ops/s",
+   "status": "pass",
+   "baseline": 248.4,
+   "candidate": 254.6,
+   "worse_by": -0.025,
+   "worse_by_rounds": [
+    -0.0432,
+    -0.025,
+    0.0139
+   ],
+   "threshold": 0.1
+  },
+  {
+   "metric": "load c3_adds/b1 p50 \u00b5s",
+   "status": "pass",
+   "baseline": 30719,
+   "candidate": 30719,
+   "worse_by": 0.0,
+   "worse_by_rounds": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "threshold": 0.15
+  },
+  {
+   "metric": "load c3_adds/b1 p99 \u00b5s",
+   "status": "pass",
+   "baseline": 61439,
+   "candidate": 61439,
+   "worse_by": 0.0,
+   "worse_by_rounds": [
+    -0.0556,
+    0.0,
+    0.0
+   ],
+   "threshold": 0.25
+  },
+  {
+   "metric": "load c4/b1 ops/s",
+   "status": "pass",
+   "baseline": 248.8,
+   "candidate": 247.0,
+   "worse_by": 0.0072,
+   "worse_by_rounds": [
+    0.0024,
+    0.0072,
+    0.0157
+   ],
+   "threshold": 0.1
+  },
+  {
+   "metric": "load c4/b1 p50 \u00b5s",
+   "status": "pass",
+   "baseline": 30719,
+   "candidate": 30719,
+   "worse_by": 0.0,
+   "worse_by_rounds": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "threshold": 0.15
+  },
+  {
+   "metric": "load c4/b1 p99 \u00b5s",
+   "status": "pass",
+   "baseline": 69631,
+   "candidate": 69631,
+   "worse_by": 0.0,
+   "worse_by_rounds": [
+    -0.0323,
+    0.0,
+    0.0
+   ],
+   "threshold": 0.25
+  },
+  {
+   "metric": "load c4/b64 ops/s",
+   "status": "pass",
+   "baseline": 247.4,
+   "candidate": 249.0,
+   "worse_by": -0.0141,
+   "worse_by_rounds": [
+    0.0024,
+    -0.0226,
+    -0.0141
+   ],
+   "threshold": 0.1
+  },
+  {
+   "metric": "load c4/b64 p50 \u00b5s",
+   "status": "pass",
+   "baseline": 30719,
+   "candidate": 30719,
+   "worse_by": 0.0,
+   "worse_by_rounds": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "threshold": 0.15
+  },
+  {
+   "metric": "load c4/b64 p99 \u00b5s",
+   "status": "pass",
+   "baseline": 61439,
+   "candidate": 69631,
+   "worse_by": 0.0,
+   "worse_by_rounds": [
+    -0.0556,
+    0.0,
+    0.1333
+   ],
+   "threshold": 0.25
+  },
+  {
+   "metric": "load c5/b1024 ops/s",
+   "status": "pass",
+   "baseline": 245.0,
+   "candidate": 242.6,
+   "worse_by": 0.0061,
+   "worse_by_rounds": [
+    0.0061,
+    0.0382,
+    -0.0196
+   ],
+   "threshold": 0.1
+  },
+  {
+   "metric": "load c5/b1024 p50 \u00b5s",
+   "status": "pass",
+   "baseline": 30719,
+   "candidate": 30719,
+   "worse_by": 0.0,
+   "worse_by_rounds": [
+    0.0333,
+    0.0,
+    0.0
+   ],
+   "threshold": 0.15
+  },
+  {
+   "metric": "load c5/b1024 p99 \u00b5s",
+   "status": "pass",
+   "baseline": 73727,
+   "candidate": 69631,
+   "worse_by": -0.0556,
+   "worse_by_rounds": [
+    -0.0556,
+    0.1333,
+    -0.1389
+   ],
+   "threshold": 0.25
+  },
+  {
+   "metric": "load c7/b1 ops/s",
+   "status": "pass",
+   "baseline": 204.3,
+   "candidate": 206.8,
+   "worse_by": -0.0122,
+   "worse_by_rounds": [
+    0.0526,
+    -0.0181,
+    -0.0122
+   ],
+   "threshold": 0.1
+  },
+  {
+   "metric": "load c7/b1 p50 \u00b5s",
+   "status": "pass",
+   "baseline": 40959,
+   "candidate": 38911,
+   "worse_by": -0.05,
+   "worse_by_rounds": [
+    0.0526,
+    -0.05,
+    -0.05
+   ],
+   "threshold": 0.15
+  },
+  {
+   "metric": "load c7/b1 p99 \u00b5s",
+   "status": "pass",
+   "baseline": 102399,
+   "candidate": 102399,
+   "worse_by": 0.0,
+   "worse_by_rounds": [
+    0.0417,
+    -0.08,
+    0.0
+   ],
+   "threshold": 0.25
+  },
+  {
+   "metric": "micro declared_views.as_of_middle_ns",
+   "status": "pass",
+   "baseline": 222406320,
+   "candidate": 228011880,
+   "worse_by": 0.0222,
+   "worse_by_rounds": [
+    0.0252,
+    0.0123,
+    0.0222
+   ],
+   "threshold": 0.1
+  },
+  {
+   "metric": "micro declared_views.latest_ns",
+   "status": "pass",
+   "baseline": 92670980,
+   "candidate": 95201990,
+   "worse_by": 0.0152,
+   "worse_by_rounds": [
+    0.0299,
+    0.0044,
+    0.0152
+   ],
+   "threshold": 0.1
+  },
+  {
+   "metric": "micro documents.decode_ns_per_document",
+   "status": "pass",
+   "baseline": 9019,
+   "candidate": 9171,
+   "worse_by": -0.0134,
+   "worse_by_rounds": [
+    0.0389,
+    -0.0187,
+    -0.0134
+   ],
+   "threshold": 0.1
+  },
+  {
+   "metric": "micro documents.encode_ns_per_document",
+   "status": "pass",
+   "baseline": 247390,
+   "candidate": 246832,
+   "worse_by": 0.0033,
+   "worse_by_rounds": [
+    0.033,
+    -0.0099,
+    0.0033
+   ],
+   "threshold": 0.1
+  }
+ ]
+}
