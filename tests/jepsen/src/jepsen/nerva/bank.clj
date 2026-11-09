@@ -245,16 +245,27 @@
      :to     (parse-long (str (get fields "to")))
      :amount (parse-long (str (get fields "amount")))}))
 
+(defn request-timeout-ms
+  "How long the next request of the records read may take: `http/timeout-ms`, or the time left
+  before `deadline` (System/nanoTime) if that is less. Throws once none is left (P239f)."
+  [deadline]
+  (let [left (quot (- deadline (System/nanoTime)) 1000000)]
+    (when (<= left 0)
+      (throw (ex-info "records deadline" {})))
+    (min http/timeout-ms left)))
+
 (defn scan-from!
   "Every record of the index with `from` = i, in pages. Throws unless every page is a 200, if a
-  cursor does not advance, or after `scan-pages-max` pages."
-  [node port i]
+  cursor does not advance, after `scan-pages-max` pages, or once `deadline` has passed; each
+  page's request is bounded by the time left (P239f)."
+  [node port i deadline]
   (loop [after nil, found [], pages 0]
     (when (<= scan-pages-max pages)
       (throw (ex-info "a scan has too many pages" {:pages pages})))
     (let [reply (http/request! node port "POST" (str "/v1/indexes/" transfers-index "/scan")
                                (cond-> {"eq" {"from" i}, "limit" page-limit}
-                                 after (assoc "after" after)))]
+                                 after (assoc "after" after))
+                               (request-timeout-ms deadline))]
       (when-not (= 200 (:status reply))
         (throw (ex-info "a scan was not answered" {:reply (select-keys reply [:status :body])})))
       (let [found (into found (map parse-record) (get-in reply [:body "records"]))]
@@ -266,35 +277,37 @@
 
 (defn count-view!
   "The count view's answer: the number of records, 0 before there is a group."
-  [node port]
-  (let [reply (http/request! node port "GET" (str "/v1/views/" transfers-view) nil)]
+  [node port deadline]
+  (let [reply (http/request! node port "GET" (str "/v1/views/" transfers-view) nil
+                             (request-timeout-ms deadline))]
     (when-not (= 200 (:status reply))
       (throw (ex-info "the count view was not answered"
                       {:reply (select-keys reply [:status :body])})))
     (reduce + (for [group (get-in reply [:body "groups"])] (parse-long (get group "count"))))))
 
 (def records-deadline-ms
-  "How long the final records read tries: 180 s, then at most one request more (P239e)."
+  "How long the final records read tries: 180 s in all (P239e). Every page and the count view
+  is bounded by the time left, so the read ends within it plus one health probe (P239f)."
   180000)
 
 (defn invoke-records
   "The final read of the records, after every pending key is resolved: all eight index keys
   and the count view, through a healthy gateway that answers all of them. It tries for
   `records-deadline-ms` (180 s, plus the request in flight), checked before every try and
-  every scan; past it, or with no healthy gateway, the op ends :fail :no-answer, which leaves
-  the keys' verdict :unknown, never a finding against Nerva."
+  every page of every scan and before the count view, each request bounded by the time left, so
+  the total is `records-deadline-ms` plus one health probe. Past it, or with no healthy
+  gateway, the op ends :fail :no-answer, which leaves the keys' verdict :unknown with the
+  harness's code, never a finding against Nerva (P239f)."
   [test op]
   (let [targets  (keyed/targets test)
         deadline (+ (System/nanoTime) (* records-deadline-ms 1000000))
-        expired? #(< deadline (System/nanoTime))]
+        expired? #(<= deadline (System/nanoTime))]
     (loop [n 0, previous nil]
       (let [[node port :as target] (keyed/pick targets previous)
             answer (when (and (not (expired?)) (http/healthy? node port))
-                     (try {:records (vec (mapcat #(do (when (expired?)
-                                                        (throw (ex-info "records deadline" {})))
-                                                      (scan-from! node port %))
+                     (try {:records (vec (mapcat #(scan-from! node port % deadline)
                                                  (range (count accounts))))
-                           :count   (count-view! node port)}
+                           :count   (count-view! node port deadline)}
                           (catch IOException _ nil)
                           (catch clojure.lang.ExceptionInfo _ nil)))]
         (cond answer (assoc op :type :ok, :value (:records answer), :count (:count answer),
@@ -445,7 +458,9 @@
 (defn duplicates-by-conflict
   "Keys that committed and were then refused `conflict`: the transfer ran a second time and
   the record read (`op_seen` 0) refused it. This is the duplicate of a re-execution, as the
-  retry workload and the canary (which needs a finding named `duplicate`) see it (P239e)."
+  retry workload and the canary (which needs a finding named `duplicate`) see it (P239e).
+  A resend after an `:unknown` original is not named here but as a refusal: the canary's
+  `duplicate` comes from the dropped replies (`drop-reply`), so tuning those can blind it."
   [records]
   (for [[key record] records
         :let [after (rest (drop-while #(not= :committed (:kind %)) (:attempts record)))]
@@ -455,7 +470,8 @@
 (defn analyze-keys
   "The keyed checks of a history: one op per key (:duplicate) and the records (:records), as
   the namespace doc says. Invalid on any error; :unknown when a key was never answered, or
-  nothing read the records; else valid."
+  nothing read the records (then with the code NRV-E0607: the harness could not read, which says
+  nothing about Nerva, P239f); else valid."
   [history]
   (let [records    (keyed/key-records history :transfer)
         reads      (filter #(and (= :records (:f %)) (= :ok (:type %))) history)
@@ -469,7 +485,8 @@
         refused-late (vec (refused-after-commit records))
         broken?    (or (seq duplicate) (seq refused-late)
                        (some #(some seq (vals %)) errors))]
-    {:valid?     (cond broken? false
+    (cond->
+     {:valid?     (cond broken? false
                        (or (seq unresolved) (empty? reads)) :unknown
                        :else true)
      :keys       (count records)
@@ -487,7 +504,8 @@
                            :examples (vec (take 10 (gather :refused-with-record)))}
      :wrong      {:count (count (gather :wrong)), :examples (vec (take 10 (gather :wrong)))}
      :count-view {:count (count (gather :count)), :examples (vec (take 10 (gather :count)))}
-     :unresolved {:count (count unresolved), :examples (vec (take 10 unresolved))}}))
+     :unresolved {:count (count unresolved), :examples (vec (take 10 unresolved))}}
+      (and (not broken?) (empty? reads)) (assoc :code "NRV-E0607"))))
 
 (defn keys-checker
   []

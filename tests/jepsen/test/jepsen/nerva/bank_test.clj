@@ -442,6 +442,11 @@
                                     (transfer :fail "k4" 7 [busy busy])
                                     (bad-resolve "unpaired") (records-read [])])))))))
 
+(defn far-deadline
+  "A records deadline an hour away."
+  []
+  (+ (System/nanoTime) (* 3600 1000000000)))
+
 (defn scan-reply
   [records next]
   {:status 200, :body (cond-> {"records" records} next (assoc "next" next))})
@@ -452,16 +457,16 @@
       (let [replies [(scan-reply [rec] "c1") (scan-reply [rec] nil)]
             calls   (atom -1)]
         (with-redefs [http/request! (fn [& _] (nth replies (swap! calls inc)))]
-          (is (= 2 (count (bank/scan-from! "n1" 8080 0)))))))
+          (is (= 2 (count (bank/scan-from! "n1" 8080 0 (far-deadline))))))))
     (testing "a cursor that does not advance throws"
       (let [replies (atom [(scan-reply [rec] "c1") (scan-reply [rec] "c1")])
             calls   (atom -1)]
         (with-redefs [http/request! (fn [& _] (nth @replies (swap! calls inc)))]
-          (is (thrown? clojure.lang.ExceptionInfo (bank/scan-from! "n1" 8080 0))))))
+          (is (thrown? clojure.lang.ExceptionInfo (bank/scan-from! "n1" 8080 0 (far-deadline)))))))
     (testing "a scan that never ends throws after the page limit"
       (let [calls (atom 0)]
         (with-redefs [http/request! (fn [& _] (scan-reply [rec] (str "c" (swap! calls inc))))]
-          (is (thrown? clojure.lang.ExceptionInfo (bank/scan-from! "n1" 8080 0)))
+          (is (thrown? clojure.lang.ExceptionInfo (bank/scan-from! "n1" 8080 0 (far-deadline))))
           (is (= bank/scan-pages-max @calls)))))))
 
 (deftest the-keys-flag-picks-the-workload
@@ -507,7 +512,37 @@
     (let [done (bank/invoke-records {:nodes ["n1"] :gateways 1} {:f :records, :type :invoke})]
       (is (= :fail (:type done)))
       (is (= :no-answer (:error done)))))
-  (testing "and an unread record set leaves the keys :unknown"
-    (is (= :unknown (:valid? (bank/analyze-keys
-                               (history-of [good-read good-view
-                                            (transfer :ok "k1" 30 [(answered 10)])])))))))
+  (testing "an unread record set leaves the keys :unknown, with the harness's code"
+    (let [result (bank/analyze-keys (history-of [good-read good-view
+                                                 (transfer :ok "k1" 30 [(answered 10)])]))]
+      (is (= :unknown (:valid? result)))
+      (is (= "NRV-E0607" (:code result)))))
+  (testing "a verdict that read the records, or that found a fault, carries no code"
+    (is (nil? (:code (bank/analyze-keys
+                       (history-of [good-read good-view
+                                    (transfer :ok "k1" 30 [(answered 10)])
+                                    (records-read [(record "k1" 30)])])))))
+    (is (nil? (:code (bank/analyze-keys
+                       (history-of [good-read good-view
+                                    (transfer :fail "k1" 30 [(answered 10) out-of-bounds])])))))))
+
+(deftest the-deadline-is-checked-between-pages-and-before-the-count-view
+  (let [rec {"id" "a", "fields" {"from" 0, "to" 1, "amount" "1"}}
+        timeouts (atom [])]
+    (testing "each request is bounded by the time left"
+      (with-redefs [http/request! (fn [_ _ _ _ _ t] (swap! timeouts conj t) (scan-reply [rec] nil))]
+        (bank/scan-from! "n1" 8080 0 (+ (System/nanoTime) (* 5000 1000000)))
+        (is (<= 1 (first @timeouts) 5000))))
+    (testing "a deadline that passes between two pages stops the scan"
+      (let [deadline (+ (System/nanoTime) (* 100 1000000))
+            calls    (atom 0)]
+        (with-redefs [http/request! (fn [& _]
+                                      (swap! calls inc)
+                                      (Thread/sleep 150)
+                                      (scan-reply [rec] (str "c" @calls)))]
+          (is (thrown? clojure.lang.ExceptionInfo (bank/scan-from! "n1" 8080 0 deadline)))
+          (is (= 1 @calls) "no second page after the deadline"))))
+    (testing "and it stops the count view, which is not requested"
+      (with-redefs [http/request! (fn [& _] (throw (AssertionError. "no request")))]
+        (is (thrown? clojure.lang.ExceptionInfo
+                     (bank/count-view! "n1" 8080 (- (System/nanoTime) 1))))))))

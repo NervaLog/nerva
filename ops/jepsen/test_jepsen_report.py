@@ -181,6 +181,32 @@ class Statuses(unittest.TestCase):
         self.assertEqual(github.opened, [])
         self.assertEqual(summary["filed"], 0)
 
+    def test_an_unread_record_set_is_the_hosts_and_never_filed(self):
+        # The keys checker's :unknown when the final records read never answered (P239f): it
+        # carries the harness's code beside the gateway's, so it is no `unknown-result` finding.
+        unread = ("{:valid? :unknown, :perf {:valid? true}, :gateways {:valid? :unknown, :code "
+                  '"NRV-E0607", :final-starts 1, :heal-failures ["boom"]}, :workload '
+                  "{:valid? :unknown, :keys {:valid? :unknown, :code "
+                  '"NRV-E0607", :keys 3, :reads 0, :unresolved {:count 3, :examples '
+                  "[{:key \"aaaa\"}]}}}}")
+        store = Store(self)
+        store.test("1", unread, args="--workload bank --nemesis kill,partition,gateway")
+        runs, _ = rep.read_night(store.path, store.write_runs())
+        self.assertEqual(runs[0].kind, "host")
+        github, _, summary = night(self, store)
+        self.assertEqual(github.statuses[0][1], "error")
+        self.assertEqual(github.opened, [])
+        self.assertEqual(summary["filed"], 0)
+
+    def test_an_unread_record_set_without_the_code_would_be_filed(self):
+        uncoded = ("{:valid? :unknown, :perf {:valid? true}, :workload {:valid? :unknown, "
+                   ":keys {:valid? :unknown, :keys 3, :reads 0, :unresolved {:count 3, "
+                   ":examples [{:key \"aaaa\"}]}}}}")
+        store = Store(self)
+        store.test("1", uncoded, args="--workload bank")
+        github, _, _ = night(self, store)
+        self.assertEqual(len(github.opened), 1, "the code is what keeps the host's from filing")
+
     def test_a_finding_elsewhere_outranks_a_harness_verdict(self):
         both = ("{:valid? false, :perf {:valid? true}, :gateways {:valid? :unknown, :code "
                 '"NRV-E0607", :errors ["boom"]}, :protocol {:valid? false, :violations 2, '
