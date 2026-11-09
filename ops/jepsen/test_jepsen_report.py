@@ -162,6 +162,29 @@ class Statuses(unittest.TestCase):
         github, _, _ = night(self, blind, canary=True)
         self.assertEqual(github.statuses[0][1], "failure")
 
+    def test_the_bank_canary_succeeds_on_a_record_read_teeth_run(self):
+        # The keyed bank with dedup off: a re-execution is refused `conflict` by the record
+        # read, which the workload counts as a duplicate (P239e), beside the other classes.
+        results = ("{:valid? false, :perf {:valid? true}, :workload {:valid? false, "
+                   ":keys {:valid? false, :duplicate {:count 355, :examples [{:key \"a\", "
+                   ":conflict true}]}, :refused-after-commit {:count 0, :examples []}, "
+                   ":refused-with-record {:count 10, :examples [{:key \"b\"}]}}, "
+                   ":refusals {:valid? false, :conflict 360, :out_of_bounds 508}}}")
+        store = Store(self)
+        store.test("1", results, args="--workload bank --teeth --time-limit 300")
+        github, _, _ = night(self, store, canary=True)
+        self.assertEqual(github.statuses[0][1:3], ("success", "jepsen/canary"))
+        self.assertEqual([t for _, t, _ in github.opened if "blind" in t], [])
+
+    def test_a_test_all_run_without_keys_is_its_own_workload(self):
+        store = Store(self)
+        directory = store.test("1", VALID, args="")
+        named = os.path.join(store.path, "1", "nerva bank no-keys x")
+        os.rename(os.path.dirname(directory), named)
+        run = rep.Run("1")
+        rep.read_test(run, os.path.join(named, "2026-11-02T01:00:00Z"))
+        self.assertEqual(run.workload, "bank-no-keys")
+
     def test_a_canary_that_threw_is_a_crash_not_blind(self):
         store = Store(self)
         directory = store.test("1", "", with_results=False, code=255, args="--workload retry")

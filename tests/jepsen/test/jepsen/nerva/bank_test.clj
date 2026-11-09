@@ -472,3 +472,42 @@
       "a keyed run that never read its records is not known to be valid")
   (is (valid? (:checker (bank/workload {:keyed false}))
               (history good-read good-view good-transfer))))
+
+(def conflict (assoc out-of-bounds :status "conflict"))
+
+(deftest a-key-that-committed-and-was-refused-conflict-is-a-duplicate
+  (let [ops [good-read good-view
+             (assoc (transfer :fail "k1" 30 [(answered 10 {:dropped? true}) conflict])
+                    :error :conflict)
+             (records-read [(record "k1" 30)])]
+        result (bank/analyze-keys (history-of ops))]
+    (is (false? (:valid? result)))
+    (is (= [{:key "k1", :conflict true}] (get-in result [:duplicate :examples])))
+    (is (= 1 (get-in result [:duplicate :count])))
+    (is (zero? (get-in result [:refused-after-commit :count]))
+        "a conflict is a duplicate, not a second class"))
+  (testing "in the final phase too"
+    (let [result (bank/analyze-keys
+                   (history-of [good-read good-view
+                                (transfer :info "k1" 30 [(answered 10 {:dropped? true}) lost])
+                                (resolve-op (entry "k1" 30 [conflict]))
+                                (records-read [(record "k1" 30)])]))]
+      (is (= 1 (get-in result [:duplicate :count])))))
+  (testing "a conflict with no commit before it is not a duplicate"
+    (is (zero? (get-in (bank/analyze-keys
+                         (history-of [good-read good-view
+                                      (assoc (transfer :fail "k1" 30 [conflict])
+                                             :error :conflict)
+                                      (records-read [])]))
+                       [:duplicate :count])))))
+
+(deftest the-final-records-read-has-a-deadline
+  (with-redefs [bank/records-deadline-ms 0
+                http/healthy? (fn [& _] (throw (AssertionError. "no gateway is tried")))]
+    (let [done (bank/invoke-records {:nodes ["n1"] :gateways 1} {:f :records, :type :invoke})]
+      (is (= :fail (:type done)))
+      (is (= :no-answer (:error done)))))
+  (testing "and an unread record set leaves the keys :unknown"
+    (is (= :unknown (:valid? (bank/analyze-keys
+                               (history-of [good-read good-view
+                                            (transfer :ok "k1" 30 [(answered 10)])])))))))

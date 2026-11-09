@@ -616,6 +616,9 @@ def read_test(run, directory):
         run.nemesis = option(words, "nemesis") or ""
         run.seed = option(words, "seed")
         run.reproduce = " ".join(shlex.quote(w) for w in reproduce_words(words))
+    if run.workload == "bank" and os.path.basename(os.path.dirname(directory)).startswith(
+            "nerva bank no-keys"):
+        run.workload = "bank-no-keys"  # `test-all` has no --workload; the test's name says it
     path = os.path.join(directory, "results.edn")
     try:
         with open(path, "rb") as file:

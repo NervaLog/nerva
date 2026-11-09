@@ -26,9 +26,11 @@
   ends :info); keys that were not are resent after healing, then every record is read through
   the index.
   Also checked:
-  - `:refused-after-commit`  no key is refused after an attempt of it committed (keys are kept
-                  forever, so a resend replays);
-  - `:duplicate`  every 2xx for a key, a discarded one included, names the same op;
+  - `:refused-after-commit`  no key is refused after an attempt of it committed, `conflict`
+                  apart (keys are kept forever, so a resend replays);
+  - `:duplicate`  every 2xx for a key, a discarded one included, names the same op, and no key
+                  that committed is then refused `conflict` (the record read caught a second
+                  application);
   - `:records`    every key that committed has exactly one record, with its `from`, `to` and
                   `amount`, and every record is of a key that committed or may have (an
                   attempt got no answer); the count view equals the records the index lists,
@@ -271,21 +273,33 @@
                       {:reply (select-keys reply [:status :body])})))
     (reduce + (for [group (get-in reply [:body "groups"])] (parse-long (get group "count"))))))
 
+(def records-deadline-ms
+  "How long the final records read tries: 180 s, then at most one request more (P239e)."
+  180000)
+
 (defn invoke-records
   "The final read of the records, after every pending key is resolved: all eight index keys
-  and the count view, through any gateway that answers all of them."
+  and the count view, through a healthy gateway that answers all of them. It tries for
+  `records-deadline-ms` (180 s, plus the request in flight), checked before every try and
+  every scan; past it, or with no healthy gateway, the op ends :fail :no-answer, which leaves
+  the keys' verdict :unknown, never a finding against Nerva."
   [test op]
-  (let [targets (keyed/targets test)]
+  (let [targets  (keyed/targets test)
+        deadline (+ (System/nanoTime) (* records-deadline-ms 1000000))
+        expired? #(< deadline (System/nanoTime))]
     (loop [n 0, previous nil]
       (let [[node port :as target] (keyed/pick targets previous)
-            answer (try {:records (vec (mapcat #(scan-from! node port %)
-                                               (range (count accounts))))
-                         :count   (count-view! node port)}
-                        (catch IOException _ nil)
-                        (catch clojure.lang.ExceptionInfo _ nil))]
+            answer (when (and (not (expired?)) (http/healthy? node port))
+                     (try {:records (vec (mapcat #(do (when (expired?)
+                                                        (throw (ex-info "records deadline" {})))
+                                                      (scan-from! node port %))
+                                                 (range (count accounts))))
+                           :count   (count-view! node port)}
+                          (catch IOException _ nil)
+                          (catch clojure.lang.ExceptionInfo _ nil)))]
         (cond answer (assoc op :type :ok, :value (:records answer), :count (:count answer),
                             :gateway (str node ":" port))
-              (< n 20) (do (keyed/backoff! (min n 5)) (recur (inc n) target))
+              (and (< n 20) (not (expired?))) (do (keyed/backoff! (min n 5)) (recur (inc n) target))
               :else (assoc op :type :fail, :error :no-answer))))))
 
 (defrecord Client [node keyed? pending phase drop-reply attempts]
@@ -419,13 +433,24 @@
 
 (defn refused-after-commit
   "Keys refused after an attempt of them committed: keys are kept forever, so a resend must
-  replay, and a cluster that refuses it has lost the key."
+  replay, and a cluster that refuses it has lost the key. `conflict` is the exception, which
+  `duplicates-by-conflict` takes: the record read caught a second application (P239e)."
   [records]
   (for [[key record] records
         :let [after (rest (drop-while #(not= :committed (:kind %)) (:attempts record)))
-              refusals (filter refused? after)]
+              refusals (remove #(= "conflict" (:status %)) (filter refused? after))]
         :when (seq refusals)]
     {:key key, :statuses (vec (map :status refusals))}))
+
+(defn duplicates-by-conflict
+  "Keys that committed and were then refused `conflict`: the transfer ran a second time and
+  the record read (`op_seen` 0) refused it. This is the duplicate of a re-execution, as the
+  retry workload and the canary (which needs a finding named `duplicate`) see it (P239e)."
+  [records]
+  (for [[key record] records
+        :let [after (rest (drop-while #(not= :committed (:kind %)) (:attempts record)))]
+        :when (some #(and (refused? %) (= "conflict" (:status %))) after)]
+    {:key key, :conflict true}))
 
 (defn analyze-keys
   "The keyed checks of a history: one op per key (:duplicate) and the records (:records), as
@@ -434,7 +459,7 @@
   [history]
   (let [records    (keyed/key-records history :transfer)
         reads      (filter #(and (= :records (:f %)) (= :ok (:type %))) history)
-        duplicate  (vec (keyed/duplicates records))
+        duplicate  (vec (concat (keyed/duplicates records) (duplicates-by-conflict records)))
         errors     (map (partial record-errors records) reads)
         gather     (fn [k] (vec (mapcat k errors)))
         unresolved (vec (for [[k r] records
