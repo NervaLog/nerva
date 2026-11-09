@@ -1,0 +1,53 @@
+name: LazyFS sentinel repro
+on:
+  push:
+    branches: ['repro/**']
+permissions:
+  contents: read
+jobs:
+  repro:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+      - name: Build the node image's LazyFS
+        run: docker build -t node tests/jepsen/node
+      - name: Write, clear, look
+        run: |
+          cat > /tmp/repro.sh <<'INNER'
+          set -u
+          D=/tmp/m; R=/tmp/r; mkdir -p $D $R; touch /tmp/lazyfs.log
+          cat > /tmp/cfg.toml <<CFG
+          [faults]
+          fifo_path="/tmp/faults.fifo"
+
+          [cache]
+          apply_eviction=false
+
+          [cache.simple]
+          custom_size="128MB"
+          blocks_per_page=1
+
+          [filesystem]
+          logfile="/tmp/lazyfs.log"
+          log_all_operations=false
+          CFG
+          cd /opt/jepsen/lazyfs/lazyfs && scripts/mount-lazyfs.sh -c /tmp/cfg.toml -m $D -r $R
+          for i in $(seq 20); do findmnt $D >/dev/null 2>&1 && [ -p /tmp/faults.fifo ] && break; sleep 0.5; done
+          findmnt $D
+          dd if=/dev/zero of=$D/unsynced bs=4096 count=1 status=none
+          dd if=/dev/zero of=$D/fsynced bs=4096 count=1 status=none conv=fsync
+          dd if=/dev/zero of=$D/odsync bs=4096 count=1 status=none oflag=dsync
+          show() { for f in unsynced fsynced odsync; do echo "$1 $f: $(stat -c %s $D/$f 2>/dev/null || echo gone)"; done; }
+          show before
+          echo "lazyfs::unsynced-data-report" > /tmp/faults.fifo; sleep 1
+          tail -3 /tmp/lazyfs.log
+          echo "lazyfs::clear-cache" > /tmp/faults.fifo; sleep 1
+          show after
+          echo "lazyfs::unsynced-data-report" > /tmp/faults.fifo; sleep 1
+          tail -2 /tmp/lazyfs.log
+          INNER
+          docker run --rm --privileged --device /dev/fuse -v /tmp/repro.sh:/tmp/repro.sh:ro node bash /tmp/repro.sh 2>&1 | tee /tmp/out.txt
+          cat /tmp/out.txt >> "$GITHUB_STEP_SUMMARY"
