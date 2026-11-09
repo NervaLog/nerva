@@ -46,15 +46,22 @@ jobs:
             report; clear; size "$1 after" lazyfs-sentinel; report
             rm -f $D/lazyfs-sentinel
           }
-          echo "--- A: idle mount, first round, then again"
-          round A1; round A2
-          echo "--- B: replica-like O_DIRECT|O_DSYNC writer, killed, then sentinel"
-          dd if=/dev/zero of=$D/replica.nerva bs=1M count=8 oflag=direct,dsync status=none
-          ( while :; do dd if=/dev/zero of=$D/replica.nerva bs=4096 count=1 seek=$((RANDOM % 2000)) conv=notrunc oflag=direct,dsync status=none; done ) &
-          W=$!; sleep 3; kill -9 $W; wait $W 2>/dev/null
-          round B1; round B2
-          echo "--- C: no sleeps (report right after dd)"
+          echo "--- D: sentinel written while a replica-like fd is open, writer killed after"
+          python3 - <<'PY' &
+          import os,time,signal
+          fd=os.open("/tmp/m/replica.nerva", os.O_RDWR|os.O_CREAT|os.O_DSYNC)
+          os.ftruncate(fd, 8<<20)
+          i=0
+          while True:
+              os.pwrite(fd, b"x"*4096, (i%2000)*4096); i+=1; time.sleep(0.01)
+          PY
+          W=$!; sleep 2
           rm -f $D/lazyfs-sentinel; dd if=/dev/zero of=$D/lazyfs-sentinel bs=4096 count=1 status=none
-          echo "lazyfs::unsynced-data-report" > /tmp/faults.fifo; sleep 0.3; tail -4 /tmp/lazyfs.log | grep -i "report:" | cut -c40-
+          size "D before" lazyfs-sentinel
+          echo "D report while writer alive:"; report
+          kill -9 $W; wait $W 2>/dev/null
+          echo "D report right after kill:"; report
+          size "D after kill" lazyfs-sentinel
+          clear; size "D after clear" lazyfs-sentinel; report
           INNER
           docker run --rm --privileged --device /dev/fuse -v /tmp/repro.sh:/tmp/repro.sh:ro node bash /tmp/repro.sh 2>&1 | tee /tmp/out.txt
