@@ -1,0 +1,67 @@
+name: LazyFS sentinel repro
+on:
+  push:
+    branches: ['repro/**']
+permissions:
+  contents: read
+jobs:
+  repro:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+      - name: Build the node image's LazyFS
+        run: docker build -t node tests/jepsen/node
+      - name: Write, clear, look
+        run: |
+          cat > /tmp/repro.sh <<'INNER'
+          set -u
+          CACHE=$1; BIG_MB=$2
+          D=/tmp/m; R=/tmp/r; mkdir -p $D $R; : > /tmp/lazyfs.log
+          cat > /tmp/cfg.toml <<CFG
+          [faults]
+          fifo_path="/tmp/faults.fifo"
+
+          [cache]
+          apply_eviction=false
+
+          [cache.simple]
+          custom_size="$CACHE"
+          blocks_per_page=1
+
+          [filesystem]
+          logfile="/tmp/lazyfs.log"
+          log_all_operations=false
+          CFG
+          cd /opt/jepsen/lazyfs/lazyfs && scripts/mount-lazyfs.sh -c /tmp/cfg.toml -m $D -r $R
+          for i in $(seq 20); do findmnt $D >/dev/null 2>&1 && [ -p /tmp/faults.fifo ] && break; sleep 0.5; done
+          cmd() { echo "lazyfs::$1" > /tmp/faults.fifo; sleep 0.4; }
+          last() { tail -3 /tmp/lazyfs.log | grep -i "$1" | tail -1 | cut -c40-; }
+          size() { echo "$1: $(stat -c %s $D/$2 2>/dev/null || echo gone)"; }
+          round() {
+            rm -f $D/lazyfs-sentinel
+            dd if=/dev/zero of=$D/lazyfs-sentinel bs=4096 count=1 status=none
+            size "$1 before" lazyfs-sentinel
+            cmd display-cache-usage; last "usage"
+            cmd unsynced-data-report; last "report:"
+            cmd clear-cache; size "$1 after clear" lazyfs-sentinel
+            rm -f $D/lazyfs-sentinel
+          }
+          echo "=== cache=$CACHE, replica-like file of ${BIG_MB} MB written O_DSYNC (sparse, as a format does)"
+          round "A empty cache"
+          python3 - $D $BIG_MB <<'PY'
+          import os,sys
+          fd=os.open(sys.argv[1]+"/replica.nerva", os.O_RDWR|os.O_CREAT|os.O_DSYNC)
+          mb=int(sys.argv[2])
+          os.pwrite(fd, b"x"*4096, (mb<<20)-4096)
+          os.close(fd)
+          PY
+          size "replica.nerva" replica.nerva
+          round "B after replica file"
+          round "C second round, cache just cleared"
+          INNER
+          docker run --rm --privileged --device /dev/fuse -v /tmp/repro.sh:/tmp/repro.sh:ro node bash /tmp/repro.sh 128MB 300 2>&1 | tee /tmp/out.txt
+          docker run --rm --privileged --device /dev/fuse -v /tmp/repro.sh:/tmp/repro.sh:ro node bash /tmp/repro.sh 128MB 60 2>&1 | tee -a /tmp/out.txt
+          docker run --rm --privileged --device /dev/fuse -v /tmp/repro.sh:/tmp/repro.sh:ro node bash /tmp/repro.sh 1GB 300 2>&1 | tee -a /tmp/out.txt
