@@ -51,13 +51,8 @@ jobs:
           }
           echo "=== cache=$CACHE, replica-like file of ${BIG_MB} MB written O_DSYNC (sparse, as a format does)"
           round "A empty cache"
-          python3 - $D $BIG_MB <<'PY'
-          import os,sys
-          fd=os.open(sys.argv[1]+"/replica.nerva", os.O_RDWR|os.O_CREAT|os.O_DSYNC)
-          mb=int(sys.argv[2])
-          os.pwrite(fd, b"x"*4096, (mb<<20)-4096)
-          os.close(fd)
-          PY
+          dd if=/dev/zero of=$D/replica.nerva bs=4096 count=1 seek=$((BIG_MB*256-1)) oflag=dsync status=none
+          cmd display-cache-usage; last "usage"
           size "replica.nerva" replica.nerva
           round "B after replica file"
           round "C second round, cache just cleared"
