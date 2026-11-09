@@ -85,19 +85,23 @@ With `lose-unfsynced-writes` in `--nemesis`, each node's data directory, `/opt/n
 [LazyFS](https://github.com/dsrhaslab/lazyfs) FUSE mount (`jepsen.nerva.lazyfs`, on
 `jepsen.lazyfs`) and the replica's data file is `/opt/nerva/data/replica.nerva`. LazyFS keeps
 every write in its own cache until it is fsynced; clearing the cache after the replica is dead
-loses the writes the replica never made durable. Whether LazyFS counts a write with `O_DSYNC`,
-which Nerva uses on every data-file open, as synced is not established (#246, P242c): if it does
-not, a clear loses everything the replica wrote since it last opened the file, which is replica
-amnesia. So the fault never acts while an earlier victim is down or has not caught up (such a
-fault is recorded `:skipped`), and its verdict (`:lazyfs`) is `:unknown` when no fault lost a byte,
-a clear was not seen to take or a fault op threw, and invalid with NRV-E0604 when the final
-recovery left a gateway or the replica down. Whether a `--development` replica gets `O_DIRECT` on FUSE is not
-measured (`replica.log` says if the mount refused it). Without the fault the data file is where it was
+loses the writes the replica never made durable. Stock LazyFS (9c5685e8) does not honour the
+`O_DSYNC` the replica opens its data file with: a non-extending direct write reaches it with no
+fsync, so it loses acknowledged writes (#246). The node image therefore builds LazyFS with
+`node/lazyfs-osync.patch`, which syncs the file in `lfs_write` when it was opened `O_DSYNC` or
+`O_SYNC` (P242d); without it a clear is replica amnesia, not a lost unfsynced write. The fault
+still never acts while an earlier victim is down or has not caught up (such a fault is recorded
+`:skipped`; a combined run takes few faults, so read `:faults` against `:skipped`), and its verdict
+(`:lazyfs`) is `:unknown` with NRV-E0607 when no fault lost a byte, a clear was not seen to take,
+a fault op threw, or the final recovery judged no node, and invalid with NRV-E0604 when the final
+recovery left a gateway or the replica down. The final recovery settles every node the fault has
+hit, not only the ones still down. Whether a `--development` replica gets `O_DIRECT` on FUSE is
+not measured (`replica.log` says if the mount refused it). Without the fault the data file is where it was
 and nothing is mounted.
 
 The node image (`node/Dockerfile`) builds LazyFS from one pinned commit (0.3.0, the version
 `jepsen.lazyfs` is written for) in a first stage that fails unless the checkout is exactly that
-commit and the binary finds its libraries; `run.sh` passes `/dev/fuse` to the nodes. The fault's
+commit, the patch applies and the binary finds its libraries; `run.sh` passes `/dev/fuse` to the nodes. The fault's
 op in the history lists `:killed`, `:unsynced-bytes` (what LazyFS held and so lost, by node,
 from its own report) and `:remaining` (the report after the clear, 0 when it took), and each node's `lazyfs.log` is in `store/`.
 

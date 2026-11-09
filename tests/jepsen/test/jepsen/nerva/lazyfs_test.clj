@@ -64,7 +64,7 @@
     (with-redefs [lazyfs/kill!    (fn [_ nodes] (swap! calls conj [:kill nodes]) (vec nodes))
                   lazyfs/lose!    (fn [_ _ nodes] (swap! calls conj [:lose nodes])
                                     (zipmap nodes (repeat {:before 4096, :after 0})))
-                  lazyfs/recover! (fn [_ nodes _ final?]
+                  lazyfs/recover! (fn [_ nodes _ final? _]
                                     (swap! calls conj [:recover nodes final?])
                                     {:nodes (vec nodes), :down [], :pending [], :replica-down []
                                      :unsettled []})]
@@ -99,7 +99,7 @@
           nemesis (lazyfs/nemesis "/opt/nerva" nil)]
       (with-redefs [lazyfs/kill!    (fn [_ nodes] (vec nodes))
                     lazyfs/lose!    (fn [& _] (throw (ex-info "fifo timeout" {})))
-                    lazyfs/recover! (fn [_ nodes _ final?]
+                    lazyfs/recover! (fn [_ nodes _ final? _]
                                       (swap! calls conj [nodes final?])
                                       {:nodes nodes, :down [], :pending [], :replica-down []
                                        :unsettled []})]
@@ -113,7 +113,7 @@
 
 (deftest recover-reports-what-it-left-down
   (let [nemesis (lazyfs/nemesis "/opt/nerva" nil)]
-    (with-redefs [lazyfs/recover! (fn [_ nodes _ _]
+    (with-redefs [lazyfs/recover! (fn [_ nodes _ _ _]
                                     {:nodes nodes, :down [["n2" 1]], :pending [["n3" 0]]
                                      :replica-down ["n2"], :unsettled ["n2"]})]
       (let [done (n/invoke! nemesis five {:type :info, :f :lazyfs-recover})]
@@ -133,7 +133,7 @@
                                        (zipmap nodes (repeat {:before 10, :after 0})))
                     lazyfs/catch-up! (fn [_ nodes _] (swap! calls conj [:catch-up (vec nodes)])
                                        @behind)
-                    lazyfs/recover!  (fn [_ nodes _ _]
+                    lazyfs/recover!  (fn [_ nodes _ _ _]
                                        {:nodes nodes, :down [], :pending [], :replica-down []
                                         :unsettled @behind})]
         (n/invoke! nemesis five (assoc fault-op :value {:scope :minority, :nodes ["n1"]}))
@@ -147,6 +147,46 @@
         (reset! behind [])
         (let [done (n/invoke! nemesis five fault-op)]
           (is (= ["n3"] (:killed (:value done)))))))))
+
+(deftest an-empty-recover-keeps-the-nodes-still-behind
+  (testing "MUST 2: fault, unsettled recover, skip, empty recover, fault"
+    (let [calls    (atom [])
+          behind   (atom ["n1"])
+          nemesis  (lazyfs/nemesis "/opt/nerva" nil)
+          fault-op (fn [node] {:type :info, :f :lose-unfsynced-writes
+                               :value {:scope :minority, :nodes [node]}})]
+      (with-redefs [lazyfs/kill!     (fn [_ nodes] (vec nodes))
+                    lazyfs/lose!     (fn [_ _ nodes] (swap! calls conj [:lose nodes])
+                                       (zipmap nodes (repeat {:before 10, :after 0})))
+                    lazyfs/catch-up! (fn [_ _ _] @behind)
+                    lazyfs/recover!  (fn [_ nodes _ _ _]
+                                       {:nodes nodes, :judged nodes, :down [], :pending []
+                                        :replica-down [], :unsettled (vec (filter (set @behind) nodes))})]
+        (n/invoke! nemesis five (fault-op "n1"))
+        (n/invoke! nemesis five {:type :info, :f :lazyfs-recover})
+        (is (= :not-caught-up (:skipped (:value (n/invoke! nemesis five (fault-op "n3"))))))
+        (let [done (n/invoke! nemesis five {:type :info, :f :lazyfs-recover})]
+          (is (= [] (:started (:value done)))))
+        (reset! calls [])
+        (is (= :not-caught-up (:skipped (:value (n/invoke! nemesis five (fault-op "n3")))))
+            "the empty recover settled nothing, so the gate still holds")
+        (is (= [] @calls))))))
+
+(deftest the-final-recovery-settles-every-node-the-fault-hit
+  (let [seen    (atom nil)
+        nemesis (lazyfs/nemesis "/opt/nerva" nil)]
+    (with-redefs [lazyfs/kill!    (fn [_ nodes] (vec nodes))
+                  lazyfs/lose!    (fn [_ _ nodes] (zipmap nodes (repeat {:before 10, :after 0})))
+                  lazyfs/recover! (fn [_ nodes _ final? watch]
+                                    (when final? (reset! seen [nodes (set watch)]))
+                                    {:nodes nodes, :judged nodes, :down [], :pending []
+                                     :replica-down [], :unsettled []})]
+      (n/invoke! nemesis five {:type :info, :f :lose-unfsynced-writes
+                               :value {:scope :minority, :nodes ["n2"]}})
+      (n/invoke! nemesis five {:type :info, :f :lazyfs-recover})
+      (n/invoke! nemesis five {:type :info, :f :lazyfs-recover :value {:final? true}})
+      (is (= [[] #{"n2"}] @seen)
+          "nothing was pending, but n2 was hit and the last recover was mid-run"))))
 
 (deftest parse-report-reads-both-endings
   (testing "hosted run 42202316064: a clear leaves no total, LazyFS says everything is synced"
@@ -189,12 +229,14 @@
     (with-redefs [c/on-nodes        (fn [_ nodes f]
                                       (into {} (for [n nodes]
                                                  [n (binding [c/*host* n] (f {} n))])))
+                  lazyfs/recover-wait-ms {:mid 1500, :final 1500}
+                  lazyfs/stable-ms 200
                   lazyfs/start-node! (fn [& _] nil)]
       (let [r (lazyfs/recover! {} ["n1" "n2"]
                                {:probe (fn [_] (if (= "n2" c/*host*)
                                                  {:replica :dead, :up [0]}
                                                  {:replica :up, :up [0]}))}
-                               true)]
+                               true [])]
         (is (= ["n2"] (:replica-down r)))
         (is (= ["n2"] (:unsettled r)))))))
 
@@ -212,7 +254,7 @@
         extra))
 
 (defn- recover-pair [value & {:as extra}]
-  (pair :lazyfs-recover (merge {:started ["n1"], :final? true, :down [], :pending []
+  (pair :lazyfs-recover (merge {:started ["n1"], :judged ["n1"], :final? true, :down [], :pending []
                                 :replica-down []}
                                value)
         extra))
@@ -270,6 +312,11 @@
                                            :remaining {"n1" 10}})
                                     (recover-pair {})))]
       (is (some #{:clear-unconfirmed} (:problems r)))))
+  (testing "a final recovery that judged no node proves nothing"
+    (let [r (check-recover (history (fault-pair) (recover-pair {:started [], :judged []})))]
+      (is (= :unknown (:valid? r)))
+      (is (some #{:final-judged-nothing} (:problems r)))
+      (is (= "NRV-E0607" (:code r)) "the harness's, not Nerva's")))
   (testing "a skipped fault is counted, not judged; no fault asked, nothing judged"
     (let [r (check-recover (history (fault-pair)
                                     (pair :lose-unfsynced-writes

@@ -2,8 +2,10 @@
 # Jepsen's `su`, and LazyFS with FUSE for the `lose-unfsynced-writes` fault (slice 9). nerva
 # itself is uploaded by the test (db.clj), so the image does not change with it.
 
-# LazyFS, built from one pinned commit (tag 0.3.0, the version `jepsen.lazyfs` is written for).
-# The commit is the pin: the build fails if the checkout is not exactly it. Its two build-time
+# LazyFS, built from one pinned commit (tag 0.3.0, the version `jepsen.lazyfs` is written for)
+# plus `lazyfs-osync.patch` (P242b, #246): LazyFS drops the acknowledged writes of a file opened
+# O_DSYNC unless it syncs in `lfs_write`. The commit is the pin: the build fails if the checkout
+# is not exactly it, or if the patch does not apply. Its two build-time
 # downloads, toml11 v3.7.1 and spdlog 1.10.0, are named by tag and URL in LazyFS's CMakeLists
 # at this commit, so they move only with the commit.
 FROM debian:bookworm-slim AS lazyfs
@@ -12,12 +14,14 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       build-essential cmake git ca-certificates libfuse3-dev fuse3 \
  && rm -rf /var/lib/apt/lists/*
+COPY lazyfs-osync.patch /tmp/
 RUN git init -q /opt/jepsen/lazyfs \
  && cd /opt/jepsen/lazyfs \
  && git remote add origin https://github.com/dsrhaslab/lazyfs.git \
  && git fetch -q --depth 1 origin "$LAZYFS_COMMIT" \
  && git checkout -q FETCH_HEAD \
  && test "$(git rev-parse HEAD)" = "$LAZYFS_COMMIT" \
+ && git apply --check /tmp/lazyfs-osync.patch && git apply /tmp/lazyfs-osync.patch \
  && (cd libs/libpcache && ./build.sh) \
  && (cd lazyfs && ./build.sh) \
  && test -x lazyfs/build/lazyfs \

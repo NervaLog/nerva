@@ -1,12 +1,13 @@
 (ns jepsen.nerva.lazyfs
   "The `lose-unfsynced-writes` fault (R1 slice 9): each node's data directory is a LazyFS mount
-  (`jepsen.lazyfs`), whose page cache holds every write until it is fsynced (or, as Nerva
-  writes, until a write with O_DSYNC returns, which the kernel turns into a FUSE fsync). Killing
+  (`jepsen.lazyfs`), whose page cache holds every write until it is fsynced. Stock LazyFS does
+  not count a write to a file opened O_DSYNC (Nerva's data file) as synced (#246); the image's
+  LazyFS carries `node/lazyfs-osync.patch`, which does (P242d). Killing
   a replica and then clearing that cache is a crash that loses every write the replica never
   made durable: the fault a power cut makes, which `kill` (SIGKILL, the page cache survives)
   cannot.
 
-  LazyFS is built into the node image (`node/Dockerfile`, at a pinned commit), not by
+  LazyFS is built into the node image (`node/Dockerfile`, at a pinned commit plus that patch), not by
   `jepsen.lazyfs/install!`. The data file is `<mount>/replica.nerva` when the test runs the
   fault (`data-file`), else `<dir>/replica.nerva` as before.
 
@@ -36,10 +37,10 @@
   "data")
 
 (def cache-size
-  "LazyFS's page cache. Eviction is off, so it holds every write not yet synced. If LazyFS does
-  not count O_DSYNC writes as synced (#246), that is everything a replica wrote since its last
-  open (the report showed 0.8 to 1.6 MB after a few minutes), so a long run can fill it: size it
-  from the run length if a run longer than about an hour needs the fault."
+  "LazyFS's page cache. Eviction is off, so it holds every write not yet synced. With the image's
+  patch (P242d) that is little; without it (#246) it is everything a replica wrote since its last
+  open (5.5 MB per node in 5 minutes), so a run much longer than an hour would need it sized
+  from the run length."
   "128MB")
 
 (defn enabled?
@@ -216,21 +217,29 @@
 (defn recover!
   "Starts the replica and gateways on `nodes`, then settles each (`settle-recovery`, waiting at
   most `recover-wait-ms` for the final or mid-run kind) with `(:probe env)` (called on the node,
-  `(probe test)`, returns `{:up :down :pending :replica}`). Returns `{:nodes nodes, :down
-  [[node index]...], :pending [...], :replica-down [node...], :unsettled [node...], :waited-ms
-  {node ms}}`. `db/start!` reports no outcome, so without this a gateway or replica the
-  recovery left down would never be judged (P242b, P242c)."
-  [test nodes env final?]
+  `(probe test)`, returns `{:up :down :pending :replica}`). `watch` are nodes settled and judged
+  without starting anything (the final recovery watches every node the fault has hit, P242d).
+  Returns `{:nodes nodes, :judged [node...], :down [[node index]...], :pending [...],
+  :replica-down [node...], :unsettled [node...], :waited-ms {node ms}}`. `db/start!` reports no
+  outcome, so without this a gateway or replica the recovery left down would never be judged
+  (P242b, P242c)."
+  [test nodes env final? watch]
   (let [probe    (:probe env)
-        outcomes (c/on-nodes test nodes
-                             (fn [test _]
-                               (start-node! test env final?)
-                               (settle-recovery (when probe #(probe test))
-                                                {:wait-ms   (recover-wait-ms (if final? :final :mid))
-                                                 :stable-ms stable-ms})))
+        watch    (vec (remove (set nodes) watch))
+        settle   (fn [test]
+                   (settle-recovery (when probe #(probe test))
+                                    {:wait-ms   (recover-wait-ms (if final? :final :mid))
+                                     :stable-ms stable-ms}))
+        outcomes (merge (c/on-nodes test nodes
+                                    (fn [test _]
+                                      (start-node! test env final?)
+                                      (settle test)))
+                        (when (seq watch)
+                          (c/on-nodes test watch (fn [test _] (settle test)))))
         pairs    (fn [k] (vec (for [n (sort (keys outcomes)), i (get-in outcomes [n k])]
                                 [n i])))]
     {:nodes        (vec nodes)
+     :judged       (vec (sort (keys outcomes)))
      :down         (pairs :down)
      :pending      (pairs :pending)
      :replica-down (vec (sort (for [[n o] outcomes :when (= :dead (:replica o))] n)))
@@ -266,9 +275,10 @@
   `:down` or `:pending`, the replica dead, or did not finish (an `:exception`): a node that
   cannot serve after the restart is an availability finding. Only the final recovery is judged
   for that (`:final? true`): mid-run, a `kill` or `partition` may have removed quorum.
-  `:unknown`, without a code (the harness, not Nerva, is at fault; the run proved nothing), when
+  `:unknown`, with NRV-E0607 (the harness, not Nerva, is at fault; the run proved nothing), when
   the fault was asked for and:
-  a fault op threw; no final recovery ran; no fault took (`:faults` 0) or none lost a byte
+  a fault op threw; no final recovery ran; the final recovery judged no node (it settles every
+  node the fault hit, P242d); no fault took (`:faults` 0) or none lost a byte
   (`:lost-bytes` 0, so the run proved nothing); or a clear was not seen to take. A fault op
   skipped because an earlier victim had not caught up (`:skipped`) is counted, not judged.
   Valid with nothing to judge when the run did not ask for the fault."
@@ -294,6 +304,9 @@
             problems (cond-> []
                        (some :exception done)               (conj :fault-threw)
                        (and asked? (empty? finals))         (conj :no-final-recover)
+                       (and (seq took) (seq finals)
+                            (every? (comp empty? :judged :value) finals))
+                                                            (conj :final-judged-nothing)
                        (and asked? (empty? took))           (conj :no-fault-took)
                        (and (seq took) (zero? lost))        (conj :no-bytes-lost)
                        (seq unclear)                        (conj :clear-unconfirmed))]
@@ -306,6 +319,7 @@
                  :recovers   (count recovers)
                  :final      (count finals)}
           (seq problems) (assoc :problems problems)
+          (and (seq problems) (not (seq judged))) (assoc :code "NRV-E0607")
           (seq judged)   (assoc :code         "NRV-E0604"
                                 :gateways     (vec (distinct (mapcat #(concat (:down (:value %))
                                                                               (:pending (:value %)))
@@ -339,7 +353,8 @@
   [dir env]
   (let [lz        (lazyfs-map dir)
         pending   (atom #{})
-        unsettled (atom #{})]
+        unsettled (atom #{})
+        hit       (atom #{})]
     (reify
       n/Reflection
       (fs [_] #{fault :lazyfs-recover})
@@ -350,14 +365,15 @@
       (invoke! [_ test o]
         (case (:f o)
           :lose-unfsynced-writes
-          (let [late  (vec (remove @pending @unsettled))
-                still (when (or (seq @pending) (seq late))
-                        (into (vec @pending) (catch-up! test late env)))]
+          (let [late   (vec (remove @pending @unsettled))
+                behind (if (seq late) (catch-up! test late env) [])
+                _      (reset! unsettled (set behind))
+                still  (into (vec @pending) behind)]
             (if (seq still)
               (assoc o :value (assoc (:value o) :killed [], :skipped :not-caught-up
                                      :behind (vec (sort still))))
-              (let [_             (reset! unsettled #{})
-                    [killed lost] (invoke-fault test lz (:value o) #(swap! pending into %))]
+              (let [queue!        #(do (swap! pending into %) (swap! hit into %))
+                    [killed lost] (invoke-fault test lz (:value o) queue!)]
                 (assoc o :value (assoc (:value o)
                                        :killed         killed
                                        :unsynced-bytes (update-vals lost :before)
@@ -366,10 +382,14 @@
           :lazyfs-recover
           (let [final? (boolean (:final? (:value o)))
                 nodes  (vec (sort @pending))
-                r      (recover! test nodes env final?)]
+                watch  (when final? (into @hit @unsettled))
+                r      (recover! test nodes env final? watch)]
             (swap! pending #(reduce disj % nodes))
-            (reset! unsettled (set (:unsettled r)))
+            ;; Only the nodes this recovery settled leave `unsettled`: a recover with no nodes
+            ;; (after a skipped fault) settled nothing (P242d).
+            (swap! unsettled #(into (reduce disj % (:judged r)) (:unsettled r)))
             (assoc o :value {:started      nodes
+                             :judged       (:judged r)
                              :final?       final?
                              :down         (:down r)
                              :pending      (:pending r)
