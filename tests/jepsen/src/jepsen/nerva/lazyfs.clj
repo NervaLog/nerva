@@ -9,12 +9,14 @@
 
   LazyFS is built into the node image (`node/Dockerfile`, at a pinned commit plus that patch), not by
   `jepsen.lazyfs/install!`. The data file is `<mount>/replica.nerva` when the test runs the
-  fault (`data-file`), else `<dir>/replica.nerva` as before.
+  fault (`data-file`), else `<dir>/replica.nerva` as before. It is formatted on the backing path
+  before the mount (`format-file`), so LazyFS's cache starts empty (P242h).
 
   The fault's op value is `{:scope :minority|:all, :nodes [...]}`; for `:all` also `:crash`, a
   majority killed first. The completion adds `:killed` (the nodes killed) and `:unsynced-bytes`
-  (`{node bytes}`: what LazyFS held unsynced, and so lost), `:remaining` and `:sentinel`
-  (`{node :gone|:truncated|:survived|:unwritten}`, P242e). Its undo, `:lazyfs-recover`, starts
+  (`{node bytes}`: what LazyFS held unsynced, and so lost), `:remaining`, `:cache-usage`
+  (`{node percent}`, LazyFS's cache before the clear: 100 means it wrote through, P242h) and
+  `:sentinel` (`{node :gone|:truncated|:survived|:unwritten|:unchecked}`, P242e). Its undo, `:lazyfs-recover`, starts
   the replica and the gateways again on the nodes the fault killed.
   The nemesis kills through `db/kill!` and starts through `db/start!`, so it needs nothing from
   `jepsen.nerva.db`."
@@ -38,10 +40,11 @@
   "data")
 
 (def cache-size
-  "LazyFS's page cache. Eviction is off, so it holds every write not yet synced. With the image's
-  patch (P242d) that is little; without it (#246) it is everything a replica wrote since its last
-  open (5.5 MB per node in 5 minutes), so a run much longer than an hour would need it sized
-  from the run length."
+  "LazyFS's page cache. Eviction is off, so every page written through the mount stays until a
+  clear. The data file is formatted on the backing path before the mount (`format-file`, P242h),
+  so the cache starts empty: it holds only what the replica writes (5.5 MB per node in 5
+  minutes), and a run much longer than an hour could fill it. A full cache makes LazyFS write
+  through, which `lose!` records (`:cache-usage`) and the checker judges (`:cache-full`)."
   "128MB")
 
 (defn enabled?
@@ -59,6 +62,18 @@
   "Where the replica's data file is: in the mount when the test runs the fault, else `plain`."
   [test dir plain]
   (if (enabled? test) (str dir "/" mount-name "/replica.nerva") plain))
+
+(defn backing-dir
+  "Where LazyFS keeps the files behind the mount at `dir/data`: `dir/data.lazyfs/data`."
+  [dir]
+  (:data-dir (lazyfs-map dir)))
+
+(defn format-file
+  "Where `nerva format` writes the data file: on the backing path when the test runs the fault,
+  not through the mount, so the format's writes do not fill LazyFS's cache (P242h); else `plain`.
+  The replica opens `data-file` and finds the same file."
+  [test dir plain]
+  (if (enabled? test) (str (backing-dir dir) "/replica.nerva") plain))
 
 (defn mount!
   "Mounts LazyFS on this node and waits for it (bounded by `jepsen.lazyfs`'s own await)."
@@ -109,7 +124,7 @@
   (vec nodes))
 
 (def report-wait-polls
-  "How many times (200 ms apart) `unsynced-bytes` looks for LazyFS's report in its log."
+  "How many times (200 ms apart) `await-line` looks for LazyFS's answer in its log."
   10)
 
 (def report-pattern
@@ -117,11 +132,15 @@
   every block is synced (no total is printed then: hosted run 42202316064)."
   "total number of bytes un-fsynced\\|all data blocks are synced")
 
-(defn report-count
-  "How many report-ending lines LazyFS's log holds."
-  [lz]
-  (parse-long (str/trim (c/exec :sh :-c (str "grep -c '" report-pattern "' "
-                                              (:log-file lz) " || true")))))
+(def usage-pattern
+  "The line `lazyfs::display-cache-usage` logs: `cache usage (%pages) is 29.3%`."
+  "cache usage (")
+
+(defn- count-lines
+  "How many lines of LazyFS's log match `pattern`."
+  [lz pattern]
+  (parse-long (str/trim (c/exec :sh :-c (str "grep -c '" pattern "' " (:log-file lz)
+                                              " || true")))))
 
 (defn parse-report
   "The bytes a report-ending line says are unsynced: the total, 0 for \"all data blocks are
@@ -130,49 +149,91 @@
   (cond (str/includes? line "all data blocks are synced") 0
         :else (some->> (re-find #"un-fsynced: (\d+)" line) second parse-long)))
 
-(defn unsynced-bytes
-  "Asks LazyFS to report the bytes written and not fsynced, and reads the report from its log;
-  nil if it does not appear within `report-wait-polls` polls. The evidence that the fault took
-  something: a replica that is quiet has none to lose."
-  [lz]
-  (let [before (report-count lz)]
-    (lazyfs/fifo! lz "lazyfs::unsynced-data-report")
+(defn parse-usage
+  "The percent of its cache LazyFS says it uses, from a `display-cache-usage` line; nil for
+  anything else."
+  [line]
+  (some->> (re-find #"is ([0-9.]+)%" line) second parse-double))
+
+(defn cache-full?
+  "Is `usage` (percent) a full cache? LazyFS writes through exactly at 100 (`cache_full`)."
+  [usage]
+  (boolean (and usage (<= 100.0 usage))))
+
+(defn- await-line
+  "Sends `command` to LazyFS and returns the last log line matching `pattern` that it wrote in
+  answer; nil if none appears within `report-wait-polls` polls (about 2 s plus the fifo's 1 s)."
+  [lz command pattern]
+  (let [before (count-lines lz pattern)]
+    (lazyfs/fifo! lz command)
     (loop [polls report-wait-polls]
-      (if (< before (report-count lz))
-        (parse-report (c/exec :sh :-c (str "grep '" report-pattern "' " (:log-file lz)
-                                           " | tail -1")))
+      (if (< before (count-lines lz pattern))
+        (c/exec :sh :-c (str "grep '" pattern "' " (:log-file lz) " | tail -1"))
         (when (pos? polls)
           (Thread/sleep 200)
           (recur (dec polls)))))))
+
+(defn unsynced-bytes
+  "Asks LazyFS to report the bytes written and not fsynced, and reads the report from its log;
+  nil if it does not appear. The evidence that the fault took something: a replica that is quiet
+  has none to lose."
+  [lz]
+  (some-> (await-line lz "lazyfs::unsynced-data-report" report-pattern) parse-report))
+
+(defn cache-usage
+  "Asks LazyFS how full its cache is, in percent; nil if it does not answer. A full cache writes
+  through, and then a clear loses nothing."
+  [lz]
+  (some-> (await-line lz "lazyfs::display-cache-usage" usage-pattern) parse-usage))
 
 (def clear-wait-polls
   "How many times `clear!` asks LazyFS for its unsynced bytes after a clear, hoping for 0."
   5)
 
 (def sentinel-name
-  "The file `lose!` writes on the mount, without syncing it, before every clear (P242e)."
+  "The file `lose!` writes on the mount, without syncing it, before the clear (P242e, P242h)."
   "lazyfs-sentinel")
 
 (def sentinel-bytes
   "The sentinel's size: one 4 KiB block."
   4096)
 
+(def fs-timeout-s
+  "A command on the mount (`dd`, `stat`, `rm`) is killed after this long: a wedged LazyFS does
+  not fail them, it blocks them, and the single nemesis worker must not wait forever."
+  10)
+
 (defn classify-sentinel
   "What became of the sentinel: `written` is its size before the clear, `after` its size after
-  (nil when the file is gone). `:gone` and `:truncated` mean the clear lost the unsynced bytes;
-  `:survived` means it did not (the fault did not bite); `:unwritten` means the sentinel never
-  reached `written` bytes before the clear, so nothing was proved."
+  (nil when the file is gone, `:timeout` when the mount did not answer). `:gone` and `:truncated`
+  mean the clear lost the unsynced bytes; `:survived` means it did not (the fault did not bite:
+  a full cache wrote the sentinel through); `:unwritten` means the sentinel never reached
+  `written` bytes before the clear, and `:unchecked` that its size after was not read: nothing
+  was proved."
   [written after]
   (cond (not= sentinel-bytes written) :unwritten
+        (= :timeout after)            :unchecked
         (nil? after)                  :gone
         (< after written)             :truncated
         :else                         :survived))
 
+(defn- on-mount
+  "Runs `cmd` on this node under `timeout`; returns `[exit-code stdout]`, 124 or 137 when it was
+  killed."
+  [cmd]
+  (let [out (str/trim (c/exec :sh :-c (str "out=$(timeout -k 2 " fs-timeout-s " " cmd
+                                           " 2>/dev/null); echo \"$?\"; echo \"$out\"")))
+        [rc & more] (str/split-lines out)]
+    [(parse-long rc) (str/join "\n" more)]))
+
 (defn- size-of
-  "The size in bytes of `path` on this node; nil when it does not exist."
+  "The size in bytes of `path` on this node; nil when it does not exist, `:timeout` when the
+  mount did not answer within `fs-timeout-s`."
   [path]
-  (let [out (str/trim (c/exec :sh :-c (str "stat -c %s " path " 2>/dev/null || echo gone")))]
-    (when-not (= "gone" out) (parse-long out))))
+  (let [[rc out] (on-mount (str "stat -c %s " path))]
+    (cond (zero? rc)            (parse-long out)
+          (#{124 137} rc)       :timeout
+          :else                 nil)))
 
 (defn clear!
   "Clears LazyFS's cache, then reads its unsynced bytes again until they are 0
@@ -186,33 +247,37 @@
         (recur (dec polls))))))
 
 (defn lose!
-  "On `nodes` (the replica must be dead there): reads the unsynced bytes, clears LazyFS's cache,
-  writes the sentinel on the mount without syncing it, clears again. Each clear is followed by
-  reads until the unsynced bytes are 0 (`clear!`), so the op ends only once the clears have been
-  applied and a fast restart's open-time fsync cannot make the lost bytes durable. Returns
-  `{node {:before bytes, :after bytes, :sentinel kw}}`: `:before` is what the replica left
-  unsynced; `:after` is not 0 when a clear was not seen to take; `:sentinel` is
-  `classify-sentinel`'s verdict, which is what proves the clear bit even when the replica,
-  writing O_DSYNC, left nothing unsynced (P242e). The first clear comes before the sentinel
-  because a full LazyFS cache writes through (P242f): the replica's data file, clean after its
-  format, fills the 128 MB cache, and an unsynced write is then durable and unreported. The
-  sentinel is removed afterwards."
+  "On `nodes` (the replica must be dead there): reads the cache usage and the unsynced bytes,
+  writes the sentinel on the mount without syncing it, clears LazyFS's cache, then reads until
+  the unsynced bytes are 0 (`clear!`), so the op ends only once the clear has been applied and a
+  fast restart's open-time fsync cannot make the lost bytes durable. Returns
+  `{node {:before bytes, :after bytes, :sentinel kw, :cache-usage percent}}`: `:before` is what
+  the replica left unsynced; `:after` is not 0 when the clear was not seen to take; `:sentinel`
+  is `classify-sentinel`'s verdict, which proves the clear bit even when the replica, writing
+  O_DSYNC, left nothing unsynced (P242e); `:cache-usage` is how full the cache was, 100 when
+  LazyFS was writing through and the clear lost nothing (P242h). The sentinel comes before the
+  first clear, so the first fault on a node is checked too; the cache starts empty because the
+  data file is formatted outside the mount (`format-file`). The sentinel is removed afterwards.
+  Each command on the mount is bounded (`fs-timeout-s`); the longest a node takes is about 75 s
+  (two reads of 3 s, the fifo's 1 s and up to 6 reports of 3 s, and five mount commands of 10
+  s), and nodes go in parallel."
   [test lz nodes]
   (c/on-nodes test nodes
               (fn [_ _]
                 (let [path    (str (:dir lz) "/" sentinel-name)
+                      usage   (cache-usage lz)
                       before  (unsynced-bytes lz)
-                      first-a (clear! lz)
-                      _       (c/exec :rm :-f path)
-                      _       (c/exec :dd "if=/dev/zero" (str "of=" path)
-                                      (str "bs=" sentinel-bytes) "count=1" "status=none")
+                      _       (on-mount (str "rm -f " path))
+                      _       (on-mount (str "dd if=/dev/zero of=" path " bs=" sentinel-bytes
+                                             " count=1 status=none"))
                       written (size-of path)
                       after   (clear! lz)
                       status  (classify-sentinel written (size-of path))]
-                  (c/exec :rm :-f path)
-                  {:before before
-                   :after  (if (= 0 first-a) after first-a)
-                   :sentinel status}))))
+                  (on-mount (str "rm -f " path))
+                  {:before      before
+                   :after       after
+                   :sentinel    status
+                   :cache-usage usage}))))
 
 (def recover-wait-ms
   "How long a recovery waits for a restarted node to serve (`settle-recovery`). The mid-run wait
@@ -329,7 +394,8 @@
   node the fault hit, P242d); no fault took (`:faults` 0); a clear was not seen to take
   (`:remaining` not 0); or the sentinel `lose!` writes unsynced before each clear (P242e) was not
   proved lost: it `:survived` (`:sentinel-survived`, with a `:reason`: the fault did not bite) or
-  was not checked. The bytes LazyFS lost (`:lost-bytes`) are reported, not judged: with the
+  was not checked; or a fault met a full cache (`:cache-full`: LazyFS wrote through, so the
+  clear lost nothing, P242h). The bytes LazyFS lost (`:lost-bytes`) are reported, not judged: with the
   image's O_DSYNC patch (P242d) Nerva leaves none unsynced, so only the sentinel shows the
   clear bit. A fault op skipped because an earlier victim had not caught up (`:skipped`) is
   counted, not judged.
@@ -356,7 +422,11 @@
                        (get-in (:value o) [:sentinel n]))
             survived (count (filter #{:survived} sentinel))
             unproved (count (remove #{:gone :truncated :survived} sentinel))
-            asked?   (boolean (or (:lazyfs test) (seq pairs)))
+            ;; Asked for: the test runs the fault, or the history holds one of its ops. A run
+            ;; with only kill, partition or gateway ops (the nightly) never asked (P242h).
+            asked?   (boolean (or (:lazyfs test) (seq done) (seq recovers)))
+            usage    (for [o took, [n u] (:cache-usage (:value o)) :when u] [n u])
+            full     (vec (distinct (for [[n u] usage :when (cache-full? u)] n)))
             problems (cond-> []
                        (some :exception done)               (conj :fault-threw)
                        (and asked? (empty? finals))         (conj :no-final-recover)
@@ -364,6 +434,7 @@
                             (every? (comp empty? :judged :value) finals))
                                                             (conj :final-judged-nothing)
                        (and asked? (empty? took))           (conj :no-fault-took)
+                       (seq full)                           (conj :cache-full)
                        (pos? survived)                      (conj :sentinel-survived)
                        (pos? unproved)                      (conj :sentinel-unchecked)
                        (seq unclear)                        (conj :clear-unconfirmed))]
@@ -373,11 +444,13 @@
                  :faults     (count took)
                  :skipped    (count skipped)
                  :lost-bytes lost
+                 :cache-usage-max (reduce max 0 (map second usage))
                  :sentinel   (frequencies sentinel)
                  :recovers   (count recovers)
                  :final      (count finals)}
           (seq problems) (assoc :problems problems)
           (and (seq problems) (not (seq judged))) (assoc :code "NRV-E0607")
+          (seq full)     (assoc :cache-full full)
           (pos? survived) (assoc :reason (str "the fault did not bite: an unsynced sentinel file "
                                               "survived a LazyFS clear on " survived " node(s)"))
           (seq judged)   (assoc :code         "NRV-E0604"
@@ -438,7 +511,8 @@
                                        :killed         killed
                                        :unsynced-bytes (update-vals lost :before)
                                        :remaining      (update-vals lost :after)
-                                       :sentinel       (update-vals lost :sentinel))))))
+                                       :sentinel       (update-vals lost :sentinel)
+                                       :cache-usage    (update-vals lost :cache-usage))))))
 
           :lazyfs-recover
           (let [final? (boolean (:final? (:value o)))

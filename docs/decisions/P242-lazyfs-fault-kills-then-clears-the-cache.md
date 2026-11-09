@@ -47,6 +47,9 @@ its completion carries `:down` and `:pending` as `[node index]` pairs, and
 
 ## P242c: the fault is sound whether or not LazyFS honours O_DSYNC
 
+(Superseded in part by P242d: the image's LazyFS now honours `O_DSYNC`, so a clear is no longer
+amnesia. The sections below describe the harness before the patch and are kept as the record.)
+
 The Opus review of this pull request found that P242's claim "the slice's claim is the minority
 fault" does not hold if LazyFS drops `O_DSYNC` writes (#246): a clear then wipes everything the
 replica wrote since it last opened its file (`src/io/linux.zig:1653-1662` fsyncs only at open),

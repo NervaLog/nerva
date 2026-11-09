@@ -526,11 +526,14 @@
           (c/exec :chmod "+x" binary)
           (install-cluster-key!)
           (create-gateway-users!)
-          (when (lazyfs/enabled? test) (lazyfs/mount! dir))
+          ;; With the fault, format on the backing path and mount after, so the format's writes
+          ;; do not fill LazyFS's cache (P242h).
+          (when (lazyfs/enabled? test) (c/exec :mkdir :-p (lazyfs/backing-dir dir)))
           (c/exec binary :format (str "--cluster=" cluster)
                   (str "--replica=" (replica-index test node))
                   (str "--replica-count=" (count (:nodes test)))
-                  :--development (lazyfs/data-file test dir data-file))
+                  :--development (lazyfs/format-file test dir data-file))
+          (when (lazyfs/enabled? test) (lazyfs/mount! dir))
           (start-replica! test)
           (start-api! test))
         (doseq [index (range (gateways test node))]

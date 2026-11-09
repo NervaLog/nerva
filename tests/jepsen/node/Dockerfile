@@ -3,13 +3,16 @@
 # itself is uploaded by the test (db.clj), so the image does not change with it.
 
 # LazyFS, built from one pinned commit (tag 0.3.0, the version `jepsen.lazyfs` is written for)
-# plus `lazyfs-osync.patch` (P242b, #246): LazyFS drops the acknowledged writes of a file opened
+# plus `lazyfs-osync.patch` (P242d, #246): LazyFS drops the acknowledged writes of a file opened
 # O_DSYNC unless it syncs in `lfs_write`. The commit is the pin: the build fails if the checkout
 # is not exactly it, or if the patch does not apply. Its two build-time
 # downloads, toml11 v3.7.1 and spdlog 1.10.0, are named by tag and URL in LazyFS's CMakeLists
 # at this commit, so they move only with the commit.
 FROM debian:bookworm-slim AS lazyfs
 ARG LAZYFS_COMMIT=9c5685e828da8b5d113d2f9134f6671e481d7162
+# `no` builds stock LazyFS, the teeth canary of the lose-unfsynced-writes checkers (P242h): with
+# `--lazyfs-all-nodes` they must fail on it. Never `no` in a real run.
+ARG LAZYFS_PATCH=yes
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       build-essential cmake git ca-certificates libfuse3-dev fuse3 \
@@ -21,7 +24,7 @@ RUN git init -q /opt/jepsen/lazyfs \
  && git fetch -q --depth 1 origin "$LAZYFS_COMMIT" \
  && git checkout -q FETCH_HEAD \
  && test "$(git rev-parse HEAD)" = "$LAZYFS_COMMIT" \
- && git apply --check /tmp/lazyfs-osync.patch && git apply /tmp/lazyfs-osync.patch \
+ && if [ "$LAZYFS_PATCH" = yes ]; then git apply --check /tmp/lazyfs-osync.patch && git apply /tmp/lazyfs-osync.patch; fi \
  && (cd libs/libpcache && ./build.sh) \
  && (cd lazyfs && ./build.sh) \
  && test -x lazyfs/build/lazyfs \

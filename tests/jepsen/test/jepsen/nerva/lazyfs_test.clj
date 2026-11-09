@@ -360,6 +360,21 @@
       (is (= 1 (:skipped r))))
     (is (true? (:valid? (check-recover {} []))))))
 
+(deftest a-run-that-never-asked-for-the-fault-is-not-judged-by-it
+  ;; Review MUST 1: kill, partition and gateway runs (the nightly, the default jepsen.yml run,
+  ;; demo steps 1 and 2) have nemesis ops and `:lazyfs false`; they were `:unknown` NRV-E0607.
+  (let [others (history (pair :kill {:nodes ["n1"]}) (pair :start {:nodes ["n1"]})
+                        (pair :start-partition {:grudge {}}) (pair :stop-partition {}))]
+    (doseq [test [{:lazyfs false} {}]]
+      (let [r (check-recover test others)]
+        (is (true? (:valid? r)) (pr-str test))
+        (is (nil? (:code r)))
+        (is (nil? (:problems r)))))
+    (testing "a run that asked for the fault, and only killed, is still unknown"
+      (is (= :unknown (:valid? (check-recover {:lazyfs true} others)))))
+    (testing "a fault or recover op in the history is asking, whatever the test map says"
+      (is (some #{:no-fault-took} (:problems (check-recover {} (history (recover-pair {})))))))))
+
 (deftest sentinel-classification
   (is (= :gone (lazyfs/classify-sentinel 4096 nil)))
   (is (= :truncated (lazyfs/classify-sentinel 4096 0)))
@@ -387,22 +402,73 @@
   (is (= [:lose-unfsynced-writes :kill] (core/parse-faults "lose-unfsynced-writes,kill")))
   (is (contains? core/faults lazyfs/fault)))
 
-(deftest lose-clears-before-the-sentinel-so-a-full-cache-cannot-hide-it
-  (testing "P242f: a full LazyFS cache writes through, so the sentinel is written after a clear"
-    (let [st (atom {:full? true, :file nil})]
-      (with-redefs [c/on-nodes (fn [_ nodes f]
-                                 (into {} (for [n nodes] [n (binding [c/*host* n] (f {} n))])))
-                    c/exec     (fn [& args]
-                                 (when (= :dd (first args))
-                                   (swap! st assoc :file (if (:full? @st) :durable :cached)))
-                                 "")
-                    lazyfs/unsynced-bytes (fn [_] (if (= :cached (:file @st)) 4096 0))
-                    lazyfs/size-of       (fn [_] (when (#{:durable :cached} (:file @st)) 4096))
-                    upstream-lazyfs/lose-unfsynced-writes!
-                    (fn [_]
-                      (swap! st #(cond-> (assoc % :full? false)
-                                   (= :cached (:file %)) (assoc :file :lost))))]
-        (let [r (get (lazyfs/lose! {} {:dir "/opt/nerva/data"} ["n1"]) "n1")]
-          (is (= :gone (:sentinel r)) "the second clear lost the cached sentinel")
-          (is (= 0 (:before r)) "the sentinel is not counted as the replica's bytes")
-          (is (= 0 (:after r))))))))
+(defn- fake-node
+  "Redefs for `lose!` against one node whose LazyFS cache is `full?` or empty: a sentinel written
+  into a full cache is durable, into an empty one is lost by the clear."
+  [st f]
+  (with-redefs [c/on-nodes (fn [_ nodes g]
+                             (into {} (for [n nodes] [n (binding [c/*host* n] (g {} n))])))
+                c/exec     (fn [& _] "")
+                lazyfs/on-mount (fn [cmd]
+                                  (when (re-find #"^dd " cmd)
+                                    (swap! st assoc :file (if (:full? @st) :durable :cached)))
+                                  [0 ""])
+                lazyfs/cache-usage    (fn [_] (if (:full? @st) 100.0 12.5))
+                lazyfs/unsynced-bytes (fn [_] 0)
+                lazyfs/size-of        (fn [_] (when (#{:durable :cached} (:file @st)) 4096))
+                upstream-lazyfs/lose-unfsynced-writes!
+                (fn [_] (swap! st #(cond-> % (= :cached (:file %)) (assoc :file :lost))))]
+    (f)))
+
+(deftest lose-writes-the-sentinel-before-the-first-clear
+  (testing "P242h: an empty cache loses the sentinel on the very first clear"
+    (let [st (atom {:full? false, :file nil})
+          r  (fake-node st #(get (lazyfs/lose! {} {:dir "/opt/nerva/data"} ["n1"]) "n1"))]
+      (is (= :gone (:sentinel r)))
+      (is (= 12.5 (:cache-usage r)))
+      (is (= 0 (:before r)) "the sentinel is not counted as the replica's bytes")))
+  (testing "P242h: a full cache wrote the sentinel through; the first fault is not hidden"
+    (let [st (atom {:full? true, :file nil})
+          r  (fake-node st #(get (lazyfs/lose! {} {:dir "/opt/nerva/data"} ["n1"]) "n1"))]
+      (is (= :survived (:sentinel r)))
+      (is (= 100.0 (:cache-usage r))))))
+
+(deftest a-wedged-mount-is-unchecked-not-a-hang
+  (is (= :unchecked (lazyfs/classify-sentinel 4096 :timeout)))
+  (with-redefs [c/exec (fn [& _] "124\n")]
+    (is (= :timeout (#'lazyfs/size-of "/m/x"))))
+  (with-redefs [c/exec (fn [& _] "1\n")]
+    (is (nil? (#'lazyfs/size-of "/m/x"))))
+  (with-redefs [c/exec (fn [& _] "0\n4096")]
+    (is (= 4096 (#'lazyfs/size-of "/m/x")))))
+
+(deftest cache-usage-lines
+  (is (= 29.3 (lazyfs/parse-usage "[lazyfs.cmds]: cache usage (%pages) is 29.3%")))
+  (is (= 0.0 (lazyfs/parse-usage "[x] cache usage (%pages) is 0%")))
+  (is (nil? (lazyfs/parse-usage "nothing")))
+  (is (lazyfs/cache-full? 100.0))
+  (is (not (lazyfs/cache-full? 99.9)))
+  (is (not (lazyfs/cache-full? nil))))
+
+(deftest data-is-formatted-outside-the-mount
+  (is (= "/opt/nerva/data.lazyfs/data/replica.nerva"
+         (lazyfs/format-file {:lazyfs true} "/opt/nerva" "/x")))
+  (is (= "/x" (lazyfs/format-file {} "/opt/nerva" "/x"))))
+
+(deftest a-full-cache-is-reported-not-counted-clean
+  (let [r (check-recover (history (pair :lose-unfsynced-writes
+                                        {:killed ["n1"], :unsynced-bytes {"n1" 0}
+                                         :remaining {"n1" 0}, :sentinel {"n1" :gone}
+                                         :cache-usage {"n1" 100.0}})
+                                  (recover-pair {})))]
+    (is (= :unknown (:valid? r)))
+    (is (some #{:cache-full} (:problems r)))
+    (is (= ["n1"] (:cache-full r)))
+    (is (= 100.0 (:cache-usage-max r))))
+  (let [r (check-recover (history (pair :lose-unfsynced-writes
+                                        {:killed ["n1"], :unsynced-bytes {"n1" 0}
+                                         :remaining {"n1" 0}, :sentinel {"n1" :truncated}
+                                         :cache-usage {"n1" 3.5}})
+                                  (recover-pair {})))]
+    (is (true? (:valid? r)))
+    (is (= 3.5 (:cache-usage-max r)))))

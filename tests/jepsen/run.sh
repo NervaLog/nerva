@@ -35,7 +35,8 @@ cleanup() {
 trap cleanup EXIT
 cleanup
 
-docker build -q -t "$image" "$here/node" > /dev/null
+# JEPSEN_LAZYFS_PATCH=no builds stock LazyFS: the teeth canary of the lose-unfsynced-writes fault.
+docker build -q --build-arg "LAZYFS_PATCH=${JEPSEN_LAZYFS_PATCH:-yes}" -t "$image" "$here/node" > /dev/null
 docker network create --subnet "$subnet" "$network" > /dev/null
 # LazyFS (the lose-unfsynced-writes fault) mounts a FUSE filesystem in each node: it needs the
 # host's /dev/fuse, which --privileged also exposes; passing it by name keeps it explicit.

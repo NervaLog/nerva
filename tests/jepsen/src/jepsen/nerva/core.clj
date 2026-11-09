@@ -143,7 +143,7 @@
     :default  8
     :parse-fn parse-long
     :validate [pos? "Must be positive"]]
-   [nil "--lazyfs-all-nodes" "lose-unfsynced-writes: also lose writes on every node after a quorum crash. Off: LazyFS likely drops the replica's O_DSYNC writes, so the whole cluster would come back empty (#246, docs/demos/r1.md)."]
+   [nil "--lazyfs-all-nodes" "lose-unfsynced-writes: also lose writes on every node after a quorum crash. Off until a hosted run of it with the image's O_DSYNC patch is recorded (P242d, docs/demos/r1.md)."]
    [nil "--nerva-binary PATH" "The nerva binary to install on every node."
     :default "../../zig-out/bin/nerva"]])
 

@@ -20,6 +20,11 @@ on:
         type: boolean
         required: false
         default: false
+      unpatched-lazyfs:
+        description: "Canary: build the node image with stock LazyFS, without lazyfs-osync.patch (P242h); run it with --nemesis lose-unfsynced-writes --lazyfs-all-nodes, it must fail"
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
@@ -32,6 +37,7 @@ env:
   # A push has no inputs: it runs this.
   ARGS: ${{ inputs.args || 'test --workload bank --nemesis kill,partition --time-limit 300' }}
   TEETH: ${{ inputs.teeth && 'true' || 'false' }}
+  JEPSEN_LAZYFS_PATCH: ${{ inputs.unpatched-lazyfs && 'no' || 'yes' }}
 
 jobs:
   jepsen:
