@@ -41,11 +41,29 @@
 
 (def cache-size
   "LazyFS's page cache. Eviction is off, so every page written through the mount stays until a
-  clear. The data file is formatted on the backing path before the mount (`format-file`, P242h),
-  so the cache starts empty: it holds only what the replica writes (5.5 MB per node in 5
-  minutes), and a run much longer than an hour could fill it. A full cache makes LazyFS write
-  through, which `lose!` records (`:cache-usage`) and the checker judges (`:cache-full`)."
-  "128MB")
+  clear, but the cache is keyed by file offset: it can never hold more than the files on the
+  mount, and the only large one is the replica's data file (1.06 GiB, `nerva format
+  --development`). The cache is sized above that file (`cache-bytes-min`), so it cannot fill
+  whatever the run's length (P242i). The measured fill rate is 15 to 50 MB a node a minute, so
+  the 128 MB of P242h was full after about 6 minutes (run 42692440134). Pages are allocated as
+  they are written: a node holds only what its replica touched. `check-cache-bound!` asserts the
+  bound after the format. A full cache would make LazyFS write through, which `lose!` records
+  (`:cache-usage`) and the checker judges (`:cache-full`)."
+  "1200MB")
+
+(def cache-bytes-min
+  "The cache size in bytes, taking LazyFS's `MB` as 10^6 (the smaller reading)."
+  1200000000)
+
+(def sentinel-slack-bytes
+  "What the mount may hold beyond the data file: the sentinel, and room for a stray file."
+  (* 16 1024 1024))
+
+(defn cache-covers?
+  "Can the cache hold a data file of `file-bytes` and the slack on top?"
+  [file-bytes]
+  (boolean (and (integer? file-bytes)
+                (<= (+ file-bytes sentinel-slack-bytes) cache-bytes-min))))
 
 (defn enabled?
   "Does the test run the fault (so mount LazyFS)?"
@@ -74,6 +92,20 @@
   The replica opens `data-file` and finds the same file."
   [test dir plain]
   (if (enabled? test) (str (backing-dir dir) "/replica.nerva") plain))
+
+(defn check-cache-bound!
+  "Throws, a harness failure, when the data file just formatted at `format-file` does not fit the
+  cache (`cache-covers?`), so a change to the format's size cannot silently bring back a cache
+  that fills (P242i). Run on the node, after the format and before the mount. Nothing with the
+  fault off."
+  [test dir plain]
+  (when (enabled? test)
+    (let [path (format-file test dir plain)
+          size (parse-long (str/trim (c/exec :stat :-c "%s" path)))]
+      (when-not (cache-covers? size)
+        (throw (ex-info (str "NRV-E0607: the data file (" size " bytes) does not fit LazyFS's "
+                             "cache (" cache-size "); raise cache-bytes-min and cache-size (P242i)")
+                        {:size size, :cache cache-bytes-min}))))))
 
 (defn mount!
   "Mounts LazyFS on this node and waits for it (bounded by `jepsen.lazyfs`'s own await)."
@@ -208,32 +240,37 @@
   (nil when the file is gone, `:timeout` when the mount did not answer). `:gone` and `:truncated`
   mean the clear lost the unsynced bytes; `:survived` means it did not (the fault did not bite:
   a full cache wrote the sentinel through); `:unwritten` means the sentinel never reached
-  `written` bytes before the clear, and `:unchecked` that its size after was not read: nothing
-  was proved."
+  `written` bytes before the clear, and `:unchecked` that its size after was not read (a timeout,
+  or `:error`: `stat` failed for a reason other than the file not existing, such as a dead
+  mount): nothing was proved."
   [written after]
   (cond (not= sentinel-bytes written) :unwritten
-        (= :timeout after)            :unchecked
+        (keyword? after)              :unchecked
         (nil? after)                  :gone
         (< after written)             :truncated
         :else                         :survived))
 
 (defn- on-mount
-  "Runs `cmd` on this node under `timeout`; returns `[exit-code stdout]`, 124 or 137 when it was
-  killed."
-  [cmd]
+  "Runs `cmd` on this node under `timeout`; returns `[exit-code output]`, 124 or 137 when it was
+  killed. The output is stdout, and stdout and stderr together when `both?`."
+  [cmd & [both?]]
   (let [out (str/trim (c/exec :sh :-c (str "out=$(timeout -k 2 " fs-timeout-s " " cmd
-                                           " 2>/dev/null); echo \"$?\"; echo \"$out\"")))
+                                           (if both? " 2>&1" " 2>/dev/null")
+                                           "); echo \"$?\"; echo \"$out\"")))
         [rc & more] (str/split-lines out)]
     [(parse-long rc) (str/join "\n" more)]))
 
 (defn- size-of
-  "The size in bytes of `path` on this node; nil when it does not exist, `:timeout` when the
-  mount did not answer within `fs-timeout-s`."
+  "The size in bytes of `path` on this node; nil only when it does not exist (ENOENT), `:timeout`
+  when the mount did not answer within `fs-timeout-s`, `:error` for any other failure of `stat`
+  (a dead FUSE mount says \"Transport endpoint is not connected\"): that is not proof that a clear
+  dropped the file."
   [path]
-  (let [[rc out] (on-mount (str "stat -c %s " path))]
-    (cond (zero? rc)            (parse-long out)
-          (#{124 137} rc)       :timeout
-          :else                 nil)))
+  (let [[rc out] (on-mount (str "stat -c %s " path) true)]
+    (cond (zero? rc)                          (parse-long out)
+          (#{124 137} rc)                     :timeout
+          (str/includes? out "No such file")  nil
+          :else                               :error)))
 
 (defn clear!
   "Clears LazyFS's cache, then reads its unsynced bytes again until they are 0
@@ -397,7 +434,10 @@
   was not checked; or a fault met a full cache (`:cache-full`: LazyFS wrote through, so the
   clear lost nothing, P242h). The bytes LazyFS lost (`:lost-bytes`) are reported, not judged: with the
   image's O_DSYNC patch (P242d) Nerva leaves none unsynced, so only the sentinel shows the
-  clear bit. A fault op skipped because an earlier victim had not caught up (`:skipped`) is
+  clear bit; a run that loses some carries `:warnings [:unsynced-bytes-lost]` (not judged: a Nerva
+  that stopped syncing, or an unpatched LazyFS, shows here, P242i). `:cache-usage-unread` counts the
+  faults whose cache usage LazyFS did not answer, so `:cache-usage-max` is not mistaken for a
+  complete measurement. A fault op skipped because an earlier victim had not caught up (`:skipped`) is
   counted, not judged.
   Valid with nothing to judge when the run did not ask for the fault."
   []
@@ -426,6 +466,7 @@
             ;; with only kill, partition or gateway ops (the nightly) never asked (P242h).
             asked?   (boolean (or (:lazyfs test) (seq done) (seq recovers)))
             usage    (for [o took, [n u] (:cache-usage (:value o)) :when u] [n u])
+            unread   (count (for [o took, [_ u] (:cache-usage (:value o)) :when (nil? u)] 1))
             full     (vec (distinct (for [[n u] usage :when (cache-full? u)] n)))
             problems (cond-> []
                        (some :exception done)               (conj :fault-threw)
@@ -445,10 +486,12 @@
                  :skipped    (count skipped)
                  :lost-bytes lost
                  :cache-usage-max (reduce max 0 (map second usage))
+                 :cache-usage-unread unread
                  :sentinel   (frequencies sentinel)
                  :recovers   (count recovers)
                  :final      (count finals)}
           (seq problems) (assoc :problems problems)
+          (pos? lost)    (assoc :warnings [:unsynced-bytes-lost])
           (and (seq problems) (not (seq judged))) (assoc :code "NRV-E0607")
           (seq full)     (assoc :cache-full full)
           (pos? survived) (assoc :reason (str "the fault did not bite: an unsynced sentinel file "

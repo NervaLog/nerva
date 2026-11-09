@@ -533,6 +533,7 @@
                   (str "--replica=" (replica-index test node))
                   (str "--replica-count=" (count (:nodes test)))
                   :--development (lazyfs/format-file test dir data-file))
+          (lazyfs/check-cache-bound! test dir data-file)
           (when (lazyfs/enabled? test) (lazyfs/mount! dir))
           (start-replica! test)
           (start-api! test))

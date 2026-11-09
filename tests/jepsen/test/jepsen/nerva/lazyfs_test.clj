@@ -437,8 +437,12 @@
   (is (= :unchecked (lazyfs/classify-sentinel 4096 :timeout)))
   (with-redefs [c/exec (fn [& _] "124\n")]
     (is (= :timeout (#'lazyfs/size-of "/m/x"))))
-  (with-redefs [c/exec (fn [& _] "1\n")]
+  (with-redefs [c/exec (fn [& _] "1\nstat: cannot statx '/m/x': No such file or directory")]
     (is (nil? (#'lazyfs/size-of "/m/x"))))
+  ;; A dead FUSE mount is not a missing file (review of 9a78be9): never the sentinel's `:gone`.
+  (with-redefs [c/exec (fn [& _] "1\nstat: cannot statx '/m/x': Transport endpoint is not connected")]
+    (is (= :error (#'lazyfs/size-of "/m/x")))
+    (is (= :unchecked (lazyfs/classify-sentinel 4096 (#'lazyfs/size-of "/m/x")))))
   (with-redefs [c/exec (fn [& _] "0\n4096")]
     (is (= 4096 (#'lazyfs/size-of "/m/x")))))
 
@@ -472,3 +476,37 @@
                                   (recover-pair {})))]
     (is (true? (:valid? r)))
     (is (= 3.5 (:cache-usage-max r)))))
+
+(deftest the-cache-covers-the-data-file-so-it-cannot-fill
+  ;; P242i: `nerva format --development` writes 1,141,374,976 bytes.
+  (is (lazyfs/cache-covers? 1141374976))
+  (is (not (lazyfs/cache-covers? 1200000000)))
+  (is (not (lazyfs/cache-covers? nil)))
+  (is (not (lazyfs/cache-covers? 134217728000)))
+  (testing "nothing is checked, and nothing run, with the fault off"
+    (with-redefs [c/exec (fn [& _] (throw (ex-info "no command" {})))]
+      (is (nil? (lazyfs/check-cache-bound! {} "/opt/nerva" "/opt/nerva/replica.nerva")))))
+  (testing "a data file that does not fit is a harness failure"
+    (with-redefs [c/exec (fn [& _] "5000000000\n")]
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"NRV-E0607"
+            (lazyfs/check-cache-bound! {:lazyfs true} "/opt/nerva" "/opt/nerva/replica.nerva")))))
+  (testing "the format's size fits"
+    (with-redefs [c/exec (fn [& _] "1141374976\n")]
+      (is (nil? (lazyfs/check-cache-bound! {:lazyfs true} "/opt/nerva" "/opt/nerva/replica.nerva"))))))
+
+(deftest lost-bytes-and-unread-usage-are-reported
+  (let [r (check-recover (history (pair :lose-unfsynced-writes
+                                        {:killed ["n1" "n2"], :unsynced-bytes {"n1" 4096 "n2" 0}
+                                         :remaining {"n1" 0 "n2" 0}
+                                         :sentinel {"n1" :truncated "n2" :truncated}
+                                         :cache-usage {"n1" nil "n2" 3.5}})
+                                  (recover-pair {})))]
+    (is (true? (:valid? r)))
+    (is (= [:unsynced-bytes-lost] (:warnings r)))
+    (is (= 1 (:cache-usage-unread r))))
+  (is (nil? (:warnings (check-recover (history (pair :lose-unfsynced-writes
+                                                     {:killed ["n1"], :unsynced-bytes {"n1" 0}
+                                                      :remaining {"n1" 0}
+                                                      :sentinel {"n1" :truncated}
+                                                      :cache-usage {"n1" 3.5}})
+                                               (recover-pair {})))))))
