@@ -534,7 +534,10 @@
                   (str "--replica-count=" (count (:nodes test)))
                   :--development (lazyfs/format-file test dir data-file))
           (lazyfs/check-cache-bound! test dir data-file)
-          (when (lazyfs/enabled? test) (lazyfs/mount! dir))
+          (when (lazyfs/enabled? test)
+            (lazyfs/mount! dir)
+            ;; LazyFS holds its whole cache from the mount on (P242i): record the memory left.
+            (info "Memory after the LazyFS mount on" node ":" (c/exec :free :-m)))
           (start-replica! test)
           (start-api! test))
         (doseq [index (range (gateways test node))]

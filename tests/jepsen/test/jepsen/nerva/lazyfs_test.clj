@@ -59,6 +59,22 @@
             :lose-unfsynced-writes :lazyfs-recover]
            fs))))
 
+(deftest the-first-fault-is-all-when-the-test-allows-it
+  (let [g       (:generator (package))
+        context (ctx/context five)
+        scopes  (fn [test]
+                  (loop [g g, fs [], context context]
+                    (if (= 8 (count fs))
+                      fs
+                      (let [[o g'] (gen/op g test context)
+                            o      (assoc o :process :nemesis)]
+                        (recur (gen/update g' test context o)
+                               (cond-> fs (= :lose-unfsynced-writes (:f o))
+                                       (conj (:scope (:value o))))
+                               (ctx/busy-thread context (:time o) :nemesis))))))]
+    (is (= :all (first (scopes (assoc five :lazyfs-all-nodes true)))) "a canary draws an :all")
+    (is (= #{:minority} (set (scopes five))))))
+
 (deftest acts-in-order-and-recovers-what-it-killed
   (let [calls   (atom [])
         nemesis (lazyfs/nemesis "/opt/nerva" nil)]
@@ -444,7 +460,11 @@
     (is (= :error (#'lazyfs/size-of "/m/x")))
     (is (= :unchecked (lazyfs/classify-sentinel 4096 (#'lazyfs/size-of "/m/x")))))
   (with-redefs [c/exec (fn [& _] "0\n4096")]
-    (is (= 4096 (#'lazyfs/size-of "/m/x")))))
+    (is (= 4096 (#'lazyfs/size-of "/m/x"))))
+  ;; Exit 0 with output that is not a bare integer (stderr rides along) is not proof either.
+  (with-redefs [c/exec (fn [& _] "0\nstat: warning: something\n4096")]
+    (is (= :error (#'lazyfs/size-of "/m/x")))
+    (is (= :unchecked (lazyfs/classify-sentinel 4096 (#'lazyfs/size-of "/m/x"))))))
 
 (deftest cache-usage-lines
   (is (= 29.3 (lazyfs/parse-usage "[lazyfs.cmds]: cache usage (%pages) is 29.3%")))
@@ -510,3 +530,15 @@
                                                       :sentinel {"n1" :truncated}
                                                       :cache-usage {"n1" 3.5}})
                                                (recover-pair {})))))))
+
+(deftest the-checker-reports-each-fault-scope
+  (let [r (check-recover (history (pair :lose-unfsynced-writes
+                                        {:scope :all, :killed ["n1"], :unsynced-bytes {"n1" 0}
+                                         :remaining {"n1" 0}, :sentinel {"n1" :gone}})
+                                  (recover-pair {})
+                                  (pair :lose-unfsynced-writes
+                                        {:scope :minority, :killed ["n1"]
+                                         :unsynced-bytes {"n1" 0}, :remaining {"n1" 0}
+                                         :sentinel {"n1" :gone}})
+                                  (recover-pair {})))]
+    (is (= {:all 1, :minority 1} (:scopes r)))))

@@ -44,7 +44,8 @@ Each item names the pull request whose review found it. Say in the PR which item
       can fail (a blind canary proves nothing). Quote what it caught. (#239)
       Say which checker can fail it: `lose-unfsynced-writes`'s `:lazyfs` checker judges the fault,
       not Nerva's durability, so its canary's teeth are the workload's `:keys` checker (lost acknowledged
-      records) under `--lazyfs-all-nodes`, and `:warnings [:unsynced-bytes-lost]` in its result. (#242)
+      records) under `--lazyfs-all-nodes`, and `:warnings [:unsynced-bytes-lost]` in its result; the result
+      counts only with `:scopes {:all n}`, n at least 1 (the first fault is `:all`). (#242)
 - [ ] A fixture uses the code and shape of the wire (NRV-E0203, not a guess). (#239)
 
 ## Bounds

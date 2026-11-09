@@ -40,30 +40,34 @@
   "data")
 
 (def cache-size
-  "LazyFS's page cache. Eviction is off, so every page written through the mount stays until a
-  clear, but the cache is keyed by file offset: it can never hold more than the files on the
-  mount, and the only large one is the replica's data file (1.06 GiB, `nerva format
-  --development`). The cache is sized above that file (`cache-bytes-min`), so it cannot fill
-  whatever the run's length (P242i). The measured fill rate is 15 to 50 MB a node a minute, so
-  the 128 MB of P242h was full after about 6 minutes (run 42692440134). Pages are allocated as
-  they are written: a node holds only what its replica touched. `check-cache-bound!` asserts the
-  bound after the format. A full cache would make LazyFS write through, which `lose!` records
-  (`:cache-usage`) and the checker judges (`:cache-full`)."
-  "1200MB")
+  "LazyFS's page cache, in LazyFS's MB, which is 2^20 bytes (a MiB). Eviction is off, so every
+  page written through the mount stays until a clear, but the cache is keyed by file offset: it
+  can never hold more than the files on the mount, and the only large one is the replica's data
+  file (1,141,374,976 bytes = 1,088.5 MiB, `nerva format --development`). The cache is sized just
+  above that file plus `sentinel-slack-bytes` (`cache-bytes`: 1,105 MiB), so it cannot fill
+  whatever the run's length (P242i). The memory is not allocated as it is used: LazyFS
+  pre-allocates and zero-fills every cache page when it mounts (custom_cache.cpp:33-48,
+  page.cpp:33-34), so each node holds the whole 1,105 MiB (about 1.08 GiB, 5.4 GiB for 5 nodes)
+  from mount to unmount, touched or not. `check-cache-bound!` asserts the bound after the format.
+  A full cache would make LazyFS write through, which `lose!` records (`:cache-usage`) and the
+  checker judges (`:cache-full`)."
+  "1105MB")
 
-(def cache-bytes-min
-  "The cache size in bytes, taking LazyFS's `MB` as 10^6 (the smaller reading)."
-  1200000000)
+(def cache-bytes
+  "`cache-size` in bytes: 1,105 MiB."
+  (* 1105 1024 1024))
 
 (def sentinel-slack-bytes
-  "What the mount may hold beyond the data file: the sentinel, and room for a stray file."
+  "What the mount may hold beyond the data file: the sentinel (4 KiB) and room for a stray file.
+  16 MiB: `cache-bytes` (1,105 MiB) is 0.5 MiB over the file plus this, the cache being sized to
+  the MiB because every MiB is resident on every node for the whole run."
   (* 16 1024 1024))
 
 (defn cache-covers?
   "Can the cache hold a data file of `file-bytes` and the slack on top?"
   [file-bytes]
   (boolean (and (integer? file-bytes)
-                (<= (+ file-bytes sentinel-slack-bytes) cache-bytes-min))))
+                (<= (+ file-bytes sentinel-slack-bytes) cache-bytes))))
 
 (defn enabled?
   "Does the test run the fault (so mount LazyFS)?"
@@ -104,8 +108,8 @@
           size (parse-long (str/trim (c/exec :stat :-c "%s" path)))]
       (when-not (cache-covers? size)
         (throw (ex-info (str "NRV-E0607: the data file (" size " bytes) does not fit LazyFS's "
-                             "cache (" cache-size "); raise cache-bytes-min and cache-size (P242i)")
-                        {:size size, :cache cache-bytes-min}))))))
+                             "cache (" cache-size "); raise cache-bytes and cache-size (P242i)")
+                        {:size size, :cache cache-bytes}))))))
 
 (defn mount!
   "Mounts LazyFS on this node and waits for it (bounded by `jepsen.lazyfs`'s own await)."
@@ -135,10 +139,11 @@
 
 (defn fault-value
   "A fresh op value against `test`: `:minority` loses writes on 1 to a minority of nodes;
-  `:all` (opt in) crashes a majority first, then the rest, and loses writes on every node."
-  [test]
+  `:all` (opt in) crashes a majority first, then the rest, and loses writes on every node.
+  `forced`, when given, is the scope instead of a draw (the generator's first fault, P242i)."
+  [test & [forced]]
   (let [nodes (vec (:nodes test))
-        scope (rand/nth (scopes test))]
+        scope (or forced (rand/nth (scopes test)))]
     (case scope
       :minority {:scope :minority
                  :nodes (vec (take (rand/nth (vec (range 1 (inc (minority-size-max (count nodes))))))
@@ -267,7 +272,7 @@
   dropped the file."
   [path]
   (let [[rc out] (on-mount (str "stat -c %s " path) true)]
-    (cond (zero? rc)                          (parse-long out)
+    (cond (zero? rc)                          (or (parse-long out) :error)
           (#{124 137} rc)                     :timeout
           (str/includes? out "No such file")  nil
           :else                               :error)))
@@ -465,6 +470,7 @@
             ;; Asked for: the test runs the fault, or the history holds one of its ops. A run
             ;; with only kill, partition or gateway ops (the nightly) never asked (P242h).
             asked?   (boolean (or (:lazyfs test) (seq done) (seq recovers)))
+            scopes   (frequencies (map #(:scope (:value %)) took))
             usage    (for [o took, [n u] (:cache-usage (:value o)) :when u] [n u])
             unread   (count (for [o took, [_ u] (:cache-usage (:value o)) :when (nil? u)] 1))
             full     (vec (distinct (for [[n u] usage :when (cache-full? u)] n)))
@@ -483,6 +489,7 @@
                                    (seq problems) :unknown
                                    :else          true)
                  :faults     (count took)
+                 :scopes     scopes
                  :skipped    (count skipped)
                  :lost-bytes lost
                  :cache-usage-max (reduce max 0 (map second usage))
@@ -586,12 +593,20 @@
   `:start-mid!` (`db/start-node-bounded!`); core wires them, as `lazyfs` cannot require `db`.
   Its final generator is the one judged recovery: it starts every node the fault killed."
   [opts]
-  (let [on? (contains? (:faults opts) fault)]
+  (let [on?    (contains? (:faults opts) fault)
+        first? (atom true)]
     {:generator       (when on?
                        (gen/stagger (:interval opts 10)
                                     (gen/flip-flop
                                       (fn [test _]
-                                        {:type :info, :f fault, :value (fault-value test)})
+                                        {:type :info, :f fault
+                                         :value (fault-value
+                                                  test
+                                                  ;; The first fault is `:all` when the test
+                                                  ;; allows it: a canary draws one (P242i).
+                                                  (when (and (:lazyfs-all-nodes test)
+                                                             (compare-and-set! first? true false))
+                                                    :all))})
                                       (fn [_ _] {:type :info, :f :lazyfs-recover}))))
      :final-generator (when on? [{:type :info, :f :lazyfs-recover, :value {:final? true}}])
      :nemesis         (nemesis (:dir opts) {:probe      (:node-probe opts)

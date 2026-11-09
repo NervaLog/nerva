@@ -98,7 +98,7 @@ OS, creates the token and the tracker issue, runs `setup.sh` as root).
 | --- | --- |
 | Machine | x86_64, 8 cores / 16 threads, 64 GB, NVMe (P147h's suggestion); **KVM exposed** (`/dev/kvm`, for slice 10 only) |
 | OS | Ubuntu 24.04 LTS, cgroup v2, systemd |
-| Memory for Jepsen | 16 GB during its window: 5 replicas at about 1.33 GiB, 10 gateways, a 4 GB JVM. The fleet is stopped for the window, so its `MemoryMax=56G` never overlaps |
+| Memory for Jepsen | 16 GB during its window: 5 replicas at about 1.33 GiB, 10 gateways, a 4 GB JVM. With `lose-unfsynced-writes`, LazyFS adds about 1.08 GiB a node (a 1,105 MiB cache, pre-allocated and zeroed at mount, resident until unmount), 5.4 GiB for the 5 nodes (P242i). The fleet is stopped for the window, so its `MemoryMax=56G` never overlaps |
 | Time | about 2.5 h a night (two 3,600 s runs, setup, checking), the fleet stopped meanwhile |
 | Docker | Docker Engine, **privileged containers** (iptables in the nodes), the `owner` iptables match, `/dev/fuse` passed to the nodes (slice 9) |
 | Tools | OpenJDK 21 (Ubuntu's), Leiningen 2.12.0 (script and standalone jar, sha256 pinned), gnuplot (else every result is `:unknown`, #106), git, python3, zstd; Zig from `./zig/download.sh` |

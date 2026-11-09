@@ -127,8 +127,23 @@ jobs:
           echo "NERVA_CLUSTER_KEY=$NERVA_CLUSTER_KEY" >> "$GITHUB_ENV"
           export NERVA_CLUSTER_KEY
           read -r -a words <<< "$ARGS"
+          # The memory record (P242i): `free -m` at the start and the end, and the lowest
+          # MemAvailable seen (sampled every 5 s) in between, which includes LazyFS's cache (about
+          # 1.08 GiB a node, resident from mount to unmount).
+          free -m
+          (min=; while :; do
+             v=$(awk '/^MemAvailable:/ {print int($2/1024)}' /proc/meminfo)
+             if [[ -z "$min" || "$v" -lt "$min" ]]; then min=$v; echo "memory: MemAvailable low $min MiB" > /tmp/jepsen-mem-low; fi
+             sleep 5
+           done) &
+          sampler=$!
           # Jepsen exits 0 valid, 1 invalid, 2 unknown, 255 on a crash.
-          tests/jepsen/run.sh "$NERVA" "${words[@]}"
+          rc=0
+          tests/jepsen/run.sh "$NERVA" "${words[@]}" || rc=$?
+          kill "$sampler" 2>/dev/null || true
+          free -m
+          cat /tmp/jepsen-mem-low || true
+          exit "$rc"
 
       # Searches case-insensitively, for the key and for its first 16 hex characters. The pack
       # and upload below run only when this step did not fail: a leak is never uploaded.
