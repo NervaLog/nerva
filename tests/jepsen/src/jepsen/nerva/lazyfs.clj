@@ -13,7 +13,8 @@
 
   The fault's op value is `{:scope :minority|:all, :nodes [...]}`; for `:all` also `:crash`, a
   majority killed first. The completion adds `:killed` (the nodes killed) and `:unsynced-bytes`
-  (`{node bytes}`: what LazyFS held unsynced, and so lost). Its undo, `:lazyfs-recover`, starts
+  (`{node bytes}`: what LazyFS held unsynced, and so lost), `:remaining` and `:sentinel`
+  (`{node :gone|:truncated|:survived|:unwritten}`, P242e). Its undo, `:lazyfs-recover`, starts
   the replica and the gateways again on the nodes the fault killed.
   The nemesis kills through `db/kill!` and starts through `db/start!`, so it needs nothing from
   `jepsen.nerva.db`."
@@ -148,23 +149,58 @@
   "How many times `lose!` asks LazyFS for its unsynced bytes after the clear, hoping for 0."
   5)
 
+(def sentinel-name
+  "The file `lose!` writes on the mount, without syncing it, before every clear (P242e)."
+  "lazyfs-sentinel")
+
+(def sentinel-bytes
+  "The sentinel's size: one 4 KiB block."
+  4096)
+
+(defn classify-sentinel
+  "What became of the sentinel: `written` is its size before the clear, `after` its size after
+  (nil when the file is gone). `:gone` and `:truncated` mean the clear lost the unsynced bytes;
+  `:survived` means it did not (the fault did not bite); `:unwritten` means the sentinel never
+  reached `written` bytes before the clear, so nothing was proved."
+  [written after]
+  (cond (not= sentinel-bytes written) :unwritten
+        (nil? after)                  :gone
+        (< after written)             :truncated
+        :else                         :survived))
+
+(defn- size-of
+  "The size in bytes of `path` on this node; nil when it does not exist."
+  [path]
+  (let [out (str/trim (c/exec :sh :-c (str "stat -c %s " path " 2>/dev/null || echo gone")))]
+    (when-not (= "gone" out) (parse-long out))))
+
 (defn lose!
-  "On `nodes` (the replica must be dead there): reads the unsynced bytes, clears LazyFS's cache,
-  then reads them again until they are 0 (`clear-wait-polls`), so the op ends only once the clear
-  has been applied and a fast restart's open-time fsync cannot make the lost bytes durable.
-  Returns `{node {:before bytes, :after bytes}}`; `:after` is not 0 when the clear was not seen
-  to take."
+  "On `nodes` (the replica must be dead there): writes the sentinel on the mount without
+  syncing it, reads the unsynced bytes, clears LazyFS's cache, then reads them again until they
+  are 0 (`clear-wait-polls`), so the op ends only once the clear has been applied and a fast
+  restart's open-time fsync cannot make the lost bytes durable. Returns
+  `{node {:before bytes, :after bytes, :sentinel kw}}`: `:after` is not 0 when the clear was not
+  seen to take; `:sentinel` is `classify-sentinel`'s verdict, which is what proves the clear
+  bit even when the replica, writing O_DSYNC, left nothing unsynced (P242e). The sentinel is
+  removed afterwards."
   [test lz nodes]
   (c/on-nodes test nodes
               (fn [_ _]
-                (let [before (unsynced-bytes lz)]
+                (let [path    (str (:dir lz) "/" sentinel-name)
+                      _       (c/exec :rm :-f path)
+                      _       (c/exec :dd "if=/dev/zero" (str "of=" path)
+                                      (str "bs=" sentinel-bytes) "count=1" "status=none")
+                      written (size-of path)
+                      before  (unsynced-bytes lz)]
                   (lazyfs/lose-unfsynced-writes! lz)
-                  {:before before
-                   :after  (loop [polls clear-wait-polls]
-                             (let [after (unsynced-bytes lz)]
-                               (if (or (= 0 after) (zero? polls))
-                                 after
-                                 (recur (dec polls)))))}))))
+                  (let [after  (loop [polls clear-wait-polls]
+                                 (let [after (unsynced-bytes lz)]
+                                   (if (or (= 0 after) (zero? polls))
+                                     after
+                                     (recur (dec polls)))))
+                        status (classify-sentinel written (size-of path))]
+                    (c/exec :rm :-f path)
+                    {:before before, :after after, :sentinel status})))))
 
 (def recover-wait-ms
   "How long a recovery waits for a restarted node to serve (`settle-recovery`). The mid-run wait
@@ -278,9 +314,13 @@
   `:unknown`, with NRV-E0607 (the harness, not Nerva, is at fault; the run proved nothing), when
   the fault was asked for and:
   a fault op threw; no final recovery ran; the final recovery judged no node (it settles every
-  node the fault hit, P242d); no fault took (`:faults` 0) or none lost a byte
-  (`:lost-bytes` 0, so the run proved nothing); or a clear was not seen to take. A fault op
-  skipped because an earlier victim had not caught up (`:skipped`) is counted, not judged.
+  node the fault hit, P242d); no fault took (`:faults` 0); a clear was not seen to take
+  (`:remaining` not 0); or the sentinel `lose!` writes unsynced before each clear (P242e) was not
+  proved lost: it `:survived` (`:sentinel-survived`, with a `:reason`: the fault did not bite) or
+  was not checked. The bytes LazyFS lost (`:lost-bytes`) are reported, not judged: with the
+  image's O_DSYNC patch (P242d) Nerva leaves none unsynced, so only the sentinel shows the
+  clear bit. A fault op skipped because an earlier victim had not caught up (`:skipped`) is
+  counted, not judged.
   Valid with nothing to judge when the run did not ask for the fault."
   []
   (reify checker/Checker
@@ -300,6 +340,10 @@
                              finals)
             lost     (reduce + 0 (for [o took, [_ b] (:unsynced-bytes (:value o))] (or b 0)))
             unclear  (for [o took, [n a] (:remaining (:value o)) :when (not= 0 a)] n)
+            sentinel (for [o took, n (keys (:unsynced-bytes (:value o)))]
+                       (get-in (:value o) [:sentinel n]))
+            survived (count (filter #{:survived} sentinel))
+            unproved (count (remove #{:gone :truncated :survived} sentinel))
             asked?   (boolean (or (:lazyfs test) (seq pairs)))
             problems (cond-> []
                        (some :exception done)               (conj :fault-threw)
@@ -308,7 +352,8 @@
                             (every? (comp empty? :judged :value) finals))
                                                             (conj :final-judged-nothing)
                        (and asked? (empty? took))           (conj :no-fault-took)
-                       (and (seq took) (zero? lost))        (conj :no-bytes-lost)
+                       (pos? survived)                      (conj :sentinel-survived)
+                       (pos? unproved)                      (conj :sentinel-unchecked)
                        (seq unclear)                        (conj :clear-unconfirmed))]
         (cond-> {:valid?     (cond (seq judged)   false
                                    (seq problems) :unknown
@@ -316,10 +361,13 @@
                  :faults     (count took)
                  :skipped    (count skipped)
                  :lost-bytes lost
+                 :sentinel   (frequencies sentinel)
                  :recovers   (count recovers)
                  :final      (count finals)}
           (seq problems) (assoc :problems problems)
           (and (seq problems) (not (seq judged))) (assoc :code "NRV-E0607")
+          (pos? survived) (assoc :reason (str "the fault did not bite: an unsynced sentinel file "
+                                              "survived a LazyFS clear on " survived " node(s)"))
           (seq judged)   (assoc :code         "NRV-E0604"
                                 :gateways     (vec (distinct (mapcat #(concat (:down (:value %))
                                                                               (:pending (:value %)))
@@ -377,7 +425,8 @@
                 (assoc o :value (assoc (:value o)
                                        :killed         killed
                                        :unsynced-bytes (update-vals lost :before)
-                                       :remaining      (update-vals lost :after))))))
+                                       :remaining      (update-vals lost :after)
+                                       :sentinel       (update-vals lost :sentinel))))))
 
           :lazyfs-recover
           (let [final? (boolean (:final? (:value o)))

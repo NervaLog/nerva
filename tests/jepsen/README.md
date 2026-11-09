@@ -92,7 +92,8 @@ fsync, so it loses acknowledged writes (#246). The node image therefore builds L
 `O_SYNC` (P242d); without it a clear is replica amnesia, not a lost unfsynced write. The fault
 still never acts while an earlier victim is down or has not caught up (such a fault is recorded
 `:skipped`; a combined run takes few faults, so read `:faults` against `:skipped`), and its verdict
-(`:lazyfs`) is `:unknown` with NRV-E0607 when no fault lost a byte, a clear was not seen to take,
+(`:lazyfs`) is `:unknown` with NRV-E0607 when a clear was not seen to take, the unsynced sentinel file written before
+each clear survived it (the fault did not bite, P242e; the bytes lost are reported, not judged),
 a fault op threw, or the final recovery judged no node, and invalid with NRV-E0604 when the final
 recovery left a gateway or the replica down. The final recovery settles every node the fault has
 hit, not only the ones still down. Whether a `--development` replica gets `O_DIRECT` on FUSE is
@@ -103,7 +104,7 @@ The node image (`node/Dockerfile`) builds LazyFS from one pinned commit (0.3.0, 
 `jepsen.lazyfs` is written for) in a first stage that fails unless the checkout is exactly that
 commit, the patch applies and the binary finds its libraries; `run.sh` passes `/dev/fuse` to the nodes. The fault's
 op in the history lists `:killed`, `:unsynced-bytes` (what LazyFS held and so lost, by node,
-from its own report) and `:remaining` (the report after the clear, 0 when it took), and each node's `lazyfs.log` is in `store/`.
+from its own report) and `:remaining` (the report after the clear, 0 when it took), `:sentinel` (`:gone`, `:truncated` or `:survived`), and each node's `lazyfs.log` is in `store/`.
 
 Planned: bit flips, clock faults (on
 separate machines: `nerva` is a static binary, so libfaketime cannot fool it, and containers

@@ -63,7 +63,7 @@
         nemesis (lazyfs/nemesis "/opt/nerva" nil)]
     (with-redefs [lazyfs/kill!    (fn [_ nodes] (swap! calls conj [:kill nodes]) (vec nodes))
                   lazyfs/lose!    (fn [_ _ nodes] (swap! calls conj [:lose nodes])
-                                    (zipmap nodes (repeat {:before 4096, :after 0})))
+                                    (zipmap nodes (repeat {:before 4096, :after 0, :sentinel :gone})))
                   lazyfs/recover! (fn [_ nodes _ final? _]
                                     (swap! calls conj [:recover nodes final?])
                                     {:nodes (vec nodes), :down [], :pending [], :replica-down []
@@ -250,7 +250,8 @@
 
 (defn- fault-pair [& {:as extra}]
   (pair :lose-unfsynced-writes
-        {:killed ["n1"], :unsynced-bytes {"n1" 100}, :remaining {"n1" 0}}
+        {:killed ["n1"], :unsynced-bytes {"n1" 100}, :remaining {"n1" 0}
+         :sentinel {"n1" :gone}}
         extra))
 
 (defn- recover-pair [value & {:as extra}]
@@ -298,14 +299,46 @@
       (is (some #{:fault-threw} (:problems r))))
     (let [r (check-recover (history (fault-pair)))]
       (is (some #{:no-final-recover} (:problems r)))))
-  (testing "the fault was asked for but never recovered, took nothing, or lost nothing"
+  (testing "the fault was asked for but took nothing"
     (is (some #{:no-fault-took} (:problems (check-recover [])))
-        "zero faults and zero recovers are invalid when the test asked for the fault")
+        "zero faults and zero recovers are invalid when the test asked for the fault"))
+  (testing "P242e: no bytes lost is reported, not judged, when the sentinel is gone"
     (let [r (check-recover (history (pair :lose-unfsynced-writes
                                           {:killed ["n1"], :unsynced-bytes {"n1" 0}
-                                           :remaining {"n1" 0}})
+                                           :remaining {"n1" 0}, :sentinel {"n1" :gone}})
                                     (recover-pair {})))]
-      (is (some #{:no-bytes-lost} (:problems r)))))
+      (is (true? (:valid? r)))
+      (is (= 0 (:lost-bytes r)))
+      (is (= {:gone 1} (:sentinel r))))
+    (let [r (check-recover (history (pair :lose-unfsynced-writes
+                                          {:killed ["n1"], :unsynced-bytes {"n1" 0}
+                                           :remaining {"n1" 0}, :sentinel {"n1" :truncated}})
+                                    (recover-pair {})))]
+      (is (true? (:valid? r)))))
+  (testing "P242e: a sentinel that survives the clear means the fault did not bite"
+    (let [r (check-recover (history (pair :lose-unfsynced-writes
+                                          {:killed ["n1"], :unsynced-bytes {"n1" 4096}
+                                           :remaining {"n1" 0}, :sentinel {"n1" :survived}})
+                                    (recover-pair {})))]
+      (is (= :unknown (:valid? r)))
+      (is (= "NRV-E0607" (:code r)))
+      (is (some #{:sentinel-survived} (:problems r)))
+      (is (re-find #"did not bite" (:reason r)))))
+  (testing "P242e: a sentinel that was never checked proves nothing"
+    (doseq [sentinel [{} {"n1" :unwritten}]]
+      (let [r (check-recover (history (pair :lose-unfsynced-writes
+                                            {:killed ["n1"], :unsynced-bytes {"n1" 0}
+                                             :remaining {"n1" 0}, :sentinel sentinel})
+                                      (recover-pair {})))]
+        (is (= :unknown (:valid? r)))
+        (is (some #{:sentinel-unchecked} (:problems r))))))
+  (testing "P242e: a clear LazyFS did not confirm is unknown even with the sentinel gone"
+    (let [r (check-recover (history (pair :lose-unfsynced-writes
+                                          {:killed ["n1"], :unsynced-bytes {"n1" 10}
+                                           :remaining {"n1" 10}, :sentinel {"n1" :gone}})
+                                    (recover-pair {})))]
+      (is (= :unknown (:valid? r)))
+      (is (some #{:clear-unconfirmed} (:problems r)))))
   (testing "a clear not seen to take is invalid"
     (let [r (check-recover (history (pair :lose-unfsynced-writes
                                           {:killed ["n1"], :unsynced-bytes {"n1" 10}
@@ -325,6 +358,14 @@
       (is (true? (:valid? r)))
       (is (= 1 (:skipped r))))
     (is (true? (:valid? (check-recover {} []))))))
+
+(deftest sentinel-classification
+  (is (= :gone (lazyfs/classify-sentinel 4096 nil)))
+  (is (= :truncated (lazyfs/classify-sentinel 4096 0)))
+  (is (= :truncated (lazyfs/classify-sentinel 4096 100)))
+  (is (= :survived (lazyfs/classify-sentinel 4096 4096)))
+  (is (= :unwritten (lazyfs/classify-sentinel nil nil)))
+  (is (= :unwritten (lazyfs/classify-sentinel 0 0))))
 
 (deftest data-file-follows-the-fault
   (is (= "/opt/nerva/data/replica.nerva" (lazyfs/data-file {:lazyfs true} "/opt/nerva" "/x")))
