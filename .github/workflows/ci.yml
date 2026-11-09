@@ -99,14 +99,15 @@ jobs:
           echo "code=$code" >> "$GITHUB_OUTPUT"
           echo "code=$code"
 
-  # The typecheck builds the nerva binary that the integration, API and view tests run, so it goes
-  # with them; the unit tests, the longest step, run alone.
-  system:
+  # P251: the old `system` job ran these serially (about 26 minutes). They are split into jobs that
+  # run in parallel, and `system` below aggregates them under the required check's name. The
+  # typecheck builds the nerva binary that the view tests run, so they go together.
+  checks:
     needs: changes
     if: ${{ !cancelled() }}
-    name: check, integration, API, views
+    name: check, fmt, scripts, views
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         if: needs.changes.outputs.code != 'false'
@@ -155,21 +156,117 @@ jobs:
         if: needs.changes.outputs.code != 'false'
         run: python3 -I ops/jepsen/test_jepsen_report.py
 
+      - name: Declared views (against a model)
+        if: needs.changes.outputs.code != 'false'
+        run: ./zig/zig build test:views
+
+  # Three real replicas; about 3.5 GiB of disk.
+  integration:
+    needs: changes
+    if: ${{ !cancelled() }}
+    name: integration
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        if: needs.changes.outputs.code != 'false'
+        with:
+          persist-credentials: false
+
+      # GitHub's runners start empty: the pinned toolchain is restored from Actions' cache, keyed by
+      # download.sh's hash, where INSTALL_ZIG looks for it (P147e).
+      - uses: actions/cache@v4
+        if: needs.changes.outputs.code != 'false'
+        with:
+          path: ~/.cache/nerva-toolchain
+          key: nerva-toolchain-${{ runner.os }}-${{ hashFiles('zig/download.sh') }}
+
+      - name: Install the pinned Zig
+        if: needs.changes.outputs.code != 'false'
+        run: eval "$INSTALL_ZIG"
+
       - name: Integration (three real replicas)
         if: needs.changes.outputs.code != 'false'
         run: ./zig/zig build test:integration
+
+  api:
+    needs: changes
+    if: ${{ !cancelled() }}
+    name: API
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        if: needs.changes.outputs.code != 'false'
+        with:
+          persist-credentials: false
+
+      # GitHub's runners start empty: the pinned toolchain is restored from Actions' cache, keyed by
+      # download.sh's hash, where INSTALL_ZIG looks for it (P147e).
+      - uses: actions/cache@v4
+        if: needs.changes.outputs.code != 'false'
+        with:
+          path: ~/.cache/nerva-toolchain
+          key: nerva-toolchain-${{ runner.os }}-${{ hashFiles('zig/download.sh') }}
+
+      - name: Install the pinned Zig
+        if: needs.changes.outputs.code != 'false'
+        run: eval "$INSTALL_ZIG"
 
       - name: JSON API (against a model)
         if: needs.changes.outputs.code != 'false'
         run: ./zig/zig build test:api
 
-      - name: Declared views (against a model)
+  releases:
+    needs: changes
+    if: ${{ !cancelled() }}
+    name: releases
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         if: needs.changes.outputs.code != 'false'
-        run: ./zig/zig build test:views
+        with:
+          persist-credentials: false
+
+      # GitHub's runners start empty: the pinned toolchain is restored from Actions' cache, keyed by
+      # download.sh's hash, where INSTALL_ZIG looks for it (P147e).
+      - uses: actions/cache@v4
+        if: needs.changes.outputs.code != 'false'
+        with:
+          path: ~/.cache/nerva-toolchain
+          key: nerva-toolchain-${{ runner.os }}-${{ hashFiles('zig/download.sh') }}
+
+      - name: Install the pinned Zig
+        if: needs.changes.outputs.code != 'false'
+        run: eval "$INSTALL_ZIG"
 
       - name: Mixed releases (a second nerva, another release string)
         if: needs.changes.outputs.code != 'false'
         run: ./zig/zig build test:release
+
+  # The required check's name (the ruleset cannot change here). It passes only if every split job
+  # above succeeded: `always()` so that a failed, cancelled or skipped one still runs this job and
+  # fails it, instead of leaving it skipped (which a ruleset may count as passing). A docs-only
+  # pull request: each split job runs and skips its steps, so each is `success`, and so is this.
+  system:
+    needs: [checks, integration, api, releases]
+    if: ${{ always() }}
+    name: check, integration, API, views
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Every split job succeeded
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "results: $RESULTS"
+          for r in $RESULTS; do
+            if [ "$r" != success ]; then
+              echo "::error::a job this check waits for finished '$r', not 'success'"
+              exit 1
+            fi
+          done
 
   unit:
     needs: changes

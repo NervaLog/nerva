@@ -79,6 +79,7 @@
             :db        db
             :client    (:client workload)
             :nemesis   (:nemesis package)
+            :nemesis-faults (set (:nemesis opts))
             :checker   (checker/compose
                          {:perf       (checker/perf {:nemeses (:perf package)})
                           :timeline   (timeline/html)

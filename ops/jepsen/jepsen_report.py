@@ -3,6 +3,7 @@
 
     jepsen_report.py ingest --commit SHA --store DIR --state FILE [--archive PATH]
                             [--runs FILE] [--expect-invalid] [--no-status]
+                            [--expect-workloads "W1 W2"]
                             [--repo OWNER/NAME --token-file FILE] [--tracker N] [--dry-run]
 
 Reads one night that `nightly.sh` wrote under DIR: `runs` (one line per Jepsen run:
@@ -18,7 +19,8 @@ Each run is valid, invalid, unknown, or the host's:
   key, its anomaly class; never the seed or the commit); a known fingerprint gets a comment only
   for a commit it has not been reported on, at most COMMENTS_PER_FAILURE_PER_DAY a UTC day; at
   most FAILURES_PER_DAY distinct failures are looked at a day. The status is `failure`;
-- the host's (exit 124 past the night's deadline, 125, 126, 137 the OOM killer, 143 an
+- the host's (a checker's verdict carrying `:code "NRV-E0607"`, the Jepsen harness failing, unless
+  another checker found something: that finding is filed and the harness one is dropped; exit 124 past the night's deadline, 125, 126, 137 the OOM killer, 143 an
   interrupted night, unless a verdict was written: an invalid or unknown one outranks the exit code; a run with no `jepsen.log` at
   all; a night that did not start; graphs that did not draw): counted, status `error`, never an
   issue;
@@ -31,10 +33,15 @@ status for it, read first; unreadable, nothing is posted. `--no-status` posts no
 
 Then one comment a day on the tracker issue: what ran, on which commit, the verdict.
 
+`--expect-workloads "W1 W2"` names the workloads the night must have run: a night missing one
+of them is `error`, never `success` (a run whose workload cannot be read counts for none).
+
 `--expect-invalid` is the canary (a build with commit-key deduplication off): an invalid verdict
 with a `duplicate` is what it expects. The issue it files says so and the status is
 `jepsen/canary` = `success`; a verdict without the duplicate means Jepsen cannot see a duplicate
-any more: status `failure` and an issue "canary is blind". `--dry-run` asks GitHub nothing and
+any more: status `failure` and an issue "canary is blind". A run whose only failure is
+NRV-E0607 (the harness failed) produced no duplicate either: it is blind too, the issue naming
+the harness failure, never a silent `error` (P244f). `--dry-run` asks GitHub nothing and
 prints what it would do (it still writes the state file it is given: give it a state of its own).
 
 Exit codes: 0 done, 1 usage or bad input, 2 environment (state file, token, GitHub). Standard
@@ -428,24 +435,32 @@ def failing_leaves(path, value, depth):
     return [(path, verdict, value)]
 
 
+HARNESS_CODE = "NRV-E0607"  # docs/ERRORS.md: the Jepsen harness failed, not Nerva (P244e).
+
+
 def findings_of(results):
-    """[(checker, class, result)] the verdict fails on, and whether only the host's graphs
-    failed. `checker` is a path: `protocol`, `workload`, `workload.source`."""
+    """([(checker, class, result)], graphs_only, harness) the verdict fails on. `graphs_only`:
+    only the host's graphs failed. `harness`: a failing checker carries `:code "NRV-E0607"`, the
+    Jepsen harness's own failure: it is the host's, never a finding, and is dropped from the list
+    whatever else failed (a real finding elsewhere in the run still outranks it).
+    `checker` is a path: `protocol`, `workload`, `workload.source`."""
     failing = []
     for key, value in results.items():
         if isinstance(key, Keyword) and str(key) != "valid?" and isinstance(value, dict):
             for leaf in failing_leaves(str(key), value, 1):
                 failing.append((str(key), *leaf))
-    real = [f for f in failing if f[0] not in HOST_CHECKERS]
+    harness = [f for f in failing if f[0] not in HOST_CHECKERS
+               and isinstance(f[3], dict) and kw(f[3], "code") == HARNESS_CODE]
+    real = [f for f in failing if f[0] not in HOST_CHECKERS and f not in harness]
     if not real:
-        return [], bool(failing)
+        return [], bool(failing) and not harness, bool(harness)
     firm = [f for f in real if f[2] is False] or real
     found = []
     for _, checker, _, value in firm:
         for name in checker_classes(checker, value):
             if len(found) < FINDINGS_MAX:
                 found.append((checker, name, value))
-    return found, False
+    return found, False, bool(harness)
 
 
 def anomaly_ids(subtrees):
@@ -586,7 +601,9 @@ class Run:
         self.name = None
         self.kind = None  # valid, invalid, unknown or host
         self.host_reason = None
+        self.harness = False  # a checker carried NRV-E0607 (P244f)
         self.workload = "bank"  # the suite's default
+        self.workload_read = False  # False: `workload` is only the default, not what the run did
         self.nemesis = ""
         self.seed = None
         self.reproduce = None
@@ -613,6 +630,7 @@ def read_test(run, directory):
         words = ["lein", "run"] + run.args
     if words is not None:
         run.workload = workload_of(words) or run.workload
+        run.workload_read = run.workload_read or bool(option(words, "workload"))
         run.nemesis = option(words, "nemesis") or ""
         run.seed = option(words, "seed")
         run.reproduce = " ".join(shlex.quote(w) for w in reproduce_words(words))
@@ -642,7 +660,12 @@ def read_test(run, directory):
     if verdict is True:
         run.kind = "valid"
         return
-    run.findings, graphs_only = findings_of(results)
+    run.findings, graphs_only, harness = findings_of(results)
+    run.harness = harness
+    if harness and not run.findings:
+        run.kind = "host"
+        run.host_reason = f"the Jepsen harness failed ({HARNESS_CODE}), not Nerva"
+        return
     if graphs_only or not run.findings:
         run.kind = "host"
         run.host_reason = "Jepsen's graphs did not draw (gnuplot?)" if graphs_only \
@@ -734,6 +757,7 @@ def read_night(store, runs_file):
             else:
                 words = ["lein", "run"] + args
                 run.workload = workload_of(words) or run.workload
+                run.workload_read = bool(option(words, "workload"))
                 run.nemesis = option(words, "nemesis") or ""
             settle_run(run, code, tests)
             runs.append(run)
@@ -788,6 +812,10 @@ def make_findings(run, canary):
         # The canary's own fingerprint: a test build's crash is not a crash on main (P235).
         for checker, name, subtree in run.findings:
             out.append(finding(run, True, checker, name, subtree))
+    elif run.kind == "host" and run.harness:
+        # A harness failure (NRV-E0607) and no real finding: the canary produced no duplicate,
+        # so it is blind whether or not the harness failed (P244f). Filed, never silently `error`.
+        out.append(finding(run, True, "workload", "blind", None))
     elif run.kind in ("invalid", "unknown", "valid"):
         # Whatever else it saw is a real finding; the canary itself saw no duplicate.
         for checker, name, subtree in run.findings:
@@ -830,6 +858,10 @@ def report_text(item, commit, archive, first):
     if item["class"] == "blind":
         out.append("- **Verdict:** the canary run found no `duplicate`: Jepsen cannot see a "
                    "resent key committing twice")
+        if run.harness:
+            out.append(f"- **Also:** the Jepsen harness failed in this run ({HARNESS_CODE}, the "
+                       "host's, not Nerva's), so the canary may be blind only because of it; "
+                       "read `jepsen.log` before blaming the workload checker")
     else:
         out.append(f"- **Checker:** `{item['checker']}`, anomaly `{item['class']}`")
     others = sorted({f"{c}/{n}" for c, n, _ in run.findings} - {f"{item['checker']}/{item['class']}"})
@@ -1185,7 +1217,7 @@ class DryRun:
 # Ingest.
 
 
-def night_state(runs, host_failure, canary):
+def night_state(runs, host_failure, canary, expected=()):
     """(commit status state, description) for the night."""
     if host_failure is not None:
         return "error", f"the host's: {host_failure}"
@@ -1194,10 +1226,12 @@ def night_state(runs, host_failure, canary):
     kinds = [run.kind for run in runs]
     verdicts = [(run.kind, run) for run in runs]
     total = len(runs)
+    missing = [w for w in expected if w not in {run.workload for run in runs if run.workload_read}]
     if canary:
         crashed = [r for k, r in verdicts if k == "crashed"]
-        blind = [r for k, r in verdicts if k not in ("host", "crashed")
-                 and not (k == "invalid" and "duplicate" in {n for _, n, _ in r.findings})]
+        blind = [r for k, r in verdicts if (k == "host" and r.harness)
+                 or (k not in ("host", "crashed")
+                     and not (k == "invalid" and "duplicate" in {n for _, n, _ in r.findings}))]
         if crashed or blind:
             parts = []
             if crashed:
@@ -1206,6 +1240,8 @@ def night_state(runs, host_failure, canary):
             if blind:
                 parts.append(f"canary blind: {len(blind)} of {total} run(s) saw no duplicate")
             return "failure", "; ".join(parts)
+        if missing:
+            return "error", f"the host's: no run of {', '.join(missing)}"
         if "host" in kinds:
             return "error", f"the host's: {kinds.count('host')} of {total} run(s) did not finish"
         return "success", f"canary: Jepsen saw the duplicate in {total} of {total} run(s)"
@@ -1213,6 +1249,8 @@ def night_state(runs, host_failure, canary):
     if bad:
         return "failure", f"{len(bad)} of {total} run(s) invalid or unknown: " + ", ".join(
             sorted({r.workload for r in bad}))
+    if missing:
+        return "error", f"the host's: no run of {', '.join(missing)}"
     if "host" in kinds:
         return "error", f"the host's: {kinds.count('host')} of {total} run(s) did not finish"
     return "success", f"{total} of {total} run(s) valid: " + ", ".join(
@@ -1234,7 +1272,7 @@ def tracker_text(today, commit, runs, host_failure, state_name, description, fil
 
 
 def ingest(github, state, runs, host_failure, commit, tracker, archive, canary, now, repo, log,
-           status=True):
+           status=True, expected=()):
     """Counts the night, sets its status, files or comments, posts the day. Returns a summary
     dict. Stops the writes at the first rate limit or unreachable GitHub."""
     summary = {"filed": 0, "commented": 0, "throttled": 0, "dropped": 0, "forbidden": 0,
@@ -1243,7 +1281,7 @@ def ingest(github, state, runs, host_failure, commit, tracker, archive, canary, 
     day = day_of(state, today)
     day["nights"] += 1
     day["commit"] = commit
-    state_name, description = night_state(runs, host_failure, canary)
+    state_name, description = night_state(runs, host_failure, canary, expected)
     summary["status"] = state_name
     posted, why = (None, "no status for this night")
     if status:
@@ -1370,6 +1408,9 @@ def main(argv, now=None):
     cmd.add_argument("--expect-invalid", action="store_true")
     cmd.add_argument("--dry-run", action="store_true")
     cmd.add_argument("--no-status", action="store_true")
+    cmd.add_argument("--expect-workloads", default="",
+                     help="space-separated workloads the night must have run; a night missing "
+                          "one is never `success`")
     args = parser.parse_args(argv)
     now = int(time.time()) if now is None else now
 
@@ -1418,7 +1459,7 @@ def main(argv, now=None):
     try:
         summary = ingest(github, state, runs, host_failure, args.commit, args.tracker,
                          args.archive, args.expect_invalid, now, args.repo, log,
-                         status=not args.no_status)
+                         status=not args.no_status, expected=args.expect_workloads.split())
     except Exception:
         # Whatever was posted before the fault is remembered, so the next night does not repeat it.
         with contextlib.suppress(OSError):

@@ -13,7 +13,7 @@ runs the night when it comes up). The unit stops `sim-fleet.service`, runs `nigh
 user `jepsen`, and starts the fleet again whatever happened (`ExecStartPre=+` and
 `ExecStopPost=+`, root, outside the unit's sandbox). `nightly.sh`:
 
-1. takes `flock` once (a second start leaves quietly) and a whole-night deadline of 3 h
+1. takes `flock` once (a second start, by hand say, logs the holder's pid and exits 75, so the unit shows as failed) and a whole-night deadline of 3 h
    (`JEPSEN_NIGHT_SECONDS`); a run past it is killed and counted as the host's;
 2. fetches `main`, builds `nerva` in ReleaseSafe at the tip (`./zig/zig build -Drelease`);
 3. runs `retry` and then `bank`, each `--nemesis kill,partition,gateway --time-limit 3600` and a
@@ -30,16 +30,24 @@ checkout, the code under test; it never runs the `ops/jepsen/` in it. So a broke
 change to the runner (`nightly.sh`, `jepsen_report.py`, `jepsen.service`, `jepsen.timer`) reaches the
 host only when `setup.sh` runs again**, as root, from a checkout of the commit to install.
 
-A systemd stop or the unit's timeout sends TERM: a trap records the run in flight as exit 143 (or
-a `host-failure` if none had finished) and posts `jepsen/nightly` = `error` (the host's) and the
-tracker's line within about 80 s; `TimeoutStopSec=120` leaves room for that. A second night that
-finds the lock held logs the pid in `nightly.pid`. With no token, `nightly.sh` exits at once with
+Any end that is not the end of the script (a systemd stop or the unit's timeout, which send TERM;
+a Ctrl-C; a `set -e` abort such as a full disk) goes through one `EXIT` trap: it records the run in
+flight (as exit 143 only if it was still running) and gives every workload that never ran a 143
+line, so the night is never `success`. It writes a `host-failure` only when no run had finished (a
+finished run's finding is reported as it is: `failure` and its issue), and posts `jepsen/nightly`
+(`error`, or `failure`) and the tracker's line within about 110 s (the run's stop 20 s, the archive 30 s, the report 60 s), once, after archiving the runs
+that finished (an issue then names an archive that outlives the night's directory). The first
+host-failure reason stands: a failed build is not rewritten as "interrupted";
+`TimeoutStopSec=120` leaves room for that. A stop during the final report is not reported again
+(the reporter may have filed an issue; a second report could file it twice). `docker info` is
+bounded to 60 s. A second night that finds the lock held logs the pid in `nightly.pid` and exits
+75; `setup.sh` takes the same lock for the checkout and refuses while a night runs. With no token, `nightly.sh` exits at once with
 one journal line; the unit runs `nightly.sh --check-token` before it stops the fleet.
 
 ## What the reporter does
 
 `jepsen_report.py ingest --store DIR --commit SHA --state FILE [--runs FILE] [--archive PATH]
-[--tracker N] [--expect-invalid] [--no-status] [--dry-run] [--repo OWNER/NAME --token-file FILE]`. Python 3,
+[--tracker N] [--expect-workloads "W1 W2"] [--expect-invalid] [--no-status] [--dry-run] [--repo OWNER/NAME --token-file FILE]`. Python 3,
 standard library only (P147i). For each run:
 
 | Run | Status `jepsen/nightly` | Issue |
@@ -47,10 +55,10 @@ standard library only (P147i). For each run:
 | valid | `success` | none |
 | invalid or unknown (`results.edn`) | `failure` | one per fingerprint |
 | the test threw: a `jepsen.log` and no `results.edn`, and no host exit code, and no host failure (ssh refused, out of heap, disk full, Docker) at the log's end (`nerva` died at setup, say) | `failure` | one per workload (checker `run`, class `crashed`), with the log's end |
-| the host's (exit 124, 125, 126, 137 or 143 with no verdict written, a build that failed, Docker down, Jepsen never started, graphs that did not draw) | `error` | **never** |
+| the host's (exit 124, 125, 126, 137 or 143 with no verdict written, a build that failed, Docker down, Jepsen never started, graphs that did not draw, a checker's verdict carrying `:code "NRV-E0607"`: the Jepsen harness failed, P244e) | `error` | **never** |
 
 `failure` outranks `error` outranks `success`: a night with one real finding and one host
-failure is `failure`, and the finding is filed. A night that did not run at all (`host-failure`
+failure is `failure`, and the finding is filed. A harness verdict (NRV-E0607) beside a finding in the same run is dropped: the finding is filed, the run is `invalid` or `unknown`. A night that did not run at all (`host-failure`
 in the store) is `error`.
 
 - **Fingerprint:** workload, the failing checker key and its anomaly class (`duplicate`,
@@ -73,7 +81,7 @@ in the store) is `error`.
   given is written, so `nightly.sh` gives a dry run one of its own (`state/dry-run.json`).
 - **Statuses only move up** (P235b): error, then success, then failure, per commit and context.
   A later night on the same commit never turns a `failure` green, and a night that could not run
-  never turns a `success` into `error`. The rank is the higher of the state file'"'"'s and GitHub'"'"'s own
+  never turns a `success` into `error`. The rank is the higher of the state file's and GitHub's own
   status for the commit (read before posting); if that read fails, nothing is posted and the tracker
   line says so (P235b). A night that failed to fetch posts no status (`--no-status`):
   it tested nothing, and the commit it knew is the previous night's. The tracker line says so.
@@ -128,7 +136,8 @@ the fleet by hand first.
 
 ## Limits
 
-- Not run on a host yet (slice 7). Verified in a cloud session: the reporter's tests, a dry run
+- Not run on a host yet (slice 7). **A runner change needs `setup.sh` run again on the host**
+  (P240): merging it changes nothing there until then. Verified in a cloud session: the reporter's tests, a dry run
   against the stores of two hosted runs, `shellcheck`, and `systemd-analyze verify`. Bank's `results.edn` shape in the tests is built from `bank.clj`'s checker composition: no
   hosted run of `bank` existed to copy it from.
 - A run cannot be replayed from its seed: the seed steers Jepsen's generators and the faults
