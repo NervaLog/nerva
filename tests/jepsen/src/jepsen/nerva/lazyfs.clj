@@ -146,7 +146,7 @@
           (recur (dec polls)))))))
 
 (def clear-wait-polls
-  "How many times `lose!` asks LazyFS for its unsynced bytes after the clear, hoping for 0."
+  "How many times `clear!` asks LazyFS for its unsynced bytes after a clear, hoping for 0."
   5)
 
 (def sentinel-name
@@ -174,33 +174,45 @@
   (let [out (str/trim (c/exec :sh :-c (str "stat -c %s " path " 2>/dev/null || echo gone")))]
     (when-not (= "gone" out) (parse-long out))))
 
+(defn clear!
+  "Clears LazyFS's cache, then reads its unsynced bytes again until they are 0
+  (`clear-wait-polls`); returns the last reading (not 0 when the clear was not seen to take)."
+  [lz]
+  (lazyfs/lose-unfsynced-writes! lz)
+  (loop [polls clear-wait-polls]
+    (let [after (unsynced-bytes lz)]
+      (if (or (= 0 after) (zero? polls))
+        after
+        (recur (dec polls))))))
+
 (defn lose!
-  "On `nodes` (the replica must be dead there): writes the sentinel on the mount without
-  syncing it, reads the unsynced bytes, clears LazyFS's cache, then reads them again until they
-  are 0 (`clear-wait-polls`), so the op ends only once the clear has been applied and a fast
-  restart's open-time fsync cannot make the lost bytes durable. Returns
-  `{node {:before bytes, :after bytes, :sentinel kw}}`: `:after` is not 0 when the clear was not
-  seen to take; `:sentinel` is `classify-sentinel`'s verdict, which is what proves the clear
-  bit even when the replica, writing O_DSYNC, left nothing unsynced (P242e). The sentinel is
-  removed afterwards."
+  "On `nodes` (the replica must be dead there): reads the unsynced bytes, clears LazyFS's cache,
+  writes the sentinel on the mount without syncing it, clears again. Each clear is followed by
+  reads until the unsynced bytes are 0 (`clear!`), so the op ends only once the clears have been
+  applied and a fast restart's open-time fsync cannot make the lost bytes durable. Returns
+  `{node {:before bytes, :after bytes, :sentinel kw}}`: `:before` is what the replica left
+  unsynced; `:after` is not 0 when a clear was not seen to take; `:sentinel` is
+  `classify-sentinel`'s verdict, which is what proves the clear bit even when the replica,
+  writing O_DSYNC, left nothing unsynced (P242e). The first clear comes before the sentinel
+  because a full LazyFS cache writes through (P242f): the replica's data file, clean after its
+  format, fills the 128 MB cache, and an unsynced write is then durable and unreported. The
+  sentinel is removed afterwards."
   [test lz nodes]
   (c/on-nodes test nodes
               (fn [_ _]
                 (let [path    (str (:dir lz) "/" sentinel-name)
+                      before  (unsynced-bytes lz)
+                      first-a (clear! lz)
                       _       (c/exec :rm :-f path)
                       _       (c/exec :dd "if=/dev/zero" (str "of=" path)
                                       (str "bs=" sentinel-bytes) "count=1" "status=none")
                       written (size-of path)
-                      before  (unsynced-bytes lz)]
-                  (lazyfs/lose-unfsynced-writes! lz)
-                  (let [after  (loop [polls clear-wait-polls]
-                                 (let [after (unsynced-bytes lz)]
-                                   (if (or (= 0 after) (zero? polls))
-                                     after
-                                     (recur (dec polls)))))
-                        status (classify-sentinel written (size-of path))]
-                    (c/exec :rm :-f path)
-                    {:before before, :after after, :sentinel status})))))
+                      after   (clear! lz)
+                      status  (classify-sentinel written (size-of path))]
+                  (c/exec :rm :-f path)
+                  {:before before
+                   :after  (if (= 0 first-a) after first-a)
+                   :sentinel status}))))
 
 (def recover-wait-ms
   "How long a recovery waits for a restarted node to serve (`settle-recovery`). The mid-run wait

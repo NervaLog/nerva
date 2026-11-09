@@ -9,6 +9,7 @@
             [jepsen.nemesis :as n]
             [jepsen.nerva.core :as core]
             [jepsen.nerva.db :as db]
+            [jepsen.lazyfs :as upstream-lazyfs]
             [jepsen.nerva.lazyfs :as lazyfs]))
 
 (def five {:nodes ["n1" "n2" "n3" "n4" "n5"], :concurrency 1})
@@ -385,3 +386,23 @@
 (deftest cli-accepts-the-fault
   (is (= [:lose-unfsynced-writes :kill] (core/parse-faults "lose-unfsynced-writes,kill")))
   (is (contains? core/faults lazyfs/fault)))
+
+(deftest lose-clears-before-the-sentinel-so-a-full-cache-cannot-hide-it
+  (testing "P242f: a full LazyFS cache writes through, so the sentinel is written after a clear"
+    (let [st (atom {:full? true, :file nil})]
+      (with-redefs [c/on-nodes (fn [_ nodes f]
+                                 (into {} (for [n nodes] [n (binding [c/*host* n] (f {} n))])))
+                    c/exec     (fn [& args]
+                                 (when (= :dd (first args))
+                                   (swap! st assoc :file (if (:full? @st) :durable :cached)))
+                                 "")
+                    lazyfs/unsynced-bytes (fn [_] (if (= :cached (:file @st)) 4096 0))
+                    lazyfs/size-of       (fn [_] (when (#{:durable :cached} (:file @st)) 4096))
+                    upstream-lazyfs/lose-unfsynced-writes!
+                    (fn [_]
+                      (swap! st #(cond-> (assoc % :full? false)
+                                   (= :cached (:file %)) (assoc :file :lost))))]
+        (let [r (get (lazyfs/lose! {} {:dir "/opt/nerva/data"} ["n1"]) "n1")]
+          (is (= :gone (:sentinel r)) "the second clear lost the cached sentinel")
+          (is (= 0 (:before r)) "the sentinel is not counted as the replica's bytes")
+          (is (= 0 (:after r))))))))
