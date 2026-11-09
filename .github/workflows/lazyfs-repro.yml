@@ -1,0 +1,60 @@
+name: LazyFS sentinel repro
+on:
+  push:
+    branches: ['repro/**']
+permissions:
+  contents: read
+jobs:
+  repro:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+      - name: Build the node image's LazyFS
+        run: docker build -t node tests/jepsen/node
+      - name: Write, clear, look
+        run: |
+          cat > /tmp/repro.sh <<'INNER'
+          set -u
+          D=/tmp/m; R=/tmp/r; mkdir -p $D $R; touch /tmp/lazyfs.log
+          cat > /tmp/cfg.toml <<CFG
+          [faults]
+          fifo_path="/tmp/faults.fifo"
+
+          [cache]
+          apply_eviction=false
+
+          [cache.simple]
+          custom_size="128MB"
+          blocks_per_page=1
+
+          [filesystem]
+          logfile="/tmp/lazyfs.log"
+          log_all_operations=false
+          CFG
+          cd /opt/jepsen/lazyfs/lazyfs && scripts/mount-lazyfs.sh -c /tmp/cfg.toml -m $D -r $R
+          for i in $(seq 20); do findmnt $D >/dev/null 2>&1 && [ -p /tmp/faults.fifo ] && break; sleep 0.5; done
+          report() { echo "lazyfs::unsynced-data-report" > /tmp/faults.fifo; sleep 0.3; tail -4 /tmp/lazyfs.log | grep -i "report:" | cut -c40-; }
+          clear() { echo "lazyfs::clear-cache" > /tmp/faults.fifo; sleep 0.3; }
+          size() { echo "$1 $2: $(stat -c %s $D/$2 2>/dev/null || echo gone)"; }
+          round() {  # $1 label
+            rm -f $D/lazyfs-sentinel
+            dd if=/dev/zero of=$D/lazyfs-sentinel bs=4096 count=1 status=none
+            size "$1 before" lazyfs-sentinel
+            report; clear; size "$1 after" lazyfs-sentinel; report
+            rm -f $D/lazyfs-sentinel
+          }
+          echo "--- A: idle mount, first round, then again"
+          round A1; round A2
+          echo "--- B: replica-like O_DIRECT|O_DSYNC writer, killed, then sentinel"
+          dd if=/dev/zero of=$D/replica.nerva bs=1M count=8 oflag=direct,dsync status=none
+          ( while :; do dd if=/dev/zero of=$D/replica.nerva bs=4096 count=1 seek=$((RANDOM % 2000)) conv=notrunc oflag=direct,dsync status=none; done ) &
+          W=$!; sleep 3; kill -9 $W; wait $W 2>/dev/null
+          round B1; round B2
+          echo "--- C: no sleeps (report right after dd)"
+          rm -f $D/lazyfs-sentinel; dd if=/dev/zero of=$D/lazyfs-sentinel bs=4096 count=1 status=none
+          echo "lazyfs::unsynced-data-report" > /tmp/faults.fifo; sleep 0.3; tail -4 /tmp/lazyfs.log | grep -i "report:" | cut -c40-
+          INNER
+          docker run --rm --privileged --device /dev/fuse -v /tmp/repro.sh:/tmp/repro.sh:ro node bash /tmp/repro.sh 2>&1 | tee /tmp/out.txt
