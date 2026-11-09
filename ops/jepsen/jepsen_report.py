@@ -353,6 +353,13 @@ def option(words, name):
     return None
 
 
+def workload_of(words):
+    """The workload a command runs, as findings name it: the unkeyed `bank` is its own (P239b),
+    so its failures do not share a fingerprint with the keyed run's."""
+    workload = option(words, "workload")
+    return "bank-no-keys" if workload == "bank" and "--no-keys" in words else workload
+
+
 MACHINE_OPTIONS = ("nodes", "username", "ssh-private-key", "nerva-binary")
 
 
@@ -622,11 +629,14 @@ def read_test(run, directory):
     if words is None and run.args is not None:
         words = ["lein", "run"] + run.args
     if words is not None:
-        run.workload = option(words, "workload") or run.workload
+        run.workload = workload_of(words) or run.workload
         run.workload_read = run.workload_read or bool(option(words, "workload"))
         run.nemesis = option(words, "nemesis") or ""
         run.seed = option(words, "seed")
         run.reproduce = " ".join(shlex.quote(w) for w in reproduce_words(words))
+    if run.workload == "bank" and os.path.basename(os.path.dirname(directory)).startswith(
+            "nerva bank no-keys"):
+        run.workload = "bank-no-keys"  # `test-all` has no --workload; the test's name says it
     path = os.path.join(directory, "results.edn")
     try:
         with open(path, "rb") as file:
@@ -746,7 +756,7 @@ def read_night(store, runs_file):
                 read_test(run, tests[0])
             else:
                 words = ["lein", "run"] + args
-                run.workload = option(words, "workload") or run.workload
+                run.workload = workload_of(words) or run.workload
                 run.workload_read = bool(option(words, "workload"))
                 run.nemesis = option(words, "nemesis") or ""
             settle_run(run, code, tests)

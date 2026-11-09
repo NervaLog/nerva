@@ -26,9 +26,10 @@
   {:bank  bank/workload
    :retry retry/workload})
 
-(def default-gateways
-  "Gateways per node when --gateways is not given: `retry` resends to another gateway."
-  {:bank 1, :retry 2})
+(defn default-gateways
+  "Gateways per node when --gateways is not given: a keyed workload resends to another gateway."
+  [{:keys [workload keyed]}]
+  (if (or (= :retry workload) (and (= :bank workload) (not (false? keyed)))) 2 1))
 
 (def faults
   "The faults --nemesis may name."
@@ -59,10 +60,13 @@
                       :kill      {:targets [:one :minority :majority :all]}
                       :pause     {:targets [:one :minority :majority]}
                       :partition {:targets [:one :majority :majorities-ring]}}]
+    ;; Final generators run in this order. The lazyfs recovery is judged, so it comes after the
+    ;; replica restart (db-package) and the partition heal, which may otherwise leave it no
+    ;; quorum, and before nemesis/package's final gateway start.
     (combined/compose-packages [(nemesis/heal-package package-opts)
-                                (lazyfs/package package-opts)
                                 (combined/db-package package-opts)
                                 (combined/partition-package package-opts)
+                                (lazyfs/package package-opts)
                                 (nemesis/package package-opts)])))
 
 (defn nerva-test
@@ -70,7 +74,7 @@
   [opts]
   (let [workload ((workloads (:workload opts)) opts)
         opts     (assoc opts
-                        :gateways (or (:gateways opts) (default-gateways (:workload opts)))
+                        :gateways (or (:gateways opts) (default-gateways opts))
                         :lazyfs   (contains? (set (:nemesis opts)) lazyfs/fault))
         db       (db/db (:bootstrap workload))
         package  (nemesis-package opts db)]
@@ -78,6 +82,8 @@
            opts
            (:test-keys workload)
            {:name      (str "nerva " (name (:workload opts))
+                            (when (and (= :bank (:workload opts)) (false? (:keyed opts)))
+                              " no-keys")
                             (when (seq (:nemesis opts))
                               (str " " (str/join "," (map name (:nemesis opts))))))
             :os        os/noop
@@ -123,14 +129,17 @@
    [nil "--recovery-time SECONDS" "Seconds between healing and the final reads."
     :default  20
     :parse-fn parse-long]
-   [nil "--gateways N" "Gateways per node: 1, or 2 (ports 8080 and 8081), as R4's sidecars. Default: 2 for retry, else 1."
+   [nil "--gateways N" "Gateways per node: 1, or 2 (ports 8080 and 8081), as R4's sidecars. Default: 2 for retry and for bank with keys, else 1."
     :parse-fn parse-long
     :validate [#{1 2} "Must be 1 or 2"]]
-   [nil "--drop-reply P" "retry: the probability that the client discards a 200 and resends."
+   [nil "--[no-]keys" "bank: send each transfer under a commit key, with a record, retried as retry's are (default), or unkeyed."
+    :id      :keyed
+    :default true]
+   [nil "--drop-reply P" "keyed workloads: the probability that the client discards a 200 and resends."
     :default  0.1
     :parse-fn parse-double
     :validate [#(<= 0 % 1) "Must be between 0 and 1"]]
-   [nil "--attempts N" "retry: attempts per operation before it ends unresolved."
+   [nil "--attempts N" "keyed workloads: attempts per operation before it ends unresolved."
     :default  8
     :parse-fn parse-long
     :validate [pos? "Must be positive"]]
@@ -138,13 +147,18 @@
    [nil "--nerva-binary PATH" "The nerva binary to install on every node."
     :default "../../zig-out/bin/nerva"]])
 
+(def all-variants
+  "What test-all runs under every nemesis: [workload keyed?]. `bank` runs both ways, so that
+  the unkeyed run stays covered."
+  [[:bank true] [:bank false] [:retry true]])
+
 (defn all-tests
-  "test-all: every workload under every nemesis in all-nemeses."
+  "test-all: every workload variant under every nemesis in all-nemeses."
   [opts]
-  (for [workload (keys workloads)
-        nemesis  all-nemeses
-        _        (range (:test-count opts 1))]
-    (nerva-test (assoc opts :workload workload, :nemesis nemesis))))
+  (for [[workload keyed] all-variants
+        nemesis          all-nemeses
+        _                (range (:test-count opts 1))]
+    (nerva-test (assoc opts :workload workload, :keyed keyed, :nemesis nemesis))))
 
 (defn -main
   [& args]

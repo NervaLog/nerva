@@ -181,6 +181,32 @@ class Statuses(unittest.TestCase):
         self.assertEqual(github.opened, [])
         self.assertEqual(summary["filed"], 0)
 
+    def test_an_unread_record_set_is_the_hosts_and_never_filed(self):
+        # The keys checker's :unknown when the final records read never answered (P239f): it
+        # carries the harness's code beside the gateway's, so it is no `unknown-result` finding.
+        unread = ("{:valid? :unknown, :perf {:valid? true}, :gateways {:valid? :unknown, :code "
+                  '"NRV-E0607", :final-starts 1, :heal-failures ["boom"]}, :workload '
+                  "{:valid? :unknown, :keys {:valid? :unknown, :code "
+                  '"NRV-E0607", :keys 3, :reads 0, :unresolved {:count 3, :examples '
+                  "[{:key \"aaaa\"}]}}}}")
+        store = Store(self)
+        store.test("1", unread, args="--workload bank --nemesis kill,partition,gateway")
+        runs, _ = rep.read_night(store.path, store.write_runs())
+        self.assertEqual(runs[0].kind, "host")
+        github, _, summary = night(self, store)
+        self.assertEqual(github.statuses[0][1], "error")
+        self.assertEqual(github.opened, [])
+        self.assertEqual(summary["filed"], 0)
+
+    def test_an_unread_record_set_without_the_code_would_be_filed(self):
+        uncoded = ("{:valid? :unknown, :perf {:valid? true}, :workload {:valid? :unknown, "
+                   ":keys {:valid? :unknown, :keys 3, :reads 0, :unresolved {:count 3, "
+                   ":examples [{:key \"aaaa\"}]}}}}")
+        store = Store(self)
+        store.test("1", uncoded, args="--workload bank")
+        github, _, _ = night(self, store)
+        self.assertEqual(len(github.opened), 1, "the code is what keeps the host's from filing")
+
     def test_a_finding_elsewhere_outranks_a_harness_verdict(self):
         both = ("{:valid? false, :perf {:valid? true}, :gateways {:valid? :unknown, :code "
                 '"NRV-E0607", :errors ["boom"]}, :protocol {:valid? false, :violations 2, '
@@ -223,6 +249,29 @@ class Statuses(unittest.TestCase):
         blind.test("1", VALID)
         github, _, _ = night(self, blind, canary=True)
         self.assertEqual(github.statuses[0][1], "failure")
+
+    def test_the_bank_canary_succeeds_on_a_record_read_teeth_run(self):
+        # The keyed bank with dedup off: a re-execution is refused `conflict` by the record
+        # read, which the workload counts as a duplicate (P239e), beside the other classes.
+        results = ("{:valid? false, :perf {:valid? true}, :workload {:valid? false, "
+                   ":keys {:valid? false, :duplicate {:count 355, :examples [{:key \"a\", "
+                   ":conflict true}]}, :refused-after-commit {:count 0, :examples []}, "
+                   ":refused-with-record {:count 10, :examples [{:key \"b\"}]}}, "
+                   ":refusals {:valid? false, :conflict 360, :out_of_bounds 508}}}")
+        store = Store(self)
+        store.test("1", results, args="--workload bank --teeth --time-limit 300")
+        github, _, _ = night(self, store, canary=True)
+        self.assertEqual(github.statuses[0][1:3], ("success", "jepsen/canary"))
+        self.assertEqual([t for _, t, _ in github.opened if "blind" in t], [])
+
+    def test_a_test_all_run_without_keys_is_its_own_workload(self):
+        store = Store(self)
+        directory = store.test("1", VALID, args="")
+        named = os.path.join(store.path, "1", "nerva bank no-keys x")
+        os.rename(os.path.dirname(directory), named)
+        run = rep.Run("1")
+        rep.read_test(run, os.path.join(named, "2026-11-02T01:00:00Z"))
+        self.assertEqual(run.workload, "bank-no-keys")
 
     def test_a_canary_with_only_a_harness_failure_is_blind_and_filed(self):
         store = Store(self)
@@ -297,6 +346,11 @@ class Fingerprints(unittest.TestCase):
         c = self.fingerprint(self.filed(invalid(name="applied-lie"), "--workload retry"))
         d = self.fingerprint(self.filed(invalid(checker="bank"), "--workload retry"))
         self.assertEqual(len({a, b, c, d}), 4)
+
+    def test_the_unkeyed_bank_run_has_its_own(self):
+        a = self.fingerprint(self.filed(invalid(), "--workload bank"))
+        b = self.fingerprint(self.filed(invalid(), "--workload bank --no-keys"))
+        self.assertNotEqual(a, b)
 
     def test_the_canary_has_its_own_fingerprints(self):
         store = Store(self)
