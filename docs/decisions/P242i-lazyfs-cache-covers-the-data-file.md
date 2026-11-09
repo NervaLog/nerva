@@ -34,10 +34,14 @@ The decision, in four parts.
    (every hosted run: 0), and an unpatched LazyFS or a Nerva that stops syncing leaves some, so the
    warning shows in the result of any scope. The canary (`unpatched-lazyfs`, `--nemesis
    lose-unfsynced-writes --lazyfs-all-nodes`, P242h part 5) is expected to show that warning with
-   `:lost-bytes` above 0, and the bank or protocol checker failing (the whole cluster restarting
-   empty or short, #246). The teeth for the failure come from those checkers under
-   `--lazyfs-all-nodes`; the default `:minority` scope on a Nerva that stopped syncing passes the
-   `:lazyfs` checker with the warning only, which is what the warning is for.
+   `:lost-bytes` above 0, and the workload's `:keys` checker failing (acknowledged records lost
+   when the whole cluster restarts short, #246). Run 42696580002 (9a78be9, 120 s) did exactly that:
+   `:keys` invalid (`:committed 506`, `:records 425`, `:missing` 405, `:duplicate` 1, `:count-view`
+   5); bank, source, view and refusals valid; `:lazyfs` valid with `:faults 4` and `:lost-bytes
+   24715264`. The teeth for the failure come from the `:keys` checker under `--lazyfs-all-nodes`
+   (the bank and protocol checkers did not fail); the default `:minority` scope on a Nerva that
+   stopped syncing passes the `:lazyfs` checker with the warning only, which is what the warning
+   is for.
 
 Why (amends P242h): the review of 9a78be9 found that P242h's "about 5.5 MB per node in 5 minutes"
 was wrong by more than 10x. Run 42692440134 shows a node at 0.27% and, 56 s after a restart, at
@@ -52,5 +56,5 @@ and drops the unsynced data the fault is there to lose).
 What it costs: up to about 1.2 GB of RAM per node container (6 GB for the cluster) on a long run,
 where the file is fully touched; a hosted runner has 16 GB. A change to the format's size is a
 setup failure until `cache-size` and `cache-bytes-min` follow it. The `:lost-bytes` warning is
-not a verdict, so a Nerva that stopped syncing is failed only by the workload's checkers and
+not a verdict, so a Nerva that stopped syncing is failed only by the workload's `:keys` checker and
 only under `--lazyfs-all-nodes`.
