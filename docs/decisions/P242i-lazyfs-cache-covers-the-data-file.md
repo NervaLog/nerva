@@ -72,7 +72,17 @@ of every run with the fault, not only with `--lazyfs-all-nodes` (an earlier text
 said pages are allocated as they are written; that was wrong). `1200MB` would have held 1.26 GB a
 node, 6.3 GB for the cluster. The R1 brief's risk 2 puts the hosted runner's 15,983 MB (`free
 -m`) at about 13 GB with two gateways per node, so the sizing is the tightest the bound allows
-and the headroom is measured, not assumed: MEASURED. The workflow records `free -m` at the start
+and the headroom is measured, not assumed. Run 42702458425 (5fda8e0, bank,
+`lose-unfsynced-writes --lazyfs-all-nodes`, 300 s, hosted, 15,982 MB): MemAvailable 14,945 MiB
+before the run, 2,796 MiB after the fifth mount (as the replicas and gateways were starting), and
+a lowest of 414 MiB (sampled every 5 s) at some point in the run. The run passed: `:valid?
+true`, `:lazyfs {:faults 14 :scopes {:all 5 :minority 9} :lost-bytes 0 :cache-usage-max 5.51
+:sentinel {:truncated 40}}`. 414 MiB is far under the 2 GB the sizing was held to, so this
+decision is not enough on its own: a longer run, or a runner with less cache memory free, can be
+OOM-killed (exit 137, as #107), and it would show as a red job, not as NRV-E0607. The sizing
+cannot go lower (the bound is the data file); what is left is less elsewhere (one gateway per
+node, `-Xmx3g`, per the brief's risk 2) or running the fault only on the 64 GB host. The
+owner decides which. The workflow records `free -m` at the start
 and end of the run and the lowest MemAvailable between, and the harness logs `free -m` after
 each mount. A change to the format's size is a setup failure until `cache-size` and
 `cache-bytes` follow it. The `:lost-bytes` warning is not a verdict, so a Nerva that stopped
