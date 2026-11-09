@@ -2,7 +2,9 @@
   "Each row of README's \"What a reply means\" maps to the outcome R4's contract gives it
   (P215d)."
   (:require [clojure.test :refer [deftest is testing]]
-            [jepsen.nerva.http :as http]))
+            [jepsen.nerva.http :as http])
+  (:import (com.sun.net.httpserver HttpExchange HttpHandler HttpServer)
+           (java.net InetSocketAddress)))
 
 (defn reply
   [status body]
@@ -80,3 +82,25 @@
       "a read without a reply changed nothing")
   (is (= :info (:type (http/unknown {:f :transfer} true :x))))
   (is (= :fail (:type (http/unknown {:f :read} false :x)))))
+
+(defn- healthz-says
+  "Whether `http/healthy?` calls a server that answers `/healthz` with `status` and `body` healthy."
+  [status ^String body]
+  (let [server (HttpServer/create (InetSocketAddress. "127.0.0.1" 0) 0)]
+    (.createContext server "/healthz"
+                    (reify HttpHandler
+                      (handle [_ ex]
+                        (let [bytes (.getBytes body "UTF-8")]
+                          (.sendResponseHeaders ^HttpExchange ex status (count bytes))
+                          (with-open [out (.getResponseBody ^HttpExchange ex)]
+                            (.write out bytes))))))
+    (.start server)
+    (try (http/healthy? "127.0.0.1" (.getPort (.getAddress server)))
+         (finally (.stop server 0)))))
+
+(deftest healthy-means-a-200-and-nothing-else-throws
+  (is (true? (healthz-says 200 "{\"session\":\"ok\"}")))
+  (is (false? (healthz-says 503 "{\"session\":\"reconnecting\"}")))
+  (is (false? (healthz-says 200 "this is not json"))
+      "a body that cannot be read is a gateway that is not healthy, not a harness throw")
+  (is (false? (http/healthy? "127.0.0.1" 1)) "no reply"))
