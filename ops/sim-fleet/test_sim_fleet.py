@@ -44,11 +44,11 @@ class Round:
         test.addCleanup(self.dir.cleanup)
         self.path = self.dir.name
 
-    def seed(self, worker, target, seed, code, tail="", errors=None):
+    def seed(self, worker, target, seed, code, tail="", errors=None, seconds=3):
         wdir = os.path.join(self.path, f"w{worker}")
         os.makedirs(wdir, exist_ok=True)
         with open(os.path.join(wdir, "results"), "a") as file:
-            file.write(f"{target} {seed} {code} 3\n")
+            file.write(f"{target} {seed} {code} {seconds}\n")
         if code not in (0, 124, 137):
             fail = os.path.join(wdir, f"fail-{target.replace(':', '-')}-{seed}")
             os.makedirs(fail, exist_ok=True)
@@ -388,6 +388,154 @@ class StateFile(unittest.TestCase):
                                "--state", self.path, "--dry-run"], now=DAY_ONE)
         self.assertEqual(code, 1)
         self.assertFalse(os.path.exists(self.path))
+
+
+SHA_A = "1a2b3c4" + "0" * 33
+SHA_B = "9f8e7d6" + "0" * 33
+
+
+def soak_round(test, seconds=1800):
+    """A round of two workers, each busy for `seconds`: 2 vopr-nerva, 1 vopr-testing, 1 fuzz seed
+    and one failing vopr-nerva seed."""
+    rnd = Round(test)
+    rnd.seed(0, "vopr-nerva", 1, 0, seconds=seconds // 2)
+    rnd.seed(0, "vopr-nerva", 2, 134, PANIC_LOG, seconds=seconds // 2)
+    rnd.seed(1, "vopr-testing", 3, 0, seconds=seconds // 2)
+    rnd.seed(1, "fuzz:lsm_tree", 4, 0, seconds=seconds // 2)
+    return rnd
+
+
+def soak(test, state, commit):
+    path = os.path.join(tempfile.mkdtemp(), "state.json")
+    test.addCleanup(lambda: os.path.exists(path) and os.unlink(path))
+    fleet.save_state(path, state)
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        code = fleet.main(["soak", "--commit", commit, "--state", path], now=DAY_ONE)
+    return code, out.getvalue().strip(), err.getvalue()
+
+
+class Soak(unittest.TestCase):
+    def test_hours_and_seeds_are_counted_per_commit_from_rounds_that_span_two_commits(self):
+        github, state = Recorder(), fleet.new_state()
+        for i in range(2):
+            ingest(self, github, state, soak_round(self), SHA_A, DAY_ONE + 60 * i)
+        ingest(self, github, state, soak_round(self, 900), SHA_B, DAY_ONE + 600)
+        ingest(self, github, state, soak_round(self), SHA_A, DAY_ONE + 700)
+        a, b = state["commits"][SHA_A], state["commits"][SHA_B]
+        # The busiest worker's seconds: 1800 each time, never the two workers' sum.
+        self.assertEqual((a["seconds"], a["rounds"]), (3 * 1800, 3))
+        self.assertEqual((b["seconds"], b["rounds"]), (900, 1))
+        self.assertEqual(a["kinds"]["vopr-nerva"], {"seeds": 6, "failed": 3})
+        self.assertEqual(a["kinds"]["fuzz"], {"seeds": 3, "failed": 0})
+        self.assertEqual(b["kinds"]["vopr-testing"], {"seeds": 1, "failed": 0})
+
+    def test_the_soak_line_is_the_one_the_release_quotes(self):
+        github, state = Recorder(), fleet.new_state()
+        for i in range(2):
+            ingest(self, github, state, soak_round(self, 3600), SHA_A, DAY_ONE + 60 * i)
+        code, line, _ = soak(self, state, SHA_A)
+        self.assertEqual(code, 0)
+        # The seed's own 134 failure is filed on the first round, so it is listed too.
+        self.assertEqual(line, "soak 1a2b3c4: 2.0 h, vopr-nerva 4 seeds, vopr-testing 2, fuzz 2; "
+                               "2 failures; open sim-fleet issues against it: #101")
+        # A prefix names the commit as well.
+        self.assertEqual(soak(self, state, "1a2b3c4")[1], line)
+
+    def test_a_commit_with_no_failure_says_none(self):
+        github, state = Recorder(), fleet.new_state()
+        rnd = Round(self)
+        rnd.seed(0, "vopr-nerva", 1, 0, seconds=90 * 60)
+        ingest(self, github, state, rnd, SHA_A, DAY_ONE)
+        code, line, _ = soak(self, state, SHA_A)
+        self.assertEqual((code, line), (0, "soak 1a2b3c4: 1.5 h, vopr-nerva 1 seeds, "
+                                           "vopr-testing 0, fuzz 0; 0 failures; "
+                                           "open sim-fleet issues against it: none"))
+
+    def test_an_open_fingerprint_last_reported_on_the_commit_is_listed(self):
+        github, state = Recorder(), fleet.new_state()
+        ingest(self, github, state, soak_round(self), SHA_A, DAY_ONE)
+        ingest(self, github, state, soak_round(self), SHA_B, DAY_ONE + 60)
+        self.assertIn("open sim-fleet issues against it: #101", soak(self, state, SHA_B)[1])
+        # Last reported on B, so no longer against A.
+        self.assertIn("open sim-fleet issues against it: none", soak(self, state, SHA_A)[1])
+
+    def test_an_unknown_commit_is_0_hours_and_exit_1(self):
+        github, state = Recorder(), fleet.new_state()
+        ingest(self, github, state, soak_round(self), SHA_A, DAY_ONE)
+        code, line, err = soak(self, state, "deadbee" + "0" * 33)
+        self.assertEqual(code, 1)
+        self.assertEqual(line, "soak deadbee: 0.0 h, vopr-nerva 0 seeds, vopr-testing 0, fuzz 0; "
+                               "0 failures; open sim-fleet issues against it: none")
+        self.assertIn("no rounds of deadbee", err)
+
+    def test_a_prefix_of_two_commits_is_refused(self):
+        github, state = Recorder(), fleet.new_state()
+        ingest(self, github, state, soak_round(self), "abcdef1" + "0" * 33, DAY_ONE)
+        ingest(self, github, state, soak_round(self), "abcdef1" + "1" * 33, DAY_ONE + 60)
+        self.assertEqual(soak(self, state, "abcdef1")[0], 1)
+
+    def test_a_bad_commit_or_a_missing_state_is_refused(self):
+        self.assertEqual(soak(self, fleet.new_state(), "xyz")[0], 1)
+        with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(fleet.main(["soak", "--commit", SHA_A, "--state",
+                                         "/nonexistent/state.json"]), 2)
+
+    def test_the_65th_commit_drops_the_oldest(self):
+        github, state = Recorder(), fleet.new_state()
+        for i in range(fleet.COMMITS_KEPT + 1):
+            rnd = Round(self)
+            rnd.seed(0, "vopr-nerva", 1, 0, seconds=60)
+            ingest(self, github, state, rnd, f"{i:040x}", DAY_ONE + i)
+        self.assertEqual(len(state["commits"]), 64)
+        self.assertNotIn(f"{0:040x}", state["commits"])
+        self.assertIn(f"{1:040x}", state["commits"])
+        self.assertIn(f"{64:040x}", state["commits"])
+        # Counting an old commit again keeps it: the entry dropped is the least recently counted.
+        rnd = Round(self)
+        rnd.seed(0, "vopr-nerva", 1, 0, seconds=60)
+        ingest(self, github, state, rnd, f"{1:040x}", DAY_ONE + 100)
+        rnd = Round(self)
+        rnd.seed(0, "vopr-nerva", 1, 0, seconds=60)
+        ingest(self, github, state, rnd, f"{65:040x}", DAY_ONE + 101)
+        self.assertIn(f"{1:040x}", state["commits"])
+        self.assertNotIn(f"{2:040x}", state["commits"])
+        self.assertEqual(len(state["commits"]), 64)
+        self.assertEqual(soak(self, state, f"{2:040x}")[0], 1)
+
+    def test_the_daily_comment_has_one_line_per_commit_that_ran(self):
+        github, state = Recorder(), fleet.new_state()
+        ingest(self, github, state, soak_round(self, 3600), SHA_A, DAY_ONE, tracker=9)
+        ingest(self, github, state, soak_round(self, 1800), SHA_B, DAY_ONE + 60, tracker=9)
+        ingest(self, github, state, soak_round(self, 3600), SHA_A, DAY_ONE + DAY, tracker=9)
+        ingest(self, github, state, soak_round(self), SHA_A, DAY_ONE + DAY + 60, tracker=9)
+        text = [body for number, body in github.comments if number == 9][0]
+        self.assertIn("Commits that ran:\n"
+                      "- `1a2b3c4`: 1.0 h that day, 2.0 h in all, 4 seeds that day\n"
+                      "- `9f8e7d6`: 0.5 h that day, 0.5 h in all, 4 seeds that day\n", text)
+
+    def test_a_state_from_before_the_counting_loads_and_starts_counting(self):
+        path = os.path.join(tempfile.mkdtemp(), "state.json")
+        Path(path).write_text(json.dumps({"version": 1, "filed": {}, "days": {}, "hold_until": 0}))
+        state = fleet.load_state(path)
+        self.assertEqual(state["commits"], {})
+        github = Recorder()
+        ingest(self, github, state, soak_round(self), SHA_A, DAY_ONE)
+        self.assertEqual(state["commits"][SHA_A]["rounds"], 1)
+
+    def test_two_recorded_rounds_through_the_dry_run_print_the_soak_line(self):
+        state_path = os.path.join(tempfile.mkdtemp(), "state.json")
+        for i in range(2):
+            rnd = soak_round(self, 3600)
+            with contextlib.redirect_stdout(io.StringIO()), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(fleet.main(["ingest", "--round", rnd.path, "--commit", SHA_A,
+                                             "--state", state_path, "--dry-run"],
+                                            now=DAY_ONE + 900 * i), 0)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(fleet.main(["soak", "--commit", SHA_A, "--state", state_path]), 0)
+        self.assertTrue(out.getvalue().startswith("soak 1a2b3c4: 2.0 h, vopr-nerva 4 seeds, "))
 
 
 class WorkerPlan(unittest.TestCase):

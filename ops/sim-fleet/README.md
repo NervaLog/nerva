@@ -207,6 +207,65 @@ survives, so the round in flight is lost and nothing else), runs for about 2.5 h
 is stopped for the window is normal: its tracker line for that day is late, not missing. Do not
 start the fleet by hand during the window.
 
+## Release soak
+
+A release is cut from a frozen `main` commit, the candidate (docs/briefs/v0.7.1.md, P284b), and
+the gate asks that the fleet ran it for 24 hours. The fleet counts that itself.
+
+**What it counts.** For each of the last 64 commits (the oldest is dropped past that, bounded in
+`sim_fleet.py` and asserted) the state file keeps the hours its rounds ran, the seeds by kind
+(`vopr-nerva`, `vopr-testing`, `fuzz`) and the failing seeds. A round's hours are its busiest
+worker's seconds, summed from that worker's `results` file: the rounds' own records, never wall
+time, so a stopped fleet (the Jepsen window, a crash) adds nothing. Each daily tracker comment has
+a "Commits that ran" list, one line per commit that ran that day: its hours that day, its hours in
+all and its seeds that day. A state file written before this counting loads and starts counting
+from its next round; commits that ran before have no hours.
+
+**The line the release PR quotes**, from the state file alone (no token, no network):
+
+```
+python3 -I /var/lib/sim-fleet/state/bin/$(cat /var/lib/sim-fleet/state/built)/sim_fleet.py soak --commit <SHA> --state /var/lib/sim-fleet/state/state.json
+soak 1a2b3c4: 24.6 h, vopr-nerva 182,311 seeds, vopr-testing 15,020, fuzz 9,874; 0 failures; open sim-fleet issues against it: none
+```
+
+(The built commit's copy, or any checkout's `ops/sim-fleet/sim_fleet.py`, works: `soak` reads only the state file. `--commit`
+is the full SHA or a prefix of at least 7 hex digits.) Exit 0 if the commit ran, 1 if the state
+has no round of it (the line then says `0.0 h`) or the prefix names two commits, 2 if the state
+file is missing or unreadable. "Failures" counts failing seeds, not distinct bugs. "Open sim-fleet
+issues against it" lists every issue whose last report was this commit, from the state the
+reporter keeps; the state does not see a closed issue, so confirm each listed issue on GitHub
+(`label:sim-fleet is:open`) before quoting "none" or a list. The gate wants 24 hours and no open
+issue; the line does not decide that, the reader does.
+
+**Pointing the fleet at the candidate.** Set `SIM_FLEET_BRANCH` in `/etc/sim-fleet/fleet.env` to
+the candidate's **full 40-character SHA** and `systemctl restart sim-fleet`. `run.sh` runs
+`git fetch origin $SIM_FLEET_BRANCH`, takes `FETCH_HEAD` as the commit and checks it out, and
+that works with a SHA unchanged: GitHub serves any commit of a public repository to `git fetch`
+by its full SHA (checked from a clone with `main`'s tip three commits ahead of the SHA: the fetch
+succeeds, `FETCH_HEAD` is the SHA, the checkout is detached on it). An abbreviated SHA does not
+fetch (`couldn't find remote ref`; the loop logs `git fetch failed` and keeps what it has, so a
+typo soaks the old commit silently: check `journalctl -u sim-fleet` for `building <SHA>`). The
+fleet then stops following `main`; the soak restarts at a new commit when the owner moves the
+pin (a fix merged to `main` first), and when the soak ends the owner removes the line and
+restarts the service.
+
+**Before the soak counts** (the owner's host steps, in order; none is done by this repository):
+
+1. Provision the host (docs/briefs/r1.md, "The host").
+2. Create the two tokens (R1 owner question 3): fleet Issues only; Jepsen Issues and Commit
+   statuses.
+3. Run both `setup.sh` (trackers #177 and #266). **Run this one again after the change that adds
+   the counting merges** (P240: the host runs the installed copy of `sim_fleet.py`, which
+   `setup.sh` copies from the checkout; merging changes nothing on the host until then). A
+   `soak` run before that finds no `commits` and says `0.0 h`.
+4. Watch one full day on `main` (a tracker post from each).
+5. Run R2's canary (a scratch-branch fault, filed once, then commented on and not filed again).
+6. Run R1's teeth night (`--expect-invalid` on the keys-off build files one `jepsen` issue). A
+   fleet that has never filed anything passes the gate silently; steps 5 and 6 prove it would not.
+
+The Jepsen clause of the same soak is in [ops/jepsen](../jepsen/README.md#release-soak). Jepsen
+stops the fleet for about 2.5 h a night, so 24 hours of rounds take about 27 of wall time.
+
 ## Limits
 
 - The token files issues and comments; it cannot close, label or delete. Closing and reopening
