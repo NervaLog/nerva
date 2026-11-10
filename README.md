@@ -885,7 +885,7 @@ Nerva holds its first client's money on the R milestones' terms, in
 | R3 · Measured | Sizing and latency on three machines; the Fly p99 explained | Not started |
 | R4 · Gateway | Beside its client: a gateway per client process on loopback, no ambiguous 503, metrics | **Delivered** 2026-11-06: `demo_r4` green on `main` ([run](https://github.com/NervaLog/nerva/actions/runs/42136037296/job/127624296815), [docs/demos/r4.md](./docs/demos/r4.md)) |
 | R5 · Recover | Replace a lost replica, and restore a backup, with the cluster open | **Delivered** 2026-11-05: `demo_r5` green on `main` ([run](https://github.com/NervaLog/nerva/actions/runs/41997293568/job/127143488126), [docs/demos/r5.md](./docs/demos/r5.md)) |
-| R6 · Upgrade | Rolling upgrades between releases with the same data format | Not started |
+| R6 · Upgrade | Rolling upgrades between releases with the same data format | Brief written ([docs/briefs/r6.md](./docs/briefs/r6.md)) |
 | R7 · Retention | Keys, history and view versions trimmed below a horizon | Not started |
 | R8 · Native client | The client library from the JVM over a C ABI: no gateway, no JSON, batched ops | Not started |
 
