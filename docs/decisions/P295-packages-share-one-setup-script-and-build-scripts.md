@@ -30,3 +30,25 @@ message.
 **Cost.** One more file under `packaging/linux/`. The package's message begins `nerva package:` where
 `install.sh`'s begins `install.sh:`. A unit file is not reloaded by the package; `systemctl enable` and `start`
 read it from disk.
+
+## Findings from the container runs, and signing
+
+Measured in the Packages workflow (the `FINDING:` lines of `tests/packaging/packages.py`), not assumed:
+
+- **Unsigned packages.** `dnf install /path/nerva-*.rpm` with the defaults installs the unsigned file on Rocky 9
+  (rpm 4.16, dnf 4) and on Fedora latest (rpm 6.1, dnf 5): neither checks a local file's signature
+  (`localpkg_gpgcheck` is off). rpm 6.1 itself, run directly, refuses the same file (`rpm -U`:
+  `package nerva-0.7.0-1.x86_64 does not verify: no signature`); `rpm -U --nosignature` installs it. Rocky's rpm
+  4.16 takes `rpm -U` unsigned without an option. So a user installing our unsigned `.rpm` on Fedora uses
+  `dnf install ./nerva-<version>-1.<arch>.rpm`, or `rpm -U --nosignature` with rpm directly. The test uses
+  exactly those and no `--no-gpgchecks`.
+- **Signing.** Packages are **unsigned in 0.7.1**; the release already publishes `SHA256SUMS` beside them.
+  Signing the `.rpm` (and a signed apt/dnf repository) is a follow-up issue, because it needs a release key
+  and its custody, which the owner has not decided.
+- **dpkg doc excludes.** The `ubuntu` image carries `/etc/dpkg/dpkg.cfg.d/excludes` (`path-exclude=/usr/share/doc/*`),
+  so dpkg does not unpack `/usr/share/doc/nerva/*` there; the deb flow removes that file before installing.
+  dnf's equivalent is `tsflags=nodocs`, set empty with `--setopt=tsflags=`. Real hosts are unaffected.
+- **apt lists.** The images ship no apt package lists, and a package installed from a local file is not in
+  them, so `apt-get remove` and `purge` cannot find it; the test removes with `dpkg -r` and `dpkg -P`, which
+  run the same maintainer scripts.
+- **`cmp`.** Rocky's image has no `cmp`; the checks compare SHA-256 sums.
