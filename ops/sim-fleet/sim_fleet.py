@@ -3,6 +3,7 @@
 
     sim_fleet.py ingest --round DIR --commit SHA --state FILE [--source-root DIR]
                         [--repo OWNER/NAME --token-file FILE] [--tracker N] [--dry-run]
+    sim_fleet.py soak --commit SHA --state FILE
 
 Reads one round that `run.sh` wrote: each worker's directory `DIR/w<N>/` holds `results`, one
 line per seed run (`<target> <seed> <exit code> <seconds>`), and for each failing seed a
@@ -21,6 +22,15 @@ over. No request follows a redirect, so the token never goes to another host. `-
 GitHub nothing and prints what it would file (it still counts into the state file it is given:
 give it a state file of its own). `--source-root` is the checkout the binaries were built in; a
 stack frame is Nerva's when its path is under its `src/`.
+
+`soak` prints, from the state file alone, what the release gate asks of the fleet for one commit
+(the candidate of the release soak, ops/sim-fleet/README.md): the hours its rounds ran, the seeds
+by kind, the failing, deadline-hit and host-killed seeds, and the failures its rounds hit (with
+their issues). A seed counts for at most SEED_SECONDS_MAX seconds. A round's hours
+are its busiest worker's seconds (the sum of the `<seconds>` column of that worker's `results`),
+so they come from the rounds' own records and never from wall time. Exit 0 if the commit ran
+and is clean; 1 if the state has no round of it (`0.0 h`), or any seed of it failed, ran past its
+deadline or was killed by the host, or a rounds' failure fingerprint was hit.
 
 Exit codes: 0 done, 1 usage or bad input, 2 environment (state file, token, GitHub). The state is
 saved whenever it was read, whatever GitHub answered. Standard library only.
@@ -53,6 +63,7 @@ TITLE_BYTES_MAX = 120
 SEEDS_LISTED_MAX = 20  # Other seeds of the round that failed alike, listed in a report.
 FILED_MAX = 2048  # Fingerprints remembered.
 DAYS_KEPT = 31
+COMMITS_KEPT = 64  # Commits whose hours and seeds are remembered (the release soak); the oldest go.
 FAILURES_PER_DAY = 64  # Distinct failures looked at a UTC day; the rest are only counted.
 COMMENTS_PER_FAILURE_PER_DAY = 4
 FIND_PAGES_MAX = 5  # Issue pages (100 each) scanned when the state file is rebuilt.
@@ -65,14 +76,19 @@ HOLD_SECONDS_MAX = 24 * 3600
 HTTP_TIMEOUT_SECONDS = 60
 
 assert COMMENTS_PER_FAILURE_PER_DAY > 0
+assert COMMITS_KEPT > 0
 assert FAILURES_PER_DAY <= FILED_MAX
 assert HOLD_SECONDS_DEFAULT <= HOLD_SECONDS_MAX
 assert ISSUE_LOG_BYTES_MAX <= LOG_READ_BYTES_MAX
 
 VOPR_TARGETS = ("vopr-nerva", "vopr-testing")
+KINDS = ("vopr-nerva", "vopr-testing", "fuzz")  # What a soak line counts seeds by.
 TARGET = re.compile(r"^(vopr-nerva|vopr-testing|fuzz:[a-z0-9_]{1,64})$")
 # Exit codes that are the host's, not the code's: counted, never filed. 124: past the per-seed
 # deadline (`timeout`); 125, 126: `timeout` or the exec failed; 137: SIGKILL, the OOM killer.
+# One seed's seconds count for at most this much: a seed's deadline (600 s VOPR, 900 s fuzz by
+# default) plus its replay (1800 s), rounded up. A clock step during a seed cannot add hours.
+SEED_SECONDS_MAX = 3600
 HOST_CODES = {124: "timeout", 125: "host", 126: "host", 137: "host"}
 
 PANIC = re.compile(r"(?:^|\s)panic: (.+)$")
@@ -236,11 +252,20 @@ def read_bounded(path):
     return data.decode("utf-8", "replace").splitlines()
 
 
+class Counts(dict):
+    """Counts per target; `busy` is each worker's seconds (the sum of its seeds' seconds)."""
+
+    def __init__(self):
+        super().__init__()
+        self.busy = {}
+
+
 def read_round(round_dir, source_root=None):
-    """Every seed of the round: counts per target, and the failures to report."""
+    """Every seed of the round: counts per target (with each worker's busy seconds), and the
+    failures to report."""
     if not os.path.isdir(round_dir):
         raise BadInput(f"{round_dir} is not a directory")
-    counts = {}
+    counts = Counts()
     failures = []
     lines_read = 0
     workers = sorted(name for name in os.listdir(round_dir) if re.fullmatch(r"w\d{1,4}", name))
@@ -276,6 +301,8 @@ def read_result(round_dir, worker, line, counts, source_root):
         raise BadInput(f"{worker}/results: seed or exit code out of range: {line!r}")
     count = counts.setdefault(target, {"seeds": 0, "failed": 0, "timeouts": 0, "host": 0})
     count["seeds"] += 1
+    if hasattr(counts, "busy"):
+        counts.busy[worker] = counts.busy.get(worker, 0) + min(int(seconds), SEED_SECONDS_MAX)
     if code == 0:
         return None
     if code in HOST_CODES:
@@ -379,7 +406,8 @@ def ymd(now):
 
 
 def new_state():
-    return {"version": STATE_VERSION, "filed": {}, "days": {}, "hold_until": 0}
+    return {"version": STATE_VERSION, "filed": {}, "days": {}, "hold_until": 0, "commits": {},
+            "sequence": 0}
 
 
 def load_state(path):
@@ -405,11 +433,19 @@ def load_state(path):
             raise Environment(f"the state file {path} has no valid `{key}`")
     if len(state["filed"]) > FILED_MAX:
         raise Environment(f"the state file {path} remembers more than {FILED_MAX} failures")
+    # Written by a fleet that did not count commits: start counting, nothing is invented.
+    state.setdefault("commits", {})
+    state.setdefault("sequence", 0)
+    if not isinstance(state["commits"], dict) or not isinstance(state["sequence"], int):
+        raise Environment(f"the state file {path} has no valid `commits`")
+    if len(state["commits"]) > COMMITS_KEPT:
+        raise Environment(f"the state file {path} remembers more than {COMMITS_KEPT} commits")
     return state
 
 
 def save_state(path, state):
     assert len(state["filed"]) <= FILED_MAX
+    assert len(state["commits"]) <= COMMITS_KEPT
     data = json.dumps(state, indent=1, sort_keys=True).encode()
     assert len(data) <= STATE_BYTES_MAX
     temporary = path + ".new"
@@ -424,14 +460,51 @@ def day_of(state, today):
     day = state["days"].get(today)
     if day is None:
         day = {"reported": False, "rounds": 0, "commit": "", "targets": {}, "seen": {},
-               "overflow": 0}
+               "overflow": 0, "commits": {}}
         state["days"][today] = day
         for old in sorted(state["days"])[:-DAYS_KEPT]:
             del state["days"][old]
     return day
 
 
-def count_round(day, counts, commit):
+def kind_of(target):
+    return "fuzz" if target.startswith("fuzz:") else target
+
+
+def round_seconds(counts):
+    """A round's hours, as seconds: its busiest worker's. Workers run at once, so no worker's
+    busy time exceeds the round's wall time, and the fleet never claims more than ran."""
+    return max(getattr(counts, "busy", {}).values(), default=0)
+
+
+def commit_entry(entries, commit, sequence):
+    """The entry of `commit` in `entries` (the state's, or a day's), made if new; past
+    COMMITS_KEPT the entry least recently counted is dropped."""
+    entry = entries.get(commit)
+    if entry is None:
+        while len(entries) >= COMMITS_KEPT:
+            oldest = min(entries, key=lambda sha: entries[sha]["last"])
+            del entries[oldest]
+        entry = {"last": sequence, "seconds": 0, "rounds": 0, "kinds": {}, "fingerprints": [],
+                 "dropped": 0}
+        entries[commit] = entry
+    entry["last"] = sequence
+    assert len(entries) <= COMMITS_KEPT
+    return entry
+
+
+def add_round(entry, counts):
+    entry["rounds"] += 1
+    entry["seconds"] += round_seconds(counts)
+    for target, count in counts.items():
+        kind = entry["kinds"].setdefault(kind_of(target), {"seeds": 0, "failed": 0,
+                                                           "timeouts": 0, "host": 0})
+        for key in ("seeds", "failed", "timeouts", "host"):
+            kind[key] = kind.get(key, 0) + count[key]
+    assert len(entry["kinds"]) <= len(KINDS)
+
+
+def count_round(day, counts, commit, state=None):
     day["rounds"] += 1
     day["commit"] = commit
     for target, count in counts.items():
@@ -439,6 +512,26 @@ def count_round(day, counts, commit):
                                                    "host": 0})
         for key in total:
             total[key] += count[key]
+    if state is not None:
+        state["sequence"] += 1
+        add_round(commit_entry(day.setdefault("commits", {}), commit, state["sequence"]), counts)
+        add_round(commit_entry(state["commits"], commit, state["sequence"]), counts)
+
+
+def record_fingerprints(state, commit, groups):
+    """The failures a commit's rounds hit, whether or not a report was posted (a hold, a rate
+    limit or a day's cap stop reports, not this). Bounded by FAILURES_PER_DAY; the rest are
+    only counted."""
+    entry = state["commits"][commit]
+    for group in groups:
+        fingerprint = group[0]["fingerprint"]
+        if fingerprint in entry["fingerprints"]:
+            continue
+        if len(entry["fingerprints"]) >= FAILURES_PER_DAY:
+            entry["dropped"] += 1
+            continue
+        entry["fingerprints"].append(fingerprint)
+    assert len(entry["fingerprints"]) <= FAILURES_PER_DAY
 
 
 def see(day, fingerprint, seeds):
@@ -464,6 +557,39 @@ def remember(state, fingerprint, number, first_commit, last_commit):
     assert len(state["filed"]) <= FILED_MAX
 
 
+def hours_text(seconds):
+    return f"{seconds // 360 / 10:.1f}"  # Floor to a tenth: never more hours than ran.
+
+
+def seeds_of(entry):
+    return sum(kind["seeds"] for kind in entry["kinds"].values())
+
+
+def soak_line(state, commit):
+    """The line the release PR quotes, whether the commit ran at all, and whether it is clean
+    (no failing, hung or killed seed, no failure fingerprint). `commit` is a full SHA or a prefix
+    of at least 7 hex digits; one that names two commits is not a commit."""
+    matches = [sha for sha in state["commits"] if sha.startswith(commit)]
+    entry = state["commits"][matches[0]] if len(matches) == 1 else \
+        {"seconds": 0, "kinds": {}, "fingerprints": [], "dropped": 0}
+    kinds = [f"{kind} {entry['kinds'].get(kind, {}).get('seeds', 0):,}" +
+             (" seeds" if index == 0 else "") for index, kind in enumerate(KINDS)]
+    sums = {key: sum(kind.get(key, 0) for kind in entry["kinds"].values())
+            for key in ("failed", "timeouts", "host")}
+    hit = []
+    for fingerprint in entry.get("fingerprints", []):
+        filed = state["filed"].get(fingerprint)
+        hit.append(f"#{filed['issue']}" if filed else f"not filed ({fingerprint[:12]})")
+    if entry.get("dropped"):
+        hit.append(f"{entry['dropped']} more not listed")
+    line = (f"soak {commit[:7]}: {hours_text(entry['seconds'])} h, {', '.join(kinds)}; "
+            f"{sums['failed']} failures, {sums['timeouts']} past the deadline, "
+            f"{sums['host']} killed by the host; sim-fleet issues its rounds hit: "
+            f"{', '.join(hit) or 'none'}")
+    ran = len(matches) == 1 and entry["seconds"] > 0
+    return line, ran, not (any(sums.values()) or hit)
+
+
 def totals_text(state, ymd_day, day):
     targets = day["targets"]
     seeds = sum(t["seeds"] for t in targets.values())
@@ -476,6 +602,13 @@ def totals_text(state, ymd_day, day):
         out.append(f"- {target}: {total['seeds']} seeds, {total['failed']} failed, "
                    f"{total['timeouts']} past the per-seed deadline, {total['host']} killed "
                    f"by the host")
+    if day.get("commits"):
+        out.append("")
+        out.append("Commits that ran:")
+        for sha in sorted(day["commits"], key=lambda sha: day["commits"][sha]["last"]):
+            out.append(f"- `{sha[:7]}`: {hours_text(day['commits'][sha]['seconds'])} h that day, "
+                       f"{hours_text(state['commits'].get(sha, day['commits'][sha])['seconds'])}"
+                       f" h in all, {seeds_of(day['commits'][sha])} seeds that day")
     if day["seen"]:
         out.append("")
         out.append("Failures by issue:")
@@ -634,8 +767,9 @@ def ingest(github, state, counts, failures, commit, tracker, now, log):
                "reports": 0, "held": False, "stopped": None}
     today = ymd(now)
     day = day_of(state, today)
-    count_round(day, counts, commit)
+    count_round(day, counts, commit, state)
     groups = group_failures(failures)
+    record_fingerprints(state, commit, groups)
     seen = {group[0]["fingerprint"]: see(day, group[0]["fingerprint"], len(group))
             for group in groups}
     if state["hold_until"] > now:
@@ -732,9 +866,34 @@ def read_token(path):
     return token
 
 
+def soak_main(args, log):
+    if not re.fullmatch(r"[0-9a-f]{7,64}", args.commit):
+        log("--commit must be a hex commit of at least 7 digits")
+        return 1
+    try:
+        state = load_state(args.state)
+    except Environment as err:
+        log(str(err))
+        return 2
+    if state is None:
+        log(f"no state file at {args.state}")
+        return 2
+    line, ran, clean = soak_line(state, args.commit)
+    print(line, flush=True)
+    if not ran:
+        log(f"no rounds of {args.commit[:7]} in the state (or its prefix names two commits)")
+    elif not clean:
+        log(f"{args.commit[:7]} is not clean: a seed failed, hung or was killed, or a failure "
+            f"was hit")
+    return 0 if ran and clean else 1
+
+
 def main(argv, now=None):
     parser = argparse.ArgumentParser(prog="sim_fleet.py")
     sub = parser.add_subparsers(dest="command", required=True)
+    soak = sub.add_parser("soak")
+    soak.add_argument("--commit", required=True)
+    soak.add_argument("--state", required=True)
     cmd = sub.add_parser("ingest")
     cmd.add_argument("--round", required=True)
     cmd.add_argument("--commit", required=True)
@@ -750,6 +909,8 @@ def main(argv, now=None):
     def log(message):
         print(f"sim-fleet: {message}", file=sys.stderr, flush=True)
 
+    if args.command == "soak":
+        return soak_main(args, log)
     if not re.fullmatch(r"[0-9a-f]{7,64}", args.commit):
         log("--commit must be a hex commit")
         return 1

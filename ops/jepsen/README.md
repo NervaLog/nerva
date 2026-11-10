@@ -134,6 +134,33 @@ run has a night directory (`nights/<date>-dry`), an archive and a state file of 
 never touches a real night's. It still runs both workloads (about 2.5 h) and stops nothing: stop
 the fleet by hand first.
 
+## Release soak
+
+The Jepsen clause of the release gate is one night on the candidate, a frozen `main` commit
+(docs/briefs/v0.7.1.md, P284b), in which both `retry` and `bank` are `:valid? true`: the commit
+status `jepsen/nightly` is `success` on the candidate's SHA. The fleet's clause is in
+[ops/sim-fleet](../sim-fleet/README.md#release-soak), which also lists the host steps that come
+before any of this counts.
+
+**Pointing the night at the candidate.** Set `JEPSEN_BRANCH` in `/etc/jepsen/jepsen.env` to the
+candidate's **full 40-character SHA**. `nightly.sh` runs `git fetch origin $JEPSEN_BRANCH` and
+checks out `FETCH_HEAD`, which works with a SHA unchanged: GitHub serves any commit of a public
+repository to `git fetch` by its full SHA (checked from a clone with `main`'s tip three commits
+ahead: the fetch succeeds and the detached checkout is that commit). An abbreviated SHA does not
+fetch: the night records a host failure (`git fetch failed`), tests nothing and posts no status.
+The commit status goes on the SHA the night tested, the candidate. `nightly.sh` is the installed
+copy: nothing changes on the host until `setup.sh` runs again (P240), but this slice changes
+no script, so only the environment file is edited.
+
+**A night by hand**, inside the soak rather than waiting for 01:17: `systemctl start
+jepsen.service` (it stops the fleet for the window and starts it again after, as every night
+does; `journalctl -u jepsen -f`). Read the result as the status `jepsen/nightly` on the candidate
+on GitHub (`gh api repos/NervaLog/nerva/commits/<SHA>/status`), and quote it in the release PR.
+
+A merged fix moves the candidate: change `JEPSEN_BRANCH` (and the fleet's `SIM_FLEET_BRANCH`) to
+the new SHA, and both clauses start again, unless the fix changed only Markdown. When the soak
+ends, remove the line from `jepsen.env` so the night follows `main` again.
+
 ## Limits
 
 - Not run on a host yet (slice 7). **A runner change needs `setup.sh` run again on the host**
