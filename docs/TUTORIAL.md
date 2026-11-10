@@ -113,7 +113,7 @@ own Zig compiler:
 
 ```bash
 git clone https://github.com/NervaLog/nerva.git
-cd nerva-ledger
+cd nerva
 ./zig/download.sh      # installs Zig 0.14.1 into ./zig
 ./zig/zig build        # builds zig-out/bin/nerva (a few minutes the first time)
 ./zig-out/bin/nerva version
@@ -138,9 +138,9 @@ The version is `<protocol release>+<commit>`: `0.0.6` is the protocol release of
 decides which replicas, data files and clients work together (see "One release per cluster"
 below).
 
-Or skip the build: v0.6.0 binaries for Linux and macOS (x86_64, aarch64) are on the
+Or skip the build: release binaries for Linux and macOS (x86_64, aarch64) are on the
 [releases page](https://github.com/NervaLog/nerva/releases), each with a bill of
-materials (`nerva-v0.6.0.cdx.json`) listing exactly what went into it. This tutorial matches
+materials (`nerva-<tag>.cdx.json`) listing exactly what went into it. This tutorial matches
 v0.7.0, and its outputs were recorded on an earlier release (see the top of this page);
 [CHANGELOG.md](../CHANGELOG.md) lists what each release changed, and the README's
 [Limits](../README.md#limits) section lists every limit a caller can hit.
@@ -153,7 +153,7 @@ memory. Use a scratch directory:
 
 ```bash
 mkdir -p /tmp/nerva-tutorial && cd /tmp/nerva-tutorial
-NERVA=~/nerva-ledger/zig-out/bin/nerva     # adjust to where you built it
+NERVA=~/nerva/zig-out/bin/nerva     # adjust to where you built it
 
 $NERVA format --cluster=1 --replica=0 --replica-count=1 --development 1_0.nerva
 # info(main): 0: formatted: cluster=1 replica_count=1
