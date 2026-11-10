@@ -46,6 +46,7 @@ a one-line summary, who is to blame, the cause and a fix. Codes are never reused
   | `08xx` | export and import |
   | `09xx` | keys between replicas |
   | `10xx` | `nerva view` |
+  | `11xx` | installation and packages |
 
 - **Blame:**
   - `client`: the request was wrong; fix it, do not retry it.
@@ -234,6 +235,18 @@ These are the replies to `POST /v1/commit`. The identifier is the state machine'
 | NRV-E1001 | The op asked for is not committed yet | 504 `the op is not committed yet`, with `"applied": false` and `"code": "NRV-E1001"` | retry | As NRV-E0401 |
 | NRV-E1002 | The view does not match its table's layout | 409 `the view does not match its table's layout` | client | Declare the view again under a new name |
 | NRV-W1003 | More changes than `nerva view` keeps; declared views stop here | Logged only (N35) | operator | Read views from the replicas (N52) |
+
+## 11xx · Installation and packages
+
+For `install.sh` in the Linux release tarball (and, from slice 5, the package maintainer scripts), which an operator runs. Each prints `error[NRV-E11xx]: install.sh: <what>`, a `cause` line (the summary below) and a `fix` line, and exits 1 (the operator's input) or 2 (the machine). `tests/packaging/install.py` triggers each from the real script, under systemd, in CI (`packages.yml`).
+
+| Code | Summary | Today | Blame | Fix |
+| --- | --- | --- | --- | --- |
+| NRV-E1101 | The installer was not run as root | `error[NRV-E1101]: install.sh: must run as root`, exit 1; also with `--dry-run`; nothing is changed | operator | Run it with `sudo` |
+| NRV-E1102 | The installer found no running systemd | `error[NRV-E1102]: install.sh: this machine is not running systemd`, exit 2 (no `systemctl`, or no `/run/systemd/system`: a container, or a machine booted without it); nothing is changed | operator | Install on a machine that boots with systemd, or run `nerva` by hand |
+| NRV-E1103 | A different nerva is already installed | `error[NRV-E1103]: install.sh: /usr/local/bin/nerva is a different build (<its first version line>)`, exit 1; nothing is changed | operator | Stop the replicas, run `install.sh --upgrade`, restart them. An upgrade across a protocol release is by export and import (README, "Upgrading a cluster") |
+| NRV-E1104 | This machine cannot run this tarball's nerva, or lacks sha256sum | `error[NRV-E1104]: install.sh: the nerva in <dir> does not run on this machine (<uname -m>)`, exit 2 (the wrong architecture); `sha256sum is not installed`, exit 2; `<dir>/<file> is missing`, exit 1 (run from outside the unpacked tarball, or an incomplete one) | operator | Use the tarball for this machine (`x86_64-linux` or `aarch64-linux`), unpacked whole; install coreutils |
+| NRV-E1105 | A user or unit named nerva exists and is not the one Nerva's installer makes | `error[NRV-E1105]: install.sh: the user nerva exists, with home <dir>` (its home is not `/var/lib/nerva`), or `<unit path> exists and is not Nerva's` (a `nerva@.service` or `nerva-api@.service` without Nerva's first-lines marker), exit 1; nothing is changed | operator | Rename or remove that user or unit, or give the user the home `/var/lib/nerva`; change Nerva's units with a drop-in (`systemctl edit`), never in place |
 
 ## Bugs
 

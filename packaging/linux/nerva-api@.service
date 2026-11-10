@@ -1,0 +1,32 @@
+# Part of Nerva (https://github.com/NervaLog/nerva): shipped by the tarball's install.sh and by
+# the nerva packages, byte for byte. Change it with a drop-in (systemctl edit nerva-api@0), not here.
+#
+# One gateway per instance: nerva-api@0 reads /etc/nerva/api-0.env (see api.env.example). It
+# listens on loopback unless the env file says otherwise (and adds --listen-remote to NERVA_FLAGS).
+[Unit]
+Description=Nerva gateway %i
+Documentation=https://github.com/NervaLog/nerva
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=nerva
+Group=nerva
+EnvironmentFile=/etc/nerva/api-%i.env
+ExecStart=nerva api --cluster=${NERVA_CLUSTER} --addresses=${NERVA_ADDRESSES} --listen=${NERVA_LISTEN} $NERVA_FLAGS
+Restart=on-failure
+RestartSec=1
+# A restart cannot fix 1 (a flag, a key or a port: NRV-E0007, NRV-E0009) or 2 (the environment).
+RestartPreventExitStatus=1 2
+LimitNOFILE=65536
+TimeoutStopSec=30
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+[Install]
+WantedBy=multi-user.target
