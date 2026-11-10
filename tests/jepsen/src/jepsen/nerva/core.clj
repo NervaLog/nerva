@@ -162,9 +162,21 @@
         _                (range (:test-count opts 1))]
     (nerva-test (assoc opts :workload workload, :keyed keyed, :nemesis nemesis))))
 
+(defn refusing-test
+  "`nerva-test`, except that a refusal (`check-host-memory!`: an ex-info with `:refusal`) is one
+  line on stderr and exit 2, not Jepsen's fatal stack trace and exit 255. Exits the JVM."
+  [opts]
+  (try (nerva-test opts)
+       (catch clojure.lang.ExceptionInfo e
+         (if (:refusal (ex-data e))
+           (do (binding [*out* *err*] (println (.getMessage e)))
+               (flush)
+               (System/exit 2))
+           (throw e)))))
+
 (defn -main
   [& args]
-  (cli/run! (merge (cli/single-test-cmd {:test-fn nerva-test, :opt-spec cli-opts})
+  (cli/run! (merge (cli/single-test-cmd {:test-fn refusing-test, :opt-spec cli-opts})
                    (cli/test-all-cmd {:tests-fn all-tests, :opt-spec cli-opts})
                    (cli/serve-cmd))
             args))
