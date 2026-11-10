@@ -29,10 +29,10 @@ green in CI, with a link to the run.
 
 | Milestone | What it adds | Status |
 | --- | --- | --- |
-| R1 · Proven | Jepsen nightly on a dedicated host: commit keys under unknown outcomes, the gateway killed and cut off | Not started (the bank suite exists; nightly is draft PR #106) |
+| R1 · Proven | Jepsen nightly on a dedicated host: commit keys under unknown outcomes, the gateway killed and cut off | In progress (the retry, bank-keys and gateway workloads and the nightly workflow are merged and run on GitHub-hosted runners; the dedicated host is not provisioned) |
 | R2 · Fleet | An always-on VOPR and fuzzer fleet on Hetzner that files every new failure | In progress (scripts and reporter written; host not provisioned) |
 | R3 · Measured | Sizing and latency on the real topology: three machines, the Fly p99 explained | Not started |
-| R4 · Gateway | Beside its client, never ambiguous, observable: a gateway per client process, no ambiguous 503, metrics | Brief written ([docs/briefs/r4.md](./briefs/r4.md)) |
+| R4 · Gateway | Beside its client, never ambiguous, observable: a gateway per client process, no ambiguous 503, metrics | Delivered 2026-11-06 ([demo](https://github.com/NervaLog/nerva/actions/runs/42136037296/job/127624296815), [docs/demos/r4.md](./demos/r4.md)) |
 | R5 · Recover | Replace a lost replica, and restore from a backup, with the cluster open | Delivered 2026-11-05 ([demo](https://github.com/NervaLog/nerva/actions/runs/41997293568/job/127143488126), [docs/demos/r5.md](./demos/r5.md)) |
 | R6 · Upgrade | Rolling upgrades between releases with the same data format | Not started |
 | R7 · Retention | Commit keys, history and view versions trimmed below a horizon: bounded growth | Not started |
