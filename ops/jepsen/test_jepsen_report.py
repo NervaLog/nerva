@@ -181,6 +181,27 @@ class Statuses(unittest.TestCase):
         self.assertEqual(github.opened, [])
         self.assertEqual(summary["filed"], 0)
 
+    def test_a_lazyfs_oom_kill_is_the_hosts_and_never_filed(self):
+        # NRV-E0611 (P268): the host's memory killed LazyFS; like NRV-E0607 it is no Nerva finding.
+        oom = ("{:valid? :unknown, :perf {:valid? true}, :lazyfs {:valid? :unknown, :code "
+               '"NRV-E0611", :oom-killed ["n1"], :faults 1}}')
+        store = Store(self)
+        store.test("1", oom, args="--workload bank --nemesis lose-unfsynced-writes")
+        runs, _ = rep.read_night(store.path, store.write_runs())
+        self.assertEqual(runs[0].kind, "host")
+        self.assertIn("NRV-E0611", runs[0].host_reason)
+        self.assertIn("memory killed LazyFS", runs[0].host_reason, "names the host's memory")
+        self.assertNotIn("harness", runs[0].host_reason, "not the harness's fault")
+        self.assertEqual(rep.Run("x").harness, [], "no codes by default, never a bool")
+        github, _, summary = night(self, store)
+        self.assertEqual(github.statuses[0][1], "error")
+        self.assertEqual(github.opened, [])
+        self.assertEqual(summary["filed"], 0)
+        real = invalid().replace(":perf", ':lazyfs {:valid? :unknown, :code "NRV-E0611"}, :perf')
+        found, _, codes = rep.findings_of(rep.parse_edn(real))
+        self.assertEqual(codes, ["NRV-E0611"])
+        self.assertTrue(found, "a real finding elsewhere still outranks it")
+
     def test_an_unread_record_set_is_the_hosts_and_never_filed(self):
         # The keys checker's :unknown when the final records read never answered (P239f): it
         # carries the harness's code beside the gateway's, so it is no `unknown-result` finding.

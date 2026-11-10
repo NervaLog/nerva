@@ -20,7 +20,8 @@
   the replica and the gateways again on the nodes the fault killed.
   The nemesis kills through `db/kill!` and starts through `db/start!`, so it needs nothing from
   `jepsen.nerva.db`."
-  (:require [clojure.string :as str]
+  (:require [clojure.set :as set]
+            [clojure.string :as str]
             [clojure.tools.logging :refer [info]]
             [jepsen [checker :as checker]
                     [control :as c]
@@ -346,6 +347,106 @@
         (< after written)             :truncated
         :else                         :survived))
 
+;; LazyFS killed for lack of memory (NRV-E0611, P268). The signal is the kernel's own OOM line for
+;; a process named `lazyfs` ("oom-kill:...,task_memcg=/docker/<id>,task=lazyfs,pid=4321,..."),
+;; read from `dmesg` (the nodes are privileged containers, so they read the host's ring buffer; no
+;; `journalctl` is installed in them, so there is no fallback: an unreadable log claims nothing),
+;; AND this node's `lazyfs` process seen gone. The ring buffer is the host's, so every node reads
+;; every node's kills and earlier runs'; a line counts for a node only when it names that node's
+;; own container id (`task_memcg`, the id from the node's own `/proc/self/mountinfo`), and only
+;; when it is not in the set taken at setup. Lines are compared as a set, not counted: the buffer
+;; rotates, so a count can go down and hide a new kill, or an old line rotating out can never
+;; invent one. A gone process alone may be a crash, which is not memory (that stays NRV-E0607's
+;; unchecked sentinel). `docker inspect`'s `OOMKilled` is not used: it flags the container's init
+;; process, and the nodes' containers have no memory limit, so the kernel kills on the host's
+;; shortage.
+
+(def oom-kill-regex
+  "The line the kernel logs when it OOM-kills LazyFS (host or cgroup OOM alike)."
+  #"(?i)oom-kill:.*task=lazyfs,")
+
+(defn oom-kill-lines
+  "The set of kernel-log lines in `text` that say this node's LazyFS was OOM-killed. `text` is
+  `oom-kills`'s output: the node's container id on its first line (`NRV-ID:<id>`), then the
+  candidate lines. A line counts when it matches `oom-kill-regex` and names the id (its
+  `task_memcg`). nil when `text` is nil, or the id or the log could not be read: no claim."
+  [text]
+  (when text
+    (let [[head & lines] (str/split-lines text)
+          id             (second (re-matches #"NRV-ID:([0-9a-f]{12,})" (str/trim (or head ""))))]
+      (when id
+        (set (filter #(and (re-find oom-kill-regex %) (str/includes? % id)) lines))))))
+
+(defn oom-evidence?
+  "Did the memory kill LazyFS on this node? `baseline` is the set of this node's OOM lines at setup
+  (nil when it could not be read: no claim), `now` the set now (nil when unreadable), `running?`
+  whether this node's `lazyfs` process is up (false only when seen gone; nil, unknown, claims
+  nothing). True only for a line not in the baseline and a process seen gone."
+  [baseline now running?]
+  (boolean (and baseline now (false? running?) (seq (set/difference now baseline)))))
+
+(defn- quietly
+  "`(f)`, or nil when it throws; `InterruptedException` is rethrown."
+  [f]
+  (try (f)
+       (catch InterruptedException e (throw e))
+       (catch Exception _ nil)))
+
+(defn oom-kills
+  "On this node: the set of kernel-log lines saying its LazyFS was OOM-killed (`oom-kill-lines`),
+  nil when the container id or the log cannot be read. One bounded command (10 s)."
+  []
+  (quietly
+    #(oom-kill-lines
+       (c/exec :sh :-c (str "id=$(grep -o 'containers/[0-9a-f]\\{64\\}' /proc/self/mountinfo "
+                            "| head -n 1 | cut -d/ -f2); "
+                            "[ -n \"$id\" ] || exit 0; "
+                            "out=$(timeout 10 dmesg 2>/dev/null) || exit 0; "
+                            "echo \"NRV-ID:$id\"; "
+                            "printf '%s\\n' \"$out\" | grep -i 'oom-kill:' | grep 'task=lazyfs,' "
+                            "|| true")))))
+
+(defn lazyfs-running?
+  "Is a `lazyfs` process up on this node? true on `pgrep` exit 0, false only on exit 1 (no match),
+  nil when that could not be asked: a `pgrep` the timeout killed (124) or that errored (2, 3) says
+  nothing (one bounded command)."
+  []
+  (quietly #(case (str/trim (c/exec :sh :-c (str "timeout 5 pgrep -x lazyfs > /dev/null; "
+                                                 "case $? in 0) echo up;; 1) echo gone;; "
+                                                 "*) echo unknown;; esac")))
+              "up"   true
+              "gone" false
+              nil)))
+
+(defn- per-node
+  "`{node (f node)}` on `nodes`, each node's call isolated: one that throws is nil, and the others are
+  kept; an `InterruptedException` is rethrown. nil when the whole run throws."
+  [test nodes f]
+  (quietly #(c/on-nodes test nodes (fn [_ node] (quietly (fn [] (f node)))))))
+
+(defn oom-baselines
+  "`{node #{line}}` of the kernel's OOM-killed-LazyFS lines on the test's mounted nodes, taken at
+  setup; a node whose log cannot be read is left out, so no OOM is claimed there."
+  [test]
+  (let [nodes (lazyfs-nodes test)]
+    (or (when (and (enabled? test) (seq nodes))
+          (into {} (for [[n k] (per-node test nodes (fn [_] (oom-kills))) :when k] [n k])))
+        {})))
+
+(defn oom-killed-nodes
+  "Of `nodes`, those where the memory killed LazyFS since `baselines` (`oom-baselines`): the kernel
+  logged a new kill naming this node's container and this node's process is gone
+  (`oom-evidence?`)."
+  [test baselines nodes]
+  (let [nodes (vec (filter baselines nodes))]
+    (or (when (seq nodes)
+          (vec (sort (for [[n bad] (per-node test nodes
+                                             (fn [node] (oom-evidence? (get baselines node) (oom-kills)
+                                                                       (lazyfs-running?))))
+                           :when bad]
+                       n))))
+        [])))
+
 (defn- on-mount
   "Runs `cmd` on this node under `timeout`; returns `[exit-code output]`, 124 or 137 when it was
   killed. The output is stdout, and stdout and stderr together when `both?`."
@@ -521,6 +622,15 @@
   `:down` or `:pending`, the replica dead, or did not finish (an `:exception`): a node that
   cannot serve after the restart is an availability finding. Only the final recovery is judged
   for that (`:final? true`): mid-run, a `kill` or `partition` may have removed quorum.
+  The memory killing LazyFS on a node (`:oom-killed`, `oom-evidence?`) explains only that node's
+  replica, whose data file lives on the dead mount: its `:replica-down` is not NRV-E0604. Its
+  gateways do not use the mount (they reach the cluster through every replica), so a gateway
+  `:down` or `:pending` there, another node's anything, and a final recovery that threw, still are
+  (P268).
+  `:valid? false`, with NRV-E0608, when `:lazyfs-strict-sync` and bytes were lost (see below), an
+  OOM kill never outranking it: lost bytes are LazyFS's own report, made alive (P268).
+  `:unknown`, with NRV-E0611 (the host, not Nerva, is at fault), when the kernel's log shows the
+  memory killed LazyFS on a node and nothing above holds: it outranks NRV-E0607 only.
   `:unknown`, with NRV-E0607 (the harness, not Nerva, is at fault; the run proved nothing), when
   the fault was asked for and:
   a fault op threw; no final recovery ran; the final recovery judged no node (it settles every
@@ -548,11 +658,19 @@
             skipped  (filter #(:skipped (:value %)) done)
             threw    (filter :exception (concat done recovers))
             finals   (filter #(:final? (:value %)) recovers)
-            judged   (filter #(or (:exception %)
-                                  (seq (:down (:value %)))
-                                  (seq (:pending (:value %)))
-                                  (seq (:replica-down (:value %))))
-                             finals)
+            oom      (vec (sort (distinct (mapcat #(:oom-killed (:value %)) (concat done recovers)))))
+            ;; What the final recovery left wrong, less the replicas of the nodes the memory killed
+            ;; LazyFS on. Their gateways stay judged: a gateway does not use the mount. A throw has
+            ;; no node, so it is never excused (P268).
+            judged   (for [o finals
+                           :let [v   (:value o)
+                                 r   {:exception    (:exception o)
+                                      :down         (vec (:down v))
+                                      :pending      (vec (:pending v))
+                                      :replica-down (vec (remove (set oom) (:replica-down v)))}]
+                           :when (or (:exception r) (seq (:down r)) (seq (:pending r))
+                                     (seq (:replica-down r)))]
+                       r)
             lost     (reduce + 0 (for [o took, [_ b] (:unsynced-bytes (:value o))] (or b 0)))
             unclear  (for [o took, [n a] (:remaining (:value o)) :when (not= 0 a)] n)
             sentinel (for [o took, n (keys (:unsynced-bytes (:value o)))]
@@ -577,9 +695,14 @@
                        (pos? survived)                      (conj :sentinel-survived)
                        (pos? unproved)                      (conj :sentinel-unchecked)
                        (seq unclear)                        (conj :clear-unconfirmed))
-            strict?  (boolean (and (:lazyfs-strict-sync test) (pos? lost)))]
+            strict?  (boolean (and (:lazyfs-strict-sync test) (pos? lost)))
+            oomed?   (and (seq oom) (not (seq judged)) (not strict?))
+            oom-why  (str "the host's memory killed LazyFS on " (str/join ", " oom)
+                          ": the run says nothing about Nerva on " (if (= 1 (count oom)) "it" "them")
+                          "; run it on a host with more memory (P242j, P268)")]
         (cond-> {:valid?     (cond (seq judged)   false
                                    strict?        false
+                                   oomed?         :unknown
                                    (seq problems) :unknown
                                    :else          true)
                  :faults     (count took)
@@ -597,20 +720,22 @@
                                              "with `--lazyfs-strict-sync` that is a failure (an "
                                              "unpatched LazyFS, or a Nerva that stopped syncing)"))
           strict?        (assoc :code "NRV-E0608")
-          (and (seq problems) (not (seq judged)) (not strict?)) (assoc :code "NRV-E0607")
+          (and (seq problems) (not (seq judged)) (not strict?) (not oomed?)) (assoc :code "NRV-E0607")
           (seq full)     (assoc :cache-full full)
-          (pos? survived) (assoc (if strict? :harness-reason :reason)
+          (pos? survived) (assoc (if (or strict? oomed?) :harness-reason :reason)
                                  (str "the fault did not bite: an unsynced sentinel file "
                                       "survived a LazyFS clear on " survived " node(s)"))
           (seq judged)   (assoc :code         "NRV-E0604"
-                                :gateways     (vec (distinct (mapcat #(concat (:down (:value %))
-                                                                              (:pending (:value %)))
+                                :gateways     (vec (distinct (mapcat #(concat (:down %) (:pending %))
                                                                      judged)))
-                                :replica-down (vec (distinct (mapcat #(:replica-down (:value %))
-                                                                     judged))))
+                                :replica-down (vec (distinct (mapcat :replica-down judged))))
           (seq threw)    (assoc :exceptions (vec (keep #(let [e (:exception %)]
                                                           (and e (or (:cause e) (str e))))
-                                                        threw))))))))
+                                                        threw)))
+          ;; The verdict is NRV-E0611's only when no finding stands (P268); beside one it is context.
+          (seq oom)      (assoc :oom-killed oom)
+          oomed?         (assoc :code "NRV-E0611", :reason oom-why)
+          (and (seq oom) (not oomed?)) (assoc :oom-reason oom-why))))))
 
 (defn invoke-fault
   "Applies a fault op's value: kill, then lose. A `:crash` majority dies before the rest. Returns
@@ -636,13 +761,24 @@
   (let [lz        (lazyfs-map dir)
         pending   (atom #{})
         unsettled (atom #{})
-        hit       (atom #{})]
+        hit       (atom #{})
+        baselines (atom {})
+        seen      (atom #{})
+        ;; Probes `nodes` for an OOM-killed LazyFS and remembers it, so a kill seen after one fault
+        ;; is still reported when a later probe cannot ask (a log that rotated, a process that
+        ;; cannot be asked about) (P268).
+        probe!    (fn [test nodes]
+                    (let [oom (oom-killed-nodes test @baselines nodes)]
+                      (swap! seen into oom)
+                      oom))]
     (reify
       n/Reflection
       (fs [_] #{fault :lazyfs-recover})
 
       n/Nemesis
-      (setup! [this _] this)
+      (setup! [this test]
+        (reset! baselines (oom-baselines test))
+        this)
 
       (invoke! [_ test o]
         (case (:f o)
@@ -655,9 +791,16 @@
               (assoc o :value (assoc (:value o) :killed [], :skipped :not-caught-up
                                      :behind (vec (sort still))))
               (let [queue!        #(do (swap! pending into %) (swap! hit into %))
-                    [killed lost] (invoke-fault test lz (:value o) queue!)]
+                    ;; A dead LazyFS makes `lose!` throw: probe before the throw leaves.
+                    [killed lost] (try (invoke-fault test lz (:value o) queue!)
+                                       (catch InterruptedException e (throw e))
+                                       (catch Throwable e
+                                         (probe! test (:nodes (:value o)))
+                                         (throw e)))
+                    oom           (probe! test (:nodes (:value o)))]
                 (assoc o :value (assoc (:value o)
                                        :killed         killed
+                                       :oom-killed     oom
                                        :unsynced-bytes (update-vals lost :before)
                                        :remaining      (update-vals lost :after)
                                        :sentinel       (update-vals lost :sentinel)
@@ -667,19 +810,34 @@
           (let [final? (boolean (:final? (:value o)))
                 nodes  (vec (sort @pending))
                 watch  (when final? (into @hit @unsettled))
-                r      (recover! test nodes env final? watch)]
-            (swap! pending #(reduce disj % nodes))
-            ;; Only the nodes this recovery settled leave `unsettled`: a recover with no nodes
-            ;; (after a skipped fault) settled nothing (P242d).
-            (swap! unsettled #(into (reduce disj % (:judged r)) (:unsettled r)))
-            (assoc o :value {:started      nodes
-                             :judged       (:judged r)
-                             :final?       final?
-                             :down         (:down r)
-                             :pending      (:pending r)
-                             :replica-down (:replica-down r)
-                             :unsettled    (:unsettled r)
-                             :waited-ms    (:waited-ms r)}))))
+                ;; Every mounted node at the final recovery, not only the ones the fault hit.
+                probe  #(vec (sort (into @seen (when final?
+                                                  (probe! test (vec (lazyfs-nodes test)))))))
+                r      (try (recover! test nodes env final? watch)
+                            (catch InterruptedException e (throw e))
+                            (catch Throwable e e))]
+            (if (instance? Throwable r)
+              ;; A throw has no node. With evidence it is returned as the op's `:exception` (the
+              ;; checker still judges it, and the evidence reaches it); without, it propagates.
+              (let [oom (probe)]
+                (if (and final? (seq oom))
+                  (assoc o :exception {:cause (or (ex-message r) (str r))}
+                         :value {:started nodes, :final? final?, :oom-killed oom})
+                  (throw r)))
+              (let [oom (probe)]
+                (swap! pending #(reduce disj % nodes))
+                ;; Only the nodes this recovery settled leave `unsettled`: a recover with no nodes
+                ;; (after a skipped fault) settled nothing (P242d).
+                (swap! unsettled #(into (reduce disj % (:judged r)) (:unsettled r)))
+                (assoc o :value {:started      nodes
+                                 :judged       (:judged r)
+                                 :final?       final?
+                                 :oom-killed   oom
+                                 :down         (:down r)
+                                 :pending      (:pending r)
+                                 :replica-down (:replica-down r)
+                                 :unsettled    (:unsettled r)
+                                 :waited-ms    (:waited-ms r)}))))))
 
       (teardown! [_ _]))))
 

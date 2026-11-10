@@ -3559,6 +3559,9 @@ pub fn StateMachineType(comptime Storage: type) type {
         fn transaction_writes_nothing(self: *StateMachine, entries: []const WideEntry) bool {
             if (!self.commit_keys_deduplicate) return false;
             if (entries.len == 0 or entries[0].kind != .key) return false;
+            // Validity is not checked here, so that admission, the extreme scans and the VOPR
+            // model (`views_admit`) agree: an invalid key entry whose row exists writes nothing
+            // either way, because it is refused regardless (#267).
             return self.forest.grooves.rows.get(commit_key_row(&entries[0])) == .found_object;
         }
 
@@ -3810,6 +3813,8 @@ pub fn StateMachineType(comptime Storage: type) type {
                 }
                 const scan = &self.extreme_scans.items[entry.value_ptr.*];
                 const member = nerva.member_key(view.id, slot, id);
+                // Admission counted every member a scan may count (#254, #255).
+                assert(self.view_op_members.contains(member));
                 if (self.extreme_counted.getOrPutAssumeCapacity(member).found_existing) continue;
                 scan.removals_max += 1;
                 const stored = group orelse continue;

@@ -423,7 +423,7 @@ error[NRV-E0004]: export: cluster.export exists
 The exit status says who is to blame: 1 the operator's input, 2 the environment (disk, kernel,
 file system), 70 a bug in Nerva (`bug[NRV-B…]`, with the error's name on a `detail` line under
 `--log-debug`). `nerva start`'s runtime exits keep their statuses (2 to 8). The flag parser's own
-messages (an unknown or repeated flag) are not coded yet.
+messages (an unknown or repeated flag) are NRV-E0001, exit 1 (#167).
 
 ### Metrics and traces
 
