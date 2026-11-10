@@ -5,7 +5,7 @@ publishes a version's section as its GitHub release notes, and refuses to releas
 without one. Design reasons are in [docs/DECISIONS.md](./docs/DECISIONS.md); the full log of
 work is [WORKLOG.md](./WORKLOG.md).
 
-## v0.7.0 — TBD
+## v0.7.0 — 2026-11-10
 
 A lost replica can now be replaced while the cluster stays open, and a cluster can be backed up
 and restored with a record kept apart from the backup (R5). Each client process can have its own
