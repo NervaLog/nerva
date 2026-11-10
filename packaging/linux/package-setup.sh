@@ -4,7 +4,9 @@
 # /var/lib/nerva (0750, nerva:nerva) and /etc/nerva (0750, root:nerva), and does nothing else:
 # it never formats, enables, starts or removes anything, and no removal script touches the data.
 # A second run changes nothing. A user or group named nerva that is not the one install.sh makes
-# is refused with NRV-E1105, before the package's files are unpacked. The text never uses a
+# is refused with NRV-E1105, and a tarball install still on the machine (install.sh's binary in
+# /usr/local/bin or its units in /etc/systemd/system, which would shadow the package's) with
+# NRV-E1111, both before the package's files are unpacked. The text never uses a
 # percent sign: the .rpm embeds it in its spec.
 set -eu
 
@@ -23,6 +25,17 @@ refuse() { # <headline> <fix>
     echo "  fix    $2" >&2
     exit 1
 }
+
+# install.sh's files shadow the package's: /usr/local/bin comes before /usr/bin on the PATH and
+# /etc/systemd/system overrides /usr/lib/systemd/system. install.sh refuses the same way.
+for left in /usr/local/bin/nerva /etc/systemd/system/nerva@.service /etc/systemd/system/nerva-api@.service; do
+    if [ -e "$left" ]; then
+        echo "error[NRV-E1111]: nerva package: $left exists, from a tarball install" >&2
+        echo "  cause  A tarball install of Nerva is still on this machine and would shadow the package's binary and units" >&2
+        echo "  fix    run install.sh --uninstall from the tarball (it keeps /var/lib/nerva, /etc/nerva and the user), then install the package" >&2
+        exit 1
+    fi
+done
 
 if getent passwd "$user" > /dev/null 2>&1; then
     home=$(getent passwd "$user" | cut -d: -f6)

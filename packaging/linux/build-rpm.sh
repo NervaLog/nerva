@@ -32,6 +32,8 @@ case "$version" in
         ;;
 esac
 [ -f "$nerva" ] || { echo "build-rpm.sh: $nerva is not a file" >&2; exit 1; }
+. "$here/check-elf.sh"
+check_elf build-rpm.sh "$nerva" "$arch"
 SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH:-$(git -C "$root" log -1 --format=%ct)}
 export SOURCE_DATE_EPOCH
 

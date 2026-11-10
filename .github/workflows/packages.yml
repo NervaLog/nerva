@@ -124,8 +124,12 @@ jobs:
       - name: Install the pinned Zig
         run: eval "$INSTALL_ZIG"
 
-      - name: Build nerva (the release build the packages carry)
-        run: ./zig/zig build -Drelease
+      # Each package carries the binary built for its own architecture; the build scripts read the
+      # ELF header and refuse another (NRV-E1110), and packages.py compares the bytes.
+      - name: Build nerva for x86_64-linux and aarch64-linux (the release builds the packages carry)
+        run: |
+          ./zig/zig build -Drelease
+          ./zig/zig build -Drelease -Dtarget=aarch64-linux -p zig-out-aarch64
 
       - name: Install rpmbuild, pinned
         run: |
@@ -137,4 +141,4 @@ jobs:
           dpkg-deb --version | head -n1
 
       - name: Build, inspect and install the packages (tests/packaging/packages.py)
-        run: python3 -I tests/packaging/packages.py zig-out/bin/nerva .
+        run: python3 -I tests/packaging/packages.py zig-out/bin/nerva . --aarch64 zig-out-aarch64/bin/nerva
