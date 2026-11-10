@@ -357,12 +357,88 @@ jobs:
             ./zig/zig build -Drelease -Dtarget="$target"
           done
 
+  # Nerva on a Mac (#278, v0.7.1 slice 2). GitHub's hosted macOS runners are free for a public
+  # repository, and the job runs ad hoc: it holds no Apple secret. Each leg builds both macOS
+  # targets (ReleaseSafe, as release.yml builds them), joins them with `lipo` into a universal
+  # binary, and runs tests/macos/smoke.py on its own architecture's thin binary and on the
+  # universal one. The arm64 leg then builds and runs `test:unit` natively. Zig's linker signs
+  # aarch64-macos output ad hoc; the x86_64 binary and the universal one are signed here with
+  # `codesign -s -`, which is what `zig build mac-release -Dsign-identity=-` will do (slice 3, #291):
+  # see the marked step below.
+  macos:
+    needs: changes
+    if: ${{ !cancelled() }}
+    name: macOS (${{ matrix.arch }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            arch: arm64
+          - os: macos-15-intel
+            arch: x86_64
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        if: needs.changes.outputs.code != 'false'
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned Zig
+        if: needs.changes.outputs.code != 'false'
+        run: ./zig/download.sh
+
+      - uses: ./.github/actions/zig-build-cache
+        if: needs.changes.outputs.code != 'false'
+        with:
+          name: macos_${{ matrix.arch }}
+
+      - name: Build both targets and join them with lipo
+        if: needs.changes.outputs.code != 'false'
+        run: |
+          set -eu
+          mkdir -p macos-out
+          for target in aarch64-macos x86_64-macos; do
+            ./zig/zig build -Drelease -Dtarget="$target"
+            cp zig-out/bin/nerva "macos-out/nerva-$target"
+          done
+          lipo -create macos-out/nerva-aarch64-macos macos-out/nerva-x86_64-macos -output macos-out/nerva-universal
+          archs=$(lipo -archs macos-out/nerva-universal)
+          echo "lipo -archs: $archs"
+          [ "$archs" = "x86_64 arm64" ]
+          # Ad hoc: lipo invalidates the arm64 slice's signature and x86_64 has none.
+          codesign --force -s - macos-out/nerva-x86_64-macos macos-out/nerva-universal
+          chmod +x macos-out/nerva-*
+
+      - name: Smoke test, thin binary of this architecture
+        if: needs.changes.outputs.code != 'false'
+        run: |
+          if [ "${{ matrix.arch }}" = arm64 ]; then thin=aarch64-macos; else thin=x86_64-macos; fi
+          python3 tests/macos/smoke.py "macos-out/nerva-$thin" --arch ${{ matrix.arch }}
+
+      # Follow-up (#291): once `zig build mac-release` is on main, build the universal binary with
+      # `./zig/zig build mac-release -Dsign-identity=-` instead of the lipo above, and run this
+      # step on zig-out/mac-release/nerva-v<VERSION>-universal-macos/nerva.
+      - name: Smoke test, universal binary
+        if: needs.changes.outputs.code != 'false'
+        run: python3 tests/macos/smoke.py macos-out/nerva-universal --arch ${{ matrix.arch }}
+
+      - name: Unit tests, native
+        if: needs.changes.outputs.code != 'false' && matrix.arch == 'arm64'
+        run: ./zig/zig build test:unit
+
+      - uses: ./.github/actions/zig-build-cache-save
+        if: needs.changes.outputs.code != 'false'
+        with:
+          name: macos_${{ matrix.arch }}
+
   # The required check's name (the ruleset cannot change here). It passes only if every split job
   # above succeeded: `always()` so that a failed, cancelled or skipped one still runs this job and
   # fails it, instead of leaving it skipped (which a ruleset may count as passing). A docs-only
   # pull request: each split job runs and skips its steps, so each is `success`, and so is this.
   system:
-    needs: [checks, integration, api, releases, targets]
+    needs: [checks, integration, api, releases, targets, macos]
     if: ${{ always() }}
     name: check, integration, API, views
     runs-on: ubuntu-24.04
