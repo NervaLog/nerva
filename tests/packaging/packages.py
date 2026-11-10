@@ -313,7 +313,14 @@ chmod 644 /tmp/@PKG@ /tmp/@PKG2@
 stub_systemctl
 apt-get install -y -qq --no-install-recommends /tmp/@PKG@ > /dev/null
 check_installed
-grep -qx daemon-reload /tmp/systemctl.log
+if ! grep -qx daemon-reload /tmp/systemctl.log; then
+    echo "the postinst did not run systemctl daemon-reload; the log:"
+    cat /tmp/systemctl.log
+    ls -l /var/lib/dpkg/info/nerva.* /run/systemd
+    echo "PATH=$PATH"
+    sh -x /var/lib/dpkg/info/nerva.postinst configure
+    exit 1
+fi
 uid=$(id -u nerva)
 make_state
 apt-get install -y -qq --reinstall --no-install-recommends /tmp/@PKG@ > /dev/null
