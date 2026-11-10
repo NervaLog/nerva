@@ -755,13 +755,23 @@
     (is (= "NRV-E0611" (:code r)))
     (is (= ["n1"] (:oom-killed r)))
     (is (re-find #"memory killed LazyFS on n1" (:reason r))))
-  (testing "its own node left down is the kill's: NRV-E0611, not NRV-E0604"
+  (testing "its own node's replica left down is the kill's: NRV-E0611, not NRV-E0604"
     (let [r (check-recover {:lazyfs true}
                            (history (oom-fault "n1")
-                                    (recover-pair {:replica-down ["n1"] :down [["n1" 0]]
-                                                   :oom-killed ["n1"]})))]
+                                    (recover-pair {:replica-down ["n1"] :oom-killed ["n1"]})))]
       (is (= "NRV-E0611" (:code r)))
       (is (= :unknown (:valid? r)))))
+  (testing "its own node's gateway left down or pending is still NRV-E0604: it does not use the mount"
+    (doseq [k [:down :pending]]
+      (let [r (check-recover {:lazyfs true}
+                             (history (oom-fault "n1")
+                                      (recover-pair {:replica-down ["n1"] k [["n1" 0]]
+                                                     :oom-killed ["n1"]})))]
+        (is (false? (:valid? r)))
+        (is (= "NRV-E0604" (:code r)))
+        (is (= [["n1" 0]] (:gateways r)))
+        (is (= [] (:replica-down r)))
+        (is (= ["n1"] (:oom-killed r))))))
   (testing "another node's replica left down is still NRV-E0604, and the verdict is false"
     (let [r (check-recover {:lazyfs true}
                            (history (oom-fault "n1")
@@ -773,13 +783,26 @@
       (is (= [["n3" 0]] (:gateways r)))
       (is (= ["n1"] (:oom-killed r)))
       (is (some? (:oom-reason r)) "the kill stays as context")))
-  (testing "both nodes down: only the other node's is reported"
+  (testing "both nodes' replicas down: only the other node's is reported"
     (let [r (check-recover {:lazyfs true}
                            (history (oom-fault "n1")
-                                    (recover-pair {:replica-down ["n1" "n3"] :pending [["n1" 1]]
+                                    (recover-pair {:replica-down ["n1" "n3"]
                                                    :oom-killed ["n1"]})))]
       (is (= ["n3"] (:replica-down r)))
       (is (= [] (:gateways r)))))
+  (testing "another node's sentinel-survived reason is kept beside the kill's"
+    (let [r (check-recover {:lazyfs true}
+                           (history (pair :lose-unfsynced-writes
+                                          {:killed ["n1" "n2"]
+                                           :unsynced-bytes {"n1" nil "n2" 4096}
+                                           :remaining {"n1" nil "n2" 0}
+                                           :sentinel {"n1" :unchecked "n2" :survived}
+                                           :cache-usage {"n1" nil "n2" nil}
+                                           :oom-killed ["n1"]})
+                                    (recover-pair {})))]
+      (is (= "NRV-E0611" (:code r)))
+      (is (re-find #"memory killed LazyFS on n1" (:reason r)))
+      (is (re-find #"did not bite" (:harness-reason r)))))
   (testing "a final recovery that threw has no node: never excused"
     (let [r (check-recover {:lazyfs true}
                            (history (oom-fault "n1")
@@ -880,3 +903,11 @@
                      (n/invoke! (n/setup! (lazyfs/nemesis "/opt/nerva" nil) five) five
                                 {:type :info, :f :lazyfs-recover :value {:final? true}}))
             "without evidence the throw propagates as before")))))
+
+(deftest lazyfs-running-answers-gone-only-on-exit-1
+  (let [ask (fn [out] (with-redefs [c/exec (fn [& _] out)] (lazyfs/lazyfs-running?)))]
+    (is (true? (ask "up\n")))
+    (is (false? (ask "gone\n")))
+    (is (nil? (ask "unknown\n")) "a timed-out or failed pgrep claims nothing")
+    (is (nil? (ask "")))
+    (is (nil? (with-redefs [c/exec (fn [& _] (throw (ex-info "x" {})))] (lazyfs/lazyfs-running?))))))

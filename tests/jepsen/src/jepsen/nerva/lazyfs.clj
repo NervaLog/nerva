@@ -407,10 +407,13 @@
                             "|| true")))))
 
 (defn lazyfs-running?
-  "Is a `lazyfs` process up on this node? nil when that could not be asked (one bounded command)."
+  "Is a `lazyfs` process up on this node? true on `pgrep` exit 0, false only on exit 1 (no match),
+  nil when that could not be asked: a `pgrep` the timeout killed (124) or that errored (2, 3) says
+  nothing (one bounded command)."
   []
-  (quietly #(case (str/trim (c/exec :sh :-c (str "timeout 5 pgrep -x lazyfs > /dev/null "
-                                                 "&& echo up || echo gone")))
+  (quietly #(case (str/trim (c/exec :sh :-c (str "timeout 5 pgrep -x lazyfs > /dev/null; "
+                                                 "case $? in 0) echo up;; 1) echo gone;; "
+                                                 "*) echo unknown;; esac")))
               "up"   true
               "gone" false
               nil)))
@@ -619,9 +622,11 @@
   `:down` or `:pending`, the replica dead, or did not finish (an `:exception`): a node that
   cannot serve after the restart is an availability finding. Only the final recovery is judged
   for that (`:final? true`): mid-run, a `kill` or `partition` may have removed quorum.
-  The memory killing LazyFS on a node (`:oom-killed`, `oom-evidence?`) explains only that node: a
-  gateway or replica left down on it is not NRV-E0604. Another node's, or a final recovery that
-  threw, still is (P268).
+  The memory killing LazyFS on a node (`:oom-killed`, `oom-evidence?`) explains only that node's
+  replica, whose data file lives on the dead mount: its `:replica-down` is not NRV-E0604. Its
+  gateways do not use the mount (they reach the cluster through every replica), so a gateway
+  `:down` or `:pending` there, another node's anything, and a final recovery that threw, still are
+  (P268).
   `:valid? false`, with NRV-E0608, when `:lazyfs-strict-sync` and bytes were lost (see below), an
   OOM kill never outranking it: lost bytes are LazyFS's own report, made alive (P268).
   `:unknown`, with NRV-E0611 (the host, not Nerva, is at fault), when the kernel's log shows the
@@ -654,16 +659,15 @@
             threw    (filter :exception (concat done recovers))
             finals   (filter #(:final? (:value %)) recovers)
             oom      (vec (sort (distinct (mapcat #(:oom-killed (:value %)) (concat done recovers)))))
-            ;; What the final recovery left wrong, less the nodes the memory killed LazyFS on: a
-            ;; throw has no node, so it is never excused (P268).
+            ;; What the final recovery left wrong, less the replicas of the nodes the memory killed
+            ;; LazyFS on. Their gateways stay judged: a gateway does not use the mount. A throw has
+            ;; no node, so it is never excused (P268).
             judged   (for [o finals
                            :let [v   (:value o)
-                                 off (fn [xs] (vec (remove #((set oom) (if (vector? %) (first %) %))
-                                                           xs)))
                                  r   {:exception    (:exception o)
-                                      :down         (off (:down v))
-                                      :pending      (off (:pending v))
-                                      :replica-down (off (:replica-down v))}]
+                                      :down         (vec (:down v))
+                                      :pending      (vec (:pending v))
+                                      :replica-down (vec (remove (set oom) (:replica-down v)))}]
                            :when (or (:exception r) (seq (:down r)) (seq (:pending r))
                                      (seq (:replica-down r)))]
                        r)
@@ -718,7 +722,7 @@
           strict?        (assoc :code "NRV-E0608")
           (and (seq problems) (not (seq judged)) (not strict?) (not oomed?)) (assoc :code "NRV-E0607")
           (seq full)     (assoc :cache-full full)
-          (pos? survived) (assoc (if strict? :harness-reason :reason)
+          (pos? survived) (assoc (if (or strict? oomed?) :harness-reason :reason)
                                  (str "the fault did not bite: an unsynced sentinel file "
                                       "survived a LazyFS clear on " survived " node(s)"))
           (seq judged)   (assoc :code         "NRV-E0604"
@@ -760,8 +764,9 @@
         hit       (atom #{})
         baselines (atom {})
         seen      (atom #{})
-        ;; Probes `nodes` for an OOM-killed LazyFS and remembers it: a recovery restarts LazyFS, so
-        ;; a kill seen only at the final recovery would be missed (P268).
+        ;; Probes `nodes` for an OOM-killed LazyFS and remembers it, so a kill seen after one fault
+        ;; is still reported when a later probe cannot ask (a log that rotated, a process that
+        ;; cannot be asked about) (P268).
         probe!    (fn [test nodes]
                     (let [oom (oom-killed-nodes test @baselines nodes)]
                       (swap! seen into oom)

@@ -14,8 +14,11 @@ harness reports it as its own verdict with its own code, `NRV-E0611`, and P242j'
 1. The `lazyfs` verdict is `:valid? :unknown` with `:code "NRV-E0611"`, `:oom-killed` (the nodes)
    and a `:reason`, when the kernel's log shows a new OOM kill of a process named `lazyfs` that
    names that node's own container and that node's `lazyfs` process is seen gone, and no finding
-   stands. It excuses only that node: a gateway or replica left down on it is the kill's, but
-   another node's is still NRV-E0604 (`:valid? false`, the kill beside it as `:oom-reason`), and a
+   stands. It excuses only that node's replica, whose data file is on the dead
+   mount (`:replica-down`). Its gateways do not use the mount (`nerva api` runs in `/opt/nerva` and
+   reaches the cluster through every replica), so a gateway `:down` or `:pending` there is still
+   NRV-E0604, as is anything on another node (`:valid? false`, the kill beside it as `:oom-reason`; another
+   node's sentinel-survived `:reason` is kept as `:harness-reason`), and a
    final recovery that threw has no node, so it is never excused. It never outranks NRV-E0608: lost
    bytes are LazyFS's own report, made while it was alive, so the kill, which came after, did not
    cause them. It outranks NRV-E0607 only.
@@ -30,7 +33,9 @@ harness reports it as its own verdict with its own code, `NRV-E0611`, and P242j'
    cannot be asked about claims nothing.
    The probe runs after each fault, in the fault's failure path too (a dead LazyFS makes `lose!`
    throw), and at the final recovery on every mounted node, in its failure path too. What it sees
-   is kept, as a recovery restarts LazyFS and would hide it. A final recovery that threw after a
+   is kept, so a kill seen once is still reported when a later probe cannot ask. Nothing restarts
+   a killed LazyFS (`lazyfs/mount!` runs only in `db/setup!`), so it stays dead to the end of the
+   run. `lazyfs-running?` says gone only on `pgrep` exit 1; a timeout or error claims nothing. A final recovery that threw after a
    kill is returned as the op's `:exception` with the evidence.
 3. The nightly's reporter classes NRV-E0611 with NRV-E0607 (`HOST_VERDICT_CODES`): the host's,
    counted as `error` and never filed; a real finding elsewhere still outranks it.
