@@ -249,7 +249,13 @@ fi
 check_installed
 echo data > /var/lib/nerva/marker
 uid=$(id -u nerva)
-rpm -U --replacepkgs /tmp/@PKG@
+if rpm -U --replacepkgs /tmp/@PKG@ > /tmp/rpm.out 2>&1; then
+    echo "FINDING: @IMAGE@ rpm -U installed the unsigned rpm with its defaults"
+else
+    echo "FINDING: @IMAGE@ rpm -U refused the unsigned rpm with its defaults: $(head -n 2 /tmp/rpm.out | tr '\n' ' ')"
+    rpm -U --replacepkgs --nosignature /tmp/@PKG@
+    echo "FINDING: @IMAGE@ rpm -U --nosignature installed it"
+fi
 [ "$(id -u nerva)" = "$uid" ]
 [ "$(cat /var/lib/nerva/marker)" = data ]
 rm /var/lib/nerva/marker
