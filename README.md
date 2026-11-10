@@ -880,7 +880,7 @@ Nerva holds its first client's money on the R milestones' terms, in
 
 | Milestone | What it adds | Status |
 | --- | --- | --- |
-| R1 · Proven | Jepsen nightly on a dedicated host: commit keys under unknown outcomes, the gateway killed and cut off | Not started (bank suite exists; nightly is draft #106) |
+| R1 · Proven | Jepsen nightly on a dedicated host: commit keys under unknown outcomes, the gateway killed and cut off | In progress (the retry, bank-keys and gateway workloads and the nightly workflow are merged and run on GitHub-hosted runners; the dedicated host is not provisioned) |
 | R2 · Fleet | An always-on VOPR and fuzzer fleet on Hetzner that files every new failure | In progress |
 | R3 · Measured | Sizing and latency on three machines; the Fly p99 explained | Not started |
 | R4 · Gateway | Beside its client: a gateway per client process on loopback, no ambiguous 503, metrics | **Delivered** 2026-11-06: `demo_r4` green on `main` ([run](https://github.com/NervaLog/nerva/actions/runs/42136037296/job/127624296815), [docs/demos/r4.md](./docs/demos/r4.md)) |
