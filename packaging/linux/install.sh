@@ -24,6 +24,12 @@ units="nerva@.service nerva-api@.service"
 examples="replica.env.example api.env.example"
 marker="^# Part of Nerva "
 
+# refuse <status> <code> <headline> <cause> <fix>: one block, as `nerva` prints, then exit.
+refuse() {
+    printf 'error[%s]: install.sh: %s\n  cause  %s\n  fix    %s\n' "$2" "$3" "$4" "$5" >&2
+    exit "$1"
+}
+
 dry=0
 upgrade=0
 uninstall=0
@@ -37,21 +43,17 @@ for arg in "$@"; do
             exit 0
             ;;
         *)
-            echo "usage: install.sh [--dry-run] [--upgrade] | --uninstall [--dry-run]" >&2
-            exit 1
+            refuse 1 NRV-E1106 "unknown argument $arg" \
+                "install.sh was given a flag or a combination of flags it does not take" \
+                "usage: install.sh [--dry-run] [--upgrade] | --uninstall [--dry-run] (see --help)"
             ;;
     esac
 done
 if [ "$upgrade" = 1 ] && [ "$uninstall" = 1 ]; then
-    echo "usage: --upgrade and --uninstall do not go together" >&2
-    exit 1
+    refuse 1 NRV-E1106 "--upgrade and --uninstall do not go together" \
+        "install.sh was given a flag or a combination of flags it does not take" \
+        "usage: install.sh [--dry-run] [--upgrade] | --uninstall [--dry-run] (see --help)"
 fi
-
-# refuse <status> <code> <headline> <cause> <fix>: one block, as `nerva` prints, then exit.
-refuse() {
-    printf 'error[%s]: install.sh: %s\n  cause  %s\n  fix    %s\n' "$2" "$3" "$4" "$5" >&2
-    exit "$1"
-}
 
 # do_ <description> <command...>: runs the command, or only says it would.
 do_() {
@@ -78,42 +80,66 @@ if ! command -v systemctl > /dev/null 2>&1 || [ ! -d /run/systemd/system ]; then
         "install on a machine that boots with systemd, or run nerva by hand (docs/QUICKSTART.md)"
 fi
 if ! command -v sha256sum > /dev/null 2>&1; then
-    refuse 2 NRV-E1104 "sha256sum is not installed" \
-        "This machine cannot run this tarball's nerva, or lacks sha256sum" \
-        "install coreutils, and use the tarball for this machine's architecture ($(uname -m))"
+    refuse 2 NRV-E1109 "sha256sum is not installed" \
+        "The installer needs sha256sum, and this machine has none on its PATH" \
+        "install coreutils, then run install.sh again"
 fi
+# elf_machine <file>: the ELF header's machine as `uname -m` names it, or nothing when the file is
+# not an ELF this installer knows (x86_64, aarch64).
+elf_machine() {
+    [ "$(od -An -tx1 -N4 "$1" | tr -d ' \n')" = 7f454c46 ] || return 0
+    case "$(od -An -tx1 -j18 -N2 "$1" | tr -d ' \n')" in
+        3e00) echo x86_64 ;;
+        b700) echo aarch64 ;;
+    esac
+}
 if [ "$uninstall" = 0 ]; then
-    if [ ! -f "$here/nerva" ]; then
-        refuse 1 NRV-E1104 "$here/nerva is missing" \
-            "This machine cannot run this tarball's nerva, or lacks sha256sum" \
-            "run install.sh from the unpacked release tarball, beside nerva"
-    fi
-    chmod 0755 "$here/nerva" 2> /dev/null || true
-    if ! "$here/nerva" version > /dev/null 2>&1; then
-        refuse 2 NRV-E1104 "the nerva in $here does not run on this machine ($(uname -m))" \
-            "This machine cannot run this tarball's nerva, or lacks sha256sum" \
-            "download the tarball for this machine's architecture: x86_64-linux or aarch64-linux"
-    fi
-    for file in $units $examples; do
+    for file in nerva $units $examples; do
         if [ ! -f "$here/$file" ]; then
-            refuse 1 NRV-E1104 "$here/$file is missing" \
-                "This machine cannot run this tarball's nerva, or lacks sha256sum" \
-                "run install.sh from the unpacked release tarball, beside nerva"
+            refuse 1 NRV-E1108 "$here/$file is missing" \
+                "The tarball is incomplete, or install.sh was run outside the unpacked tarball" \
+                "unpack the release tarball whole, and run install.sh from its directory"
         fi
     done
+    chmod 0755 "$here/nerva" 2> /dev/null || true
+    host=$(uname -m)
+    [ "$host" != arm64 ] || host=aarch64
+    built=$(elf_machine "$here/nerva")
+    if [ -n "$built" ] && [ "$built" != "$host" ]; then
+        refuse 2 NRV-E1104 "the nerva in $here is for $built, and this machine is $host" \
+            "The tarball's nerva is for another architecture than this machine's" \
+            "download the tarball for this machine: x86_64-linux or aarch64-linux"
+    fi
+    status=0
+    "$here/nerva" version > /dev/null 2>&1 || status=$?
+    if [ "$status" != 0 ]; then
+        refuse 2 NRV-E1107 "the nerva in $here cannot run (exit status $status)" \
+            "This machine cannot run the tarball's nerva, though it is for this architecture" \
+            "unpack the tarball where programs may run (not a noexec mount such as /tmp on a hardened host), and run '$here/nerva version' to see why"
+    fi
 fi
 if getent passwd "$user" > /dev/null 2>&1; then
     home=$(getent passwd "$user" | cut -d: -f6)
     if [ "$home" != "$data_dir" ]; then
         refuse 1 NRV-E1105 "the user $user exists, with home $home" \
-            "A user or unit named nerva exists and is not the one Nerva's installer makes" \
+            "A user, group or unit named nerva exists and is not the one Nerva's installer makes" \
             "rename or remove that user, or give it the home $data_dir"
     fi
+    group=$(id -gn "$user" 2> /dev/null || true)
+    if [ "$group" != "$user" ]; then
+        refuse 1 NRV-E1105 "the user $user exists, with primary group ${group:-unknown}" \
+            "A user, group or unit named nerva exists and is not the one Nerva's installer makes" \
+            "give the user the primary group $user (usermod -g $user $user), or remove the user"
+    fi
+elif getent group "$user" > /dev/null 2>&1; then
+    refuse 1 NRV-E1105 "the group $user exists, and the user $user does not" \
+        "A user, group or unit named nerva exists and is not the one Nerva's installer makes" \
+        "remove the group (groupdel $user), or create the user $user with it as primary group (useradd -g $user ...)"
 fi
 for unit in $units; do
     if [ -e "$unit_dir/$unit" ] && ! grep -q "$marker" "$unit_dir/$unit" 2> /dev/null; then
         refuse 1 NRV-E1105 "$unit_dir/$unit exists and is not Nerva's" \
-            "A user or unit named nerva exists and is not the one Nerva's installer makes" \
+            "A user, group or unit named nerva exists and is not the one Nerva's installer makes" \
             "move it away, or change it with a drop-in (systemctl edit) and keep Nerva's"
     fi
 done
@@ -134,6 +160,14 @@ if [ "$uninstall" = 1 ]; then
         do_ "remove $bin_dir/nerva" rm -f "$bin_dir/nerva"
         changed=1
     fi
+    # The enable links of instances the operator enabled (nerva@0, nerva-api@0): left behind they
+    # dangle, and a later install would make them live again.
+    for link in "$unit_dir"/*.wants/nerva@*.service "$unit_dir"/*.wants/nerva-api@*.service; do
+        [ -L "$link" ] || continue
+        do_ "disable $(basename "$link") (remove the link $link)" \
+            systemctl disable "$(basename "$link")"
+        changed=1
+    done
     for unit in $units; do
         if [ -e "$unit_dir/$unit" ]; then
             do_ "remove $unit_dir/$unit" rm -f "$unit_dir/$unit"
@@ -207,10 +241,10 @@ if [ "$dry" = 1 ]; then
     exit 0
 fi
 echo "installed: $("$bin_dir/nerva" version | head -n1)"
-cat << 'NEXT'
+cat << NEXT
 
 Nothing is formatted, enabled or started. Next, for replica 0 of three (docs/QUICKSTART.md):
   1. cp /etc/nerva/replica.env.example /etc/nerva/replica-0.env   # then set the addresses and key
-  2. runuser -u nerva -- nerva format --cluster=1 --replica=0 --replica-count=3 /var/lib/nerva/0.nerva
+  2. runuser -u nerva -- $bin_dir/nerva format --cluster=1 --replica=0 --replica-count=3 /var/lib/nerva/0.nerva
   3. systemctl enable --now nerva@0
 NEXT

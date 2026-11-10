@@ -1,21 +1,19 @@
 # Linux packaging (v0.7.1, slice 4; docs/briefs/v0.7.1.md): the release tarball's install.sh and
 # the two systemd units, proved on a real systemd. Slice 5 adds its package jobs to this file.
 #
-# It runs on a pull request that changes packaging (a draft's run waits until the pull request is
-# marked ready), and on main. Every job runs on GitHub's hosted runners, as ci.yml's do (P147e): a
+# It runs on every push to main (so on the release commit), and on a pull request that changes
+# packaging, the code whose output or exit statuses the installer and units rely on
+# (src/nerva_main.zig, src/nerva/diagnostic.zig) or VERSION (a draft's run waits until the pull
+# request is marked ready). Every job runs on GitHub's hosted runners, as ci.yml's do (P147e): a
 # test that installs a service and starts replicas as root needs a machine of its own, and a fork's
 # pull request must never run on a self-hosted one. The pinned toolchain comes from Actions' cache,
 # installed as ci.yml installs it. This workflow is not a required check: a pull request that
-# touches no packaging never starts it.
+# touches none of those paths never starts it.
 name: Packages
 
 on:
   push:
     branches: [main]
-    paths:
-      - 'packaging/**'
-      - 'tests/packaging/**'
-      - '.github/workflows/packages.yml'
   pull_request:
     branches: [main]
     types: [opened, synchronize, reopened, ready_for_review]
@@ -23,6 +21,9 @@ on:
       - 'packaging/**'
       - 'tests/packaging/**'
       - '.github/workflows/packages.yml'
+      - 'src/nerva_main.zig'
+      - 'src/nerva/diagnostic.zig'
+      - 'VERSION'
   workflow_dispatch:
 
 permissions:

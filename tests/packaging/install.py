@@ -8,18 +8,22 @@ Run as root on a machine booted with systemd (CI's ubuntu-24.04 runner): it chan
 tarball's contents, then checks, against the real units:
   1. `install.sh --dry-run` changes nothing;
   2. `install.sh` installs, and a second run changes nothing; both units pass `systemd-analyze verify`;
-  3. every refusal, NRV-E1101 to NRV-E1105, with its code, exit status and three-line block;
-  4. three replicas, formatted as `nerva`, run as nerva@0..2 behind nerva-api@0; a commit and a
+  3. every refusal, NRV-E1101 to NRV-E1109, with its code, exit status and three-line block;
+  4. the gateway nerva-api@0 started while the cluster is down fails with NRV-E0604 and is restarted,
+     and serves once three replicas, formatted as `nerva` and run as nerva@0..2, are up; a commit and a
      lookup; `systemctl kill -s KILL nerva@1` is restarted and catches up (a quorum of it and
      replica 2 commits while replica 0 is stopped);
   5. a replica imported from another export than its peers exits 8 (NRV-E0711) and systemd does not
      restart it;
-  6. `install.sh --uninstall` removes the binary and the units and leaves /var/lib/nerva.
-`sha256sum` missing (also NRV-E1104) is the same branch as the one tested, and is not provoked.
+  6. `install.sh --uninstall` removes the binary, the units and the enable links of the instances
+     that were enabled, and leaves /var/lib/nerva.
+Not provoked: NRV-E1102's `/run/systemd/system` half, and a `nerva` on a noexec mount (a script that
+exits 1 stands for it in NRV-E1107).
 """
 import http.client
 import json
 import os
+import platform
 import re
 import shutil
 import socket
@@ -38,6 +42,7 @@ FILES = ["install.sh", "replica.env.example", "api.env.example"] + UNITS
 KEY = "packaging-test-gateway-key-0123456789"
 CLUSTER_KEY = os.urandom(32).hex()
 TABLE = 3
+NOT_OURS = "A user, group or unit named nerva exists and is not the one Nerva's installer makes"
 STATUS_ORIGIN_MISMATCH = 8
 
 
@@ -207,6 +212,20 @@ def stop_all():
     systemctl("reset-failed")
 
 
+def test_early_refusals(stage):
+    """Refusals that need no installed state: usage, and a group nerva without the user."""
+    usage = "install.sh was given a flag or a combination of flags it does not take"
+    refused(installer(stage, "--no-such-flag", expect=1), 1, "NRV-E1106", usage)
+    refused(installer(stage, "--upgrade", "--uninstall", expect=1), 1, "NRV-E1106", usage)
+    assert sh(["groupadd", "nerva"]).returncode == 0
+    try:
+        for args in ([], ["--dry-run"]):
+            refused(installer(stage, *args, expect=1), 1, "NRV-E1105", NOT_OURS)
+    finally:
+        assert sh(["groupdel", "nerva"]).returncode == 0
+    assert sh(["getent", "passwd", "nerva"]).returncode != 0
+
+
 def test_dry_run_and_install(stage):
     before = snapshot()
     result = installer(stage, "--dry-run")
@@ -217,6 +236,7 @@ def test_dry_run_and_install(stage):
     result = installer(stage)
     assert "installed: Nerva version" in result.stdout, result.stdout
     assert "systemctl enable --now nerva@0" in result.stdout, result.stdout
+    assert f"runuser -u nerva -- {BIN} format" in result.stdout, result.stdout
     assert sha256(BIN) == sha256(f"{stage}/nerva")
     for unit in UNITS:
         assert sha256(f"{UNIT_DIR}/{unit}") == sha256(f"{stage}/{unit}"), unit
@@ -248,16 +268,34 @@ def test_refusals(packaging, nerva, tmp, stage):
                     "sh", "/stage/install.sh"])
     refused(container, 2, "NRV-E1102", "The installer found no running systemd")
 
-    # A nerva that does not run on this machine (stands for the wrong architecture).
+    # A nerva that does not run on this machine: not an ELF, so no architecture to blame.
     broken = stage_tarball(packaging, nerva, tmp, "broken")
     with open(f"{broken}/nerva", "w") as f:
         f.write("#!/bin/sh\nexit 1\n")
-    refused(installer(broken, expect=2), 2, "NRV-E1104",
-            "This machine cannot run this tarball's nerva, or lacks sha256sum")
+    refused(installer(broken, expect=2), 2, "NRV-E1107",
+            "This machine cannot run the tarball's nerva, though it is for this architecture")
+    # The other architecture's ELF header, which no host runs (or an emulator would).
+    foreign = stage_tarball(packaging, nerva, tmp, "foreign")
+    with open(f"{foreign}/nerva", "r+b") as f:
+        f.seek(18)
+        f.write(b"\xb7\x00" if platform.machine() == "x86_64" else b"\x3e\x00")
+    refused(installer(foreign, expect=2), 2, "NRV-E1104",
+            "The tarball's nerva is for another architecture than this machine's")
+    incomplete = "The tarball is incomplete, or install.sh was run outside the unpacked tarball"
     missing = stage_tarball(packaging, nerva, tmp, "missing")
     os.remove(f"{missing}/nerva-api@.service")
-    refused(installer(missing, expect=1), 1, "NRV-E1104",
-            "This machine cannot run this tarball's nerva, or lacks sha256sum")
+    refused(installer(missing, expect=1), 1, "NRV-E1108", incomplete)
+    os.remove(f"{missing}/nerva")
+    refused(installer(missing, "--dry-run", expect=1), 1, "NRV-E1108", incomplete)
+    # No sha256sum: a PATH of links to everything else.
+    bare = os.path.join(tmp, "bare-path")
+    os.mkdir(bare)
+    for directory in ("/usr/sbin", "/usr/bin", "/sbin", "/bin"):
+        for name in os.listdir(directory):
+            if name != "sha256sum" and not os.path.lexists(os.path.join(bare, name)):
+                os.symlink(os.path.join(directory, name), os.path.join(bare, name))
+    refused(sh(["sh", f"{stage}/install.sh"], env={"PATH": bare}), 2, "NRV-E1109",
+            "The installer needs sha256sum, and this machine has none on its PATH")
 
     # A different nerva is installed: refused, unchanged, then replaced by --upgrade.
     other = stage_tarball(packaging, nerva, tmp, "other", extra=b"\0")
@@ -273,15 +311,20 @@ def test_refusals(packaging, nerva, tmp, stage):
 
     # A user or a unit that is not ours.
     assert sh(["usermod", "--home", "/home/nerva-other", "nerva"]).returncode == 0
-    refused(installer(stage, expect=1), 1, "NRV-E1105",
-            "A user or unit named nerva exists and is not the one Nerva's installer makes")
+    refused(installer(stage, expect=1), 1, "NRV-E1105", NOT_OURS)
     assert sh(["usermod", "--home", DATA, "nerva"]).returncode == 0
+    # A primary group that is not nerva's own.
+    assert sh(["groupadd", "nerva-other"]).returncode == 0
+    assert sh(["usermod", "--gid", "nerva-other", "nerva"]).returncode == 0
+    refused(installer(stage, expect=1), 1, "NRV-E1105", NOT_OURS)
+    refused(installer(stage, "--dry-run", expect=1), 1, "NRV-E1105", NOT_OURS)
+    assert sh(["usermod", "--gid", "nerva", "nerva"]).returncode == 0
+    assert sh(["groupdel", "nerva-other"]).returncode == 0
     path = f"{UNIT_DIR}/nerva-api@.service"
     shutil.copy(path, f"{tmp}/api-unit.saved")
     with open(path, "w") as f:
         f.write("[Service]\nExecStart=/bin/true\n")
-    refused(installer(stage, expect=1), 1, "NRV-E1105",
-            "A user or unit named nerva exists and is not the one Nerva's installer makes")
+    refused(installer(stage, expect=1), 1, "NRV-E1105", NOT_OURS)
     shutil.copy(f"{tmp}/api-unit.saved", path)
     installer(stage)
 
@@ -297,13 +340,20 @@ def test_cluster(tmp):
         verified = sh(["systemd-analyze", "verify", unit])
         assert verified.returncode == 0 and not verified.stderr.strip(), (unit, verified.stderr)
 
+    # The gateway starts while the cluster is down. After its 30 s registration timeout it exits 1
+    # with NRV-E0604, and the unit must restart it (a restart is what cures it).
+    assert systemctl("start", "nerva-api@0").returncode == 0
+    wait("the gateway gives up on the cluster and is restarted",
+         lambda: int(show("nerva-api@0", "NRestarts")["NRestarts"]) >= 1, seconds=120)
+    log = sh(["journalctl", "-u", "nerva-api@0", "--no-pager"]).stdout
+    assert "NRV-E0604" in log, log[-2000:]
+    assert show("nerva-api@0", "ActiveState")["ActiveState"] != "failed"
     for index in range(3):
         assert systemctl("start", f"nerva@{index}").returncode == 0
     for index in range(3):
         wait(f"replica {index} listens", lambda i=index: listening(ports[i]))
-    assert systemctl("start", "nerva-api@0").returncode == 0
     api = ports[3]
-    wait("the gateway listens", lambda: listening(api))
+    wait("the gateway comes up once the cluster does", lambda: listening(api), seconds=120)
     for unit in ["nerva@0", "nerva@1", "nerva@2", "nerva-api@0"]:
         assert systemctl("is-active", unit).stdout.strip() == "active", unit
     assert "User=nerva" in systemctl("cat", "nerva@0").stdout
@@ -364,11 +414,18 @@ def test_origin_mismatch(tmp, addresses, api):
 
 
 def test_uninstall(stage):
+    for instance in ("nerva@0", "nerva@1", "nerva-api@0"):
+        assert systemctl("enable", instance).returncode == 0
+    links = [f"{UNIT_DIR}/multi-user.target.wants/{i}.service" for i in ("nerva@0", "nerva@1", "nerva-api@0")]
+    assert all(os.path.islink(link) for link in links), links
     before = {p: v for p, v in snapshot().items() if p.startswith(DATA) or p.startswith(ETC)}
     assert os.listdir(DATA), "the data directory should hold the data files by now"
     result = installer(stage, "--uninstall", "--dry-run")
-    assert "would remove" in result.stdout and os.path.exists(BIN)
-    installer(stage, "--uninstall")
+    assert "would remove" in result.stdout and "would disable nerva@0.service" in result.stdout
+    assert os.path.exists(BIN) and all(os.path.islink(link) for link in links)
+    result = installer(stage, "--uninstall")
+    assert "disable nerva-api@0.service" in result.stdout, result.stdout
+    assert not any(os.path.lexists(link) for link in links), "--uninstall left an enable link"
     assert not os.path.exists(BIN)
     assert not any(os.path.exists(f"{UNIT_DIR}/{u}") for u in UNITS)
     after = {p: v for p, v in snapshot().items() if p.startswith(DATA) or p.startswith(ETC)}
@@ -388,16 +445,17 @@ def main():
     started = time.monotonic()
     try:
         stage = stage_tarball(packaging, nerva, tmp, "stage")
+        test_early_refusals(stage)
         test_dry_run_and_install(stage)
         print("ok: --dry-run changes nothing; install; a second install changes nothing")
         test_refusals(packaging, nerva, tmp, stage)
-        print("ok: NRV-E1101 to NRV-E1105, and --upgrade")
+        print("ok: NRV-E1101 to NRV-E1109, and --upgrade")
         addresses, api = test_cluster(tmp)
-        print("ok: three replicas and a gateway under systemd; a commit; SIGKILL restarts")
+        print("ok: a gateway outlives a down cluster; three replicas under systemd; a commit; SIGKILL restarts")
         test_origin_mismatch(tmp, addresses, api)
         print("ok: a wrong-origin replica exits 8 and is not restarted")
         test_uninstall(stage)
-        print("ok: --uninstall leaves /var/lib/nerva")
+        print("ok: --uninstall removes the enable links and leaves /var/lib/nerva")
         print(f"packaging: PASS in {time.monotonic() - started:.0f} s")
     except BaseException:
         stop_all()
