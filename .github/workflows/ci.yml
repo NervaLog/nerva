@@ -4,6 +4,16 @@
 # self-hosted runner (P147e, superseding the Fly runners of N57 and N59). The pinned toolchain
 # comes from Actions' cache. The jobs run in parallel, balanced so none is much longer than the
 # others (N57).
+#
+# Zig's build cache (P285). Every job that compiles Nerva restores ~/.cache/zig and .zig-cache
+# (./.github/actions/zig-cache) and saves them as its last step (./.github/actions/zig-cache-save).
+# The key is the job, the OS, the hash of zig/download.sh (the pinned Zig), build.zig and src/**;
+# a restore without an exact hit takes the newest entry of the same job and Zig, and Zig's
+# content-addressed cache recompiles only what the change touched. Only a push to main saves (a
+# release's call of this workflow is one): a pull request, from a fork or not, only restores, so
+# it cannot poison the cache. A restore over 1500 MB is dropped, since Zig never prunes. Sizes
+# are in the pull request that added this and are printed by each job ("zig-cache: saving").
+# The toolchain has its own cache, above, since it lives outside both.
 name: CI
 
 on:
@@ -126,6 +136,12 @@ jobs:
         if: needs.changes.outputs.code != 'false'
         run: eval "$INSTALL_ZIG"
 
+      # Zig's build cache: restored everywhere, saved by the last step on a push to main only.
+      - uses: ./.github/actions/zig-cache
+        if: needs.changes.outputs.code != 'false'
+        with:
+          name: check
+
       - name: Typecheck
         if: needs.changes.outputs.code != 'false'
         run: ./zig/zig build check
@@ -160,6 +176,11 @@ jobs:
         if: needs.changes.outputs.code != 'false'
         run: ./zig/zig build test:views
 
+      - uses: ./.github/actions/zig-cache-save
+        if: needs.changes.outputs.code != 'false'
+        with:
+          name: check
+
   # Three real replicas; about 3.5 GiB of disk.
   integration:
     needs: changes
@@ -185,9 +206,20 @@ jobs:
         if: needs.changes.outputs.code != 'false'
         run: eval "$INSTALL_ZIG"
 
+      # Zig's build cache: restored everywhere, saved by the last step on a push to main only.
+      - uses: ./.github/actions/zig-cache
+        if: needs.changes.outputs.code != 'false'
+        with:
+          name: integration
+
       - name: Integration (three real replicas)
         if: needs.changes.outputs.code != 'false'
         run: ./zig/zig build test:integration
+
+      - uses: ./.github/actions/zig-cache-save
+        if: needs.changes.outputs.code != 'false'
+        with:
+          name: integration
 
   api:
     needs: changes
@@ -213,9 +245,20 @@ jobs:
         if: needs.changes.outputs.code != 'false'
         run: eval "$INSTALL_ZIG"
 
+      # Zig's build cache: restored everywhere, saved by the last step on a push to main only.
+      - uses: ./.github/actions/zig-cache
+        if: needs.changes.outputs.code != 'false'
+        with:
+          name: api
+
       - name: JSON API (against a model)
         if: needs.changes.outputs.code != 'false'
         run: ./zig/zig build test:api
+
+      - uses: ./.github/actions/zig-cache-save
+        if: needs.changes.outputs.code != 'false'
+        with:
+          name: api
 
   releases:
     needs: changes
@@ -241,13 +284,30 @@ jobs:
         if: needs.changes.outputs.code != 'false'
         run: eval "$INSTALL_ZIG"
 
+      # Zig's build cache: restored everywhere, saved by the last step on a push to main only.
+      - uses: ./.github/actions/zig-cache
+        if: needs.changes.outputs.code != 'false'
+        with:
+          name: releases
+
       - name: Mixed releases (a second nerva, another release string)
         if: needs.changes.outputs.code != 'false'
         run: ./zig/zig build test:release
 
+      - uses: ./.github/actions/zig-cache-save
+        if: needs.changes.outputs.code != 'false'
+        with:
+          name: releases
+
   # Every release target compiles (#276). release.yml cross-compiles all four from Linux, so a
   # change that only builds on Linux (a `std.os.linux` call, a Linux-only flag) must fail here, not
-  # when a release is cut. This only builds; the binaries are not run.
+  # when a release is cut. A pull request type-checks each target with `zig build check
+  # -Dtarget=T` (a Debug build of the same `nerva` executable from src/nerva_main.zig, so it
+  # analyses the same code the release build reaches; it is the step that finds #276's error on
+  # both macOS targets, and takes about 1.5 minutes a target cold, against about 4 for ReleaseSafe).
+  # A push to main, and a release's call of this workflow, then build all four with `-Drelease`, as
+  # release.yml builds them. Nothing is run. The cache is saved after the type-check only, so it
+  # holds Debug artifacts and stays small.
   targets:
     needs: changes
     if: ${{ !cancelled() }}
@@ -272,8 +332,26 @@ jobs:
         if: needs.changes.outputs.code != 'false'
         run: eval "$INSTALL_ZIG"
 
-      - name: Cross-compile every release target (as release.yml builds them)
+      # Zig's build cache: restored everywhere, saved by the last step on a push to main only.
+      - uses: ./.github/actions/zig-cache
         if: needs.changes.outputs.code != 'false'
+        with:
+          name: targets
+
+      - name: Type-check every release target (zig build check)
+        if: needs.changes.outputs.code != 'false'
+        run: |
+          for target in x86_64-linux aarch64-linux x86_64-macos aarch64-macos; do
+            ./zig/zig build check -Dtarget="$target"
+          done
+
+      - uses: ./.github/actions/zig-cache-save
+        if: needs.changes.outputs.code != 'false'
+        with:
+          name: targets
+
+      - name: Cross-compile every release target (as release.yml builds them)
+        if: needs.changes.outputs.code != 'false' && github.event_name != 'pull_request'
         run: |
           for target in x86_64-linux aarch64-linux x86_64-macos aarch64-macos; do
             ./zig/zig build -Drelease -Dtarget="$target"
@@ -325,12 +403,23 @@ jobs:
         if: needs.changes.outputs.code != 'false'
         run: eval "$INSTALL_ZIG"
 
+      # Zig's build cache: restored everywhere, saved by the last step on a push to main only.
+      - uses: ./.github/actions/zig-cache
+        if: needs.changes.outputs.code != 'false'
+        with:
+          name: unit
+
       # `benchmark.perf: usage example` skips itself where perf_event_open is denied, as on
       # GitHub's runners and Botpike's (jobs run as a user, perf_event_paranoid 2); it fails only
       # where it is allowed without hardware counters (UPSTREAM.md).
       - name: Unit tests
         if: needs.changes.outputs.code != 'false'
         run: ./zig/zig build test:unit
+
+      - uses: ./.github/actions/zig-cache-save
+        if: needs.changes.outputs.code != 'false'
+        with:
+          name: unit
 
   # Every fuzzer, vendored and Nerva's own, at its smoke size and seed (N46, N53), so a fuzzer that
   # stops working fails here; a job of its own, so it does not lengthen the unit tests'.
@@ -359,9 +448,20 @@ jobs:
         if: needs.changes.outputs.code != 'false'
         run: eval "$INSTALL_ZIG"
 
+      # Zig's build cache: restored everywhere, saved by the last step on a push to main only.
+      - uses: ./.github/actions/zig-cache
+        if: needs.changes.outputs.code != 'false'
+        with:
+          name: fuzz
+
       - name: Fuzzers (smoke)
         if: needs.changes.outputs.code != 'false'
         run: ./zig/zig build fuzz -- smoke
+
+      - uses: ./.github/actions/zig-cache-save
+        if: needs.changes.outputs.code != 'false'
+        with:
+          name: fuzz
 
   # The demos, three replicas and all, while processes are crashed and restarted: each demo on its
   # own Machine, run exactly as `zig build -Drelease test:demo -- --seconds=75` runs it.
@@ -402,6 +502,12 @@ jobs:
         if: needs.changes.outputs.code != 'false'
         run: eval "$INSTALL_ZIG"
 
+      # Zig's build cache: restored everywhere, saved by the last step on a push to main only.
+      - uses: ./.github/actions/zig-cache
+        if: needs.changes.outputs.code != 'false'
+        with:
+          name: demo
+
       - name: Build (release)
         if: needs.changes.outputs.code != 'false'
         run: ./zig/zig build -Drelease
@@ -409,6 +515,11 @@ jobs:
       - name: ${{ matrix.demo }} under crashes
         if: needs.changes.outputs.code != 'false'
         run: python3 tests/demo/${{ matrix.demo }} zig-out/bin/nerva --seconds=75
+
+      - uses: ./.github/actions/zig-cache-save
+        if: needs.changes.outputs.code != 'false'
+        with:
+          name: demo
 
   # R5's demo (docs/demos/r5.md): three replicas, one lost and recovered while writes go on, a
   # backup, a restore drill, a wipe and a restore. Exactly what `./zig/zig build -Drelease demo-r5`
@@ -436,9 +547,20 @@ jobs:
         if: needs.changes.outputs.code != 'false'
         run: eval "$INSTALL_ZIG"
 
+      # Zig's build cache: restored everywhere, saved by the last step on a push to main only.
+      - uses: ./.github/actions/zig-cache
+        if: needs.changes.outputs.code != 'false'
+        with:
+          name: demo_r5
+
       - name: demo-r5 (release)
         if: needs.changes.outputs.code != 'false'
         run: ./zig/zig build -Drelease demo-r5
+
+      - uses: ./.github/actions/zig-cache-save
+        if: needs.changes.outputs.code != 'false'
+        with:
+          name: demo_r5
 
   # R4's demo (docs/demos/r4.md): two clients, each with its own gateway on one three-replica
   # cluster: busy refusals and their metrics, a killed gateway, a stalled cluster, keyed resends.
@@ -467,9 +589,20 @@ jobs:
         if: needs.changes.outputs.code != 'false'
         run: eval "$INSTALL_ZIG"
 
+      # Zig's build cache: restored everywhere, saved by the last step on a push to main only.
+      - uses: ./.github/actions/zig-cache
+        if: needs.changes.outputs.code != 'false'
+        with:
+          name: demo_r4
+
       - name: demo-r4 (release)
         if: needs.changes.outputs.code != 'false'
         run: ./zig/zig build -Drelease demo-r4
+
+      - uses: ./.github/actions/zig-cache-save
+        if: needs.changes.outputs.code != 'false'
+        with:
+          name: demo_r4
 
   # Pull requests: the fixed seeds and one random seed, in Debug. Everything else (pushes to main,
   # the release's run, a dispatch) runs `vopr_main` instead (N74).
@@ -500,6 +633,12 @@ jobs:
         if: needs.changes.outputs.code != 'false'
         run: eval "$INSTALL_ZIG"
 
+      # Zig's build cache: restored everywhere, saved by the last step on a push to main only.
+      - uses: ./.github/actions/zig-cache
+        if: needs.changes.outputs.code != 'false'
+        with:
+          name: vopr
+
       # A failure replays exactly with `./zig/zig build vopr -- <seed>`.
       - name: VOPR
         if: needs.changes.outputs.code != 'false'
@@ -509,6 +648,11 @@ jobs:
           echo "VOPR seed: $seed"
           echo "### VOPR seed \`$seed\`" >> "$GITHUB_STEP_SUMMARY"
           ./zig/zig build vopr -- "$seed"
+
+      - uses: ./.github/actions/zig-cache-save
+        if: needs.changes.outputs.code != 'false'
+        with:
+          name: vopr
   # Main, in ReleaseSafe, which runs a seed 10 to 40 times faster than Debug (N74): the fixed seeds,
   # then four lanes that each search fresh random seeds for 6 minutes (fuzz_loop.sh, as the long
   # fuzzing does, N59), about 300 seeds a push. A failing seed stops its lane and prints the
@@ -541,6 +685,12 @@ jobs:
         if: needs.changes.outputs.code != 'false'
         run: eval "$INSTALL_ZIG"
 
+      # Zig's build cache: restored everywhere, saved by the last step on a push to main only.
+      - uses: ./.github/actions/zig-cache
+        if: needs.changes.outputs.code != 'false'
+        with:
+          name: vopr_main
+
       # A failure replays exactly with `./zig/zig build -Drelease vopr -- <seed>`.
       - name: VOPR seeds 1, 2 and 5 (ReleaseSafe)
         if: needs.changes.outputs.code != 'false' && (matrix.lane == 'fixed')
@@ -554,3 +704,8 @@ jobs:
       - name: VOPR on random seeds (ReleaseSafe, 6 minutes)
         if: needs.changes.outputs.code != 'false' && (matrix.lane != 'fixed')
         run: .github/scripts/fuzz_loop.sh vopr nerva 6
+
+      - uses: ./.github/actions/zig-cache-save
+        if: needs.changes.outputs.code != 'false'
+        with:
+          name: vopr_main

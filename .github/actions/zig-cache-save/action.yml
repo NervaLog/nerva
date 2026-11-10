@@ -1,0 +1,28 @@
+name: Save Zig's build cache
+description: >
+  The last step of a job that used ./.github/actions/zig-cache: saves the cache, with the same
+  key, only on a push to main (a release's call of ci.yml is one) and only if the job so far
+  succeeded. A pull request, from a fork or not, never saves.
+inputs:
+  name:
+    description: The same name the job gave ./.github/actions/zig-cache.
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Prune and size what is saved
+      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      shell: bash
+      run: |
+        # What tests and demos write under .zig-cache is the state of one run, never saved.
+        rm -rf .zig-cache/tmp
+        echo "zig-cache: saving $(du -sm ~/.cache/zig .zig-cache | tr '\n' ' ') (MB)"
+
+    - name: Save ~/.cache/zig and .zig-cache
+      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      uses: actions/cache/save@v4
+      with:
+        path: |
+          ~/.cache/zig
+          .zig-cache
+        key: zig-v1-${{ inputs.name }}-${{ runner.os }}-${{ hashFiles('zig/download.sh') }}-${{ hashFiles('build.zig', 'src/**') }}
