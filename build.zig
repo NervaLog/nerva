@@ -150,6 +150,11 @@ pub fn build(b: *std.Build) !void {
             "off: a test `nerva` that commits a resent key again; it starts only with " ++
                 "--development (R1)",
         ) orelse .on,
+        .version = b.option(
+            []const u8,
+            "version",
+            "The release `nerva version` names (default: VERSION's contents).",
+        ) orelse version_file(b),
         .print_exe = b.option(
             bool,
             "print-exe",
@@ -203,6 +208,7 @@ pub fn build(b: *std.Build) !void {
         .vsr_options = vsr_options,
         .target = target,
         .mode = mode,
+        .version = options.version,
         .commit_keys_deduplicate = options.test_commit_keys == .on,
     });
     b.installArtifact(nerva);
@@ -213,6 +219,7 @@ pub fn build(b: *std.Build) !void {
         .vsr_options = vsr_options,
         .target = target,
         .mode = mode,
+        .version = options.version,
         .commit_keys_deduplicate = false,
     });
     const nerva_run = b.addRunArtifact(nerva);
@@ -220,6 +227,7 @@ pub fn build(b: *std.Build) !void {
     steps.run.dependOn(&nerva_run.step);
     steps.check.dependOn(&nerva.step);
     steps.check.dependOn(&nerva_keys_off.step);
+    add_mac_release(b, steps.check, stdx_module, vsr_options, options.version);
 
     // zig build test:unit
     const stdx_unit_tests = b.addTest(.{
@@ -431,6 +439,7 @@ pub fn build(b: *std.Build) !void {
         .vsr_options = vsr_options_other,
         .target = target,
         .mode = mode,
+        .version = options.version,
     });
     // `origins.py` also runs a client of the oldest release this build accepts: the same code
     // under `release_client_min` (P90).
@@ -444,6 +453,7 @@ pub fn build(b: *std.Build) !void {
         .vsr_options = vsr_options_client,
         .target = target,
         .mode = mode,
+        .version = options.version,
     });
     // Then an upgrade: an export from `nerva`, imported by the other release (N80), without
     // records (export version 1) and with them (version 2, P123b); then replicas imported from
@@ -569,6 +579,7 @@ fn nerva_executable(b: *std.Build, options: struct {
     vsr_options: *std.Build.Step.Options,
     target: std.Build.ResolvedTarget,
     mode: std.builtin.OptimizeMode,
+    version: []const u8,
     commit_keys_deduplicate: bool = true,
 }) *std.Build.Step.Compile {
     const nerva = b.addExecutable(.{
@@ -588,6 +599,7 @@ fn nerva_executable(b: *std.Build, options: struct {
     // Only this binary's `start` can turn commit-key deduplication off (R1).
     const nerva_options = b.addOptions();
     nerva_options.addOption(bool, "commit_keys_deduplicate", options.commit_keys_deduplicate);
+    nerva_options.addOption([]const u8, "version", options.version);
     nerva.root_module.addOptions("nerva_options", nerva_options);
     // Keep stack traces in release builds.
     nerva.root_module.omit_frame_pointer = false;
@@ -611,6 +623,82 @@ fn vsr_module(b: *std.Build, options: struct {
     module.addOptions("vsr_options", options.vsr_options);
     module.addOptions("test_options", options.test_options);
     return module;
+}
+
+/// `VERSION`'s contents: what `nerva version` names as the release (v0.7.1, P284).
+fn version_file(b: *std.Build) []const u8 {
+    const text = b.build_root.handle.readFileAlloc(b.allocator, "VERSION", 64) catch
+        @panic("cannot read VERSION; pass -Dversion");
+    return std.mem.trim(u8, text, " \r\n");
+}
+
+/// `zig build mac-release` (v0.7.1, P284): the universal macOS binary, signed, zipped and
+/// optionally notarized, and the Homebrew formula; see src/nerva/mac_release.zig. Run on a Mac,
+/// by the owner; `-Dsign-identity=-` signs ad hoc, as CI does. Nothing is compiled or signed
+/// before its `preflight` run has checked the tree, the tag, the identity and the notary profile.
+fn add_mac_release(
+    b: *std.Build,
+    check: *std.Build.Step,
+    stdx_module: *std.Build.Module,
+    vsr_options: *std.Build.Step.Options,
+    version: []const u8,
+) void {
+    const mac_release = @import("src/nerva/mac_release.zig");
+    const identity = b.option(
+        []const u8,
+        "sign-identity",
+        "mac-release: the codesign identity (- is ad hoc); default " ++ mac_release.default_identity,
+    ) orelse mac_release.default_identity;
+    const profile = b.option(
+        []const u8,
+        "notary-profile",
+        "mac-release: the notarytool keychain profile; default " ++ mac_release.default_profile,
+    ) orelse mac_release.default_profile;
+    const notarize = b.option(
+        bool,
+        "notarize",
+        "mac-release: submit the zip to Apple's notary service and wait",
+    ) orelse false;
+
+    const tool = b.addExecutable(.{
+        .name = "mac_release",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/nerva/mac_release.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
+    });
+    check.dependOn(&tool.step);
+
+    const preflight = b.addRunArtifact(tool);
+    preflight.setCwd(b.path("."));
+    preflight.addArgs(&.{ "preflight", "--version", version });
+    preflight.addArgs(&.{ "--identity", identity, "--profile", profile });
+    preflight.has_side_effects = true;
+
+    const package = b.addRunArtifact(tool);
+    package.setCwd(b.path("."));
+    package.addArgs(&.{ "package", "--version", version });
+    package.addArgs(&.{ "--identity", identity, "--profile", profile });
+    if (notarize) package.addArg("--notarize");
+    package.has_side_effects = true;
+    inline for (.{ "aarch64-macos", "x86_64-macos" }) |triple| {
+        const thin = nerva_executable(b, .{
+            .stdx_module = stdx_module,
+            .vsr_options = vsr_options,
+            .target = resolve_target(b, triple) catch unreachable,
+            .mode = .ReleaseSafe,
+            .version = version,
+        });
+        thin.step.dependOn(&preflight.step);
+        package.addArg(if (comptime std.mem.startsWith(u8, triple, "aarch64"))
+            "--arm64"
+        else
+            "--x86_64");
+        package.addArtifactArg(thin);
+    }
+    const step = b.step("mac-release", "Sign, zip and optionally notarize the universal macOS nerva");
+    step.dependOn(&package.step);
 }
 
 /// The current commit, or all zeros before the first commit / outside a git checkout.

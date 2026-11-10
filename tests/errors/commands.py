@@ -32,6 +32,11 @@ KEY = "errors-test-key"
 # derivations or `format_epoch` (src/nerva/format_digest.zig), and only then. Update it with the decision that
 # says what changed (docs/decisions/), beside `format_test.zig`'s snapshot.
 FORMAT_DIGEST = "a2d6e50b122836b2b596f8548a391e77c3b2beead93ee5e30939479601259362"
+# The last line of `version` names the release, read from `VERSION` at build time (v0.7.1, P284).
+# The format digest does not include it: two builds of one commit under different `VERSION`s are
+# one protocol.
+with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "VERSION")) as f:
+    RELEASE_VERSION = f.read().strip()
 VERSION_FIRST = re.compile(r"Nerva version (\d+\.\d+\.\d+)(\+[0-9a-f]{7})?(\+keys-off)?")
 RAW_NAME = re.compile(r"\berror\.[A-Z][A-Za-z0-9]+")
 LOG_LINE = re.compile(r"\d{4}-\d\d-\d\d ")
@@ -252,13 +257,14 @@ def main():
                 "release_client_min 0.0.4",
                 "format " + FORMAT_DIGEST,
                 "bundles none",
+                "version " + RELEASE_VERSION,
             ], binary_run.stdout
         verbose = run(nerva, ["version", "--verbose"])
         assert verbose.returncode == 0, verbose.stderr
         lines = verbose.stdout.splitlines()
-        assert lines[:5] == version.stdout.splitlines(), verbose.stdout
-        assert lines[5:7] == ["format_epoch 1", "superblock_version 2"], verbose.stdout
-        assert re.fullmatch(r"commit ([0-9a-f]{40}|none)", lines[7]) and len(lines) == 8, \
+        assert lines[:6] == version.stdout.splitlines(), verbose.stdout
+        assert lines[6:8] == ["format_epoch 1", "superblock_version 2"], verbose.stdout
+        assert re.fullmatch(r"commit ([0-9a-f]{40}|none)", lines[8]) and len(lines) == 9, \
             verbose.stdout
         before = sha(data)
         check("start keys off without development",
