@@ -1,0 +1,39 @@
+# Part of Nerva (https://github.com/NervaLog/nerva): shipped by the tarball's install.sh and by
+# the nerva packages, byte for byte. Change it with a drop-in (systemctl edit nerva@0), not here.
+#
+# One replica per instance: nerva@0 reads /etc/nerva/replica-0.env (see replica.env.example).
+# Format its data file first, as the nerva user (docs/QUICKSTART.md). Nothing here formats,
+# enables or starts a replica for you.
+[Unit]
+Description=Nerva replica %i
+Documentation=https://github.com/NervaLog/nerva
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=nerva
+Group=nerva
+EnvironmentFile=/etc/nerva/replica-%i.env
+# `nerva` is found on systemd's executable path: /usr/local/bin for the tarball, /usr/bin for the
+# packages. $NERVA_FLAGS splits on spaces; ${NERVA_ADDRESSES} and ${NERVA_DATA_FILE} do not.
+ExecStart=nerva start --addresses=${NERVA_ADDRESSES} $NERVA_FLAGS ${NERVA_DATA_FILE}
+Restart=on-failure
+RestartSec=1
+# A restart cannot fix these `nerva start` exits (docs/ERRORS.md): 1 a flag or a data file,
+# 2 the disk or the kernel, 3 to 6 the data file's limits, 7 a bug (NRV-B0003), 8 a data file
+# imported from another export (NRV-E0711). A crash (a signal) or any other exit restarts.
+RestartPreventExitStatus=1 2 3 4 5 6 7 8
+LimitMEMLOCK=infinity
+LimitNOFILE=65536
+TimeoutStopSec=30
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/nerva
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,38 @@
+# Part of Nerva (https://github.com/NervaLog/nerva): shipped by the tarball's install.sh and by
+# the nerva packages, byte for byte. Change it with a drop-in (systemctl edit nerva-api@0), not here.
+#
+# One gateway per instance: nerva-api@0 reads /etc/nerva/api-0.env (see api.env.example). It
+# listens on loopback unless the env file says otherwise (and adds --listen-remote to NERVA_FLAGS).
+[Unit]
+Description=Nerva gateway %i
+Documentation=https://github.com/NervaLog/nerva
+After=network-online.target
+StartLimitIntervalSec=10
+StartLimitBurst=5
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=nerva
+Group=nerva
+EnvironmentFile=/etc/nerva/api-%i.env
+ExecStart=nerva api --cluster=${NERVA_CLUSTER} --addresses=${NERVA_ADDRESSES} --listen=${NERVA_LISTEN} $NERVA_FLAGS
+Restart=on-failure
+RestartSec=1
+# Exit 1 is not listed: it is a bad flag or key, and also NRV-E0604 (no reply from the cluster
+# within 30 s), which a gateway that starts before a quorum must outlive, so a restart is the cure.
+# The two cannot be told apart by status. A bad flag exits at once, and the start limit (5 starts
+# in 10 s, the default, set below) stops it after a few tries; a gateway that waits 30 s for a
+# cluster never reaches it. Exit 2 (the environment: the kernel, a resource) a restart cannot fix.
+RestartPreventExitStatus=2
+LimitNOFILE=65536
+TimeoutStopSec=30
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,99 @@
+# Linux packaging (v0.7.1, slice 4; docs/briefs/v0.7.1.md): the release tarball's install.sh and
+# the two systemd units, proved on a real systemd. Slice 5 adds its package jobs to this file.
+#
+# It runs on every push to main (so on the release commit), and on a pull request that changes
+# packaging, the code whose output or exit statuses the installer and units rely on
+# (src/nerva_main.zig, src/nerva/diagnostic.zig) or VERSION (a draft's run waits until the pull
+# request is marked ready). Every job runs on GitHub's hosted runners, as ci.yml's do (P147e): a
+# test that installs a service and starts replicas as root needs a machine of its own, and a fork's
+# pull request must never run on a self-hosted one. The pinned toolchain comes from Actions' cache,
+# installed as ci.yml installs it. This workflow is not a required check: a pull request that
+# touches none of those paths never starts it.
+name: Packages
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - 'packaging/**'
+      - 'tests/packaging/**'
+      - '.github/workflows/packages.yml'
+      - 'src/nerva_main.zig'
+      - 'src/nerva/diagnostic.zig'
+      - 'VERSION'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: packages-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Installs the Zig pinned by zig/download.sh. Checkout removes ./zig's toolchain, so it is kept
+  # on the Machine's volume, under the cache directory, keyed by download.sh's hash (which holds
+  # the version and checksums), and linked back in; Zig finds its lib next to the real binary.
+  # A copy is used only if complete (written aside, then renamed) and it runs; otherwise it is
+  # replaced by a fresh download. download.sh then checks the version, as before. First, a disk
+  # left too full by earlier jobs on the volume is freed (free_disk.sh, N65).
+  INSTALL_ZIG: |
+    set -eu
+    .github/scripts/free_disk.sh
+    cache="${XDG_CACHE_HOME:-$HOME/.cache}/nerva-toolchain"
+    toolchain="$cache/zig-$(sha256sum zig/download.sh | cut -c1-16)"
+    if [ -x "$toolchain/zig" ] && [ -f "$toolchain/lib/std/std.zig" ]; then
+      rm -rf zig/zig zig/lib
+      ln -s "$toolchain/zig" zig/zig
+      ln -s "$toolchain/lib" zig/lib
+    fi
+    if ! ./zig/zig env > /dev/null 2>&1 || [ ! -f zig/lib/std/std.zig ]; then
+      rm -rf zig/zig zig/lib
+      ./zig/download.sh
+      mkdir -p "$cache"
+      rm -rf "$toolchain" "$toolchain.partial"
+      mkdir "$toolchain.partial"
+      cp -a zig/zig zig/lib "$toolchain.partial/"
+      mv "$toolchain.partial" "$toolchain"
+    fi
+    echo "Zig $(./zig/zig version) from $(readlink -f zig/zig)"
+    ./zig/download.sh
+
+jobs:
+
+  # The tarball's install.sh and units, under systemd as root on the runner (tests/packaging/
+  # install.py): install, idempotence, every NRV-E11xx, three replicas and a gateway, a SIGKILL,
+  # a replica that exits 8, uninstall. It changes /usr/local/bin, /etc and /var/lib: the runner is
+  # thrown away after the job.
+  tarball:
+    name: tarball installs
+    # A draft pull request waits for ready_for_review; every other event runs.
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/nerva-toolchain
+          key: nerva-toolchain-${{ runner.os }}-${{ hashFiles('zig/download.sh') }}
+
+      - name: Install the pinned Zig
+        run: eval "$INSTALL_ZIG"
+
+      - name: Build nerva (the release build the tarball carries)
+        run: ./zig/zig build -Drelease
+
+      - name: The runner boots with systemd
+        run: |
+          systemd-analyze --version | head -n1
+          test -d /run/systemd/system
+
+      - name: Install and run (tests/packaging/install.py)
+        run: sudo python3 -I tests/packaging/install.py zig-out/bin/nerva packaging/linux
