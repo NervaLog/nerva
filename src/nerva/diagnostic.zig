@@ -16,6 +16,7 @@
 //! `bug[NRV-B0004]`, and its name appears only on a `detail` line under `--log-debug`.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const assert = std.debug.assert;
 
 pub const exit_operator: u8 = 1;
@@ -208,8 +209,17 @@ fn cleanup_signals_restore() void {
 
 fn cleanup_signal_mask() std.posix.sigset_t {
     var mask = std.posix.empty_sigset;
-    for (cleanup_signals) |signal| std.os.linux.sigaddset(&mask, signal);
+    for (cleanup_signals) |signal| sigaddset(&mask, signal);
     return mask;
+}
+
+/// `std.posix` has no `sigaddset`: Linux's sigset is a bit array, macOS's a `u32`, each with its own.
+fn sigaddset(mask: *std.posix.sigset_t, signal: u6) void {
+    if (builtin.os.tag == .linux) {
+        std.os.linux.sigaddset(mask, signal);
+    } else {
+        std.c.sigaddset(mask, @intCast(signal));
+    }
 }
 
 /// Async-signal-safe: system calls on the fixed buffer only, no allocation, no logging, no error
@@ -220,12 +230,15 @@ fn cleanup_unlink_raw() bool {
     if (length == 0) return false;
     const path: [*:0]const u8 = @ptrCast(&cleanup_path_buffer);
     assert(cleanup_path_buffer[length] == 0);
-    var stat: std.os.linux.Stat = undefined;
-    const AT = std.os.linux.AT;
-    const stat_result = std.os.linux.fstatat(AT.FDCWD, path, &stat, AT.SYMLINK_NOFOLLOW);
-    if (std.os.linux.E.init(stat_result) != .SUCCESS) return false;
+    // The raw system calls, not `std.posix.fstatatZ`: those turn some errnos into `unreachable`
+    // or a stack trace, which a signal handler must not reach. `system` is the Linux system call
+    // layer on Linux and libc on macOS, and `errno` reads either result.
+    var stat: std.posix.Stat = undefined;
+    const AT = std.posix.AT;
+    const stat_result = std.posix.system.fstatat(AT.FDCWD, path, &stat, AT.SYMLINK_NOFOLLOW);
+    if (std.posix.errno(stat_result) != .SUCCESS) return false;
     if (stat.ino != cleanup_inode or stat.dev != cleanup_device) return false;
-    return std.os.linux.E.init(std.os.linux.unlink(path)) == .SUCCESS;
+    return std.posix.errno(std.posix.system.unlink(path)) == .SUCCESS;
 }
 
 /// SIGINT or SIGTERM while the trace file is registered (P208): remove it, then die of the same
@@ -672,7 +685,7 @@ fn cleanup_child_prepare() void {
     const signals = [_]u6{ std.posix.SIG.INT, std.posix.SIG.TERM };
     for (signals) |signal| {
         std.posix.sigaction(signal, &default, null);
-        std.os.linux.sigaddset(&mask, signal);
+        sigaddset(&mask, signal);
     }
     std.posix.sigprocmask(std.posix.SIG.UNBLOCK, &mask, null);
     const null_fd = std.posix.open("/dev/null", .{ .ACCMODE = .WRONLY }, 0) catch std.posix.exit(3);

@@ -245,12 +245,46 @@ jobs:
         if: needs.changes.outputs.code != 'false'
         run: ./zig/zig build test:release
 
+  # Every release target compiles (#276). release.yml cross-compiles all four from Linux, so a
+  # change that only builds on Linux (a `std.os.linux` call, a Linux-only flag) must fail here, not
+  # when a release is cut. This only builds; the binaries are not run.
+  targets:
+    needs: changes
+    if: ${{ !cancelled() }}
+    name: release targets
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        if: needs.changes.outputs.code != 'false'
+        with:
+          persist-credentials: false
+
+      # GitHub's runners start empty: the pinned toolchain is restored from Actions' cache, keyed by
+      # download.sh's hash, where INSTALL_ZIG looks for it (P147e).
+      - uses: actions/cache@v4
+        if: needs.changes.outputs.code != 'false'
+        with:
+          path: ~/.cache/nerva-toolchain
+          key: nerva-toolchain-${{ runner.os }}-${{ hashFiles('zig/download.sh') }}
+
+      - name: Install the pinned Zig
+        if: needs.changes.outputs.code != 'false'
+        run: eval "$INSTALL_ZIG"
+
+      - name: Cross-compile every release target (as release.yml builds them)
+        if: needs.changes.outputs.code != 'false'
+        run: |
+          for target in x86_64-linux aarch64-linux x86_64-macos aarch64-macos; do
+            ./zig/zig build -Drelease -Dtarget="$target"
+          done
+
   # The required check's name (the ruleset cannot change here). It passes only if every split job
   # above succeeded: `always()` so that a failed, cancelled or skipped one still runs this job and
   # fails it, instead of leaving it skipped (which a ruleset may count as passing). A docs-only
   # pull request: each split job runs and skips its steps, so each is `success`, and so is this.
   system:
-    needs: [checks, integration, api, releases]
+    needs: [checks, integration, api, releases, targets]
     if: ${{ always() }}
     name: check, integration, API, views
     runs-on: ubuntu-24.04
