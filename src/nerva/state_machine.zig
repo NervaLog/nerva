@@ -3559,8 +3559,9 @@ pub fn StateMachineType(comptime Storage: type) type {
         fn transaction_writes_nothing(self: *StateMachine, entries: []const WideEntry) bool {
             if (!self.commit_keys_deduplicate) return false;
             if (entries.len == 0 or entries[0].kind != .key) return false;
-            // An invalid key entry is reported by the static checks (as `commit_key_failure`).
-            if (nerva.wide_entry_validate(&entries[0]) != null) return false;
+            // Validity is not checked here, so that admission, the extreme scans and the VOPR
+            // model (`views_admit`) agree: an invalid key entry whose row exists writes nothing
+            // either way, because it is refused regardless (#267).
             return self.forest.grooves.rows.get(commit_key_row(&entries[0])) == .found_object;
         }
 
