@@ -25,143 +25,20 @@ const indexes = @import("indexes.zig");
 const documents = @import("documents.zig");
 const catalog = @import("catalog.zig");
 const export_file = @import("export_file.zig");
-
-/// The size, and each field's offset (or bit, for a packed struct), size and type, of a struct;
-/// or the tag type and every value of an enum.
-fn layout_render(writer: anytype, comptime T: type) !void {
-    switch (@typeInfo(T)) {
-        .@"struct" => |info| {
-            try writer.print("{s}: {s} struct, size {}\n", .{
-                @typeName(T),
-                @tagName(info.layout),
-                @sizeOf(T),
-            });
-            inline for (info.fields) |field| {
-                if (info.layout == .@"packed") {
-                    try writer.print("  {s}: bit {}, {} bits, {s}\n", .{
-                        field.name,
-                        @bitOffsetOf(T, field.name),
-                        @bitSizeOf(field.type),
-                        @typeName(field.type),
-                    });
-                } else {
-                    try writer.print("  {s}: offset {}, size {}, {s}\n", .{
-                        field.name,
-                        @offsetOf(T, field.name),
-                        @sizeOf(field.type),
-                        @typeName(field.type),
-                    });
-                }
-            }
-        },
-        .@"enum" => |info| {
-            try writer.print("{s}: enum({s}){s}\n", .{
-                @typeName(T),
-                @typeName(info.tag_type),
-                if (info.is_exhaustive) "" else ", non-exhaustive",
-            });
-            inline for (info.fields) |field| {
-                try writer.print("  {s} = {}\n", .{ field.name, field.value });
-            }
-        },
-        else => @compileError("not a struct or an enum: " ++ @typeName(T)),
-    }
-}
+const format_digest = @import("format_digest.zig");
 
 test "format: wire and storage layouts" {
     var out = std.ArrayList(u8).init(testing.allocator);
     defer out.deinit();
     const writer = out.writer();
 
-    inline for (.{
-        nerva.Row,
-        @FieldType(nerva.Row, "flags"),
-        nerva.Entry,
-        nerva.EntryKind,
-        nerva.EntryResult,
-        nerva.EntryStatus,
-        nerva.Add,
-        @FieldType(nerva.Add, "flags"),
-        nerva.Add.AddField,
-        nerva.RowKey,
-        nerva.RowValue,
-        @FieldType(nerva.RowValue, "flags"),
-        nerva.Change,
-        @FieldType(nerva.Change, "flags"),
-        nerva.ChangeKind,
-        nerva.ChangesFilter,
-        nerva.HistoryFilter,
-        nerva.Operation,
-        documents.Header,
-        documents.Header.Flags,
-        // Views maintained by the state machine (N52): stored in the views and groups trees, and
-        // declared and read over the wire.
-        nerva.FieldKind,
-        nerva.FieldRef,
-        nerva.Comparison,
-        nerva.AggregateFunction,
-        nerva.Where,
-        nerva.AggregateRef,
-        nerva.ViewDefinition,
-        nerva.DeclareStatus,
-        nerva.DeclareResult,
-        nerva.ViewState,
-        nerva.View,
-        nerva.Group,
-        nerva.ViewQuery,
-        nerva.ViewRecord,
-        nerva.ViewRecord.Kind,
-        nerva.ViewRecord.Flags,
-        // min, max and as_of (N62): the members, group versions and view versions trees.
-        nerva.Member,
-        nerva.Member.Flags,
-        nerva.GroupVersion,
-        nerva.ViewVersion,
-        // Ledgers (N75): declared over the wire and stored in the ledgers tree.
-        nerva.LedgerField,
-        nerva.LedgerField.Flags,
-        nerva.LedgerDefinition,
-        nerva.DeclareLedgerStatus,
-        nerva.DeclareLedgerResult,
-        nerva.LedgerQuery,
-        nerva.Ledger,
-        // Commit keys (P123): a key's row value in `table_commit_keys`.
-        nerva.CommitKey,
-        // Records (P123b): `commit_wide`'s entries, stored records and their changes, and
-        // the lookups and history over them.
-        nerva.WideEntry,
-        nerva.Record,
-        nerva.RecordKey,
-        nerva.RecordValue,
-        @FieldType(nerva.RecordValue, "flags"),
-        nerva.RecordChange,
-        nerva.RecordHistoryFilter,
-        // Declared indexes (P123c): declared and queried over the wire, stored in the indexes
-        // and index entries trees.
-        nerva.IndexDefinition,
-        @FieldType(nerva.IndexDefinition, "flags"),
-        nerva.DeclareIndexStatus,
-        nerva.DeclareIndexResult,
-        nerva.IndexState,
-        nerva.Index,
-        nerva.IndexEntry,
-        @FieldType(nerva.IndexEntry, "flags"),
-        nerva.IndexQuery,
-        @FieldType(nerva.IndexQuery, "flags"),
-        nerva.IndexRecord,
-        nerva.IndexRecord.Kind,
-        @FieldType(nerva.IndexRecord, "flags"),
-        nerva.IndexGet,
-    }) |T| try layout_render(writer, T);
-
-    // Tree ids name the LSM trees in the data file: never renumber them (CLAUDE.md).
-    try writer.writeAll("tree_ids:\n");
-    inline for (comptime std.meta.declarations(nerva.tree_ids)) |groove| {
-        const ids = @field(nerva.tree_ids, groove.name);
-        inline for (comptime std.meta.fieldNames(@TypeOf(ids))) |tree| {
-            try writer.print("  {s}.{s} = {}\n", .{ groove.name, tree, @field(ids, tree) });
-        }
-    }
+    try format_digest.render(writer, format_digest.layout_types, format_digest.build_inputs);
+    // The digest follows the layouts (P259b): a change to either fails this test. Updating the
+    // snapshot needs a decision (docs/decisions/) that says what changed and whether
+    // `format_digest.format_epoch` moves with it.
+    const digest = format_digest.digest_text(out.items);
+    try testing.expectEqual(format_digest.format_digest, digest);
+    try writer.print("format_digest: {s}\n", .{format_digest.hex(&digest)});
 
     try snap(@src(),
         \\nerva.Row: extern struct, size 128
@@ -665,6 +542,27 @@ test "format: wire and storage layouts" {
         \\  IndexEntry.timestamp = 24
         \\  IndexEntry.key = 25
         \\  IndexEntry.order = 26
+        \\cluster:
+        \\  cache_line_size = 64
+        \\  clients_max = 7
+        \\  pipeline_prepare_queue_max = 4
+        \\  view_change_headers_suffix_max = 5
+        \\  quorum_replication_max = 3
+        \\  journal_slot_count = 32
+        \\  message_size_max = 4096
+        \\  superblock_copies = 4
+        \\  block_size = 4096
+        \\  lsm_levels = 7
+        \\  lsm_growth_factor = 4
+        \\  lsm_compaction_ops = 4
+        \\  lsm_snapshots_max = 32
+        \\  lsm_manifest_compact_extra_blocks = 5
+        \\  lsm_table_coalescing_threshold_percent = 50
+        \\  vsr_releases_max = 64
+        \\  lsm_scans_max = 12
+        \\superblock_version: 2
+        \\format_epoch: 1
+        \\format_digest: 9eaeb1c8f45cd307d6bfe86f045995125300199c5ff386877c3134719985234f
         \\
     ).diff(out.items);
 }

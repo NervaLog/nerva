@@ -18,6 +18,23 @@ const release = "0.0.6";
 const release_client_min = "0.0.4";
 // Only `zig build test:release` builds this release, to run a cluster of two releases (N61).
 const release_test_other = "0.0.200";
+// The one past release a binary bundles, so that a cluster can move from it to `release` one
+// replica at a time (R6, P259). None until the packer exists (R6 slice 3). A release that rolls
+// keeps `release_client_min` at or below the bundled release, so that the past release's clients
+// stay valid after the switch.
+const release_bundled: ?[]const u8 = null;
+
+comptime {
+    @setEvalBranchQuota(10_000);
+    const current = std.SemanticVersion.parse(release) catch unreachable;
+    const client_min = std.SemanticVersion.parse(release_client_min) catch unreachable;
+    assert(client_min.order(current) != .gt);
+    if (release_bundled) |bundled_text| {
+        const bundled = std.SemanticVersion.parse(bundled_text) catch unreachable;
+        assert(bundled.order(current) == .lt);
+        assert(client_min.order(bundled) != .gt);
+    }
+}
 
 const zig_version = std.SemanticVersion{
     .major = 0,

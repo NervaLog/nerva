@@ -25,6 +25,7 @@ const import_ = @import("nerva/import.zig");
 const recover = @import("nerva/recover.zig");
 const backup = @import("nerva/backup.zig");
 const release_peers = @import("nerva/release_peers.zig");
+const format_digest = @import("nerva/format_digest.zig");
 const peer_auth = @import("nerva/peer_auth.zig");
 const preflight = @import("nerva/preflight.zig");
 
@@ -96,11 +97,8 @@ fn run() !void {
     const command = cli.parse_args(&flags);
     diagnostic.command = @tagName(command);
     switch (command) {
-        .version => {
-            try std.io.getStdOut().writer().print("Nerva version {}{s}\n", .{
-                constants.semver,
-                if (commit_keys_deduplicate) "" else "+keys-off",
-            });
+        .version => |args| {
+            try version_write(std.io.getStdOut().writer(), args.verbose);
             return;
         },
         .view => |*args| {
@@ -867,6 +865,34 @@ fn listen_remote_warn(comptime command: []const u8, args: anytype) void {
     log.warn("NRV-W0010 " ++ command ++ ": --listen-remote serves plain HTTP: the key and every " ++
         "reply cross the network unencrypted; put TLS in front, or use a loopback address " ++
         "beside the client", .{});
+}
+
+/// `nerva version`: the first line is the one the release workflow and scripts read; the rest
+/// say what an upgrade needs to compare (R6, P259b). `bundles` lists the past releases this
+/// binary can also run; none yet. `--verbose` adds what the digest is made of and the commit.
+fn version_write(writer: anytype, verbose: bool) !void {
+    const release = config.process.release.triple();
+    const release_client_min = config.process.release_client_min.triple();
+    try writer.print("Nerva version {}{s}\n", .{
+        constants.semver,
+        if (commit_keys_deduplicate) "" else "+keys-off",
+    });
+    try writer.print("release {}.{}.{}\n", .{ release.major, release.minor, release.patch });
+    try writer.print("release_client_min {}.{}.{}\n", .{
+        release_client_min.major,
+        release_client_min.minor,
+        release_client_min.patch,
+    });
+    try writer.print("format {s}\n", .{format_digest.hex(&format_digest.format_digest)});
+    try writer.writeAll("bundles none\n");
+    if (!verbose) return;
+    try writer.print("format_epoch {}\n", .{format_digest.format_epoch});
+    try writer.print("superblock_version {}\n", .{format_digest.build_inputs.superblock});
+    if (config.process.git_commit) |commit| {
+        try writer.print("commit {s}\n", .{commit});
+    } else {
+        try writer.writeAll("commit none\n");
+    }
 }
 
 fn command_view(gpa: std.mem.Allocator, args: *const cli.Command.View) !void {

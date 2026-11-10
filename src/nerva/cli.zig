@@ -121,7 +121,7 @@ const CLIArgs = union(enum) {
         path: []const u8,
     },
 
-    version: struct {},
+    version: struct { verbose: bool = false },
 
     pub const help =
         \\Usage:
@@ -161,7 +161,7 @@ const CLIArgs = union(enum) {
         \\               --addresses=<addresses> --origin=<sha256>|none
         \\               [--development] [--log-debug] <path>
         \\
-        \\  nerva version
+        \\  nerva version [--verbose]
         \\
         \\Commands:
         \\
@@ -202,7 +202,8 @@ const CLIArgs = union(enum) {
         \\           again. One replica at a time, each caught up before the next; at least
         \\           three replicas. Writes <path>.recovering and renames it once complete.
         \\
-        \\  version  Print the version.
+        \\  version  Print the release, the oldest client release it serves, the format digest and
+        \\           the releases the binary bundles. --verbose adds the digest's inputs and the commit.
         \\
         \\Options:
         \\
@@ -300,7 +301,9 @@ pub const Command = union(enum) {
     backup: Backup,
     restore: Restore,
     recover: Recover,
-    version,
+    version: Version,
+
+    pub const Version = struct { verbose: bool };
 
     pub const Export = struct {
         cluster: u128,
@@ -465,7 +468,7 @@ pub fn parse_args(flags: *stdx.Flags) Command {
                 args.manifest,
         } },
         .recover => |args| .{ .recover = recover_resolve(args) },
-        .version => .version,
+        .version => |args| .{ .version = .{ .verbose = args.verbose } },
     };
 }
 
