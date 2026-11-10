@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
 """docs/API.md names exactly the routes `nerva api` serves.
 
-Usage: docs_routes.py <nerva>   (the binary is not used: the gateway lists no routes at run time,
-so they are read from its source; the argument only keeps the runner's calling convention)
+Usage: python3 -I tests/api/docs_routes.py   (no argument: the gateway lists no routes at run
+time, so they are read from its source; the test starts no process)
 
 The gateway's routes are the `routes` table in src/nerva/api/api.zig, the prefix and suffix
 constants beside it, `/healthz` in src/nerva/api/server.zig, and the `Route` enum. This test
 derives every `METHOD /path` from them and compares it with the headings of docs/API.md, which
-are written ### `METHOD /path` with `<name>` for a path's variable part. A route the source
-serves and the page lacks fails; so does a heading for a route that does not exist. A `Route`
-member this test has no mapping for fails too, so a new route cannot be added without a decision
-here and a section in the page. The methods of the prefix routes (tables, views, ledgers,
-indexes) are fixed in this file: they are not in a table the source exposes. `nerva view`'s own
-routes (the header of src/nerva/view/server.zig) must be among the page's too.
+are written ### `METHOD /path` with `<name>` for a path's variable part (a heading inside a
+fenced code block is not a heading). A route the source serves and the page lacks fails; so does
+a heading for a route that does not exist. A `Route` member this test has no mapping for fails
+too, and so does an exact path compared in `handle()` that no mapping names: a new path cannot be
+added, even onto an existing `Route` member, without a decision here and a section in the page.
+The methods of the prefix routes (tables, views, ledgers, indexes) are fixed in this file: they
+are not in a table the source exposes. `nerva view`'s own routes (the header of
+src/nerva/view/server.zig) must be among the page's too.
 """
 import os
 import re
@@ -75,6 +77,20 @@ def served(api, server):
     return found
 
 
+def literal_paths(api, mapped):
+    """An exact path `handle()` compares is a route this test maps to a documented section."""
+    handle = re.search(r"pub fn handle\(.*?\n\}\n", api, re.S)
+    assert handle, "api.handle was not found in api.zig"
+    literals = set(re.findall(r'std\.mem\.eql\(u8, path, "([^"]+)"\)', handle.group(0)))
+    assert "/v1/indexes" in literals and "/v1/views" in literals, "handle()'s paths not found"
+    known = {path.split(" ", 1)[1] for path in mapped}
+    return [
+        "api.zig handle() serves the exact path %s, which docs_routes.py does not map to a section"
+        % literal
+        for literal in sorted(literals - known)
+    ]
+
+
 def view_routes(view):
     found = set()
     header = [line for line in view.splitlines() if line.startswith("//!")][:8]
@@ -88,6 +104,7 @@ def view_routes(view):
 
 def documented(page):
     found = set()
+    page = re.sub(r"^```.*?^```[ \t]*$", "", page, flags=re.M | re.S)
     for method, path in re.findall(r"^#{2,4} `([A-Z]+) (/\S*)`", page, re.M):
         found.add("%s %s" % (method, path))
     return found
@@ -104,7 +121,7 @@ def main():
     page = documented(read("docs/API.md"))
     want = served(api, server)
     have = normal(page)
-    failures = []
+    failures = literal_paths(api, want)
     for route in sorted(normal(want) - have):
         failures.append("docs/API.md has no section for %s, which the gateway serves" % route)
     for route in sorted(have - normal(want)):

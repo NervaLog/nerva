@@ -38,7 +38,7 @@ with the cases. If the block shows `NRV-B…`, report it with the command and it
 
 | You see | Code | Do |
 |---|---|---|
-| `--addresses: argument is required`, an unknown or repeated flag | NRV-E0001 | `nerva <command> --help` |
+| `--addresses: argument is required`, an unknown or repeated flag | NRV-E0001 | `nerva --help` lists every command and flag (`nerva <command> --help` is itself refused with this code, [#300](https://github.com/NervaLog/nerva/issues/300)) |
 | `--request-timeout must be 1000 to 60000 milliseconds`, any flag out of range | NRV-E0002 | The message names the bounds |
 | `--listen must be <ipv4>:<port> or [<ipv6>]:<port>` | NRV-E0003 | Give `host:port` |
 | `<path> exists` on `format`, `export`, `import` | NRV-E0004, NRV-E0005 | Give a new path; Nerva never overwrites a file |
@@ -58,7 +58,7 @@ A `503` from a gateway has four causes. The code in the reply says which.
 |---|---|---|
 | NRV-E0605 | The gateway has no cluster session now and sent nothing. `/healthz` is `503` too | Wait: it reconnects by itself, at most every 5 s. If it does not, a quorum of replicas is not running: see [a replica exits](#a-replica-exits) |
 | NRV-E0601 | The cluster did not answer within `--request-timeout` (30 s unless set) | Retry. For a write, see [`applied: "unknown"`](#applied-unknown) |
-| NRV-E0606 | The request's one `--request-timeout` window was spent before the next cluster call | Resend. Nothing further was applied |
+| NRV-E0606 | The request's one `--request-timeout` window was spent before the next cluster call | Look at `"applied"`. `false`: resend. `"unknown"`: an earlier call of the request sent a write, so treat it as [below](#applied-unknown) |
 | NRV-E0602 | All 16 connections were busy and this one was not read | Retry; fewer concurrent clients |
 
 NRV-E0211 (`views_busy`) and NRV-E0313 (`catalog busy`) are also `503`: resend, under the same
@@ -79,8 +79,9 @@ GET /healthz (either gateway)
 The gateway logged `reconnecting to the cluster: error.Timeout` and, once the replica was started
 again, answered `GET /healthz` with `200 {"ok":true,"session":"ready"}` without a restart.
 
-With the replica stopped (`SIGSTOP`) rather than gone, a commit waited 30 s and was answered
-`503 {"error":"cluster unavailable","applied":false,"code":"NRV-E0601"}`; the row was not written.
+With the replica stopped (`SIGSTOP`) rather than gone, a commit waited out `--request-timeout` and
+was answered `503` NRV-E0601, with `"applied":"unknown"` when the write had been sent (see the next
+section).
 
 Sections: [01xx · The gateway](ERRORS.md#01xx--the-gateway-transport-keys-routes-requests),
 [06xx · The cluster and sessions](ERRORS.md#06xx--the-cluster-and-sessions).
@@ -90,17 +91,35 @@ Sections: [01xx · The gateway](ERRORS.md#01xx--the-gateway-transport-keys-route
 Every non-success reply says whether anything was written: `"applied": false` (nothing), or
 `"applied": "unknown"`. `"unknown"` means a write was sent to the cluster and no answer came back
 (a timeout, or the session was evicted), so it may or may not have committed. It comes with NRV-E0601
-on a write, with NRV-E0313 and with NRV-B0001 or NRV-B0002 if the gateway had already sent one.
+on a write, with NRV-E0313, and with NRV-E0606, NRV-E0113, NRV-B0001 or NRV-B0002 when an earlier call of
+the same request had already sent a write. Check `"applied"` on each of these: a `500` or `413`
+that says `"unknown"` is not only a bug to report.
+
+**Only a keyed resend is safe.** Never resend an unkeyed write on `"unknown"` without reading the
+rows first: it may apply twice.
 
 - A commit **with a `key`**: resend the same request with the same key. It commits at most once; if
   it had committed, the answer is `200` with `"replayed": true` and NRV-W0201, which is a success.
-  A key used for a different transaction is `409 key_reused` (NRV-E0207).
+  A key used for a different transaction is `409 key_reused` (NRV-E0207). A replayed reply has no
+  `adds`: a client that used `clamp` reads the rows as of the reply's `op` to learn what was applied
+  ([API.md](API.md#post-v1commit)).
 - A commit **without a key**: read the rows (or `GET /v1/history`) to see whether it landed, then
   decide. Use a key for every write you may need to resend.
 - A layout or view declaration (`PUT`): send it again. Declarations are idempotent.
 
-Not run: a reply with `"applied":"unknown"` was not produced in this recording (the stopped replica
-above gave `false`, because the gateway had not yet sent the write when its session broke). The shapes are those of ERRORS.md.
+Reproduced: an API gateway with `--request-timeout=2000`, the replica stopped (`SIGSTOP`), a keyed
+`put` of one row, then the replica continued (`SIGCONT`):
+
+```
+POST /v1/commit {"key":"0a0b0c0d0e0f000102030405060708aa","entries":[{"kind":"put","table":1,"id":"5","value_hex":"c0ffee"}]}
+-> 503 {"error":"cluster unavailable","applied":"unknown","code":"NRV-E0601"}
+(the replica continues; `GET /healthz` answers 503 reconnecting, then 200 within seconds)
+(the same request again)
+-> 200 {"status":"committed","op":"52","replayed":true,"code":"NRV-W0201"}
+```
+
+The first request had landed, and the resend said so without writing it again. NRV-E0606, E0113
+and B0001 with `"unknown"` were not run.
 
 Section: [06xx · The cluster and sessions](ERRORS.md#06xx--the-cluster-and-sessions);
 [API.md](API.md#post-v1commit) for commit keys.
@@ -111,8 +130,8 @@ Section: [06xx · The cluster and sessions](ERRORS.md#06xx--the-cluster-and-sess
 |---|---|---|
 | 400 | NRV-E0105 to E0115 | The request is malformed. The `error` text names the member |
 | 401 | NRV-E0103 | `X-Nerva-Key` is missing or wrong (during a rotation `NERVA_KEY_NEXT` is accepted too) |
-| 404 | NRV-E0104 | No such route. `GET /v1/tables/7` on `nerva view` is this: it serves three routes only |
-| 405 | NRV-E0104 | The route does not take this method; answered before the key is checked |
+| 404 | NRV-E0104 | No such route (with a valid key; without one it is `401`). `GET /v1/tables/7` on `nerva view` is this: it serves three routes only |
+| 405 | NRV-E0104 | The route does not take this method. The key is checked first for `GET`, `POST` and `PUT`: with no valid key those are `401`, even for a route that does not exist. Only `DELETE`, `PATCH` and other methods get `405` before the key is looked at |
 | 408 | NRV-E0116 | The request did not arrive whole within 10 s |
 | 413 | NRV-E0102 | The body is over 4 MiB |
 | 409 | NRV-E0202 to E0209 | A commit was refused on its merits (`conflict`, `out_of_bounds`, …). Nothing was written |
@@ -185,7 +204,7 @@ status says which:
 | 5 | The next checkpoint would put the data file over its limit | NRV-E0707 | As exit 4. Not run |
 | 6 | The forest's table count would exceed its limit | none yet | The message tells you to contact "the team"; report it ([#304](https://github.com/NervaLog/nerva/issues/304)). Not run |
 | 7 | `unknown VSR command, crashing for safety` | NRV-B0003 | A bug: report it. Not run |
-| 8 | `origin_mismatch`: this replica was imported from another export than its peers | NRV-E0711 | Import it again from the cluster's export, or `nerva recover` it with `--origin=` the export its peers announce. Not run |
+| 8 | `origin_mismatch`: this replica was imported from another export than its peers | NRV-E0711 | In a running cluster, `nerva recover` this replica with `--origin=` the export its peers announce (never import it alone again). When the whole cluster is being restored with the cluster closed, import every replica from the same export. Not run |
 
 The statuses are `FatalReason` in `src/vsr.zig`. None of exits 2 to 8 was reproduced for this page.
 A damaged disk or write-ahead log (NRV-E0708, NRV-E0709) is today a panic or a raw
@@ -195,6 +214,17 @@ Sections: [07xx · Replicas and data files](ERRORS.md#07xx--replicas-and-data-fi
 [Bugs](ERRORS.md#bugs).
 
 ## A replica will not start or will not join
+
+> **Never re-format, re-import or restore one replica of a running cluster.** A replica that is
+> formatted again has forgotten what its predecessor promised the others, and the cluster's
+> guarantees are void (README, [Backups](../README.md#backups): "a replica of a running cluster is
+> never restored alone", P90). A damaged or lost replica of a cluster that is running and has a
+> quorum is replaced with `nerva recover`, which makes its new data file safely (README,
+> [Replacing a lost replica](../README.md#replacing-a-lost-replica),
+> [OPERATING.md](OPERATING.md#replacing-a-lost-replica)). `format`, `import` and `restore` are for
+> a new cluster, a lone replica (a cluster of one), or **every** replica together with the cluster
+> closed, and a restore loses every op after the backup
+> ([OPERATING.md](OPERATING.md#backups-and-a-restore-drill)).
 
 Refusals before the replica opens its data file, each exit 1 unless noted:
 
@@ -210,6 +240,10 @@ error[NRV-E0005]: format: data/0_0.nerva exists
   fix    give a new path, or remove the old file if it is really unwanted
 ```
 
+That `fix` fits a new cluster or a data file that never held anything. Do not remove the data file
+of a replica of a running cluster and format it again: see the warning above, and use
+`nerva recover`.
+
 ```
 error[NRV-E0901]: start: NERVA_CLUSTER_KEY is shorter than 32 bytes
   cause  `NERVA_CLUSTER_KEY` is missing, short, or wrongly paired with `_NEXT`
@@ -224,7 +258,7 @@ Not run, quoted from ERRORS.md:
 | You see | Code | Do |
 |---|---|---|
 | `start: <path> was written by release X, and this is release Y` | NRV-E0701 | Upgrade by export and import (README, [Upgrading a cluster](../README.md#upgrading-a-cluster)) |
-| `start: <path> has no usable superblock (…)` | NRV-E0702 | Check the path; restore from a backup |
+| `start: <path> has no usable superblock (…)` | NRV-E0702 | Check the path. If the file is damaged: a replica of a running cluster is replaced with `nerva recover`; a lone replica or a closed cluster is restored from a backup (every replica, from the same one) |
 | `start: all --addresses must be provided` | NRV-E0710 | Give every replica's address, in replica order |
 | `start: the file system of <path> does not support direct IO`, exit 2 | NRV-E0704 | Put the data file on ext4 or XFS (`--development` allows it) |
 | `<command>: the kernel is X.Y; Nerva needs 5.11 or newer`, exit 2 | NRV-E0705 | Upgrade the kernel |
@@ -239,7 +273,8 @@ Look at its log:
 - Exit 8, NRV-E0711 (above): the replica was imported from another export than its peers.
 - Fewer than a majority of the replicas run, so no gateway gets a session: NRV-E0604 on the gateway.
   Start the others. To bring back a lost replica, see README,
-  [Replacing a lost replica](../README.md#replacing-a-lost-replica).
+  [Replacing a lost replica](../README.md#replacing-a-lost-replica) and
+  [OPERATING.md](OPERATING.md#replacing-a-lost-replica). Do not format it again by hand.
 
 NRV-E0901 and NRV-E0902 are in
 [09xx · Keys between replicas](ERRORS.md#09xx--keys-between-replicas).
