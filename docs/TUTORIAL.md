@@ -118,7 +118,16 @@ cd nerva-ledger
 ./zig/zig build        # builds zig-out/bin/nerva (a few minutes the first time)
 ./zig-out/bin/nerva version
 # Nerva version 0.0.6+0d8d13a
+# release 0.0.6
+# release_client_min 0.0.4
+# format 0c6ab505bf8766ee27f1c79b4d319a5e7100edbb445cb92dfa96b35569a252b8
+# bundles none
 ```
+
+The lines after the first say what an upgrade compares: the release, the oldest client release
+this binary serves, the format digest (equal digests mean equal wire and data formats; P269b) and
+the past releases the binary bundles (none yet). `nerva version --verbose` adds what the digest
+is made of and the commit.
 
 The version is `<protocol release>+<commit>`: `0.0.6` is the protocol release of v0.6.0. It
 decides which replicas, data files and clients work together (see "One release per cluster"
