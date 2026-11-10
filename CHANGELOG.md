@@ -115,8 +115,29 @@ NERVA_KEY=secret nerva api --cluster=1 --addresses=10.0.0.1:3001,10.0.0.2:3001,1
   gateway answers `503 {"error":"catalog busy","applied":"unknown","code":"NRV-E0313"}` and keeps
   its session. Before, it answered `cluster unavailable` and reconnected (#216, P228).
 
+### New: `nerva version` prints the release and the data format (#269)
+
+`nerva version` now prints five lines (`--verbose` prints the same):
+
+```
+Nerva version 0.0.6+b1ea448
+release 0.0.6
+release_client_min 0.0.4
+format a2d6e50b122836b2b596f8548a391e77c3b2beead93ee5e30939479601259362
+bundles none
+```
+
+The first line is what v0.6.1 printed. The next lines are the protocol release, the oldest
+client release it accepts, the digest of the data format and the bundled extensions. **A script
+that compares or parses the whole output must read only the first line:** `nerva version | head -n1`
+(see "Upgrading from v0.6.1").
+
 ### Fixed
 
+- **#276:** the v0.7.0 release run failed building the macOS binaries (`x86_64-macos` and
+  `aarch64-macos`): the trace-file cleanup (#206) used Linux-only calls, and the gateway's metrics
+  send used a flag that does not exist on macOS. Fixed in #277, which also adds a CI job that
+  cross-compiles every release target. The macOS binaries have not been run on a Mac (#278).
 - **#120:** a busy gateway closed a request mid-send, so the client could not tell whether it was
   applied. Fixed in #170.
 - **#112:** two gateways could silently share one port through `SO_REUSEPORT`. Fixed in #170.
@@ -161,12 +182,24 @@ NERVA_KEY=secret nerva api --cluster=1 --addresses=10.0.0.1:3001,10.0.0.2:3001,1
 
 ### Release review
 
-Reviewed adversarially by two independent reviewers before release (P147b):
-The reviewers' issues are [#270](https://github.com/NervaLog/nerva/issues/270),
+The release candidate is `main` at `b1ea448`. Two independent reviewers reviewed it adversarially
+before release (P147b), in two rounds. They first reviewed `a0a6a80`, whose issues are
+[#270](https://github.com/NervaLog/nerva/issues/270),
 [#271](https://github.com/NervaLog/nerva/issues/271),
 [#272](https://github.com/NervaLog/nerva/issues/272) and
 [#273](https://github.com/NervaLog/nerva/issues/273). #270 and #272 are why "Upgrading from
 v0.6.1" gives an order and limits rollback.
+
+The release run for `a0a6a80` failed on macOS (#276), so the candidate moved to `b1ea448` (#277,
+and #269, which changes `nerva version`). Two new reviewers, given only `a0a6a80..b1ea448`,
+reviewed that delta. Their issues are
+[#279](https://github.com/NervaLog/nerva/issues/279),
+[#280](https://github.com/NervaLog/nerva/issues/280),
+[#281](https://github.com/NervaLog/nerva/issues/281),
+[#282](https://github.com/NervaLog/nerva/issues/282) (a duplicate of
+[#278](https://github.com/NervaLog/nerva/issues/278), running the macOS binaries on a Mac) and
+[#276](https://github.com/NervaLog/nerva/issues/276). #279 and #281 are why this section's
+"`nerva version`" notes exist.
 
 ### Upgrading from v0.6.1
 
@@ -182,7 +215,7 @@ combine requests into such ops. Do it in this order:
    `tree_ids`, `Operation` values and the export format are the same, so v0.7.0 replicas open
    v0.6.1 data files: no export or import. For each replica: stop it, start it with the v0.7.0
    binary, and wait for it to rejoin (its log says it is committing) before the next one.
-3. Only when every replica runs v0.7.0 (`nerva version` on each), upgrade the gateways and start
+3. Only when every replica runs v0.7.0 (`nerva version | head -n1` on each), upgrade the gateways and start
    any multi-batch client.
 
 Never run a v0.7.0 gateway, or any client that sends several batches in one request, while a
@@ -223,8 +256,19 @@ the operator's choice.
 on release `0.0.6`, so moving from v0.7.0 to it is an export and import (P259g). That release's
 notes will say so.
 
+**`nerva version` has five lines now.** Scripts must read the first line only
+(`nerva version | head -n1`). Anything that compares the whole output, takes a field with `awk`,
+or takes the last word of it gets the wrong text from v0.7.0 (for example `bundles none`'s
+`none`). Release builds fail closed on this, and no data is at risk. The release workflow
+already uses `head -n1`.
+
 **Botpike (`nerva.pin`).** The repository moved to `NervaLog/nerva`, so releases are published
 there. Set `NERVA_REPO=NervaLog/nerva` along with the new tag, commit and tarball checksums.
+Three of Botpike's checks read the whole output of `nerva version` and fail on v0.7.0 until they
+read the first line only: the replica image's Dockerfile check, `scripts/nerva.sh`'s version
+check and `NervaContainer`'s version check (Botpike/app#160). Fix them before, or in the same
+change as, the pin bump. Bump the replicas' pin and the gateway's separately, replicas first
+(P260, Botpike/app#159): one pin feeds both.
 Botpike's Fly gateway already listens on `127.0.0.1`. The `NervaContainer` test fixture
 (`cluster.sh`) runs `nerva api --listen=0.0.0.0:8080` and needs `--listen-remote`. Botpike's
 client timeout is 5 s, so set `--request-timeout` below it (INF-2).
