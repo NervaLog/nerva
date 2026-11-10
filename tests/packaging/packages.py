@@ -318,7 +318,11 @@ if ! grep -qx daemon-reload /tmp/systemctl.log; then
     cat /tmp/systemctl.log
     ls -l /var/lib/dpkg/info/nerva.* /run/systemd
     echo "PATH=$PATH"
-    sh -x /var/lib/dpkg/info/nerva.postinst configure
+    cat /var/lib/dpkg/info/nerva.postinst
+    : > /tmp/systemctl.log
+    dpkg -i /tmp/@PKG@
+    echo "after dpkg -i, the log:"
+    cat /tmp/systemctl.log
     exit 1
 fi
 uid=$(id -u nerva)
