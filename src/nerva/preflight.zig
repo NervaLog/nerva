@@ -23,9 +23,15 @@ const SuperBlockHeader = superblock.SuperBlockHeader;
 
 /// The oldest kernel Nerva runs on: `io_uring` as the vendored IO uses it (NRV-E0705).
 pub const kernel_version_min = Version{ .major = 5, .minor = 11 };
-/// As the vendored open does: a killed process's lock can linger while `io_uring` completes.
-const lock_attempts = 5;
+/// A killed process's lock can linger while `io_uring` tears its ring down (the vendored open
+/// waits 250 ms for it; a loaded host needs longer, #288, P290). Bounded: 40 x 50 ms = 2 s, then
+/// the lock is refused as held (NRV-E0703).
 const lock_retry_ms = 50;
+const lock_wait_ms = 2000;
+const lock_attempts = lock_wait_ms / lock_retry_ms;
+comptime {
+    assert(lock_attempts * lock_retry_ms == lock_wait_ms);
+}
 
 pub const Version = struct {
     major: u32,
@@ -288,6 +294,30 @@ test "preflight: a held lock" {
     try testing.expect((try open_check(testing.allocator, path, .disabled)).? == .locked);
     try posix.flock(file.handle, posix.LOCK.UN);
     // Free: the next check goes on to the superblock, which an empty file lacks.
+    try testing.expect((try open_check(testing.allocator, path, .disabled)).? == .damaged);
+}
+
+test "preflight: a lock released within the wait is not refused" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = try tmp.dir.realpath(".", &buffer);
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, "{s}/lingering", .{dir});
+    const file = try std.fs.createFileAbsolute(path, .{});
+    defer file.close();
+    try posix.flock(file.handle, posix.LOCK.EX | posix.LOCK.NB);
+    // Another thread frees the lock after 1 s, beyond the vendored open's 250 ms, as the kernel
+    // does when it finishes tearing a killed process's ring down.
+    const releaser = try std.Thread.spawn(.{}, struct {
+        fn run(fd: posix.fd_t) void {
+            std.time.sleep(1000 * std.time.ns_per_ms);
+            posix.flock(fd, posix.LOCK.UN) catch @panic("unlock");
+        }
+    }.run, .{file.handle});
+    defer releaser.join();
+    // Free by then: the check goes on to the superblock, which an empty file lacks.
     try testing.expect((try open_check(testing.allocator, path, .disabled)).? == .damaged);
 }
 
