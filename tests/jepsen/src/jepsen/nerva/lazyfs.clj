@@ -346,7 +346,7 @@
         (< after written)             :truncated
         :else                         :survived))
 
-;; LazyFS killed for lack of memory (NRV-E0611, P269). The signal is the kernel's own OOM line for
+;; LazyFS killed for lack of memory (NRV-E0611, P268). The signal is the kernel's own OOM line for
 ;; a process named `lazyfs` ("Out of memory: Killed process 4321 (lazyfs) ..."), read from
 ;; `dmesg` (the nodes are privileged containers, so they read the host's ring buffer; the journal's
 ;; kernel log when `dmesg` is refused), counted at setup and again after each fault, AND this
@@ -600,7 +600,7 @@
   for that (`:final? true`): mid-run, a `kill` or `partition` may have removed quorum.
   `:unknown`, with NRV-E0611 (the host, not Nerva, is at fault), first of all, when the kernel's
   log shows the memory killed LazyFS on a node (`:oom-killed`, `oom-evidence?`): it outranks every
-  other verdict below, NRV-E0604 and NRV-E0608 included, as a dead LazyFS explains them (P269).
+  other verdict below, NRV-E0604 and NRV-E0608 included, as a dead LazyFS explains them (P268).
   `:unknown`, with NRV-E0607 (the harness, not Nerva, is at fault; the run proved nothing), when
   the fault was asked for and:
   a fault op threw; no final recovery ran; the final recovery judged no node (it settles every
@@ -695,13 +695,13 @@
                                                         threw)))
           ;; Last, so it replaces every other verdict's code: an OOM-killed LazyFS takes its
           ;; mount and the replica's data file with it, so what the run shows after it, a down
-          ;; replica (NRV-E0604) or lost bytes (NRV-E0608), is its doing (P269).
+          ;; replica (NRV-E0604) or lost bytes (NRV-E0608), is its doing (P268).
           (seq oom)      (assoc :code        "NRV-E0611"
                                 :oom-killed  oom
                                 :reason      (str "the host's memory killed LazyFS on "
                                                   (str/join ", " oom)
                                                   ": the run says nothing about Nerva; run it on "
-                                                  "a host with more memory (P242j, P269)")))))))
+                                                  "a host with more memory (P242j, P268)")))))))
 
 (defn invoke-fault
   "Applies a fault op's value: kill, then lose. A `:crash` majority dies before the rest. Returns

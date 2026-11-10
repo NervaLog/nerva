@@ -182,7 +182,7 @@ class Statuses(unittest.TestCase):
         self.assertEqual(summary["filed"], 0)
 
     def test_a_lazyfs_oom_kill_is_the_hosts_and_never_filed(self):
-        # NRV-E0611 (P269): the host's memory killed LazyFS; like NRV-E0607 it is no Nerva finding.
+        # NRV-E0611 (P268): the host's memory killed LazyFS; like NRV-E0607 it is no Nerva finding.
         oom = ("{:valid? :unknown, :perf {:valid? true}, :lazyfs {:valid? :unknown, :code "
                '"NRV-E0611", :oom-killed ["n1"], :faults 1}}')
         store = Store(self)

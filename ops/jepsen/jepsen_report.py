@@ -20,7 +20,7 @@ Each run is valid, invalid, unknown, or the host's:
   for a commit it has not been reported on, at most COMMENTS_PER_FAILURE_PER_DAY a UTC day; at
   most FAILURES_PER_DAY distinct failures are looked at a day. The status is `failure`;
 - the host's (a checker's verdict carrying `:code "NRV-E0607"`, the Jepsen harness failing, or
-  `"NRV-E0611"`, LazyFS killed for lack of memory (P269), unless
+  `"NRV-E0611"`, LazyFS killed for lack of memory (P268), unless
   another checker found something: that finding is filed and the harness one is dropped; exit 124 past the night's deadline, 125, 126, 137 the OOM killer, 143 an
   interrupted night, unless a verdict was written: an invalid or unknown one outranks the exit code; a run with no `jepsen.log` at
   all; a night that did not start; graphs that did not draw): counted, status `error`, never an
@@ -438,7 +438,7 @@ def failing_leaves(path, value, depth):
 
 HARNESS_CODE = "NRV-E0607"  # docs/ERRORS.md: the Jepsen harness failed, not Nerva (P244e).
 # The codes of a checker's verdict that are the host's, never Nerva's: the harness failed, or the
-# host's memory killed LazyFS (NRV-E0611, P269). Neither is ever filed.
+# host's memory killed LazyFS (NRV-E0611, P268). Neither is ever filed.
 HOST_VERDICT_CODES = (HARNESS_CODE, "NRV-E0611")
 
 
