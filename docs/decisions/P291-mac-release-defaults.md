@@ -7,7 +7,7 @@ amends: P284
 
 # `mac-release`: the owner's identity as the default, the zip's name, and what the formula pins
 
-**Decision.** v0.7.1 slice 3 settles four things the brief left open.
+**Decision.** v0.7.1 slice 3 settles five things the brief left open.
 
 1. `-Dsign-identity` defaults to the owner's Developer ID Application identity, the one
    Zigbox's `mac-release` already uses, and `-Dnotary-profile` to `nerva-notary`. `-` signs ad hoc
@@ -21,6 +21,11 @@ amends: P284
 4. `nerva version`'s new last line is `version <VERSION>`, placed after `bundles none` and before
    the `--verbose` lines, so the existing lines keep their order and text (Botpike/app#160). The
    format digest is unchanged.
+
+5. The step is run as `zig build -Drelease mac-release`, the build `release.yml` uses, and refuses
+   otherwise: the thin binaries share the build's options, and `config_verify` is on in every
+   mode but `-Drelease`. The tool also checks each architecture slice's signature and CDHash,
+   and the zip's listing.
 
 **Reason.** A refusal before compiling saves a long build and cannot leave a half-signed output.
 The identity is already public in Zigbox's repository and is not a secret; the keychain holds the

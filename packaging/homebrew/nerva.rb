@@ -20,6 +20,6 @@ class Nerva < Formula
   end
 
   test do
-    assert_match "version #{version}", shell_output("#{bin}/nerva version")
+    assert_match(/^version #{Regexp.escape(version.to_s)}$/, shell_output("#{bin}/nerva version"))
   end
 end

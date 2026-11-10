@@ -203,8 +203,9 @@ const CLIArgs = union(enum) {
         \\           three replicas. Writes <path>.recovering and renames it once complete.
         \\
         \\  version  Print the release, the oldest client release it serves, the format digest and
-        \\           the releases the binary bundles. --verbose adds the digest's inputs and the
-        \\           commit.
+        \\           the releases the binary bundles, then a last line `version <release>`: the
+        \\           release this binary was built as, as people name it. --verbose adds the
+        \\           digest's inputs and the commit.
         \\
         \\Options:
         \\

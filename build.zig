@@ -125,6 +125,7 @@ pub fn build(b: *std.Build) !void {
         .bench_load = b.step("bench:load", "Run the load generator (ReleaseSafe; pass flags after --)"),
     };
 
+    const mac_release = @import("src/nerva/mac_release.zig");
     const options = .{
         .config_verify = b.option(bool, "config_verify", "Enable extra assertions.") orelse
             (mode == .Debug),
@@ -161,6 +162,15 @@ pub fn build(b: *std.Build) !void {
             "Build tasks print the path of the executable",
         ) orelse false,
     };
+
+    if (!mac_release.version_valid(options.version)) {
+        std.log.err(
+            "-Dversion (or VERSION) '{s}' is not a release version: want N.N.N or N.N.N-suffix " ++
+                "(letters, digits, dots), at most {} characters",
+            .{ options.version, mac_release.version_length_max },
+        );
+        return error.InvalidVersion;
+    }
 
     const test_options = b.addOptions();
     // Benchmarks run in two modes:
@@ -227,7 +237,14 @@ pub fn build(b: *std.Build) !void {
     steps.run.dependOn(&nerva_run.step);
     steps.check.dependOn(&nerva.step);
     steps.check.dependOn(&nerva_keys_off.step);
-    add_mac_release(b, steps.check, stdx_module, vsr_options, options.version);
+    add_mac_release(
+        b,
+        steps.check,
+        stdx_module,
+        vsr_options,
+        options.version,
+        mode == .ReleaseSafe and !options.config_verify,
+    );
 
     // zig build test:unit
     const stdx_unit_tests = b.addTest(.{
@@ -642,6 +659,7 @@ fn add_mac_release(
     stdx_module: *std.Build.Module,
     vsr_options: *std.Build.Step.Options,
     version: []const u8,
+    release_build: bool,
 ) void {
     const mac_release = @import("src/nerva/mac_release.zig");
     const identity = b.option(
@@ -674,6 +692,7 @@ fn add_mac_release(
     preflight.setCwd(b.path("."));
     preflight.addArgs(&.{ "preflight", "--version", version });
     preflight.addArgs(&.{ "--identity", identity, "--profile", profile });
+    if (notarize) preflight.addArg("--notarize");
     preflight.has_side_effects = true;
 
     const package = b.addRunArtifact(tool);
@@ -697,7 +716,15 @@ fn add_mac_release(
             "--x86_64");
         package.addArtifactArg(thin);
     }
-    const step = b.step("mac-release", "Sign, zip and optionally notarize the universal macOS nerva");
+    // The thin binaries must be what `release.yml` builds with `-Drelease`: ReleaseSafe with
+    // `config_verify` off. Anything else would ship the simulator's extra checks.
+    if (!release_build) {
+        const refuse = b.addFail("mac-release: run it as `zig build -Drelease mac-release` " ++
+            "(the release's ReleaseSafe build, without the extra verification)");
+        preflight.step.dependOn(&refuse.step);
+        package.step.dependOn(&refuse.step);
+    }
+    const step = b.step("mac-release", "Sign, zip and optionally notarize the universal macOS nerva (use -Drelease)");
     step.dependOn(&package.step);
 }
 

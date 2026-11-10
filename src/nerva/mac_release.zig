@@ -17,12 +17,30 @@ pub const default_identity = "Developer ID Application: Alex Zuzin (56A872L679)"
 pub const default_profile = "nerva-notary";
 const release_url = "https://github.com/NervaLog/nerva/releases/download";
 
+/// The longest release version the tool and `-Dversion` accept; every name buffer below is sized
+/// from it, so none can overflow.
+pub const version_length_max = 40;
+pub const archive_stem_max = "nerva-v-universal-macos".len + version_length_max;
+pub const tag_max = "v".len + version_length_max;
+
+const codesign_tool = "/usr/bin/codesign";
+const ditto_tool = "/usr/bin/ditto";
+const lipo_tool = "/usr/bin/lipo";
+const security_tool = "/usr/bin/security";
+const unzip_tool = "/usr/bin/unzip";
+const xcrun_tool = "/usr/bin/xcrun";
+
+/// The two slices of the universal binary, as `codesign --arch` names them.
+const slice_archs = [_][]const u8{ "arm64", "x86_64" };
+
 /// The refusals the pure checks return. `message` turns one into its line.
 pub const Refusal = enum {
     dirty_tree,
     head_not_tag,
     identity_unknown,
+    adhoc_notarize,
     archs_wrong,
+    zip_layout_wrong,
     signature_invalid,
     version_line_wrong,
     commit_line_wrong,
@@ -37,7 +55,9 @@ pub fn message(refusal: Refusal) []const u8 {
         .head_not_tag => "HEAD is not the release's tag; check out v<VERSION>",
         .identity_unknown => "the signing identity is not in the keychain " ++
             "(security find-identity -v -p codesigning)",
+        .adhoc_notarize => "-Dnotarize needs a Developer ID identity, not the ad hoc one (-)",
         .archs_wrong => "the joined binary is not exactly x86_64 and arm64",
+        .zip_layout_wrong => "the zip does not hold exactly <name>/ with nerva, LICENSE and NOTICE",
         .signature_invalid => "codesign -dv does not show the signature this release needs",
         .version_line_wrong => "`nerva version` does not end with the release's version line",
         .commit_line_wrong => "`nerva version`'s first line does not name the tag's commit",
@@ -49,13 +69,15 @@ pub fn message(refusal: Refusal) []const u8 {
 
 /// `nerva-v<version>-universal-macos`: the directory inside the zip, and the zip's name less its
 /// extension.
-pub fn archive_stem(buffer: []u8, version: []const u8) []const u8 {
-    return std.fmt.bufPrint(buffer, "nerva-v{s}-universal-macos", .{version}) catch unreachable;
+pub fn archive_stem(buffer: *[archive_stem_max]u8, version: []const u8) []const u8 {
+    assert(version_valid(version));
+    return std.fmt.bufPrint(buffer, "nerva-v{s}-universal-macos", .{version}) catch unreachable; // Sized from the bound.
 }
 
 /// The tag a release is cut from.
-pub fn tag_name(buffer: []u8, version: []const u8) []const u8 {
-    return std.fmt.bufPrint(buffer, "v{s}", .{version}) catch unreachable;
+pub fn tag_name(buffer: *[tag_max]u8, version: []const u8) []const u8 {
+    assert(version_valid(version));
+    return std.fmt.bufPrint(buffer, "v{s}", .{version}) catch unreachable; // Sized from the bound.
 }
 
 /// The tree must be clean (`git status --porcelain` printed nothing) and HEAD must be the tag
@@ -67,6 +89,11 @@ pub fn check_tree(porcelain: []const u8, tags_at_head: []const u8, tag: []const 
         if (std.mem.eql(u8, std.mem.trim(u8, line, " \r"), tag)) return null;
     }
     return .head_not_tag;
+}
+
+/// A notarized release needs a Developer ID identity; Apple rejects an ad hoc signature.
+pub fn check_notarize(identity: []const u8, notarize: bool) ?Refusal {
+    return if (notarize and std.mem.eql(u8, identity, "-")) .adhoc_notarize else null;
 }
 
 /// The identity (a quoted name in `security find-identity` output) is listed. `-` is ad hoc and
@@ -96,19 +123,18 @@ pub fn check_archs(output: []const u8) ?Refusal {
 /// The `codesign` arguments that sign `path`: the hardened runtime, no entitlements, a secure
 /// timestamp. Ad hoc (`-`) has no timestamp server to ask, so it says `none`.
 pub fn codesign_args(
-    buffer: *[9][]const u8,
+    buffer: *[8][]const u8,
     identity: []const u8,
     path: []const u8,
 ) []const []const u8 {
     const adhoc = std.mem.eql(u8, identity, "-");
     buffer.* = .{
-        "codesign",                                       "--force",
+        codesign_tool,                                    "--force",
         "--options",                                      "runtime",
         if (adhoc) "--timestamp=none" else "--timestamp", "--sign",
         identity,                                         path,
-        "",
     };
-    return buffer[0..8];
+    return buffer;
 }
 
 /// `codesign -dvvv` output (it goes to stderr). A Developer ID signature names its authority,
@@ -155,17 +181,39 @@ pub fn check_version_output(
 ) ?Refusal {
     var lines = std.mem.tokenizeScalar(u8, output, '\n');
     const first = lines.next() orelse return .commit_line_wrong;
-    var suffix_buffer: [64]u8 = undefined;
+    var suffix_buffer: [version_length_max + 8]u8 = undefined;
     const suffix = std.fmt.bufPrint(&suffix_buffer, "+{s}", .{short_commit}) catch
         return .commit_line_wrong;
     if (std.mem.indexOf(u8, first, suffix) == null) return .commit_line_wrong;
-    var line_buffer: [64]u8 = undefined;
+    var line_buffer: [version_length_max + 8]u8 = undefined;
     const wanted = std.fmt.bufPrint(&line_buffer, "version {s}", .{version}) catch
         return .version_line_wrong;
     while (lines.next()) |line| {
         if (std.mem.eql(u8, std.mem.trimRight(u8, line, "\r"), wanted)) return null;
     }
     return .version_line_wrong;
+}
+
+/// `unzip -Z1` of the release zip: exactly `<stem>/` (optional entry) and the three files in it,
+/// and nothing else (no `__MACOSX`, no AppleDouble `._` entries).
+pub fn check_zip_listing(listing: []const u8, stem: []const u8) ?Refusal {
+    const names = [_][]const u8{ "nerva", "LICENSE", "NOTICE" };
+    var seen = [_]bool{false} ** names.len;
+    var lines = std.mem.tokenizeAny(u8, listing, "\r\n");
+    while (lines.next()) |line| {
+        if (line.len == stem.len + 1 and std.mem.startsWith(u8, line, stem) and
+            line[stem.len] == '/') continue;
+        if (!std.mem.startsWith(u8, line, stem)) return .zip_layout_wrong;
+        if (line.len <= stem.len + 1 or line[stem.len] != '/') return .zip_layout_wrong;
+        const entry = line[stem.len + 1 ..];
+        const index = for (names, 0..) |name, at| {
+            if (std.mem.eql(u8, entry, name)) break at;
+        } else return .zip_layout_wrong;
+        if (seen[index]) return .zip_layout_wrong;
+        seen[index] = true;
+    }
+    for (seen) |present| if (!present) return .zip_layout_wrong;
+    return null;
 }
 
 /// `notarytool submit --wait` ends with `status: Accepted` or another status (`Invalid`).
@@ -204,11 +252,28 @@ pub fn formula_fill(
     return text;
 }
 
-/// A release's version: `major.minor.patch` with an optional `-prerelease`, as `release.yml`
-/// checks it.
+/// A release's version: `[0-9]+.[0-9]+.[0-9]+` with an optional `-[0-9A-Za-z.]+` suffix, at most
+/// `version_length_max` bytes. `build.zig` checks `-Dversion` with it, so no other string reaches
+/// `nerva version`.
 pub fn version_valid(version: []const u8) bool {
-    const parsed = std.SemanticVersion.parse(version) catch return false;
-    return parsed.build == null;
+    if (version.len == 0 or version.len > version_length_max) return false;
+    var rest = version;
+    for (0..3) |part| {
+        var digits: usize = 0;
+        while (digits < rest.len and std.ascii.isDigit(rest[digits])) digits += 1;
+        if (digits == 0) return false;
+        rest = rest[digits..];
+        if (part < 2) {
+            if (rest.len == 0 or rest[0] != '.') return false;
+            rest = rest[1..];
+        }
+    }
+    if (rest.len == 0) return true;
+    if (rest[0] != '-' or rest.len == 1) return false;
+    for (rest[1..]) |byte| {
+        if (!std.ascii.isAlphanumeric(byte) and byte != '.') return false;
+    }
+    return true;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -245,7 +310,13 @@ fn run(gpa: std.mem.Allocator, cwd: []const u8, argv: []const []const u8, what: 
         .argv = argv,
         .cwd = cwd,
         .max_output_bytes = 1 << 20,
-    }) catch |err| fail("{s}: cannot run {s}: {s}", .{ what, argv[0], @errorName(err) });
+    }) catch |err| switch (err) {
+        error.FileNotFound => fail(
+            "{s}: {s} is not installed (xcode-select --install)",
+            .{ what, argv[0] },
+        ),
+        else => fail("{s}: cannot run {s}", .{ what, argv[0] }),
+    };
     const code: u32 = switch (result.term) {
         .Exited => |code| code,
         else => 255,
@@ -318,19 +389,20 @@ pub fn main() !void {
 
 /// Refuses before anything is built or signed.
 fn preflight(gpa: std.mem.Allocator, options: Options) void {
-    var tag_buffer: [64]u8 = undefined;
+    if (check_notarize(options.identity, options.notarize)) |refusal| refuse(refusal);
+    var tag_buffer: [tag_max]u8 = undefined;
     const tag = tag_name(&tag_buffer, options.version);
     const status = run(gpa, options.root, &.{ "git", "status", "--porcelain" }, "git");
     const tags = run(gpa, options.root, &.{ "git", "tag", "--points-at", "HEAD" }, "git");
     if (check_tree(status.stdout, tags.stdout, tag)) |refusal| refuse(refusal);
     if (std.mem.eql(u8, options.identity, "-")) return;
     const listing = run(gpa, options.root, &.{
-        "security", "find-identity", "-v", "-p", "codesigning",
+        security_tool, "find-identity", "-v", "-p", "codesigning",
     }, "security");
     if (check_identity(listing.stdout, options.identity)) |refusal| refuse(refusal);
     // The profile holds the notary credentials; this only asks Apple whether it works.
     _ = run(gpa, options.root, &.{
-        "xcrun", "notarytool", "history", "--keychain-profile", options.profile,
+        xcrun_tool, "notarytool", "history", "--keychain-profile", options.profile,
     }, "the notary profile");
 }
 
@@ -342,24 +414,35 @@ fn print(gpa: std.mem.Allocator, comptime format: []const u8, args: anytype) []u
     return std.fmt.allocPrint(gpa, format, args) catch @panic("OOM");
 }
 
+/// What went wrong with a file, in words; never the error's own name.
+fn file_problem(err: anyerror) []const u8 {
+    return switch (err) {
+        error.FileNotFound => "it does not exist",
+        error.AccessDenied, error.PermissionDenied => "permission denied",
+        error.NoSpaceLeft => "the disk is full",
+        error.FileTooBig => "it is too large",
+        else => "the operating system refused",
+    };
+}
+
 fn fail_at(what: []const u8, path: []const u8, err: anyerror) noreturn {
-    fail("cannot {s} {s}: {s}", .{ what, path, @errorName(err) });
+    fail("cannot {s} {s}: {s}", .{ what, path, file_problem(err) });
 }
 
 fn package(gpa: std.mem.Allocator, options: Options) void {
     const out = std.fs.path.resolve(gpa, &.{ options.root, options.out }) catch @panic("OOM");
     std.fs.cwd().deleteTree(out) catch |err| fail_at("empty", out, err);
-    var stem_buffer: [96]u8 = undefined;
+    var stem_buffer: [archive_stem_max]u8 = undefined;
     const stem = archive_stem(&stem_buffer, options.version);
     const stage = join(gpa, &.{ out, stem });
     std.fs.cwd().makePath(stage) catch |err| fail_at("make", stage, err);
     const binary = join(gpa, &.{ stage, "nerva" });
 
     const lipo_args = [_][]const u8{
-        "lipo", "-create", "-output", binary, options.arm64, options.x86_64,
+        lipo_tool, "-create", "-output", binary, options.arm64, options.x86_64,
     };
     _ = run(gpa, out, &lipo_args, "lipo");
-    const archs = run(gpa, out, &.{ "lipo", "-archs", binary }, "lipo");
+    const archs = run(gpa, out, &.{ lipo_tool, "-archs", binary }, "lipo");
     if (check_archs(archs.stdout)) |refusal| refuse(refusal);
 
     sign_and_verify(gpa, out, options, binary);
@@ -372,13 +455,17 @@ fn package(gpa: std.mem.Allocator, options: Options) void {
     }
     const zip_name = print(gpa, "{s}.zip", .{stem});
     const zip = join(gpa, &.{ out, zip_name });
-    _ = run(gpa, out, &.{ "ditto", "-c", "-k", "--keepParent", stage, zip }, "ditto");
+    _ = run(gpa, out, &.{
+        ditto_tool, "-c", "-k", "--norsrc", "--keepParent", stage, zip,
+    }, "ditto");
+    const listing = run(gpa, out, &.{ unzip_tool, "-Z1", zip }, "unzip");
+    if (check_zip_listing(listing.stdout, stem)) |refusal| refuse(refusal);
     check_unzipped(gpa, out, zip, binary);
     const sha = write_checksum(gpa, zip, zip_name);
 
     if (options.notarize) {
         const submitted = run(gpa, out, &.{
-            "xcrun", "notarytool", "submit", zip, "--keychain-profile", options.profile, "--wait",
+            xcrun_tool, "notarytool", "submit", zip, "--keychain-profile", options.profile, "--wait",
         }, "notarytool");
         if (check_notary(submitted.stdout)) |refusal| refuse(refusal);
     }
@@ -392,19 +479,29 @@ fn sign_and_verify(
     options: Options,
     binary: []const u8,
 ) void {
-    var argv_buffer: [9][]const u8 = undefined;
+    var argv_buffer: [8][]const u8 = undefined;
     _ = run(gpa, cwd, codesign_args(&argv_buffer, options.identity, binary), "codesign");
-    _ = run(gpa, cwd, &.{ "codesign", "--verify", "--strict", binary }, "codesign --verify");
-    const shown = run(gpa, cwd, &.{ "codesign", "-dvvv", binary }, "codesign -dv");
-    // `codesign -d` writes to stderr.
+    _ = run(gpa, cwd, &.{ codesign_tool, "--verify", "--strict", binary }, "codesign --verify");
+    // `codesign -d` describes one slice of a universal binary (the host's, unless `--arch`
+    // says), so each slice is verified and described on its own.
     const adhoc = std.mem.eql(u8, options.identity, "-");
-    if (check_signature(shown.stderr, adhoc)) |refusal| refuse(refusal);
+    for (slice_archs) |arch| {
+        _ = run(gpa, cwd, &.{
+            codesign_tool, "--verify", "--strict", "--arch", arch, binary,
+        }, "codesign --verify");
+        const shown = run(gpa, cwd, &.{
+            codesign_tool, "-dvvv", "--arch", arch, binary,
+        }, "codesign -dv");
+        // `codesign -d` writes to stderr.
+        if (check_signature(shown.stderr, adhoc)) |refusal| refuse(refusal);
+    }
 }
 
 /// The signed binary runs, and the hardened runtime does not break `format`.
 fn run_signed(gpa: std.mem.Allocator, options: Options, binary: []const u8) void {
-    const commit = run(gpa, options.root, &.{ "git", "rev-parse", "--short=7", "HEAD" }, "git");
-    const short = std.mem.trim(u8, commit.stdout, " \r\n");
+    const commit = run(gpa, options.root, &.{ "git", "rev-parse", "HEAD" }, "git");
+    // The binary's `+<commit>` is the first 7 characters; `--short=7` may be longer.
+    const short = std.mem.trim(u8, commit.stdout, " \r\n")[0..7];
     const version = run(gpa, options.root, &.{ binary, "version" }, "nerva version");
     if (check_version_output(version.stdout, short, options.version)) |refusal| refuse(refusal);
     const directory = join(gpa, &.{ std.fs.path.dirname(binary).?, ".format" });
@@ -426,12 +523,18 @@ fn check_unzipped(
     const unzipped_dir = join(gpa, &.{ out, ".unzipped" });
     defer std.fs.cwd().deleteTree(unzipped_dir) catch {};
     std.fs.cwd().makePath(unzipped_dir) catch |err| fail_at("make", unzipped_dir, err);
-    _ = run(gpa, out, &.{ "ditto", "-x", "-k", zip, unzipped_dir }, "ditto");
+    _ = run(gpa, out, &.{ ditto_tool, "-x", "-k", zip, unzipped_dir }, "ditto");
     const name = std.fs.path.basename(zip);
     const copy = join(gpa, &.{ unzipped_dir, name[0 .. name.len - ".zip".len], "nerva" });
-    const signed = run(gpa, out, &.{ "codesign", "-dvvv", binary }, "codesign -dv");
-    const unzipped = run(gpa, out, &.{ "codesign", "-dvvv", copy }, "codesign -dv");
-    if (check_cdhash(signed.stderr, unzipped.stderr)) |refusal| refuse(refusal);
+    for (slice_archs) |arch| {
+        const signed = run(gpa, out, &.{
+            codesign_tool, "-dvvv", "--arch", arch, binary,
+        }, "codesign -dv");
+        const unzipped = run(gpa, out, &.{
+            codesign_tool, "-dvvv", "--arch", arch, copy,
+        }, "codesign -dv");
+        if (check_cdhash(signed.stderr, unzipped.stderr)) |refusal| refuse(refusal);
+    }
 }
 
 /// `<zip>.sha256` as `sha256sum` and `shasum -c` read it; returns the hex digest.
@@ -459,20 +562,30 @@ fn write_formula(
     const template = std.fs.cwd().readFileAlloc(gpa, template_path, 1 << 20) catch |err|
         fail_at("read", template_path, err);
     const url = print(gpa, "{s}/v{s}/{s}.zip", .{ release_url, options.version, stem });
-    const filled = formula_fill(gpa, template, options.version, url, sha) catch |err|
-        fail("cannot fill the formula: {s}", .{@errorName(err)});
+    const filled = formula_fill(gpa, template, options.version, url, sha) catch |err| switch (err) {
+        error.PlaceholderLeft => fail(
+            "cannot fill the formula: the template has a placeholder this tool does not know",
+            .{},
+        ),
+        error.OutOfMemory => fail("cannot fill the formula: out of memory", .{}),
+    };
     const path = join(gpa, &.{ out, "nerva.rb" });
     std.fs.cwd().writeFile(.{ .sub_path = path, .data = filled }) catch |err|
         fail_at("write", path, err);
 }
 
 test "archive and tag names" {
-    var buffer: [96]u8 = undefined;
+    var stem_buffer: [archive_stem_max]u8 = undefined;
+    var tag_buffer: [tag_max]u8 = undefined;
     try std.testing.expectEqualStrings(
         "nerva-v0.7.1-universal-macos",
-        archive_stem(&buffer, "0.7.1"),
+        archive_stem(&stem_buffer, "0.7.1"),
     );
-    try std.testing.expectEqualStrings("v0.7.1", tag_name(&buffer, "0.7.1"));
+    try std.testing.expectEqualStrings("v0.7.1", tag_name(&tag_buffer, "0.7.1"));
+    const longest = "1.2.3-" ++ "a" ** (version_length_max - 6);
+    try std.testing.expectEqual(version_length_max, longest.len);
+    try std.testing.expect(archive_stem(&stem_buffer, longest).len == archive_stem_max);
+    try std.testing.expect(tag_name(&tag_buffer, longest).len == tag_max);
 }
 
 test "check_tree refuses a dirty tree and a HEAD that is not the tag" {
@@ -511,15 +624,15 @@ test "check_archs wants x86_64 and arm64, either order" {
 }
 
 test "codesign_args for an identity and for ad hoc" {
-    var buffer: [9][]const u8 = undefined;
+    var buffer: [8][]const u8 = undefined;
     const identity = codesign_args(&buffer, default_identity, "/x/nerva");
     try std.testing.expectEqualSlices([]const u8, &.{
-        "codesign",    "--force", "--options",      "runtime",
+        codesign_tool, "--force", "--options",      "runtime",
         "--timestamp", "--sign",  default_identity, "/x/nerva",
     }, identity);
     const adhoc = codesign_args(&buffer, "-", "/x/nerva");
     try std.testing.expectEqualSlices([]const u8, &.{
-        "codesign",         "--force", "--options", "runtime",
+        codesign_tool,      "--force", "--options", "runtime",
         "--timestamp=none", "--sign",  "-",         "/x/nerva",
     }, adhoc);
 }
@@ -615,4 +728,53 @@ test "version_valid" {
     try std.testing.expect(!version_valid("0.7"));
     try std.testing.expect(!version_valid("v0.7.1"));
     try std.testing.expect(!version_valid("0.7.1+abc"));
+    try std.testing.expect(version_valid("10.20.30"));
+    try std.testing.expect(!version_valid("0.7.1-"));
+    try std.testing.expect(!version_valid("0.7.1\n"));
+    try std.testing.expect(!version_valid("x\nformat bogus"));
+    try std.testing.expect(!version_valid("0.7.1-rc 1"));
+    try std.testing.expect(!version_valid("0..1"));
+    try std.testing.expect(!version_valid(".7.1"));
+}
+
+test "version_valid is bounded" {
+    const at_bound = "1.2.3-" ++ "a" ** (version_length_max - 6);
+    try std.testing.expect(version_valid(at_bound));
+    try std.testing.expect(!version_valid(at_bound ++ "a"));
+}
+
+test "check_notarize refuses ad hoc" {
+    try std.testing.expectEqual(@as(?Refusal, .adhoc_notarize), check_notarize("-", true));
+    try std.testing.expectEqual(@as(?Refusal, null), check_notarize("-", false));
+    try std.testing.expectEqual(@as(?Refusal, null), check_notarize(default_identity, true));
+}
+
+test "check_zip_listing wants exactly the stem with its three files" {
+    const stem = "nerva-v0.7.1-universal-macos";
+    const good = stem ++ "/\n" ++ stem ++ "/nerva\n" ++ stem ++ "/LICENSE\n" ++ stem ++ "/NOTICE\n";
+    try std.testing.expectEqual(@as(?Refusal, null), check_zip_listing(good, stem));
+    try std.testing.expectEqual(
+        @as(?Refusal, null),
+        check_zip_listing(stem ++ "/nerva\n" ++ stem ++ "/NOTICE\n" ++ stem ++ "/LICENSE\n", stem),
+    );
+    try std.testing.expectEqual(
+        @as(?Refusal, .zip_layout_wrong),
+        check_zip_listing(good ++ "__MACOSX/\n__MACOSX/" ++ stem ++ "/._nerva\n", stem),
+    );
+    try std.testing.expectEqual(
+        @as(?Refusal, .zip_layout_wrong),
+        check_zip_listing(good ++ stem ++ "/._nerva\n", stem),
+    );
+    try std.testing.expectEqual(
+        @as(?Refusal, .zip_layout_wrong),
+        check_zip_listing(stem ++ "/nerva\n" ++ stem ++ "/LICENSE\n", stem),
+    );
+    try std.testing.expectEqual(
+        @as(?Refusal, .zip_layout_wrong),
+        check_zip_listing(good ++ stem ++ "/nerva\n", stem),
+    );
+    try std.testing.expectEqual(
+        @as(?Refusal, .zip_layout_wrong),
+        check_zip_listing(stem ++ "x/nerva\n", stem),
+    );
 }
