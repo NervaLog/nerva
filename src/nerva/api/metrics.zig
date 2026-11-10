@@ -414,9 +414,11 @@ pub fn init_reason(err: anyerror) []const u8 {
 /// Sends windows over UDP. The socket is non-blocking: a window never waits for the network.
 pub const Emitter = struct {
     socket: posix.socket_t,
-    /// Where the metrics go. Every send names it, so a socket whose `connect` found no route
-    /// still sends (P176d).
+    /// Where the metrics go. A socket whose `connect` found no route is not connected and names
+    /// it on every send (P176d); a connected one sends without it (macOS refuses an address
+    /// on a connected socket with EISCONN).
     destination: std.net.Address,
+    connected: bool,
     tags: [tags_size_max]u8,
     tags_len: usize,
     timer: std.time.Timer,
@@ -448,13 +450,17 @@ pub const Emitter = struct {
         errdefer posix.close(socket);
         // Connecting only checks that the address can be sent to at all.
         const size = address_std.getOsSockLen();
+        var connected = true;
         posix.connect(socket, &address_std.any, size) catch |err| switch (err) {
-            error.NetworkUnreachable, error.ConnectionRefused, error.ConnectionTimedOut => {},
+            error.NetworkUnreachable, error.ConnectionRefused, error.ConnectionTimedOut => {
+                connected = false;
+            },
             else => return err,
         };
         var emitter: Emitter = .{
             .socket = socket,
             .destination = address_std,
+            .connected = connected,
             .tags = undefined,
             .tags_len = 0,
             .timer = try std.time.Timer.start(),
@@ -497,7 +503,11 @@ pub const Emitter = struct {
         timings_now: *OperationTimings,
         observed: Observed,
     ) void {
-        var sink: UdpSink = .{ .socket = emitter.socket, .destination = &emitter.destination };
+        var sink: UdpSink = .{
+            .socket = emitter.socket,
+            .destination = &emitter.destination,
+            .connected = emitter.connected,
+        };
         emitter.tick_to(counters, timings_now, observed, &sink);
     }
 
@@ -538,24 +548,30 @@ pub const Emitter = struct {
     const UdpSink = struct {
         socket: posix.socket_t,
         destination: *const std.net.Address,
+        connected: bool,
 
-        /// Every refusal is a dropped packet: `posix.send` would make a refused or unreachable
-        /// destination `unreachable`, a panic ten seconds after start with no collector (M1).
-        /// `std.posix.MSG` is `void` on macOS, which has no `MSG_NOSIGNAL` (a datagram socket
-        /// raises no SIGPIPE there anyway) and whose `MSG_DONTWAIT` is 0x80 (`<sys/socket.h>`).
+        /// `MSG_DONTWAIT` on Darwin (`<sys/socket.h>`); `std.posix.MSG` is `void` there.
+        const darwin_msg_dontwait: u32 = 0x80;
+
+        /// Every errno is a dropped packet: `posix.sendto` would make a refused or unreachable
+        /// destination `unreachable`, a panic ten seconds after start with no collector (M1),
+        /// and a connected socket given an address `unreachable` on macOS (EISCONN). A connected
+        /// socket sends without an address; one whose `connect` found no route names it.
+        /// macOS has no `MSG_NOSIGNAL`; a datagram socket raises no SIGPIPE there anyway.
         fn send(sink: *UdpSink, bytes: []const u8) bool {
-            const flags: u32 = if (builtin.os.tag == .linux)
-                posix.MSG.DONTWAIT | posix.MSG.NOSIGNAL
+            const flags: u32 = switch (builtin.os.tag) {
+                .linux => posix.MSG.DONTWAIT | posix.MSG.NOSIGNAL,
+                .macos, .ios, .tvos, .watchos, .visionos => darwin_msg_dontwait,
+                else => @compileError("statsd send: unsupported OS"),
+            };
+            const address: ?*const posix.sockaddr = if (sink.connected)
+                null
             else
-                0x80;
-            const sent = posix.sendto(
-                sink.socket,
-                bytes,
-                flags,
-                &sink.destination.any,
-                sink.destination.getOsSockLen(),
-            ) catch return false;
-            return sent == bytes.len;
+                &sink.destination.any;
+            const size: posix.socklen_t = if (sink.connected) 0 else sink.destination.getOsSockLen();
+            const result = posix.system.sendto(sink.socket, bytes.ptr, bytes.len, flags, address, size);
+            if (posix.errno(result) != .SUCCESS) return false;
+            return result == bytes.len;
         }
     };
 };
