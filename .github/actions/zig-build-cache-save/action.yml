@@ -1,11 +1,11 @@
 name: Save Zig's build cache
 description: >
-  The last step of a job that used ./.github/actions/zig-cache: saves the cache, with the same
+  The last step of a job that used ./.github/actions/zig-build-cache: saves the cache, with the same
   key, only on a push to main (a release's call of ci.yml is one) and only if the job so far
   succeeded. A pull request, from a fork or not, never saves.
 inputs:
   name:
-    description: The same name the job gave ./.github/actions/zig-cache.
+    description: The same name the job gave ./.github/actions/zig-build-cache.
     required: true
 runs:
   using: composite

@@ -6,7 +6,7 @@
 # others (N57).
 #
 # Zig's build cache (P285). Every job that compiles Nerva restores ~/.cache/zig and .zig-cache
-# (./.github/actions/zig-cache) and saves them as its last step (./.github/actions/zig-cache-save).
+# (./.github/actions/zig-build-cache) and saves them as its last step (./.github/actions/zig-build-cache-save).
 # The key is the job, the OS, the hash of zig/download.sh (the pinned Zig), build.zig and src/**;
 # a restore without an exact hit takes the newest entry of the same job and Zig, and Zig's
 # content-addressed cache recompiles only what the change touched. Only a push to main saves (a
@@ -137,7 +137,7 @@ jobs:
         run: eval "$INSTALL_ZIG"
 
       # Zig's build cache: restored everywhere, saved by the last step on a push to main only.
-      - uses: ./.github/actions/zig-cache
+      - uses: ./.github/actions/zig-build-cache
         if: needs.changes.outputs.code != 'false'
         with:
           name: check
@@ -176,7 +176,7 @@ jobs:
         if: needs.changes.outputs.code != 'false'
         run: ./zig/zig build test:views
 
-      - uses: ./.github/actions/zig-cache-save
+      - uses: ./.github/actions/zig-build-cache-save
         if: needs.changes.outputs.code != 'false'
         with:
           name: check
@@ -207,7 +207,7 @@ jobs:
         run: eval "$INSTALL_ZIG"
 
       # Zig's build cache: restored everywhere, saved by the last step on a push to main only.
-      - uses: ./.github/actions/zig-cache
+      - uses: ./.github/actions/zig-build-cache
         if: needs.changes.outputs.code != 'false'
         with:
           name: integration
@@ -216,7 +216,7 @@ jobs:
         if: needs.changes.outputs.code != 'false'
         run: ./zig/zig build test:integration
 
-      - uses: ./.github/actions/zig-cache-save
+      - uses: ./.github/actions/zig-build-cache-save
         if: needs.changes.outputs.code != 'false'
         with:
           name: integration
@@ -246,7 +246,7 @@ jobs:
         run: eval "$INSTALL_ZIG"
 
       # Zig's build cache: restored everywhere, saved by the last step on a push to main only.
-      - uses: ./.github/actions/zig-cache
+      - uses: ./.github/actions/zig-build-cache
         if: needs.changes.outputs.code != 'false'
         with:
           name: api
@@ -255,7 +255,7 @@ jobs:
         if: needs.changes.outputs.code != 'false'
         run: ./zig/zig build test:api
 
-      - uses: ./.github/actions/zig-cache-save
+      - uses: ./.github/actions/zig-build-cache-save
         if: needs.changes.outputs.code != 'false'
         with:
           name: api
@@ -285,7 +285,7 @@ jobs:
         run: eval "$INSTALL_ZIG"
 
       # Zig's build cache: restored everywhere, saved by the last step on a push to main only.
-      - uses: ./.github/actions/zig-cache
+      - uses: ./.github/actions/zig-build-cache
         if: needs.changes.outputs.code != 'false'
         with:
           name: releases
@@ -294,7 +294,7 @@ jobs:
         if: needs.changes.outputs.code != 'false'
         run: ./zig/zig build test:release
 
-      - uses: ./.github/actions/zig-cache-save
+      - uses: ./.github/actions/zig-build-cache-save
         if: needs.changes.outputs.code != 'false'
         with:
           name: releases
@@ -333,7 +333,7 @@ jobs:
         run: eval "$INSTALL_ZIG"
 
       # Zig's build cache: restored everywhere, saved by the last step on a push to main only.
-      - uses: ./.github/actions/zig-cache
+      - uses: ./.github/actions/zig-build-cache
         if: needs.changes.outputs.code != 'false'
         with:
           name: targets
@@ -345,7 +345,7 @@ jobs:
             ./zig/zig build check -Dtarget="$target"
           done
 
-      - uses: ./.github/actions/zig-cache-save
+      - uses: ./.github/actions/zig-build-cache-save
         if: needs.changes.outputs.code != 'false'
         with:
           name: targets
@@ -404,7 +404,7 @@ jobs:
         run: eval "$INSTALL_ZIG"
 
       # Zig's build cache: restored everywhere, saved by the last step on a push to main only.
-      - uses: ./.github/actions/zig-cache
+      - uses: ./.github/actions/zig-build-cache
         if: needs.changes.outputs.code != 'false'
         with:
           name: unit
@@ -416,7 +416,7 @@ jobs:
         if: needs.changes.outputs.code != 'false'
         run: ./zig/zig build test:unit
 
-      - uses: ./.github/actions/zig-cache-save
+      - uses: ./.github/actions/zig-build-cache-save
         if: needs.changes.outputs.code != 'false'
         with:
           name: unit
@@ -449,7 +449,7 @@ jobs:
         run: eval "$INSTALL_ZIG"
 
       # Zig's build cache: restored everywhere, saved by the last step on a push to main only.
-      - uses: ./.github/actions/zig-cache
+      - uses: ./.github/actions/zig-build-cache
         if: needs.changes.outputs.code != 'false'
         with:
           name: fuzz
@@ -458,7 +458,7 @@ jobs:
         if: needs.changes.outputs.code != 'false'
         run: ./zig/zig build fuzz -- smoke
 
-      - uses: ./.github/actions/zig-cache-save
+      - uses: ./.github/actions/zig-build-cache-save
         if: needs.changes.outputs.code != 'false'
         with:
           name: fuzz
@@ -503,7 +503,7 @@ jobs:
         run: eval "$INSTALL_ZIG"
 
       # Zig's build cache: restored everywhere, saved by the last step on a push to main only.
-      - uses: ./.github/actions/zig-cache
+      - uses: ./.github/actions/zig-build-cache
         if: needs.changes.outputs.code != 'false'
         with:
           name: demo
@@ -516,7 +516,7 @@ jobs:
         if: needs.changes.outputs.code != 'false'
         run: python3 tests/demo/${{ matrix.demo }} zig-out/bin/nerva --seconds=75
 
-      - uses: ./.github/actions/zig-cache-save
+      - uses: ./.github/actions/zig-build-cache-save
         if: needs.changes.outputs.code != 'false'
         with:
           name: demo
@@ -548,7 +548,7 @@ jobs:
         run: eval "$INSTALL_ZIG"
 
       # Zig's build cache: restored everywhere, saved by the last step on a push to main only.
-      - uses: ./.github/actions/zig-cache
+      - uses: ./.github/actions/zig-build-cache
         if: needs.changes.outputs.code != 'false'
         with:
           name: demo_r5
@@ -557,7 +557,7 @@ jobs:
         if: needs.changes.outputs.code != 'false'
         run: ./zig/zig build -Drelease demo-r5
 
-      - uses: ./.github/actions/zig-cache-save
+      - uses: ./.github/actions/zig-build-cache-save
         if: needs.changes.outputs.code != 'false'
         with:
           name: demo_r5
@@ -590,7 +590,7 @@ jobs:
         run: eval "$INSTALL_ZIG"
 
       # Zig's build cache: restored everywhere, saved by the last step on a push to main only.
-      - uses: ./.github/actions/zig-cache
+      - uses: ./.github/actions/zig-build-cache
         if: needs.changes.outputs.code != 'false'
         with:
           name: demo_r4
@@ -599,7 +599,7 @@ jobs:
         if: needs.changes.outputs.code != 'false'
         run: ./zig/zig build -Drelease demo-r4
 
-      - uses: ./.github/actions/zig-cache-save
+      - uses: ./.github/actions/zig-build-cache-save
         if: needs.changes.outputs.code != 'false'
         with:
           name: demo_r4
@@ -634,7 +634,7 @@ jobs:
         run: eval "$INSTALL_ZIG"
 
       # Zig's build cache: restored everywhere, saved by the last step on a push to main only.
-      - uses: ./.github/actions/zig-cache
+      - uses: ./.github/actions/zig-build-cache
         if: needs.changes.outputs.code != 'false'
         with:
           name: vopr
@@ -649,7 +649,7 @@ jobs:
           echo "### VOPR seed \`$seed\`" >> "$GITHUB_STEP_SUMMARY"
           ./zig/zig build vopr -- "$seed"
 
-      - uses: ./.github/actions/zig-cache-save
+      - uses: ./.github/actions/zig-build-cache-save
         if: needs.changes.outputs.code != 'false'
         with:
           name: vopr
@@ -686,7 +686,7 @@ jobs:
         run: eval "$INSTALL_ZIG"
 
       # Zig's build cache: restored everywhere, saved by the last step on a push to main only.
-      - uses: ./.github/actions/zig-cache
+      - uses: ./.github/actions/zig-build-cache
         if: needs.changes.outputs.code != 'false'
         with:
           name: vopr_main
@@ -705,7 +705,7 @@ jobs:
         if: needs.changes.outputs.code != 'false' && (matrix.lane != 'fixed')
         run: .github/scripts/fuzz_loop.sh vopr nerva 6
 
-      - uses: ./.github/actions/zig-cache-save
+      - uses: ./.github/actions/zig-build-cache-save
         if: needs.changes.outputs.code != 'false'
         with:
           name: vopr_main
