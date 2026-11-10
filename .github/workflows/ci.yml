@@ -358,32 +358,39 @@ jobs:
           done
 
   # Nerva on a Mac (#278, v0.7.1 slice 2). GitHub's hosted macOS runners are free for a public
-  # repository, and the job runs ad hoc: it holds no Apple secret. Each leg builds both macOS
-  # targets (ReleaseSafe, as release.yml builds them), joins them with `lipo` into a universal
-  # binary, and runs tests/macos/smoke.py on its own architecture's thin binary and on the
-  # universal one. The arm64 leg then builds and runs `test:unit` natively. Zig's linker signs
-  # aarch64-macos output ad hoc; the x86_64 binary and the universal one are signed here with
-  # `codesign -s -`, which is what `zig build mac-release -Dsign-identity=-` will do (slice 3, #291):
-  # see the marked step below.
-  macos:
+  # repository, and the jobs run ad hoc: they hold no Apple secret. `macos-arm64` (the faster
+  # runner) cross-compiles both macOS targets once, ReleaseSafe as release.yml builds them, and
+  # joins them with `lipo` into a universal binary; it signs only that one ad hoc, as
+  # `mac-release` will, since lipo invalidates the arm64 slice's signature. The thin binaries are
+  # left as the linker wrote them, which is how release.yml ships them (arm64 ad hoc, x86_64
+  # unsigned). It smoke-tests the arm64 thin binary and the universal one natively, then runs
+  # `test:unit`, and uploads the three binaries. `macos-x86_64` (an Intel runner) downloads them
+  # and only runs tests/macos/smoke.py on the x86_64 thin and the universal binary, so the
+  # ReleaseSafe builds are not repeated on the critical path (P293).
+  #
+  # Follow-up (slice 7, not here): swapping the lipo for `zig build -Drelease mac-release` needs
+  # a local tag `v<VERSION>` on a clean tree (#291's preflight refuses otherwise, even ad hoc),
+  # and its output outside the checkout. Slice 7 decides that.
+  macos-arm64:
     needs: changes
     if: ${{ !cancelled() }}
-    name: macOS (${{ matrix.arch }})
-    runs-on: ${{ matrix.os }}
+    name: macOS (arm64)
+    runs-on: macos-15
     timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: macos-15
-            arch: arm64
-          - os: macos-15-intel
-            arch: x86_64
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         if: needs.changes.outputs.code != 'false'
         with:
           persist-credentials: false
+
+      # The toolchain, cached as the Linux jobs do (download.sh finds zig/zig and skips).
+      - uses: actions/cache@v4
+        if: needs.changes.outputs.code != 'false'
+        with:
+          path: |
+            zig/zig
+            zig/lib
+          key: nerva-toolchain-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('zig/download.sh') }}
 
       - name: Install the pinned Zig
         if: needs.changes.outputs.code != 'false'
@@ -392,53 +399,90 @@ jobs:
       - uses: ./.github/actions/zig-build-cache
         if: needs.changes.outputs.code != 'false'
         with:
-          name: macos_${{ matrix.arch }}
+          name: macos_arm64
 
+      # Outputs go to $RUNNER_TEMP/macos-out/<name>/nerva, outside the tree, and named `nerva`
+      # so that codesign's ad hoc identifier is the release's.
       - name: Build both targets and join them with lipo
         if: needs.changes.outputs.code != 'false'
         run: |
           set -eu
-          mkdir -p macos-out
+          out="$RUNNER_TEMP/macos-out"
+          mkdir -p "$out/aarch64-macos" "$out/x86_64-macos" "$out/universal"
           for target in aarch64-macos x86_64-macos; do
             ./zig/zig build -Drelease -Dtarget="$target"
-            cp zig-out/bin/nerva "macos-out/nerva-$target"
+            cp zig-out/bin/nerva "$out/$target/nerva"
           done
-          lipo -create macos-out/nerva-aarch64-macos macos-out/nerva-x86_64-macos -output macos-out/nerva-universal
-          archs=$(lipo -archs macos-out/nerva-universal)
+          lipo -create "$out/aarch64-macos/nerva" "$out/x86_64-macos/nerva" -output "$out/universal/nerva"
+          archs=$(lipo -archs "$out/universal/nerva")
           echo "lipo -archs: $archs"
           [ "$archs" = "x86_64 arm64" ]
-          # Ad hoc: lipo invalidates the arm64 slice's signature and x86_64 has none.
-          codesign --force -s - macos-out/nerva-x86_64-macos macos-out/nerva-universal
-          chmod +x macos-out/nerva-*
+          # Only the universal binary is signed: lipo invalidates the arm64 slice's signature.
+          codesign --force -s - "$out/universal/nerva"
+          chmod +x "$out"/*/nerva
 
-      - name: Smoke test, thin binary of this architecture
+      - name: Smoke test, thin binary (arm64, signed by the linker)
         if: needs.changes.outputs.code != 'false'
-        run: |
-          if [ "${{ matrix.arch }}" = arm64 ]; then thin=aarch64-macos; else thin=x86_64-macos; fi
-          python3 tests/macos/smoke.py "macos-out/nerva-$thin" --arch ${{ matrix.arch }}
+        run: python3 tests/macos/smoke.py "$RUNNER_TEMP/macos-out/aarch64-macos/nerva" --arch arm64 --expect-signature adhoc
 
-      # Follow-up (#291): once `zig build mac-release` is on main, build the universal binary with
-      # `./zig/zig build mac-release -Dsign-identity=-` instead of the lipo above, and run this
-      # step on zig-out/mac-release/nerva-v<VERSION>-universal-macos/nerva.
       - name: Smoke test, universal binary
         if: needs.changes.outputs.code != 'false'
-        run: python3 tests/macos/smoke.py macos-out/nerva-universal --arch ${{ matrix.arch }}
+        run: python3 tests/macos/smoke.py "$RUNNER_TEMP/macos-out/universal/nerva" --arch arm64 --expect-signature adhoc
 
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: needs.changes.outputs.code != 'false'
+        with:
+          name: macos-binaries
+          path: ${{ runner.temp }}/macos-out
+          retention-days: 3
+
+      # `--summary all` lists every step; the tests that skip off Linux (preflight's missing file
+      # and held lock, io/test.zig's, and `benchmark.perf: usage example`) are in the PR.
       - name: Unit tests, native
-        if: needs.changes.outputs.code != 'false' && matrix.arch == 'arm64'
-        run: ./zig/zig build test:unit
+        if: needs.changes.outputs.code != 'false'
+        run: ./zig/zig build test:unit --summary all
 
       - uses: ./.github/actions/zig-build-cache-save
         if: needs.changes.outputs.code != 'false'
         with:
-          name: macos_${{ matrix.arch }}
+          name: macos_arm64
+
+  macos-x86_64:
+    needs: [changes, macos-arm64]
+    if: ${{ !cancelled() && needs.macos-arm64.result == 'success' }}
+    name: macOS (x86_64)
+    runs-on: macos-15-intel
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        if: needs.changes.outputs.code != 'false'
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        if: needs.changes.outputs.code != 'false'
+        with:
+          name: macos-binaries
+          path: ${{ runner.temp }}/macos-out
+
+      # The thin x86_64 binary is run as release.yml ships it: unsigned, whatever codesign says
+      # is recorded. The universal binary is the ad hoc signed one the arm64 job made.
+      - name: Smoke test, thin binary (x86_64, as shipped)
+        if: needs.changes.outputs.code != 'false'
+        run: |
+          chmod +x "$RUNNER_TEMP"/macos-out/*/nerva
+          python3 tests/macos/smoke.py "$RUNNER_TEMP/macos-out/x86_64-macos/nerva" --arch x86_64 --expect-signature any
+
+      - name: Smoke test, universal binary
+        if: needs.changes.outputs.code != 'false'
+        run: python3 tests/macos/smoke.py "$RUNNER_TEMP/macos-out/universal/nerva" --arch x86_64 --expect-signature adhoc
 
   # The required check's name (the ruleset cannot change here). It passes only if every split job
   # above succeeded: `always()` so that a failed, cancelled or skipped one still runs this job and
   # fails it, instead of leaving it skipped (which a ruleset may count as passing). A docs-only
   # pull request: each split job runs and skips its steps, so each is `success`, and so is this.
   system:
-    needs: [checks, integration, api, releases, targets, macos]
+    needs: [checks, integration, api, releases, targets, macos-arm64, macos-x86_64]
     if: ${{ always() }}
     name: check, integration, API, views
     runs-on: ubuntu-24.04

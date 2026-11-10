@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """The macOS smoke test (docs/briefs/v0.7.1.md, slice 2; #278): a release binary, run for real.
 
-Usage: smoke.py <nerva> [--arch arm64|x86_64]
+Usage: smoke.py <nerva> --arch arm64|x86_64 --expect-signature adhoc|developer-id|none|any
 
 Runs on a Mac, on the thin binary of the runner's architecture and again on the universal one,
-and holds no secret. Seven steps, one line each; the last line is `macos-smoke: PASS` or
+and holds no secret. Eight steps, one line each; the last line is `macos-smoke: PASS` or
 `macos-smoke: FAIL step N: ...`.
 
- 1  `codesign -dv`: arm64 must be ad hoc signed; what x86_64 shows is recorded, not judged
+ 0  the host: `--arch` must be the machine's own architecture, not run under Rosetta, so the
+    slice of a universal binary that runs is the one named
+ 1  `codesign -dv` is recorded and must show `--expect-signature` (`any` records only)
  2  `nerva version`
  3  format three replicas with `--development` in a temporary directory and start them
  4  `nerva api --statsd=127.0.0.1:<port>` against a UDP listener of this script
@@ -18,8 +20,8 @@ and holds no secret. Seven steps, one line each; the last line is `macos-smoke: 
 import http.client
 import json
 import os
-import platform
 import re
+import select
 import shutil
 import signal
 import socket
@@ -75,16 +77,39 @@ def ok(port, method, target, body=None, seconds=120):
         time.sleep(0.3)
 
 
-def step_1_codesign(nerva, arch):
+def sysctl(name):
+    result = subprocess.run(["sysctl", "-n", name], capture_output=True, text=True, timeout=30)
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def step_0_host(arch):
     if sys.platform != "darwin":  # Only so that the script can be tried on a Linux build.
+        say("host: skipped, not macOS")
+        return
+    # Not platform.machine(): a translated Python reports x86_64 on an Apple-silicon Mac.
+    host = "arm64" if sysctl("hw.optional.arm64") == "1" else "x86_64"
+    translated = sysctl("sysctl.proc_translated") == "1"
+    assert not translated, "this script runs under Rosetta, so no x86_64 slice runs natively"
+    assert host == arch, f"--arch {arch} but this Mac is {host}: the {arch} slice would not run"
+    say(f"host: {host}, not translated; the {arch} slice runs natively")
+
+
+def step_1_codesign(nerva, arch, expect):
+    if sys.platform != "darwin":
         say("codesign: skipped, not macOS")
         return
     result = subprocess.run(["codesign", "-dv", nerva], capture_output=True, text=True)
     shown = result.stderr.strip().replace("\n", " | ")
-    signature = re.search(r"Signature=(\S+)", result.stderr)
-    if arch == "arm64":
-        assert signature and signature.group(1) == "adhoc", f"arm64 must be ad hoc: {shown}"
-    say(f"codesign: {signature.group(1) if signature else 'no signature'} ({arch})")
+    if "Authority=Developer ID Application" in result.stderr:
+        found = "developer-id"
+    elif "Signature=adhoc" in result.stderr:
+        found = "adhoc"
+    elif "not signed at all" in result.stderr:
+        found = "none"
+    else:
+        found = "unrecognised"
+    assert expect == "any" or found == expect, f"expected {expect}, found {found}: {shown}"
+    say(f"codesign: {found}, expected {expect} ({arch})")
     print(f"  codesign -dv: {shown}", flush=True)
 
 
@@ -144,8 +169,9 @@ class Smoke:
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=open(log, "w"),
             env={**os.environ, "NERVA_KEY": KEY}, text=True)
         self.processes.append(("api", process))
-        line = process.stdout.readline()
-        assert line, f"nerva api exited: {open(log, errors='replace').read()[-2000:]}"
+        ready, _, _ = select.select([process.stdout], [], [], 60)
+        line = process.stdout.readline() if ready else ""
+        assert line, f"nerva api printed no port in 60 s: {open(log, errors='replace').read()[-2000:]}"
         return int(line)
 
     def stop_all(self):
@@ -169,7 +195,7 @@ class Smoke:
                 process.wait()
 
 
-def run(nerva, arch):
+def run(nerva, arch, expect_signature):
     global step_number
     nerva = os.path.abspath(nerva)
     statsd = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -177,8 +203,10 @@ def run(nerva, arch):
     tmp = tempfile.mkdtemp(prefix="nerva-macos-smoke-")
     smoke = Smoke(nerva, tmp)
     try:
+        step_number = 0
+        step_0_host(arch)
         step_number = 1
-        step_1_codesign(nerva, arch)
+        step_1_codesign(nerva, arch, expect_signature)
         step_number = 2
         step_2_version(nerva)
 
@@ -224,10 +252,14 @@ def run(nerva, arch):
         smoke.stop_all()
         for index in range(REPLICAS):
             assert "panic" not in smoke.log(index), smoke.log(index)[-2000:]
-        leftover = sorted(name for name in os.listdir(tmp)
-                          if not re.fullmatch(r"0_(\d|api)\.(nerva|log|nerva\.log)", name))
-        assert not leftover, f"files left behind: {leftover}"
-        say("every process stopped on SIGTERM, none panicked, no stray file")
+        api_log = open(os.path.join(tmp, "0_api.log"), errors="replace").read()
+        assert "panic" not in api_log, api_log[-2000:]
+        expected = {f"0_{i}.nerva{suffix}" for i in range(REPLICAS) for suffix in ("", ".log")}
+        expected.add("0_api.log")
+        found = set(os.listdir(tmp))
+        assert found == expected, f"files left behind: {sorted(found - expected)}, " \
+            f"missing: {sorted(expected - found)}"
+        say("every process stopped on SIGTERM, none panicked, only the expected files")
     finally:
         smoke.kill_all()
         statsd.close()
@@ -236,14 +268,18 @@ def run(nerva, arch):
 
 def main():
     args = sys.argv[1:]
-    arch = platform.machine().replace("aarch64", "arm64")
-    if "--arch" in args:
-        index = args.index("--arch")
-        arch = args[index + 1]
-        del args[index:index + 2]
-    assert len(args) == 1, __doc__
+    options = {}
+    for name in ("--arch", "--expect-signature"):
+        if name in args:
+            index = args.index(name)
+            options[name] = args[index + 1]
+            del args[index:index + 2]
+    arch = options.get("--arch", "")
+    expect = options.get("--expect-signature", "")
+    assert len(args) == 1 and arch in ("arm64", "x86_64") \
+        and expect in ("adhoc", "developer-id", "none", "any"), __doc__
     try:
-        run(args[0], arch)
+        run(args[0], arch, expect)
     except BaseException as error:  # noqa: BLE001
         if not isinstance(error, AssertionError):
             traceback.print_exc()
