@@ -203,7 +203,10 @@ check_removed() {
 }
 """
 
+# Container images exclude /usr/share/doc from what dpkg and dnf unpack (ubuntu's
+# dpkg.cfg.d/excludes, a nodocs transaction flag); an installed machine does not, so lift both.
 DEB_FLOW = r"""
+rm -f /etc/dpkg/dpkg.cfg.d/*exclude*
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq > /dev/null
 cp /dist/@PKG@ /tmp/@PKG@
@@ -232,7 +235,7 @@ RPM_FLOW = r"""
 cp /dist/@PKG@ /tmp/@PKG@
 chmod 644 /tmp/@PKG@
 dnf_install() {
-    dnf install -y -q --setopt=install_weak_deps=False "$@" /tmp/@PKG@ > /tmp/dnf.out 2>&1
+    dnf install -y -q --setopt=install_weak_deps=False --setopt=tsflags= "$@" /tmp/@PKG@ > /tmp/dnf.out 2>&1
 }
 if dnf_install; then
     echo "FINDING: @IMAGE@ ($(rpm --version)) installed the unsigned rpm with its defaults"
@@ -258,6 +261,7 @@ echo "remove left /var/lib/nerva, /etc/nerva and the user"
 """
 
 DEB_FOREIGN = r"""
+rm -f /etc/dpkg/dpkg.cfg.d/*exclude*
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq > /dev/null
 cp /dist/@PKG@ /tmp/@PKG@
@@ -272,8 +276,8 @@ RPM_FOREIGN = r"""
 cp /dist/@PKG@ /tmp/@PKG@
 chmod 644 /tmp/@PKG@
 useradd --system --home-dir /nonexistent nerva
-if dnf install -y --setopt=install_weak_deps=False --no-gpgchecks /tmp/@PKG@ > /tmp/out 2>&1 ||
-    dnf install -y --setopt=install_weak_deps=False --nogpgcheck /tmp/@PKG@ > /tmp/out 2>&1; then
+if dnf install -y --setopt=install_weak_deps=False --setopt=tsflags= --no-gpgchecks /tmp/@PKG@ > /tmp/out 2>&1 ||
+    dnf install -y --setopt=install_weak_deps=False --setopt=tsflags= --nogpgcheck /tmp/@PKG@ > /tmp/out 2>&1; then
     echo "the install should have been refused"; exit 1
 fi
 """
@@ -297,7 +301,8 @@ def container(image, dist, repo, script, label):
         if line:
             print(f"    {line}")
     if result.returncode != 0:
-        sys.exit(f"FAIL: {image} {label}: exit {result.returncode}\n{result.stderr[-3000:]}")
+        tail = "\n".join(result.stderr.strip().split("\n")[-60:])
+        sys.exit(f"FAIL: {image} {label}: exit {result.returncode}\nstderr (last 60 lines):\n{tail}")
 
 
 def containers(images, dist, repo, version, require_line):
