@@ -303,8 +303,7 @@ error[NRV-E1106]: install.sh: unknown argument --bogus
 ```
 
 `--upgrade --uninstall` together is NRV-E1106 too (exit 1). NRV-E1102 exits 2 (it was run as root in a
-container with no systemd). The `fix` line of NRV-E1102 names `docs/QUICKSTART.md`, which this
-commit does not contain.
+container with no systemd). The `fix` line of NRV-E1102 names [QUICKSTART.md](QUICKSTART.md).
 
 Not run, from ERRORS.md:
 
@@ -325,3 +324,10 @@ Look the code up in ERRORS.md: its section is the first two digits (`NRV-E06xx` 
 [06xx](ERRORS.md#06xx--the-cluster-and-sessions)). A message with no code is a gap in Nerva's own
 error handling: today exits 3 and 6 above, and a damaged disk or write-ahead log. Report it on
 GitHub with the command, its output and `nerva version`.
+
+## Where to go next
+
+[INSTALL.md](INSTALL.md) and [QUICKSTART.md](QUICKSTART.md) install Nerva and run a first cluster.
+[OPERATING.md](OPERATING.md) is what a replica needs, what to alert on and how to upgrade.
+[SECURITY.md](../SECURITY.md) says what a `401` and a key protect, and [MATURITY.md](MATURITY.md)
+says what the alpha label promises.

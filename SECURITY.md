@@ -98,3 +98,9 @@ process's environment, holds the key; rotate after any exposure. The packaged un
 replicas and gateways as the same user, `nerva`, so a gateway on a replica's host can read that
 replica's `NERVA_CLUSTER_KEY` from its environment and its data file. Run gateways off the
 replicas' hosts, or as another user.
+
+## See also
+
+[docs/INSTALL.md](./docs/INSTALL.md#checking-a-download) (checking a download),
+[docs/OPERATING.md](./docs/OPERATING.md#production-checklist) (the production checklist, with keys and
+networks) and [docs/API.md](./docs/API.md#conventions) (the gateway's key and transport).

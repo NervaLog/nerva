@@ -56,3 +56,9 @@ reviewers' verdicts. Until then this section holds no numbers._
 GitHub issues on [NervaLog/nerva](https://github.com/NervaLog/nerva/issues). There is no SLA
 and no other support channel. A vulnerability goes through [SECURITY.md](../SECURITY.md), not
 an issue.
+
+## Where to go next
+
+[INSTALL.md](./INSTALL.md) and [QUICKSTART.md](./QUICKSTART.md) get a cluster running;
+[OPERATING.md](./OPERATING.md) says how to run it, back it up and upgrade it, and
+[TROUBLESHOOTING.md](./TROUBLESHOOTING.md) what to do when it refuses.

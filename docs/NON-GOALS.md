@@ -28,3 +28,6 @@ which milestone in [docs/PRODUCTION.md](./PRODUCTION.md) may change it. The labe
   ([README](../README.md#limits)). A constant of the replica, not a setting.
 - **Linux for production.** Production has run only on Linux (io_uring, Direct IO). macOS is for
   development and evaluation.
+
+See also [OPERATING.md](./OPERATING.md) for how to run Nerva within these limits and
+[TROUBLESHOOTING.md](./TROUBLESHOOTING.md) when one of them refuses a request.
