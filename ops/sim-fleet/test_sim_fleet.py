@@ -426,39 +426,75 @@ class Soak(unittest.TestCase):
         # The busiest worker's seconds: 1800 each time, never the two workers' sum.
         self.assertEqual((a["seconds"], a["rounds"]), (3 * 1800, 3))
         self.assertEqual((b["seconds"], b["rounds"]), (900, 1))
-        self.assertEqual(a["kinds"]["vopr-nerva"], {"seeds": 6, "failed": 3})
-        self.assertEqual(a["kinds"]["fuzz"], {"seeds": 3, "failed": 0})
-        self.assertEqual(b["kinds"]["vopr-testing"], {"seeds": 1, "failed": 0})
+        self.assertEqual(a["kinds"]["vopr-nerva"], {"seeds": 6, "failed": 3, "timeouts": 0, "host": 0})
+        self.assertEqual(a["kinds"]["fuzz"], {"seeds": 3, "failed": 0, "timeouts": 0, "host": 0})
+        self.assertEqual(b["kinds"]["vopr-testing"], {"seeds": 1, "failed": 0, "timeouts": 0, "host": 0})
 
     def test_the_soak_line_is_the_one_the_release_quotes(self):
         github, state = Recorder(), fleet.new_state()
         for i in range(2):
             ingest(self, github, state, soak_round(self, 3600), SHA_A, DAY_ONE + 60 * i)
         code, line, _ = soak(self, state, SHA_A)
-        self.assertEqual(code, 0)
+        self.assertEqual(code, 1)  # Not clean: two seeds failed.
         # The seed's own 134 failure is filed on the first round, so it is listed too.
         self.assertEqual(line, "soak 1a2b3c4: 2.0 h, vopr-nerva 4 seeds, vopr-testing 2, fuzz 2; "
-                               "2 failures; open sim-fleet issues against it: #101")
+                               "2 failures, 0 past the deadline, 0 killed by the host; "
+                               "sim-fleet issues its rounds hit: #101")
         # A prefix names the commit as well.
         self.assertEqual(soak(self, state, "1a2b3c4")[1], line)
 
     def test_a_commit_with_no_failure_says_none(self):
         github, state = Recorder(), fleet.new_state()
         rnd = Round(self)
-        rnd.seed(0, "vopr-nerva", 1, 0, seconds=90 * 60)
+        rnd.seed(0, "vopr-nerva", 1, 0, seconds=45 * 60)
+        rnd.seed(0, "vopr-nerva", 2, 0, seconds=45 * 60)
         ingest(self, github, state, rnd, SHA_A, DAY_ONE)
         code, line, _ = soak(self, state, SHA_A)
-        self.assertEqual((code, line), (0, "soak 1a2b3c4: 1.5 h, vopr-nerva 1 seeds, "
-                                           "vopr-testing 0, fuzz 0; 0 failures; "
-                                           "open sim-fleet issues against it: none"))
+        self.assertEqual((code, line), (0, "soak 1a2b3c4: 1.5 h, vopr-nerva 2 seeds, "
+                                           "vopr-testing 0, fuzz 0; 0 failures, 0 past "
+                                           "the deadline, 0 killed by the host; "
+                                           "sim-fleet issues its rounds hit: none"))
 
-    def test_an_open_fingerprint_last_reported_on_the_commit_is_listed(self):
+    def test_a_fingerprint_a_commit_hit_is_listed(self):
         github, state = Recorder(), fleet.new_state()
         ingest(self, github, state, soak_round(self), SHA_A, DAY_ONE)
         ingest(self, github, state, soak_round(self), SHA_B, DAY_ONE + 60)
-        self.assertIn("open sim-fleet issues against it: #101", soak(self, state, SHA_B)[1])
-        # Last reported on B, so no longer against A.
-        self.assertIn("open sim-fleet issues against it: none", soak(self, state, SHA_A)[1])
+        self.assertIn("sim-fleet issues its rounds hit: #101", soak(self, state, SHA_B)[1])
+        # The rounds of A hit it as well: the record is by round, not by last report.
+        self.assertIn("sim-fleet issues its rounds hit: #101", soak(self, state, SHA_A)[1])
+
+    def test_a_fingerprint_is_listed_though_no_report_was_posted(self):
+        github, state = Recorder(), fleet.new_state()
+        state["hold_until"] = DAY_ONE + 3600
+        ingest(self, github, state, soak_round(self), SHA_A, DAY_ONE)
+        self.assertEqual(github.opened if hasattr(github, "opened") else [], [])
+        code, line, _ = soak(self, state, SHA_A)
+        self.assertEqual(code, 1)
+        self.assertRegex(line, r"sim-fleet issues its rounds hit: not filed \([0-9a-f]{12}\)$")
+
+    def test_hung_and_killed_seeds_are_not_a_clean_soak(self):
+        github, state = Recorder(), fleet.new_state()
+        rnd = Round(self)
+        for seed in range(144):
+            rnd.seed(0, "vopr-nerva", seed, 124, seconds=600)
+        rnd.seed(1, "vopr-nerva", 999, 137, seconds=30)
+        ingest(self, github, state, rnd, SHA_A, DAY_ONE)
+        code, line, err = soak(self, state, SHA_A)
+        self.assertEqual(code, 1)
+        self.assertIn("0 failures, 144 past the deadline, 1 killed by the host", line)
+        self.assertIn("not clean", err)
+
+    def test_a_seed_counts_for_at_most_its_cap(self):
+        github, state = Recorder(), fleet.new_state()
+        rnd = Round(self)
+        rnd.seed(0, "fuzz:ewah", 3, 0, seconds=86400)
+        ingest(self, github, state, rnd, SHA_A, DAY_ONE)
+        self.assertEqual(state["commits"][SHA_A]["seconds"], fleet.SEED_SECONDS_MAX)
+        self.assertEqual(soak(self, state, SHA_A)[0], 0)
+
+    def test_hours_are_floored(self):
+        self.assertEqual(fleet.hours_text(86256), "23.9")
+        self.assertEqual(fleet.hours_text(86400), "24.0")
 
     def test_an_unknown_commit_is_0_hours_and_exit_1(self):
         github, state = Recorder(), fleet.new_state()
@@ -466,7 +502,8 @@ class Soak(unittest.TestCase):
         code, line, err = soak(self, state, "deadbee" + "0" * 33)
         self.assertEqual(code, 1)
         self.assertEqual(line, "soak deadbee: 0.0 h, vopr-nerva 0 seeds, vopr-testing 0, fuzz 0; "
-                               "0 failures; open sim-fleet issues against it: none")
+                               "0 failures, 0 past the deadline, 0 killed by the host; "
+                               "sim-fleet issues its rounds hit: none")
         self.assertIn("no rounds of deadbee", err)
 
     def test_a_prefix_of_two_commits_is_refused(self):
@@ -534,7 +571,8 @@ class Soak(unittest.TestCase):
                                             now=DAY_ONE + 900 * i), 0)
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            self.assertEqual(fleet.main(["soak", "--commit", SHA_A, "--state", state_path]), 0)
+            # Not clean (the rounds hold failing seeds), so exit 1; the line is what is quoted.
+            self.assertEqual(fleet.main(["soak", "--commit", SHA_A, "--state", state_path]), 1)
         self.assertTrue(out.getvalue().startswith("soak 1a2b3c4: 2.0 h, vopr-nerva 4 seeds, "))
 
 

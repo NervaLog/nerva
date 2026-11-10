@@ -216,7 +216,11 @@ the gate asks that the fleet ran it for 24 hours. The fleet counts that itself.
 `sim_fleet.py` and asserted) the state file keeps the hours its rounds ran, the seeds by kind
 (`vopr-nerva`, `vopr-testing`, `fuzz`) and the failing seeds. A round's hours are its busiest
 worker's seconds, summed from that worker's `results` file: the rounds' own records, never wall
-time, so a stopped fleet (the Jepsen window, a crash) adds nothing. Each daily tracker comment has
+time, so a stopped fleet (the Jepsen window, a crash) adds nothing. One seed counts for at most
+`SEED_SECONDS_MAX` (3600 s: a seed's deadline plus its replay), so a clock step cannot add hours;
+hours are floored to a tenth. The entry also keeps the seeds past their deadline and killed by the
+host, and the failure fingerprints its rounds hit (at most 64, the rest counted), whether or not a
+report was posted. Each daily tracker comment has
 a "Commits that ran" list, one line per commit that ran that day: its hours that day, its hours in
 all and its seeds that day. A state file written before this counting loads and starts counting
 from its next round; commits that ran before have no hours.
@@ -225,16 +229,19 @@ from its next round; commits that ran before have no hours.
 
 ```
 python3 -I /var/lib/sim-fleet/state/bin/$(cat /var/lib/sim-fleet/state/built)/sim_fleet.py soak --commit <SHA> --state /var/lib/sim-fleet/state/state.json
-soak 1a2b3c4: 24.6 h, vopr-nerva 182,311 seeds, vopr-testing 15,020, fuzz 9,874; 0 failures; open sim-fleet issues against it: none
+soak 1a2b3c4: 24.6 h, vopr-nerva 182,311 seeds, vopr-testing 15,020, fuzz 9,874; 0 failures, 0 past the deadline, 0 killed by the host; sim-fleet issues its rounds hit: none
 ```
 
 (The built commit's copy, or any checkout's `ops/sim-fleet/sim_fleet.py`, works: `soak` reads only the state file. `--commit`
-is the full SHA or a prefix of at least 7 hex digits.) Exit 0 if the commit ran, 1 if the state
-has no round of it (the line then says `0.0 h`) or the prefix names two commits, 2 if the state
-file is missing or unreadable. "Failures" counts failing seeds, not distinct bugs. "Open sim-fleet
-issues against it" lists every issue whose last report was this commit, from the state the
-reporter keeps; the state does not see a closed issue, so confirm each listed issue on GitHub
-(`label:sim-fleet is:open`) before quoting "none" or a list. The gate wants 24 hours and no open
+is the full SHA or a prefix of at least 7 hex digits.) Exit 0 if the commit ran and is clean; 1 if the state
+has no round of it (the line then says `0.0 h`), the prefix names two commits, or the commit is not
+clean: any failing seed, any seed past its deadline or killed by the host (a candidate that hangs
+its seeds is not clean, however many hours they fill), or any failure fingerprint hit; 2 if the
+state file is missing or unreadable. "Failures" counts failing seeds, not distinct bugs. "Issues
+its rounds hit" lists the issue of every failure fingerprint the commit's rounds hit, from the
+rounds' own records and so independent of throttling, a hold or a rate limit (`not filed (...)`
+is a failure whose report was not posted); the state does not see a closed issue, so confirm each
+listed issue on GitHub (`label:sim-fleet is:open`) before quoting it. The gate wants 24 hours and no open
 issue; the line does not decide that, the reader does.
 
 **Pointing the fleet at the candidate.** Set `SIM_FLEET_BRANCH` in `/etc/sim-fleet/fleet.env` to
@@ -254,10 +261,15 @@ restarts the service.
 1. Provision the host (docs/briefs/r1.md, "The host").
 2. Create the two tokens (R1 owner question 3): fleet Issues only; Jepsen Issues and Commit
    statuses.
-3. Run both `setup.sh` (trackers #177 and #266). **Run this one again after the change that adds
-   the counting merges** (P240: the host runs the installed copy of `sim_fleet.py`, which
-   `setup.sh` copies from the checkout; merging changes nothing on the host until then). A
-   `soak` run before that finds no `commits` and says `0.0 h`.
+3. Run both `setup.sh` (trackers #177 and #266). The fleet installs only `sim-fleet.service`
+   (P240 applies to `ops/jepsen/` only): it runs `run.sh` from its own checkout, and `run.sh` runs
+   the `sim_fleet.py` copied from the commit it built. So counting starts as soon as the fleet
+   builds a commit that contains it, and during the soak **the candidate's own `sim_fleet.py`
+   counts and files**: a candidate that changes the reporter grades itself. The owner confirms
+   `ops/sim-fleet/sim_fleet.py` is unchanged between the soak's commit and the reviewed one (or
+   notes the change in the release PR); `soak` itself can be run from a checkout of the last
+   release, since it reads only the state file. A `soak` run before any counted round finds no
+   `commits` and says `0.0 h`.
 4. Watch one full day on `main` (a tracker post from each).
 5. Run R2's canary (a scratch-branch fault, filed once, then commented on and not filed again).
 6. Run R1's teeth night (`--expect-invalid` on the keys-off build files one `jepsen` issue). A

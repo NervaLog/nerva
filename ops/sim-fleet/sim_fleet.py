@@ -25,10 +25,12 @@ stack frame is Nerva's when its path is under its `src/`.
 
 `soak` prints, from the state file alone, what the release gate asks of the fleet for one commit
 (the candidate of the release soak, ops/sim-fleet/README.md): the hours its rounds ran, the seeds
-by kind, the failing seeds, and the open issues whose last report is that commit. A round's hours
+by kind, the failing, deadline-hit and host-killed seeds, and the failures its rounds hit (with
+their issues). A seed counts for at most SEED_SECONDS_MAX seconds. A round's hours
 are its busiest worker's seconds (the sum of the `<seconds>` column of that worker's `results`),
-so they come from the rounds' own records and never from wall time. Exit 0 if the commit ran,
-1 if the state has no round of it (`0.0 h`).
+so they come from the rounds' own records and never from wall time. Exit 0 if the commit ran
+and is clean; 1 if the state has no round of it (`0.0 h`), or any seed of it failed, ran past its
+deadline or was killed by the host, or a rounds' failure fingerprint was hit.
 
 Exit codes: 0 done, 1 usage or bad input, 2 environment (state file, token, GitHub). The state is
 saved whenever it was read, whatever GitHub answered. Standard library only.
@@ -84,6 +86,9 @@ KINDS = ("vopr-nerva", "vopr-testing", "fuzz")  # What a soak line counts seeds 
 TARGET = re.compile(r"^(vopr-nerva|vopr-testing|fuzz:[a-z0-9_]{1,64})$")
 # Exit codes that are the host's, not the code's: counted, never filed. 124: past the per-seed
 # deadline (`timeout`); 125, 126: `timeout` or the exec failed; 137: SIGKILL, the OOM killer.
+# One seed's seconds count for at most this much: a seed's deadline (600 s VOPR, 900 s fuzz by
+# default) plus its replay (1800 s), rounded up. A clock step during a seed cannot add hours.
+SEED_SECONDS_MAX = 3600
 HOST_CODES = {124: "timeout", 125: "host", 126: "host", 137: "host"}
 
 PANIC = re.compile(r"(?:^|\s)panic: (.+)$")
@@ -297,7 +302,7 @@ def read_result(round_dir, worker, line, counts, source_root):
     count = counts.setdefault(target, {"seeds": 0, "failed": 0, "timeouts": 0, "host": 0})
     count["seeds"] += 1
     if hasattr(counts, "busy"):
-        counts.busy[worker] = counts.busy.get(worker, 0) + int(seconds)
+        counts.busy[worker] = counts.busy.get(worker, 0) + min(int(seconds), SEED_SECONDS_MAX)
     if code == 0:
         return None
     if code in HOST_CODES:
@@ -480,7 +485,8 @@ def commit_entry(entries, commit, sequence):
         while len(entries) >= COMMITS_KEPT:
             oldest = min(entries, key=lambda sha: entries[sha]["last"])
             del entries[oldest]
-        entry = {"last": sequence, "seconds": 0, "rounds": 0, "kinds": {}}
+        entry = {"last": sequence, "seconds": 0, "rounds": 0, "kinds": {}, "fingerprints": [],
+                 "dropped": 0}
         entries[commit] = entry
     entry["last"] = sequence
     assert len(entries) <= COMMITS_KEPT
@@ -491,9 +497,10 @@ def add_round(entry, counts):
     entry["rounds"] += 1
     entry["seconds"] += round_seconds(counts)
     for target, count in counts.items():
-        kind = entry["kinds"].setdefault(kind_of(target), {"seeds": 0, "failed": 0})
-        kind["seeds"] += count["seeds"]
-        kind["failed"] += count["failed"]
+        kind = entry["kinds"].setdefault(kind_of(target), {"seeds": 0, "failed": 0,
+                                                           "timeouts": 0, "host": 0})
+        for key in ("seeds", "failed", "timeouts", "host"):
+            kind[key] = kind.get(key, 0) + count[key]
     assert len(entry["kinds"]) <= len(KINDS)
 
 
@@ -509,6 +516,22 @@ def count_round(day, counts, commit, state=None):
         state["sequence"] += 1
         add_round(commit_entry(day.setdefault("commits", {}), commit, state["sequence"]), counts)
         add_round(commit_entry(state["commits"], commit, state["sequence"]), counts)
+
+
+def record_fingerprints(state, commit, groups):
+    """The failures a commit's rounds hit, whether or not a report was posted (a hold, a rate
+    limit or a day's cap stop reports, not this). Bounded by FAILURES_PER_DAY; the rest are
+    only counted."""
+    entry = state["commits"][commit]
+    for group in groups:
+        fingerprint = group[0]["fingerprint"]
+        if fingerprint in entry["fingerprints"]:
+            continue
+        if len(entry["fingerprints"]) >= FAILURES_PER_DAY:
+            entry["dropped"] += 1
+            continue
+        entry["fingerprints"].append(fingerprint)
+    assert len(entry["fingerprints"]) <= FAILURES_PER_DAY
 
 
 def see(day, fingerprint, seeds):
@@ -535,7 +558,7 @@ def remember(state, fingerprint, number, first_commit, last_commit):
 
 
 def hours_text(seconds):
-    return f"{seconds / 3600:.1f}"
+    return f"{seconds // 360 / 10:.1f}"  # Floor to a tenth: never more hours than ran.
 
 
 def seeds_of(entry):
@@ -543,21 +566,28 @@ def seeds_of(entry):
 
 
 def soak_line(state, commit):
-    """The line the release PR quotes, and whether the commit ran at all. `commit` is a full SHA
-    or a prefix of at least 7 hex digits; one that names two commits is not a commit."""
+    """The line the release PR quotes, whether the commit ran at all, and whether it is clean
+    (no failing, hung or killed seed, no failure fingerprint). `commit` is a full SHA or a prefix
+    of at least 7 hex digits; one that names two commits is not a commit."""
     matches = [sha for sha in state["commits"] if sha.startswith(commit)]
     entry = state["commits"][matches[0]] if len(matches) == 1 else \
-        {"seconds": 0, "kinds": {}}
+        {"seconds": 0, "kinds": {}, "fingerprints": [], "dropped": 0}
     kinds = [f"{kind} {entry['kinds'].get(kind, {}).get('seeds', 0):,}" +
              (" seeds" if index == 0 else "") for index, kind in enumerate(KINDS)]
-    failures = sum(kind["failed"] for kind in entry["kinds"].values())
-    open_issues = sorted(f["issue"] for f in state["filed"].values()
-                         if f["last_commit"] and (f["last_commit"].startswith(commit)
-                                                  or commit.startswith(f["last_commit"])))
-    issues = ", ".join(f"#{number}" for number in open_issues) or "none"
+    sums = {key: sum(kind.get(key, 0) for kind in entry["kinds"].values())
+            for key in ("failed", "timeouts", "host")}
+    hit = []
+    for fingerprint in entry.get("fingerprints", []):
+        filed = state["filed"].get(fingerprint)
+        hit.append(f"#{filed['issue']}" if filed else f"not filed ({fingerprint[:12]})")
+    if entry.get("dropped"):
+        hit.append(f"{entry['dropped']} more not listed")
     line = (f"soak {commit[:7]}: {hours_text(entry['seconds'])} h, {', '.join(kinds)}; "
-            f"{failures} failures; open sim-fleet issues against it: {issues}")
-    return line, len(matches) == 1 and entry["seconds"] > 0
+            f"{sums['failed']} failures, {sums['timeouts']} past the deadline, "
+            f"{sums['host']} killed by the host; sim-fleet issues its rounds hit: "
+            f"{', '.join(hit) or 'none'}")
+    ran = len(matches) == 1 and entry["seconds"] > 0
+    return line, ran, not (any(sums.values()) or hit)
 
 
 def totals_text(state, ymd_day, day):
@@ -739,6 +769,7 @@ def ingest(github, state, counts, failures, commit, tracker, now, log):
     day = day_of(state, today)
     count_round(day, counts, commit, state)
     groups = group_failures(failures)
+    record_fingerprints(state, commit, groups)
     seen = {group[0]["fingerprint"]: see(day, group[0]["fingerprint"], len(group))
             for group in groups}
     if state["hold_until"] > now:
@@ -847,11 +878,14 @@ def soak_main(args, log):
     if state is None:
         log(f"no state file at {args.state}")
         return 2
-    line, ran = soak_line(state, args.commit)
+    line, ran, clean = soak_line(state, args.commit)
     print(line, flush=True)
     if not ran:
         log(f"no rounds of {args.commit[:7]} in the state (or its prefix names two commits)")
-    return 0 if ran else 1
+    elif not clean:
+        log(f"{args.commit[:7]} is not clean: a seed failed, hung or was killed, or a failure "
+            f"was hit")
+    return 0 if ran and clean else 1
 
 
 def main(argv, now=None):
