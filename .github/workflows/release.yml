@@ -110,7 +110,9 @@ jobs:
           tar -xzf "dist/nerva-$TAG-x86_64-linux.tar.gz"
           "./nerva-$TAG-x86_64-linux/nerva" version | tee version.txt
           grep -q "+$(git rev-parse --short=7 HEAD)" version.txt
-          echo "BINARY_VERSION=$(sed 's/^Nerva version //' version.txt)" >> "$GITHUB_ENV"
+          # Only the first line: `nerva version` goes on to print release, format and bundles lines,
+          # which an env-file refuses.
+          echo "BINARY_VERSION=$(head -n1 version.txt | sed 's/^Nerva version //')" >> "$GITHUB_ENV"
 
       # Creates the tag on exactly this commit, then the release.
       - name: Publish

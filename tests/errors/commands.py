@@ -26,6 +26,13 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 from api import Cluster  # noqa: E402
 
 KEY = "errors-test-key"
+# The format digest of a `nerva` build (R6, P259b): what `nerva version` prints. It moves with any
+# change to a wire or storage layout (the state machine's, the message headers', the superblock's),
+# a tree id, the cluster config, the superblock version, the outputs of the pure key and id
+# derivations or `format_epoch` (src/nerva/format_digest.zig), and only then. Update it with the decision that
+# says what changed (docs/decisions/), beside `format_test.zig`'s snapshot.
+FORMAT_DIGEST = "a2d6e50b122836b2b596f8548a391e77c3b2beead93ee5e30939479601259362"
+VERSION_FIRST = re.compile(r"Nerva version (\d+\.\d+\.\d+)(\+[0-9a-f]{7})?(\+keys-off)?")
 RAW_NAME = re.compile(r"\berror\.[A-Z][A-Za-z0-9]+")
 LOG_LINE = re.compile(r"\d{4}-\d\d-\d\d ")
 TRACE = re.compile(r"panic|Stack trace|thread \d+|\.zig:\d+")
@@ -128,6 +135,7 @@ def main():
         check("missing required flag", ["format", "--replica=0", "--replica-count=3",
                                         data + ".z"], "NRV-E0001", 1, "--cluster")
         check("unexpected positional", ["version", "extra"], "NRV-E0001", 1, "extra")
+        check("unknown version flag", ["version", "--bogus"], "NRV-E0001", 1, "--bogus")
         check("as-of", ["export", "--cluster=0", "--addresses=127.0.0.1:1", "--as-of=0",
                         "--output=" + os.path.join(tmp, "x")], "NRV-E0001", 1, "--as-of")
         check("addresses", ["start", "--addresses=127.0.0.1:1,127.0.0.1:2", "--development",
@@ -232,7 +240,26 @@ def main():
         assert version.returncode == 0 and "keys-off" not in version.stdout, version.stdout
         version_off = run(nerva_off, ["version"])
         assert version_off.returncode == 0 and \
-            version_off.stdout.strip().endswith("+keys-off"), version_off.stdout
+            version_off.stdout.splitlines()[0].endswith("+keys-off"), version_off.stdout
+        # `version`'s text (R6): the first line is the one the release workflow reads; then what
+        # an upgrade compares. No binary bundles a past release yet (slice 3).
+        for binary_run in (version, version_off):
+            lines = binary_run.stdout.splitlines()
+            first = VERSION_FIRST.fullmatch(lines[0])
+            assert first, binary_run.stdout
+            assert lines[1:] == [
+                "release " + first[1],
+                "release_client_min 0.0.4",
+                "format " + FORMAT_DIGEST,
+                "bundles none",
+            ], binary_run.stdout
+        verbose = run(nerva, ["version", "--verbose"])
+        assert verbose.returncode == 0, verbose.stderr
+        lines = verbose.stdout.splitlines()
+        assert lines[:5] == version.stdout.splitlines(), verbose.stdout
+        assert lines[5:7] == ["format_epoch 1", "superblock_version 2"], verbose.stdout
+        assert re.fullmatch(r"commit ([0-9a-f]{40}|none)", lines[7]) and len(lines) == 8, \
+            verbose.stdout
         before = sha(data)
         check("start keys off without development",
               ["start", "--addresses=127.0.0.1:1,127.0.0.1:2,127.0.0.1:3", data],

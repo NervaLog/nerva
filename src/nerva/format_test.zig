@@ -25,143 +25,25 @@ const indexes = @import("indexes.zig");
 const documents = @import("documents.zig");
 const catalog = @import("catalog.zig");
 const export_file = @import("export_file.zig");
-
-/// The size, and each field's offset (or bit, for a packed struct), size and type, of a struct;
-/// or the tag type and every value of an enum.
-fn layout_render(writer: anytype, comptime T: type) !void {
-    switch (@typeInfo(T)) {
-        .@"struct" => |info| {
-            try writer.print("{s}: {s} struct, size {}\n", .{
-                @typeName(T),
-                @tagName(info.layout),
-                @sizeOf(T),
-            });
-            inline for (info.fields) |field| {
-                if (info.layout == .@"packed") {
-                    try writer.print("  {s}: bit {}, {} bits, {s}\n", .{
-                        field.name,
-                        @bitOffsetOf(T, field.name),
-                        @bitSizeOf(field.type),
-                        @typeName(field.type),
-                    });
-                } else {
-                    try writer.print("  {s}: offset {}, size {}, {s}\n", .{
-                        field.name,
-                        @offsetOf(T, field.name),
-                        @sizeOf(field.type),
-                        @typeName(field.type),
-                    });
-                }
-            }
-        },
-        .@"enum" => |info| {
-            try writer.print("{s}: enum({s}){s}\n", .{
-                @typeName(T),
-                @typeName(info.tag_type),
-                if (info.is_exhaustive) "" else ", non-exhaustive",
-            });
-            inline for (info.fields) |field| {
-                try writer.print("  {s} = {}\n", .{ field.name, field.value });
-            }
-        },
-        else => @compileError("not a struct or an enum: " ++ @typeName(T)),
-    }
-}
+const format_digest = @import("format_digest.zig");
 
 test "format: wire and storage layouts" {
     var out = std.ArrayList(u8).init(testing.allocator);
     defer out.deinit();
     const writer = out.writer();
 
-    inline for (.{
-        nerva.Row,
-        @FieldType(nerva.Row, "flags"),
-        nerva.Entry,
-        nerva.EntryKind,
-        nerva.EntryResult,
-        nerva.EntryStatus,
-        nerva.Add,
-        @FieldType(nerva.Add, "flags"),
-        nerva.Add.AddField,
-        nerva.RowKey,
-        nerva.RowValue,
-        @FieldType(nerva.RowValue, "flags"),
-        nerva.Change,
-        @FieldType(nerva.Change, "flags"),
-        nerva.ChangeKind,
-        nerva.ChangesFilter,
-        nerva.HistoryFilter,
-        nerva.Operation,
-        documents.Header,
-        documents.Header.Flags,
-        // Views maintained by the state machine (N52): stored in the views and groups trees, and
-        // declared and read over the wire.
-        nerva.FieldKind,
-        nerva.FieldRef,
-        nerva.Comparison,
-        nerva.AggregateFunction,
-        nerva.Where,
-        nerva.AggregateRef,
-        nerva.ViewDefinition,
-        nerva.DeclareStatus,
-        nerva.DeclareResult,
-        nerva.ViewState,
-        nerva.View,
-        nerva.Group,
-        nerva.ViewQuery,
-        nerva.ViewRecord,
-        nerva.ViewRecord.Kind,
-        nerva.ViewRecord.Flags,
-        // min, max and as_of (N62): the members, group versions and view versions trees.
-        nerva.Member,
-        nerva.Member.Flags,
-        nerva.GroupVersion,
-        nerva.ViewVersion,
-        // Ledgers (N75): declared over the wire and stored in the ledgers tree.
-        nerva.LedgerField,
-        nerva.LedgerField.Flags,
-        nerva.LedgerDefinition,
-        nerva.DeclareLedgerStatus,
-        nerva.DeclareLedgerResult,
-        nerva.LedgerQuery,
-        nerva.Ledger,
-        // Commit keys (P123): a key's row value in `table_commit_keys`.
-        nerva.CommitKey,
-        // Records (P123b): `commit_wide`'s entries, stored records and their changes, and
-        // the lookups and history over them.
-        nerva.WideEntry,
-        nerva.Record,
-        nerva.RecordKey,
-        nerva.RecordValue,
-        @FieldType(nerva.RecordValue, "flags"),
-        nerva.RecordChange,
-        nerva.RecordHistoryFilter,
-        // Declared indexes (P123c): declared and queried over the wire, stored in the indexes
-        // and index entries trees.
-        nerva.IndexDefinition,
-        @FieldType(nerva.IndexDefinition, "flags"),
-        nerva.DeclareIndexStatus,
-        nerva.DeclareIndexResult,
-        nerva.IndexState,
-        nerva.Index,
-        nerva.IndexEntry,
-        @FieldType(nerva.IndexEntry, "flags"),
-        nerva.IndexQuery,
-        @FieldType(nerva.IndexQuery, "flags"),
-        nerva.IndexRecord,
-        nerva.IndexRecord.Kind,
-        @FieldType(nerva.IndexRecord, "flags"),
-        nerva.IndexGet,
-    }) |T| try layout_render(writer, T);
-
-    // Tree ids name the LSM trees in the data file: never renumber them (CLAUDE.md).
-    try writer.writeAll("tree_ids:\n");
-    inline for (comptime std.meta.declarations(nerva.tree_ids)) |groove| {
-        const ids = @field(nerva.tree_ids, groove.name);
-        inline for (comptime std.meta.fieldNames(@TypeOf(ids))) |tree| {
-            try writer.print("  {s}.{s} = {}\n", .{ groove.name, tree, @field(ids, tree) });
-        }
-    }
+    try format_digest.render(
+        writer,
+        format_digest.layout_types,
+        format_digest.vendored_types ++ format_digest.vendored_headers,
+        format_digest.build_inputs,
+    );
+    // The digest follows the layouts (P259b): a change to either fails this test. Updating the
+    // snapshot needs a decision (docs/decisions/) that says what changed and whether
+    // `format_digest.format_epoch` moves with it.
+    const digest = format_digest.digest_text(out.items);
+    try testing.expectEqual(format_digest.format_digest, digest);
+    try writer.print("format_digest: {s}\n", .{format_digest.hex(&digest)});
 
     try snap(@src(),
         \\nerva.Row: extern struct, size 128
@@ -665,6 +547,767 @@ test "format: wire and storage layouts" {
         \\  IndexEntry.timestamp = 24
         \\  IndexEntry.key = 25
         \\  IndexEntry.order = 26
+        \\cluster:
+        \\  cache_line_size = 64
+        \\  clients_max = 7
+        \\  pipeline_prepare_queue_max = 4
+        \\  view_change_headers_suffix_max = 5
+        \\  quorum_replication_max = 3
+        \\  journal_slot_count = 32
+        \\  message_size_max = 4096
+        \\  superblock_copies = 4
+        \\  block_size = 4096
+        \\  lsm_levels = 7
+        \\  lsm_growth_factor = 4
+        \\  lsm_compaction_ops = 4
+        \\  lsm_snapshots_max = 32
+        \\  lsm_manifest_compact_extra_blocks = 5
+        \\  lsm_table_coalescing_threshold_percent = 50
+        \\  vsr_releases_max = 64
+        \\  lsm_scans_max = 12
+        \\superblock_version: 2
+        \\format_epoch: 1
+        \\vendored:
+        \\vsr.message_header.Header: extern struct, size 256
+        \\  checksum: offset 0, size 16, u128
+        \\  checksum_padding: offset 16, size 16, u128
+        \\  checksum_body: offset 32, size 16, u128
+        \\  checksum_body_padding: offset 48, size 16, u128
+        \\  nonce_reserved: offset 64, size 16, u128
+        \\  cluster: offset 80, size 16, u128
+        \\  size: offset 96, size 4, u32
+        \\  epoch: offset 100, size 4, u32
+        \\  view: offset 104, size 4, u32
+        \\  release: offset 108, size 4, multiversion.Release
+        \\  protocol: offset 112, size 2, u16
+        \\  command: offset 114, size 1, vsr.Command
+        \\  replica: offset 115, size 1, u8
+        \\  reserved_frame: offset 116, size 12, [12]u8
+        \\  reserved_command: offset 128, size 128, [128]u8
+        \\vsr.Command: enum(u8)
+        \\  reserved = 0
+        \\  ping = 1
+        \\  pong = 2
+        \\  ping_client = 3
+        \\  pong_client = 4
+        \\  request = 5
+        \\  prepare = 6
+        \\  prepare_ok = 7
+        \\  reply = 8
+        \\  commit = 9
+        \\  exit_view = 10
+        \\  join_view = 11
+        \\  get_view = 13
+        \\  get_headers = 14
+        \\  get_prepare = 15
+        \\  get_reply = 16
+        \\  get_blocks = 19
+        \\  headers = 17
+        \\  eviction = 18
+        \\  block = 20
+        \\  view = 24
+        \\  peer_hello = 25
+        \\  peer_challenge = 26
+        \\  peer_proof = 27
+        \\  deprecated_12 = 12
+        \\  deprecated_21 = 21
+        \\  deprecated_22 = 22
+        \\  deprecated_23 = 23
+        \\vsr.Operation: enum(u8), non-exhaustive
+        \\  reserved = 0
+        \\  root = 1
+        \\  register = 2
+        \\  reconfigure = 3
+        \\  pulse = 4
+        \\  upgrade = 5
+        \\  noop = 6
+        \\multiversion.Release: extern struct, size 4
+        \\  value: offset 0, size 4, u32
+        \\vsr.RegisterRequest: extern struct, size 256
+        \\  batch_size_limit: offset 0, size 4, u32
+        \\  reserved: offset 4, size 252, [252]u8
+        \\vsr.RegisterResult: extern struct, size 64
+        \\  batch_size_limit: offset 0, size 4, u32
+        \\  reserved: offset 4, size 60, [60]u8
+        \\vsr.BlockRequest: extern struct, size 32
+        \\  block_checksum: offset 0, size 16, u128
+        \\  block_address: offset 16, size 8, u64
+        \\  reserved: offset 24, size 8, [8]u8
+        \\vsr.ReconfigurationRequest: extern struct, size 256
+        \\  members: offset 0, size 192, [12]u128
+        \\  epoch: offset 192, size 4, u32
+        \\  replica_count: offset 196, size 1, u8
+        \\  standby_count: offset 197, size 1, u8
+        \\  reserved: offset 198, size 54, [54]u8
+        \\  result: offset 252, size 4, vsr.ReconfigurationResult
+        \\vsr.ReconfigurationResult: enum(u32)
+        \\  reserved = 0
+        \\  ok = 1
+        \\  replica_count_zero = 2
+        \\  replica_count_max_exceeded = 3
+        \\  standby_count_max_exceeded = 4
+        \\  members_invalid = 5
+        \\  members_count_invalid = 6
+        \\  reserved_field = 7
+        \\  result_must_be_reserved = 8
+        \\  epoch_in_the_past = 9
+        \\  epoch_in_the_future = 10
+        \\  different_replica_count = 11
+        \\  different_standby_count = 12
+        \\  different_member_set = 13
+        \\  configuration_applied = 14
+        \\  configuration_conflict = 15
+        \\  configuration_is_no_op = 16
+        \\vsr.message_header.Header.Eviction.Reason: enum(u8)
+        \\  reserved = 0
+        \\  no_session = 1
+        \\  client_release_too_low = 2
+        \\  client_release_too_high = 3
+        \\  invalid_request_operation = 4
+        \\  invalid_request_body = 5
+        \\  invalid_request_body_size = 6
+        \\  session_too_low = 7
+        \\  session_release_mismatch = 8
+        \\vsr.UpgradeRequest: extern struct, size 16
+        \\  release: offset 0, size 4, multiversion.Release
+        \\  reserved: offset 4, size 12, [12]u8
+        \\vsr.superblock.SuperBlockHeader: extern struct, size 8192
+        \\  checksum: offset 0, size 16, u128
+        \\  checksum_padding: offset 16, size 16, u128
+        \\  copy: offset 32, size 2, u16
+        \\  version: offset 34, size 2, u16
+        \\  release_format: offset 36, size 4, multiversion.Release
+        \\  sequence: offset 40, size 8, u64
+        \\  cluster: offset 48, size 16, u128
+        \\  parent: offset 64, size 16, u128
+        \\  parent_padding: offset 80, size 16, u128
+        \\  vsr_state: offset 96, size 2048, vsr.superblock.SuperBlockHeader.VSRState
+        \\  flags: offset 2144, size 8, u64
+        \\  view_headers_count: offset 2152, size 4, u32
+        \\  reserved: offset 2156, size 1940, [1940]u8
+        \\  view_headers_all: offset 4096, size 1792, [7]vsr.message_header.Header.Prepare
+        \\  view_headers_reserved: offset 5888, size 2304, [2304]u8
+        \\vsr.superblock.SuperBlockHeader.VSRState: extern struct, size 2048
+        \\  checkpoint: offset 0, size 1024, vsr.superblock.SuperBlockHeader.CheckpointState
+        \\  replica_id: offset 1024, size 16, u128
+        \\  members: offset 1040, size 192, [12]u128
+        \\  commit_max: offset 1232, size 8, u64
+        \\  sync_op_min: offset 1240, size 8, u64
+        \\  sync_op_max: offset 1248, size 8, u64
+        \\  sync_view: offset 1256, size 4, u32
+        \\  log_view: offset 1260, size 4, u32
+        \\  view: offset 1264, size 4, u32
+        \\  replica_count: offset 1268, size 1, u8
+        \\  origin: offset 1269, size 32, [32]u8
+        \\  reserved: offset 1301, size 747, [747]u8
+        \\vsr.superblock.SuperBlockHeader.CheckpointState: extern struct, size 1024
+        \\  header: offset 0, size 256, vsr.message_header.Header.Prepare
+        \\  free_set_blocks_acquired_last_block_checksum: offset 256, size 16, u128
+        \\  free_set_blocks_acquired_last_block_checksum_padding: offset 272, size 16, u128
+        \\  free_set_blocks_released_last_block_checksum: offset 288, size 16, u128
+        \\  free_set_blocks_released_last_block_checksum_padding: offset 304, size 16, u128
+        \\  client_sessions_last_block_checksum: offset 320, size 16, u128
+        \\  client_sessions_last_block_checksum_padding: offset 336, size 16, u128
+        \\  manifest_oldest_checksum: offset 352, size 16, u128
+        \\  manifest_oldest_checksum_padding: offset 368, size 16, u128
+        \\  manifest_newest_checksum: offset 384, size 16, u128
+        \\  manifest_newest_checksum_padding: offset 400, size 16, u128
+        \\  snapshots_block_checksum: offset 416, size 16, u128
+        \\  snapshots_block_checksum_padding: offset 432, size 16, u128
+        \\  free_set_blocks_acquired_checksum: offset 448, size 16, u128
+        \\  free_set_blocks_released_checksum: offset 464, size 16, u128
+        \\  client_sessions_checksum: offset 480, size 16, u128
+        \\  parent_checkpoint_id: offset 496, size 16, u128
+        \\  grandparent_checkpoint_id: offset 512, size 16, u128
+        \\  free_set_blocks_acquired_last_block_address: offset 528, size 8, u64
+        \\  free_set_blocks_released_last_block_address: offset 536, size 8, u64
+        \\  client_sessions_last_block_address: offset 544, size 8, u64
+        \\  manifest_oldest_address: offset 552, size 8, u64
+        \\  manifest_newest_address: offset 560, size 8, u64
+        \\  snapshots_block_address: offset 568, size 8, u64
+        \\  storage_size: offset 576, size 8, u64
+        \\  free_set_blocks_acquired_size: offset 584, size 8, u64
+        \\  free_set_blocks_released_size: offset 592, size 8, u64
+        \\  client_sessions_size: offset 600, size 8, u64
+        \\  manifest_block_count: offset 608, size 4, u32
+        \\  release: offset 612, size 4, multiversion.Release
+        \\  reserved: offset 616, size 408, [408]u8
+        \\lsm.schema.BlockType: enum(u8)
+        \\  reserved = 0
+        \\  free_set = 1
+        \\  client_sessions = 2
+        \\  manifest = 3
+        \\  index = 4
+        \\  value = 5
+        \\lsm.schema.Checksum: extern struct, size 32
+        \\  value: offset 0, size 16, u128
+        \\  padding: offset 16, size 16, u128
+        \\lsm.schema.TableIndex.Metadata: extern struct, size 96
+        \\  value_block_count: offset 0, size 4, u32
+        \\  value_block_count_max: offset 4, size 4, u32
+        \\  key_size: offset 8, size 4, u32
+        \\  tree_id: offset 12, size 2, u16
+        \\  reserved: offset 14, size 82, [82]u8
+        \\lsm.schema.TableValue.Metadata: extern struct, size 96
+        \\  value_count_max: offset 0, size 4, u32
+        \\  value_count: offset 4, size 4, u32
+        \\  value_size: offset 8, size 4, u32
+        \\  tree_id: offset 12, size 2, u16
+        \\  reserved: offset 14, size 82, [82]u8
+        \\lsm.schema.TrailerNode.Metadata: extern struct, size 96
+        \\  previous_trailer_block_checksum: offset 0, size 16, u128
+        \\  previous_trailer_block_checksum_padding: offset 16, size 16, u128
+        \\  previous_trailer_block_address: offset 32, size 8, u64
+        \\  reserved: offset 40, size 56, [56]u8
+        \\lsm.schema.ManifestNode.Metadata: extern struct, size 96
+        \\  previous_manifest_block_checksum: offset 0, size 16, u128
+        \\  previous_manifest_block_checksum_padding: offset 16, size 16, u128
+        \\  previous_manifest_block_address: offset 32, size 8, u64
+        \\  entry_count: offset 40, size 4, u32
+        \\  reserved: offset 44, size 52, [52]u8
+        \\lsm.schema.ManifestNode.TableInfo: extern struct, size 128
+        \\  key_min: offset 0, size 32, [32]u8
+        \\  key_max: offset 32, size 32, [32]u8
+        \\  checksum: offset 64, size 16, u128
+        \\  checksum_padding: offset 80, size 16, u128
+        \\  address: offset 96, size 8, u64
+        \\  snapshot_min: offset 104, size 8, u64
+        \\  snapshot_max: offset 112, size 8, u64
+        \\  value_count: offset 120, size 4, u32
+        \\  tree_id: offset 124, size 2, u16
+        \\  label: offset 126, size 1, lsm.schema.ManifestNode.Label
+        \\  reserved: offset 127, size 1, [1]u8
+        \\lsm.schema.ManifestNode.Event: enum(u2)
+        \\  reserved = 0
+        \\  insert = 1
+        \\  update = 2
+        \\  remove = 3
+        \\lsm.schema.ManifestNode.Label: packed struct, size 1
+        \\  level: bit 0, 6 bits, u6
+        \\  event: bit 6, 2 bits, lsm.schema.ManifestNode.Event
+        \\lsm.composite_key.CompositeKeyType(u64): extern struct, size 16
+        \\  field: offset 0, size 8, u64
+        \\  timestamp: offset 8, size 8, u64
+        \\  padding: offset 16, size 0, u0
+        \\lsm.composite_key.CompositeKeyType(u128): extern struct, size 32
+        \\  field: offset 0, size 16, u128
+        \\  timestamp: offset 16, size 8, u64
+        \\  padding: offset 24, size 8, u64
+        \\lsm.unique_key.UniqueKeyType(u64): extern struct, size 16
+        \\  field: offset 0, size 8, u64
+        \\  timestamp: offset 8, size 8, u64
+        \\  padding: offset 16, size 0, u0
+        \\lsm.unique_key.UniqueKeyType(u128): extern struct, size 32
+        \\  field: offset 0, size 16, u128
+        \\  timestamp: offset 16, size 8, u64
+        \\  padding: offset 24, size 8, u64
+        \\vsr.message_header.Header.Reserved: extern struct, size 256
+        \\  checksum: offset 0, size 16, u128
+        \\  checksum_padding: offset 16, size 16, u128
+        \\  checksum_body: offset 32, size 16, u128
+        \\  checksum_body_padding: offset 48, size 16, u128
+        \\  nonce_reserved: offset 64, size 16, u128
+        \\  cluster: offset 80, size 16, u128
+        \\  size: offset 96, size 4, u32
+        \\  epoch: offset 100, size 4, u32
+        \\  view: offset 104, size 4, u32
+        \\  release: offset 108, size 4, multiversion.Release
+        \\  protocol: offset 112, size 2, u16
+        \\  command: offset 114, size 1, vsr.Command
+        \\  replica: offset 115, size 1, u8
+        \\  reserved_frame: offset 116, size 12, [12]u8
+        \\  reserved: offset 128, size 128, [128]u8
+        \\vsr.message_header.Header.Ping: extern struct, size 256
+        \\  checksum: offset 0, size 16, u128
+        \\  checksum_padding: offset 16, size 16, u128
+        \\  checksum_body: offset 32, size 16, u128
+        \\  checksum_body_padding: offset 48, size 16, u128
+        \\  nonce_reserved: offset 64, size 16, u128
+        \\  cluster: offset 80, size 16, u128
+        \\  size: offset 96, size 4, u32
+        \\  epoch: offset 100, size 4, u32
+        \\  view: offset 104, size 4, u32
+        \\  release: offset 108, size 4, multiversion.Release
+        \\  protocol: offset 112, size 2, u16
+        \\  command: offset 114, size 1, vsr.Command
+        \\  replica: offset 115, size 1, u8
+        \\  reserved_frame: offset 116, size 12, [12]u8
+        \\  checkpoint_id: offset 128, size 16, u128
+        \\  checkpoint_op: offset 144, size 8, u64
+        \\  ping_timestamp_monotonic: offset 152, size 8, u64
+        \\  release_count: offset 160, size 2, u16
+        \\  origin: offset 162, size 32, [32]u8
+        \\  reserved: offset 194, size 62, [62]u8
+        \\vsr.message_header.Header.Pong: extern struct, size 256
+        \\  checksum: offset 0, size 16, u128
+        \\  checksum_padding: offset 16, size 16, u128
+        \\  checksum_body: offset 32, size 16, u128
+        \\  checksum_body_padding: offset 48, size 16, u128
+        \\  nonce_reserved: offset 64, size 16, u128
+        \\  cluster: offset 80, size 16, u128
+        \\  size: offset 96, size 4, u32
+        \\  epoch: offset 100, size 4, u32
+        \\  view: offset 104, size 4, u32
+        \\  release: offset 108, size 4, multiversion.Release
+        \\  protocol: offset 112, size 2, u16
+        \\  command: offset 114, size 1, vsr.Command
+        \\  replica: offset 115, size 1, u8
+        \\  reserved_frame: offset 116, size 12, [12]u8
+        \\  ping_timestamp_monotonic: offset 128, size 8, u64
+        \\  pong_timestamp_wall: offset 136, size 8, u64
+        \\  origin: offset 144, size 32, [32]u8
+        \\  reserved: offset 176, size 80, [80]u8
+        \\vsr.message_header.Header.PingClient: extern struct, size 256
+        \\  checksum: offset 0, size 16, u128
+        \\  checksum_padding: offset 16, size 16, u128
+        \\  checksum_body: offset 32, size 16, u128
+        \\  checksum_body_padding: offset 48, size 16, u128
+        \\  nonce_reserved: offset 64, size 16, u128
+        \\  cluster: offset 80, size 16, u128
+        \\  size: offset 96, size 4, u32
+        \\  epoch: offset 100, size 4, u32
+        \\  view: offset 104, size 4, u32
+        \\  release: offset 108, size 4, multiversion.Release
+        \\  protocol: offset 112, size 2, u16
+        \\  command: offset 114, size 1, vsr.Command
+        \\  replica: offset 115, size 1, u8
+        \\  reserved_frame: offset 116, size 12, [12]u8
+        \\  client: offset 128, size 16, u128
+        \\  ping_timestamp_monotonic: offset 144, size 8, u64
+        \\  session: offset 152, size 8, u64
+        \\  reserved: offset 160, size 96, [96]u8
+        \\vsr.message_header.Header.PongClient: extern struct, size 256
+        \\  checksum: offset 0, size 16, u128
+        \\  checksum_padding: offset 16, size 16, u128
+        \\  checksum_body: offset 32, size 16, u128
+        \\  checksum_body_padding: offset 48, size 16, u128
+        \\  nonce_reserved: offset 64, size 16, u128
+        \\  cluster: offset 80, size 16, u128
+        \\  size: offset 96, size 4, u32
+        \\  epoch: offset 100, size 4, u32
+        \\  view: offset 104, size 4, u32
+        \\  release: offset 108, size 4, multiversion.Release
+        \\  protocol: offset 112, size 2, u16
+        \\  command: offset 114, size 1, vsr.Command
+        \\  replica: offset 115, size 1, u8
+        \\  reserved_frame: offset 116, size 12, [12]u8
+        \\  ping_timestamp_monotonic: offset 128, size 8, u64
+        \\  reserved: offset 136, size 120, [120]u8
+        \\vsr.message_header.Header.Request: extern struct, size 256
+        \\  checksum: offset 0, size 16, u128
+        \\  checksum_padding: offset 16, size 16, u128
+        \\  checksum_body: offset 32, size 16, u128
+        \\  checksum_body_padding: offset 48, size 16, u128
+        \\  nonce_reserved: offset 64, size 16, u128
+        \\  cluster: offset 80, size 16, u128
+        \\  size: offset 96, size 4, u32
+        \\  epoch: offset 100, size 4, u32
+        \\  view: offset 104, size 4, u32
+        \\  release: offset 108, size 4, multiversion.Release
+        \\  protocol: offset 112, size 2, u16
+        \\  command: offset 114, size 1, vsr.Command
+        \\  replica: offset 115, size 1, u8
+        \\  reserved_frame: offset 116, size 12, [12]u8
+        \\  parent: offset 128, size 16, u128
+        \\  parent_padding: offset 144, size 16, u128
+        \\  client: offset 160, size 16, u128
+        \\  session: offset 176, size 8, u64
+        \\  timestamp: offset 184, size 8, u64
+        \\  request: offset 192, size 4, u32
+        \\  operation: offset 196, size 1, vsr.Operation
+        \\  previous_request_latency_padding: offset 197, size 3, [3]u8
+        \\  previous_request_latency: offset 200, size 4, u32
+        \\  reserved: offset 204, size 52, [52]u8
+        \\vsr.message_header.Header.Prepare: extern struct, size 256
+        \\  checksum: offset 0, size 16, u128
+        \\  checksum_padding: offset 16, size 16, u128
+        \\  checksum_body: offset 32, size 16, u128
+        \\  checksum_body_padding: offset 48, size 16, u128
+        \\  nonce_reserved: offset 64, size 16, u128
+        \\  cluster: offset 80, size 16, u128
+        \\  size: offset 96, size 4, u32
+        \\  epoch: offset 100, size 4, u32
+        \\  view: offset 104, size 4, u32
+        \\  release: offset 108, size 4, multiversion.Release
+        \\  protocol: offset 112, size 2, u16
+        \\  command: offset 114, size 1, vsr.Command
+        \\  replica: offset 115, size 1, u8
+        \\  reserved_frame: offset 116, size 12, [12]u8
+        \\  parent: offset 128, size 16, u128
+        \\  parent_padding: offset 144, size 16, u128
+        \\  request_checksum: offset 160, size 16, u128
+        \\  request_checksum_padding: offset 176, size 16, u128
+        \\  checkpoint_id: offset 192, size 16, u128
+        \\  client: offset 208, size 16, u128
+        \\  op: offset 224, size 8, u64
+        \\  commit: offset 232, size 8, u64
+        \\  timestamp: offset 240, size 8, u64
+        \\  request: offset 248, size 4, u32
+        \\  operation: offset 252, size 1, vsr.Operation
+        \\  reserved: offset 253, size 3, [3]u8
+        \\vsr.message_header.Header.PrepareOk: extern struct, size 256
+        \\  checksum: offset 0, size 16, u128
+        \\  checksum_padding: offset 16, size 16, u128
+        \\  checksum_body: offset 32, size 16, u128
+        \\  checksum_body_padding: offset 48, size 16, u128
+        \\  nonce_reserved: offset 64, size 16, u128
+        \\  cluster: offset 80, size 16, u128
+        \\  size: offset 96, size 4, u32
+        \\  epoch: offset 100, size 4, u32
+        \\  view: offset 104, size 4, u32
+        \\  release: offset 108, size 4, multiversion.Release
+        \\  protocol: offset 112, size 2, u16
+        \\  command: offset 114, size 1, vsr.Command
+        \\  replica: offset 115, size 1, u8
+        \\  reserved_frame: offset 116, size 12, [12]u8
+        \\  parent: offset 128, size 16, u128
+        \\  parent_padding: offset 144, size 16, u128
+        \\  prepare_checksum: offset 160, size 16, u128
+        \\  prepare_checksum_padding: offset 176, size 16, u128
+        \\  checkpoint_id: offset 192, size 16, u128
+        \\  client: offset 208, size 16, u128
+        \\  op: offset 224, size 8, u64
+        \\  commit_min: offset 232, size 8, u64
+        \\  timestamp: offset 240, size 8, u64
+        \\  request: offset 248, size 4, u32
+        \\  operation: offset 252, size 1, vsr.Operation
+        \\  reserved: offset 253, size 3, [3]u8
+        \\vsr.message_header.Header.Reply: extern struct, size 256
+        \\  checksum: offset 0, size 16, u128
+        \\  checksum_padding: offset 16, size 16, u128
+        \\  checksum_body: offset 32, size 16, u128
+        \\  checksum_body_padding: offset 48, size 16, u128
+        \\  nonce_reserved: offset 64, size 16, u128
+        \\  cluster: offset 80, size 16, u128
+        \\  size: offset 96, size 4, u32
+        \\  epoch: offset 100, size 4, u32
+        \\  view: offset 104, size 4, u32
+        \\  release: offset 108, size 4, multiversion.Release
+        \\  protocol: offset 112, size 2, u16
+        \\  command: offset 114, size 1, vsr.Command
+        \\  replica: offset 115, size 1, u8
+        \\  reserved_frame: offset 116, size 12, [12]u8
+        \\  request_checksum: offset 128, size 16, u128
+        \\  request_checksum_padding: offset 144, size 16, u128
+        \\  context: offset 160, size 16, u128
+        \\  context_padding: offset 176, size 16, u128
+        \\  client: offset 192, size 16, u128
+        \\  op: offset 208, size 8, u64
+        \\  commit: offset 216, size 8, u64
+        \\  timestamp: offset 224, size 8, u64
+        \\  request: offset 232, size 4, u32
+        \\  operation: offset 236, size 1, vsr.Operation
+        \\  reserved: offset 237, size 19, [19]u8
+        \\vsr.message_header.Header.Commit: extern struct, size 256
+        \\  checksum: offset 0, size 16, u128
+        \\  checksum_padding: offset 16, size 16, u128
+        \\  checksum_body: offset 32, size 16, u128
+        \\  checksum_body_padding: offset 48, size 16, u128
+        \\  nonce_reserved: offset 64, size 16, u128
+        \\  cluster: offset 80, size 16, u128
+        \\  size: offset 96, size 4, u32
+        \\  epoch: offset 100, size 4, u32
+        \\  view: offset 104, size 4, u32
+        \\  release: offset 108, size 4, multiversion.Release
+        \\  protocol: offset 112, size 2, u16
+        \\  command: offset 114, size 1, vsr.Command
+        \\  replica: offset 115, size 1, u8
+        \\  reserved_frame: offset 116, size 12, [12]u8
+        \\  commit_checksum: offset 128, size 16, u128
+        \\  commit_checksum_padding: offset 144, size 16, u128
+        \\  checkpoint_id: offset 160, size 16, u128
+        \\  checkpoint_op: offset 176, size 8, u64
+        \\  commit: offset 184, size 8, u64
+        \\  timestamp_monotonic: offset 192, size 8, u64
+        \\  reserved: offset 200, size 56, [56]u8
+        \\vsr.message_header.Header.ExitView: extern struct, size 256
+        \\  checksum: offset 0, size 16, u128
+        \\  checksum_padding: offset 16, size 16, u128
+        \\  checksum_body: offset 32, size 16, u128
+        \\  checksum_body_padding: offset 48, size 16, u128
+        \\  nonce_reserved: offset 64, size 16, u128
+        \\  cluster: offset 80, size 16, u128
+        \\  size: offset 96, size 4, u32
+        \\  epoch: offset 100, size 4, u32
+        \\  view: offset 104, size 4, u32
+        \\  release: offset 108, size 4, multiversion.Release
+        \\  protocol: offset 112, size 2, u16
+        \\  command: offset 114, size 1, vsr.Command
+        \\  replica: offset 115, size 1, u8
+        \\  reserved_frame: offset 116, size 12, [12]u8
+        \\  reserved: offset 128, size 128, [128]u8
+        \\vsr.message_header.Header.JoinView: extern struct, size 256
+        \\  checksum: offset 0, size 16, u128
+        \\  checksum_padding: offset 16, size 16, u128
+        \\  checksum_body: offset 32, size 16, u128
+        \\  checksum_body_padding: offset 48, size 16, u128
+        \\  nonce_reserved: offset 64, size 16, u128
+        \\  cluster: offset 80, size 16, u128
+        \\  size: offset 96, size 4, u32
+        \\  epoch: offset 100, size 4, u32
+        \\  view: offset 104, size 4, u32
+        \\  release: offset 108, size 4, multiversion.Release
+        \\  protocol: offset 112, size 2, u16
+        \\  command: offset 114, size 1, vsr.Command
+        \\  replica: offset 115, size 1, u8
+        \\  reserved_frame: offset 116, size 12, [12]u8
+        \\  present_bitset: offset 128, size 16, u128
+        \\  nack_bitset: offset 144, size 16, u128
+        \\  op: offset 160, size 8, u64
+        \\  commit_min: offset 168, size 8, u64
+        \\  checkpoint_op: offset 176, size 8, u64
+        \\  log_view: offset 184, size 4, u32
+        \\  reserved: offset 188, size 68, [68]u8
+        \\vsr.message_header.Header.GetView: extern struct, size 256
+        \\  checksum: offset 0, size 16, u128
+        \\  checksum_padding: offset 16, size 16, u128
+        \\  checksum_body: offset 32, size 16, u128
+        \\  checksum_body_padding: offset 48, size 16, u128
+        \\  nonce_reserved: offset 64, size 16, u128
+        \\  cluster: offset 80, size 16, u128
+        \\  size: offset 96, size 4, u32
+        \\  epoch: offset 100, size 4, u32
+        \\  view: offset 104, size 4, u32
+        \\  release: offset 108, size 4, multiversion.Release
+        \\  protocol: offset 112, size 2, u16
+        \\  command: offset 114, size 1, vsr.Command
+        \\  replica: offset 115, size 1, u8
+        \\  reserved_frame: offset 116, size 12, [12]u8
+        \\  nonce: offset 128, size 16, u128
+        \\  reserved: offset 144, size 112, [112]u8
+        \\vsr.message_header.Header.GetHeaders: extern struct, size 256
+        \\  checksum: offset 0, size 16, u128
+        \\  checksum_padding: offset 16, size 16, u128
+        \\  checksum_body: offset 32, size 16, u128
+        \\  checksum_body_padding: offset 48, size 16, u128
+        \\  nonce_reserved: offset 64, size 16, u128
+        \\  cluster: offset 80, size 16, u128
+        \\  size: offset 96, size 4, u32
+        \\  epoch: offset 100, size 4, u32
+        \\  view: offset 104, size 4, u32
+        \\  release: offset 108, size 4, multiversion.Release
+        \\  protocol: offset 112, size 2, u16
+        \\  command: offset 114, size 1, vsr.Command
+        \\  replica: offset 115, size 1, u8
+        \\  reserved_frame: offset 116, size 12, [12]u8
+        \\  op_min: offset 128, size 8, u64
+        \\  op_max: offset 136, size 8, u64
+        \\  reserved: offset 144, size 112, [112]u8
+        \\vsr.message_header.Header.GetPrepare: extern struct, size 256
+        \\  checksum: offset 0, size 16, u128
+        \\  checksum_padding: offset 16, size 16, u128
+        \\  checksum_body: offset 32, size 16, u128
+        \\  checksum_body_padding: offset 48, size 16, u128
+        \\  nonce_reserved: offset 64, size 16, u128
+        \\  cluster: offset 80, size 16, u128
+        \\  size: offset 96, size 4, u32
+        \\  epoch: offset 100, size 4, u32
+        \\  view: offset 104, size 4, u32
+        \\  release: offset 108, size 4, multiversion.Release
+        \\  protocol: offset 112, size 2, u16
+        \\  command: offset 114, size 1, vsr.Command
+        \\  replica: offset 115, size 1, u8
+        \\  reserved_frame: offset 116, size 12, [12]u8
+        \\  prepare_checksum: offset 128, size 16, u128
+        \\  prepare_checksum_padding: offset 144, size 16, u128
+        \\  prepare_op: offset 160, size 8, u64
+        \\  reserved: offset 168, size 88, [88]u8
+        \\vsr.message_header.Header.GetReply: extern struct, size 256
+        \\  checksum: offset 0, size 16, u128
+        \\  checksum_padding: offset 16, size 16, u128
+        \\  checksum_body: offset 32, size 16, u128
+        \\  checksum_body_padding: offset 48, size 16, u128
+        \\  nonce_reserved: offset 64, size 16, u128
+        \\  cluster: offset 80, size 16, u128
+        \\  size: offset 96, size 4, u32
+        \\  epoch: offset 100, size 4, u32
+        \\  view: offset 104, size 4, u32
+        \\  release: offset 108, size 4, multiversion.Release
+        \\  protocol: offset 112, size 2, u16
+        \\  command: offset 114, size 1, vsr.Command
+        \\  replica: offset 115, size 1, u8
+        \\  reserved_frame: offset 116, size 12, [12]u8
+        \\  reply_checksum: offset 128, size 16, u128
+        \\  reply_checksum_padding: offset 144, size 16, u128
+        \\  reply_client: offset 160, size 16, u128
+        \\  reply_op: offset 176, size 8, u64
+        \\  reserved: offset 184, size 72, [72]u8
+        \\vsr.message_header.Header.GetBlocks: extern struct, size 256
+        \\  checksum: offset 0, size 16, u128
+        \\  checksum_padding: offset 16, size 16, u128
+        \\  checksum_body: offset 32, size 16, u128
+        \\  checksum_body_padding: offset 48, size 16, u128
+        \\  nonce_reserved: offset 64, size 16, u128
+        \\  cluster: offset 80, size 16, u128
+        \\  size: offset 96, size 4, u32
+        \\  epoch: offset 100, size 4, u32
+        \\  view: offset 104, size 4, u32
+        \\  release: offset 108, size 4, multiversion.Release
+        \\  protocol: offset 112, size 2, u16
+        \\  command: offset 114, size 1, vsr.Command
+        \\  replica: offset 115, size 1, u8
+        \\  reserved_frame: offset 116, size 12, [12]u8
+        \\  reserved: offset 128, size 128, [128]u8
+        \\vsr.message_header.Header.Headers: extern struct, size 256
+        \\  checksum: offset 0, size 16, u128
+        \\  checksum_padding: offset 16, size 16, u128
+        \\  checksum_body: offset 32, size 16, u128
+        \\  checksum_body_padding: offset 48, size 16, u128
+        \\  nonce_reserved: offset 64, size 16, u128
+        \\  cluster: offset 80, size 16, u128
+        \\  size: offset 96, size 4, u32
+        \\  epoch: offset 100, size 4, u32
+        \\  view: offset 104, size 4, u32
+        \\  release: offset 108, size 4, multiversion.Release
+        \\  protocol: offset 112, size 2, u16
+        \\  command: offset 114, size 1, vsr.Command
+        \\  replica: offset 115, size 1, u8
+        \\  reserved_frame: offset 116, size 12, [12]u8
+        \\  reserved: offset 128, size 128, [128]u8
+        \\vsr.message_header.Header.Eviction: extern struct, size 256
+        \\  checksum: offset 0, size 16, u128
+        \\  checksum_padding: offset 16, size 16, u128
+        \\  checksum_body: offset 32, size 16, u128
+        \\  checksum_body_padding: offset 48, size 16, u128
+        \\  nonce_reserved: offset 64, size 16, u128
+        \\  cluster: offset 80, size 16, u128
+        \\  size: offset 96, size 4, u32
+        \\  epoch: offset 100, size 4, u32
+        \\  view: offset 104, size 4, u32
+        \\  release: offset 108, size 4, multiversion.Release
+        \\  protocol: offset 112, size 2, u16
+        \\  command: offset 114, size 1, vsr.Command
+        \\  replica: offset 115, size 1, u8
+        \\  reserved_frame: offset 116, size 12, [12]u8
+        \\  client: offset 128, size 16, u128
+        \\  reserved: offset 144, size 111, [111]u8
+        \\  reason: offset 255, size 1, vsr.message_header.Header.Eviction.Reason
+        \\vsr.message_header.Header.Block: extern struct, size 256
+        \\  checksum: offset 0, size 16, u128
+        \\  checksum_padding: offset 16, size 16, u128
+        \\  checksum_body: offset 32, size 16, u128
+        \\  checksum_body_padding: offset 48, size 16, u128
+        \\  nonce_reserved: offset 64, size 16, u128
+        \\  cluster: offset 80, size 16, u128
+        \\  size: offset 96, size 4, u32
+        \\  epoch: offset 100, size 4, u32
+        \\  view: offset 104, size 4, u32
+        \\  release: offset 108, size 4, multiversion.Release
+        \\  protocol: offset 112, size 2, u16
+        \\  command: offset 114, size 1, vsr.Command
+        \\  replica: offset 115, size 1, u8
+        \\  reserved_frame: offset 116, size 12, [12]u8
+        \\  metadata_bytes: offset 128, size 96, [96]u8
+        \\  address: offset 224, size 8, u64
+        \\  snapshot: offset 232, size 8, u64
+        \\  block_type: offset 240, size 1, lsm.schema.BlockType
+        \\  reserved_block: offset 241, size 15, [15]u8
+        \\vsr.message_header.Header.View: extern struct, size 256
+        \\  checksum: offset 0, size 16, u128
+        \\  checksum_padding: offset 16, size 16, u128
+        \\  checksum_body: offset 32, size 16, u128
+        \\  checksum_body_padding: offset 48, size 16, u128
+        \\  nonce_reserved: offset 64, size 16, u128
+        \\  cluster: offset 80, size 16, u128
+        \\  size: offset 96, size 4, u32
+        \\  epoch: offset 100, size 4, u32
+        \\  view: offset 104, size 4, u32
+        \\  release: offset 108, size 4, multiversion.Release
+        \\  protocol: offset 112, size 2, u16
+        \\  command: offset 114, size 1, vsr.Command
+        \\  replica: offset 115, size 1, u8
+        \\  reserved_frame: offset 116, size 12, [12]u8
+        \\  nonce: offset 128, size 16, u128
+        \\  op: offset 144, size 8, u64
+        \\  commit_max: offset 152, size 8, u64
+        \\  checkpoint_op: offset 160, size 8, u64
+        \\  reserved: offset 168, size 88, [88]u8
+        \\vsr.message_header.Header.PeerHello: extern struct, size 256
+        \\  checksum: offset 0, size 16, u128
+        \\  checksum_padding: offset 16, size 16, u128
+        \\  checksum_body: offset 32, size 16, u128
+        \\  checksum_body_padding: offset 48, size 16, u128
+        \\  nonce_reserved: offset 64, size 16, u128
+        \\  cluster: offset 80, size 16, u128
+        \\  size: offset 96, size 4, u32
+        \\  epoch: offset 100, size 4, u32
+        \\  view: offset 104, size 4, u32
+        \\  release: offset 108, size 4, multiversion.Release
+        \\  protocol: offset 112, size 2, u16
+        \\  command: offset 114, size 1, vsr.Command
+        \\  replica: offset 115, size 1, u8
+        \\  reserved_frame: offset 116, size 12, [12]u8
+        \\  nonce: offset 128, size 16, u128
+        \\  origin: offset 144, size 32, [32]u8
+        \\  reserved: offset 176, size 80, [80]u8
+        \\vsr.message_header.Header.PeerChallenge: extern struct, size 256
+        \\  checksum: offset 0, size 16, u128
+        \\  checksum_padding: offset 16, size 16, u128
+        \\  checksum_body: offset 32, size 16, u128
+        \\  checksum_body_padding: offset 48, size 16, u128
+        \\  nonce_reserved: offset 64, size 16, u128
+        \\  cluster: offset 80, size 16, u128
+        \\  size: offset 96, size 4, u32
+        \\  epoch: offset 100, size 4, u32
+        \\  view: offset 104, size 4, u32
+        \\  release: offset 108, size 4, multiversion.Release
+        \\  protocol: offset 112, size 2, u16
+        \\  command: offset 114, size 1, vsr.Command
+        \\  replica: offset 115, size 1, u8
+        \\  reserved_frame: offset 116, size 12, [12]u8
+        \\  nonce: offset 128, size 16, u128
+        \\  mac: offset 144, size 16, [16]u8
+        \\  origin: offset 160, size 32, [32]u8
+        \\  reserved: offset 192, size 64, [64]u8
+        \\vsr.message_header.Header.PeerProof: extern struct, size 256
+        \\  checksum: offset 0, size 16, u128
+        \\  checksum_padding: offset 16, size 16, u128
+        \\  checksum_body: offset 32, size 16, u128
+        \\  checksum_body_padding: offset 48, size 16, u128
+        \\  nonce_reserved: offset 64, size 16, u128
+        \\  cluster: offset 80, size 16, u128
+        \\  size: offset 96, size 4, u32
+        \\  epoch: offset 100, size 4, u32
+        \\  view: offset 104, size 4, u32
+        \\  release: offset 108, size 4, multiversion.Release
+        \\  protocol: offset 112, size 2, u16
+        \\  command: offset 114, size 1, vsr.Command
+        \\  replica: offset 115, size 1, u8
+        \\  reserved_frame: offset 116, size 12, [12]u8
+        \\  mac: offset 128, size 16, [16]u8
+        \\  reserved: offset 144, size 112, [112]u8
+        \\vsr.message_header.Header.Deprecated: extern struct, size 256
+        \\  checksum: offset 0, size 16, u128
+        \\  checksum_padding: offset 16, size 16, u128
+        \\  checksum_body: offset 32, size 16, u128
+        \\  checksum_body_padding: offset 48, size 16, u128
+        \\  nonce_reserved: offset 64, size 16, u128
+        \\  cluster: offset 80, size 16, u128
+        \\  size: offset 96, size 4, u32
+        \\  epoch: offset 100, size 4, u32
+        \\  view: offset 104, size 4, u32
+        \\  release: offset 108, size 4, multiversion.Release
+        \\  protocol: offset 112, size 2, u16
+        \\  command: offset 114, size 1, vsr.Command
+        \\  replica: offset 115, size 1, u8
+        \\  reserved_frame: offset 116, size 12, [12]u8
+        \\  reserved: offset 128, size 128, [128]u8
+        \\derivations:
+        \\row_key(5, 7) = 92233720368547758087
+        \\row_key(0xFFFF0002, max) = 79226953643784955185497899007
+        \\documents.row_id(0, table.5) = 14508685050127223560
+        \\documents.tail_id(id0, 1) = 4613465043632273798
+        \\documents.tail_id(id0, 2) = 4590579942568114901
+        \\commit_key_id(1) = 10562569181977696665
+        \\commit_key_id(0x0123_4567_89ab_cdef_0123_4567_89ab_cdef) = 6225441356227291988
+        \\record_key(0x8000_0001, 0xfedc_ba98_7654_3210_0123_4567_89ab_cdef) = 170141183601885234047750166926088000722
+        \\indexes.position_prefix(3, eq 02..) = 16297427750713542426
+        \\index_entry_key(3, 0x8000_0001_0000_0000_0000_0000_0000_0005) = 237684487542793012780631851013
+        \\views.member_order_prefix(1, 2, key 07..) = 647901329103683596
+        \\member_key(3, 2, 99) = 14203992936756354744419
+        \\group_version_key(1 << 64 | 17400499127971693294, 5) = 5166132196011238418138295778693611525
+        \\view_version_key(3, 5) = 55340232221128654853
+        \\format_digest: f2060561d266df00982069391927c8bc31aabf7156ef5af134393f0f5d78b0e1
         \\
     ).diff(out.items);
 }
@@ -715,7 +1358,10 @@ test "format: persisted derivations" {
     // integers): the members tree's keys and the order prefix, and both versions' keys.
     var group_key: [nerva.group_key_size_max]u8 = @splat(0);
     group_key[0] = 7;
-    try testing.expectEqual(@as(u64, 647901329103683596), views.member_order_prefix(1, 2, &group_key));
+    try testing.expectEqual(
+        @as(u64, 647901329103683596),
+        views.member_order_prefix(1, 2, &group_key),
+    );
     try testing.expectEqual(@as(u128, 14203992936756354744419), nerva.member_key(3, 2, 99));
     try testing.expectEqual(
         @as(u128, 5166132196011238418138295778693611525),
@@ -743,16 +1389,45 @@ test "format: persisted derivations" {
     , .{});
     const row = (try catalog.fields_encode(&layout, object))[0..nerva.value_size];
 
+    const layout_text = try catalog.layout_render(arena, &layout);
+    const view_text = try catalog.view_render(arena, &view);
+
     try snap(@src(),
         \\layout: {"name":"seats","fields":[{"name":"section","type":"u8"},{"name":"price","type":"u64"},{"name":"sold","type":"bool"},{"name":"delta","type":"i64"},{"name":"holder","type":"bytes","size":5},{"name":"row","type":"u16"},{"name":"seat","type":"u32"}]}
         \\view: {"table":5,"where":[{"field":"sold","op":"eq","value":"1"},{"field":"price","op":"ge","value":"100"}],"group_by":["section","row"],"aggregates":[{"fn":"count"},{"fn":"sum","field":"price"},{"fn":"min","field":"delta"},{"fn":"max","field":"seat"}]}
         \\row: 0300000000000000ffffffffffffffff0100000000000000feffffffffffffff6162630000000102ffffffff000000000000000000000000000000000000000000000000000000000000000000000000
         \\
     ).diff_fmt("layout: {s}\nview: {s}\nrow: {s}\n", .{
-        try catalog.layout_render(arena, &layout),
-        try catalog.view_render(arena, &view),
+        layout_text,
+        view_text,
         std.fmt.fmtSliceHexLower(row),
     });
+
+    // The pure derivations above are hashed into the format digest (P269d), so changing one
+    // moves it. These three cannot run at comptime (they parse JSON), so their output is tied to
+    // `format_epoch` by a ledger: a change needs a new entry with a higher epoch, and the last
+    // entry must be the current epoch, so the epoch moves with it.
+    var text = std.ArrayList(u8).init(testing.allocator);
+    defer text.deinit();
+    try text.writer().print("layout: {s}\nview: {s}\nrow: {s}\n", .{
+        layout_text,
+        view_text,
+        std.fmt.fmtSliceHexLower(row),
+    });
+    var hash: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(text.items, &hash, .{});
+    const ledger = [_]struct { epoch: u32, hash: []const u8 }{
+        .{
+            .epoch = 1,
+            .hash = "d2303cb82f62ccf70f7a0309df9009fb81f899dc13e4a8a32430ccae6bfceff6",
+        },
+    };
+    for (ledger[1..], ledger[0 .. ledger.len - 1]) |entry, earlier| {
+        try testing.expect(entry.epoch > earlier.epoch);
+    }
+    const last = ledger[ledger.len - 1];
+    try testing.expectEqual(format_digest.format_epoch, last.epoch);
+    try testing.expectEqualStrings(last.hash, &format_digest.hex(&hash));
 }
 
 test "format: the export file" {
