@@ -12,21 +12,33 @@ harness reports it as its own verdict with its own code, `NRV-E0611`, and P242j'
 (32 GiB total, 16 GiB available for `--lazyfs-all-nodes`) stays as it is.
 
 1. The `lazyfs` verdict is `:valid? :unknown` with `:code "NRV-E0611"`, `:oom-killed` (the nodes)
-   and a `:reason`, when the kernel's log shows an OOM kill of a process named `lazyfs` since the
-   count taken at setup and that node's `lazyfs` process is gone. It is checked after each fault
-   and at the final recovery, and it outranks NRV-E0604 and NRV-E0608: a dead LazyFS takes the
-   mount and the replica's data file with it, so a down replica or lost bytes after it are its
-   doing, not Nerva's.
-2. The signal is the kernel's own line (`Out of memory: Killed process N (lazyfs)`), read with
-   `dmesg` (the nodes are privileged containers), else `journalctl -k`. It was chosen over
-   `docker inspect`'s `OOMKilled` (it flags a container's init process, and the nodes have no
-   memory limit: the kernel kills on the host's shortage) and over "process gone" alone (a crash
-   is not memory). The ring buffer is the host's and keeps earlier runs' lines, so the count is
-   taken at setup and only a new line counts; an unreadable log claims nothing.
+   and a `:reason`, when the kernel's log shows a new OOM kill of a process named `lazyfs` that
+   names that node's own container and that node's `lazyfs` process is seen gone, and no finding
+   stands. It excuses only that node: a gateway or replica left down on it is the kill's, but
+   another node's is still NRV-E0604 (`:valid? false`, the kill beside it as `:oom-reason`), and a
+   final recovery that threw has no node, so it is never excused. It never outranks NRV-E0608: lost
+   bytes are LazyFS's own report, made while it was alive, so the kill, which came after, did not
+   cause them. It outranks NRV-E0607 only.
+2. The signal is the kernel's own line (`oom-kill:...,task_memcg=/docker/<id>,task=lazyfs,...`),
+   read with `dmesg` (the nodes are privileged containers; no `journalctl` is installed in them,
+   so there is no fallback: an unreadable log claims nothing). The ring buffer is the host's, so
+   every node reads every node's kills: a line counts for a node only when it names the container
+   id from the node's own `/proc/self/mountinfo`. The lines are kept as a set at setup and a new
+   one is a line not in it; a count would go down when the buffer rotates and hide a kill. It was
+   chosen over `docker inspect`'s `OOMKilled` (it flags a container's init process, and the nodes
+   have no memory limit) and over "process gone" alone (a crash is not memory). A process that
+   cannot be asked about claims nothing.
+   The probe runs after each fault, in the fault's failure path too (a dead LazyFS makes `lose!`
+   throw), and at the final recovery on every mounted node, in its failure path too. What it sees
+   is kept, as a recovery restarts LazyFS and would hide it. A final recovery that threw after a
+   kill is returned as the op's `:exception` with the evidence.
 3. The nightly's reporter classes NRV-E0611 with NRV-E0607 (`HOST_VERDICT_CODES`): the host's,
    counted as `error` and never filed; a real finding elsewhere still outranks it.
 4. Registered in docs/ERRORS.md. (E0609 and E0610 are R6 slice 1's.)
 
-Cost: a kill with no kernel line (an unreadable log, a different process name) is still
+Cost: a kill with no kernel line naming the container (a different process name, a log that
+rotated it out before the probe, a node whose container id cannot be read) is still
 NRV-E0607's unchecked sentinel, and one between the last fault and teardown is seen only if the
-final recovery sees it. Nothing here has met a real OOM kill.
+final recovery sees it. A final recovery that throws without an `:oom-killed` node attached, or beside another
+node's finding, stays NRV-E0604: a throw cannot be tied to a node, and a Nerva finding wrongly
+excused costs more than a host failure wrongly filed. Nothing here has met a real OOM kill.

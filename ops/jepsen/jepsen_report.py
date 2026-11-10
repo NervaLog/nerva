@@ -439,7 +439,10 @@ def failing_leaves(path, value, depth):
 HARNESS_CODE = "NRV-E0607"  # docs/ERRORS.md: the Jepsen harness failed, not Nerva (P244e).
 # The codes of a checker's verdict that are the host's, never Nerva's: the harness failed, or the
 # host's memory killed LazyFS (NRV-E0611, P268). Neither is ever filed.
-HOST_VERDICT_CODES = (HARNESS_CODE, "NRV-E0611")
+HOST_VERDICT_CODES = {
+    HARNESS_CODE: "the Jepsen harness failed",
+    "NRV-E0611": "the host's memory killed LazyFS",
+}
 
 
 def findings_of(results):
@@ -607,7 +610,7 @@ class Run:
         self.name = None
         self.kind = None  # valid, invalid, unknown or host
         self.host_reason = None
-        self.harness = False  # a checker carried NRV-E0607 (P244f)
+        self.harness = []  # the host's codes a checker carried: NRV-E0607 (P244f), NRV-E0611 (P268)
         self.workload = "bank"  # the suite's default
         self.workload_read = False  # False: `workload` is only the default, not what the run did
         self.nemesis = ""
@@ -670,7 +673,7 @@ def read_test(run, directory):
     run.harness = harness
     if harness and not run.findings:
         run.kind = "host"
-        run.host_reason = f"the Jepsen harness failed ({', '.join(harness)}), not Nerva"
+        run.host_reason = "; ".join(f"{HOST_VERDICT_CODES[c]} ({c})" for c in harness) + ", not Nerva"
         return
     if graphs_only or not run.findings:
         run.kind = "host"
@@ -865,7 +868,7 @@ def report_text(item, commit, archive, first):
         out.append("- **Verdict:** the canary run found no `duplicate`: Jepsen cannot see a "
                    "resent key committing twice")
         if run.harness:
-            out.append(f"- **Also:** the Jepsen harness failed in this run ({', '.join(run.harness)}, the "
+            out.append(f"- **Also:** the host failed in this run ({', '.join(run.harness)}: the "
                        "host's, not Nerva's), so the canary may be blind only because of it; "
                        "read `jepsen.log` before blaming the workload checker")
     else:
