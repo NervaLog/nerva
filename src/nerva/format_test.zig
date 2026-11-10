@@ -640,6 +640,34 @@ test "format: wire and storage layouts" {
         \\  standby_count: offset 197, size 1, u8
         \\  reserved: offset 198, size 54, [54]u8
         \\  result: offset 252, size 4, vsr.ReconfigurationResult
+        \\vsr.ReconfigurationResult: enum(u32)
+        \\  reserved = 0
+        \\  ok = 1
+        \\  replica_count_zero = 2
+        \\  replica_count_max_exceeded = 3
+        \\  standby_count_max_exceeded = 4
+        \\  members_invalid = 5
+        \\  members_count_invalid = 6
+        \\  reserved_field = 7
+        \\  result_must_be_reserved = 8
+        \\  epoch_in_the_past = 9
+        \\  epoch_in_the_future = 10
+        \\  different_replica_count = 11
+        \\  different_standby_count = 12
+        \\  different_member_set = 13
+        \\  configuration_applied = 14
+        \\  configuration_conflict = 15
+        \\  configuration_is_no_op = 16
+        \\vsr.message_header.Header.Eviction.Reason: enum(u8)
+        \\  reserved = 0
+        \\  no_session = 1
+        \\  client_release_too_low = 2
+        \\  client_release_too_high = 3
+        \\  invalid_request_operation = 4
+        \\  invalid_request_body = 5
+        \\  invalid_request_body_size = 6
+        \\  session_too_low = 7
+        \\  session_release_mismatch = 8
         \\vsr.UpgradeRequest: extern struct, size 16
         \\  release: offset 0, size 4, multiversion.Release
         \\  reserved: offset 4, size 12, [12]u8
@@ -757,6 +785,22 @@ test "format: wire and storage layouts" {
         \\lsm.schema.ManifestNode.Label: packed struct, size 1
         \\  level: bit 0, 6 bits, u6
         \\  event: bit 6, 2 bits, lsm.schema.ManifestNode.Event
+        \\lsm.composite_key.CompositeKeyType(u64): extern struct, size 16
+        \\  field: offset 0, size 8, u64
+        \\  timestamp: offset 8, size 8, u64
+        \\  padding: offset 16, size 0, u0
+        \\lsm.composite_key.CompositeKeyType(u128): extern struct, size 32
+        \\  field: offset 0, size 16, u128
+        \\  timestamp: offset 16, size 8, u64
+        \\  padding: offset 24, size 8, u64
+        \\lsm.unique_key.UniqueKeyType(u64): extern struct, size 16
+        \\  field: offset 0, size 8, u64
+        \\  timestamp: offset 8, size 8, u64
+        \\  padding: offset 16, size 0, u0
+        \\lsm.unique_key.UniqueKeyType(u128): extern struct, size 32
+        \\  field: offset 0, size 16, u128
+        \\  timestamp: offset 16, size 8, u64
+        \\  padding: offset 24, size 8, u64
         \\vsr.message_header.Header.Reserved: extern struct, size 256
         \\  checksum: offset 0, size 16, u128
         \\  checksum_padding: offset 16, size 16, u128
@@ -1248,7 +1292,22 @@ test "format: wire and storage layouts" {
         \\  replica: offset 115, size 1, u8
         \\  reserved_frame: offset 116, size 12, [12]u8
         \\  reserved: offset 128, size 128, [128]u8
-        \\format_digest: 9ed6145d187897db71f57cf9aee9e442d9590455eabf454af769cc057145d44d
+        \\derivations:
+        \\row_key(5, 7) = 92233720368547758087
+        \\row_key(0xFFFF0002, max) = 79226953643784955185497899007
+        \\documents.row_id(0, table.5) = 14508685050127223560
+        \\documents.tail_id(id0, 1) = 4613465043632273798
+        \\documents.tail_id(id0, 2) = 4590579942568114901
+        \\commit_key_id(1) = 10562569181977696665
+        \\commit_key_id(0x0123_4567_89ab_cdef_0123_4567_89ab_cdef) = 6225441356227291988
+        \\record_key(0x8000_0001, 0xfedc_ba98_7654_3210_0123_4567_89ab_cdef) = 170141183601885234047750166926088000722
+        \\indexes.position_prefix(3, eq 02..) = 16297427750713542426
+        \\index_entry_key(3, 0x8000_0001_0000_0000_0000_0000_0000_0005) = 237684487542793012780631851013
+        \\views.member_order_prefix(1, 2, key 07..) = 647901329103683596
+        \\member_key(3, 2, 99) = 14203992936756354744419
+        \\group_version_key(1 << 64 | 17400499127971693294, 5) = 5166132196011238418138295778693611525
+        \\view_version_key(3, 5) = 55340232221128654853
+        \\format_digest: f2060561d266df00982069391927c8bc31aabf7156ef5af134393f0f5d78b0e1
         \\
     ).diff(out.items);
 }
@@ -1299,7 +1358,10 @@ test "format: persisted derivations" {
     // integers): the members tree's keys and the order prefix, and both versions' keys.
     var group_key: [nerva.group_key_size_max]u8 = @splat(0);
     group_key[0] = 7;
-    try testing.expectEqual(@as(u64, 647901329103683596), views.member_order_prefix(1, 2, &group_key));
+    try testing.expectEqual(
+        @as(u64, 647901329103683596),
+        views.member_order_prefix(1, 2, &group_key),
+    );
     try testing.expectEqual(@as(u128, 14203992936756354744419), nerva.member_key(3, 2, 99));
     try testing.expectEqual(
         @as(u128, 5166132196011238418138295778693611525),
@@ -1327,16 +1389,45 @@ test "format: persisted derivations" {
     , .{});
     const row = (try catalog.fields_encode(&layout, object))[0..nerva.value_size];
 
+    const layout_text = try catalog.layout_render(arena, &layout);
+    const view_text = try catalog.view_render(arena, &view);
+
     try snap(@src(),
         \\layout: {"name":"seats","fields":[{"name":"section","type":"u8"},{"name":"price","type":"u64"},{"name":"sold","type":"bool"},{"name":"delta","type":"i64"},{"name":"holder","type":"bytes","size":5},{"name":"row","type":"u16"},{"name":"seat","type":"u32"}]}
         \\view: {"table":5,"where":[{"field":"sold","op":"eq","value":"1"},{"field":"price","op":"ge","value":"100"}],"group_by":["section","row"],"aggregates":[{"fn":"count"},{"fn":"sum","field":"price"},{"fn":"min","field":"delta"},{"fn":"max","field":"seat"}]}
         \\row: 0300000000000000ffffffffffffffff0100000000000000feffffffffffffff6162630000000102ffffffff000000000000000000000000000000000000000000000000000000000000000000000000
         \\
     ).diff_fmt("layout: {s}\nview: {s}\nrow: {s}\n", .{
-        try catalog.layout_render(arena, &layout),
-        try catalog.view_render(arena, &view),
+        layout_text,
+        view_text,
         std.fmt.fmtSliceHexLower(row),
     });
+
+    // The pure derivations above are hashed into the format digest (P269d), so changing one
+    // moves it. These three cannot run at comptime (they parse JSON), so their output is tied to
+    // `format_epoch` by a ledger: a change needs a new entry with a higher epoch, and the last
+    // entry must be the current epoch, so the epoch moves with it.
+    var text = std.ArrayList(u8).init(testing.allocator);
+    defer text.deinit();
+    try text.writer().print("layout: {s}\nview: {s}\nrow: {s}\n", .{
+        layout_text,
+        view_text,
+        std.fmt.fmtSliceHexLower(row),
+    });
+    var hash: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(text.items, &hash, .{});
+    const ledger = [_]struct { epoch: u32, hash: []const u8 }{
+        .{
+            .epoch = 1,
+            .hash = "d2303cb82f62ccf70f7a0309df9009fb81f899dc13e4a8a32430ccae6bfceff6",
+        },
+    };
+    for (ledger[1..], ledger[0 .. ledger.len - 1]) |entry, earlier| {
+        try testing.expect(entry.epoch > earlier.epoch);
+    }
+    const last = ledger[ledger.len - 1];
+    try testing.expectEqual(format_digest.format_epoch, last.epoch);
+    try testing.expectEqualStrings(last.hash, &format_digest.hex(&hash));
 }
 
 test "format: the export file" {

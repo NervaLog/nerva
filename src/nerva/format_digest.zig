@@ -13,11 +13,16 @@
 //! - the layouts of the vendored wire and disk types (`vendored_types`, P269c): the message
 //!   `vsr.Header` and every command's header (Ping, Pong, PeerHello, PeerChallenge, PeerProof
 //!   and the rest), the request bodies of `vsr.zig`, the `SuperBlockHeader`, `VSRState` and
-//!   `CheckpointState`, and the LSM block metadata, manifest entry and label of `lsm/schema.zig`.
+//!   `CheckpointState`, and the LSM block metadata, manifest entry and label of `lsm/schema.zig`,
+//!   with the enums and structs their fields name (a field's type is rendered by name only, so
+//!   `the walk` test fails when one is missing), and
+//! - the outputs of the pure persisted derivations (`derivations_render`, P269d): the row, record,
+//!   member, version and index keys, and the document, tail and commit-key ids, for fixed inputs.
 //!
-//! What no layout shows is not covered: how bytes are computed (checksums, MACs, key
-//! derivations), what a value means, and the encoding of keys and values a tree stores as
-//! bytes. A change to those moves `format_epoch`.
+//! What no layout shows is not covered: how bytes are computed (checksums, MACs), what a value
+//! means, the encoding of keys and values a tree stores as bytes, and the derivations that cannot
+//! run at comptime (the catalog's canonical JSON and `fields_encode`, which
+//! `format_test.zig` pins to `format_epoch`, P269d). A change to those moves `format_epoch`.
 //!
 //! The text names types and fields as well as sizes and offsets (P269c), so a pure rename moves
 //! the digest too. It is computed at comptime, so a binary carries it as a constant and
@@ -33,7 +38,11 @@ const nerva = @import("../nerva.zig");
 const constants = @import("../constants.zig");
 const vsr = @import("../vsr.zig");
 const documents = @import("documents.zig");
+const indexes = @import("indexes.zig");
+const views = @import("views.zig");
 const schema = @import("../lsm/schema.zig");
+const CompositeKeyType = @import("../lsm/composite_key.zig").CompositeKeyType;
+const UniqueKeyType = @import("../lsm/unique_key.zig").UniqueKeyType;
 
 /// Moved by hand, never by a layout change (those move the digest by themselves), when a
 /// format change escapes the layouts. Moving it needs a decision (docs/decisions/) that says what
@@ -138,6 +147,8 @@ pub const vendored_types = [_]type{
     vsr.RegisterResult,
     vsr.BlockRequest,
     vsr.ReconfigurationRequest,
+    vsr.ReconfigurationResult,
+    vsr.Header.Eviction.Reason,
     vsr.UpgradeRequest,
     vsr.superblock.SuperBlockHeader,
     vsr.superblock.SuperBlockHeader.VSRState,
@@ -151,6 +162,12 @@ pub const vendored_types = [_]type{
     schema.ManifestNode.TableInfo,
     schema.ManifestNode.Event,
     schema.ManifestNode.Label,
+    // The keys Nerva's index and unique-key (id) trees store: `groove.zig` instantiates them over
+    // the field's type normalized to `u64` or `u128`.
+    CompositeKeyType(u64),
+    CompositeKeyType(u128),
+    UniqueKeyType(u64),
+    UniqueKeyType(u128),
 };
 
 /// The header of every command, each once (several commands share `Deprecated`).
@@ -214,6 +231,46 @@ pub fn layout_render(writer: anytype, comptime T: type) !void {
     }
 }
 
+/// The outputs of the persisted derivations that are pure and run at comptime, for fixed inputs
+/// (P269d). The hash behind a row id, a key's bit packing or a position prefix is a format as
+/// much as a layout is: a replica of another release would compute other tree keys for the same
+/// prepare. The inputs are those `format_test.zig` pinned apart from this code.
+pub fn derivations_render(writer: anytype) !void {
+    var eq_key: [nerva.group_key_size_max]u8 = @splat(0);
+    eq_key[0] = 2;
+    var group_key: [nerva.group_key_size_max]u8 = @splat(0);
+    group_key[0] = 7;
+    const id0 = documents.row_id(0, "table.5");
+    try writer.print("row_key(5, 7) = {}\n", .{nerva.row_key(5, 7)});
+    try writer.print("row_key(0xFFFF0002, max) = {}\n", .{
+        nerva.row_key(0xFFFF0002, std.math.maxInt(u64)),
+    });
+    try writer.print("documents.row_id(0, table.5) = {}\n", .{id0});
+    try writer.print("documents.tail_id(id0, 1) = {}\n", .{documents.tail_id(id0, 1)});
+    try writer.print("documents.tail_id(id0, 2) = {}\n", .{documents.tail_id(id0, 2)});
+    try writer.print("commit_key_id(1) = {}\n", .{nerva.commit_key_id(1)});
+    try writer.print("commit_key_id(0x0123_4567_89ab_cdef_0123_4567_89ab_cdef) = {}\n", .{
+        nerva.commit_key_id(0x0123_4567_89ab_cdef_0123_4567_89ab_cdef),
+    });
+    try writer.print("record_key(0x8000_0001, 0xfedc_ba98_7654_3210_0123_4567_89ab_cdef) = {}\n", .{
+        nerva.record_key(0x8000_0001, 0xfedc_ba98_7654_3210_0123_4567_89ab_cdef),
+    });
+    try writer.print("indexes.position_prefix(3, eq 02..) = {}\n", .{
+        indexes.position_prefix(3, &eq_key),
+    });
+    try writer.print("index_entry_key(3, 0x8000_0001_0000_0000_0000_0000_0000_0005) = {}\n", .{
+        nerva.index_entry_key(3, 0x8000_0001_0000_0000_0000_0000_0000_0005),
+    });
+    try writer.print("views.member_order_prefix(1, 2, key 07..) = {}\n", .{
+        views.member_order_prefix(1, 2, &group_key),
+    });
+    try writer.print("member_key(3, 2, 99) = {}\n", .{nerva.member_key(3, 2, 99)});
+    try writer.print("group_version_key(1 << 64 | 17400499127971693294, 5) = {}\n", .{
+        nerva.group_version_key(1 << 64 | 17400499127971693294, 5),
+    });
+    try writer.print("view_version_key(3, 5) = {}\n", .{nerva.view_version_key(3, 5)});
+}
+
 /// What the format is made of, besides the layouts: the tree ids (a namespace like
 /// `nerva.tree_ids`), the cluster configuration (`constants.config.cluster`, which
 /// `config.cluster.checksum()` fingerprints; that checksum cannot run at comptime, so its fields
@@ -228,8 +285,9 @@ pub fn Inputs(comptime ids_namespace: type, comptime cluster_type: type) type {
 }
 
 /// The layouts of `types`, then the tree ids, the cluster configuration, the superblock version,
-/// the epoch and the layouts of `vendored`: the text `format_test.zig` snapshots and the digest hashes. Tree ids name the
-/// LSM trees in the data file: never renumber them (CLAUDE.md).
+/// the epoch, the layouts of `vendored` and the derivations' outputs: the text `format_test.zig`
+/// snapshots and the digest hashes. Tree ids name the LSM trees in the data file: never renumber
+/// them (CLAUDE.md).
 pub fn render(
     writer: anytype,
     comptime types: anytype,
@@ -253,6 +311,8 @@ pub fn render(
     try writer.print("format_epoch: {}\n", .{inputs.epoch});
     try writer.writeAll("vendored:\n");
     inline for (vendored) |T| try layout_render(writer, T);
+    try writer.writeAll("derivations:\n");
+    try derivations_render(writer);
 }
 
 /// The digest of a rendered text, at run time or comptime.
@@ -288,7 +348,11 @@ pub const build_inputs = Inputs(nerva.tree_ids, @TypeOf(constants.config.cluster
 };
 
 /// This build's format digest.
-pub const format_digest: [32]u8 = digest_of(layout_types, vendored_types ++ vendored_headers, build_inputs);
+pub const format_digest: [32]u8 = digest_of(
+    layout_types,
+    vendored_types ++ vendored_headers,
+    build_inputs,
+);
 
 /// A digest as 64 lower-case hex digits.
 pub fn hex(digest: *const [32]u8) [64]u8 {
@@ -326,7 +390,11 @@ const no_ids = struct {};
 const Synthetic = Inputs(no_ids, struct { clients_max: u32 });
 
 fn synthetic(clients_max: u32, superblock: u16, epoch: u32) Synthetic {
-    return .{ .cluster = .{ .clients_max = clients_max }, .superblock = superblock, .epoch = epoch };
+    return .{
+        .cluster = .{ .clients_max = clients_max },
+        .superblock = superblock,
+        .epoch = epoch,
+    };
 }
 
 test "format_digest: a field moved gives another digest" {
@@ -350,7 +418,8 @@ test "format_digest: a field moved gives another digest" {
 }
 
 /// `T` with its first and last fields exchanged: the same members in another order, the layout
-/// of a vendored header or superblock after a field moved. Only the layout differs from `same(T)`.
+/// of a vendored header or superblock after a field moved. Only the layout differs from
+/// `exchanged(T, false)`.
 fn exchanged(comptime T: type, comptime exchange: bool) type {
     const info = @typeInfo(T).@"struct";
     var fields: [info.fields.len]std.builtin.Type.StructField = undefined;
@@ -389,7 +458,22 @@ test "format_digest: the vendored layouts are in the digest" {
     defer out.deinit();
     try render(out.writer(), layout_types, vendored_types ++ vendored_headers, build_inputs);
     const vendored_text = out.items[std.mem.indexOf(u8, out.items, "vendored:\n").?..];
-    inline for (.{ "Header: extern struct, size 256", "Header.Ping", "Header.Pong", "Header.PeerHello", "Header.PeerChallenge", "Header.PeerProof", "SuperBlockHeader: extern", "VSRState: extern", "CheckpointState: extern", "Header.Block: extern" }) |name| {
+    inline for (.{
+        "Header: extern struct, size 256",
+        "Header.Ping",
+        "Header.Pong",
+        "Header.PeerHello",
+        "Header.PeerChallenge",
+        "Header.PeerProof",
+        "SuperBlockHeader: extern",
+        "VSRState: extern",
+        "CheckpointState: extern",
+        "Header.Block: extern",
+        "Header.Eviction.Reason: enum",
+        "ReconfigurationResult: enum",
+        "CompositeKey",
+        "UniqueKey",
+    }) |name| {
         try testing.expect(std.mem.indexOf(u8, vendored_text, name) != null);
     }
     // Each distinct command header once: Deprecated is shared by four commands.
@@ -449,4 +533,63 @@ test "format_digest: the comptime digest is the run-time digest of the rendered 
     const runtime = digest_text(out.items);
     try testing.expectEqual(format_digest, runtime);
     try testing.expectEqual(@as(usize, 64), hex(&runtime).len);
+}
+
+/// Types a listed type's field names that the digest deliberately does not render, each with its
+/// reason (P269d). A new entry needs a reason that is true of every field that names it.
+const walk_excluded = .{};
+
+fn walk_listed(comptime T: type, comptime lists: anytype) bool {
+    inline for (lists) |list| {
+        inline for (list) |listed| if (listed == T) return true;
+    }
+    return false;
+}
+
+/// The struct, enum and union types named by the fields of `T`, through arrays, optionals and
+/// pointers, that are in none of `lists` nor `walk_excluded`.
+fn walk_unlisted(comptime T: type, comptime lists: anytype) []const type {
+    comptime {
+        @setEvalBranchQuota(eval_branch_quota);
+        var found: []const type = &.{};
+        for (switch (@typeInfo(T)) {
+            .@"struct" => |info| info.fields,
+            else => &.{},
+        }) |field| {
+            var F = field.type;
+            while (true) switch (@typeInfo(F)) {
+                .array => |info| F = info.child,
+                .optional => |info| F = info.child,
+                .pointer => |info| F = info.child,
+                else => break,
+            };
+            switch (@typeInfo(F)) {
+                .@"struct", .@"enum", .@"union" => {
+                    var excluded = false;
+                    for (walk_excluded) |entry| {
+                        if (entry[0] == F) excluded = true;
+                    }
+                    if (!excluded and !walk_listed(F, lists)) found = found ++ &[_]type{F};
+                },
+                else => {},
+            }
+        }
+        return found;
+    }
+}
+
+test "format_digest: the walk finds no type a listed field names that is not listed" {
+    @setEvalBranchQuota(eval_branch_quota);
+    const lists = .{ layout_types, vendored_types, vendored_headers };
+    var unlisted: usize = 0;
+    inline for (lists) |list| {
+        inline for (list) |T| {
+            inline for (comptime walk_unlisted(T, lists)) |missing| {
+                std.debug.print("unlisted: {s}.{s}\n", .{ @typeName(T), @typeName(missing) });
+                unlisted += 1;
+            }
+        }
+    }
+    try testing.expectEqual(@as(usize, 0), unlisted);
+    inline for (walk_excluded) |entry| try testing.expect(entry[1].len > 0);
 }
