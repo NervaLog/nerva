@@ -43,9 +43,12 @@ Each item names the pull request whose review found it. Say in the PR which item
 - [ ] Every new check has a test that fails on the previous code, and a hosted teeth run that
       can fail (a blind canary proves nothing). Quote what it caught. (#239)
       Say which checker can fail it: `lose-unfsynced-writes`'s `:lazyfs` checker judges the fault,
-      not Nerva's durability, so its canary's teeth are the workload's `:keys` checker (lost acknowledged
-      records) under `--lazyfs-all-nodes`, and `:warnings [:unsynced-bytes-lost]` in its result; the result
-      counts only with `:scopes {:all n}`, n at least 1 (the first fault is `:all`). (#242)
+      not Nerva's durability, unless `--lazyfs-strict-sync`. The hosted canary (LazyFS on a minority
+      of nodes, P242j) runs with it: its teeth are `:lazyfs` `:valid? false` with `:lost-bytes` above 0
+      (stock LazyFS keeps O_DSYNC writes unsynced); a minority loss is repaired by VSR, so it cannot
+      fail `:keys`, and it does not test Nerva's durability. The `:keys` checker's teeth (lost acknowledged
+      records; `:warnings [:unsynced-bytes-lost]`, `:scopes {:all n}`, n at least 1, the first fault is
+      `:all`) need `--lazyfs-all-nodes`, the R1 host only. (#242)
 - [ ] A fixture uses the code and shape of the wire (NRV-E0203, not a guess). (#239)
 
 ## Bounds

@@ -11,7 +11,9 @@
 FROM debian:bookworm-slim AS lazyfs
 ARG LAZYFS_COMMIT=9c5685e828da8b5d113d2f9134f6671e481d7162
 # `no` builds stock LazyFS, the teeth canary of the lose-unfsynced-writes checkers (P242h): with
-# `--lazyfs-all-nodes` they must fail on it. Never `no` in a real run.
+# `--lazyfs-strict-sync` (hosted) or `--lazyfs-all-nodes` (R1 host) they must fail on it (P242j).
+# Never `no` in a real run. The patch's upstream issue: https://github.com/dsrhaslab/lazyfs/issues/25
+# (the full-cache write-through, P242f, is #24).
 ARG LAZYFS_PATCH=yes
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
