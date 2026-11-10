@@ -1,19 +1,30 @@
-//! The format digest (P259b, R6): one number for everything Nerva puts on the wire or on disk.
+//! The format digest (P259b, P269c, R6): one number for the wire and disk formats that decide
+//! whether two releases can share a cluster or a data file.
 //!
 //! The digest is the SHA-256 of
 //!
-//! - the layout text of every wire and storage type and every persisted enum (`layout_types`,
-//!   rendered by `layout_render`, the same text `format_test.zig` snapshots),
+//! - the layout text of every state machine wire and storage type and every persisted enum
+//!   (`layout_types`, rendered by `layout_render`, the text `format_test.zig` snapshots),
 //! - the LSM tree ids,
 //! - the cluster configuration (the fields `config.cluster.checksum()` fingerprints), the
-//!   superblock version, and
+//!   superblock version,
 //! - `format_epoch`, a constant moved by hand when a format change escapes the layouts: a key
-//!   derivation, the meaning of a stored field, how a view's stored state is read.
+//!   derivation, the meaning of a stored field, how a view's stored state is read, and
+//! - the layouts of the vendored wire and disk types (`vendored_types`, P269c): the message
+//!   `vsr.Header` and every command's header (Ping, Pong, PeerHello, PeerChallenge, PeerProof
+//!   and the rest), the request bodies of `vsr.zig`, the `SuperBlockHeader`, `VSRState` and
+//!   `CheckpointState`, and the LSM block metadata, manifest entry and label of `lsm/schema.zig`.
 //!
-//! It is computed at comptime, so a binary carries it as a constant and `nerva version` prints
-//! it. Two releases with one digest open each other's data files; in R6 any other pair moves a
-//! cluster by export and import, never by a rolling upgrade (P259c). Nothing here is persisted
-//! or sent: the digest is only read, so no persisted identifier changes.
+//! What no layout shows is not covered: how bytes are computed (checksums, MACs, key
+//! derivations), what a value means, and the encoding of keys and values a tree stores as
+//! bytes. A change to those moves `format_epoch`.
+//!
+//! The text names types and fields as well as sizes and offsets (P269c), so a pure rename moves
+//! the digest too. It is computed at comptime, so a binary carries it as a constant and
+//! `nerva version` prints it. Two releases with one digest open each other's data files; in R6
+//! any other pair moves a cluster by export and import, never by a rolling upgrade (P259c).
+//! Nothing here is persisted or sent: the digest is only read, so no persisted identifier
+//! changes.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -22,6 +33,7 @@ const nerva = @import("../nerva.zig");
 const constants = @import("../constants.zig");
 const vsr = @import("../vsr.zig");
 const documents = @import("documents.zig");
+const schema = @import("../lsm/schema.zig");
 
 /// Moved by hand, never by a layout change (those move the digest by themselves), when a
 /// format change escapes the layouts. Moving it needs a decision (docs/decisions/) that says what
@@ -115,6 +127,51 @@ pub const layout_types = .{
     nerva.IndexGet,
 };
 
+/// The vendored wire and disk types whose layout is part of the format (P269c), besides the
+/// header of every command (`vendored_headers`). Their files are never edited for the digest.
+pub const vendored_types = [_]type{
+    vsr.Header,
+    vsr.Command,
+    vsr.Operation,
+    vsr.Release,
+    vsr.RegisterRequest,
+    vsr.RegisterResult,
+    vsr.BlockRequest,
+    vsr.ReconfigurationRequest,
+    vsr.UpgradeRequest,
+    vsr.superblock.SuperBlockHeader,
+    vsr.superblock.SuperBlockHeader.VSRState,
+    vsr.CheckpointState,
+    schema.BlockType,
+    schema.Checksum,
+    schema.TableIndex.Metadata,
+    schema.TableValue.Metadata,
+    schema.TrailerNode.Metadata,
+    schema.ManifestNode.Metadata,
+    schema.ManifestNode.TableInfo,
+    schema.ManifestNode.Event,
+    schema.ManifestNode.Label,
+};
+
+/// The header of every command, each once (several commands share `Deprecated`).
+pub const vendored_headers = blk: {
+    const commands = std.meta.fields(vsr.Command);
+    var list: [commands.len]type = undefined;
+    var count: usize = 0;
+    for (commands) |command| {
+        const T = vsr.Header.Type(@enumFromInt(command.value));
+        const seen = for (list[0..count]) |earlier| {
+            if (earlier == T) break true;
+        } else false;
+        if (!seen) {
+            list[count] = T;
+            count += 1;
+        }
+    }
+    const result: [count]type = list[0..count].*;
+    break :blk result;
+};
+
 /// The size, and each field's offset (or bit, for a packed struct), size and type, of a struct;
 /// or the tag type and every value of an enum.
 pub fn layout_render(writer: anytype, comptime T: type) !void {
@@ -170,10 +227,15 @@ pub fn Inputs(comptime ids_namespace: type, comptime cluster_type: type) type {
     };
 }
 
-/// The layouts of `types`, then the tree ids, the cluster configuration, the superblock version
-/// and the epoch: the text `format_test.zig` snapshots and the digest hashes. Tree ids name the
+/// The layouts of `types`, then the tree ids, the cluster configuration, the superblock version,
+/// the epoch and the layouts of `vendored`: the text `format_test.zig` snapshots and the digest hashes. Tree ids name the
 /// LSM trees in the data file: never renumber them (CLAUDE.md).
-pub fn render(writer: anytype, comptime types: anytype, comptime inputs: anytype) !void {
+pub fn render(
+    writer: anytype,
+    comptime types: anytype,
+    comptime vendored: anytype,
+    comptime inputs: anytype,
+) !void {
     inline for (types) |T| try layout_render(writer, T);
 
     try writer.writeAll("tree_ids:\n");
@@ -189,6 +251,8 @@ pub fn render(writer: anytype, comptime types: anytype, comptime inputs: anytype
     }
     try writer.print("superblock_version: {}\n", .{inputs.superblock});
     try writer.print("format_epoch: {}\n", .{inputs.epoch});
+    try writer.writeAll("vendored:\n");
+    inline for (vendored) |T| try layout_render(writer, T);
 }
 
 /// The digest of a rendered text, at run time or comptime.
@@ -199,13 +263,17 @@ pub fn digest_text(text: []const u8) [32]u8 {
     return hash.finalResult();
 }
 
-/// The digest of `types` and `inputs`, at comptime.
-pub fn digest_of(comptime types: anytype, comptime inputs: anytype) [32]u8 {
+/// The digest of `types`, `vendored` and `inputs`, at comptime.
+pub fn digest_of(
+    comptime types: anytype,
+    comptime vendored: anytype,
+    comptime inputs: anytype,
+) [32]u8 {
     comptime {
         @setEvalBranchQuota(eval_branch_quota);
         var buffer: [text_size_max]u8 = undefined;
         var stream = std.io.fixedBufferStream(&buffer);
-        render(stream.writer(), types, inputs) catch |err| switch (err) {
+        render(stream.writer(), types, vendored, inputs) catch |err| switch (err) {
             error.NoSpaceLeft => @compileError("the format text outgrew text_size_max"),
         };
         return digest_text(stream.getWritten());
@@ -220,7 +288,7 @@ pub const build_inputs = Inputs(nerva.tree_ids, @TypeOf(constants.config.cluster
 };
 
 /// This build's format digest.
-pub const format_digest: [32]u8 = digest_of(layout_types, build_inputs);
+pub const format_digest: [32]u8 = digest_of(layout_types, vendored_types ++ vendored_headers, build_inputs);
 
 /// A digest as 64 lower-case hex digits.
 pub fn hex(digest: *const [32]u8) [64]u8 {
@@ -262,11 +330,11 @@ fn synthetic(clients_max: u32, superblock: u16, epoch: u32) Synthetic {
 }
 
 test "format_digest: a field moved gives another digest" {
-    const before = comptime digest_of(.{pair(false)}, synthetic(1, 2, 1));
-    const after = comptime digest_of(.{pair(true)}, synthetic(1, 2, 1));
+    const before = comptime digest_of(.{pair(false)}, .{}, synthetic(1, 2, 1));
+    const after = comptime digest_of(.{pair(true)}, .{}, synthetic(1, 2, 1));
     try testing.expect(!std.mem.eql(u8, &before, &after));
     // The same list, twice, gives the same digest.
-    const again = comptime digest_of(.{pair(false)}, synthetic(1, 2, 1));
+    const again = comptime digest_of(.{pair(false)}, .{}, synthetic(1, 2, 1));
     try testing.expectEqual(before, again);
     // The digests differ because the layouts do, not only the names: under the name line, the
     // two renders differ.
@@ -281,6 +349,56 @@ test "format_digest: a field moved gives another digest" {
     try testing.expect(!std.mem.eql(u8, one_fields, other_fields));
 }
 
+/// `T` with its first and last fields exchanged: the same members in another order, the layout
+/// of a vendored header or superblock after a field moved. Only the layout differs from `same(T)`.
+fn exchanged(comptime T: type, comptime exchange: bool) type {
+    const info = @typeInfo(T).@"struct";
+    var fields: [info.fields.len]std.builtin.Type.StructField = undefined;
+    for (info.fields, 0..) |field, index| fields[index] = field;
+    if (exchange) std.mem.swap(std.builtin.Type.StructField, &fields[0], &fields[fields.len - 1]);
+    return @Type(.{ .@"struct" = .{
+        .layout = info.layout,
+        .fields = &fields,
+        .decls = &.{},
+        .is_tuple = false,
+    } });
+}
+
+fn vendored_digest(comptime T: type, comptime exchange: bool) [32]u8 {
+    return comptime digest_of(.{}, .{exchanged(T, exchange)}, synthetic(1, 2, 1));
+}
+
+test "format_digest: a change to a message header, a command header or the superblock moves it" {
+    const Superblock = vsr.superblock.SuperBlockHeader;
+    inline for (.{
+        vsr.Header,
+        vsr.Header.PeerHello,
+        vsr.Header.Ping,
+        Superblock,
+        Superblock.VSRState,
+        vsr.CheckpointState,
+        schema.ManifestNode.TableInfo,
+    }) |T| {
+        try testing.expectEqual(vendored_digest(T, false), vendored_digest(T, false));
+        try testing.expect(!std.mem.eql(u8, &vendored_digest(T, false), &vendored_digest(T, true)));
+    }
+}
+
+test "format_digest: the vendored layouts are in the digest" {
+    var out = std.ArrayList(u8).init(testing.allocator);
+    defer out.deinit();
+    try render(out.writer(), layout_types, vendored_types ++ vendored_headers, build_inputs);
+    const vendored_text = out.items[std.mem.indexOf(u8, out.items, "vendored:\n").?..];
+    inline for (.{ "Header: extern struct, size 256", "Header.Ping", "Header.Pong", "Header.PeerHello", "Header.PeerChallenge", "Header.PeerProof", "SuperBlockHeader: extern", "VSRState: extern", "CheckpointState: extern", "Header.Block: extern" }) |name| {
+        try testing.expect(std.mem.indexOf(u8, vendored_text, name) != null);
+    }
+    // Each distinct command header once: Deprecated is shared by four commands.
+    try testing.expect(vendored_headers.len < std.meta.fields(vsr.Command).len);
+    // A vendored type moves the digest when it is left out of the list.
+    const without = comptime digest_of(layout_types, .{}, build_inputs);
+    try testing.expect(!std.mem.eql(u8, &without, &format_digest));
+}
+
 test "format_digest: a tree id, the epoch, the cluster config and the superblock move it" {
     const ids_one = struct {
         pub const Tree = .{ .a = 1 };
@@ -290,28 +408,28 @@ test "format_digest: a tree id, the epoch, the cluster config and the superblock
     };
     const Ones = Inputs(ids_one, struct { clients_max: u32 });
     const Twos = Inputs(ids_two, struct { clients_max: u32 });
-    const base = comptime digest_of(.{pair(false)}, Ones{
+    const base = comptime digest_of(.{pair(false)}, .{}, Ones{
         .cluster = .{ .clients_max = 1 },
         .superblock = 2,
         .epoch = 1,
     });
     const moved = [_][32]u8{
-        comptime digest_of(.{pair(false)}, Twos{
+        comptime digest_of(.{pair(false)}, .{}, Twos{
             .cluster = .{ .clients_max = 1 },
             .superblock = 2,
             .epoch = 1,
         }),
-        comptime digest_of(.{pair(false)}, Ones{
+        comptime digest_of(.{pair(false)}, .{}, Ones{
             .cluster = .{ .clients_max = 1 },
             .superblock = 2,
             .epoch = 2,
         }),
-        comptime digest_of(.{pair(false)}, Ones{
+        comptime digest_of(.{pair(false)}, .{}, Ones{
             .cluster = .{ .clients_max = 3 },
             .superblock = 2,
             .epoch = 1,
         }),
-        comptime digest_of(.{pair(false)}, Ones{
+        comptime digest_of(.{pair(false)}, .{}, Ones{
             .cluster = .{ .clients_max = 1 },
             .superblock = 3,
             .epoch = 1,
@@ -326,7 +444,7 @@ test "format_digest: a tree id, the epoch, the cluster config and the superblock
 test "format_digest: the comptime digest is the run-time digest of the rendered text" {
     var out = std.ArrayList(u8).init(testing.allocator);
     defer out.deinit();
-    try render(out.writer(), layout_types, build_inputs);
+    try render(out.writer(), layout_types, vendored_types ++ vendored_headers, build_inputs);
     try testing.expect(out.items.len < text_size_max);
     const runtime = digest_text(out.items);
     try testing.expectEqual(format_digest, runtime);

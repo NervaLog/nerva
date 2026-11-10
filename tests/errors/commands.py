@@ -27,10 +27,11 @@ from api import Cluster  # noqa: E402
 
 KEY = "errors-test-key"
 # The format digest of a `nerva` build (R6, P259b): what `nerva version` prints. It moves with any
-# change to a wire or storage layout, a tree id, the cluster config, the superblock version or
-# `format_epoch` (src/nerva/format_digest.zig), and only then. Update it with the decision that
+# change to a wire or storage layout (the state machine's, the message headers', the superblock's),
+# a tree id, the cluster config, the superblock version or `format_epoch`
+# (src/nerva/format_digest.zig), and only then. Update it with the decision that
 # says what changed (docs/decisions/), beside `format_test.zig`'s snapshot.
-FORMAT_DIGEST = "0c6ab505bf8766ee27f1c79b4d319a5e7100edbb445cb92dfa96b35569a252b8"
+FORMAT_DIGEST = "2fe367d5d926e0a6200f5bd6956653fde1d45d1f60985adac6f82bd3952e7b55"
 VERSION_FIRST = re.compile(r"Nerva version (\d+\.\d+\.\d+)(\+[0-9a-f]{7})?(\+keys-off)?")
 RAW_NAME = re.compile(r"\berror\.[A-Z][A-Za-z0-9]+")
 LOG_LINE = re.compile(r"\d{4}-\d\d-\d\d ")

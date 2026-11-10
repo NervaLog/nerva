@@ -125,7 +125,7 @@ cd nerva-ledger
 ```
 
 The lines after the first say what an upgrade compares: the release, the oldest client release
-this binary serves, the format digest (equal digests mean equal wire and data formats; P269b) and
+this binary serves, the format digest (equal digests mean equal layouts of the state machine's, the message and the superblock's wire and data formats, and equal tree ids, cluster configuration and `format_epoch`; how bytes are computed or what a field means is covered only by `format_epoch`; P269b, P269c) and
 the past releases the binary bundles (none yet). `nerva version --verbose` adds what the digest
 is made of and the commit.
 

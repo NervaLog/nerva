@@ -7,9 +7,9 @@ area: Releases
 # The format digest, and `format_epoch`, as built
 
 `src/nerva/format_digest.zig` computes, at comptime, the SHA-256 of one text: the layout of every
-wire and storage type and persisted enum (`layout_types`, rendered by `layout_render`, the text
+state machine wire and storage type and persisted enum (`layout_types`, rendered by `layout_render`, the text
 `format_test.zig` snapshots), the LSM tree ids, the cluster configuration, the superblock version
-and `format_epoch: u32`. `nerva version` prints it as `format <hex>`, beside `release`,
+`format_epoch: u32` and, from P269c, the vendored wire and disk layouts. `nerva version` prints it as `format <hex>`, beside `release`,
 `release_client_min` and `bundles none`; `--verbose` adds `format_epoch`, `superblock_version` and
 the commit. `format_test.zig` snapshots the digest after the layouts, so a change to either fails
 the same test.
