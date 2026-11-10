@@ -168,6 +168,9 @@ def check_payload(root, repo, epoch):
 
 # The checks a container runs after an install; %s are replaced by Python, never by sh.
 CHECKS = r"""
+same() {
+    [ "$(sha256sum "$1" | cut -d' ' -f1)" = "$(sha256sum "$2" | cut -d' ' -f1)" ]
+}
 check_installed() {
     nerva version > /tmp/version.out
     [ -s /tmp/version.out ]
@@ -177,10 +180,10 @@ check_installed() {
     tail -n1 /tmp/version.out
     [ "$(stat -c '%a %U %G' /usr/bin/nerva)" = "755 root root" ]
     for unit in nerva@.service nerva-api@.service; do
-        cmp /usr/lib/systemd/system/$unit /src/$unit
+        same /usr/lib/systemd/system/$unit /src/$unit
     done
     for doc in replica.env.example api.env.example; do
-        cmp /usr/share/doc/nerva/$doc /src/$doc
+        same /usr/share/doc/nerva/$doc /src/$doc
     done
     entry=$(getent passwd nerva)
     [ "$(echo "$entry" | cut -d: -f6)" = /var/lib/nerva ]
@@ -229,27 +232,24 @@ echo "remove and purge left /var/lib/nerva, /etc/nerva and the user"
 """
 
 # dnf4 (Rocky 9) and dnf5 (Fedora 43 on) both take install/remove with -y; the weak dependency
-# on systemd is left out so the container stays small. Fedora's rpm 6 may refuse an unsigned file:
-# that is recorded as a FINDING, and the install retried without the check so the rest still runs.
+# on systemd is left out so the container stays small. Whether an image
+# accepts the unsigned file is recorded as a FINDING; a refusal fails the run.
 RPM_FLOW = r"""
 cp /dist/@PKG@ /tmp/@PKG@
 chmod 644 /tmp/@PKG@
-dnf_install() {
-    dnf install -y -q --setopt=install_weak_deps=False --setopt=tsflags= "$@" /tmp/@PKG@ > /tmp/dnf.out 2>&1
-}
-if dnf_install; then
+# An unsigned local package must install with the defaults: no option turns the signature
+# check off, so what users of the unsigned .rpm must do is recorded from this run.
+if dnf install -y -q --setopt=install_weak_deps=False --setopt=tsflags= /tmp/@PKG@ > /tmp/dnf.out 2>&1; then
     echo "FINDING: @IMAGE@ ($(rpm --version)) installed the unsigned rpm with its defaults"
 else
     echo "FINDING: @IMAGE@ ($(rpm --version)) refused the unsigned rpm with its defaults:"
     head -n 12 /tmp/dnf.out
-    if [ "@IMAGE@" != fedora:latest ]; then exit 1; fi
-    dnf_install --no-gpgchecks || dnf_install --nogpgcheck
-    echo "FINDING: it installs with the signature check off"
+    exit 1
 fi
 check_installed
 echo data > /var/lib/nerva/marker
 uid=$(id -u nerva)
-rpm -U --replacepkgs --nosignature /tmp/@PKG@ || rpm -U --replacepkgs /tmp/@PKG@
+rpm -U --replacepkgs /tmp/@PKG@
 [ "$(id -u nerva)" = "$uid" ]
 [ "$(cat /var/lib/nerva/marker)" = data ]
 rm /var/lib/nerva/marker
@@ -276,8 +276,7 @@ RPM_FOREIGN = r"""
 cp /dist/@PKG@ /tmp/@PKG@
 chmod 644 /tmp/@PKG@
 useradd --system --home-dir /nonexistent nerva
-if dnf install -y --setopt=install_weak_deps=False --setopt=tsflags= --no-gpgchecks /tmp/@PKG@ > /tmp/out 2>&1 ||
-    dnf install -y --setopt=install_weak_deps=False --setopt=tsflags= --nogpgcheck /tmp/@PKG@ > /tmp/out 2>&1; then
+if dnf install -y --setopt=install_weak_deps=False --setopt=tsflags= /tmp/@PKG@ > /tmp/out 2>&1; then
     echo "the install should have been refused"; exit 1
 fi
 """
