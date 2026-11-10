@@ -3553,6 +3553,15 @@ pub fn StateMachineType(comptime Storage: type) type {
             groups.prefetch(prefetch_groups_callback, &self.groups_prefetch_context);
         }
 
+        /// Whether the transaction writes nothing because its key's row exists
+        /// (`commit_key_failure`). Admission counts no group or member for it, so the scans
+        /// that follow must count none either (#254, #255).
+        fn transaction_writes_nothing(self: *StateMachine, entries: []const WideEntry) bool {
+            if (!self.commit_keys_deduplicate) return false;
+            if (entries.len == 0 or entries[0].kind != .key) return false;
+            return self.forest.grooves.rows.get(commit_key_row(&entries[0])) == .found_object;
+        }
+
         /// Adds the transaction's groups and members to the op's, if they fit (`view_txn_keys`
         /// and `view_txn_members` hold those it added). Otherwise leaves the op's as they were.
         /// A write counts, in each view of its table, the groups of its old and new values that
@@ -3564,12 +3573,7 @@ pub fn StateMachineType(comptime Storage: type) type {
         ) views.Admission {
             self.view_txn_keys.clearRetainingCapacity();
             self.view_txn_members.clearRetainingCapacity();
-            // A transaction whose key's row exists writes nothing (`commit_key_failure`).
-            if (self.commit_keys_deduplicate and entries.len > 0 and entries[0].kind == .key and
-                self.forest.grooves.rows.get(commit_key_row(&entries[0])) == .found_object)
-            {
-                return .fits;
-            }
+            if (self.transaction_writes_nothing(entries)) return .fits;
             const admission: views.Admission = admission: {
                 for (entries) |*entry| {
                     if (!self.entry_viewed(entry, narrow)) continue;
@@ -3740,7 +3744,10 @@ pub fn StateMachineType(comptime Storage: type) type {
             var batch_index: u32 = 0;
             while (decoder.pop()) |batch| : (batch_index += 1) {
                 if (self.view_txn_busy.isSet(batch_index)) continue;
-                for (self.batch_entries(operation, batch)) |*entry| {
+                const entries = self.batch_entries(operation, batch);
+                // Only what admission counted was prefetched, and fits the scan buffers.
+                if (self.transaction_writes_nothing(entries)) continue;
+                for (entries) |*entry| {
                     if (!self.entry_viewed(entry, operation == .commit)) continue;
                     // Views over records have no `min` or `max`.
                     if (nerva.table_is_record(entry.table)) continue;
@@ -3757,6 +3764,8 @@ pub fn StateMachineType(comptime Storage: type) type {
                     }
                 }
             }
+            // Every member counted was admitted: the maps and the scan buffers are sized for it.
+            assert(self.extreme_counted.count() <= self.view_op_members.count());
             var count: u32 = 0;
             for (self.extreme_scans.items) |*scan| {
                 if (!scan.read) continue;

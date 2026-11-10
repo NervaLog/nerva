@@ -3160,6 +3160,54 @@ test "views: one op moving every min and max holder it admits to new groups (#62
     try testing.expectEqual(rows, seen);
 }
 
+test "views: resent keyed transactions are not counted by the extreme scans (#254, #255)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const context = try context_init(&arena);
+
+    // Four `min`/`max` slots over a u64 group key: each row alone in its group holds all four.
+    const a: nerva.FieldRef = .{ .offset = 8, .size = 8, .kind = .unsigned };
+    var definition = std.mem.zeroes(nerva.ViewDefinition);
+    @memcpy(definition.name[0..6], "resent");
+    definition.table = 8;
+    definition.group_by_count = 1;
+    definition.group_by[0] = .{ .offset = 0, .size = 8, .kind = .unsigned };
+    definition.aggregate_count = 5;
+    definition.aggregates[0] = .{ .function = .count, .field = std.mem.zeroes(nerva.FieldRef) };
+    definition.aggregates[1] = .{ .function = .min, .field = a };
+    definition.aggregates[2] = .{ .function = .max, .field = a };
+    definition.aggregates[3] = .{ .function = .min, .field = a };
+    definition.aggregates[4] = .{ .function = .max, .field = a };
+    try testing.expectEqual(nerva.DeclareStatus.created, (try context.declare(definition)).status);
+    _ = context.pulse_until_ready();
+
+    // More keyed transactions than the op's member limit admits members for, each of which
+    // writes one row: they commit in ops of their own.
+    const limit = context.state_machine.member_writes_limit;
+    const count = limit / 2;
+    try testing.expect(4 * count > limit);
+    const entries = try allocator.alloc([2]Entry, count);
+    const batches = try allocator.alloc([]const Entry, count);
+    for (entries, batches, 0..) |*pair, *batch, index| {
+        pair[0] = nerva.commit_key_entry(1000 + index);
+        pair[1] = put(8, index + 1, 0);
+        std.mem.writeInt(u64, pair[1].value[0..8], index, .little);
+        batch.* = pair;
+    }
+    for (0..count) |index| {
+        for ((try context.commit(&.{batches[index]}))[0]) |result| {
+            try testing.expectEqual(nerva.EntryStatus.ok, result.status);
+        }
+    }
+
+    // All of them resent in one op: each is `committed_before` and writes
+    // nothing, so admission counted no member for any, and the scans must count none.
+    for ((try context.commit(batches))) |results| {
+        try expect_statuses(results, &.{ .committed_before, .aborted });
+    }
+}
+
 // ---- Restore (N80) ----
 
 /// Seats with `min` and `max` of the price as well: every kind of view state a restore rebuilds.
