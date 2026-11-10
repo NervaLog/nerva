@@ -5,15 +5,198 @@ publishes a version's section as its GitHub release notes, and refuses to releas
 without one. Design reasons are in [docs/DECISIONS.md](./docs/DECISIONS.md); the full log of
 work is [WORKLOG.md](./WORKLOG.md).
 
-## Unreleased
+## v0.7.0 — TBD
 
-### Upgrade: `nerva api` and `nerva view` serve loopback unless `--listen-remote` (#183)
+A lost replica can now be replaced while the cluster stays open, and a cluster can be backed up
+and restored with a record kept apart from the backup (R5). Each client process can have its own
+`nerva api` gateway on loopback: every connection gets a reply with a status line, every refusal
+says whether anything was applied, and the gateway sends metrics (R4). Every failure a command or
+the JSON API reports now has a stable code (`NRV-…`, [docs/ERRORS.md](./docs/ERRORS.md)). **Data
+files, the replica protocol and the export format do not change.** The protocol release is still
+`0.0.6`, so replicas upgrade in place with no export or import. **`nerva api` and `nerva view`
+now refuse a non-loopback `--listen` unless you pass `--listen-remote`:** see "Upgrading from
+v0.6.1" below.
 
-Both commands now refuse a `--listen` that is not loopback (`127.0.0.0/8`, `::1`) with NRV-E0009.
-If you bind `0.0.0.0` or `[::]`, add `--listen-remote` (it logs NRV-W0010: the key and every reply
-cross the network in plain HTTP), or bind `127.0.0.1` and put the caller beside the gateway.
-Check scripts and fixtures that start either command, and any forwarder (`socat`, a proxy) in
-front of a gateway: a forwarder still reaches a loopback gateway and is the operator's choice.
+### New: `nerva recover` replaces a lost replica with the cluster open (R5, #94)
+
+When a replica's disk is lost, `recover` builds a new data file for that replica from the running
+cluster. The new replica then catches up by repair or state sync. You need at least three
+replicas, and must recover one at a time:
+
+```bash
+# The lost replica is destroyed first. On its replacement host:
+nerva recover --cluster=0 --replica=2 --replica-count=3 --addresses=3001,3002,3003 \
+    --origin=none 0_2.nerva
+nerva start --addresses=3001,3002,3003 0_2.nerva
+```
+
+- `--origin` has no default. Pass `none` for a cluster made with `nerva format`. For a cluster
+  made with `import` or `restore`, pass the SHA-256 of the export it was made from. With the
+  wrong origin, the replica exits with status 8 and `NRV-E0711` when it starts.
+- `recover` refuses while the lost replica's address still answers (`NRV-E0713`) and when fewer
+  than a quorum of the other replicas run (`NRV-E0712`). If a `recover` is killed, its
+  `<path>.recovering` file blocks the next attempt (`NRV-E0715`) until you remove it.
+- The new data file's view is two past the cluster's, so the replacement never contradicts
+  what the lost replica promised (TigerBeetle's `replica_reformat`, P149b).
+
+### New: `nerva backup` and `nerva restore` (R5)
+
+```bash
+nerva backup --cluster=0 --addresses=3001,3002,3003 --output=b.nerva-backup
+# backup b.nerva-backup: op 10001, sha256 521eb1ce3f94...
+# manifest b.nerva-backup.manifest.json
+nerva restore --cluster=0 --replica=0 --replica-count=3 --input=b.nerva-backup \
+    --manifest=b.nerva-backup.manifest.json 0_0.nerva      # and --replica=1, 2
+```
+
+- A backup is a normal export (format version 1 or 2, as before) plus a JSON manifest
+  (`"format":"nerva-backup","version":1`). The manifest records the release, the op, the
+  export's SHA-256 and size, and every view hash and ledger total. `backup` reads the export
+  back through `import`'s checks before it writes the manifest. It never overwrites either file
+  (`NRV-E0004`).
+- `restore` compares the backup with its manifest before it creates any file. On a mismatch it
+  refuses with `NRV-E0809`, naming the first difference. A missing, malformed or
+  unknown-version manifest is `NRV-E0808`, and a damaged backup is `NRV-E0804`.
+- For a restore drill, use another `--cluster` id. That restores the backup beside the running
+  cluster, so you can compare the drill's view hashes and ledger totals with the manifest.
+
+### New: each client process can have its own gateway (R4)
+
+```bash
+NERVA_KEY=secret nerva api --cluster=1 --addresses=10.0.0.1:3001,10.0.0.2:3001,10.0.0.3:3001 \
+    --listen=127.0.0.1:8080 --request-timeout=4000 --statsd=127.0.0.1:9125
+```
+
+- **Every connection gets a reply.** When all 16 slots are busy, the gateway answers
+  `503 {"error":"busy","applied":false,"code":"NRV-E0602"}` and does not read the request.
+  Before, it closed the request mid-send (#120). A request that has not arrived whole after
+  10 s gets `408`, NRV-E0116. A second gateway on the same port now exits with NRV-E0007.
+  Before, both shared the port through `SO_REUSEPORT` (#112).
+- **`applied` and `code` on every reply that is not `2xx`**, beside the `error` or `status`
+  each reply already had. Those strings keep their spelling (P168b, P173c). With
+  `"applied": false`, the request is safe to send again. With `"applied": "unknown"`, a write
+  went out and no reply came back. Send a `/v1/commit` again only under its `key`, or read the
+  rows to find out what happened. A replayed commit answers `200` with
+  `"replayed":true,"code":"NRV-W0201"`.
+- **`--request-timeout=<ms>`** (`nerva api`, `nerva view`; default 30000) sets one deadline for
+  each HTTP request. It covers every cluster call that request makes, a reconnection included
+  (#186). The gateway answers a request within 1 s of queue wait, plus `--request-timeout`,
+  plus 1 s: 32 s by default. When less than a sixteenth of the deadline is left, the gateway
+  does not send the call. It answers `503` NRV-E0606, nothing is sent, and the session stays
+  open (P209). Set this flag below your client's own timeout.
+- **An idle gateway checks its cluster.** It sends one read whenever it has had no reply for
+  5 s, so `/healthz` turns `503` (NRV-E0605) within 5 s plus `--request-timeout` of the cluster
+  going away.
+- **`nerva api --statsd=<host:port>`** sends `nerva.api.*` metrics every 10 s: requests by route
+  and status, refusals by reason, `unknown` outcomes (page on these), group sizes, cluster
+  latency, queue wait, reconnects, session state and connections. README, "Gateway metrics",
+  lists them.
+- **Commits and lookups that wait together are combined** into one cluster request, at most 16
+  of them. Each request still gets the reply it would have had alone (P143). With 12 callers on
+  one 4-CPU machine, one gateway went from about 340 to about 1,400 Botpike-shaped submits per
+  second, and its p99 latency fell from about 75 ms to about 30 ms.
+- **`/v1/documents/commit` takes a commit `key`**, as `/v1/commit` does. A resend answers
+  `replayed` and applies nothing (P180). A malformed key is NRV-E0109 on every route (P180b).
+
+### New: coded errors everywhere
+
+- A command that refuses prints one `error[NRV-…]` block with its cause and fix. It exits 1 for
+  bad operator input, 2 for an environment problem and 70 for a bug in Nerva (P149e).
+  `nerva start`'s runtime exit statuses 2 to 8 are unchanged. Flag-parser errors are now
+  NRV-E0001, still with exit status 1 (#167).
+- Before a command opens a data file, a pre-flight check refuses bad input (a missing file,
+  wrong sizes, a mismatched cluster) with a code, where TigerBeetle's vendored open would have
+  panicked (P152).
+- `nerva start --statsd` with an address this host cannot send to is refused with NRV-E0010 at
+  start. Before, it was reported as a bug or as "cannot listen" (#181, #184).
+- `nerva start --trace` removes its trace file when startup fails, panics or is stopped by
+  SIGINT or SIGTERM, so the next start is no longer refused with NRV-E0004 (#197, P208).
+- When 16 attempts in a row to declare a layout or a view lose to concurrent declarations, the
+  gateway answers `503 {"error":"catalog busy","applied":"unknown","code":"NRV-E0313"}` and keeps
+  its session. Before, it answered `cluster unavailable` and reconnected (#216, P228).
+
+### Fixed
+
+- **#120:** a busy gateway closed a request mid-send, so the client could not tell whether it was
+  applied. Fixed in #170.
+- **#112:** two gateways could silently share one port through `SO_REUSEPORT`. Fixed in #170.
+- **#172:** a full lingering table reset refused clients that were still sending. Fixed in #173
+  (the table holds 128).
+- **#174:** a gateway polled on `/healthz` at least once a second never replaced its broken
+  cluster client. Fixed in #175.
+- **#186:** `--request-timeout` bounded each cluster call, not the whole HTTP request. Fixed in
+  #195 and #213.
+- **#205:** a call started near the end of its deadline timed out and broke the session. Fixed in
+  #209.
+- **#216:** contention on a catalog write was reported as `cluster unavailable`. Fixed in #228.
+- **#181, #184:** a `--statsd` address that cannot be used was reported as a bug or as the wrong
+  layer's error. Fixed in #196.
+- **#197:** after a failed start, `nerva start --trace` left an empty trace file behind. Fixed in
+  #202 and #208.
+- **#95:** a replica given a data file of another release panicked instead of refusing it.
+  Pre-flight now refuses it (#152).
+- **#141:** VOPR seed 10957567299726034325. The workload's `lookup_records` batches exceeded
+  `event_max`, so the client was evicted (test workload only). Fixed in #142.
+- **#226:** a `client.zig` test cast an unaligned stack array. Fixed in #227.
+
+### Testing
+
+- Jepsen (R1, in progress): the suite runs against real replicas and gateways. It covers commit
+  keys under unknown outcomes, gateway kill and partition nemeses, and a keyed bank with records,
+  and it can be dispatched from `jepsen.yml`. A nightly on a dedicated host files failures as
+  issues (`ops/jepsen`). A test-only build, `-Dtest-commit-keys=off`, turns commit-key
+  deduplication off so the suite can show that it detects duplicates. That build is never
+  installed.
+- The VOPR can start a cluster from an imported checkpoint (P159). It draws the primary's commit
+  stall per seed (P143b), and it says when a run stops at TigerBeetle's liveness exemption
+  (P171).
+- `zig build demo-r4` and `zig build demo-r5` run in CI.
+
+### Release review
+
+Reviewed adversarially by two independent reviewers before release (P147b):
+<!-- links to the `release-review` issues and both verdicts go here -->
+TBD.
+
+### Upgrading from v0.6.1
+
+**Replicas.** The protocol release is unchanged (`0.0.6`). Data files, the superblock, the
+replica protocol, `tree_ids`, `Operation` values and the export format are all the same, so
+v0.7.0 replicas open v0.6.1 data files. Stop one replica, start it with the v0.7.0 binary, and
+wait for it to rejoin before you upgrade the next one. You do not need to export or import.
+v0.6.1 and v0.7.0 replicas may run in one cluster during the roll, and a v0.6.1 binary opens a
+data file that v0.7.0 has written, so you can roll back the same way.
+<!-- docs/releases/v0.7.0-audit.md records what was tested by hand -->
+
+**Gateways: check `--listen` first (#183).** `nerva api` and `nerva view` now refuse a
+`--listen` address outside `127.0.0.0/8` and `::1` with NRV-E0009 (exit 1). If you bind
+`0.0.0.0` or `[::]`, add `--listen-remote` before you upgrade. With it, the gateway logs
+NRV-W0010: the key and every reply cross the network in plain HTTP. The alternative is to bind
+`127.0.0.1` and run the caller beside the gateway. Check scripts and test fixtures that start
+either command, for example a Docker fixture that serves `nerva api` on `0.0.0.0` to its host.
+A forwarder in front of a gateway (`socat`, a proxy) still reaches a loopback gateway, and it is
+the operator's choice.
+
+**Gateways: other changes.**
+
+- Set `--request-timeout` below your client's own HTTP timeout, so that your client always
+  gets the gateway's answer. The default (30 s) suits only clients that wait longer than 32 s.
+- Clients that match on error replies keep working: `error`, `status` and their spellings are
+  unchanged, and `applied` and `code` are new fields. Before, a busy or slow connection was
+  closed without a reply. Now it gets `503 busy` (E0602) or `408` (E0116). Treat both as
+  "nothing applied".
+- Two gateways can no longer share one port.
+- v0.6.1 and v0.7.0 gateways may run against one cluster side by side.
+
+**After v0.7.0.** The first release with rolling upgrades between releases (R6) will not run
+on release `0.0.6`, so moving from v0.7.0 to it is an export and import (P259g). That release's
+notes will say so.
+
+**Botpike (`nerva.pin`).** The repository moved to `NervaLog/nerva`, so releases are published
+there. Set `NERVA_REPO=NervaLog/nerva` along with the new tag, commit and tarball checksums.
+Botpike's Fly gateway already listens on `127.0.0.1`. The `NervaContainer` test fixture
+(`cluster.sh`) runs `nerva api --listen=0.0.0.0:8080` and needs `--listen-remote`. Botpike's
+client timeout is 5 s, so set `--request-timeout` below it (INF-2).
 
 ## v0.6.1 — 2026-10-21
 
