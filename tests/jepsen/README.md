@@ -41,7 +41,7 @@ Options (`lein run test --help` lists Jepsen's own):
 | Option | Default | |
 |---|---|---|
 | `--workload` | `bank` | `bank` or `retry`: what the clients do and what is checked (below) |
-| `--nemesis` | none | Comma-separated faults: `kill`, `pause`, `partition`, `gateway` (= `gateway-kill`, `gateway-partition`, `gateway-pause`, each also nameable alone) |
+| `--nemesis` | none | Comma-separated faults: `kill`, `pause`, `partition`, `gateway` (= `gateway-kill`, `gateway-partition`, `gateway-pause`, each also nameable alone), `lose-unfsynced-writes` |
 | `--nemesis-interval` | 10 | Mean seconds between faults |
 | `--rate` | 20 | Requests per second, over all workers |
 | `--time-limit` | 60 | Seconds of requests and faults, before healing |
@@ -75,11 +75,41 @@ status alone:
 | `gateway-partition` | Drops a gateway's traffic to its own node's replica, to a majority of the replicas, or to all of them (`iptables -t mangle -A OUTPUT -m owner --uid-owner nerva-gwN -p tcp -d REPLICA --dport 3000 -j DROP`, one rule per replica); the gateways are one, one node's, or a minority of nodes'; its clients still reach it and wait out its `--request-timeout`. In the mangle table, so a `partition` heal does not lift it |
 | `gateway-pause` | SIGSTOPs one gateway or one node's gateways, the replica left running, then SIGCONTs them |
 | `gateway` | The three above, mixed; its final phase resumes, heals and starts every gateway |
+| `lose-unfsynced-writes` | LazyFS (below): kills the replica and gateways on a minority of nodes (1 or 2 of 5) and clears LazyFS's cache there (with `--lazyfs-all-nodes`, also kills a majority, then the rest, and clears every node's cache; off by default, and refused with NRV-E0607 on a host with under 32 GiB: only the 64 GB R1 host runs it, see `docs/demos/r1.md`, P242j). LazyFS is mounted on 2 of the 5 nodes (the first two) unless `--lazyfs-all-nodes`, so a hosted run has the memory; `--lazyfs-strict-sync` fails a run that finds any unsynced byte after a kill (the canary); the undo starts the nodes it killed |
 
 Each gateway runs as its own Unix user (`nerva-gw0`, `nerva-gw1`) so that iptables can name one.
 The nemesis draws its targets from the gateways the test runs (`--gateways 2` gives two only to the first three nodes; every other node runs one, index 0 on port 8080, and has no index 1 to kill, pause or cut, so no fault names a gateway that does not exist, and `retry`'s clients use only the gateways that exist). The op's value in the history lists the targets (`:gateways`, or `:cut` and `:scope` for a partition), and its completion adds `:hit`, the `[node index]` pairs reached: for a kill, a cut or a pause only gateways running when checked (one that exits between the check and the action is still counted); for a start only gateways that came up (the others are `:down`, exited, or `:pending`, alive and not yet answering). In the final phase `gateway-resume` and `gateway-heal` run before the replicas' `start`, and `gateway-start` after it; that last start retries each gateway (bounded, with backoff). The `gateways` checker judges two things apart. A gateway still down or pending after it is a Nerva availability finding: `:valid? false`, NRV-E0604, and it wins over the other. A failure of the harness says nothing about Nerva: `:valid? :unknown`, NRV-E0607, for a final start that threw, did not finish or never ran when the faults called for it (`:expected 1`), a gateway whose probe threw (named in the op's `:error`, while the node's other gateways keep their `:up`, `:down` and `:pending`), or a final `gateway-heal` that failed. A gateway that answers `/healthz` with a body it cannot read counts as not healthy (NRV-E0604), not as a harness failure. That start also runs under the replica `kill` nemesis alone, and under `lose-unfsynced-writes`: their main-phase `:start` restarts gateways with only the short settle (P244), so the final start is what brings them back and judges them. The heal deletes each gateway rule (at most 8 copies per replica), then asks `iptables -C` and accepts only its exit 1 (no such rule) as healed: a rule left, or iptables failing, fails the heal with NRV-E0607; only the final phase's heal is judged (it returns the failure per node), a mid-run heal that failed is listed as `:mid-run-heal-failures` and changes nothing. A teardown after the run only logs a failed heal, so the analysis still runs. The nightly's reporter reads the checker's `:code`: a verdict carrying NRV-E0607 is the host's (counted, status `error`, no issue) unless another checker found something. `gateway-pause` and `gateway-resume` signal only gateways whose pidfile names a process of the gateway's own user.
 
-Planned: lost unsynced writes (LazyFS) and bit flips, clock faults (on
+### Lost unsynced writes (LazyFS)
+
+With `lose-unfsynced-writes` in `--nemesis`, each node's data directory, `/opt/nerva/data`, is a
+[LazyFS](https://github.com/dsrhaslab/lazyfs) FUSE mount (`jepsen.nerva.lazyfs`, on
+`jepsen.lazyfs`) and the replica's data file is `/opt/nerva/data/replica.nerva`. LazyFS keeps
+every write in its own cache until it is fsynced; clearing the cache after the replica is dead
+loses the writes the replica never made durable. Stock LazyFS (9c5685e8) does not honour the
+`O_DSYNC` the replica opens its data file with: a non-extending direct write reaches it with no
+fsync, so it loses acknowledged writes (#246). The node image therefore builds LazyFS with
+`node/lazyfs-osync.patch`, which syncs the file in `lfs_write` when it was opened `O_DSYNC` or
+`O_SYNC` (P242d); without it a clear is replica amnesia, not a lost unfsynced write. The fault
+still never acts while an earlier victim is down or has not caught up (such a fault is recorded
+`:skipped`; a combined run takes few faults, so read `:faults` against `:skipped`), and its verdict
+(`:lazyfs`) is `:unknown` with NRV-E0607 when a clear was not seen to take, the unsynced sentinel file written before
+the clear survived it (the fault did not bite, P242e; the bytes lost are reported, not judged),
+a fault op threw, or the final recovery judged no node, and invalid with NRV-E0604 when the final
+recovery left a gateway or the replica down. The final recovery settles every node the fault has
+hit, not only the ones still down. Whether a `--development` replica gets `O_DIRECT` on FUSE is
+not measured (`replica.log` says if the mount refused it). With the fault the data file is formatted on LazyFS's backing path before the mount, so its cache
+starts empty (P242h). Without the fault the data file is where it was
+and nothing is mounted. A run that never asked for the fault (the nightly, the default
+`kill,partition` run) is not judged by `:lazyfs`.
+
+The node image (`node/Dockerfile`) builds LazyFS from one pinned commit (0.3.0, the version
+`jepsen.lazyfs` is written for) in a first stage that fails unless the checkout is exactly that
+commit, the patch applies and the binary finds its libraries; `run.sh` passes `/dev/fuse` to the nodes. The fault's
+op in the history lists `:killed`, `:unsynced-bytes` (what LazyFS held and so lost, by node,
+from its own report) and `:remaining` (the report after the clear, 0 when it took), `:sentinel` (`:gone`, `:truncated`, `:survived`, `:unwritten` or `:unchecked`), `:cache-usage` (LazyFS's cache before the clear, in percent; 100 means it wrote through and the fault lost nothing: the verdict is `:unknown`, `:cache-full`, P242h), and each node's `lazyfs.log` is in `store/`.
+
+Planned: bit flips, clock faults (on
 separate machines: `nerva` is a static binary, so libfaketime cannot fool it, and containers
 share one clock), and rolling upgrades.
 

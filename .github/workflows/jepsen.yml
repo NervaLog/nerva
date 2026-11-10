@@ -20,6 +20,11 @@ on:
         type: boolean
         required: false
         default: false
+      unpatched-lazyfs:
+        description: "Canary: build the node image with stock LazyFS, without lazyfs-osync.patch (P242h); run it with --nemesis lose-unfsynced-writes --lazyfs-strict-sync, it must fail (P242j: a hosted run cannot run the all-nodes fault)"
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
@@ -32,6 +37,7 @@ env:
   # A push has no inputs: it runs this.
   ARGS: ${{ inputs.args || 'test --workload bank --nemesis kill,partition --time-limit 300' }}
   TEETH: ${{ inputs.teeth && 'true' || 'false' }}
+  JEPSEN_LAZYFS_PATCH: ${{ inputs.unpatched-lazyfs && 'no' || 'yes' }}
 
 jobs:
   jepsen:
@@ -61,6 +67,9 @@ jobs:
             case "${words[$i]}" in
               --test-count|--test-count=*)
                 echo "::error::--test-count is refused: the 1200 s --time-limit check cannot bound a multiplied run"
+                exit 1 ;;
+              --lazyfs-all-nodes|--lazyfs-all-nodes=*)
+                echo "::error::NRV-E0607: --lazyfs-all-nodes is refused on a hosted runner: LazyFS on all 5 nodes leaves its 16 GB about 0.4 GiB free (P242j). Run it on the R1 host (ops/jepsen)"
                 exit 1 ;;
               --time-limit) limit=${words[$((i + 1))]:-} ;;
               --time-limit=*) limit=${words[$i]#--time-limit=} ;;
@@ -121,8 +130,22 @@ jobs:
           echo "NERVA_CLUSTER_KEY=$NERVA_CLUSTER_KEY" >> "$GITHUB_ENV"
           export NERVA_CLUSTER_KEY
           read -r -a words <<< "$ARGS"
+          # The memory record (P242i): `free -m` at the start and the end, and the lowest
+          # MemAvailable seen (sampled every 5 s) in between, which includes LazyFS's cache (about
+          # 0.9 to 1.2 GiB resident a node, from mount to unmount, on 2 of the 5 nodes, P242j).
+          free -m
+          # Every 5 s, bounded: meminfo (Cached, Shmem), RSS per command, the top processes and
+          # container cgroups (tests/jepsen/memsample.sh, P242j); the artifact `jepsen-memory`.
+          tests/jepsen/memsample.sh "$RUNNER_TEMP/jepsen-memory.log" "$RUNNER_TEMP/jepsen-memory-low.txt" &
+          sampler=$!
           # Jepsen exits 0 valid, 1 invalid, 2 unknown, 255 on a crash.
-          tests/jepsen/run.sh "$NERVA" "${words[@]}"
+          rc=0
+          tests/jepsen/run.sh "$NERVA" "${words[@]}" || rc=$?
+          kill "$sampler" 2>/dev/null || true
+          free -m
+          echo "memory: the sample at the lowest MemAvailable"
+          cat "$RUNNER_TEMP/jepsen-memory-low.txt" || true
+          exit "$rc"
 
       # Searches case-insensitively, for the key and for its first 16 hex characters. The pack
       # and upload below run only when this step did not fail: a leak is never uploaded.
@@ -150,6 +173,14 @@ jobs:
         with:
           name: jepsen-store
           path: ${{ runner.temp }}/jepsen-store.tar.gz
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: jepsen-memory
+          path: ${{ runner.temp }}/jepsen-memory*
           if-no-files-found: ignore
           retention-days: 14
 

@@ -35,13 +35,18 @@ cleanup() {
 trap cleanup EXIT
 cleanup
 
-docker build -q -t "$image" "$here/node" > /dev/null
+# JEPSEN_LAZYFS_PATCH=no builds stock LazyFS: the teeth canary of the lose-unfsynced-writes fault.
+docker build -q --build-arg "LAZYFS_PATCH=${JEPSEN_LAZYFS_PATCH:-yes}" -t "$image" "$here/node" > /dev/null
 docker network create --subnet "$subnet" "$network" > /dev/null
+# LazyFS (the lose-unfsynced-writes fault) mounts a FUSE filesystem in each node: it needs the
+# host's /dev/fuse, which --privileged also exposes; passing it by name keeps it explicit.
+fuse=()
+[[ -e /dev/fuse ]] && fuse=(--device /dev/fuse)
 # The public key is copied in, not mounted: a mounted file keeps its owner on the host (`runner`
 # in CI), and sshd refuses root an authorized_keys file another user owns.
 for i in "${!nodes[@]}"; do
   docker run -d --name "nerva-jepsen-n$((i + 1))" --hostname "n$((i + 1))" \
-    --network "$network" --ip "${nodes[$i]}" --privileged "$image" > /dev/null
+    --network "$network" --ip "${nodes[$i]}" --privileged ${fuse[@]+"${fuse[@]}"} "$image" > /dev/null
   docker exec -i "nerva-jepsen-n$((i + 1))" \
     sh -c 'cat > /root/.ssh/authorized_keys && chown root:root /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys' \
     < "$key.pub"

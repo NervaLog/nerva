@@ -1,0 +1,29 @@
+--- a/lazyfs/src/lazyfs.cpp
++++ b/lazyfs/src/lazyfs.cpp
+@@ -1132,6 +1132,26 @@
+ 
+     
+ 
++    // A write on a file opened with O_DSYNC or O_SYNC is durable when it returns, as
++    // the application was promised. The kernel does not always follow such a write
++    // with a FUSE fsync (a non-extending O_DIRECT write, e.g. through io_uring, gets
++    // none), so sync the file here, as lfs_fsync does. lfs_fsync itself is not called:
++    // it would take cache_command_lock a second time.
++    if (fi != NULL && res >= 0 && (fi->flags & (O_DSYNC | O_SYNC))) {
++
++        bool datasync = (fi->flags & O_SYNC) != O_SYNC;
++
++        if (this_ ()->FSCache->has_content_cached (inode)) {
++
++            if (this_ ()->FSCache->sync_owner (inode, datasync, (char*)path) != 0)
++                res = -EIO;
++
++        } else if (datasync ? fdatasync (fd) : fsync (fd)) {
++
++            res = -errno;
++        }
++    }
++
+     this_ ()->trigger_crash_fault ("write", "after", path, "",fault_type);
+ 
+     return res;

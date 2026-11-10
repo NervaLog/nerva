@@ -17,6 +17,7 @@
             [jepsen.nerva [bank :as bank]
                           [db :as db]
                           [http :as http]
+                          [lazyfs :as lazyfs]
                           [nemesis :as nemesis]
                           [retry :as retry]])
   (:gen-class))
@@ -32,7 +33,8 @@
 
 (def faults
   "The faults --nemesis may name."
-  #{:kill :pause :partition :gateway :gateway-kill :gateway-partition :gateway-pause})
+  #{:kill :pause :partition :gateway :gateway-kill :gateway-partition :gateway-pause
+    lazyfs/fault})
 
 (def all-nemeses
   "What test-all runs, each for every workload."
@@ -52,19 +54,29 @@
                       :nodes     (:nodes opts)
                       :faults    (set (:nemesis opts))
                       :interval  (:nemesis-interval opts)
+                      :dir       db/dir
+                      :node-probe  db/node-health
+                      :start-mid!  db/start-node-bounded!
                       :kill      {:targets [:one :minority :majority :all]}
                       :pause     {:targets [:one :minority :majority]}
                       :partition {:targets [:one :majority :majorities-ring]}}]
+    ;; Final generators run in this order. The lazyfs recovery is judged, so it comes after the
+    ;; replica restart (db-package) and the partition heal, which may otherwise leave it no
+    ;; quorum, and before nemesis/package's final gateway start.
     (combined/compose-packages [(nemesis/heal-package package-opts)
                                 (combined/db-package package-opts)
                                 (combined/partition-package package-opts)
+                                (lazyfs/package package-opts)
                                 (nemesis/package package-opts)])))
 
 (defn nerva-test
   "A test map from CLI options."
   [opts]
+  (lazyfs/check-host-memory! opts (try (slurp "/proc/meminfo") (catch Exception _ nil)))
   (let [workload ((workloads (:workload opts)) opts)
-        opts     (assoc opts :gateways (or (:gateways opts) (default-gateways opts)))
+        opts     (assoc opts
+                        :gateways (or (:gateways opts) (default-gateways opts))
+                        :lazyfs   (contains? (set (:nemesis opts)) lazyfs/fault))
         db       (db/db (:bootstrap workload))
         package  (nemesis-package opts db)]
     (merge tests/noop-test
@@ -87,6 +99,7 @@
                           :exceptions (checker/unhandled-exceptions)
                           :protocol   (http/protocol-checker)
                           :gateways   (nemesis/final-start-checker)
+                          :lazyfs     (lazyfs/recover-checker)
                           :workload   (:checker workload)})
             :generator (gen/phases
                          (->> (:generator workload)
@@ -104,7 +117,7 @@
     :default  :bank
     :parse-fn keyword
     :validate [workloads (str "Must be one of " (str/join ", " (map name (keys workloads))))]]
-   [nil "--nemesis FAULTS" "Comma-separated faults: kill, pause, partition, gateway (= gateway-kill, gateway-partition, gateway-pause)."
+   [nil "--nemesis FAULTS" "Comma-separated faults: kill, pause, partition, gateway (= gateway-kill, gateway-partition, gateway-pause), lose-unfsynced-writes (LazyFS)."
     :default  []
     :parse-fn parse-faults
     :validate [(partial every? faults) (str "Faults are " (str/join ", " (map name faults)))]]
@@ -131,6 +144,8 @@
     :default  8
     :parse-fn parse-long
     :validate [pos? "Must be positive"]]
+   [nil "--lazyfs-all-nodes" "lose-unfsynced-writes: LazyFS on all 5 nodes, and also lose writes on every node after a quorum crash. Refused (NRV-E0607) on a host with under 32 GiB: a hosted runner puts LazyFS on a minority of nodes (P242j)."]
+   [nil "--lazyfs-strict-sync" "lose-unfsynced-writes: any unsynced byte LazyFS holds after a kill fails the run (the hosted canary: an unpatched LazyFS, P242j)."]
    [nil "--nerva-binary PATH" "The nerva binary to install on every node."
     :default "../../zig-out/bin/nerva"]])
 

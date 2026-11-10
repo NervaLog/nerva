@@ -10,7 +10,8 @@
                     [core :as jepsen]
                     [db :as db]]
             [jepsen.control.util :as cu]
-            [jepsen.nerva.http :as http]))
+            [jepsen.nerva.http :as http]
+            [jepsen.nerva.lazyfs :as lazyfs]))
 
 (def dir "/opt/nerva")
 (def binary (str dir "/nerva"))
@@ -116,7 +117,7 @@
                      ;; never logged.
                      :env               (str "NERVA_CLUSTER_KEY=\"$(cat " cluster-key-file ")\"")}
                     binary :start (str "--addresses=" (addresses test)) :--development
-                    data-file))
+                    (lazyfs/data-file test dir data-file)))
 
 (defn gateway-user
   "The Unix user gateway `index` runs as, so iptables can name one gateway
@@ -293,6 +294,21 @@
         (not (gateway-running? index))                :dead
         :else                                         :pending))
 
+(defn node-gateway-outcome
+  "On this node, whether each of its gateways answers now: `(start-outcome ...)` of
+  `gateway-state` for every index. For a caller that restarted the node through `db/start!`
+  (the LazyFS recovery, P242b), which reports no outcome of its own."
+  [test]
+  (start-outcome (into {} (for [i (range (gateways test c/*host*))] [i (gateway-state i)]))))
+
+(defn node-health
+  "On this node: `node-gateway-outcome` plus `:replica`, `:up` while the replica process is alive
+  and `:dead` otherwise. A gateway answers through the other replicas, so it cannot show that
+  this node's own replica came back; the LazyFS recovery (P242c) judges both."
+  [test]
+  (assoc (node-gateway-outcome test)
+         :replica (if (cu/daemon-running? replica-pidfile) :up :dead)))
+
 (defn settle-states
   "Probes every `:pending` gateway in `states` (index to state) with `probe` in rounds, until
   none is pending or `(now)` passes `deadline`; between rounds it calls `(sleep!)`. The deadline
@@ -459,6 +475,16 @@
              :when (pos? n)]
          index)))
 
+(defn start-node-bounded!
+  "Starts the replica, then the gateways that are not running with `start-gateways!`, whose wait
+  is bounded (`start-settle-s`): a mid-run restart that a concurrent `kill` or `partition` has
+  left without quorum returns instead of retrying for minutes (`start-gateway-until-up!`). The
+  outcome is not returned; the caller probes (`node-health`)."
+  [test]
+  (c/su
+    (start-replica! test)
+    (start-gateways! test)))
+
 (defn kill-all!
   "SIGKILLs the gateways and the replica. The pidfile of a gateway the test did not start is
   harmless: `stop-daemon!` ignores a missing one."
@@ -481,6 +507,7 @@
            (throw e)))
        (finally
          (kill-all!)
+         (when (lazyfs/mounted-here? test) (lazyfs/umount! dir))
          (c/exec :rm :-rf dir))))
 
 (defn db
@@ -499,10 +526,18 @@
           (c/exec :chmod "+x" binary)
           (install-cluster-key!)
           (create-gateway-users!)
+          ;; With the fault, format on the backing path and mount after, so the format's writes
+          ;; do not fill LazyFS's cache (P242h).
+          (when (lazyfs/mounted-here? test) (c/exec :mkdir :-p (lazyfs/backing-dir dir)))
           (c/exec binary :format (str "--cluster=" cluster)
                   (str "--replica=" (replica-index test node))
                   (str "--replica-count=" (count (:nodes test)))
-                  :--development data-file)
+                  :--development (lazyfs/format-file test dir data-file))
+          (lazyfs/check-cache-bound! test dir data-file)
+          (when (lazyfs/mounted-here? test)
+            (lazyfs/mount! dir)
+            ;; LazyFS holds its whole cache from the mount on (P242i): record the memory left.
+            (info "Memory after the LazyFS mount on" node ":" (c/exec :free :-m)))
           (start-replica! test)
           (start-api! test))
         (doseq [index (range (gateways test node))]
@@ -535,6 +570,7 @@
 
       db/LogFiles
       (log-files [_ test node]
-        (into {replica-log "replica.log"}
+        (into (merge {replica-log "replica.log"}
+                     (when (lazyfs/mounted? test node) (lazyfs/log-files dir)))
               (for [index (range (gateways test node))]
                 [(gateway-log index) (if (zero? index) "api.log" (str "api-" index ".log"))]))))))
