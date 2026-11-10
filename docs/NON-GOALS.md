@@ -9,7 +9,7 @@ which milestone in [docs/PRODUCTION.md](./PRODUCTION.md) may change it. The labe
   ([README](../README.md#design-in-one-picture)).
 - **No TLS.** A gateway speaks plain HTTP on loopback beside its client, and replicas do not
   encrypt after the handshake. Put TLS or an encrypted private network in front
-  ([SECURITY.md](../SECURITY.md)). The gateway's TLS is listed as a non-goal in R4.
+  ([SECURITY.md](../SECURITY.md)). PRODUCTION.md lists TLS on the gateway as a non-goal.
 - **One shared gateway key.** `NERVA_KEY` is one bearer key per gateway
   ([README](../README.md#limits), "Network"). Every gateway has its own, so rotate them
   independently.

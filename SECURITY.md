@@ -63,7 +63,7 @@ network. Only the cluster's machines and its gateways' machines may reach it.
   caller reaches off its own host ([README, Limits](./README.md#limits), "Network").
 - **No encryption at rest.** Data files, exports and backups are checksummed, not encrypted.
   Use an encrypted volume, and treat an export as the data it holds.
-- **No per-user authorization or audit of who called.** See [docs/NON-GOALS.md](./docs/NON-GOALS.md).
+- **No per-user authorization.** See [docs/NON-GOALS.md](./docs/NON-GOALS.md).
 - **A forwarder defeats the loopback rule.** The refusal is advisory ("Gateways beside their
   clients").
 - **`--development` is not for production:** it relaxes Direct IO and falls back to a public
