@@ -2,9 +2,10 @@
 
 Nerva v0.7.1 is not released yet. This page says how each kind of download installs, so that the
 release can be used from its notes alone. Until the release exists, the file names below are the
-names the release workflow gives its assets, and the Homebrew tap and the packages are built but
-not published. Nothing here is signed by a Linux key; what is signed or checked is said under each
-heading.
+names the release process is set up to give its assets (the release workflow for the Linux
+assets, `zig build mac-release` for the Mac zip), and the Homebrew tap and the packages are
+built but not published: check the release page for what it actually lists. Nothing here is
+signed by a Linux key; what is signed or checked is said under each heading.
 
 Nerva is for development and evaluation on macOS, and for production on Linux (x86_64 with AES, or
 aarch64). It is a research database: see the [README](../README.md) for what that promises.
@@ -23,7 +24,8 @@ re-records them. Outputs marked "not run" were written from the files and not ru
 | Linux, to try it | the tarball, run by hand | [QUICKSTART.md](./QUICKSTART.md) |
 | any machine with a compiler | the source | [From source](#from-source) |
 
-Every release asset is covered by `SHA256SUMS`: [check it first](#checking-a-download).
+The tarballs, the packages and the bill of materials are covered by `SHA256SUMS`, and the Mac
+zip by its own `.sha256` file: [check a download first](#checking-a-download).
 
 ## macOS
 
@@ -51,16 +53,22 @@ unzip nerva-v0.7.1-universal-macos.zip
 ./nerva-v0.7.1-universal-macos/nerva version
 ```
 
-The binary is meant to be signed with the owner's Developer ID and notarized before the release is
+The release page also lists `nerva-v0.7.1-x86_64-macos.tar.gz` and
+`nerva-v0.7.1-aarch64-macos.tar.gz`. They are for scripts that pin them: they are not signed with
+a Developer ID or notarized, so Gatekeeper may block them. On a Mac, take Homebrew or the zip.
+
+The zip's binary is meant to be signed with the owner's Developer ID and notarized before the release is
 published; neither has been done for a candidate, and this page does not say it has. A bare
 executable cannot carry Apple's notarization ticket, so Gatekeeper looks the notarization up
 online when the file is first opened.
 
 **A browser download.** A browser marks what it downloads with a quarantine attribute, and
 Gatekeeper then checks the file when it first runs. A notarized binary passes that check. If macOS
-refuses a file you have already verified against its checksum, you can clear the mark with
-`xattr -d com.apple.quarantine nerva`. Do that only for a file whose SHA-256 matches. Homebrew and
-`curl` do not set the mark.
+refuses a binary from a zip whose SHA-256 you have already verified against its `.sha256`, you
+can clear the mark, from the directory you unzipped in, with
+`xattr -d com.apple.quarantine nerva-v0.7.1-universal-macos/nerva` (the mark is usually on the
+zip, and on what Archive Utility extracts from it). Do that only for a zip whose SHA-256 matches.
+Homebrew and `curl` do not set the mark.
 
 macOS is not a production platform for Nerva: no Mac has been used to test Nerva's durability or
 failure behavior, and the production claims in this repository are Linux's.
@@ -129,10 +137,11 @@ error[NRV-E1102]: install.sh: this machine is not running systemd
 
 Each release has a `.deb` (`amd64`, `arm64`) and an `.rpm` (`x86_64`, `aarch64`):
 `nerva_0.7.1-1_<arch>.deb` and `nerva-0.7.1-1.<arch>.rpm`. They hold the same binary and the same
-units and examples as the tarball (the binary in `/usr/bin/nerva`, the units in
-`/usr/lib/systemd/system`, the examples in `/usr/share/doc/nerva`), and create the `nerva` user,
-`/var/lib/nerva` and `/etc/nerva`. They format, enable and start nothing, and removing them leaves
-your data, your settings and the user.
+units and examples as the tarball: the binary in `/usr/bin/nerva`, the units in
+`/usr/lib/systemd/system`, and the two examples in `/usr/share/nerva`. They create the `nerva`
+user, `/var/lib/nerva` and `/etc/nerva`, but **do not put the examples in `/etc/nerva`**: you copy
+them there yourself ([QUICKSTART.md](./QUICKSTART.md#three-hosts)). They format, enable and start
+nothing, and removing them leaves your data, your settings and the user.
 
 **They are not signed in v0.7.1**, and there is no apt or dnf repository: you download the file,
 [check it against `SHA256SUMS`](#checking-a-download), and install it from disk.
@@ -142,13 +151,21 @@ sudo apt install ./nerva_0.7.1-1_amd64.deb         # Debian 12, Ubuntu 24.04
 sudo dnf install ./nerva-0.7.1-1.x86_64.rpm        # Rocky 9, Fedora
 ```
 
-`dnf` installs a local unsigned file with its defaults. Fedora 43 and later carry rpm 6, whose own
-command refuses an unsigned file, so use `dnf` there; with rpm directly, `sudo rpm -U --nosignature
-nerva-0.7.1-1.x86_64.rpm` works on every version. Do not turn signature checking off globally for
-this. A package whose user `nerva` conflicts with another one fails with NRV-E1105 before it
-unpacks anything.
+Use `dnf` for the `.rpm`: it installs a local unsigned file with its defaults. Fedora's rpm 6
+refuses an unsigned file with `rpm -i` and `rpm -U`; with rpm directly, add `--nosignature`
+(`sudo rpm -U --nosignature nerva-0.7.1-1.x86_64.rpm`). Rocky 9's rpm accepts both. Do not turn
+signature checking off globally for this.
 
-The next steps are the same as after the tarball: [QUICKSTART.md](./QUICKSTART.md#three-hosts).
+A package refuses to install, before it unpacks anything, when:
+
+- a user `nerva` that is not Nerva's already exists (NRV-E1105); or
+- a tarball install is still there: `/usr/local/bin/nerva` or a unit in `/etc/systemd/system`
+  (NRV-E1111). Run `sudo ./install.sh --uninstall` from the tarball first; it keeps your data, your
+  settings and the user. See [TROUBLESHOOTING.md](./TROUBLESHOOTING.md#the-installer-refused).
+
+What differs from the tarball when you follow [QUICKSTART.md](./QUICKSTART.md#three-hosts): the
+examples are in `/usr/share/nerva`, not `/etc/nerva`, and the binary is `/usr/bin/nerva`, not
+`/usr/local/bin/nerva`. Everything else is the same.
 
 ## From source
 
@@ -168,19 +185,31 @@ on a Mac.
 ## Checking a download
 
 Every release has `SHA256SUMS` and a bill of materials, `nerva-v0.7.1.cdx.json` (CycloneDX 1.5): the
-vendored TigerBeetle commit and the Zig toolchain Nerva was built from. Put the files you
-downloaded beside `SHA256SUMS`:
+vendored TigerBeetle commit and the Zig toolchain Nerva was built from. `SHA256SUMS` lists the
+tarballs, the packages and the bill of materials, not the Mac zip. Put the files you downloaded
+beside `SHA256SUMS`:
 
 ```bash
 sha256sum -c --ignore-missing SHA256SUMS          # Linux
-shasum -a 256 -c SHA256SUMS                       # macOS (it reports every missing file)
+grep nerva-v0.7.1-aarch64-macos.tar.gz SHA256SUMS | shasum -a 256 -c    # macOS: one file
 ```
 
-Recorded, on the Linux tarball:
+The Mac zip has its own file, `<hex>  <name>`, beside it:
+
+```bash
+shasum -a 256 -c nerva-v0.7.1-universal-macos.zip.sha256     # macOS
+```
+
+Homebrew checks the formula's own `sha256` when it installs.
+
+Recorded, on a Linux tarball and a `SHA256SUMS` made by hand from it on `4ddd232` (no release
+workflow has produced either yet):
 
 ```
 nerva-v0.7.1-x86_64-linux.tar.gz: OK
 ```
+
+The `shasum` forms were not run (this machine is not a Mac).
 
 A line that says `FAILED` means the file is not the release's: delete it and download again. The
 checksum proves the file is the one the workflow published, not that the workflow can be trusted:

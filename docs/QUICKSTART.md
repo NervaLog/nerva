@@ -16,14 +16,22 @@ cannot lose.
 
 ## One machine
 
-You need the unpacked tarball (or a Homebrew install, or a build from source: any `nerva` on your
-`PATH` or in the current directory), `curl`, and about 3.5 GiB of free disk: each replica's data
-file is 1.1 GiB.
+You need `nerva` (from the unpacked tarball or zip, Homebrew, a package or a build from
+source), `curl`, and about 3.5 GiB of free disk: each replica's data file is 1.1 GiB. Three
+replicas at `--development`'s small caches take about 1.8 GB of memory each
+([sizing](./OPERATING.md#sizing)).
+
+Set `NERVA` to the path of the binary, by whichever line fits:
 
 ```bash
-cd nerva-v0.7.1-x86_64-linux       # or wherever the nerva binary is
-NERVA=$PWD/nerva
-$NERVA version
+NERVA=$PWD/nerva-v0.7.1-x86_64-linux/nerva              # the tarball, unpacked here (the zip: nerva-v0.7.1-universal-macos/nerva)
+NERVA=$(command -v nerva)                                # Homebrew, a package or install.sh
+```
+
+Every command below writes `"$NERVA"`, quoted, so a path with a space works.
+
+```bash
+"$NERVA" version
 ```
 ```
 Nerva version 0.0.6+4ddd232
@@ -42,9 +50,9 @@ The first line is `<protocol release>+<commit>`; the last is the release as peop
 is yours to choose (`0` is reserved for tests); every client names it.
 
 ```bash
-mkdir ~/nerva-quickstart && cd ~/nerva-quickstart
+mkdir -p ~/nerva-quickstart && cd ~/nerva-quickstart
 for i in 0 1 2; do
-  $NERVA format --cluster=1 --replica=$i --replica-count=3 --development 1_$i.nerva
+  "$NERVA" format --cluster=1 --replica=$i --replica-count=3 --development 1_$i.nerva
 done
 ```
 ```
@@ -68,7 +76,7 @@ bare port means `127.0.0.1`.
 
 ```bash
 for i in 0 1 2; do
-  $NERVA start --addresses=3001,3002,3003 --development 1_$i.nerva > replica_$i.log 2>&1 &
+  "$NERVA" start --addresses=3001,3002,3003 --development 1_$i.nerva > replica_$i.log 2>&1 &
 done
 sleep 5; grep -h listening replica_*.log
 ```
@@ -87,7 +95,7 @@ its secret in `X-Nerva-Key`.
 
 ```bash
 export NERVA_KEY=secret
-$NERVA api --cluster=1 --addresses=3001,3002,3003 --listen=127.0.0.1:8080 > api.log 2>&1 &
+"$NERVA" api --cluster=1 --addresses=3001,3002,3003 --listen=127.0.0.1:8080 > api.log 2>&1 &
 sleep 5
 n() { curl -s -H "X-Nerva-Key: $NERVA_KEY" "$@"; echo; }
 A=http://127.0.0.1:8080
@@ -153,7 +161,7 @@ n "$A/v1/changes?limit=100"
 op 12. The row's history and its value at any past op are one request each:
 
 ```bash
-n "$A/v1/row?table=1&id=1001&as_of=5"     # before the order existed
+n "$A/v1/row?table=1&id=1001&as_of=5"     # any op below your first commit's
 ```
 ```
 {"table":1,"id":"1001","as_of":"5","exists":false,"op":"0","value_hex":"00…00"}
@@ -187,15 +195,24 @@ unit files and the examples the tarball and the packages ship
 
 Before you start:
 
-- Three Linux machines (call their addresses `10.0.0.1`, `10.0.0.2`, `10.0.0.3`) that reach each
-  other's port `3001`, on a private network that encrypts, such as WireGuard. The cluster key proves
-  who connects; it does not encrypt what follows
-  ([Replicas authenticate each other](../README.md#replicas-authenticate-each-other)).
-- Nerva installed on each ([INSTALL.md](./INSTALL.md#linux)): `sudo ./install.sh` from the
-  tarball, or the package. Both leave `nerva` in your `PATH`, the user `nerva`, `/var/lib/nerva`
-  and `/etc/nerva`, and the units, and start nothing.
-- A file system for `/var/lib/nerva` that supports Direct IO (ext4 and xfs do; tmpfs does not).
-  Sizing and the rest of the production checklist are in `docs/OPERATING.md`.
+- Three Linux machines (call their addresses `10.0.0.1`, `10.0.0.2`, `10.0.0.3`) on a private
+  network that encrypts, such as WireGuard. **Only the three replicas, and the hosts that run a
+  gateway or `nerva backup`, `export` or `recover`, may reach port `3001`.** The cluster key
+  authenticates replicas to each other, not clients: anyone who can reach a replica's port can read
+  and write without any key, and nothing on that port is encrypted. Close `3001` to everything
+  else ([SECURITY.md](../SECURITY.md), [README, Limits](../README.md#limits)).
+- A host for each gateway: usually the host of the process that calls it, which may be one of the
+  three. It needs Nerva installed too (step 5) and must reach `3001` on all three replicas.
+- Nerva installed on each host ([INSTALL.md](./INSTALL.md#linux)): `sudo ./install.sh` from the
+  tarball, or a package. Both leave the user `nerva`, `/var/lib/nerva`, `/etc/nerva` and the units,
+  and start nothing. They differ in two paths: the tarball's `install.sh` puts `nerva` in
+  `/usr/local/bin` and the examples in `/etc/nerva`; a package puts `nerva` in `/usr/bin` and the
+  examples in `/usr/share/nerva`. A leftover tarball install makes a package refuse with
+  NRV-E1111 ([INSTALL.md](./INSTALL.md#the-deb-and-the-rpm)).
+- A file system for `/var/lib/nerva` that supports Direct IO (ext4 and xfs do; tmpfs does not), and
+  memory: about 3 GiB a replica at the defaults, 256 MiB for a gateway, and 1.1 GiB of disk for a
+  replica's data file to start. Sizing and the rest of the production checklist are in
+  [OPERATING.md](./OPERATING.md#sizing).
 
 **1. Make one cluster key**, once, on any machine, and keep it as a secret (at least 32 bytes;
 the same on all three replicas):
@@ -206,10 +223,13 @@ openssl rand -hex 32
 
 **2. On each host, a replica's settings.** Copy the example to `/etc/nerva/replica-<n>.env`, where
 `<n>` is that host's replica index (`0` on `10.0.0.1`, `1` on `10.0.0.2`, `2` on `10.0.0.3`), and
-edit it; the file holds the key, so only root may read it:
+edit it; the file holds the key, so only root may read it. The example is in `/etc/nerva` after
+`install.sh` and in `/usr/share/nerva` after a package; or write the file from the block below:
 
 ```bash
-sudo cp /etc/nerva/replica.env.example /etc/nerva/replica-0.env
+EX=/etc/nerva/replica.env.example               # after install.sh
+EX=/usr/share/nerva/replica.env.example         # after a .deb or .rpm
+sudo cp "$EX" /etc/nerva/replica-0.env
 sudo chown root:root /etc/nerva/replica-0.env && sudo chmod 0600 /etc/nerva/replica-0.env
 sudoedit /etc/nerva/replica-0.env
 ```
@@ -220,13 +240,15 @@ NERVA_DATA_FILE=/var/lib/nerva/0.nerva
 NERVA_FLAGS=
 ```
 
+**Replace the example's `NERVA_CLUSTER_KEY` with your own.** The placeholder is longer than 32
+bytes, so Nerva accepts it and starts: nothing refuses a key that is published in this repository.
 `NERVA_ADDRESSES` is the same on all three hosts, in replica order. On the second host the file is
 `replica-1.env` with `NERVA_DATA_FILE=/var/lib/nerva/1.nerva`, and so on. Leave `NERVA_FLAGS` empty:
 never `--development` in production.
 
 **3. Format each data file, as the `nerva` user** (the unit may write only `/var/lib/nerva`; give
-the full path, since `sudo` and `runuser` may not search `/usr/local/bin`; it is `/usr/bin/nerva`
-after a package install). On host 0:
+the full path, since `sudo` and `runuser` may not search `/usr/local/bin`: `/usr/local/bin/nerva`
+after `install.sh`, `/usr/bin/nerva` after a package). On host 0:
 
 ```bash
 sudo runuser -u nerva -- /usr/local/bin/nerva format --cluster=1 --replica=0 --replica-count=3 /var/lib/nerva/0.nerva
@@ -256,9 +278,11 @@ exit status the unit lists (`1` to `8`) is not restarted, because a restart cann
 [docs/ERRORS.md](./ERRORS.md) says what to do.
 
 **5. A gateway beside each client.** `nerva-api@.service` runs `nerva api` for the process that
-uses it, on loopback. On the client's host, copy `api.env.example` to `/etc/nerva/api-0.env`,
-set the cluster id, the three addresses and a key of your own for `NERVA_KEY`, and give it the
-same ownership and mode:
+uses it, on loopback. On the gateway's host (Nerva installed there, and port `3001` of all three
+replicas reachable), copy `api.env.example` (from `/etc/nerva` or `/usr/share/nerva`, as in step 2)
+to `/etc/nerva/api-0.env`, set the cluster id, the three addresses and a key of your own for
+`NERVA_KEY` (the example's `replace-with-a-long-random-key` is a published value: replace it),
+and give it the same ownership and mode:
 
 ```
 NERVA_CLUSTER=1
@@ -295,6 +319,6 @@ replica without a key does not start.
   and [Upgrading a cluster](../README.md#upgrading-a-cluster): what to do before you rely on it.
 - [README, When a command refuses](../README.md#when-a-command-refuses) and
   [docs/ERRORS.md](./ERRORS.md): every `NRV-` code.
-- `docs/OPERATING.md`, `docs/TROUBLESHOOTING.md`, `docs/MATURITY.md` and `SECURITY.md` (written beside
-  these pages for the same release): what a replica needs, what to do when something fails, what the
-  label promises, and what the keys protect.
+- [OPERATING.md](./OPERATING.md), [TROUBLESHOOTING.md](./TROUBLESHOOTING.md),
+  [MATURITY.md](./MATURITY.md) and [SECURITY.md](../SECURITY.md): what a replica needs, what to do
+  when something fails, what the label promises, and what the keys protect.
