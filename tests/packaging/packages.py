@@ -456,7 +456,7 @@ echo "refused with @CODE@, nothing unpacked"
 
 def container(image, dist, repo, script, label):
     command = ["docker", "run", "--rm", "-v", f"{dist}:/dist:ro", "-v", f"{repo}/packaging/linux:/src:ro",
-               image, "sh", "-eu", "-c", script]
+               image, "sh", "-eux", "-c", script]
     result = run(command, check=False)
     print(f"  [{image}] {label}")
     for line in result.stdout.strip().split("\n"):
