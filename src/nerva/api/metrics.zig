@@ -15,6 +15,7 @@
 //! Series with no events in a window are not sent, except the two gauges.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const assert = std.debug.assert;
 const posix = std.posix;
 const log = std.log.scoped(.metrics);
@@ -540,8 +541,13 @@ pub const Emitter = struct {
 
         /// Every refusal is a dropped packet: `posix.send` would make a refused or unreachable
         /// destination `unreachable`, a panic ten seconds after start with no collector (M1).
+        /// `std.posix.MSG` is `void` on macOS, which has no `MSG_NOSIGNAL` (a datagram socket
+        /// raises no SIGPIPE there anyway) and whose `MSG_DONTWAIT` is 0x80 (`<sys/socket.h>`).
         fn send(sink: *UdpSink, bytes: []const u8) bool {
-            const flags = posix.MSG.DONTWAIT | posix.MSG.NOSIGNAL;
+            const flags: u32 = if (builtin.os.tag == .linux)
+                posix.MSG.DONTWAIT | posix.MSG.NOSIGNAL
+            else
+                0x80;
             const sent = posix.sendto(
                 sink.socket,
                 bytes,
