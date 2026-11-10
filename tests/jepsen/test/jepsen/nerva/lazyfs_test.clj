@@ -542,3 +542,12 @@
                                          :sentinel {"n1" :gone}})
                                   (recover-pair {})))]
     (is (= {:all 1, :minority 1} (:scopes r)))))
+
+(deftest one-gateway-under-the-fault
+  (testing "lose-unfsynced-writes runs one gateway per node, whatever the workload (P242j)"
+    (is (= 1 (core/default-gateways {:workload :bank, :nemesis #{lazyfs/fault}})))
+    (is (= 1 (core/default-gateways {:workload :retry, :nemesis [:kill lazyfs/fault]}))))
+  (testing "the other nemeses keep two for keyed workloads"
+    (is (= 2 (core/default-gateways {:workload :bank, :nemesis #{:kill}})))
+    (is (= 2 (core/default-gateways {:workload :retry, :nemesis #{}})))
+    (is (= 1 (core/default-gateways {:workload :bank, :keyed false, :nemesis #{:kill}})))))

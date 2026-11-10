@@ -49,7 +49,7 @@ Options (`lein run test --help` lists Jepsen's own):
 | `--keys` / `--no-keys` | `--keys` | `bank`: send each transfer under a commit key with a record, retried as `retry`'s are, or unkeyed as before |
 | `--drop-reply` | 0.1 | Keyed workloads (`retry`, `bank --keys`): the probability that the client discards a `200` and resends it as if it were lost |
 | `--attempts` | 8 | Keyed workloads: attempts per operation (one key) before it ends unresolved |
-| `--gateways` | 1 (2 for `retry` and `bank --keys`) | Gateways per node: 1, or 2 (on the first three nodes only, as a development replica takes 8 clients; ports 8080 and 8081; `bank --no-keys`'s clients use the first, keyed workloads' use both). They listen on `0.0.0.0` with `--listen-remote`, since the control node reaches them over the network |
+| `--gateways` | 1 (2 for `retry` and `bank --keys`, except with `lose-unfsynced-writes`, which runs 1: P242j) | Gateways per node: 1, or 2 (on the first three nodes only, as a development replica takes 8 clients; ports 8080 and 8081; `bank --no-keys`'s clients use the first, keyed workloads' use both). They listen on `0.0.0.0` with `--listen-remote`, since the control node reaches them over the network |
 
 ## What a reply means
 

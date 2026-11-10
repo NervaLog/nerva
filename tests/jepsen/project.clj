@@ -4,4 +4,4 @@
                  [jepsen "0.3.14"]
                  [org.clojure/data.json "2.5.1"]]
   :main jepsen.nerva.core
-  :jvm-opts ["-Xmx4g" "-Djava.awt.headless=true"])
+  :jvm-opts ["-Xmx3g" "-Djava.awt.headless=true"])

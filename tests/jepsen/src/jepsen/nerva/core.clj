@@ -27,9 +27,14 @@
    :retry retry/workload})
 
 (defn default-gateways
-  "Gateways per node when --gateways is not given: a keyed workload resends to another gateway."
-  [{:keys [workload keyed]}]
-  (if (or (= :retry workload) (and (= :bank workload) (not (false? keyed)))) 2 1))
+  "Gateways per node when --gateways is not given: a keyed workload resends to another gateway,
+  except under `lose-unfsynced-writes`, which runs one: LazyFS's cache is 5.4 GiB of the hosted
+  runner's 16 GB and a second gateway on three nodes is memory the run cannot spare (P242j)."
+  [{:keys [workload keyed nemesis]}]
+  (cond
+    (contains? (set nemesis) lazyfs/fault)                                1
+    (or (= :retry workload) (and (= :bank workload) (not (false? keyed)))) 2
+    :else                                                                  1))
 
 (def faults
   "The faults --nemesis may name."
