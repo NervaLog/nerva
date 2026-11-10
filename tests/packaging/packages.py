@@ -272,15 +272,15 @@ check_removed() {
     [ -d /etc/nerva ]
     getent passwd nerva > /dev/null
 }
-# The images have no systemd: a stand-in logs every call and does what `disable` does to a link.
+# The images have no systemd: a stand-in (in /usr/bin: apt runs maintainer scripts without /usr/local/bin) logs every call and does what `disable` does to a link.
 stub_systemctl() {
     mkdir -p /run/systemd/system /etc/systemd/system/multi-user.target.wants
-    cat > /usr/local/bin/systemctl << 'STUB'
+    cat > /usr/bin/systemctl << 'STUB'
 #!/bin/sh
 echo "$*" >> /tmp/systemctl.log
 case "$1" in disable) rm -f /etc/systemd/system/*.wants/"$2" ;; esac
 STUB
-    chmod 755 /usr/local/bin/systemctl
+    chmod 755 /usr/bin/systemctl
     : > /tmp/systemctl.log
 }
 link=/etc/systemd/system/multi-user.target.wants/nerva@0.service
@@ -313,18 +313,7 @@ chmod 644 /tmp/@PKG@ /tmp/@PKG2@
 stub_systemctl
 apt-get install -y -qq --no-install-recommends /tmp/@PKG@ > /dev/null
 check_installed
-if ! grep -qx daemon-reload /tmp/systemctl.log; then
-    echo "the postinst did not run systemctl daemon-reload; the log:"
-    cat /tmp/systemctl.log
-    ls -l /var/lib/dpkg/info/nerva.* /run/systemd
-    echo "PATH=$PATH"
-    cat /var/lib/dpkg/info/nerva.postinst
-    : > /tmp/systemctl.log
-    dpkg -i /tmp/@PKG@
-    echo "after dpkg -i, the log:"
-    cat /tmp/systemctl.log
-    exit 1
-fi
+grep -qx daemon-reload /tmp/systemctl.log
 uid=$(id -u nerva)
 make_state
 apt-get install -y -qq --reinstall --no-install-recommends /tmp/@PKG@ > /dev/null
