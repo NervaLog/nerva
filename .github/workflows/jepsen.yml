@@ -67,10 +67,12 @@ jobs:
           strict=false
           for i in "${!words[@]}"; do
             case "${words[$i]}" in
-              --lazyfs-strict-sync|--lazyfs-strict-sync=true) strict=true ;;
+              --lazyfs-strict-sync|--lazyfs-strict-sync=*) strict=true ;;
               --nemesis|--nemesis=*)
                 spec=${words[$i]#--nemesis=}
                 [[ "${words[$i]}" == --nemesis ]] && spec=${words[$((i + 1))]:-}
+                # tools.cli keeps only the last --nemesis, so only the last one counts (#257).
+                lazyfs_fault=false
                 [[ ",$spec," == *,lose-unfsynced-writes,* ]] && lazyfs_fault=true ;;
               --test-count|--test-count=*)
                 echo "::error::--test-count is refused: the 1200 s --time-limit check cannot bound a multiplied run"

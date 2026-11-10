@@ -72,7 +72,9 @@
 (defn nerva-test
   "A test map from CLI options."
   [opts]
-  (lazyfs/check-host-memory! opts (try (slurp "/proc/meminfo") (catch Exception _ nil)))
+  (when (:lazyfs-all-nodes opts)
+    (let [[text cause] (lazyfs/read-meminfo)]
+      (lazyfs/check-host-memory! opts text cause)))
   (let [workload ((workloads (:workload opts)) opts)
         opts     (assoc opts
                         :gateways (or (:gateways opts) (default-gateways opts))
@@ -162,21 +164,31 @@
         _                (range (:test-count opts 1))]
     (nerva-test (assoc opts :workload workload, :keyed keyed, :nemesis nemesis))))
 
-(defn refusing-test
-  "`nerva-test`, except that a refusal (`check-host-memory!`: an ex-info with `:refusal`) is one
-  line on stderr and exit 2, not Jepsen's fatal stack trace and exit 255. Exits the JVM."
-  [opts]
-  (try (nerva-test opts)
-       (catch clojure.lang.ExceptionInfo e
-         (if (:refusal (ex-data e))
-           (do (binding [*out* *err*] (println (.getMessage e)))
-               (flush)
-               (System/exit 2))
-           (throw e)))))
+(defn refusing
+  "`f`, except that a refusal (`check-host-memory!`: an ex-info with `:refusal`) is one line on
+  stderr and exit 2, not Jepsen's fatal stack trace and exit 255. Exits the JVM."
+  [f]
+  (fn [opts]
+    (try (f opts)
+         (catch clojure.lang.ExceptionInfo e
+           (if (:refusal (ex-data e))
+             (do (binding [*out* *err*] (println (.getMessage e)))
+                 (flush)
+                 (System/exit 2))
+             (throw e))))))
+
+(def refusing-test
+  "`nerva-test`, refusing as `refusing` says."
+  (refusing nerva-test))
+
+(def refusing-all-tests
+  "`all-tests`, refusing as `refusing` says. Realised here (`doall`): `test-all` builds the tests
+  lazily, outside its per-test `try`, so a refusal would otherwise reach Jepsen's fatal handler."
+  (refusing (comp doall all-tests)))
 
 (defn -main
   [& args]
   (cli/run! (merge (cli/single-test-cmd {:test-fn refusing-test, :opt-spec cli-opts})
-                   (cli/test-all-cmd {:tests-fn all-tests, :opt-spec cli-opts})
+                   (cli/test-all-cmd {:tests-fn refusing-all-tests, :opt-spec cli-opts})
                    (cli/serve-cmd))
             args))

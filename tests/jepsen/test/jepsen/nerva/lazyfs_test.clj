@@ -597,7 +597,19 @@
             (lazyfs/check-host-memory! t (meminfo 16358920)))))
     (testing "unreadable memory is refused too"
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"NRV-E0607.*unreadable"
-            (lazyfs/check-host-memory! t nil))))
+            (lazyfs/check-host-memory! t nil)))
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"unreadable /proc/meminfo: Invalid argument"
+            (lazyfs/check-host-memory! t nil "Invalid argument"))
+          "the cause is named"))
+    (testing "a missing field is named, not called unreadable"
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"no MemAvailable[^a-z]"
+            (lazyfs/check-host-memory! t "MemTotal: 65536000 kB\n")))
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"no MemTotal or MemAvailable"
+            (lazyfs/check-host-memory! t "Other: 1 kB\n"))))
+    (testing "read-meminfo reads this host's procfs, or returns the cause"
+      (let [[text cause] (lazyfs/read-meminfo)]
+        (is (or (some? text) (string? cause)))
+        (when text (is (some? (lazyfs/mem-total-kib text))))))
     (testing "a big host with little available (the fleet still running) is refused"
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"NRV-E0607.*available"
             (lazyfs/check-host-memory! t (meminfo 65536000 4000000))))
@@ -609,11 +621,15 @@
       (is (nil? (lazyfs/check-host-memory! {} (meminfo 16358920)))))
     (testing "core refuses before building anything"
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"NRV-E0607"
-            (with-redefs [slurp (fn [& _] (meminfo 16358920))]
-              (core/nerva-test {:workload :bank, :nemesis [lazyfs/fault], :lazyfs-all-nodes true})))))))
+            (with-redefs [lazyfs/read-meminfo (fn [] [(meminfo 16358920) nil])]
+              (core/nerva-test {:workload :bank, :nemesis [lazyfs/fault], :lazyfs-all-nodes true}))))
+      (testing "test-all too: the refusal comes out of `all-tests` once realised"
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"NRV-E0607"
+              (with-redefs [lazyfs/read-meminfo (fn [] [(meminfo 16358920) nil])]
+                (doall (core/all-tests {:lazyfs-all-nodes true})))))))))
 
 (deftest a-memory-refusal-is-marked-for-main
-  ;; `core/refusing-test` turns a `:refusal` ex-info into one stderr line and exit 2 (it exits the
+  ;; `core/refusing` (`refusing-test`, `refusing-all-tests`) turns a `:refusal` ex-info into one stderr line and exit 2 (it exits the
   ;; JVM, so only the mark is tested here).
   (let [e (try (lazyfs/check-host-memory! {:lazyfs-all-nodes true} "MemTotal: 1 kB\n")
                nil
