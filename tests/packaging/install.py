@@ -242,6 +242,8 @@ def test_refusals(packaging, nerva, tmp, stage):
             "The installer was not run as root")
 
     # No systemd: an Ubuntu container, which has none, runs the same script.
+    pulled = sh(["docker", "pull", "--quiet", "ubuntu:24.04"])
+    assert pulled.returncode == 0, pulled.stderr
     container = sh(["docker", "run", "--rm", "-v", f"{stage}:/stage:ro", "ubuntu:24.04",
                     "sh", "/stage/install.sh"])
     refused(container, 2, "NRV-E1102", "The installer found no running systemd")
