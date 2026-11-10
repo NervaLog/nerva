@@ -103,7 +103,8 @@ It formats nothing and enables and starts nothing. It prints the next three comm
 [QUICKSTART.md](./QUICKSTART.md#three-hosts) explains. A second run changes nothing.
 
 Flags: `--dry-run` (the same checks as a real run, no change), `--upgrade` (replace a `nerva` of
-another release: stop the replicas first and start them after, and read
+another release: stop the replicas first and start them after; the only upgrade this release states as in place is v0.7.0 to v0.7.1, see
+[OPERATING.md](./OPERATING.md#upgrading), and read
 [Upgrading a cluster](../README.md#upgrading-a-cluster) when the protocol release changes), and
 `--uninstall` (removes the binary and the units; leaves `/var/lib/nerva`, `/etc/nerva` and the
 user, so your data stays).
@@ -227,3 +228,11 @@ nerva version
 
 Its first line is `Nerva version <protocol release>+<commit>`; its last is `version <release>`, the
 one on GitHub and in `brew`. Next: [QUICKSTART.md](./QUICKSTART.md).
+
+## Where to go next
+
+[QUICKSTART.md](./QUICKSTART.md) runs a first cluster. For production read
+[OPERATING.md](./OPERATING.md) (sizing, backups, upgrades) and [SECURITY.md](../SECURITY.md) (what
+the keys protect) before you rely on it, and [MATURITY.md](./MATURITY.md) for what the alpha label
+promises. When an install refuses, [TROUBLESHOOTING.md](./TROUBLESHOOTING.md#the-installer-refused)
+has each message.

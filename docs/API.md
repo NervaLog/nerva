@@ -542,3 +542,10 @@ GET /v1/tables/7                 -> 404 {"error":"not found","applied":false,"co
 
 In the recording its `hash` equalled the API gateway's for the same groups. Its reply has no
 `view_hash` or `declared_op` in this candidate.
+
+## Where to go next
+
+[QUICKSTART.md](QUICKSTART.md) starts a cluster and a gateway and calls them. A refusal is looked up in
+[TROUBLESHOOTING.md](TROUBLESHOOTING.md#other-statuses-from-a-gateway) and [ERRORS.md](ERRORS.md).
+What `NERVA_KEY` protects, and why a gateway stays on loopback, is in [SECURITY.md](../SECURITY.md);
+what a gateway needs to run is in [OPERATING.md](OPERATING.md#sizing).

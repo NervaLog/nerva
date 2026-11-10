@@ -319,6 +319,7 @@ replica without a key does not start.
   and [Upgrading a cluster](../README.md#upgrading-a-cluster): what to do before you rely on it.
 - [README, When a command refuses](../README.md#when-a-command-refuses) and
   [docs/ERRORS.md](./ERRORS.md): every `NRV-` code.
+- [API.md](./API.md): every route the gateway serves.
 - [OPERATING.md](./OPERATING.md), [TROUBLESHOOTING.md](./TROUBLESHOOTING.md),
   [MATURITY.md](./MATURITY.md) and [SECURITY.md](../SECURITY.md): what a replica needs, what to do
   when something fails, what the label promises, and what the keys protect.

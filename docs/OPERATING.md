@@ -99,8 +99,8 @@ Do these before a cluster holds anything you care about.
    `systemctl enable --now nerva@0`. Nothing formats, enables or starts a replica for you. The
    units run as the `nerva` user with `ProtectSystem=strict` and write only to `/var/lib/nerva`;
    change a setting with a drop-in (`systemctl edit nerva@0`), not by editing the unit. Their
-   restart rules matter for alerting, below. `INSTALL.md` and `QUICKSTART.md` (written beside
-   this page) do the installation and a first cluster.
+   restart rules matter for alerting, below. [INSTALL.md](./INSTALL.md) and [QUICKSTART.md](./QUICKSTART.md) do the
+   installation and a first cluster.
 10. **A time for the backups, and a place for them** (below), and a drill that you have run once.
 11. **Metrics going somewhere.** `--statsd=<host:port>` on every replica and gateway (README
     "Metrics and traces", "Gateway metrics"), and the alerts below.
@@ -115,8 +115,8 @@ README ("Backups") and the v0.7.0 notes in [CHANGELOG.md](../CHANGELOG.md). What
   item 6; it takes one of the cluster's 64 client sessions, below). Neither file is overwritten,
   so give each a new name, for example by date. `--as-of=<op>` backs up an earlier op while
   writers go on.
-- **Make them private.** Until #302 is fixed, `nerva backup` creates the backup and its manifest
-  **world-readable** (mode 0644, though the data file is 0600): run it under `umask 077` (in the
+- **Make them private.** Until [#302](https://github.com/NervaLog/nerva/issues/302) is fixed, `nerva backup` (and `nerva export`) creates the backup and its manifest
+  **world-readable** (mode 0644, though the data file is 0600; [SECURITY.md](../SECURITY.md)): run it under `umask 077` (in the
   unit or the cron job) and write into a directory of mode 0700. Under `umask 077` both files
   were 0600 in the run recorded here. A backup holds every row and its history unencrypted
   (there is no encryption at rest), so protect every copy you keep elsewhere as you would the
@@ -312,9 +312,11 @@ process, plus a few spare for the backup, the drill and an export or `recover` y
 emergency. See README "Gateways beside their clients" and "Limits". Nothing alerts on the count in this
 release.
 
-## Pages beside this one
+## Where to go next
 
-[SECURITY.md](../SECURITY.md), [MATURITY.md](./MATURITY.md) and [NON-GOALS.md](./NON-GOALS.md)
-are in the repository. `INSTALL.md`, `QUICKSTART.md`, `API.md` and `TROUBLESHOOTING.md` are
-written in the same release and not linked until they merge; until then the README's "Limits",
-[docs/ERRORS.md](./ERRORS.md) and [CHANGELOG.md](../CHANGELOG.md) are the sources.
+[INSTALL.md](./INSTALL.md) installs it and [QUICKSTART.md](./QUICKSTART.md) runs a first cluster.
+[TROUBLESHOOTING.md](./TROUBLESHOOTING.md) says what to do when a command, a gateway or a replica
+refuses, and [API.md](./API.md) is the gateway's route reference. [SECURITY.md](../SECURITY.md),
+[MATURITY.md](./MATURITY.md) and [NON-GOALS.md](./NON-GOALS.md) say what the keys protect, what the
+label promises and what Nerva does not do. The sources behind them are the README's "Limits",
+[docs/ERRORS.md](./ERRORS.md) and [CHANGELOG.md](../CHANGELOG.md).
