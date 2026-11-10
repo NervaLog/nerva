@@ -19,7 +19,8 @@ Each run is valid, invalid, unknown, or the host's:
   key, its anomaly class; never the seed or the commit); a known fingerprint gets a comment only
   for a commit it has not been reported on, at most COMMENTS_PER_FAILURE_PER_DAY a UTC day; at
   most FAILURES_PER_DAY distinct failures are looked at a day. The status is `failure`;
-- the host's (a checker's verdict carrying `:code "NRV-E0607"`, the Jepsen harness failing, unless
+- the host's (a checker's verdict carrying `:code "NRV-E0607"`, the Jepsen harness failing, or
+  `"NRV-E0611"`, LazyFS killed for lack of memory (P269), unless
   another checker found something: that finding is filed and the harness one is dropped; exit 124 past the night's deadline, 125, 126, 137 the OOM killer, 143 an
   interrupted night, unless a verdict was written: an invalid or unknown one outranks the exit code; a run with no `jepsen.log` at
   all; a night that did not start; graphs that did not draw): counted, status `error`, never an
@@ -436,13 +437,17 @@ def failing_leaves(path, value, depth):
 
 
 HARNESS_CODE = "NRV-E0607"  # docs/ERRORS.md: the Jepsen harness failed, not Nerva (P244e).
+# The codes of a checker's verdict that are the host's, never Nerva's: the harness failed, or the
+# host's memory killed LazyFS (NRV-E0611, P269). Neither is ever filed.
+HOST_VERDICT_CODES = (HARNESS_CODE, "NRV-E0611")
 
 
 def findings_of(results):
-    """([(checker, class, result)], graphs_only, harness) the verdict fails on. `graphs_only`:
-    only the host's graphs failed. `harness`: a failing checker carries `:code "NRV-E0607"`, the
-    Jepsen harness's own failure: it is the host's, never a finding, and is dropped from the list
-    whatever else failed (a real finding elsewhere in the run still outranks it).
+    """([(checker, class, result)], graphs_only, host_codes) the verdict fails on. `graphs_only`:
+    only the host's graphs failed. `host_codes`: the sorted codes of the failing checkers that
+    carry one of `HOST_VERDICT_CODES` (NRV-E0607, the Jepsen harness's own failure; NRV-E0611,
+    LazyFS out of memory): the host's, never a finding, dropped from the list whatever else failed
+    (a real finding elsewhere in the run still outranks it).
     `checker` is a path: `protocol`, `workload`, `workload.source`."""
     failing = []
     for key, value in results.items():
@@ -450,17 +455,18 @@ def findings_of(results):
             for leaf in failing_leaves(str(key), value, 1):
                 failing.append((str(key), *leaf))
     harness = [f for f in failing if f[0] not in HOST_CHECKERS
-               and isinstance(f[3], dict) and kw(f[3], "code") == HARNESS_CODE]
+               and isinstance(f[3], dict) and kw(f[3], "code") in HOST_VERDICT_CODES]
     real = [f for f in failing if f[0] not in HOST_CHECKERS and f not in harness]
+    codes = sorted({kw(f[3], "code") for f in harness})
     if not real:
-        return [], bool(failing) and not harness, bool(harness)
+        return [], bool(failing) and not harness, codes
     firm = [f for f in real if f[2] is False] or real
     found = []
     for _, checker, _, value in firm:
         for name in checker_classes(checker, value):
             if len(found) < FINDINGS_MAX:
                 found.append((checker, name, value))
-    return found, False, bool(harness)
+    return found, False, codes
 
 
 def anomaly_ids(subtrees):
@@ -664,7 +670,7 @@ def read_test(run, directory):
     run.harness = harness
     if harness and not run.findings:
         run.kind = "host"
-        run.host_reason = f"the Jepsen harness failed ({HARNESS_CODE}), not Nerva"
+        run.host_reason = f"the Jepsen harness failed ({', '.join(harness)}), not Nerva"
         return
     if graphs_only or not run.findings:
         run.kind = "host"
@@ -859,7 +865,7 @@ def report_text(item, commit, archive, first):
         out.append("- **Verdict:** the canary run found no `duplicate`: Jepsen cannot see a "
                    "resent key committing twice")
         if run.harness:
-            out.append(f"- **Also:** the Jepsen harness failed in this run ({HARNESS_CODE}, the "
+            out.append(f"- **Also:** the Jepsen harness failed in this run ({', '.join(run.harness)}, the "
                        "host's, not Nerva's), so the canary may be blind only because of it; "
                        "read `jepsen.log` before blaming the workload checker")
     else:
