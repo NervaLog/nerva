@@ -3,21 +3,29 @@
 **Maturity: alpha.**
 
 That line is the only place the label is set; other pages link here. Alpha means: try Nerva,
-report what breaks, and expect one export and import before 1.0. It does not mean the data is
-unsafe to use, only that the promises below are all there are.
+report what breaks, and expect at least one export and import before 1.0. Nerva has had no external correctness review
+yet ([GOALS-1.0](./GOALS-1.0.md), non-goals; [PRODUCTION.md](./PRODUCTION.md)): its testing is the
+project's own. Do not hold real money, or data you cannot rebuild elsewhere, only in Nerva. The
+promises below are all there are.
 
 ## What it promises
 
-- **Data files open in place across v0.7.x.** A v0.7.x release opens the data files of any other
-  v0.7.x release, so a patch release is a binary swap. This is checked when each release is cut,
-  and v0.7.1 changes no protocol, data file or state machine format (P284).
+- **Within v0.7.x, a newer release is meant to open an older one's data files in place.**
+  Upgrade every replica before any gateway (P260). v0.7.1 is meant to change no protocol, data
+  file or state machine format (P284), and slice 7's release audit (to be filled in; it does
+  not exist yet) is what confirms that and checks each such upgrade path. Downgrades are not
+  promised. v0.6.1, v0.7.0 and v0.7.1 share release `0.0.6` and so one cluster, which is why
+  the order matters (#272).
 - **The next protocol release moves by export and import.** The first release that ships rolling
   upgrades (R6) does not open v0.7.x data files. The move is `nerva export` with the old release
   and `nerva import` with the new one, with the cluster closed (P259g;
   [Upgrading a cluster](../README.md#upgrading-a-cluster)).
 - **An export is read by at least the next release.** Format versions are listed under
   [Upgrading a cluster](../README.md#upgrading-a-cluster); a release reads every version
-  before it, back to v0.4.0.
+  before it, back to v0.4.0, except that from v0.5.0 to v0.6.0 `import` refuses rows in tables
+  from `2147483648` up (P123e). This rests on N80's design. What is tested is an export read
+  across two builds of one commit (`tests/release/upgrade.py`), not an export written by a real
+  earlier release.
 - **Wire identifiers and NRV codes keep their spelling** (P147c;
   [docs/ERRORS.md](./ERRORS.md)). `conflict`, `out_of_bounds`, `unpaired`, `key_reused` and the
   other identifiers clients match on, and every `NRV-` code, are never renamed, renumbered or
@@ -34,6 +42,7 @@ unsafe to use, only that the promises below are all there are.
 - Sizing was measured on one host, not on the three-machine topology (R3).
 - No security beyond what [SECURITY.md](../SECURITY.md) lists, and the
   [non-goals](./NON-GOALS.md) stay non-goals until a milestone changes them.
+- No external correctness review or security audit.
 - Production use is on Linux. macOS is for development and evaluation.
 
 ## What was tested for this release

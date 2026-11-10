@@ -11,16 +11,18 @@ which milestone in [docs/PRODUCTION.md](./PRODUCTION.md) may change it. The labe
   encrypt after the handshake. Put TLS or an encrypted private network in front
   ([SECURITY.md](../SECURITY.md)). PRODUCTION.md lists TLS on the gateway as a non-goal.
 - **One shared gateway key.** `NERVA_KEY` is one bearer key per gateway
-  ([README](../README.md#limits), "Network"). Every gateway has its own, so rotate them
+  ([README](../README.md#limits), "Network"). Give every gateway its own, and rotate them
   independently.
 - **No per-user authorization.** A caller with the key may do everything the API does. Decide
   who may call in the process that owns the gateway.
 - **No encryption at rest.** Data files are checksummed, not encrypted. Use an encrypted volume.
 - **No retention yet.** Commit keys, history and view versions are kept forever, so disk use,
   export and import grow with all history. R7 (Retention) is the milestone.
-- **No rolling upgrades yet.** Replicas of different releases ignore each other, so a release
+- **No rolling upgrades yet.** Replicas of different protocol releases (the `release` line of `nerva version`) ignore each
+  other, so a release
   that changes the format upgrades by export and import with the cluster closed
-  ([README](../README.md#upgrading-a-cluster)). R6 (Upgrade) is the milestone.
+  ([README](../README.md#upgrading-a-cluster)). Releases that share a release string, such as
+  v0.6.1, v0.7.0 and v0.7.1 (`0.0.6`), do form one cluster (#272). R6 (Upgrade) is the milestone.
 - **64 client sessions per cluster.** Every gateway, `nerva view`, `export`, `recover` and Zig
   client takes one, and a 65th evicts the least recent
   ([README](../README.md#limits)). A constant of the replica, not a setting.
