@@ -1474,8 +1474,15 @@ test "Receiver: a refused client that sends a body still reads its 503, at the l
 
 fn socket_pair() ![2]posix.fd_t {
     var fds: [2]i32 = undefined;
-    const rc = std.os.linux.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &fds);
-    try testing.expectEqual(@as(usize, 0), rc);
+    // Linux builds without libc and calls the kernel; macOS always links libSystem and has no
+    // such wrapper in `std.os` (#278).
+    if (builtin.os.tag == .linux) {
+        const rc = std.os.linux.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &fds);
+        try testing.expectEqual(@as(usize, 0), rc);
+    } else {
+        const rc = std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &fds);
+        try testing.expectEqual(@as(c_int, 0), rc);
+    }
     return fds;
 }
 
