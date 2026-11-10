@@ -138,6 +138,13 @@ NERVA_KEY=secret nerva api --cluster=1 --addresses=10.0.0.1:3001,10.0.0.2:3001,1
 - **#141:** VOPR seed 10957567299726034325. The workload's `lookup_records` batches exceeded
   `event_max`, so the client was evicted (test workload only). Fixed in #142.
 - **#226:** a `client.zig` test cast an unaligned stack array. Fixed in #227.
+- **#254, #255:** a replica panicked, and panicked again on every restart, on an op that holds
+  several resent keyed transactions that touch a view with `min` or `max` (`integer overflow` or
+  `reached unreachable code` in the member prefetch). Every replica commits the same op, so every
+  one of them panics. Fixed in #263 and #267. **A v0.6.1 replica has this bug.** A client that
+  sends several batches in one request can trigger it, and so can a v0.7.0 gateway, which
+  combines up to 16 requests into one op (P143). Every v0.6.1 operator should upgrade. Until
+  then, do not send several batches in one request to a v0.6.1 cluster.
 
 ### Testing
 
@@ -155,18 +162,41 @@ NERVA_KEY=secret nerva api --cluster=1 --addresses=10.0.0.1:3001,10.0.0.2:3001,1
 ### Release review
 
 Reviewed adversarially by two independent reviewers before release (P147b):
-<!-- links to the `release-review` issues and both verdicts go here -->
-TBD.
+The reviewers' issues are [#270](https://github.com/NervaLog/nerva/issues/270),
+[#271](https://github.com/NervaLog/nerva/issues/271),
+[#272](https://github.com/NervaLog/nerva/issues/272) and
+[#273](https://github.com/NervaLog/nerva/issues/273). #270 and #272 are why "Upgrading from
+v0.6.1" gives an order and limits rollback.
 
 ### Upgrading from v0.6.1
 
-**Replicas.** The protocol release is unchanged (`0.0.6`). Data files, the superblock, the
-replica protocol, `tree_ids`, `Operation` values and the export format are all the same, so
-v0.7.0 replicas open v0.6.1 data files. Stop one replica, start it with the v0.7.0 binary, and
-wait for it to rejoin before you upgrade the next one. You do not need to export or import.
-v0.6.1 and v0.7.0 replicas may run in one cluster during the roll, and a v0.6.1 binary opens a
-data file that v0.7.0 has written, so you can roll back the same way.
-<!-- docs/releases/v0.7.0-audit.md records what was tested by hand -->
+**Order: replicas first, then gateways (#272, #270, P260).** The protocol release is unchanged
+(`0.0.6`), so v0.6.1 and v0.7.0 replicas accept each other. That is a hazard, not only a
+convenience: a v0.6.1 replica panics, and panics again on every restart, on an op of several
+resent keyed transactions over `min`/`max` view members (#254, #255), and v0.7.0 gateways
+combine requests into such ops. Do it in this order:
+
+1. Check that no client sends several batches in one request, and that no v0.7.0 gateway
+   (`nerva api`) runs against the cluster. A v0.6.1 gateway is safe: it does not combine requests.
+2. Upgrade the replicas one at a time. Data files, the superblock, the replica protocol,
+   `tree_ids`, `Operation` values and the export format are the same, so v0.7.0 replicas open
+   v0.6.1 data files: no export or import. For each replica: stop it, start it with the v0.7.0
+   binary, and wait for it to rejoin (its log says it is committing) before the next one.
+3. Only when every replica runs v0.7.0 (`nerva version` on each), upgrade the gateways and start
+   any multi-batch client.
+
+Never run a v0.7.0 gateway, or any client that sends several batches in one request, while a
+v0.6.1 replica is in the cluster. If it happens, a v0.6.1 replica that has committed such an op
+cannot start again until it runs the v0.7.0 binary, and if v0.6.1 replicas are a quorum the
+cluster stops committing: upgrade them at once.
+
+**Rolling back.** A rollback to v0.6.1 is safe only if no v0.7.0 gateway and no multi-batch
+client has run against the cluster since you began the upgrade. In that case v0.6.1 opens the
+data files v0.7.0 has written (tested, `docs/releases/v0.7.0-audit.md`): stop each replica and
+start it with the v0.6.1 binary, one at a time. If a v0.7.0 gateway or a multi-batch client has
+run, an op of the shape above may be in the log. A v0.6.1 replica replays it when it opens its
+data file and panics on every start. We have not run that case against a real v0.6.1 binary, so
+treat the rollback as unsafe unless you are sure none ran. Without a rollback, keep v0.7.0.
 
 **Gateways: check `--listen` first (#183).** `nerva api` and `nerva view` now refuse a
 `--listen` address outside `127.0.0.0/8` and `::1` with NRV-E0009 (exit 1). If you bind
@@ -186,7 +216,8 @@ the operator's choice.
   closed without a reply. Now it gets `503 busy` (E0602) or `408` (E0116). Treat both as
   "nothing applied".
 - Two gateways can no longer share one port.
-- v0.6.1 and v0.7.0 gateways may run against one cluster side by side.
+- v0.6.1 gateways may run against v0.7.0 replicas. Do not run v0.7.0 gateways against v0.6.1
+  replicas (see "Order" above).
 
 **After v0.7.0.** The first release with rolling upgrades between releases (R6) will not run
 on release `0.0.6`, so moving from v0.7.0 to it is an export and import (P259g). That release's
