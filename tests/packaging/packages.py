@@ -221,9 +221,9 @@ apt-get install -y -qq --reinstall --no-install-recommends /tmp/@PKG@ > /dev/nul
 rm /var/lib/nerva/marker
 check_installed
 echo data > /var/lib/nerva/marker
-apt-get remove -y -qq nerva > /dev/null
+dpkg -r nerva > /dev/null
 check_removed
-apt-get purge -y -qq nerva > /dev/null
+dpkg -P nerva > /dev/null
 check_removed
 echo "remove and purge left /var/lib/nerva, /etc/nerva and the user"
 """
