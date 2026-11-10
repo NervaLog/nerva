@@ -24,7 +24,7 @@ const SuperBlockHeader = superblock.SuperBlockHeader;
 /// The oldest kernel Nerva runs on: `io_uring` as the vendored IO uses it (NRV-E0705).
 pub const kernel_version_min = Version{ .major = 5, .minor = 11 };
 /// A killed process's lock can linger while `io_uring` tears its ring down (the vendored open
-/// waits 250 ms for it; a loaded host needs longer, #288, P285). Bounded: 40 x 50 ms = 2 s, then
+/// waits 250 ms for it; a loaded host needs longer, #288, P290). Bounded: 40 x 50 ms = 2 s, then
 /// the lock is refused as held (NRV-E0703).
 const lock_retry_ms = 50;
 const lock_wait_ms = 2000;
