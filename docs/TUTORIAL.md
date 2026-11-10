@@ -112,7 +112,7 @@ You need Linux (io_uring) or macOS, on x86_64 with AES or on aarch64. The reposi
 own Zig compiler:
 
 ```bash
-git clone https://github.com/Botpike/nerva-ledger.git
+git clone https://github.com/NervaLog/nerva.git
 cd nerva-ledger
 ./zig/download.sh      # installs Zig 0.14.1 into ./zig
 ./zig/zig build        # builds zig-out/bin/nerva (a few minutes the first time)
@@ -139,9 +139,10 @@ decides which replicas, data files and clients work together (see "One release p
 below).
 
 Or skip the build: v0.6.0 binaries for Linux and macOS (x86_64, aarch64) are on the
-[releases page](https://github.com/Botpike/nerva-ledger/releases), each with a bill of
+[releases page](https://github.com/NervaLog/nerva/releases), each with a bill of
 materials (`nerva-v0.6.0.cdx.json`) listing exactly what went into it. This tutorial matches
-v0.6.0; [CHANGELOG.md](../CHANGELOG.md) lists what each release changed, and the README's
+v0.7.0, and its outputs were recorded on an earlier release (see the top of this page);
+[CHANGELOG.md](../CHANGELOG.md) lists what each release changed, and the README's
 [Limits](../README.md#limits) section lists every limit a caller can hit.
 
 ### Start one replica
@@ -1290,7 +1291,7 @@ repairs: **replacing one lost replica is a whole-cluster operation.** Export the
 and import every replica. Importing one replica alone would join and catch up, but it would
 have forgotten the prepares the lost replica had acknowledged, so a later failure could lose a
 committed op. A safe single-replica replacement is future work
-([#94](https://github.com/Botpike/nerva-ledger/issues/94)).
+([#94](https://github.com/NervaLog/nerva/issues/94)).
 
 From v0.4.0 on, every upgrade works as above: the old release's `export`, the new release's
 `import`. (v0.3.0 had no `nerva export`.) Two things to know for v0.6.0, which the
