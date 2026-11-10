@@ -30,8 +30,9 @@ The decision, in four parts (the owner's, after the measurements below).
    is repaired by VSR from the nodes that kept their data, so with LazyFS on 2 nodes the workload's
    `:keys` checker cannot fail on stock LazyFS: the canary no longer tests that a Nerva that
    stops syncing loses acknowledged records. It tests that the fault has teeth: with
-   `--lazyfs-strict-sync` the `:lazyfs` checker is `:valid? false` (no code; a finding about the
-   node, not the harness) when LazyFS held any unsynced byte after a kill, with `:reason`. The image's
+   `--lazyfs-strict-sync` the `:lazyfs` checker is `:valid? false` (NRV-E0608, registered in
+   docs/ERRORS.md: a finding about the node, not the harness; a harness problem beside it does not
+   turn it into NRV-E0607, and its reason is kept) when LazyFS held any unsynced byte after a kill, with `:reason`. The image's
    patched LazyFS leaves none (every hosted run: 0 over 14 to 17 faults), stock LazyFS keeps every
    O_DSYNC write unsynced, so the first fault, which never skips, loses bytes on a node that has
    written. It is a check that the LazyFS in the image is the patched one. Without the flag the

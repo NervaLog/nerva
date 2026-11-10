@@ -614,7 +614,20 @@
     (is (false? (:valid? r)))
     (is (= [:unsynced-bytes-lost] (:warnings r)))
     (is (re-find #"lazyfs-strict-sync" (:reason r)))
-    (is (nil? (:code r)) "a finding about the node, not a harness code")
+    (is (= "NRV-E0608" (:code r)) "a finding about the node, not a harness code")
+    (testing "a harness problem beside it keeps the strict verdict, reason and code (P242j)"
+      (let [r (check-recover
+                {:lazyfs true, :lazyfs-strict-sync true}
+                (history (pair :lose-unfsynced-writes
+                               {:killed ["n1"], :unsynced-bytes {"n1" 4096}
+                                :remaining {"n1" 0}, :sentinel {"n1" :survived}
+                                :cache-usage {"n1" 3.5}})
+                         (recover-pair {})))]
+        (is (false? (:valid? r)))
+        (is (some #{:sentinel-survived} (:problems r)))
+        (is (= "NRV-E0608" (:code r)))
+        (is (re-find #"lazyfs-strict-sync" (:reason r)))
+        (is (re-find #"did not bite" (:harness-reason r)))))
     (testing "without the option it stays a warning"
       (is (true? (:valid? (check-recover {:lazyfs true} h)))))
     (testing "with the option and nothing lost it is valid"

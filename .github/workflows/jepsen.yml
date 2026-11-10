@@ -68,7 +68,7 @@ jobs:
               --test-count|--test-count=*)
                 echo "::error::--test-count is refused: the 1200 s --time-limit check cannot bound a multiplied run"
                 exit 1 ;;
-              --lazyfs-all-nodes)
+              --lazyfs-all-nodes|--lazyfs-all-nodes=*)
                 echo "::error::NRV-E0607: --lazyfs-all-nodes is refused on a hosted runner: LazyFS on all 5 nodes leaves its 16 GB about 0.4 GiB free (P242j). Run it on the R1 host (ops/jepsen)"
                 exit 1 ;;
               --time-limit) limit=${words[$((i + 1))]:-} ;;
@@ -132,7 +132,7 @@ jobs:
           read -r -a words <<< "$ARGS"
           # The memory record (P242i): `free -m` at the start and the end, and the lowest
           # MemAvailable seen (sampled every 5 s) in between, which includes LazyFS's cache (about
-          # 0.9 GiB resident a node, from mount to unmount, on 2 of the 5 nodes, P242j).
+          # 0.9 to 1.2 GiB resident a node, from mount to unmount, on 2 of the 5 nodes, P242j).
           free -m
           # Every 5 s, bounded: meminfo (Cached, Shmem), RSS per command, the top processes and
           # container cgroups (tests/jepsen/memsample.sh, P242j); the artifact `jepsen-memory`.

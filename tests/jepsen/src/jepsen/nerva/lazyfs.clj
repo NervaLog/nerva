@@ -47,7 +47,7 @@
   above that file plus `sentinel-slack-bytes` (`cache-bytes`: 1,105 MiB), so it cannot fill
   whatever the run's length (P242i). The memory is not allocated as it is used: LazyFS
   pre-allocates and zero-fills every cache page when it mounts (custom_cache.cpp:33-48,
-  page.cpp:33-34), so each node holds the whole 1,105 MiB (about 1.08 GiB, 5.4 GiB for 5 nodes)
+  page.cpp:33-34), so each node holds the whole 1,105 MiB (about 1.08 GiB a node: 2.2 GiB for the 2 a hosted run mounts, 5.4 GiB for 5 on the host; RSS measured 0.9 to 1.26 GiB)
   from mount to unmount, touched or not. `check-cache-bound!` asserts the bound after the format.
   A full cache would make LazyFS write through, which `lose!` records (`:cache-usage`) and the
   checker judges (`:cache-full`)."
@@ -102,7 +102,7 @@
 
 (def all-nodes-memory-min-kib
   "The host memory `--lazyfs-all-nodes` needs: 32 GiB, in KiB. Five replicas at about 1.8 GiB, five
-  LazyFS mounts at about 0.9 GiB resident (1,105 MiB each, from mount to unmount), the JVM and
+  LazyFS mounts at about 0.9 to 1.2 GiB resident (1,105 MiB each, from mount to unmount), the JVM and
   the gateways leave about 0.4 GiB free on a 16 GB runner (measured, P242j), which a longer run
   or a larger heap turns into an OOM kill. The R1 host has 64 GB."
   (* 32 1024 1024))
@@ -559,10 +559,12 @@
           strict?        (assoc :reason (str "LazyFS held " lost " unsynced bytes after the kill: "
                                              "with `--lazyfs-strict-sync` that is a failure (an "
                                              "unpatched LazyFS, or a Nerva that stopped syncing)"))
-          (and (seq problems) (not (seq judged))) (assoc :code "NRV-E0607")
+          strict?        (assoc :code "NRV-E0608")
+          (and (seq problems) (not (seq judged)) (not strict?)) (assoc :code "NRV-E0607")
           (seq full)     (assoc :cache-full full)
-          (pos? survived) (assoc :reason (str "the fault did not bite: an unsynced sentinel file "
-                                              "survived a LazyFS clear on " survived " node(s)"))
+          (pos? survived) (assoc (if strict? :harness-reason :reason)
+                                 (str "the fault did not bite: an unsynced sentinel file "
+                                      "survived a LazyFS clear on " survived " node(s)"))
           (seq judged)   (assoc :code         "NRV-E0604"
                                 :gateways     (vec (distinct (mapcat #(concat (:down (:value %))
                                                                               (:pending (:value %)))
