@@ -45,6 +45,7 @@ const MiB = stdx.MiB;
 /// False only in the test build `-Dtest-commit-keys=off` (R1): `start` then lets a resent key
 /// commit again. Set by `build.zig` for this binary alone; the state machine's default is true.
 const commit_keys_deduplicate = @import("nerva_options").commit_keys_deduplicate;
+const release_version = @import("nerva_options").version;
 
 /// The runtime maximum log level: `.info`, or `.debug` with `--log-debug`.
 pub var log_level_runtime: std.log.Level = .info;
@@ -885,6 +886,8 @@ fn version_write(writer: anytype, verbose: bool) !void {
     });
     try writer.print("format {s}\n", .{format_digest.hex(&format_digest.format_digest)});
     try writer.writeAll("bundles none\n");
+    // The release a person downloaded, from `VERSION` (v0.7.1, P284); not in the format digest.
+    try writer.print("version {s}\n", .{release_version});
     if (!verbose) return;
     try writer.print("format_epoch {}\n", .{format_digest.format_epoch});
     try writer.print("superblock_version {}\n", .{format_digest.build_inputs.superblock});
