@@ -63,8 +63,17 @@ jobs:
           fi
           limit=60
           read -r -a words <<< "$ARGS"
+          lazyfs_fault=false
+          strict=false
           for i in "${!words[@]}"; do
             case "${words[$i]}" in
+              --lazyfs-strict-sync|--lazyfs-strict-sync=*) strict=true ;;
+              --nemesis|--nemesis=*)
+                spec=${words[$i]#--nemesis=}
+                [[ "${words[$i]}" == --nemesis ]] && spec=${words[$((i + 1))]:-}
+                # tools.cli keeps only the last --nemesis, so only the last one counts (#257).
+                lazyfs_fault=false
+                [[ ",$spec," == *,lose-unfsynced-writes,* ]] && lazyfs_fault=true ;;
               --test-count|--test-count=*)
                 echo "::error::--test-count is refused: the 1200 s --time-limit check cannot bound a multiplied run"
                 exit 1 ;;
@@ -75,6 +84,12 @@ jobs:
               --time-limit=*) limit=${words[$i]#--time-limit=} ;;
             esac
           done
+          # The canary (P242j) is a run that must fail: without the fault and strict mode it is
+          # green and blind (#257).
+          if [[ "$JEPSEN_LAZYFS_PATCH" == no ]] && { [[ $lazyfs_fault != true ]] || [[ $strict != true ]]; }; then
+            echo "::error::NRV-E0607: unpatched-lazyfs is a canary: args must name --nemesis lose-unfsynced-writes and --lazyfs-strict-sync, or the run is green and tests nothing"
+            exit 1
+          fi
           if ! [[ "$limit" =~ ^[0-9]+$ ]] || (( limit > 1200 )); then
             echo "::error::--time-limit must be a number of seconds, at most 1200, not '$limit'"
             exit 1

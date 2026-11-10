@@ -107,29 +107,66 @@
   or a larger heap turns into an OOM kill. The R1 host has 64 GB."
   (* 32 1024 1024))
 
-(defn mem-total-kib
-  "`MemTotal` in KiB from the text of /proc/meminfo, or nil."
-  [meminfo]
+(def all-nodes-available-min-kib
+  "The `MemAvailable` `--lazyfs-all-nodes` also needs: 16 GiB, in KiB. `MemTotal` alone passes a
+  64 GB host whose memory another service (the simulation fleet, if its stop failed) holds."
+  (* 16 1024 1024))
+
+(defn meminfo-kib
+  "The KiB of the /proc/meminfo field `field` (`\"MemTotal\"`) in `meminfo`'s text, or nil."
+  [meminfo field]
   (some->> (str meminfo)
-           (re-find #"(?m)^MemTotal:\s+(\d+)\s+kB")
+           (re-find (re-pattern (str "(?m)^" field ":\\s+(\\d+)\\s+kB")))
            second
            parse-long))
 
+(defn mem-total-kib
+  "`MemTotal` in KiB from the text of /proc/meminfo, or nil."
+  [meminfo]
+  (meminfo-kib meminfo "MemTotal"))
+
+(defn read-meminfo
+  "The harness host's /proc/meminfo as [text nil], or [nil cause] when it cannot be read. It reads
+  with `Files/readAllLines`, not `slurp` or `io/reader`, which throw `IOException: Invalid
+  argument` on /proc/meminfo in some JVMs (this one: a Claude Code cloud container)."
+  []
+  (try [(str/join "\n" (java.nio.file.Files/readAllLines (java.nio.file.Paths/get "/proc/meminfo" (into-array String [])))) nil]
+       (catch Exception e [nil (or (.getMessage e) (str (class e)))])))
+
 (defn check-host-memory!
-  "Refuses `--lazyfs-all-nodes` on a host with less than `all-nodes-memory-min-kib` (or whose
-  memory cannot be read): throws NRV-E0607 before anything starts, a harness refusal that says
-  nothing about Nerva. `meminfo` is the text of /proc/meminfo. Nothing without the option."
-  [test meminfo]
-  (when (:lazyfs-all-nodes test)
-    (let [total (mem-total-kib meminfo)]
-      (when-not (and total (>= total all-nodes-memory-min-kib))
-        (throw (ex-info (str "NRV-E0607: --lazyfs-all-nodes needs a host with at least 32 GiB of "
-                             "memory (this one has "
-                             (if total (str (quot total 1024) " MiB") "an unreadable /proc/meminfo")
-                             "): LazyFS on all 5 nodes leaves a 16 GB runner about 0.4 GiB free. "
-                             "Run it on the R1 host (ops/jepsen); a hosted run puts LazyFS on a "
-                             "minority of nodes (P242j)")
-                        {:total-kib total, :min-kib all-nodes-memory-min-kib}))))))
+  "Refuses `--lazyfs-all-nodes` on a host with less than `all-nodes-memory-min-kib` in total or
+  `all-nodes-available-min-kib` available (or whose memory cannot be read): throws NRV-E0607 before
+  anything starts, a harness refusal that says nothing about Nerva (its ex-data has `:refusal
+  true`, which `core/-main` prints as one line). `meminfo` is the text of the harness host's
+  /proc/meminfo (`read-meminfo`; `read-error` is why it could not be read, if so); that is the
+  machine the replicas run on only because run.sh starts the nodes as Docker containers on it.
+  Nothing without the option."
+  ([test meminfo] (check-host-memory! test meminfo nil))
+  ([test meminfo read-error]
+   (when (:lazyfs-all-nodes test)
+     (let [total (mem-total-kib meminfo)
+           avail (meminfo-kib meminfo "MemAvailable")]
+       (when-not (and total avail
+                      (>= total all-nodes-memory-min-kib)
+                      (>= avail all-nodes-available-min-kib))
+         (throw (ex-info (str "NRV-E0607: --lazyfs-all-nodes needs a host with at least 32 GiB of "
+                              "memory and 16 GiB of it available (this one has "
+                              (cond
+                                (and total avail)
+                                (str (quot total 1024) " MiB, " (quot avail 1024) " MiB available")
+                                (or read-error (nil? meminfo))
+                                (str "an unreadable /proc/meminfo"
+                                     (when read-error (str ": " read-error)))
+                                :else (str "a /proc/meminfo with no "
+                                           (str/join " or " (cond-> []
+                                                              (nil? total) (conj "MemTotal")
+                                                              (nil? avail) (conj "MemAvailable")))))
+                              "): LazyFS on all 5 nodes leaves a 16 GB runner about 0.4 GiB free. "
+                              "Run it on the R1 host (ops/jepsen) with nothing else running (stop "
+                              "sim-fleet); a hosted run puts LazyFS on a minority of nodes (P242j)")
+                         {:refusal true, :total-kib total, :available-kib avail
+                          :read-error read-error
+                          :min-kib all-nodes-memory-min-kib})))))))
 
 (defn lazyfs-map
   "The `jepsen.lazyfs` map for the node directory `dir`: mounted at `dir/data`, backed by

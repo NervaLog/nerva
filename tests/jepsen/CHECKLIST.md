@@ -49,6 +49,8 @@ Each item names the pull request whose review found it. Say in the PR which item
       fail `:keys`, and it does not test Nerva's durability. The `:keys` checker's teeth (lost acknowledged
       records; `:warnings [:unsynced-bytes-lost]`, `:scopes {:all n}`, n at least 1, the first fault is
       `:all`) need `--lazyfs-all-nodes`, the R1 host only. (#242)
+- [ ] An input check that reads options agrees with the parser: tools.cli keeps the last of a
+      repeated option, so only the last `--nemesis` counts. (#262)
 - [ ] A fixture uses the code and shape of the wire (NRV-E0203, not a guess). (#239)
 
 ## Bounds
