@@ -106,34 +106,18 @@
 ;; The replica and the gateway are the same binary, so a daemon is known by its pidfile alone
 ;; (`:match-executable? false`): otherwise starting the gateway finds the replica "running".
 
-(def lazyfs-cache-grid
-  "The replica's block cache under the LazyFS fault: the default is 1 GiB, resident in each of
-  five replicas, which with LazyFS's 1,105 MiB per node left the hosted runner's MemAvailable at
-  365 to 439 MiB (run 42735546330, P242j). 256 MiB is above the flag's floor and the workloads'
-  working set is a few MiB."
-  "--cache-grid=256MiB")
-
-(defn replica-args
-  "The arguments after `start` for this test's replica. The cache is trimmed only when the
-  test runs the fault, the one run whose memory is short (like `lazyfs/data-file`); every other
-  run keeps the default it was validated with."
-  [test]
-  (cond-> [(str "--addresses=" (addresses test)) :--development]
-    (lazyfs/enabled? test) (conj lazyfs-cache-grid)))
-
 (defn start-replica!
   [test]
-  (apply cu/start-daemon!
-         {:logfile           replica-log
-          :pidfile           replica-pidfile
-          :chdir             dir
-          :match-executable? false
-          ;; The shell that starts the replica reads the key file: start-daemon! writes
-          ;; its env into the daemon's log, which is in store/, and P102's key is
-          ;; never logged.
-          :env               (str "NERVA_CLUSTER_KEY=\"$(cat " cluster-key-file ")\"")}
-         binary :start (concat (replica-args test)
-                               [(lazyfs/data-file test dir data-file)])))
+  (cu/start-daemon! {:logfile           replica-log
+                     :pidfile           replica-pidfile
+                     :chdir             dir
+                     :match-executable? false
+                     ;; The shell that starts the replica reads the key file: start-daemon! writes
+                     ;; its env into the daemon's log, which is in store/, and P102's key is
+                     ;; never logged.
+                     :env               (str "NERVA_CLUSTER_KEY=\"$(cat " cluster-key-file ")\"")}
+                    binary :start (str "--addresses=" (addresses test)) :--development
+                    (lazyfs/data-file test dir data-file)))
 
 (defn gateway-user
   "The Unix user gateway `index` runs as, so iptables can name one gateway
