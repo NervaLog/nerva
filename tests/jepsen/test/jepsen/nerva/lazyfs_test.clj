@@ -400,8 +400,10 @@
   (is (= :unwritten (lazyfs/classify-sentinel 0 0))))
 
 (deftest data-file-follows-the-fault
-  (is (= "/opt/nerva/data/replica.nerva" (lazyfs/data-file {:lazyfs true} "/opt/nerva" "/x")))
-  (is (= "/x" (lazyfs/data-file {} "/opt/nerva" "/x")))
+  (binding [c/*host* "n1"]
+    (is (= "/opt/nerva/data/replica.nerva"
+           (lazyfs/data-file (assoc five :lazyfs true) "/opt/nerva" "/x")))
+    (is (= "/x" (lazyfs/data-file five "/opt/nerva" "/x"))))
   (is (= "/opt/nerva/data" (:dir (lazyfs/lazyfs-map "/opt/nerva"))))
   (is (= "/opt/nerva/data.lazyfs/log" (:log-file (lazyfs/lazyfs-map "/opt/nerva")))))
 
@@ -475,9 +477,10 @@
   (is (not (lazyfs/cache-full? nil))))
 
 (deftest data-is-formatted-outside-the-mount
-  (is (= "/opt/nerva/data.lazyfs/data/replica.nerva"
-         (lazyfs/format-file {:lazyfs true} "/opt/nerva" "/x")))
-  (is (= "/x" (lazyfs/format-file {} "/opt/nerva" "/x"))))
+  (binding [c/*host* "n1"]
+    (is (= "/opt/nerva/data.lazyfs/data/replica.nerva"
+           (lazyfs/format-file (assoc five :lazyfs true) "/opt/nerva" "/x")))
+    (is (= "/x" (lazyfs/format-file five "/opt/nerva" "/x")))))
 
 (deftest a-full-cache-is-reported-not-counted-clean
   (let [r (check-recover (history (pair :lose-unfsynced-writes
@@ -508,11 +511,15 @@
       (is (nil? (lazyfs/check-cache-bound! {} "/opt/nerva" "/opt/nerva/replica.nerva")))))
   (testing "a data file that does not fit is a harness failure"
     (with-redefs [c/exec (fn [& _] "5000000000\n")]
-      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"NRV-E0607"
-            (lazyfs/check-cache-bound! {:lazyfs true} "/opt/nerva" "/opt/nerva/replica.nerva")))))
+      (binding [c/*host* "n1"]
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"NRV-E0607"
+              (lazyfs/check-cache-bound! (assoc five :lazyfs true) "/opt/nerva"
+                                         "/opt/nerva/replica.nerva"))))))
   (testing "the format's size fits"
     (with-redefs [c/exec (fn [& _] "1141374976\n")]
-      (is (nil? (lazyfs/check-cache-bound! {:lazyfs true} "/opt/nerva" "/opt/nerva/replica.nerva"))))))
+      (binding [c/*host* "n1"]
+        (is (nil? (lazyfs/check-cache-bound! (assoc five :lazyfs true) "/opt/nerva"
+                                             "/opt/nerva/replica.nerva")))))))
 
 (deftest lost-bytes-and-unread-usage-are-reported
   (let [r (check-recover (history (pair :lose-unfsynced-writes
@@ -543,11 +550,78 @@
                                   (recover-pair {})))]
     (is (= {:all 1, :minority 1} (:scopes r)))))
 
-(deftest one-gateway-under-the-fault
-  (testing "lose-unfsynced-writes runs one gateway per node, whatever the workload (P242j)"
-    (is (= 1 (core/default-gateways {:workload :bank, :nemesis #{lazyfs/fault}})))
-    (is (= 1 (core/default-gateways {:workload :retry, :nemesis [:kill lazyfs/fault]}))))
-  (testing "the other nemeses keep two for keyed workloads"
-    (is (= 2 (core/default-gateways {:workload :bank, :nemesis #{:kill}})))
-    (is (= 2 (core/default-gateways {:workload :retry, :nemesis #{}})))
-    (is (= 1 (core/default-gateways {:workload :bank, :keyed false, :nemesis #{:kill}})))))
+(deftest keyed-workloads-keep-two-gateways-under-the-fault
+  ;; P242j: LazyFS on a minority of nodes leaves the memory for them again.
+  (is (= 2 (core/default-gateways {:workload :bank, :nemesis #{lazyfs/fault}})))
+  (is (= 2 (core/default-gateways {:workload :retry, :nemesis [:kill lazyfs/fault]})))
+  (is (= 1 (core/default-gateways {:workload :bank, :keyed false, :nemesis #{lazyfs/fault}}))))
+
+(deftest lazyfs-is-on-a-minority-unless-all-nodes
+  (let [t (assoc five :lazyfs true)]
+    (is (= ["n1" "n2"] (lazyfs/lazyfs-nodes t)))
+    (is (= (:nodes five) (lazyfs/lazyfs-nodes (assoc t :lazyfs-all-nodes true))))
+    (is (= ["a"] (lazyfs/lazyfs-nodes {:nodes ["a" "b" "c"]})))
+    (is (lazyfs/mounted? t "n2"))
+    (is (not (lazyfs/mounted? t "n3")))
+    (is (lazyfs/mounted? (assoc t :lazyfs-all-nodes true) "n5"))
+    (is (not (lazyfs/mounted? five "n1")) "never without the fault"))
+  (testing "a minority fault only takes nodes that have a mount"
+    (is (every? #{"n1" "n2"}
+                (mapcat :nodes (repeatedly 200 #(lazyfs/fault-value (assoc five :lazyfs true))))))
+    (is (= (set (:nodes five))
+           (set (mapcat :nodes (filter #(= :minority (:scope %))
+                                       (repeatedly 300 #(lazyfs/fault-value
+                                                          (assoc five :lazyfs true
+                                                                 :lazyfs-all-nodes true))))))))))
+
+(deftest paths-follow-the-node-that-has-a-mount
+  (let [t (assoc five :lazyfs true)]
+    (binding [c/*host* "n1"]
+      (is (= "/opt/nerva/data/replica.nerva" (lazyfs/data-file t "/opt/nerva" "/x")))
+      (is (= "/opt/nerva/data.lazyfs/data/replica.nerva" (lazyfs/format-file t "/opt/nerva" "/x"))))
+    (binding [c/*host* "n4"]
+      (is (= "/x" (lazyfs/data-file t "/opt/nerva" "/x")))
+      (is (= "/x" (lazyfs/format-file t "/opt/nerva" "/x")))
+      (with-redefs [c/exec (fn [& _] (throw (ex-info "no command" {})))]
+        (is (nil? (lazyfs/check-cache-bound! t "/opt/nerva" "/x")))))))
+
+(deftest all-nodes-is-refused-on-a-small-host
+  (let [meminfo (fn [kib] (str "MemTotal:       " kib " kB\nMemFree:        123 kB\n"))
+        t       {:lazyfs-all-nodes true}]
+    (is (= 16358920 (lazyfs/mem-total-kib (meminfo 16358920))))
+    (is (nil? (lazyfs/mem-total-kib "nothing")))
+    (testing "a 16 GB runner is refused, with NRV-E0607"
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"NRV-E0607.*16 GB runner"
+            (lazyfs/check-host-memory! t (meminfo 16358920)))))
+    (testing "unreadable memory is refused too"
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"NRV-E0607.*unreadable"
+            (lazyfs/check-host-memory! t nil))))
+    (testing "the 64 GB host passes, and so does a test without the option"
+      (is (nil? (lazyfs/check-host-memory! t (meminfo 65536000))))
+      (is (nil? (lazyfs/check-host-memory! {} (meminfo 16358920)))))
+    (testing "core refuses before building anything"
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"NRV-E0607"
+            (with-redefs [slurp (fn [& _] (meminfo 16358920))]
+              (core/nerva-test {:workload :bank, :nemesis [lazyfs/fault], :lazyfs-all-nodes true})))))))
+
+(deftest strict-sync-fails-the-run-on-unsynced-bytes
+  (let [h (history (pair :lose-unfsynced-writes
+                         {:killed ["n1"], :unsynced-bytes {"n1" 4096}
+                          :remaining {"n1" 0}, :sentinel {"n1" :gone}
+                          :cache-usage {"n1" 3.5}})
+                   (recover-pair {}))
+        r (check-recover {:lazyfs true, :lazyfs-strict-sync true} h)]
+    (is (false? (:valid? r)))
+    (is (= [:unsynced-bytes-lost] (:warnings r)))
+    (is (re-find #"lazyfs-strict-sync" (:reason r)))
+    (is (nil? (:code r)) "a finding about the node, not a harness code")
+    (testing "without the option it stays a warning"
+      (is (true? (:valid? (check-recover {:lazyfs true} h)))))
+    (testing "with the option and nothing lost it is valid"
+      (is (true? (:valid? (check-recover
+                            {:lazyfs true, :lazyfs-strict-sync true}
+                            (history (pair :lose-unfsynced-writes
+                                           {:killed ["n1"], :unsynced-bytes {"n1" 0}
+                                            :remaining {"n1" 0}, :sentinel {"n1" :gone}
+                                            :cache-usage {"n1" 3.5}})
+                                     (recover-pair {})))))))))

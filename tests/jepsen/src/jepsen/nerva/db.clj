@@ -507,7 +507,7 @@
            (throw e)))
        (finally
          (kill-all!)
-         (when (lazyfs/enabled? test) (lazyfs/umount! dir))
+         (when (lazyfs/mounted-here? test) (lazyfs/umount! dir))
          (c/exec :rm :-rf dir))))
 
 (defn db
@@ -528,13 +528,13 @@
           (create-gateway-users!)
           ;; With the fault, format on the backing path and mount after, so the format's writes
           ;; do not fill LazyFS's cache (P242h).
-          (when (lazyfs/enabled? test) (c/exec :mkdir :-p (lazyfs/backing-dir dir)))
+          (when (lazyfs/mounted-here? test) (c/exec :mkdir :-p (lazyfs/backing-dir dir)))
           (c/exec binary :format (str "--cluster=" cluster)
                   (str "--replica=" (replica-index test node))
                   (str "--replica-count=" (count (:nodes test)))
                   :--development (lazyfs/format-file test dir data-file))
           (lazyfs/check-cache-bound! test dir data-file)
-          (when (lazyfs/enabled? test)
+          (when (lazyfs/mounted-here? test)
             (lazyfs/mount! dir)
             ;; LazyFS holds its whole cache from the mount on (P242i): record the memory left.
             (info "Memory after the LazyFS mount on" node ":" (c/exec :free :-m)))
@@ -571,6 +571,6 @@
       db/LogFiles
       (log-files [_ test node]
         (into (merge {replica-log "replica.log"}
-                     (when (lazyfs/enabled? test) (lazyfs/log-files dir)))
+                     (when (lazyfs/mounted? test node) (lazyfs/log-files dir)))
               (for [index (range (gateways test node))]
                 [(gateway-log index) (if (zero? index) "api.log" (str "api-" index ".log"))]))))))

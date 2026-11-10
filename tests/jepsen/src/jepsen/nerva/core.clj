@@ -27,14 +27,9 @@
    :retry retry/workload})
 
 (defn default-gateways
-  "Gateways per node when --gateways is not given: a keyed workload resends to another gateway,
-  except under `lose-unfsynced-writes`, which runs one: LazyFS's cache is 5.4 GiB of the hosted
-  runner's 16 GB and a second gateway on three nodes is memory the run cannot spare (P242j)."
-  [{:keys [workload keyed nemesis]}]
-  (cond
-    (contains? (set nemesis) lazyfs/fault)                                1
-    (or (= :retry workload) (and (= :bank workload) (not (false? keyed)))) 2
-    :else                                                                  1))
+  "Gateways per node when --gateways is not given: a keyed workload resends to another gateway."
+  [{:keys [workload keyed]}]
+  (if (or (= :retry workload) (and (= :bank workload) (not (false? keyed)))) 2 1))
 
 (def faults
   "The faults --nemesis may name."
@@ -77,6 +72,7 @@
 (defn nerva-test
   "A test map from CLI options."
   [opts]
+  (lazyfs/check-host-memory! opts (try (slurp "/proc/meminfo") (catch Exception _ nil)))
   (let [workload ((workloads (:workload opts)) opts)
         opts     (assoc opts
                         :gateways (or (:gateways opts) (default-gateways opts))
@@ -148,7 +144,8 @@
     :default  8
     :parse-fn parse-long
     :validate [pos? "Must be positive"]]
-   [nil "--lazyfs-all-nodes" "lose-unfsynced-writes: also lose writes on every node after a quorum crash. Off until a hosted run of it with the image's O_DSYNC patch is recorded (P242d, docs/demos/r1.md)."]
+   [nil "--lazyfs-all-nodes" "lose-unfsynced-writes: LazyFS on all 5 nodes, and also lose writes on every node after a quorum crash. Refused (NRV-E0607) on a host with under 32 GiB: a hosted runner puts LazyFS on a minority of nodes (P242j)."]
+   [nil "--lazyfs-strict-sync" "lose-unfsynced-writes: any unsynced byte LazyFS holds after a kill fails the run (the hosted canary: an unpatched LazyFS, P242j)."]
    [nil "--nerva-binary PATH" "The nerva binary to install on every node."
     :default "../../zig-out/bin/nerva"]])
 

@@ -70,9 +70,66 @@
                 (<= (+ file-bytes sentinel-slack-bytes) cache-bytes))))
 
 (defn enabled?
-  "Does the test run the fault (so mount LazyFS)?"
+  "Does the test run the fault?"
   [test]
   (boolean (:lazyfs test)))
+
+(defn minority-size-max
+  "The most nodes of `n` that are a minority: 2 of 5."
+  [n]
+  (max 1 (dec (util/majority n))))
+
+(defn lazyfs-nodes
+  "The nodes whose data directory is a LazyFS mount: every node with `:lazyfs-all-nodes` (the
+  R1 host, `check-host-memory!`), else the first minority of the test's nodes, 2 of 5. Each
+  mount holds 1,105 MiB from mount to unmount, so a hosted runner (16 GB) puts it on 2 nodes,
+  not 5 (P242j). The fault only ever takes these nodes."
+  [test]
+  (let [nodes (vec (:nodes test))]
+    (if (:lazyfs-all-nodes test)
+      nodes
+      (vec (take (minority-size-max (count nodes)) nodes)))))
+
+(defn mounted?
+  "Is `node`'s data directory a LazyFS mount in this test? Never without the fault."
+  [test node]
+  (boolean (and (enabled? test) (some #{node} (lazyfs-nodes test)))))
+
+(defn mounted-here?
+  "`mounted?` for the node `c/*host*` is bound to (inside `c/on-nodes` or a DB setup)."
+  [test]
+  (mounted? test c/*host*))
+
+(def all-nodes-memory-min-kib
+  "The host memory `--lazyfs-all-nodes` needs: 32 GiB, in KiB. Five replicas at about 1.8 GiB, five
+  LazyFS mounts at about 0.9 GiB resident (1,105 MiB each, from mount to unmount), the JVM and
+  the gateways leave about 0.4 GiB free on a 16 GB runner (measured, P242j), which a longer run
+  or a larger heap turns into an OOM kill. The R1 host has 64 GB."
+  (* 32 1024 1024))
+
+(defn mem-total-kib
+  "`MemTotal` in KiB from the text of /proc/meminfo, or nil."
+  [meminfo]
+  (some->> (str meminfo)
+           (re-find #"(?m)^MemTotal:\s+(\d+)\s+kB")
+           second
+           parse-long))
+
+(defn check-host-memory!
+  "Refuses `--lazyfs-all-nodes` on a host with less than `all-nodes-memory-min-kib` (or whose
+  memory cannot be read): throws NRV-E0607 before anything starts, a harness refusal that says
+  nothing about Nerva. `meminfo` is the text of /proc/meminfo. Nothing without the option."
+  [test meminfo]
+  (when (:lazyfs-all-nodes test)
+    (let [total (mem-total-kib meminfo)]
+      (when-not (and total (>= total all-nodes-memory-min-kib))
+        (throw (ex-info (str "NRV-E0607: --lazyfs-all-nodes needs a host with at least 32 GiB of "
+                             "memory (this one has "
+                             (if total (str (quot total 1024) " MiB") "an unreadable /proc/meminfo")
+                             "): LazyFS on all 5 nodes leaves a 16 GB runner about 0.4 GiB free. "
+                             "Run it on the R1 host (ops/jepsen); a hosted run puts LazyFS on a "
+                             "minority of nodes (P242j)")
+                        {:total-kib total, :min-kib all-nodes-memory-min-kib}))))))
 
 (defn lazyfs-map
   "The `jepsen.lazyfs` map for the node directory `dir`: mounted at `dir/data`, backed by
@@ -81,9 +138,9 @@
   (assoc (lazyfs/lazyfs {:dir (str dir "/" mount-name)}) :cache-size cache-size))
 
 (defn data-file
-  "Where the replica's data file is: in the mount when the test runs the fault, else `plain`."
+  "Where the replica's data file is: in the mount when this node has one (`mounted-here?`), else `plain`."
   [test dir plain]
-  (if (enabled? test) (str dir "/" mount-name "/replica.nerva") plain))
+  (if (mounted-here? test) (str dir "/" mount-name "/replica.nerva") plain))
 
 (defn backing-dir
   "Where LazyFS keeps the files behind the mount at `dir/data`: `dir/data.lazyfs/data`."
@@ -91,11 +148,11 @@
   (:data-dir (lazyfs-map dir)))
 
 (defn format-file
-  "Where `nerva format` writes the data file: on the backing path when the test runs the fault,
+  "Where `nerva format` writes the data file: on the backing path when this node has a mount,
   not through the mount, so the format's writes do not fill LazyFS's cache (P242h); else `plain`.
   The replica opens `data-file` and finds the same file."
   [test dir plain]
-  (if (enabled? test) (str (backing-dir dir) "/replica.nerva") plain))
+  (if (mounted-here? test) (str (backing-dir dir) "/replica.nerva") plain))
 
 (defn check-cache-bound!
   "Throws, a harness failure, when the data file just formatted at `format-file` does not fit the
@@ -103,7 +160,7 @@
   that fills (P242i). Run on the node, after the format and before the mount. Nothing with the
   fault off."
   [test dir plain]
-  (when (enabled? test)
+  (when (mounted-here? test)
     (let [path (format-file test dir plain)
           size (parse-long (str/trim (c/exec :stat :-c "%s" path)))]
       (when-not (cache-covers? size)
@@ -132,22 +189,19 @@
   [test]
   (if (:lazyfs-all-nodes test) [:minority :all] [:minority]))
 
-(defn minority-size-max
-  "The most nodes of `n` that are a minority: 2 of 5."
-  [n]
-  (max 1 (dec (util/majority n))))
-
 (defn fault-value
-  "A fresh op value against `test`: `:minority` loses writes on 1 to a minority of nodes;
+  "A fresh op value against `test`: `:minority` loses writes on 1 to a minority of the
+  `lazyfs-nodes` (all of them with `--lazyfs-all-nodes`, else the 2 that have a mount);
   `:all` (opt in) crashes a majority first, then the rest, and loses writes on every node.
   `forced`, when given, is the scope instead of a draw (the generator's first fault, P242i)."
   [test & [forced]]
   (let [nodes (vec (:nodes test))
-        scope (or forced (rand/nth (scopes test)))]
+        mounts (lazyfs-nodes test)
+        scope  (or forced (rand/nth (scopes test)))]
     (case scope
       :minority {:scope :minority
                  :nodes (vec (take (rand/nth (vec (range 1 (inc (minority-size-max (count nodes))))))
-                                   (rand/shuffle nodes)))}
+                                   (rand/shuffle mounts)))}
       :all      (let [shuffled (vec (rand/shuffle nodes))]
                   {:scope :all
                    :crash (vec (take (util/majority (count nodes)) shuffled))
@@ -437,7 +491,8 @@
   (`:remaining` not 0); or the sentinel `lose!` writes unsynced before each clear (P242e) was not
   proved lost: it `:survived` (`:sentinel-survived`, with a `:reason`: the fault did not bite) or
   was not checked; or a fault met a full cache (`:cache-full`: LazyFS wrote through, so the
-  clear lost nothing, P242h). The bytes LazyFS lost (`:lost-bytes`) are reported, not judged: with the
+  clear lost nothing, P242h). The bytes LazyFS lost (`:lost-bytes`) are reported, not judged, unless the
+  test sets `:lazyfs-strict-sync` (the hosted canary, P242j), when any is `:valid? false`: with the
   image's O_DSYNC patch (P242d) Nerva leaves none unsynced, so only the sentinel shows the
   clear bit; a run that loses some carries `:warnings [:unsynced-bytes-lost]` (not judged: a Nerva
   that stopped syncing, or an unpatched LazyFS, shows here, P242i). `:cache-usage-unread` counts the
@@ -484,8 +539,10 @@
                        (seq full)                           (conj :cache-full)
                        (pos? survived)                      (conj :sentinel-survived)
                        (pos? unproved)                      (conj :sentinel-unchecked)
-                       (seq unclear)                        (conj :clear-unconfirmed))]
+                       (seq unclear)                        (conj :clear-unconfirmed))
+            strict?  (boolean (and (:lazyfs-strict-sync test) (pos? lost)))]
         (cond-> {:valid?     (cond (seq judged)   false
+                                   strict?        false
                                    (seq problems) :unknown
                                    :else          true)
                  :faults     (count took)
@@ -499,6 +556,9 @@
                  :final      (count finals)}
           (seq problems) (assoc :problems problems)
           (pos? lost)    (assoc :warnings [:unsynced-bytes-lost])
+          strict?        (assoc :reason (str "LazyFS held " lost " unsynced bytes after the kill: "
+                                             "with `--lazyfs-strict-sync` that is a failure (an "
+                                             "unpatched LazyFS, or a Nerva that stopped syncing)"))
           (and (seq problems) (not (seq judged))) (assoc :code "NRV-E0607")
           (seq full)     (assoc :cache-full full)
           (pos? survived) (assoc :reason (str "the fault did not bite: an unsynced sentinel file "
