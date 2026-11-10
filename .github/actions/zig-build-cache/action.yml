@@ -1,0 +1,42 @@
+name: Cache Zig's build
+description: >
+  Restores Zig's global cache (~/.cache/zig) and the project's .zig-cache, so a job recompiles only
+  what a change touched, and saves them on a push to main only. The key is the job, the OS, the
+  hash of zig/download.sh (the pinned Zig), build.zig and the hash of src/**; a restore without an
+  exact hit starts from the newest entry of the same job (and the same Zig). Zig's cache is content
+  addressed, so a restored entry can only skip work that an identical input already did. A step
+  with side effects runs every time. A pull request restores and never saves (the cache of a pull
+  request from a fork must not be able to poison main's), and a job that failed saves nothing.
+inputs:
+  name:
+    description: Which job's cache this is. One entry per job, so two jobs never race for a key.
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Restore ~/.cache/zig and .zig-cache
+      id: restore
+      uses: actions/cache/restore@v4
+      with:
+        path: |
+          ~/.cache/zig
+          .zig-cache
+        key: zig-v1-${{ inputs.name }}-${{ runner.os }}-${{ hashFiles('zig/download.sh') }}-${{ hashFiles('build.zig', 'src/**') }}
+        restore-keys: |
+          zig-v1-${{ inputs.name }}-${{ runner.os }}-${{ hashFiles('zig/download.sh') }}-
+
+    # Zig never deletes from its cache, so a chain of restores that each start from the previous
+    # entry only grows. Past the limit the restored entry is dropped and the job starts cold, which
+    # saves a fresh, small entry. GitHub keeps 10 GB per repository.
+    - name: Drop a restored cache that has grown too large
+      shell: bash
+      run: |
+        mkdir -p ~/.cache/zig .zig-cache
+        limit_mb=1500
+        size_mb=$(du -smc ~/.cache/zig .zig-cache | tail -1 | cut -f1)
+        echo "zig-cache: restored ${size_mb} MB (key: ${{ steps.restore.outputs.cache-matched-key }})"
+        if [ "${size_mb}" -gt "${limit_mb}" ]; then
+          echo "zig-cache: over ${limit_mb} MB, starting cold"
+          rm -rf ~/.cache/zig
+          find .zig-cache -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+        fi
