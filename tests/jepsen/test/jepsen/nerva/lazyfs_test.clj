@@ -551,3 +551,10 @@
     (is (= 2 (core/default-gateways {:workload :bank, :nemesis #{:kill}})))
     (is (= 2 (core/default-gateways {:workload :retry, :nemesis #{}})))
     (is (= 1 (core/default-gateways {:workload :bank, :keyed false, :nemesis #{:kill}})))))
+
+(deftest replica-cache-grid-under-the-fault
+  (testing "the replica runs a 256 MiB grid cache only when the test runs the fault (P242j)"
+    (is (= ["--addresses=n1:3000" :--development "--cache-grid=256MiB"]
+           (db/replica-args {:nodes ["n1"], :lazyfs true})))
+    (is (= ["--addresses=n1:3000" :--development]
+           (db/replica-args {:nodes ["n1"], :lazyfs false})))))
