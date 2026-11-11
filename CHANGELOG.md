@@ -75,7 +75,8 @@ version 0.7.1
 
 `version 0.7.1` is the release you downloaded. The first five lines are unchanged, and the format
 digest is the same as v0.7.0's, because the data format is. `--verbose` prints this line before
-its own. **Scripts still read the first line only** (`nerva version | head -n1`): one that takes
+its own, and now ends with `commit_keys deduplicate`: `release.yml` refuses to ship a binary
+without it (NRV-E1113, #271). **Scripts still read the first line only** (`nerva version | head -n1`): one that takes
 the last word of the whole output now gets `0.7.1`, which is not the protocol release.
 
 ### New documentation
