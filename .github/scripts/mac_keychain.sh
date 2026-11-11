@@ -58,23 +58,24 @@ user_keychains() {
 }
 
 # Saves the user's search list and default keychain where `destroy` finds them.
+# (Called inside `step`'s `if`, where `set -e` is off: each command ends `|| return 1`.)
 read_user_state() {
-  user_keychains > "$saved_list"
-  security default-keychain -d user | sed -e 's/^[[:space:]]*"//' -e 's/"$//' > "$saved_default"
+  user_keychains > "$saved_list" || return 1
+  security default-keychain -d user | sed -e 's/^[[:space:]]*"//' -e 's/"$//' > "$saved_default" || return 1
 }
 
 make_keychain() {
-  security create-keychain -p "$1" "$kc"
-  security set-keychain-settings "$kc"
-  security unlock-keychain -p "$1" "$kc"
+  security create-keychain -p "$1" "$kc" || return 1
+  security set-keychain-settings "$kc" || return 1
+  security unlock-keychain -p "$1" "$kc" || return 1
 }
 
 # arrange_keychains <keychain> <search list...>
 arrange_keychains() {
   local keychain=$1
   shift
-  security list-keychains -d user -s "$@"
-  security default-keychain -d user -s "$keychain"
+  security list-keychains -d user -s "$@" || return 1
+  security default-keychain -d user -s "$keychain" || return 1
 }
 
 create() {

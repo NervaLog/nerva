@@ -159,6 +159,7 @@ jobs:
         run: |
           python3 .github/scripts/test_sbom.py
           python3 .github/scripts/test_release_check.py
+          python3 .github/scripts/test_mac_sign.py
 
       - name: Nightly perf scripts (the comparison, its issues)
         if: needs.changes.outputs.code != 'false'
@@ -581,7 +582,8 @@ jobs:
           # Every NRV-E1121 headline that needs no Apple secret. Each refusal leaves the keychain to
           # destroy, as mac-sign.yml's `if: always()` step does; no secret file is left behind.
           # Not triggered here: "could not be opened for codesign" (a .p12 that imports with no key)
-          # and "not exactly one valid identity" (needs a notary profile Apple accepted).
+          # and "not exactly one valid identity" (needs a notary profile Apple accepted); both are
+          # triggered with a stand-in `security` in .github/scripts/test_mac_sign.py.
           good=$(base64 < "$RUNNER_TEMP/test.p12")
           expect() {  # expect <headline regex>; the rest of the command runs create
             local re=$1; shift
@@ -647,6 +649,47 @@ jobs:
           security default-keychain -d user | diff - "$RUNNER_TEMP/before-default.txt"
           security list-keychains -d user | diff - "$RUNNER_TEMP/before-list.txt"
           .github/scripts/mac_keychain.sh destroy   # a second destroy is harmless
+
+      # The failures that need no keychain and no Apple secret: NRV-E1125 (an unusable RUNNER_TEMP, a
+      # keychain left by an earlier run) and mac_zip_check.sh's NRV-E1126 and NRV-E1127 from the real
+      # codesign (an ad hoc signature has no Developer ID authority). The `security` commands that
+      # fail only on a broken runner, and the runtime and timestamp checks (they need a Developer ID
+      # signature), are triggered with stand-ins in `.github/scripts/test_mac_sign.py`.
+      - name: The other refusals, from the real tools
+        if: needs.changes.outputs.code != 'false'
+        run: |
+          set -uo pipefail
+          expect() {  # expect <code> <headline fragment> <command...>
+            local code=$1 frag=$2; shift 2
+            if "$@" 2> "$RUNNER_TEMP/refused.txt"; then echo "::error::accepted: $frag"; exit 1; fi
+            cat "$RUNNER_TEMP/refused.txt"
+            grep -Fq "error[$code]: " "$RUNNER_TEMP/refused.txt"
+            grep -Fq "$frag" "$RUNNER_TEMP/refused.txt"
+            grep -q '^  cause  ' "$RUNNER_TEMP/refused.txt"
+            grep -q '^  fix    ' "$RUNNER_TEMP/refused.txt"
+          }
+          export APPLE_DEVELOPER_ID_P12=eA== APPLE_DEVELOPER_ID_P12_PASSWORD=x
+          RUNNER_TEMP="$RUNNER_TEMP/missing" expect NRV-E1125 'is not a writable directory' \
+            .github/scripts/mac_keychain.sh create --skip-notary
+          kc="$RUNNER_TEMP/nerva-signing.keychain-db"
+          touch "$kc"
+          expect NRV-E1125 'a signing keychain already exists at' \
+            .github/scripts/mac_keychain.sh create --skip-notary
+          rm -f "$kc"
+
+          tag=v0.0.0-ci
+          name="nerva-$tag-universal-macos"
+          dist="$RUNNER_TEMP/dist"
+          mkdir -p "$dist/$name"
+          cp /usr/bin/true "$dist/$name/nerva"
+          codesign --force --sign - "$dist/$name/nerva"
+          (cd "$dist" && zip -qr "$name.zip" "$name" && shasum -a 256 "$name.zip" > "$name.zip.sha256")
+          expect NRV-E1127 "not signed with a Developer ID Application certificate" \
+            .github/scripts/mac_zip_check.sh "$dist" "$tag"
+          echo "0000000000000000000000000000000000000000000000000000000000000000  $name.zip" > "$dist/$name.zip.sha256"
+          expect NRV-E1126 'does not match its checksum file' .github/scripts/mac_zip_check.sh "$dist" "$tag"
+          rm "$dist/$name.zip.sha256"
+          expect NRV-E1126 'or one of the two is missing' .github/scripts/mac_zip_check.sh "$dist" "$tag"
 
   # The required check's name (the ruleset cannot change here). It passes only if every split job
   # above succeeded: `always()` so that a failed, cancelled or skipped one still runs this job and
