@@ -5,6 +5,210 @@ publishes a version's section as its GitHub release notes, and refuses to releas
 without one. Design reasons are in [docs/DECISIONS.md](./docs/DECISIONS.md); the full log of
 work is [WORKLOG.md](./WORKLOG.md).
 
+## v0.7.1 — 2026-11-11
+
+The first Nerva release for people outside the project. It changes no data file, protocol or
+state machine: what is new is how you install it, what it tells you about itself, and the pages
+that say how to run it. **Upgrading from v0.7.0 is a binary swap, one replica at a time, then the
+gateways** ("Upgrading from v0.7.0", below).
+
+**Maturity: alpha** ([docs/MATURITY.md](https://github.com/NervaLog/nerva/blob/main/docs/MATURITY.md)).
+Try Nerva, report what breaks, and expect at least one export and import before 1.0. Do not keep
+real money, or data you cannot rebuild elsewhere, only in Nerva. What the label promises about
+your data:
+
+- v0.7.x data files open in place in every v0.7.x release whose notes say so; this one does
+  ([the audit](https://github.com/NervaLog/nerva/blob/main/docs/releases/v0.7.1-audit.md)).
+- The next protocol release, the first with rolling upgrades (R6), moves by `nerva export` with
+  the old release and `nerva import` with the new one (P259g).
+- An export (format version 1 or 2) is read by at least the next release (N80).
+- Wire identifiers (`conflict`, `out_of_bounds`, `key_reused` and the rest) and `NRV-` codes keep
+  their spelling. Anything else in the API may change, with notes here.
+
+### Install
+
+[docs/INSTALL.md](https://github.com/NervaLog/nerva/blob/main/docs/INSTALL.md) covers each download
+and how to check it; [docs/QUICKSTART.md](https://github.com/NervaLog/nerva/blob/main/docs/QUICKSTART.md)
+takes you from a download to three replicas, a gateway and a first commit.
+
+- **macOS** (development and evaluation, not production): `brew install nervalog/tap/nerva`, or
+  `nerva-v0.7.1-universal-macos.zip`, one universal binary (arm64 and x86_64) checked against
+  `nerva-v0.7.1-universal-macos.zip.sha256`. Both are signed with a Developer ID and notarized by
+  Apple. The `nerva-v0.7.1-aarch64-macos.tar.gz` and `nerva-v0.7.1-x86_64-macos.tar.gz` assets
+  stay, with the same names and layout as before, for scripts that pin them. They are not
+  notarized: the arm64 binary is signed ad hoc and the x86_64 one is unsigned, so Gatekeeper may
+  block them. On a Mac, take Homebrew or the zip.
+- **Linux, with systemd:** `nerva-v0.7.1-<x86_64|aarch64>-linux.tar.gz` now holds `install.sh`,
+  two systemd units (`nerva@.service` for a replica, `nerva-api@.service` for a gateway) and two
+  commented settings examples beside the binary. `sudo ./install.sh` installs the binary in
+  `/usr/local/bin`, creates the `nerva` user, `/var/lib/nerva` and `/etc/nerva`, and installs the
+  units. It formats, enables and starts nothing; `--dry-run` says what it would do. A refusal is
+  one coded line, NRV-E1101 to NRV-E1111.
+- **Linux packages, new:** `nerva_0.7.1-1_amd64.deb`, `nerva_0.7.1-1_arm64.deb`,
+  `nerva-0.7.1-1.x86_64.rpm` and `nerva-0.7.1-1.aarch64.rpm`, with the same binary, units and
+  examples (the examples in `/usr/share/nerva`). **They are not signed** and there is no apt or
+  dnf repository yet (#296): check the file against `SHA256SUMS`, then install it from disk.
+
+  ```bash
+  sudo apt install ./nerva_0.7.1-1_amd64.deb      # Debian 12, Ubuntu 24.04
+  sudo dnf install ./nerva-0.7.1-1.x86_64.rpm     # Rocky 9, Fedora
+  ```
+
+  On Fedora use `dnf`: its rpm refuses an unsigned file with `rpm -i` or `rpm -U` unless you add
+  `--nosignature`.
+- **Linux, by hand:** the tarball's `nerva` runs from anywhere (QUICKSTART.md, "One machine").
+- `SHA256SUMS` covers the tarballs, the packages and the bill of materials
+  (`nerva-v0.7.1.cdx.json`); the Mac zip has its own `.sha256`.
+
+### New: `nerva version` names the release
+
+`nerva version` prints one more line, last:
+
+```
+Nerva version 0.0.6+<commit>
+release 0.0.6
+release_client_min 0.0.4
+format a2d6e50b122836b2b596f8548a391e77c3b2beead93ee5e30939479601259362
+bundles none
+version 0.7.1
+```
+
+`version 0.7.1` is the release you downloaded. The first five lines are unchanged, and the format
+digest is the same as v0.7.0's, because the data format is. `--verbose` prints this line before
+its own. **Scripts still read the first line only** (`nerva version | head -n1`): one that takes
+the last word of the whole output now gets `0.7.1`, which is not the protocol release.
+
+### New documentation
+
+Written for someone who did not build Nerva:
+
+- [docs/INSTALL.md](https://github.com/NervaLog/nerva/blob/main/docs/INSTALL.md): every download,
+  `install.sh`, the packages, checking `SHA256SUMS` and the SBOM.
+- [docs/QUICKSTART.md](https://github.com/NervaLog/nerva/blob/main/docs/QUICKSTART.md): one
+  machine, then three hosts with a cluster key and the units.
+- [docs/OPERATING.md](https://github.com/NervaLog/nerva/blob/main/docs/OPERATING.md): sizing, a
+  production checklist, backups and a restore drill, upgrades, what to alert on, the 64 client
+  sessions.
+- [docs/API.md](https://github.com/NervaLog/nerva/blob/main/docs/API.md): every route of
+  `nerva api` and `nerva view`, with its request, reply, statuses and codes.
+- [docs/TROUBLESHOOTING.md](https://github.com/NervaLog/nerva/blob/main/docs/TROUBLESHOOTING.md):
+  from a symptom (a `503`, `applied: "unknown"`, a replica that exits or will not join, an
+  installer refusal) to its code and fix.
+- [SECURITY.md](https://github.com/NervaLog/nerva/blob/main/SECURITY.md): what `NERVA_KEY` and
+  the cluster key protect and what they do not, and how to report a vulnerability.
+- [docs/MATURITY.md](https://github.com/NervaLog/nerva/blob/main/docs/MATURITY.md) and
+  [docs/NON-GOALS.md](https://github.com/NervaLog/nerva/blob/main/docs/NON-GOALS.md): the label,
+  and what Nerva does not do (no SQL, no TLS, no per-user authorization, no encryption at rest,
+  no retention or rolling upgrades yet).
+
+The README's first line no longer says "toy / research": it gives the label and links these pages.
+
+### Fixed
+
+- **#278:** CI had never run Nerva on macOS. CI now builds the universal binary on a Mac, runs a
+  smoke test on Apple silicon and on Intel (three replicas, a gateway with `--statsd`, a commit, a
+  lookup, the change feed) and the unit tests on Apple silicon (#293). `zig build mac-release`
+  builds, signs, zips and notarizes the universal binary and writes the Homebrew formula (#291).
+- **#271:** the release workflow did not check that the binary it publishes deduplicates commit
+  keys. It now refuses a binary built with `-Dtest-commit-keys=off`, and checks that the
+  `version` line matches the release (#311).
+- **#288:** `nerva start` right after the previous process was killed could refuse with
+  NRV-E0703 ("data file locked"), because the kernel can hold a killed process's lock for a
+  moment. Pre-flight now waits up to 2 s for the lock (#290). A lock that stays held is refused as
+  before.
+- v0.7.0's `nerva version` named the protocol release (`0.0.6`) and never the release you
+  downloaded: see "`nerva version` names the release" above (#291).
+
+### What was tested
+
+The release candidate is `main` at `TO FILL: candidate SHA`. The figures below are filled in
+after the soak and the reviews, and are quoted here from their records. **TO FILL** marks what
+is not in yet.
+
+- **Simulation:** **TO FILL** (the `sim_fleet.py soak --commit <candidate>` line: at least
+  24.0 hours of fleet rounds on the candidate, and no open `sim-fleet` issue against it).
+- **Jepsen:** **TO FILL** (the night's `jepsen/nightly` status on the candidate: `retry` and
+  `bank` valid, kill and partition nemeses, with its link).
+- **Two adversarial reviews** (P147b): **TO FILL** (each reviewer's verdict, and its
+  `release-review` issues).
+- **macOS:** **TO FILL** (the `mac-verify` run on the published v0.7.1: the signed, notarized
+  zip on Apple silicon and on Intel, its Developer ID and hardened runtime, the smoke test and
+  `brew test nerva`, with its link).
+- **Mixed releases** (P275): a v0.7.0 cluster with a v0.7.1 gateway, a rolling upgrade, a
+  v0.7.0 gateway on v0.7.1 replicas, and a rollback, run by hand
+  ([the audit](https://github.com/NervaLog/nerva/blob/main/docs/releases/v0.7.1-audit.md)).
+- **Linux packages:** `packages.yml` installs the tarball under systemd (three replicas, a
+  gateway, a kill, uninstall), and installs, upgrades, downgrades and removes each package in
+  Ubuntu 24.04, Debian 12, Rocky 9 and Fedora.
+
+### Upgrading from v0.7.0
+
+**Replace the binary, one replica at a time, then the gateways, in any order.** v0.7.0 and v0.7.1
+run the same protocol release (`release 0.0.6`), the same data file format (the same `format`
+digest) and the same export format, and v0.7.1 sends no new kind of op and changes nothing in
+the state machine ([the audit](https://github.com/NervaLog/nerva/blob/main/docs/releases/v0.7.1-audit.md),
+P275). No export or import.
+
+1. Take a backup first (`nerva backup`, OPERATING.md "Backups and a restore drill").
+2. For each replica: stop it, replace the binary, start it, and wait until it has caught up
+   before the next one: its `tb.replica_commit_min` gauge (`--statsd`) has reached the other
+   replicas', or its log says `sync: done` if it state-synced. A cluster of three keeps its
+   quorum while one replica is down.
+3. Then each gateway (`nerva api`, `nerva view`), in any order.
+
+With the tarball's `install.sh`, replicas and gateways on one host share `/usr/local/bin/nerva`,
+and the gateway unit restarts on its own: stop that host's gateways before you swap the binary
+(OPERATING.md, "Upgrading"). `install.sh --upgrade` replaces the binary; stop the host's replicas
+first.
+
+**Rolling back to v0.7.0** is the same swap the other way, and is safe: neither release sends an
+op the other cannot run, and v0.7.0 opens what v0.7.1 writes (tested, see the audit).
+
+### Upgrading from v0.6.1
+
+v0.6.1, v0.7.0 and v0.7.1 share release `0.0.6`, so they can share a cluster, and v0.7.0's order
+still applies (P260): **every replica first, then the gateways.** A v0.6.1 replica panics on an
+op of several resent keyed transactions over `min`/`max` view members (#254, #255), and a v0.7.x
+gateway combines requests into such ops.
+
+1. Check that no v0.7.x gateway and no client that sends several batches in one request runs
+   against the cluster.
+2. Upgrade the replicas to v0.7.1 one at a time, as in step 2 above. Wait for the gauge or
+   `sync: done`, not for a log line saying it is committing: no replica writes that line, and
+   v0.7.0's notes were wrong to ask for it (#308).
+3. Only when every replica runs v0.7.1 (`nerva version | head -n1` on each), upgrade the gateways.
+
+Roll back to v0.6.1 only if no v0.7.x gateway and no multi-batch client has run since you began.
+Gateways that bind beyond loopback need `--listen-remote` (v0.7.0's notes, #183).
+
+**Botpike:** bump the replicas' pin before the app's gateway (Botpike/app#159), and parse only
+the first line of `nerva version` (Botpike/app#160): taking the last word of the whole output now
+gives `0.7.1`.
+
+### Known issues
+
+Open issues an operator should know about before relying on this release:
+
+- **#302:** `nerva export` and `nerva backup` create their files and manifests world-readable
+  (0644). Run them under `umask 077`, into a directory only the `nerva` user can read.
+- **#303:** a replica's client port takes no key. Anyone who reaches it can take all 64 client
+  sessions, which evicts every gateway, or declare a view that blocks a later `nerva import`.
+  Let only the replicas, the gateways and the hosts that run backup, export or recover reach it
+  (SECURITY.md).
+- **#306:** the settings examples' placeholder keys pass the length check. Replace both
+  `NERVA_CLUSTER_KEY` and `NERVA_KEY` before you start anything, or the cluster runs on a key
+  published in this repository.
+- **#304:** a replica's exit statuses 3 and 6 print vendored text with no NRV code; exit 3 names a
+  flag Nerva does not have (TROUBLESHOOTING.md, "A replica exits").
+- **#300:** every flag refusal says to run `nerva <command> --help`, which is itself refused.
+  Run `nerva --help`.
+- **#294:** a replica refused with NRV-E0703 after a crash exits 1, and `nerva@.service` does not
+  restart on exit 1, so it stays down until you start it. Pre-flight's 2 s wait is a bound, not
+  a check of who holds the lock.
+- **#292:** `install.sh --upgrade` does not check that the replicas are stopped, and does not
+  warn when a package's `/usr/bin/nerva` is shadowed by `/usr/local/bin/nerva`.
+- **#296:** the `.deb` and `.rpm` are unsigned, and there is no package repository.
+
 ## v0.7.0 — 2026-11-10
 
 A lost replica can now be replaced while the cluster stays open, and a cluster can be backed up
