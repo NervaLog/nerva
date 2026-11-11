@@ -227,8 +227,10 @@ jobs:
         run: .github/scripts/release_check.sh assets "$TAG" dist
 
   # Signs and notarizes the Mac zip and uploads it to the draft. Waits for the owner's approval
-  # (environment apple-signing, declared in mac-sign.yml). The environment allows main only, so a
-  # dispatch from another ref skips this job and mac-verify. The workflow takes no inherited
+  # (environment apple-signing, declared in mac-sign.yml). The `if` below skips this job, and so
+  # mac-verify, on a dispatch from any ref but main; the environment's main-only deployment rule
+  # is a second guard. A prerelease draft may target only main plus VERSION and CHANGELOG.md
+  # (release_check.sh mac-draft, P343). The workflow takes no inherited
   # secrets: the environment's reach the keychain step directly.
   mac:
     needs: [version, release]
