@@ -5,6 +5,11 @@ publishes a version's section as its GitHub release notes, and refuses to releas
 without one. Design reasons are in [docs/DECISIONS.md](./docs/DECISIONS.md); the full log of
 work is [WORKLOG.md](./WORKLOG.md).
 
+## v0.7.1-rc.1 — 2026-11-11
+
+A practice run of `release.yml` on the v0.7.1 candidate (`b416ee6`). This draft is deleted after
+its assets are checked and is never published.
+
 ## v0.7.1 — 2026-11-11
 
 The first Nerva release for people outside the project. It changes no data file, protocol or
