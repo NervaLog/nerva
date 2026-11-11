@@ -9,8 +9,9 @@
 # /etc/systemd/system and runs `systemctl daemon-reload`. It never formats, enables or starts
 # anything, and prints the next three commands. A second run changes nothing. A `nerva` of
 # another release is replaced only with --upgrade. --uninstall removes the binary and the units
-# and leaves /var/lib/nerva, /etc/nerva and the user. --dry-run prints what would change, and
-# changes nothing; it runs the same checks as a real run.
+# and leaves /var/lib/nerva, /etc/nerva and the user; like --upgrade it is refused (NRV-E1118)
+# while replicas or the gateway run, and it keeps the enabled instances a package's units serve.
+# --dry-run prints what would change, and changes nothing; it runs the same checks as a real run.
 #
 # Every refusal is one coded diagnostic, as `nerva`'s are (docs/ERRORS.md, 11xx).
 set -eu
@@ -43,7 +44,7 @@ for arg in "$@"; do
         --upgrade) upgrade=1 ;;
         --uninstall) uninstall=1 ;;
         -h | --help)
-            sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'
+            sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
             exit 0
             ;;
         *)
@@ -197,7 +198,7 @@ if [ "$uninstall" = 1 ] && [ -e "$bin_dir/nerva" ]; then
     refuse_if_running "an uninstall of $bin_dir/nerva"
 fi
 if [ "$uninstall" = 0 ] && [ -e /usr/bin/nerva ]; then
-    printf 'warning[NRV-W1102]: install.sh: /usr/bin/nerva exists and %s/nerva shadows it\n  cause  install.sh found a package'"'"'s /usr/bin/nerva, which the tarball'"'"'s %s/nerva shadows\n  fix    leave the package installed (removing it disables the enabled nerva@N and nerva-api@N instances, so none starts at the next boot; run systemctl enable for each again after; install.sh --uninstall keeps them while the package is installed)\n' \
+    printf 'warning[NRV-W1102]: install.sh: /usr/bin/nerva exists and %s/nerva shadows it\n  cause  install.sh found a package'"'"'s /usr/bin/nerva, which the tarball'"'"'s %s/nerva shadows\n  fix    leave the package installed (removing it disables the enabled nerva@N and nerva-api@N instances, so none starts at the next boot; enable each again after; install.sh --uninstall keeps them while the package'"'"'s units are installed)\n' \
         "$bin_dir" "$bin_dir" >&2
 fi
 
@@ -210,15 +211,19 @@ if [ "$uninstall" = 1 ]; then
     fi
     # The enable links of instances the operator enabled (nerva@0, nerva-api@0): left behind they
     # dangle, and a later install would make them live again.
-    # A package's /usr/bin/nerva means its units serve the same instances: the links stay (P340).
+    # A package's unit file for the same template serves the instance too: its link stays (P342,
+    # #340), and is made again below, once the tarball's unit is gone, so it points at the package's.
+    kept=""
     for link in "$unit_dir"/*.wants/nerva@*.service "$unit_dir"/*.wants/nerva-api@*.service; do
         [ -L "$link" ] || continue
-        if [ -e /usr/bin/nerva ]; then
-            echo "keep $(basename "$link"): the package's /usr/bin/nerva is installed and uses it"
+        name=$(basename "$link")
+        template=$(echo "$name" | sed 's/@[^.]*\.service$/@.service/')
+        if [ -e "/usr/lib/systemd/system/$template" ]; then
+            echo "keep $name: the package's /usr/lib/systemd/system/$template serves it"
+            case " $kept " in *" $name "*) ;; *) kept="$kept $name" ;; esac
             continue
         fi
-        do_ "disable $(basename "$link") (remove the link $link)" \
-            systemctl disable "$(basename "$link")"
+        do_ "disable $name (remove the link $link)" systemctl disable "$name"
         changed=1
     done
     for unit in $units; do
@@ -229,7 +234,10 @@ if [ "$uninstall" = 1 ]; then
     done
     if [ "$changed" = 1 ]; then
         do_ "run systemctl daemon-reload" systemctl daemon-reload
-        echo "Replicas that are running keep running: stop them (systemctl stop 'nerva@*')."
+        for name in $kept; do
+            do_ "enable $name again, with the package's unit" systemctl reenable "$name"
+        done
+        echo "Units that are running keep running; the next start of a replica runs the nerva that is left (a package's /usr/bin/nerva, if any)."
     else
         echo "nothing to remove"
     fi

@@ -195,8 +195,8 @@ def check_setup_modes(repo, tmp):
             assert "\n  cause  " in result.stderr and "\n  fix    " in result.stderr, result.stderr
             # The fix is W1102's advice (#340): keep one install, stop the replicas, and the
             # enabled instances survive (or are enabled again).
-            assert "keep one install" in result.stderr and "systemctl stop" in result.stderr, result.stderr
-            assert "systemctl enable for any instance that is not enabled" in result.stderr, result.stderr
+            assert "keep one install" in result.stderr and "stop the nerva@N and nerva-api@N replicas" in result.stderr, result.stderr
+            assert "Enable any instance that is not enabled" in result.stderr, result.stderr
     print("  NRV-E1111 is checked on a first install (install, rpm 1); an upgrade (upgrade, rpm 2) "
           "warns NRV-W1101 about /usr/local/bin/nerva and goes on")
 

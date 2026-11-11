@@ -587,14 +587,45 @@ def test_uninstall(stage):
     assert os.listdir(DATA), "the data directory should hold the data files by now"
     result = installer(stage, "--uninstall", "--dry-run")
     assert "would remove" in result.stdout and "would disable nerva@0.service" in result.stdout
-    # With a package's /usr/bin/nerva its units use the same instances: the links are kept (#340).
-    shutil.copy(BIN, "/usr/bin/nerva")
+    # With a package's unit files its units serve the same instances: the links are kept (#340).
+    # Only the template the package ships decides: here nerva@ has one, nerva-api@ does not.
+    pkg_unit = "/usr/lib/systemd/system/nerva@.service"
+    shutil.copy(f"{UNIT_DIR}/nerva@.service", pkg_unit)
     try:
         kept = installer(stage, "--uninstall", "--dry-run")
     finally:
-        os.remove("/usr/bin/nerva")
-    assert "keep nerva@0.service" in kept.stdout and "disable" not in kept.stdout, kept.stdout
+        os.remove(pkg_unit)
+    assert "keep nerva@0.service" in kept.stdout and "keep nerva@1.service" in kept.stdout, kept.stdout
+    assert "disable nerva-api@0.service" in kept.stdout and "disable nerva@" not in kept.stdout, kept.stdout
     assert os.path.exists(BIN) and all(os.path.islink(link) for link in links)
+    # A /usr/bin/nerva alone (a hand copy) is not a package's units: nothing is kept.
+    shutil.copy(BIN, "/usr/bin/nerva")
+    try:
+        alone = installer(stage, "--uninstall", "--dry-run")
+    finally:
+        os.remove("/usr/bin/nerva")
+    assert "keep" not in alone.stdout and "would disable nerva@0.service" in alone.stdout, alone.stdout
+    # A real uninstall with the package's units present: the instances stay enabled and wanted.
+    shutil.copy(f"{UNIT_DIR}/nerva@.service", pkg_unit)
+    try:
+        real = installer(stage, "--uninstall")
+        assert "keep nerva@0.service" in real.stdout, real.stdout
+        systemctl("daemon-reload")
+        for instance in ("nerva@0", "nerva@1"):
+            assert systemctl("is-enabled", instance).stdout.strip() == "enabled", instance
+        wants = systemctl("show", "-p", "Wants", "multi-user.target").stdout
+        assert "nerva@0.service" in wants and "nerva@1.service" in wants, wants
+        assert not os.path.lexists(links[2]), "nerva-api@0 has no package unit: its link should go"
+        for instance in ("nerva@0", "nerva@1"):
+            assert systemctl("disable", instance).returncode == 0
+        systemctl("daemon-reload")
+    finally:
+        os.remove(pkg_unit)
+        systemctl("daemon-reload")
+    # Put the tarball install back for the plain uninstall below.
+    installer(stage)
+    for instance in ("nerva@0", "nerva@1", "nerva-api@0"):
+        assert systemctl("enable", instance).returncode == 0
     result = installer(stage, "--uninstall")
     assert "disable nerva-api@0.service" in result.stdout, result.stdout
     assert not any(os.path.lexists(link) for link in links), "--uninstall left an enable link"
