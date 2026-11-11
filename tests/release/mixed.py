@@ -26,7 +26,7 @@ import time
 # Replicas authenticate each other with a real cluster key, never the development key (P102).
 os.environ["NERVA_CLUSTER_KEY"] = os.urandom(32).hex()
 
-KEY = "release-test-key"
+KEY = "release-test-key-0123456789abcdef0123456789"
 CHECKPOINT_OPS = 1000  # Past the first checkpoint (op 960 in the production config).
 
 
