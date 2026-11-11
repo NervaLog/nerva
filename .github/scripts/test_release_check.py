@@ -13,10 +13,10 @@ ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / ".github/scripts/release_check.sh"
 
 
-def fake_nerva(directory, version, keys="deduplicate"):
+def fake_nerva(directory, version, keys="deduplicate", suffix=""):
     path = Path(directory) / "nerva"
     path.write_text(f"""#!/bin/sh
-echo "Nerva version 0.0.6+abcdef0"
+echo "Nerva version 0.0.6+abcdef0{suffix}"
 echo "release 0.0.6"
 echo "bundles none"
 echo "version {version}"
@@ -78,6 +78,13 @@ class ReleaseCheck(unittest.TestCase):
             for keys in ("", "off"):
                 result = run("binary", fake_nerva(d, "0.7.1", keys), "0.7.1")
                 self.refused(result, "NRV-E1113", "not the commit-key deduplication build")
+
+    def test_binary_with_the_keys_off_suffix(self):
+        # Even when its verbose output claims deduplication: the version line is checked too (#271).
+        # test_binary_passes is the control: the same fake without the suffix passes.
+        with tempfile.TemporaryDirectory() as d:
+            result = run("binary", fake_nerva(d, "0.7.1", suffix="+keys-off"), "0.7.1")
+            self.refused(result, "NRV-E1113", "not the commit-key deduplication build")
 
     def test_binary_that_does_not_run(self):
         result = run("binary", "/nonexistent/nerva", "0.7.1")
