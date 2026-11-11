@@ -29,7 +29,7 @@ P325's "only on the owner's Mac" are amended as follows.
    tried only by the rehearsal on a prerelease, before the real tag.
 5. The owner's Mac stays a documented fallback (P311's block) when the notary service or the
    runner fails on release day. `mac-release` is unchanged.
-6. New codes NRV-E1119 to NRV-E1123 (`docs/ERRORS.md`).
+6. New codes NRV-E1119 to NRV-E1124 (`docs/ERRORS.md`).
 7. The owner's answers of 2026-11-11. (a) The CI signing change after candidate 5d7d806 does not
    restart the 24-hour soak or the two release reviews: one focused Opus review covers the new
    workflows as part of the release diff. (b) The rehearsal is approved, as `v0.7.1-rc.2` (an
@@ -47,6 +47,16 @@ request, a fork or an unapproved run.
 names `apple-signing` is a way to use them (the owner's approval of the deployment is the guard; see the gate below).
 The release commit gains a `.github/` change after the release reviews have begun. The Developer
 ID certificate for CI is separate from the owner's own, so it can be revoked alone.
+
+The residual risk: the draft's target `zig/download.sh` and `build.zig` run in the job that holds the
+unlocked keychain, and a prerelease's target could be any commit on any branch (release.yml accepts
+a prerelease from a branch). The guard is `release_check.sh mac-draft`, before any secret is
+touched: a prerelease draft may target only a commit on `main`, or one ahead of `main` that changes
+`VERSION` and `CHANGELOG.md` and nothing else (NRV-E1124), so the code that runs with the keychain
+unlocked is `main`'s. A release must target `main` itself. The scripts that handle the secrets are
+fetched from the workflow's ref, never from the target. Once the machine account exists (see the
+gate below), "Prevent self-review" can be turned on for `apple-signing`, because then the owner
+never triggers the run they approve; until then the guard is that `apple-signing` holds no secret.
 
 **The gate (owner's answer: a bot account for sessions).** The required-reviewer approval on
 `apple-signing` is a human gate only if no session can give it. Sessions in this repository

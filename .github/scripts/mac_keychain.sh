@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # The temporary keychain that `zig build -Drelease mac-release -Dnotarize=true` signs from, in
-# `mac-sign.yml` (macOS signing in CI, v0.7.1; docs/decisions P<n>-mac-signed-in-ci.md). It needs
+# `mac-sign.yml` (macOS signing in CI, v0.7.1; docs/decisions P343-mac-signed-in-ci.md). It needs
 # macOS's `security` and `xcrun notarytool`, and runs on a hosted runner only.
 #
 #   mac_keychain.sh create [--skip-notary]   reads its secrets from the environment
@@ -72,7 +72,8 @@ create() {
   security default-keychain -d user | sed -e 's/^[[:space:]]*"//' -e 's/"$//' > "$saved_default"
 
   security create-keychain -p "$pw" "$kc"
-  security set-keychain-settings -lu "$kc"
+  # No -t: the default auto-lock (300 s) could lock the keychain during a long build; the job destroys it.
+  security set-keychain-settings "$kc"
   security unlock-keychain -p "$pw" "$kc"
   if ! printf '%s' "$APPLE_DEVELOPER_ID_P12" | base64 --decode > "$p12" 2> /dev/null; then
     refuse "the signing secret APPLE_DEVELOPER_ID_P12 is not base64" \
