@@ -198,11 +198,11 @@ status says which:
 | Exit | Condition | Code | Notes |
 |---|---|---|---|
 | 1 | A flag or file refusal before it opens anything | NRV-E0001 to E0010, E0701 to E0703, E0710 | See [the next section](#a-replica-will-not-start-or-will-not-join) |
-| 2 | The disk is full: `write failed: no space left on device` | NRV-E0706 | Free space or grow the volume. Not run |
-| 3 | The manifest node pool is exhausted | none yet | Its message names a flag, `--memory-lsm-manifest`, that `nerva start` does not have ([#304](https://github.com/NervaLog/nerva/issues/304)). Not run |
+| 2 | The disk is full: `NRV-E0706: write failed: no space left on device` | NRV-E0706 | Free space or grow the volume. Not run |
+| 3 | The manifest node pool is exhausted | NRV-E0721 | The pool is the build's; Nerva has no flag to raise it. Export, import into a cluster of another build, or report it. Not run |
 | 4 | The data file is over its size limit | NRV-E0707 | The limit is the build's; Nerva has no flag to raise it. Not run |
 | 5 | The next checkpoint would put the data file over its limit | NRV-E0707 | As exit 4. Not run |
-| 6 | The forest's table count would exceed its limit | none yet | The message tells you to contact "the team"; report it ([#304](https://github.com/NervaLog/nerva/issues/304)). Not run |
+| 6 | The forest's table count would exceed its limit | NRV-E0722 | The limit is the build's; Nerva has no flag to raise it. Report it with the counts the message prints. Not run |
 | 7 | `unknown VSR command, crashing for safety` | NRV-B0003 | A bug: report it. Not run |
 | 8 | `origin_mismatch`: this replica was imported from another export than its peers | NRV-E0711 | In a running cluster, `nerva recover` this replica with `--origin=` the export its peers announce (never import it alone again). When the whole cluster is being restored with the cluster closed, import every replica from the same export. Not run |
 

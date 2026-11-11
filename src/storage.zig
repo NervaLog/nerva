@@ -417,10 +417,10 @@ pub fn StorageType(comptime IO: type) type {
                 // here. Consider handling this without panicking.
                 error.NoSpaceLeft => {
                     // NB: Intentionally crash on physical space exhaustion.
-                    // Low space condition is handled logically, via `--limit-storage` argument.
+                    // Nerva has no `--limit-storage`; NRV-E0706 (docs/ERRORS.md).
                     vsr.fatal(
                         .no_space_left,
-                        "write failed: no space left on device (offset={} size={})",
+                        vsr.fatal_messages.no_space_left,
                         .{ write.offset, write.buffer.len },
                     );
                 },

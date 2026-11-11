@@ -540,9 +540,7 @@ pub fn ManifestLogType(comptime Storage: type) type {
             if (tables_count > manifest_log.forest_table_count_max) {
                 vsr.fatal(
                     .forest_tables_count_would_exceed_limit,
-                    "forest_tables_count would exceed limit " ++
-                        "(tables_count={} tables_max={}) - " ++
-                        "please contact the team directly who will be able to assist",
+                    vsr.fatal_messages.forest_tables_count_would_exceed_limit,
                     .{ tables_count, manifest_log.forest_table_count_max },
                 );
             }
