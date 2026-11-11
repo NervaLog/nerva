@@ -669,8 +669,10 @@ jobs:
             grep -q '^  fix    ' "$RUNNER_TEMP/refused.txt"
           }
           export APPLE_DEVELOPER_ID_P12=eA== APPLE_DEVELOPER_ID_P12_PASSWORD=x
-          RUNNER_TEMP="$RUNNER_TEMP/missing" expect NRV-E1125 'is not a writable directory' \
-            .github/scripts/mac_keychain.sh create --skip-notary
+          # `env` sets the bogus RUNNER_TEMP for the script only: a `VAR=x expect ...` prefix on a shell
+          # function would stay in force inside `expect` and break its own redirect.
+          expect NRV-E1125 'is not a writable directory' \
+            env RUNNER_TEMP="$RUNNER_TEMP/missing" .github/scripts/mac_keychain.sh create --skip-notary
           kc="$RUNNER_TEMP/nerva-signing.keychain-db"
           touch "$kc"
           expect NRV-E1125 'a signing keychain already exists at' \

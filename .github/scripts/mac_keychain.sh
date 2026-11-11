@@ -4,7 +4,7 @@
 # macOS's `security` and `xcrun notarytool`, and runs on a hosted runner only.
 #
 #   mac_keychain.sh create [--skip-notary]   reads its secrets from the environment
-#   mac_keychain.sh destroy                  never fails; run it under `if: always()`
+#   mac_keychain.sh destroy                  never fails on a runner; run it under `if: always()`; refused (NRV-E1125) without RUNNER_TEMP
 #
 # `create` needs APPLE_DEVELOPER_ID_P12 (base64 of the .p12: the Developer ID Application
 # certificate, its key and the Developer ID G2 intermediate) and APPLE_DEVELOPER_ID_P12_PASSWORD,
@@ -199,6 +199,12 @@ create() {
 
 # Never fails: it runs under `if: always()`, and the hosted VM is discarded afterwards anyway.
 destroy() {
+  # Without RUNNER_TEMP every path below would be at the root of the disk.
+  if [[ -z "$RUNNER_TEMP" ]]; then
+    fail NRV-E1125 "the runner's temporary directory '' is not a writable directory" \
+      "RUNNER_TEMP is unset, so there is no keychain to find; this script runs on a GitHub Actions runner" \
+      "run it as a step of a workflow job on a hosted runner"
+  fi
   set +e
   rm -f "$RUNNER_TEMP/nerva-id.p12" "$RUNNER_TEMP/nerva-notary.p8"
   if [[ -s "$saved_list" ]]; then

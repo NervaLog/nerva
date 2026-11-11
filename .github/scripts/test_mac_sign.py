@@ -52,6 +52,9 @@ class Keychain(unittest.TestCase):
         stub(self.bin, "xcrun", XCRUN)
 
     def create(self, *args, **extra):
+        return self.script("create", *args, **extra)
+
+    def script(self, sub, *args, **extra):
         env = dict(os.environ, PATH=f"{self.bin}:{os.environ['PATH']}", RUNNER_TEMP=str(self.runner),
                    APPLE_DEVELOPER_ID_P12=b64("p12"), APPLE_DEVELOPER_ID_P12_PASSWORD="pw",
                    APPLE_NOTARY_KEY_P8=b64("p8"), APPLE_NOTARY_KEY_ID="ABC123DEFG",
@@ -61,7 +64,7 @@ class Keychain(unittest.TestCase):
         for k, v in extra.items():
             if v is None:
                 env.pop(k, None)
-        return subprocess.run([str(SCRIPTS / "mac_keychain.sh"), "create", *args],
+        return subprocess.run([str(SCRIPTS / "mac_keychain.sh"), sub, *args],
                               capture_output=True, text=True, env=env)
 
     def refused(self, result, code, fragment):
@@ -122,6 +125,11 @@ class Keychain(unittest.TestCase):
         self.refused(self.create(RUNNER_TEMP=""), "NRV-E1125", "is not a writable directory")
         self.refused(self.create(RUNNER_TEMP=None), "NRV-E1125", "is not a writable directory")
 
+    def test_destroy_without_a_runner_temp_is_refused(self):
+        for value in ("", None):
+            result = self.script("destroy", RUNNER_TEMP=value)
+            self.refused(result, "NRV-E1125", "is not a writable directory")
+
     def test_an_existing_keychain_is_refused_and_left_alone(self):
         (self.runner / "nerva-signing.keychain-db").write_text("x")
         self.refused(self.create(), "NRV-E1125", "a signing keychain already exists at")
@@ -132,8 +140,11 @@ class Keychain(unittest.TestCase):
         self.assertNotIn("Every failure is NRV-E1121", (SCRIPTS / "mac_keychain.sh").read_text())
 
 
-def fake_codesign(directory, text, status=0):
-    stub(directory, "codesign", f"#!/bin/sh\ncat >&2 <<'EOT'\n{text}\nEOT\nexit {status}\n")
+def fake_codesign(directory, text, status=0, tag="v0.7.1"):
+    # It reads only the unpacked binary: any other path is a bug in the script under test.
+    want = f"*/nerva-{tag}-universal-macos/nerva"
+    stub(directory, "codesign", f"#!/bin/sh\ncase \"$1 $2 $3\" in \"-dv --verbose=4 \"{want}) ;; *) echo \"unexpected codesign args: $*\" >&2; exit 2 ;; esac\n"
+         f"cat >&2 <<'EOT'\n{text}\nEOT\nexit {status}\n")
 
 
 GOOD = ("Executable=/x/nerva\nIdentifier=nerva\nFormat=Mach-O universal\n"
@@ -218,12 +229,16 @@ class ZipCheck(unittest.TestCase):
 
 
 def fake_gh_upload(directory, fails):
-    stub(directory, "gh", '#!/bin/sh\n' + ('echo "HTTP 502" >&2; exit 1\n' if fails else 'exit 0\n'))
+    # Records its argv, one word per line, in $GH_ARGV_FILE.
+    stub(directory, "gh", '#!/bin/sh\nprintf \'%s\\n\' "$@" > "$GH_ARGV_FILE"\n'
+         + ('echo "HTTP 502" >&2; exit 1\n' if fails else 'exit 0\n'))
 
 
 class DraftAfterSigning(unittest.TestCase):
-    def run_check(self, *args, path_dir=None):
+    def run_check(self, *args, path_dir=None, argv_file=None):
         env = dict(os.environ, GITHUB_REPOSITORY="o/r")
+        if argv_file:
+            env["GH_ARGV_FILE"] = str(argv_file)
         if path_dir:
             env["PATH"] = f"{path_dir}:{env['PATH']}"
         return subprocess.run([str(SCRIPTS / "release_check.sh"), *args], capture_output=True, text=True, env=env)
@@ -241,10 +256,14 @@ class DraftAfterSigning(unittest.TestCase):
 
     def test_an_upload_that_fails_is_refused_and_one_that_works_passes(self):
         with tempfile.TemporaryDirectory() as d:
+            argv = Path(d) / "argv.txt"
             fake_gh_upload(d, fails=False)
-            self.assertEqual(self.run_check("mac-upload", "v0.7.1", "dist", path_dir=d).returncode, 0)
+            self.assertEqual(self.run_check("mac-upload", "v0.7.1", "dist", path_dir=d, argv_file=argv).returncode, 0)
+            zip_path = "dist/nerva-v0.7.1-universal-macos.zip"
+            self.assertEqual(argv.read_text().split("\n")[:-1],
+                             ["release", "upload", "v0.7.1", zip_path, zip_path + ".sha256", "--clobber"])
             fake_gh_upload(d, fails=True)
-            result = self.run_check("mac-upload", "v0.7.1", "dist", path_dir=d)
+            result = self.run_check("mac-upload", "v0.7.1", "dist", path_dir=d, argv_file=argv)
             self.assertEqual(result.returncode, 1, result.stderr)
             self.assertIn("error[NRV-E1129]: mac-sign.yml: the zip and its checksum could not be uploaded to the draft v0.7.1",
                           result.stderr)
