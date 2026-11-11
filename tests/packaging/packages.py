@@ -193,6 +193,10 @@ def check_setup_modes(repo, tmp):
         if not first:
             assert result.stderr.startswith("warning[NRV-W1101]: nerva package: "), result.stderr
             assert "\n  cause  " in result.stderr and "\n  fix    " in result.stderr, result.stderr
+            # The fix is W1102's advice (#340): keep one install, stop the replicas, and the
+            # enabled instances survive (or are enabled again).
+            assert "keep one install" in result.stderr and "stop the nerva@N and nerva-api@N replicas" in result.stderr, result.stderr
+            assert "Enable any instance that is not enabled" in result.stderr, result.stderr
     print("  NRV-E1111 is checked on a first install (install, rpm 1); an upgrade (upgrade, rpm 2) "
           "warns NRV-W1101 about /usr/local/bin/nerva and goes on")
 
@@ -486,9 +490,11 @@ echo "remove left /var/lib/nerva, /etc/nerva and the user, and disabled the enab
 E1105_CAUSE = "A user, group or unit named nerva exists and is not the one Nerva's installer makes"
 E1111_CAUSE = ("A file that is not this package's (a tarball install, a source build or a full unit "
                "override) would shadow the package's binary or units")
-E1111_FIX = ("if it is a tarball install, run install.sh --uninstall from the tarball (it keeps "
-             "/var/lib/nerva, /etc/nerva and the user); otherwise move or remove the file (change a "
-             "unit with a drop-in); then install the package")
+E1111_FIX = ("if it is a tarball install, stop its replicas with systemd, run install.sh --uninstall "
+             "from the tarball (it keeps /var/lib/nerva, /etc/nerva and the user; its enabled nerva@N "
+             "and nerva-api@N instances are removed, as no package is installed yet, so enable them "
+             "again after installing the package); otherwise move or remove the file (change a unit "
+             "with a drop-in); then install the package")
 FOREIGN = [
     ("a foreign user nerva", "useradd --system --home-dir /nonexistent nerva",
      "NRV-E1105", "nerva package: the user nerva exists, with home /nonexistent", E1105_CAUSE,
