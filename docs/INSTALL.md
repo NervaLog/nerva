@@ -123,6 +123,10 @@ When `install.sh` refuses, it prints one coded block and changes nothing
 | NRV-E1107 | 2 | this machine cannot run the tarball's `nerva` (a `noexec` mount such as `/tmp` on a hardened host) | unpack where programs may run |
 | NRV-E1108 | 1 | the tarball is incomplete, or `install.sh` ran outside it | unpack it whole, run from its directory |
 | NRV-E1109 | 2 | no `sha256sum` | install coreutils |
+| NRV-E1118 | 1 | `--upgrade` while `nerva@*` or `nerva-api@*` units are running | stop them, `--upgrade`, start them |
+
+When a package's `/usr/bin/nerva` is installed too, `install.sh` goes on and warns (NRV-W1102): the tarball's
+`/usr/local/bin/nerva` comes first on the path, so it is the one the units run.
 
 Recorded: `./install.sh --dry-run`, as root, in a container that is not running systemd:
 

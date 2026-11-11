@@ -8,17 +8,19 @@ Run as root on a machine booted with systemd (CI's ubuntu-24.04 runner): it chan
 tarball's contents, then checks, against the real units:
   1. `install.sh --dry-run` changes nothing;
   2. `install.sh` installs, and a second run changes nothing; both units pass `systemd-analyze verify`;
-  3. every refusal, NRV-E1101 to NRV-E1109, with its code, exit status and three-line block;
+  3. every refusal, NRV-E1101 to NRV-E1109, with its code, exit status and three-line block; a
+     fixed PATH; a dry run that does not chmod; NRV-W1102 (a package's /usr/bin/nerva); a symlinked
+     /var/lib/nerva left alone;
   4. the gateway nerva-api@0 started while the cluster is down fails with NRV-E0604 and is restarted,
      and serves once three replicas, formatted as `nerva` and run as nerva@0..2, are up; a commit and a
      lookup; `systemctl kill -s KILL nerva@1` is restarted and catches up (a quorum of it and
      replica 2 commits while replica 0 is stopped);
   5. a replica imported from another export than its peers exits 8 (NRV-E0711) and systemd does not
      restart it;
+  5b. `--upgrade` while the units run is refused with NRV-E1118 (also with --dry-run);
   6. `install.sh --uninstall` removes the binary, the units and the enable links of the instances
      that were enabled, and leaves /var/lib/nerva.
-Not provoked: NRV-E1102's `/run/systemd/system` half, and a `nerva` on a noexec mount (a script that
-exits 1 stands for it in NRV-E1107).
+Not provoked: a `nerva` on a noexec mount (a script that exits 1 stands for it in NRV-E1107).
 """
 import http.client
 import json
@@ -267,6 +269,11 @@ def test_refusals(packaging, nerva, tmp, stage):
     container = sh(["docker", "run", "--rm", "-v", f"{stage}:/stage:ro", "ubuntu:24.04",
                     "sh", "/stage/install.sh"])
     refused(container, 2, "NRV-E1102", "The installer found no running systemd")
+    # The other half: a `systemctl` on the path, and no /run/systemd/system.
+    stub = sh(["docker", "run", "--rm", "-v", f"{stage}:/stage:ro", "ubuntu:24.04", "sh", "-c",
+               "printf '#!/bin/sh\\nexit 0\\n' > /usr/bin/systemctl && chmod 755 /usr/bin/systemctl"
+               " && test ! -d /run/systemd/system && sh /stage/install.sh"])
+    refused(stub, 2, "NRV-E1102", "The installer found no running systemd")
 
     # A nerva that does not run on this machine: not an ELF, so no architecture to blame.
     broken = stage_tarball(packaging, nerva, tmp, "broken")
@@ -287,15 +294,50 @@ def test_refusals(packaging, nerva, tmp, stage):
     refused(installer(missing, expect=1), 1, "NRV-E1108", incomplete)
     os.remove(f"{missing}/nerva")
     refused(installer(missing, "--dry-run", expect=1), 1, "NRV-E1108", incomplete)
-    # No sha256sum: a PATH of links to everything else.
-    bare = os.path.join(tmp, "bare-path")
-    os.mkdir(bare)
-    for directory in ("/usr/sbin", "/usr/bin", "/sbin", "/bin"):
-        for name in os.listdir(directory):
-            if name != "sha256sum" and not os.path.lexists(os.path.join(bare, name)):
-                os.symlink(os.path.join(directory, name), os.path.join(bare, name))
-    refused(sh(["sh", f"{stage}/install.sh"], env={"PATH": bare}), 2, "NRV-E1109",
+    # No sha256sum: the script fixes its PATH, so the program itself is hidden, in a mount
+    # namespace of its own (a file with no execute bit is not found by `command -v`).
+    program = os.path.realpath(shutil.which("sha256sum"))
+    hidden = sh(["unshare", "-m", "sh", "-c", f"mount --bind /dev/null {program} && exec sh {stage}/install.sh"])
+    refused(hidden, 2, "NRV-E1109",
             "The installer needs sha256sum, and this machine has none on its PATH")
+    assert os.access(program, os.X_OK), "the hidden sha256sum leaked out of its mount namespace"
+    # The caller's PATH is not trusted: an `id` that says "not root" first on it changes nothing.
+    fake = os.path.join(tmp, "evil-path")
+    os.mkdir(fake)
+    with open(f"{fake}/id", "w") as f:
+        f.write("#!/bin/sh\necho 1000\n")
+    os.chmod(f"{fake}/id", 0o755)
+    trusted = sh(["sh", f"{stage}/install.sh", "--dry-run"], env={"PATH": fake + ":/usr/bin:/bin", "CDPATH": "/"})
+    assert trusted.returncode == 0 and "nothing was changed" in trusted.stdout, (trusted.stdout, trusted.stderr)
+    # A dry run does not chmod the tarball's nerva (and says it cannot run it).
+    plain = stage_tarball(packaging, nerva, tmp, "plain")
+    os.chmod(f"{plain}/nerva", 0o644)
+    done = installer(plain, "--dry-run")
+    assert "would make" in done.stdout and "executable" in done.stdout, done.stdout
+    assert stat.S_IMODE(os.stat(f"{plain}/nerva").st_mode) == 0o644, "--dry-run changed the mode"
+    # A package's /usr/bin/nerva: warned about, on a real run and a dry run, and the install goes on.
+    assert not os.path.exists("/usr/bin/nerva"), "a package's nerva is installed here"
+    shutil.copy(nerva, "/usr/bin/nerva")
+    try:
+        for args in (["--dry-run"], []):
+            done = installer(stage, *args)
+            lines = done.stderr.strip().split("\n")
+            assert len(lines) == 3 and lines[0].startswith(
+                "warning[NRV-W1102]: install.sh: /usr/bin/nerva exists and /usr/local/bin/nerva shadows it"), done.stderr
+            assert lines[1].startswith("  cause  ") and lines[2].startswith("  fix    "), done.stderr
+    finally:
+        os.remove("/usr/bin/nerva")
+    assert installer(stage).stderr == "", "a warning without a /usr/bin/nerva"
+    # A /var/lib/nerva that is a symlink to a directory the installer would make is left alone.
+    real = f"{DATA}.real"
+    os.rename(DATA, real)
+    os.symlink(real, DATA)
+    try:
+        done = installer(stage)
+        assert f"make {DATA}" not in done.stdout and os.path.islink(DATA), done.stdout
+    finally:
+        os.remove(DATA)
+        os.rename(real, DATA)
 
     # A different nerva is installed: refused, unchanged, then replaced by --upgrade.
     other = stage_tarball(packaging, nerva, tmp, "other", extra=b"\0")
@@ -327,6 +369,20 @@ def test_refusals(packaging, nerva, tmp, stage):
     refused(installer(stage, expect=1), 1, "NRV-E1105", NOT_OURS)
     shutil.copy(f"{tmp}/api-unit.saved", path)
     installer(stage)
+
+
+def test_upgrade_while_running(packaging, nerva, tmp, stage):
+    """Replicas and the gateway are running: --upgrade of another nerva is refused, and changes nothing."""
+    other = stage_tarball(packaging, nerva, tmp, "other-running", extra=b"\0")
+    before = snapshot()
+    for args in ([ "--upgrade"], ["--upgrade", "--dry-run"]):
+        result = installer(other, *args, expect=1)
+        refused(result, 1, "NRV-E1118", "install.sh --upgrade found a replica or gateway unit running, "
+                "and would replace the nerva it executes")
+        assert "nerva@0.service" in result.stderr and "nerva-api@0.service" in result.stderr, result.stderr
+    assert snapshot() == before and sha256(BIN) == sha256(f"{stage}/nerva")
+    # The same nerva is no replacement: nothing to refuse.
+    assert "installed:" in installer(stage, "--upgrade").stdout
 
 
 def test_cluster(tmp):
@@ -452,6 +508,8 @@ def main():
         print("ok: NRV-E1101 to NRV-E1109, and --upgrade")
         addresses, api = test_cluster(tmp)
         print("ok: a gateway outlives a down cluster; three replicas under systemd; a commit; SIGKILL restarts")
+        test_upgrade_while_running(packaging, nerva, tmp, stage)
+        print("ok: --upgrade while the units run is refused with NRV-E1118")
         test_origin_mismatch(tmp, addresses, api)
         print("ok: a wrong-origin replica exits 8 and is not restarted")
         test_uninstall(stage)

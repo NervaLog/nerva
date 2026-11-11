@@ -14,6 +14,10 @@
 #
 # Every refusal is one coded diagnostic, as `nerva`'s are (docs/ERRORS.md, 11xx).
 set -eu
+# Root trusts nothing of the caller's environment: a fixed PATH, and no CDPATH (`cd` would print).
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+unset CDPATH
 
 bin_dir=/usr/local/bin
 unit_dir=/etc/systemd/system
@@ -101,7 +105,15 @@ if [ "$uninstall" = 0 ]; then
                 "unpack the release tarball whole, and run install.sh from its directory"
         fi
     done
-    chmod 0755 "$here/nerva" 2> /dev/null || true
+    # A dry run changes nothing, the permissions of the tarball's files included: it cannot run a
+    # nerva that is not executable, so it skips that check and says so.
+    runnable=1
+    if [ "$dry" = 1 ] && [ ! -x "$here/nerva" ]; then
+        echo "would make $here/nerva executable (0755); a dry run does not run it to check it"
+        runnable=0
+    elif [ "$dry" = 0 ]; then
+        chmod 0755 "$here/nerva" 2> /dev/null || true
+    fi
     host=$(uname -m)
     [ "$host" != arm64 ] || host=aarch64
     built=$(elf_machine "$here/nerva")
@@ -111,7 +123,7 @@ if [ "$uninstall" = 0 ]; then
             "download the tarball for this machine: x86_64-linux or aarch64-linux"
     fi
     status=0
-    "$here/nerva" version > /dev/null 2>&1 || status=$?
+    [ "$runnable" = 0 ] || "$here/nerva" version > /dev/null 2>&1 || status=$?
     if [ "$status" != 0 ]; then
         refuse 2 NRV-E1107 "the nerva in $here cannot run (exit status $status)" \
             "This machine cannot run the tarball's nerva, though it is for this architecture" \
@@ -144,13 +156,28 @@ for unit in $units; do
     fi
 done
 sum_of() { sha256sum "$1" | cut -d' ' -f1; }
-if [ "$uninstall" = 0 ] && [ -e "$bin_dir/nerva" ] && [ "$upgrade" = 0 ]; then
+if [ "$uninstall" = 0 ] && [ -e "$bin_dir/nerva" ]; then
     if [ "$(sum_of "$bin_dir/nerva")" != "$(sum_of "$here/nerva")" ]; then
-        installed=$("$bin_dir/nerva" version 2> /dev/null | head -n1 || true)
-        refuse 1 NRV-E1103 "$bin_dir/nerva is a different build (${installed:-unknown})" \
-            "A different nerva is already installed" \
-            "pass --upgrade to replace it with this one (stop the replicas first, then restart them)"
+        if [ "$upgrade" = 0 ]; then
+            installed=$("$bin_dir/nerva" version 2> /dev/null | head -n1 || true)
+            refuse 1 NRV-E1103 "$bin_dir/nerva is a different build (${installed:-unknown})" \
+                "A different nerva is already installed" \
+                "pass --upgrade to replace it with this one (stop the replicas first, then restart them)"
+        fi
+        # A replica that restarts runs the new binary: a cluster of two releases, or NRV-E0701 across
+        # a protocol release. Units still starting or stopping count as running.
+        running=$(systemctl list-units --plain --no-legend --state=active,activating,deactivating,reloading \
+            'nerva@*.service' 'nerva-api@*.service' 2> /dev/null | cut -d' ' -f1 | tr '\n' ' ' || true)
+        if [ -n "${running% }" ]; then
+            refuse 1 NRV-E1118 "--upgrade while units are running: ${running% }" \
+                "install.sh --upgrade found a replica or gateway unit running, and would replace the nerva it executes" \
+                "stop them (systemctl stop 'nerva@*' 'nerva-api@*'), run install.sh --upgrade again, then start them; across a protocol release upgrade by export and import (README, Upgrading a cluster)"
+        fi
     fi
+fi
+if [ "$uninstall" = 0 ] && [ -e /usr/bin/nerva ]; then
+    printf 'warning[NRV-W1102]: install.sh: /usr/bin/nerva exists and %s/nerva shadows it\n  cause  %s comes before /usr/bin on the path, and the units run nerva by name, so a package'"'"'s nerva is not the one that runs\n  fix    remove the package (apt remove nerva, or dnf remove nerva) and keep this install, or run install.sh --uninstall and use the package\n' \
+        "$bin_dir" "$bin_dir" >&2
 fi
 
 # 2. Uninstall.
@@ -196,12 +223,12 @@ else
     owner=$user
 fi
 ensure_dir() { # <path> <mode> <group>
-    if [ ! -d "$1" ] || [ "$(stat -c '%a %U %G' "$1")" != "$2 root $3" ]; then
+    if [ ! -d "$1" ] || [ "$(stat -L -c '%a %U %G' "$1")" != "$2 root $3" ]; then
         do_ "make $1 ($2, root:$3)" install -d -m "$2" -o root -g "$3" "$1"
     fi
 }
 ensure_dir "$etc_dir" 750 "$owner"
-if [ ! -d "$data_dir" ] || [ "$(stat -c '%a %U %G' "$data_dir")" != "750 $owner $owner" ]; then
+if [ ! -d "$data_dir" ] || [ "$(stat -L -c '%a %U %G' "$data_dir")" != "750 $owner $owner" ]; then
     do_ "make $data_dir (750, $owner:$owner)" install -d -m 750 -o "$owner" -g "$owner" "$data_dir"
 fi
 

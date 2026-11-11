@@ -62,9 +62,11 @@ case "${1:-}" in
         "the binary was built from sources whose VERSION differs, or its version line is missing" \
         "build from the commit whose VERSION is $version (build.zig reads VERSION)"
     fi
-    if ! "$nerva" version --verbose 2> /dev/null | grep -qx 'commit_keys deduplicate'; then
+    # The keys-off build says so on its first line, whatever else it prints (#271).
+    if "$nerva" version 2> /dev/null | grep -q '+keys-off' ||
+      ! "$nerva" version --verbose 2> /dev/null | grep -qx 'commit_keys deduplicate'; then
       refuse NRV-E1113 "the built nerva is not the commit-key deduplication build" \
-        "'nerva version --verbose' has no 'commit_keys deduplicate' line: this is the test build -Dtest-commit-keys=off (#271), or an older nerva" \
+        "'nerva version --verbose' has no 'commit_keys deduplicate' line, or 'nerva version' carries '+keys-off': this is the test build -Dtest-commit-keys=off (#271), or an older nerva" \
         "build the release without -Dtest-commit-keys=off"
     fi
     ;;
