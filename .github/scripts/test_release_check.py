@@ -239,7 +239,7 @@ class MacDraft(unittest.TestCase):
         self.assertNotIn(".github/scripts/release_check.sh mac-draft", workflow)
         self.assertNotIn(".github/scripts/mac_keychain.sh", workflow.split("steps:")[1])
         keychain = workflow.index('"$RUNNER_TEMP/wf/mac_keychain.sh" create')
-        upload = workflow.index('gh release upload "$TAG"')
+        upload = workflow.index('mac-upload "$TAG"')
         self.assertEqual(workflow.count(call), 2)
         self.assertLess(workflow.index(call), keychain)
         self.assertLess(keychain, workflow.index(call, keychain))
