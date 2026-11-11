@@ -44,18 +44,16 @@ from a reviewed workflow, behind a human approval, is repeatable. The key never 
 request, a fork or an unapproved run.
 
 **Cost.** Apple's signing key and notary key are stored in GitHub, and a workflow change that
-names `apple-signing` is a way to use them (the owner's approval of the deployment is meant as the guard; see the open item below).
+names `apple-signing` is a way to use them (the owner's approval of the deployment is the guard; see the gate below).
 The release commit gains a `.github/` change after the release reviews have begun. The Developer
 ID certificate for CI is separate from the owner's own, so it can be revoked alone.
 
-**Open item for the owner (not solved by this decision).** The required-reviewer approval on
-`apple-signing` is not a human gate today. Sessions in this repository authenticate to GitHub as
-the owner's account, `topwombat`, which is also the environment's required reviewer, and "Prevent
-self-review" is off. A session holding that token can approve a waiting `mac-sign` deployment
-through the API (`POST /repos/NervaLog/nerva/actions/runs/{id}/pending_deployments`) with no
-human involved. Because `mac-sign.yml` runs `mac_keychain.sh` from the draft's target, which for a
-prerelease may be any branch, an unattended session could then reach the Developer ID key. The
-owner must choose before the rehearsal: (a) a separate bot account for sessions, with the owner's
-account the only reviewer; or (b) enable "Prevent self-review" on the environment together with a
-second reviewer. Until then the guard is the owner's attention, not a technical barrier, and
-nothing in this decision should be read as saying otherwise.
+**The gate (owner's answer: a bot account for sessions).** The required-reviewer approval on
+`apple-signing` is a human gate only if no session can give it. Sessions in this repository
+authenticated to GitHub as the owner's account, `topwombat`, which is also the environment's
+required reviewer, so a session could approve a waiting `mac-sign` deployment through the API
+(`POST /repos/NervaLog/nerva/actions/runs/{id}/pending_deployments`). The owner chose a separate
+machine account for sessions, with the owner's own account the only required reviewer of
+`apple-signing`; the same account makes CODEOWNERS a real review. The owner sets it up before
+the rehearsal (`v0.7.1-rc.2`), and no secret is added to `apple-signing` until sessions run as
+that account. Until then the guard is the owner's attention, not a technical barrier.
