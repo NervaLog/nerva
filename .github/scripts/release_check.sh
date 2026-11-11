@@ -9,6 +9,8 @@
 #   release_check.sh assets <tag> <dist-dir>   needs gh, GH_TOKEN and GITHUB_REPOSITORY
 #   release_check.sh mac-draft <tag>           needs gh, GH_TOKEN and GITHUB_REPOSITORY; prints the commit
 #                                              (prints mac-sign.yml: NRV-E1119, E1120, E1122, E1123, E1124)
+#   release_check.sh mac-same <tag> <signed-commit> <commit-now>   mac-sign.yml: NRV-E1128
+#   release_check.sh mac-upload <tag> <dir>    needs gh, GH_TOKEN; mac-sign.yml: NRV-E1129
 #
 # `ref` refuses a version without a suffix (a release, not a prerelease) from any ref but
 # refs/heads/main (NRV-E1116): a dispatch from a branch would draft a release that targets a commit
@@ -153,8 +155,32 @@ case "${1:-}" in
     fi
     echo "$commit"
     ;;
+  mac-same)
+    tag=${2:?usage: release_check.sh mac-same <tag> <signed-commit> <commit-now>}
+    signed=${3:?usage: release_check.sh mac-same <tag> <signed-commit> <commit-now>}
+    now=${4:?usage: release_check.sh mac-same <tag> <signed-commit> <commit-now>}
+    where=mac-sign.yml
+    if [[ "$now" != "$signed" ]]; then
+      refuse NRV-E1128 "the draft $tag now targets ${now:0:7}, not ${signed:0:7}, which was signed" \
+        "the draft was deleted and made again, or retargeted, while the zip was built and notarized" \
+        "nothing was uploaded; run mac-sign.yml again for the draft as it is now"
+    fi
+    ;;
+  mac-upload)
+    tag=${2:?usage: release_check.sh mac-upload <tag> <dir>}
+    dir=${3:?usage: release_check.sh mac-upload <tag> <dir>}
+    where=mac-sign.yml
+    zip="$dir/nerva-$tag-universal-macos.zip"
+    # --clobber replaces only an unpublished zip: the draft was checked just before.
+    if ! out=$(gh release upload "$tag" "$zip" "$zip.sha256" --clobber 2>&1); then
+      printf 'gh: %s\n' "$out" >&2
+      refuse NRV-E1129 "the zip and its checksum could not be uploaded to the draft $tag" \
+        "GitHub did not answer or refused the upload, the draft was published or deleted meanwhile, or a file is missing" \
+        "run mac-sign.yml again (it replaces an unpublished zip); if the draft is gone or published, see NRV-E1119"
+    fi
+    ;;
   *)
-    echo "usage: release_check.sh ref <tag> <git-ref> | unreleased <tag> | binary <nerva> <version> | assets <tag> <dist-dir> | mac-draft <tag>" >&2
+    echo "usage: release_check.sh ref <tag> <git-ref> | unreleased <tag> | binary <nerva> <version> | assets <tag> <dist-dir> | mac-draft <tag> | mac-same <tag> <signed> <now> | mac-upload <tag> <dir>" >&2
     exit 2
     ;;
 esac

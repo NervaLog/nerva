@@ -5,8 +5,8 @@
 # reviewer and `main` as its only deployment branch.
 #
 # The owner approves every run; the environment's secrets reach only the "Create the signing
-# keychain" step, which hands them to mac_keychain.sh (slice A1) and nothing else. That script and
-# release_check.sh are fetched from the workflow's own ref ($GITHUB_SHA, main for an approved run),
+# keychain" step, which hands them to mac_keychain.sh (slice A1) and nothing else. That script,
+# mac_zip_check.sh and release_check.sh are fetched from the workflow's own ref ($GITHUB_SHA, main for an approved run),
 # never from the draft's target. The target's `zig build` still runs with the keychain unlocked, so
 # release_check.sh mac-draft refuses a target that is not main, or main plus a change to VERSION and
 # CHANGELOG.md only (P343): the code that runs there is main's.
@@ -58,7 +58,7 @@ jobs:
           # prerelease could be any commit. Fetch both scripts from $GITHUB_SHA into $RUNNER_TEMP/wf;
           # the target is checked out after, and its copies of them are never run.
           mkdir "$RUNNER_TEMP/wf"
-          for f in release_check.sh mac_keychain.sh; do
+          for f in release_check.sh mac_keychain.sh mac_zip_check.sh; do
             gh api -H "Accept: application/vnd.github.raw" \
               "repos/$GITHUB_REPOSITORY/contents/.github/scripts/$f?ref=$GITHUB_SHA" \
               > "$RUNNER_TEMP/wf/$f"
@@ -101,21 +101,7 @@ jobs:
       - name: Check the zip from outside
         run: |
           set -eu
-          dir=zig-out/mac-release
-          zip="nerva-$TAG-universal-macos.zip"
-          (cd "$dir" && shasum -a 256 -c "$zip.sha256")
-          scratch="$RUNNER_TEMP/zipcheck"
-          mkdir "$scratch"
-          unzip -q "$dir/$zip" -d "$scratch"
-          nerva="$scratch/nerva-$TAG-universal-macos/nerva"
-          codesign -dv --verbose=4 "$nerva" 2> "$scratch/signature.txt"
-          cat "$scratch/signature.txt"
-          grep -q '^Authority=Developer ID Application' "$scratch/signature.txt" \
-            || { echo "::error::the zip's nerva is not signed with a Developer ID Application certificate"; exit 1; }
-          grep -Eq 'flags=0x[0-9a-f]+\([^)]*runtime' "$scratch/signature.txt" \
-            || { echo "::error::the zip's nerva does not have the hardened runtime"; exit 1; }
-          grep -q '^Timestamp=' "$scratch/signature.txt" \
-            || { echo "::error::the zip's nerva has no secure timestamp"; exit 1; }
+          "$RUNNER_TEMP/wf/mac_zip_check.sh" zig-out/mac-release "$TAG"
 
       - name: Upload the zip and its checksum to the draft
         env:
@@ -127,13 +113,8 @@ jobs:
           # publish in the seconds between this check and the upload is the owner's act, made only
           # after a green run, so it is not guarded.
           again=$("$RUNNER_TEMP/wf/release_check.sh" mac-draft "$TAG")
-          if [ "$again" != "$COMMIT" ]; then
-            echo "::error::the draft $TAG now targets $again, not $COMMIT, which was signed"
-            exit 1
-          fi
-          gh release upload "$TAG" \
-            "zig-out/mac-release/nerva-$TAG-universal-macos.zip" \
-            "zig-out/mac-release/nerva-$TAG-universal-macos.zip.sha256" --clobber
+          "$RUNNER_TEMP/wf/release_check.sh" mac-same "$TAG" "$COMMIT" "$again"
+          "$RUNNER_TEMP/wf/release_check.sh" mac-upload "$TAG" zig-out/mac-release
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:

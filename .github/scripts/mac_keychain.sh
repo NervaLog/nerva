@@ -17,27 +17,64 @@
 # has no stdin form, so the .p12 password (and the random keychain password) are in `security`'s
 # argv for a moment, where other processes of the runner's VM can read them: on a hosted runner
 # those are this job's own.
-# Every failure is NRV-E1121 with a headline, a cause and a fix (docs/ERRORS.md).
+# Every failure has a code, a headline, a cause and a fix (docs/ERRORS.md): NRV-E1121 for the
+# secrets and the identity (`refuse`), NRV-E1125 for the runner and the `security` commands that make
+# and arrange the keychain (`fail`). Nothing ends in a raw command error.
 #
 # `--skip-notary` is for ci.yml's `mac-keychain` job only: a self-signed test certificate, no
 # notary profile, and any code-signing identity (not only a trusted one) is accepted.
 set -euo pipefail
 
-kc="${RUNNER_TEMP:?RUNNER_TEMP is not set: this script runs on a GitHub Actions runner}/nerva-signing.keychain-db"
+RUNNER_TEMP="${RUNNER_TEMP:-}"
+kc="$RUNNER_TEMP/nerva-signing.keychain-db"
 saved_default="$RUNNER_TEMP/nerva-signing.default-keychain"
 saved_list="$RUNNER_TEMP/nerva-signing.keychain-list"
 p12="$RUNNER_TEMP/nerva-id.p12"
 p8="$RUNNER_TEMP/nerva-notary.p8"
 
-refuse() {
-  printf 'error[NRV-E1121]: mac_keychain.sh: %s\n  cause  %s\n  fix    %s\n' "$1" "$2" "$3" >&2
-  echo "::error::NRV-E1121 $1" >&2
+# fail <code> <headline> <cause> <fix>
+fail() {
+  printf 'error[%s]: mac_keychain.sh: %s\n  cause  %s\n  fix    %s\n' "$1" "$2" "$3" "$4" >&2
+  echo "::error::$1 $2" >&2
   exit 1
+}
+
+refuse() { fail NRV-E1121 "$@"; }
+
+# step <headline> <cause> <fix> <command...>: runs the command; if it fails, prints its output
+# (never a secret: none of these commands prints one) and ends with NRV-E1125.
+step() {
+  local headline=$1 cause=$2 fix=$3 out
+  shift 3
+  if ! out=$("$@" 2>&1); then
+    printf 'command: %s\n' "$out" >&2
+    fail NRV-E1125 "$headline" "$cause" "$fix"
+  fi
 }
 
 # The user's keychain search list, one path per line, without quotes.
 user_keychains() {
   security list-keychains -d user | sed -e 's/^[[:space:]]*"//' -e 's/"$//'
+}
+
+# Saves the user's search list and default keychain where `destroy` finds them.
+read_user_state() {
+  user_keychains > "$saved_list"
+  security default-keychain -d user | sed -e 's/^[[:space:]]*"//' -e 's/"$//' > "$saved_default"
+}
+
+make_keychain() {
+  security create-keychain -p "$1" "$kc"
+  security set-keychain-settings "$kc"
+  security unlock-keychain -p "$1" "$kc"
+}
+
+# arrange_keychains <keychain> <search list...>
+arrange_keychains() {
+  local keychain=$1
+  shift
+  security list-keychains -d user -s "$@"
+  security default-keychain -d user -s "$keychain"
 }
 
 create() {
@@ -47,6 +84,16 @@ create() {
     --skip-notary) skip_notary=1 ;;
     *) echo "usage: mac_keychain.sh create [--skip-notary]" >&2; exit 2 ;;
   esac
+  if [[ -z "$RUNNER_TEMP" || ! -d "$RUNNER_TEMP" || ! -w "$RUNNER_TEMP" ]]; then
+    fail NRV-E1125 "the runner's temporary directory '$RUNNER_TEMP' is not a writable directory" \
+      "RUNNER_TEMP is unset or names a directory that does not exist or cannot be written; this script runs on a GitHub Actions runner" \
+      "run it as a step of a workflow job on a hosted runner"
+  fi
+  if [[ -e "$kc" ]]; then
+    fail NRV-E1125 "a signing keychain already exists at $kc" \
+      "an earlier run on this machine left it (a hosted runner is discarded after each job, so this is a reused machine), and a second create would overwrite the saved search list" \
+      "run 'mac_keychain.sh destroy', or use a fresh runner"
+  fi
   local names=(APPLE_DEVELOPER_ID_P12 APPLE_DEVELOPER_ID_P12_PASSWORD)
   if [[ $skip_notary == 0 ]]; then
     names+=(APPLE_NOTARY_KEY_P8 APPLE_NOTARY_KEY_ID APPLE_NOTARY_ISSUER_ID)
@@ -66,15 +113,21 @@ create() {
   trap 'rm -f "$p12" "$p8"' EXIT
 
   local pw
-  pw=$(openssl rand -base64 32)
+  if ! pw=$(openssl rand -base64 32 2> /dev/null) || [[ -z "$pw" ]]; then
+    fail NRV-E1125 "a random keychain password could not be made" \
+      "'openssl rand' failed or printed nothing" \
+      "run again; if it repeats, the runner image is broken"
+  fi
   echo "::add-mask::$pw"
-  user_keychains > "$saved_list"
-  security default-keychain -d user | sed -e 's/^[[:space:]]*"//' -e 's/"$//' > "$saved_default"
-
-  security create-keychain -p "$pw" "$kc"
+  step "the user's keychain search list and default keychain could not be read" \
+    "'security list-keychains' or 'security default-keychain' failed, or the runner's temporary directory could not be written" \
+    "run again; if it repeats, the runner image is broken" \
+    read_user_state
   # No -t: the default auto-lock (300 s) could lock the keychain during a long build; the job destroys it.
-  security set-keychain-settings "$kc"
-  security unlock-keychain -p "$pw" "$kc"
+  step "the signing keychain could not be created or unlocked" \
+    "'security create-keychain', 'set-keychain-settings' or 'unlock-keychain' failed" \
+    "run again; if it repeats, the runner image is broken" \
+    make_keychain "$pw"
   if ! printf '%s' "$APPLE_DEVELOPER_ID_P12" | base64 --decode > "$p12" 2> /dev/null; then
     refuse "the signing secret APPLE_DEVELOPER_ID_P12 is not base64" \
       "it holds something other than the base64 of the .p12 file" \
@@ -99,8 +152,10 @@ create() {
   while IFS= read -r line; do
     [[ -n "$line" && "$line" != "$kc" ]] && list+=("$line")
   done < "$saved_list"
-  security list-keychains -d user -s "${list[@]}"
-  security default-keychain -d user -s "$kc"
+  step "the signing keychain could not be put first in the search list and made the default" \
+    "'security list-keychains -s' or 'security default-keychain -s' failed" \
+    "run again; if it repeats, the runner image is broken" \
+    arrange_keychains "$kc" "${list[@]}"
 
   if [[ $skip_notary == 0 ]]; then
     if ! printf '%s' "$APPLE_NOTARY_KEY_P8" | base64 --decode > "$p8" 2> /dev/null; then
@@ -121,7 +176,12 @@ create() {
 
   local flags=(-p codesigning) found
   [[ $skip_notary == 0 ]] && flags=(-v -p codesigning)
-  found=$(security find-identity "${flags[@]}" "$kc")
+  if ! found=$(security find-identity "${flags[@]}" "$kc" 2>&1); then
+    printf 'security: %s\n' "$found" >&2
+    fail NRV-E1125 "the keychain's identities could not be listed" \
+      "'security find-identity' failed on the keychain" \
+      "run again; if it repeats, the runner image is broken"
+  fi
   printf '%s\n' "$found"
   if [[ $skip_notary == 0 ]]; then
     grep -q '^ *1 valid identities found' <<< "$found" || refuse \
