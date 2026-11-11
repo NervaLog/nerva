@@ -430,6 +430,8 @@ def main():
                                f"--output={export}"])
         assert exported.returncode == 0, exported.stderr[-3000:]
         assert "exported to" in exported.stderr, exported.stderr[-3000:]
+        # #302: owner-only, whatever the umask.
+        assert os.stat(export).st_mode & 0o777 == 0o600, oct(os.stat(export).st_mode)
         refused = run(nerva, ["export", "--cluster=0", f"--addresses={old.addresses}",
                               f"--output={export}"])
         assert refused.returncode != 0 and "exists" in refused.stderr, refused.stderr[-2000:]

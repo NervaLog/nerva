@@ -77,10 +77,11 @@ today; see [issue #303](https://github.com/NervaLog/nerva/issues/303).
   caller reaches off its own host ([README, Limits](./README.md#limits), "Network").
 - **No encryption at rest.** Data files, exports and backups are checksummed, not encrypted.
   Use an encrypted volume, and treat an export as the data it holds.
-- **Exports and backups are world-readable today.** `nerva export`, `nerva backup` and the
-  backup's manifest are created with mode 0644, while the data file is 0600 (recorded on
-  `4ddd232`; [issue #302](https://github.com/NervaLog/nerva/issues/302)). Until that is fixed,
-  write them into a directory with mode 0700, or run the command under `umask 077`.
+- **Exports and backups are owner-only (0600).** `nerva export`, `nerva backup` and the backup's
+  manifest are created with mode 0600, as the data file is (from the release after v0.7.1; v0.7.0
+  and v0.7.1 create them 0644, [issue #302](https://github.com/NervaLog/nerva/issues/302)). Files
+  made by those releases stay 0644: `chmod 600` them. Whoever else reads them (a backup uploader
+  under another user) must be given access explicitly.
 - **No per-user authorization.** See [docs/NON-GOALS.md](./docs/NON-GOALS.md).
 - **A forwarder defeats the loopback rule.** The refusal is advisory ("Gateways beside their
   clients").

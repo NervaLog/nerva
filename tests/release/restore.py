@@ -289,6 +289,7 @@ def backup(nerva, cluster, addresses, output, *flags):
 
 
 def main(tmp, nerva):
+    os.umask(0o022)  # #302: the modes asserted below must not come from the caller's umask
     cluster = Cluster(tmp, "first", nerva, 3, 0, format_prepare)
     writer = None
     restored = None
@@ -324,6 +325,9 @@ def main(tmp, nerva):
         assert match, result.stdout
         assert match.group(1) == output and int(match.group(2)) == as_of, result.stdout
         assert match.group(4) == manifest_path, result.stdout
+        # #302: the backup and its manifest are owner-only, whatever the umask (022 here).
+        for path in (output, manifest_path):
+            assert os.stat(path).st_mode & 0o777 == 0o600, (path, oct(os.stat(path).st_mode))
         sha256 = match.group(3)
         with open(output, "rb") as f:
             data = f.read()

@@ -160,6 +160,10 @@ jobs:
           python3 .github/scripts/test_sbom.py
           python3 .github/scripts/test_release_check.py
 
+      - name: Placeholder keys (the refused values equal the env examples', #306)
+        if: needs.changes.outputs.code != 'false'
+        run: python3 -I .github/scripts/test_placeholder_keys.py
+
       - name: Nightly perf scripts (the comparison, its issues)
         if: needs.changes.outputs.code != 'false'
         run: |
