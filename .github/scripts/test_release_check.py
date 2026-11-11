@@ -199,7 +199,7 @@ class MacDraft(unittest.TestCase):
         workflow = (ROOT / ".github/workflows/mac-sign.yml").read_text()
         call = 'mac-draft "$TAG")'
         keychain = workflow.index("run: .github/scripts/mac_keychain.sh create")
-        upload = workflow.index("gh release upload")
+        upload = workflow.index('gh release upload "$TAG"')
         self.assertEqual(workflow.count(call), 2)
         self.assertLess(workflow.index(call), keychain)
         self.assertLess(keychain, workflow.index(call, keychain))
