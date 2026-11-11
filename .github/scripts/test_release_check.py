@@ -136,8 +136,8 @@ class ReleaseCheck(unittest.TestCase):
                          "does not hold the assets that were built")
 
 
-def fake_gh_draft(directory, releases="true\tabc1234", version="0.7.1", status="ahead",
-                  commit_fails=False, version_fails=False):
+def fake_gh_draft(directory, releases="true\tabc1234", version="0.7.1", status="behind",
+                  commit_fails=False, version_fails=False, files=(), compare_fails=False):
     """The calls `mac-draft` makes: the releases list (`releases`, the tab-separated line a real --jq
     prints, or "" for none), the commit a target resolves to, VERSION at that commit, and the compare
     status against main."""
@@ -147,7 +147,7 @@ case "$*" in
   *select*) [ -n "{releases}" ] && printf '{releases}\\n' ;;
   *commits/*) {'echo "gh: Not Found (HTTP 404)" >&2; exit 1' if commit_fails else "echo 0123456789abcdef0123456789abcdef01234567"} ;;
   *contents/VERSION*) {'echo "gh: Not Found (HTTP 404)" >&2; exit 1' if version_fails else f'echo "{version}"'} ;;
-  *compare/*) echo "{status}" ;;
+  *compare/*) {'echo "gh: Server Error (HTTP 500)" >&2; exit 1' if compare_fails else "printf '" + status + chr(92) + "n" + "".join(f + chr(92) + "n" for f in files) + "'"} ;;
 esac
 exit 0
 """)
@@ -183,13 +183,40 @@ class MacDraft(unittest.TestCase):
             self.refused(run("mac-draft", "v0.7.1", path_dir=d), "NRV-E1120",
                          "whose VERSION is '0.7.0', not 0.7.1")
 
-    def test_a_release_off_main_is_refused_and_a_prerelease_is_not_compared(self):
+    def test_a_release_off_main_is_refused(self):
         with tempfile.TemporaryDirectory() as d:
-            for status in ("diverged", "behind"):
+            for status in ("diverged", "ahead"):
+                fake_gh_draft(d, status=status, files=("VERSION",))
+                self.refused(run("mac-draft", "v0.7.1", path_dir=d), "NRV-E1124",
+                             "v0.7.1 is a release, and its draft targets 0123456, which is not on main")
+            for status in ("identical", "behind"):
                 fake_gh_draft(d, status=status)
-                self.refused(run("mac-draft", "v0.7.1", path_dir=d), "NRV-E1124", "which is not on main")
-            fake_gh_draft(d, version="0.7.1-rc.1", status="diverged")
-            self.assertEqual(run("mac-draft", "v0.7.1-rc.1", path_dir=d).returncode, 0)
+                self.assertEqual(run("mac-draft", "v0.7.1", path_dir=d).returncode, 0)
+
+    def test_a_prerelease_on_main_or_ahead_with_only_the_version_bump_passes(self):
+        with tempfile.TemporaryDirectory() as d:
+            for status, files in (("behind", ()), ("identical", ()), ("ahead", ("VERSION",)),
+                                  ("ahead", ("CHANGELOG.md", "VERSION")), ("diverged", ("VERSION",))):
+                fake_gh_draft(d, version="0.7.1-rc.2", status=status, files=files)
+                result = run("mac-draft", "v0.7.1-rc.2", path_dir=d)
+                self.assertEqual(result.returncode, 0, (status, files, result.stderr))
+
+    def test_a_prerelease_ahead_of_main_with_another_file_is_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            for files in (("VERSION", "build.zig"), ("zig/download.sh",), ("VERSION", "docs/CHANGELOG.md")):
+                fake_gh_draft(d, version="0.7.1-rc.2", status="ahead", files=files)
+                self.refused(run("mac-draft", "v0.7.1-rc.2", path_dir=d), "NRV-E1124",
+                             "v0.7.1-rc.2 is a prerelease, and its draft targets 0123456, which changes "
+                             "more than VERSION and CHANGELOG.md on top of main")
+
+    def test_a_compare_that_fails_is_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            for tag in ("v0.7.1", "v0.7.1-rc.2"):
+                fake_gh_draft(d, version=tag[1:], compare_fails=True)
+                result = run("mac-draft", tag, path_dir=d)
+                self.refused(result, "NRV-E1122",
+                             "cannot compare the commit 0123456, which the draft " + tag + " targets, with main")
+                self.assertNotIn("HTTP 500", result.stderr)
 
     def test_a_tag_that_is_not_v_version_is_refused(self):
         for tag in ("main", "0.7.1", "v0.7.1 "):

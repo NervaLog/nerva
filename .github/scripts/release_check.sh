@@ -127,12 +127,28 @@ case "${1:-}" in
         "the draft was made from another commit than the VERSION commit, or the tag was mistyped" \
         "delete the draft (gh release delete $tag) and run release.yml on the VERSION commit"
     fi
-    if [[ "$tag" != *-* ]]; then
-      status=$(gh api "repos/$GITHUB_REPOSITORY/compare/$commit...main" --jq .status)
-      if [[ "$status" != ahead && "$status" != identical ]]; then
+    # Is the commit on main? Compare main with it: `identical` or `behind` means it is on main. The
+    # files are relative to the merge base, which is on main (a first page of 30 cannot hide a file
+    # beyond VERSION and CHANGELOG.md in a list of at most two).
+    if ! compared=$(gh api "repos/$GITHUB_REPOSITORY/compare/main...$commit" \
+      --jq '.status, (.files[]? | .filename)' 2> /dev/null) || [[ -z "$compared" ]]; then
+      refuse NRV-E1122 "cannot compare the commit ${commit:0:7}, which the draft $tag targets, with main" \
+        "GitHub did not answer the compare call, so it is not known whether the commit is on main" \
+        "run again"
+    fi
+    status=$(head -n1 <<< "$compared")
+    if [[ "$status" != identical && "$status" != behind ]]; then
+      if [[ "$tag" != *-* ]]; then
         refuse NRV-E1124 "$tag is a release, and its draft targets ${commit:0:7}, which is not on main" \
           "a release is cut only from a main commit (P147b)" \
           "delete the draft (gh release delete $tag) and run release.yml on main"
+      fi
+      # A prerelease may add the version bump to main, and nothing else: its build.zig and
+      # zig/download.sh run with the keychain unlocked, so they must be main's (P343).
+      if tail -n +2 <<< "$compared" | grep -qvxE 'VERSION|CHANGELOG\.md'; then
+        refuse NRV-E1124 "$tag is a prerelease, and its draft targets ${commit:0:7}, which changes more than VERSION and CHANGELOG.md on top of main" \
+          "the code that runs with the signing keychain unlocked must be main's; a prerelease may add only the version bump to it (P343)" \
+          "delete the draft (gh release delete $tag) and run release.yml on main, or on a commit that changes only VERSION and CHANGELOG.md"
       fi
     fi
     echo "$commit"
