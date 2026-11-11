@@ -632,7 +632,10 @@ jobs:
           cp /usr/bin/true "$RUNNER_TEMP/signed-true"
           codesign --force --sign "$hash" "$RUNNER_TEMP/signed-true"
           codesign --verify --verbose "$RUNNER_TEMP/signed-true"
-          codesign -dv "$RUNNER_TEMP/signed-true" 2>&1 | grep -q 'Authority=Nerva CI Test Signing'
+          # -dvv: the Authority lines are printed only from verbosity 2.
+          info=$(codesign -dvv "$RUNNER_TEMP/signed-true" 2>&1)
+          printf '%s\n' "$info"
+          grep -q 'Authority=Nerva CI Test Signing' <<< "$info"
 
       - name: The keychain is destroyed and the user's keychains are as they were
         if: always() && needs.changes.outputs.code != 'false'
