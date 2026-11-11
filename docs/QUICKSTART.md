@@ -239,8 +239,8 @@ NERVA_DATA_FILE=/var/lib/nerva/0.nerva
 NERVA_FLAGS=
 ```
 
-**Replace the example's `NERVA_CLUSTER_KEY` with your own.** The placeholder is longer than 32
-bytes, so Nerva accepts it and starts: nothing refuses a key that is published in this repository.
+**Replace the example's `NERVA_CLUSTER_KEY` with your own.** The placeholder is published in this
+repository, so `nerva start` refuses it (NRV-E0901) until you do.
 `NERVA_ADDRESSES` is the same on all three hosts, in replica order. On the second host the file is
 `replica-1.env` with `NERVA_DATA_FILE=/var/lib/nerva/1.nerva`, and so on. Leave `NERVA_FLAGS` empty:
 never `--development` in production.
@@ -280,7 +280,7 @@ exit status the unit lists (`1` to `8`) is not restarted, because a restart cann
 uses it, on loopback. On the gateway's host (Nerva installed there, and port `3001` of all three
 replicas reachable), copy `api.env.example` (from `/etc/nerva` or `/usr/share/nerva`, as in step 2)
 to `/etc/nerva/api-0.env`, set the cluster id, the three addresses and a key of your own for
-`NERVA_KEY` (the example's `replace-with-a-long-random-key` is a published value: replace it),
+`NERVA_KEY` (the example's `replace-with-a-long-random-key` is a published value: the gateway refuses it, NRV-E0008),
 and give it the same ownership and mode:
 
 ```

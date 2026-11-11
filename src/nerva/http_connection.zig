@@ -142,6 +142,10 @@ pub fn key_matches(key_header: ?[]const u8, key: []const u8) bool {
     return equal and key_header != null;
 }
 
+/// The value `packaging/linux/api.env.example` ships for `NERVA_KEY`: published in this
+/// repository, so it is refused (#306).
+pub const placeholder_key = "replace-with-a-long-random-key";
+
 /// A gateway's keys (P96): `X-Nerva-Key` must equal `current` or, during a rotation, `next`.
 pub const Keys = struct {
     current: []const u8,
@@ -151,8 +155,14 @@ pub const Keys = struct {
     /// each set key is non-empty, and `next` differs from `current`. The message names no key.
     pub fn invalid(current: []const u8, next: ?[]const u8) ?[]const u8 {
         if (current.len == 0) return "set NERVA_KEY";
+        if (std.mem.eql(u8, current, placeholder_key)) {
+            return "NERVA_KEY is the example's placeholder: make a key with openssl rand -hex 32";
+        }
         const key_next = next orelse return null;
         if (key_next.len == 0) return "NERVA_KEY_NEXT is set but empty";
+        if (std.mem.eql(u8, key_next, placeholder_key)) {
+            return "NERVA_KEY_NEXT is the example's placeholder: make a key with openssl rand -hex 32";
+        }
         if (std.mem.eql(u8, current, key_next)) return "NERVA_KEY_NEXT equals NERVA_KEY";
         return null;
     }
@@ -963,6 +973,9 @@ test "Keys.invalid" {
         "NERVA_KEY_NEXT equals NERVA_KEY",
         Keys.invalid("same-key", "same-key").?,
     );
+    // #306: the example's published placeholder is refused, as current or as next.
+    try testing.expect(Keys.invalid(placeholder_key, null) != null);
+    try testing.expect(Keys.invalid("current-key", placeholder_key) != null);
 }
 
 fn test_connect(receiver: *const Receiver) !std.net.Stream {
