@@ -107,6 +107,11 @@ The README's first line no longer says "toy / research": it gives the label and 
 
 ### Fixed
 
+- **#308:** v0.7.0's "Upgrading from v0.6.1" step 2 told operators to wait for a log line saying
+  a replica is committing; no replica writes one. The step now names the real signal (the
+  `tb.replica_commit_min` gauge, or `sync: done`), here and in the v0.7.0 section above.
+- **#307:** the `.deb`'s `Maintainer` field had no email address, which Debian policy requires. It
+  is now `The Nerva authors <nerva@nerva.pro>`.
 - **#278:** CI had never run Nerva on macOS. CI now builds the universal binary on a Mac, runs a
   smoke test on Apple silicon and on Intel (three replicas, a gateway with `--statsd`, a commit, a
   lookup, the change feed) and the unit tests on Apple silicon (#293). `zig build -Drelease
@@ -425,7 +430,8 @@ combine requests into such ops. Do it in this order:
 2. Upgrade the replicas one at a time. Data files, the superblock, the replica protocol,
    `tree_ids`, `Operation` values and the export format are the same, so v0.7.0 replicas open
    v0.6.1 data files: no export or import. For each replica: stop it, start it with the v0.7.0
-   binary, and wait for it to rejoin (its log says it is committing) before the next one.
+   binary, and wait for it to catch up before the next one: its `tb.replica_commit_min` gauge
+   (`--statsd`) reaches the others', or `sync: done` appears in its log when it state-synced.
 3. Only when every replica runs v0.7.0 (`nerva version | head -n1` on each), upgrade the gateways and start
    any multi-batch client.
 
