@@ -109,7 +109,7 @@ The README's first line no longer says "toy / research": it gives the label and 
 
 - **#308:** v0.7.0's "Upgrading from v0.6.1" step 2 told operators to wait for a log line saying
   a replica is committing; no replica writes one. The step now names the real signal (the
-  `tb.replica_commit_min` gauge, or `sync: done`), here and in the v0.7.0 section above.
+  `tb.replica_commit_min` gauge, or `sync: done`), here and in the v0.7.0 section below.
 - **#307:** the `.deb`'s `Maintainer` field had no email address, which Debian policy requires. It
   is now `The Nerva authors <nerva@nerva.pro>`.
 - **#278:** CI had never run Nerva on macOS. CI now builds the universal binary on a Mac, runs a
