@@ -739,8 +739,10 @@ def judge_stall(records, inflight, stopped):
     first = min(r[1] for r in after if r[3].get("code") == "NRV-E0601")
     for sent, answered, status, body in after:
         # The replies of one group are written in a row, and the callers' threads wake in any
-        # order: 0.2 s is slack for that, not for a refusal that came first.
-        if body.get("code") != "NRV-E0602" and answered < first - 0.2:
+        # order: 0.2 s is slack for that, not for a refusal that came first. A busy refusal
+        # (NRV-E0602) and an expired one (NRV-E0606, P209: a request whose deadline passed while it
+        # waited behind the group in flight) were never sent, whenever they are answered.
+        if body.get("code") not in ("NRV-E0602", "NRV-E0606") and answered < first - 0.2:
             check(False, f"answered {body.get('code')} {body.get('applied')!r} {first - answered:.2f} s "
                   f"before any call to the stopped cluster timed out: {body}")
     check(worst <= 4.0, f"an in-flight request waited {worst:.1f} s after the stop")
@@ -820,6 +822,7 @@ def step9(demo, a, b):
         check(not thread.is_alive(), "a step 9 caller never finished")
     check(not errors, errors[:3])
     inflight = [r for r in records if r[0] < stopped < r[1]]  # Sent before, answered after.
+    check(inflight, "no request was in flight when the replicas stopped")
     try:
         worst, unknown, refused = judge_stall(records, inflight, stopped)
     except StepFailed:
