@@ -449,8 +449,19 @@ check_state
 echo "reinstall kept the data, the settings, the user and the enabled replica"
 mkdir -p /etc/systemd/system
 touch /etc/systemd/system/nerva@.service /usr/local/bin/nerva
-dnf install -y -q --setopt=install_weak_deps=False /tmp/@PKG2@ > /tmp/upgrade.out 2>&1
-grep -q 'warning.NRV-W1101.: nerva package: /usr/local/bin/nerva exists' /tmp/upgrade.out
+# No -q: dnf's quiet mode hides a scriptlet's stderr, and an operator who upgrades with dnf must see
+# the warning. The dnf logs are searched too, and the output is printed when the warning is missing.
+if ! dnf install -y --setopt=install_weak_deps=False /tmp/@PKG2@ > /tmp/upgrade.out 2>&1; then
+    cat /tmp/upgrade.out
+    exit 1
+fi
+cat /tmp/upgrade.out /var/log/dnf*.log > /tmp/upgrade.all 2> /dev/null || true
+if ! grep -q 'warning.NRV-W1101.: nerva package: /usr/local/bin/nerva exists' /tmp/upgrade.out; then
+    echo "the upgrade did not show NRV-W1101; dnf printed:"
+    cat /tmp/upgrade.out
+    echo "the dnf logs have it: $(grep -c 'NRV-W1101' /tmp/upgrade.all)"
+    exit 1
+fi
 [ "$(rpm -q --qf '%{VERSION}' nerva)" = "@VERSION2@" ]
 check_state
 rpm -U --oldpackage --nosignature /tmp/@PKG@
