@@ -13,6 +13,7 @@
             [jepsen.nemesis.combined :as combined]
             [jepsen.nerva.core :as core]
             [jepsen.nerva.db :as db]
+            [jepsen.nerva.lazyfs :as lazyfs]
             [jepsen.nerva.nemesis :as nemesis]))
 
 (def test-map {:nodes ["n1" "n2" "n3"], :concurrency 1})
@@ -567,6 +568,10 @@
     (is (true? (nemesis/final-start? {:faults #{f}})) (str f))
     (is (= [:gateway-start] (map :f (:final-generator (package f)))) (str f)))
   (is (false? (nemesis/final-start? {:faults #{:partition}}))))
+
+(deftest the-restarting-fault-names-are-the-ones-nemesis-knows
+  (is (= nemesis/replica-restarting-faults #{:kill lazyfs/fault})
+      "#242 landed: the LazyFS fault keeps its name, or its final start is silently lost"))
 
 (deftest the-test-map-carries-the-faults
   (let [t (core/nerva-test {:workload :bank, :nemesis [:kill :partition], :time-limit 1
