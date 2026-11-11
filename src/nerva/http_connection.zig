@@ -161,18 +161,18 @@ pub const Keys = struct {
     /// from `current`. The message names no key.
     pub fn invalid(current: []const u8, next: ?[]const u8) ?[]const u8 {
         if (current.len == 0) return "set NERVA_KEY";
-        if (current.len < key_length_min) return "NERVA_KEY is shorter than 32 bytes";
         if (std.mem.eql(u8, current, placeholder_key)) {
             return "NERVA_KEY is the example's placeholder: " ++
                 "make a key with openssl rand -hex 32";
         }
+        if (current.len < key_length_min) return "NERVA_KEY is shorter than 32 bytes";
         const key_next = next orelse return null;
         if (key_next.len == 0) return "NERVA_KEY_NEXT is set but empty";
-        if (key_next.len < key_length_min) return "NERVA_KEY_NEXT is shorter than 32 bytes";
         if (std.mem.eql(u8, key_next, placeholder_key)) {
             return "NERVA_KEY_NEXT is the example's placeholder: " ++
                 "make a key with openssl rand -hex 32";
         }
+        if (key_next.len < key_length_min) return "NERVA_KEY_NEXT is shorter than 32 bytes";
         if (std.mem.eql(u8, current, key_next)) return "NERVA_KEY_NEXT equals NERVA_KEY";
         return null;
     }

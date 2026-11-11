@@ -334,7 +334,7 @@ const FakeFeed = struct {
 };
 
 fn request_get(target: []const u8) http_connection.Request {
-    return .{ .method = .get, .target = target, .key = "k", .body = "" };
+    return .{ .method = .get, .target = target, .key = "k" ** 32, .body = "" };
 }
 
 test "view: a catch-up the window ends is NRV-E0606, and the next request resumes from the cursor" {
