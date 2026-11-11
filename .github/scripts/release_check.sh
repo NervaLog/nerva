@@ -7,6 +7,7 @@
 #   release_check.sh unreleased <tag>          needs gh, GH_TOKEN and GITHUB_REPOSITORY
 #   release_check.sh binary <nerva> <version>  <version> is VERSION's text, without the v
 #   release_check.sh assets <tag> <dist-dir>   needs gh, GH_TOKEN and GITHUB_REPOSITORY
+#   release_check.sh mac-draft <tag>           needs gh, GH_TOKEN and GITHUB_REPOSITORY; prints the commit
 #
 # `ref` refuses a version without a suffix (a release, not a prerelease) from any ref but
 # refs/heads/main (NRV-E1116): a dispatch from a branch would draft a release that targets a commit
@@ -18,8 +19,10 @@
 # exactly the files of <dist-dir>: GitHub renames a file whose name has a character it does not keep.
 set -euo pipefail
 
+where=release.yml
+
 refuse() {
-  printf 'error[%s]: release.yml: %s\n  cause  %s\n  fix    %s\n' "$1" "$2" "$3" "$4" >&2
+  printf 'error[%s]: %s: %s\n  cause  %s\n  fix    %s\n' "$1" "$where" "$2" "$3" "$4" >&2
   echo "::error::$1 $2" >&2
   exit 1
 }
@@ -83,8 +86,50 @@ case "${1:-}" in
         "delete the draft (gh release delete $tag), fix the file names and run again"
     fi
     ;;
+  mac-draft)
+    tag=${2:?usage: release_check.sh mac-draft <tag>}
+    where=mac-sign.yml
+    if ! [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+      echo "release_check.sh: '$tag' is not a release tag (v<VERSION>)" >&2
+      exit 2
+    fi
+    found=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases" \
+      --jq ".[] | select(.tag_name == \"$tag\") | [.draft, .target_commitish] | @tsv" | head -n1)
+    if [[ -z "$found" ]]; then
+      refuse NRV-E1119 "there is no draft release named $tag to sign into" \
+        "release.yml did not make it, or it was deleted" \
+        "run release.yml (or fix the tag); mac-sign.yml only adds the macOS zip to an existing draft"
+    fi
+    if [[ "${found%%$'\t'*}" != true ]]; then
+      refuse NRV-E1119 "the release $tag is not a draft" \
+        "it was published, and a published release's assets are not replaced" \
+        "to correct a published release, cut the next version"
+    fi
+    target=${found#*$'\t'}
+    commit=$(gh api "repos/$GITHUB_REPOSITORY/commits/$target" --jq .sha)
+    if [[ -z "$commit" ]]; then
+      echo "release_check.sh: cannot resolve $tag's target '$target' to a commit" >&2
+      exit 2
+    fi
+    version=$(gh api -H "Accept: application/vnd.github.raw" \
+      "repos/$GITHUB_REPOSITORY/contents/VERSION?ref=$commit" | head -n1 | tr -d '[:space:]')
+    if [[ "$version" != "${tag#v}" ]]; then
+      refuse NRV-E1120 "the draft $tag targets ${commit:0:7}, whose VERSION is '${version:-none}', not ${tag#v}" \
+        "the draft was made from another commit than the VERSION commit, or the tag was mistyped" \
+        "delete the draft (gh release delete $tag) and run release.yml on the VERSION commit"
+    fi
+    if [[ "$tag" != *-* ]]; then
+      status=$(gh api "repos/$GITHUB_REPOSITORY/compare/$commit...main" --jq .status)
+      if [[ "$status" != ahead && "$status" != identical ]]; then
+        refuse NRV-E1116 "$tag is a release, and its draft targets ${commit:0:7}, which is not on main" \
+          "a release is cut only from a main commit (P147b)" \
+          "delete the draft (gh release delete $tag) and run release.yml on main"
+      fi
+    fi
+    echo "$commit"
+    ;;
   *)
-    echo "usage: release_check.sh ref <tag> <git-ref> | unreleased <tag> | binary <nerva> <version> | assets <tag> <dist-dir>" >&2
+    echo "usage: release_check.sh ref <tag> <git-ref> | unreleased <tag> | binary <nerva> <version> | assets <tag> <dist-dir> | mac-draft <tag>" >&2
     exit 2
     ;;
 esac

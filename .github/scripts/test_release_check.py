@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for release_check.sh (NRV-E1112 to NRV-E1116) and release_notes.sh (NRV-E1117). Run from the repository root:
+"""Tests for release_check.sh (NRV-E1112 to NRV-E1116, and mac-draft: NRV-E1119, NRV-E1120) and release_notes.sh (NRV-E1117). Run from the repository root:
 python3 .github/scripts/test_release_check.py
 
 A stand-in `nerva` and a stand-in `gh` (a script that answers from files) stand for the real two."""
@@ -134,6 +134,76 @@ class ReleaseCheck(unittest.TestCase):
             fake_gh(d, False, [], ["a.tar.gz", "nerva_0.7.1_rc.1-1_amd64.deb"])
             self.refused(run("assets", "v0.7.1-rc.1", dist, path_dir=d), "NRV-E1115",
                          "does not hold the assets that were built")
+
+
+def fake_gh_draft(directory, releases="true\tabc1234", version="0.7.1", status="ahead"):
+    """The calls `mac-draft` makes: the releases list (`releases`, the tab-separated line a real --jq
+    prints, or "" for none), the commit a target resolves to, VERSION at that commit, and the compare
+    status against main."""
+    path = Path(directory) / "gh"
+    path.write_text(f"""#!/bin/sh
+case "$*" in
+  *select*) [ -n "{releases}" ] && printf '{releases}\\n' ;;
+  *commits/*) echo 0123456789abcdef0123456789abcdef01234567 ;;
+  *contents/VERSION*) echo "{version}" ;;
+  *compare/*) echo "{status}" ;;
+esac
+exit 0
+""")
+    path.chmod(0o755)
+
+
+class MacDraft(unittest.TestCase):
+    def refused(self, result, code, fragment):
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn(f"error[{code}]: mac-sign.yml: ", result.stderr)
+        self.assertIn(fragment, result.stderr)
+        self.assertIn("\n  cause  ", result.stderr)
+        self.assertIn("\n  fix    ", result.stderr)
+        self.assertIn(f"::error::{code}", result.stderr)
+
+    def test_a_draft_of_the_version_on_main_passes_and_prints_its_commit(self):
+        with tempfile.TemporaryDirectory() as d:
+            fake_gh_draft(d)
+            result = run("mac-draft", "v0.7.1", path_dir=d)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "0123456789abcdef0123456789abcdef01234567\n")
+
+    def test_a_published_release_or_no_release_is_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            fake_gh_draft(d, releases="false\tmain")
+            self.refused(run("mac-draft", "v0.7.1", path_dir=d), "NRV-E1119", "release v0.7.1 is not a draft")
+            fake_gh_draft(d, releases="")
+            self.refused(run("mac-draft", "v0.7.1", path_dir=d), "NRV-E1119", "no draft release named v0.7.1")
+
+    def test_a_target_whose_version_is_not_the_tag_is_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            fake_gh_draft(d, version="0.7.0")
+            self.refused(run("mac-draft", "v0.7.1", path_dir=d), "NRV-E1120",
+                         "whose VERSION is '0.7.0', not 0.7.1")
+
+    def test_a_release_off_main_is_refused_and_a_prerelease_is_not_compared(self):
+        with tempfile.TemporaryDirectory() as d:
+            for status in ("diverged", "behind"):
+                fake_gh_draft(d, status=status)
+                self.refused(run("mac-draft", "v0.7.1", path_dir=d), "NRV-E1116", "which is not on main")
+            fake_gh_draft(d, version="0.7.1-rc.1", status="diverged")
+            self.assertEqual(run("mac-draft", "v0.7.1-rc.1", path_dir=d).returncode, 0)
+
+    def test_a_tag_that_is_not_a_version_is_a_misuse(self):
+        result = run("mac-draft", "main")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("not a release tag", result.stderr)
+
+    def test_the_workflow_checks_the_draft_before_the_secrets_and_again_before_the_upload(self):
+        workflow = (ROOT / ".github/workflows/mac-sign.yml").read_text()
+        call = 'mac-draft "$TAG")'
+        keychain = workflow.index("run: .github/scripts/mac_keychain.sh create")
+        upload = workflow.index("gh release upload")
+        self.assertEqual(workflow.count(call), 2)
+        self.assertLess(workflow.index(call), keychain)
+        self.assertLess(keychain, workflow.index(call, keychain))
+        self.assertLess(workflow.index(call, keychain), upload)
 
 
 NOTES = ROOT / ".github/scripts/release_notes.sh"
