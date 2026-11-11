@@ -281,8 +281,9 @@ NRV-E0901 and NRV-E0902 are in
 
 ## The installer refused
 
-`install.sh` in the Linux release tarball (and the `.deb`'s preinst and `.rpm`'s `%pre`, as `nerva package:`) prints `error[NRV-E11xx]: install.sh: <what>`, a `cause`
-and a `fix`, changes nothing, and exits 1 (your input) or 2 (the machine).
+`install.sh` in the Linux release tarball prints `error[NRV-E11xx]: install.sh: <what>`; the
+`.deb`'s preinst and the `.rpm`'s `%pre` print `error[NRV-E11xx]: nerva package: <what>`. Each is
+followed by a `cause` and a `fix` line, changes nothing, and exits 1 (your input) or 2 (the machine).
 
 ```
 error[NRV-E1101]: install.sh: must run as root

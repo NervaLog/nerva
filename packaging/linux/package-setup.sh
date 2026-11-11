@@ -9,7 +9,9 @@
 # NRV-E1111, both before the package's files are unpacked. The NRV-E1111 check runs on a first
 # install only (dpkg `install`, with or without an old version; rpm `1`): on an upgrade, a file
 # there is the operator's own (`systemctl edit --full`, a source-built binary), not a tarball
-# install (#319). The text never uses a percent sign: the .rpm embeds it in its spec.
+# install (#319). On an upgrade a /usr/local/bin/nerva left behind still shadows the package's
+# binary, so the script warns about it (NRV-W1101) and goes on. The text never uses a percent sign:
+# the .rpm embeds it in its spec.
 set -eu
 
 # dpkg calls the preinst with `install`, `upgrade` or `abort-upgrade`; rpm passes a count.
@@ -38,7 +40,7 @@ refuse() { # <headline> <fix>
 # A file install.sh would make, or one that overrides the package's, shadows the package's:
 # /usr/local/bin comes before /usr/bin on the PATH and /etc/systemd/system overrides
 # /usr/lib/systemd/system. It is a tarball install's, a source build's or a full unit override.
-# install.sh refuses the reverse the same way.
+# install.sh does not look for the package's /usr/bin/nerva (#292), so nothing refuses the reverse.
 if [ "$first_install" = yes ]; then
     for left in /usr/local/bin/nerva /etc/systemd/system/nerva@.service /etc/systemd/system/nerva-api@.service; do
         if [ -e "$left" ]; then
@@ -48,6 +50,12 @@ if [ "$first_install" = yes ]; then
             exit 1
         fi
     done
+elif [ -e /usr/local/bin/nerva ]; then
+    # An upgrade is not refused (#319), but the file still comes first on the PATH, and both units
+    # run a bare nerva, so the replicas would keep running it instead of the package's new binary.
+    echo "warning[NRV-W1101]: nerva package: /usr/local/bin/nerva exists and shadows this package's /usr/bin/nerva" >&2
+    echo "  cause  /usr/local/bin comes before /usr/bin on the path, and the units run nerva by name, so the replicas run that file and not the package's new nerva" >&2
+    echo "  fix    if it is a tarball install, run install.sh --uninstall from the tarball (it keeps /var/lib/nerva, /etc/nerva and the user); otherwise move or remove the file; then restart the replicas" >&2
 fi
 
 if getent passwd "$user" > /dev/null 2>&1; then

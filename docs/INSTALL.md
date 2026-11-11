@@ -163,7 +163,9 @@ A package refuses to install, before it unpacks anything, when:
 - on a first install, `/usr/local/bin/nerva` or a unit in `/etc/systemd/system` exists and would
   shadow the package's (NRV-E1111). If it is a tarball install, run `sudo ./install.sh --uninstall`
   from the tarball first; it keeps your data, your settings and the user. Otherwise move or remove
-  the file. An upgrade is not checked. See [TROUBLESHOOTING.md](./TROUBLESHOOTING.md#the-installer-refused).
+  the file. An upgrade is not refused, but if `/usr/local/bin/nerva` is still there, the preinst warns
+  (NRV-W1101) that it shadows the package's binary and the replicas keep running it. See
+  [TROUBLESHOOTING.md](./TROUBLESHOOTING.md#the-installer-refused).
 
 What differs from the tarball when you follow [QUICKSTART.md](./QUICKSTART.md#three-hosts): the
 examples are in `/usr/share/nerva`, not `/etc/nerva`, and the binary is `/usr/bin/nerva`, not

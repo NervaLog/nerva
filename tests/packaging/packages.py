@@ -158,8 +158,10 @@ def check_setup_modes(repo, tmp):
     os.makedirs(f"{root}/bin")
     os.makedirs(f"{root}/etc/systemd/system")
     text = read(f"{repo}/packaging/linux/package-setup.sh").decode()
-    for path in ("/usr/local/bin/nerva", "/etc/systemd/system/"):
+    for path in ("/usr/local/bin", "/etc/systemd/system"):
         text = text.replace(path, root + path)
+    # A path added to the script later and not moved here would be checked on the host itself.
+    assert not re.findall(r"(?<!modes)/(?:usr/local|etc/systemd)", text), "a host path is not moved"
     with open(f"{root}/setup.sh", "w") as out:
         out.write(text)
     for tool in ("getent", "useradd", "install", "id"):
@@ -179,7 +181,20 @@ def check_setup_modes(repo, tmp):
     for args in (["install"], ["upgrade", "0.7.0-1"], ["1"], ["2"]):
         result = run(["sh", f"{root}/setup.sh", *args], check=False, env=env)
         assert result.returncode == 0, (args, result.stderr)
-    print("  NRV-E1111 is checked on a first install (install, rpm 1) and not on an upgrade (upgrade, rpm 2)")
+        assert "NRV-W1101" not in result.stderr, (args, result.stderr)
+    binary = f"{root}/usr/local/bin/nerva"
+    os.makedirs(os.path.dirname(binary))
+    open(binary, "w").close()
+    for args, first in ((["install"], True), (["upgrade", "0.7.0-1"], False), (["2"], False),
+                        (["10"], False)):
+        result = run(["sh", f"{root}/setup.sh", *args], check=False, env=env)
+        assert result.returncode == (1 if first else 0), (args, result.returncode, result.stderr)
+        assert ("NRV-W1101" in result.stderr) == (not first), (args, result.stderr)
+        if not first:
+            assert result.stderr.startswith("warning[NRV-W1101]: nerva package: "), result.stderr
+            assert "\n  cause  " in result.stderr and "\n  fix    " in result.stderr, result.stderr
+    print("  NRV-E1111 is checked on a first install (install, rpm 1); an upgrade (upgrade, rpm 2) "
+          "warns NRV-W1101 about /usr/local/bin/nerva and goes on")
 
 
 def check_reproducible(first, second):
@@ -378,12 +393,13 @@ check_state
 echo "reinstall kept the data, the settings, the user and the enabled replica"
 mkdir -p /etc/systemd/system
 touch /etc/systemd/system/nerva@.service /usr/local/bin/nerva
-apt-get install -y -qq --no-install-recommends /tmp/@PKG2@ > /dev/null
-rm /etc/systemd/system/nerva@.service /usr/local/bin/nerva
+apt-get install -y -qq --no-install-recommends /tmp/@PKG2@ > /tmp/upgrade.out 2>&1
+grep -q 'warning.NRV-W1101.: nerva package: /usr/local/bin/nerva exists' /tmp/upgrade.out
 [ "$(dpkg-query -W -f='${Version}' nerva)" = "@VERSION2@-1" ]
 check_state
 apt-get install -y -qq --allow-downgrades --no-install-recommends /tmp/@PKG@ > /dev/null
 [ "$(dpkg-query -W -f='${Version}' nerva)" = "@VERSION@-1" ]
+rm /etc/systemd/system/nerva@.service /usr/local/bin/nerva
 check_state
 echo "upgrade to @VERSION2@ and downgrade back kept the data, the settings, the user and the enabled replica"
 dpkg --verify nerva
@@ -433,12 +449,13 @@ check_state
 echo "reinstall kept the data, the settings, the user and the enabled replica"
 mkdir -p /etc/systemd/system
 touch /etc/systemd/system/nerva@.service /usr/local/bin/nerva
-dnf install -y -q --setopt=install_weak_deps=False /tmp/@PKG2@ > /dev/null
-rm /etc/systemd/system/nerva@.service /usr/local/bin/nerva
+dnf install -y -q --setopt=install_weak_deps=False /tmp/@PKG2@ > /tmp/upgrade.out 2>&1
+grep -q 'warning.NRV-W1101.: nerva package: /usr/local/bin/nerva exists' /tmp/upgrade.out
 [ "$(rpm -q --qf '%{VERSION}' nerva)" = "@VERSION2@" ]
 check_state
 rpm -U --oldpackage --nosignature /tmp/@PKG@
 [ "$(rpm -q --qf '%{VERSION}' nerva)" = "@VERSION@" ]
+rm /etc/systemd/system/nerva@.service /usr/local/bin/nerva
 check_state
 echo "upgrade to @VERSION2@ and downgrade back kept the data, the settings, the user and the enabled replica"
 rpm -V nerva
@@ -580,6 +597,8 @@ def main():
     try:
         print(f"rpmbuild: {run(['rpmbuild', '--version']).stdout.strip()}; "
               f"{run(['dpkg-deb', '--version']).stdout.split(chr(10))[0]}")
+        print("0. the package script's first-install and upgrade modes (no build needed)")
+        check_setup_modes(repo, tmp)
         print("1. built twice, the bytes equal")
         first = build(repo, binaries, version, f"{tmp}/a", epoch)
         second = build(repo, binaries, version, f"{tmp}/b", epoch, reproducibility_probe=True)
@@ -592,7 +611,6 @@ def main():
         print("4. a binary for another architecture is refused")
         check_refusals(repo, binaries, version, tmp)
         check_prerelease(repo, binaries, tmp, epoch)
-        check_setup_modes(repo, tmp)
         if not args.no_containers:
             print("5. installed in containers")
             # The next patch version, from the same binary: what an upgrade installs over this one.
