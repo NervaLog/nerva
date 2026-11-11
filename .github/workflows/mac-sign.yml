@@ -7,8 +7,9 @@
 # The owner approves every run; the environment's secrets reach only the "Create the signing
 # keychain" step, which hands them to mac_keychain.sh (slice A1) and nothing else. That script and
 # release_check.sh are fetched from the workflow's own ref ($GITHUB_SHA, main for an approved run),
-# never from the draft's target. The target's `zig build` still runs with the keychain unlocked:
-# approving a prerelease approves that commit's build.zig (P343).
+# never from the draft's target. The target's `zig build` still runs with the keychain unlocked, so
+# release_check.sh mac-draft refuses a target that is not main, or main plus a change to VERSION and
+# CHANGELOG.md only (P343): the code that runs there is main's.
 # mac-release then reads the keychain, never a secret. The signed commit is the one the draft
 # targets, never the workflow's ref; the draft is checked before any secret is unlocked
 # (release_check.sh mac-draft: NRV-E1119, NRV-E1120, NRV-E1122, NRV-E1123, NRV-E1124) and again before the upload. A
@@ -54,7 +55,7 @@ jobs:
           set -eu
           # The code that sees the secrets or judges the draft comes from the workflow's own ref
           # (main: the environment's deployment rule), never from the draft's target, which for a
-          # prerelease can be any commit. Fetch both scripts from $GITHUB_SHA into $RUNNER_TEMP/wf;
+          # prerelease could be any commit. Fetch both scripts from $GITHUB_SHA into $RUNNER_TEMP/wf;
           # the target is checked out after, and its copies of them are never run.
           mkdir "$RUNNER_TEMP/wf"
           for f in release_check.sh mac_keychain.sh; do
