@@ -156,12 +156,14 @@ pub const Keys = struct {
     pub fn invalid(current: []const u8, next: ?[]const u8) ?[]const u8 {
         if (current.len == 0) return "set NERVA_KEY";
         if (std.mem.eql(u8, current, placeholder_key)) {
-            return "NERVA_KEY is the example's placeholder: make a key with openssl rand -hex 32";
+            return "NERVA_KEY is the example's placeholder: " ++
+                "make a key with openssl rand -hex 32";
         }
         const key_next = next orelse return null;
         if (key_next.len == 0) return "NERVA_KEY_NEXT is set but empty";
         if (std.mem.eql(u8, key_next, placeholder_key)) {
-            return "NERVA_KEY_NEXT is the example's placeholder: make a key with openssl rand -hex 32";
+            return "NERVA_KEY_NEXT is the example's placeholder: " ++
+                "make a key with openssl rand -hex 32";
         }
         if (std.mem.eql(u8, current, key_next)) return "NERVA_KEY_NEXT equals NERVA_KEY";
         return null;
@@ -974,8 +976,22 @@ test "Keys.invalid" {
         Keys.invalid("same-key", "same-key").?,
     );
     // #306: the example's published placeholder is refused, as current or as next.
-    try testing.expect(Keys.invalid(placeholder_key, null) != null);
-    try testing.expect(Keys.invalid("current-key", placeholder_key) != null);
+    try testing.expectEqualStrings(
+        "NERVA_KEY is the example's placeholder: make a key with openssl rand -hex 32",
+        Keys.invalid(placeholder_key, null).?,
+    );
+    try testing.expectEqualStrings(
+        "NERVA_KEY_NEXT is the example's placeholder: make a key with openssl rand -hex 32",
+        Keys.invalid("current-key", placeholder_key).?,
+    );
+    // No message names a key.
+    for ([_]?[]const u8{
+        Keys.invalid(placeholder_key, null),
+        Keys.invalid("current-key", placeholder_key),
+    }) |message| {
+        try testing.expect(std.mem.indexOf(u8, message.?, placeholder_key) == null);
+        try testing.expect(std.mem.indexOf(u8, message.?, "current-key") == null);
+    }
 }
 
 fn test_connect(receiver: *const Receiver) !std.net.Stream {

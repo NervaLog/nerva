@@ -862,7 +862,8 @@ gateways can reach.
 To rotate a gateway key without downtime: restart every gateway with the new key as
 `NERVA_KEY_NEXT` (it accepts both); move every caller to the new key; then restart every gateway
 with the new key as `NERVA_KEY` and no `NERVA_KEY_NEXT`. Each set key must be non-empty, and the
-two must differ; a gateway refuses to start otherwise, without printing either key (P96).
+two must differ, and neither may be the placeholder `api.env.example` ships; a gateway refuses to
+start otherwise, without printing either key (P96).
 
 ## Demos
 

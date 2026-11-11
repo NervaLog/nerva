@@ -51,7 +51,8 @@ pub const Keys = struct {
         if (current.len == 0) return "set NERVA_CLUSTER_KEY (at least 32 bytes)";
         if (current.len < key_length_min) return "NERVA_CLUSTER_KEY is shorter than 32 bytes";
         if (std.mem.eql(u8, current, placeholder_key)) {
-            return "NERVA_CLUSTER_KEY is the example's placeholder: make a key with openssl rand -hex 32";
+            return "NERVA_CLUSTER_KEY is the example's placeholder: " ++
+                "make a key with openssl rand -hex 32";
         }
         if (next) |key_next| {
             if (key_next.len == 0) return "NERVA_CLUSTER_KEY_NEXT is set but empty";
@@ -59,7 +60,8 @@ pub const Keys = struct {
                 return "NERVA_CLUSTER_KEY_NEXT is shorter than 32 bytes";
             }
             if (std.mem.eql(u8, key_next, placeholder_key)) {
-                return "NERVA_CLUSTER_KEY_NEXT is the example's placeholder: make a key with openssl rand -hex 32";
+                return "NERVA_CLUSTER_KEY_NEXT is the example's placeholder: " ++
+                    "make a key with openssl rand -hex 32";
             }
             if (std.mem.eql(u8, key_next, current)) {
                 return "NERVA_CLUSTER_KEY_NEXT equals NERVA_CLUSTER_KEY";
@@ -291,14 +293,22 @@ test "peer_auth: Keys.invalid" {
 
     // #306: the example's published placeholder is refused, as current or as next, and a
     // refusal is not a fallback to the development key.
-    try testing.expect(Keys.invalid(placeholder_key, null) != null);
-    try testing.expect(Keys.invalid(key_a, placeholder_key) != null);
+    try testing.expectEqualStrings(
+        "NERVA_CLUSTER_KEY is the example's placeholder: make a key with openssl rand -hex 32",
+        Keys.invalid(placeholder_key, null).?,
+    );
+    try testing.expectEqualStrings(
+        "NERVA_CLUSTER_KEY_NEXT is the example's placeholder: make a key with openssl rand -hex 32",
+        Keys.invalid(key_a, placeholder_key).?,
+    );
 
     // No message names a key.
     const messages = [_]?[]const u8{
         Keys.invalid(key_a[1..], null),
         Keys.invalid(key_a, key_b[1..]),
         Keys.invalid(key_a, key_a),
+        Keys.invalid(placeholder_key, null),
+        Keys.invalid(key_a, placeholder_key),
     };
     for (messages) |message| {
         try testing.expect(std.mem.indexOf(u8, message.?, "aaaa") == null);

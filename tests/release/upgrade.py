@@ -408,6 +408,7 @@ def run(nerva, args, **options):
 
 
 def main():
+    os.umask(0o022)  # #302: the mode asserted below must not come from the caller's umask
     nerva, nerva_other = sys.argv[1], sys.argv[2]
     tmp = tempfile.mkdtemp(prefix="nerva-upgrade-")
     old = new = None
