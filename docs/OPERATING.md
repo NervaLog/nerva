@@ -195,7 +195,7 @@ client session (the backup) and some reads.
    declared:
 
    ```bash
-   curl -H 'X-Nerva-Key: secret' http://127.0.0.1:8081/v1/views/by_section
+   curl -H "X-Nerva-Key: $NERVA_KEY" http://127.0.0.1:8081/v1/views/by_section
    ```
 
    Compare its `view_hash` and `groups` with the **manifest's** (and a ledger's total with

@@ -184,7 +184,7 @@ without a key.
 ### Start the JSON gateway
 
 ```bash
-export NERVA_KEY=secret
+export NERVA_KEY=$(openssl rand -hex 32)
 $NERVA api --cluster=1 --addresses=3001 --listen=127.0.0.1:8080 > api.log 2>&1 &
 
 curl http://127.0.0.1:8080/healthz
@@ -197,7 +197,7 @@ one in `NERVA_KEY_NEXT` as well (it then accepts either), move clients to it, an
 with it as `NERVA_KEY` alone. Define a short helper for the rest of the tutorial:
 
 ```bash
-n() { curl -s -H 'X-Nerva-Key: secret' "$@"; echo; }
+n() { curl -s -H "X-Nerva-Key: $NERVA_KEY" "$@"; echo; }
 A=http://127.0.0.1:8080
 ```
 
