@@ -132,9 +132,12 @@ is not in yet.
   `bank` valid, kill and partition nemeses, with its link).
 - **Two adversarial reviews** (P147b): **TO FILL** (each reviewer's verdict, and its
   `release-review` issues).
-- **macOS:** **TO FILL** (the `mac-verify` run on the published v0.7.1: the signed, notarized
-  zip on Apple silicon and on Intel, its Developer ID and hardened runtime, the smoke test and
-  `brew test nerva`, with its link).
+- **macOS:** the owner builds, signs and notarizes the zip on a Mac and uploads it to the draft
+  release. The `mac-verify` workflow then checks it on Apple silicon and on Intel: the zip against
+  its checksum, the binary's version and commit, its Developer ID signature, hardened runtime and
+  secure timestamp, and the smoke test; it is run on the draft before publishing, and once the
+  release is published its run also does `brew install nervalog/tap/nerva && brew test nerva`.
+  Those runs are listed under Actions, "Mac verify", for tag v0.7.1.
 - **Mixed releases** (P275): a v0.7.0 cluster with a v0.7.1 gateway, a rolling upgrade, a
   v0.7.0 gateway on v0.7.1 replicas, and a rollback, run by hand
   ([the audit](https://github.com/NervaLog/nerva/blob/main/docs/releases/v0.7.1-audit.md)).
