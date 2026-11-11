@@ -935,11 +935,16 @@ test "an emitter whose collector is not listening drops and counts, and never pa
     defer emitter.deinit();
     var counters: Counters = .{};
     var timings = OperationTimings.initFill(.{});
-    // The first packet leaves; the ICMP error it draws makes the next sends fail with
-    // `ConnectionRefused`, which `posix.send` would have turned into a panic.
-    for (0..5) |_| {
+    // The first packet leaves; the ICMP error it draws makes later sends fail with
+    // `ConnectionRefused`, which `posix.send` would have turned into a panic. The error arrives
+    // asynchronously (on macOS, after several sends have already succeeded), so tick until the
+    // first drop, bounded, instead of assuming it shows within a fixed number of sends.
+    const ticks_max = 200;
+    for (0..ticks_max) |_| {
         counters.replied(.commit, 200, false);
         emitter.tick(&counters, &timings, test_observed);
+        if (emitter.dropped > 0) break;
+        std.Thread.sleep(5 * std.time.ns_per_ms);
     }
     try testing.expect(emitter.dropped > 0);
     // Nothing reached a collector, so no report was marked reported.
