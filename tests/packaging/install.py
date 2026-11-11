@@ -69,10 +69,12 @@ def sha256(path):
     return sh(["sha256sum", path]).stdout.split()[0]
 
 
-def snapshot():
-    """Every path the installer owns or may touch, with what a change would alter."""
+def snapshot(data=True):
+    """Every path the installer owns or may touch, with what a change would alter.
+
+    `data=False` leaves out DATA: running replicas write there, so its mtimes move on their own."""
     seen = {}
-    roots = [BIN] + [f"{UNIT_DIR}/{u}" for u in UNITS] + [ETC, DATA]
+    roots = [BIN] + [f"{UNIT_DIR}/{u}" for u in UNITS] + [ETC] + ([DATA] if data else [])
     for root in roots:
         for base, dirs, files in os.walk(root) if os.path.isdir(root) else [(None, [], [])]:
             for name in dirs + files:
@@ -384,13 +386,15 @@ def test_refusals(packaging, nerva, tmp, stage):
 def test_upgrade_while_running(packaging, nerva, tmp, stage):
     """Replicas and the gateway are running: --upgrade of another nerva is refused, and changes nothing."""
     other = stage_tarball(packaging, nerva, tmp, "other-running", extra=b"\0")
-    before = snapshot()
+    before = snapshot(data=False)
     for args in ([ "--upgrade"], ["--upgrade", "--dry-run"]):
         result = installer(other, *args, expect=1)
         refused(result, 1, "NRV-E1118", "install.sh found a replica or gateway unit running, "
                 "and would replace the nerva it executes")
         assert "nerva@0.service" in result.stderr and "nerva-api@0.service" in result.stderr, result.stderr
-    assert snapshot() == before and sha256(BIN) == sha256(f"{stage}/nerva")
+    after = snapshot(data=False)
+    assert after == before, [k for k in set(before) | set(after) if before.get(k) != after.get(k)]
+    assert sha256(BIN) == sha256(f"{stage}/nerva"), "the running nerva was replaced"
     # The same nerva is no replacement: nothing to refuse.
     assert "installed:" in installer(stage, "--upgrade").stdout
     # A systemctl that cannot list the units: the check cannot tell, so it refuses (exit 2).
