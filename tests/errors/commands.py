@@ -143,13 +143,18 @@ def main():
         check("unknown version flag", ["version", "--bogus"], "NRV-E0001", 1, "--bogus")
         # #300: the fix line of a flag refusal names a command that works. `nerva --help` is the
         # only help there is; `nerva <command> --help` is refused, so no hint may name it.
-        for label, argv in (("E0001", ["format", "--bogus=1"]), ("E0002", [
-                "api", "--cluster=0", "--addresses=127.0.0.1:1", "--listen=127.0.0.1:0",
-                "--request-timeout=1"])):
+        hint = "run nerva --help, which lists every command and the flags it takes"
+        for label, argv, fix_line in (
+                ("E0001", ["format", "--bogus=1"], "  fix    " + hint),
+                ("E0002", ["api", "--cluster=0", "--addresses=127.0.0.1:1",
+                           "--listen=127.0.0.1:0", "--request-timeout=1"],
+                 "  fix    the message names the bound; " + hint)):
             refused = run(nerva, argv, {"NERVA_KEY": KEY})
             fix = [line for line in refused.stderr.splitlines() if line.startswith("  fix    ")]
-            assert len(fix) == 1 and "nerva --help" in fix[0] and "<command>" not in fix[0], \
-                (label, refused.stderr)
+            assert fix == [fix_line], (label, refused.stderr)
+        # The premise (P338): per-command help does not exist. The day it does, this fails and
+        # points at the hint.
+        check("command help refused", ["start", "--help"], "NRV-E0001", 1, "--help")
         helped = run(nerva, ["--help"])
         assert helped.returncode == 0, helped.stderr
         for command in ("format", "start", "view", "api", "export", "import", "backup",

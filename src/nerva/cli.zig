@@ -402,6 +402,8 @@ pub const Command = union(enum) {
 /// parser answers `-h`/`--help` for the top level alone, and refuses `nerva <command> --help` as
 /// an unexpected argument, so no hint may send anyone there.
 pub const help_hint = "run nerva --help, which lists every command and the flags it takes";
+/// NRV-E0002's fix line: the message already names the bound (docs/ERRORS.md), then the help.
+pub const range_hint = "the message names the bound; " ++ help_hint;
 
 /// The vendored flag parser's failures (unknown or repeated flag, missing or malformed value,
 /// unexpected argument) as NRV-E0001, through `stdx.Flags.fatal_hook`.
@@ -539,7 +541,7 @@ fn flag_range(comptime command: []const u8, err: Error) noreturn {
         "NRV-E0002",
         command ++ ": {s}",
         .{error_message(err)},
-        help_hint,
+        range_hint,
         .{},
     );
 }
@@ -572,13 +574,22 @@ pub fn listen_is_loopback(address: std.net.Address) bool {
 
 const loopback_ipv6 = [_]u8{0} ** 15 ++ [_]u8{1};
 
-test "the flag hints name only a command that exists (#300)" {
-    // `nerva <command> --help` is refused by the flag parser, so a hint must not name it.
-    try std.testing.expect(std.mem.indexOf(u8, help_hint, "<command>") == null);
-    try std.testing.expectEqualStrings(
-        "run nerva --help, which lists every command and the flags it takes",
-        help_hint,
-    );
+// The call sites pass `help_hint` and `range_hint` to `diag.fail`, which exits the process, so
+// only `tests/errors/commands.py` (test:integration) catches a call site that bypasses them. This
+// test renders the blocks the hints produce.
+test "the flag refusals' rendered fix lines name only a command that exists (#300)" {
+    var buffer: [diag.block_size_max]u8 = undefined;
+    inline for (.{
+        .{ "NRV-E0001", help_hint },
+        .{ "NRV-E0002", range_hint },
+    }) |case| {
+        var stream = std.io.fixedBufferStream(&buffer);
+        try diag.render(stream.writer(), case[0], "format: {s}", .{"x"}, case[1], .{});
+        const block = stream.getWritten();
+        // `nerva <command> --help` is refused by the flag parser, so a hint must not name it.
+        try std.testing.expect(std.mem.indexOf(u8, block, "<command>") == null);
+        try std.testing.expect(std.mem.indexOf(u8, block, "nerva --help") != null);
+    }
     // The command the hint names is the one the usage text documents.
     try std.testing.expect(std.mem.indexOf(u8, CLIArgs.help, "nerva [-h | --help]") != null);
 }
