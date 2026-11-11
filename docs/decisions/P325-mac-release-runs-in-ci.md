@@ -24,6 +24,6 @@ owner's Mac is the Developer ID signature, the hardened runtime and the notariza
 would have been the owner's on release day, with a command the step refuses.
 
 **Cost.** About a minute more on the macOS job, a second build of both thin binaries
-(cached). Nothing under `src/` or `build.zig` changes. The step writes `zig-out/mac-release` inside
+(cached). `src/nerva/mac_release.zig` changes (#328: its paths were relative; the owner approved it in writing): release tooling that `build.zig` runs, not compiled into the `nerva` binary. `build.zig` does not change. The step writes `zig-out/mac-release` inside
 the checkout (git ignores it); the output directory is fixed by `build.zig`, so it was not moved
 outside.
