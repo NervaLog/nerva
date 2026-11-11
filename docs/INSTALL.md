@@ -8,7 +8,7 @@ built but not published: check the release page for what it actually lists. Noth
 signed by a Linux key; what is signed or checked is said under each heading.
 
 Nerva is for development and evaluation on macOS, and for production on Linux (x86_64 with AES, or
-aarch64). It is a research database: see the [README](../README.md) for what that promises.
+aarch64). Nerva is alpha: see [MATURITY.md](./MATURITY.md) for what that promises.
 
 **Where the outputs come from.** Every output on this page and in [QUICKSTART.md](./QUICKSTART.md)
 was recorded from a build of `main` at commit `4ddd232` on Linux x86_64 (the candidate's
@@ -183,8 +183,8 @@ git clone https://github.com/NervaLog/nerva.git && cd nerva
 ```
 
 A build from a checkout prints `+<commit>` after the protocol release. `./zig/zig build test`
-runs the unit tests and the format check; Linux needs io_uring, and the unit tests do not build
-on a Mac.
+runs the unit tests and the format check. The unit tests build and run on macOS (Apple silicon in
+CI); Linux needs io_uring.
 
 ## Checking a download
 

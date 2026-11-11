@@ -43,7 +43,8 @@ takes you from a download to three replicas, a gateway and a first commit.
   commented settings examples beside the binary. `sudo ./install.sh` installs the binary in
   `/usr/local/bin`, creates the `nerva` user, `/var/lib/nerva` and `/etc/nerva`, and installs the
   units. It formats, enables and starts nothing; `--dry-run` says what it would do. A refusal is
-  one coded line, NRV-E1101 to NRV-E1111.
+  one coded block (headline, cause, fix), NRV-E1101 to NRV-E1109; the packages refuse with
+  NRV-E1105 or NRV-E1111.
 - **Linux packages, new:** `nerva_0.7.1-1_amd64.deb`, `nerva_0.7.1-1_arm64.deb`,
   `nerva-0.7.1-1.x86_64.rpm` and `nerva-0.7.1-1.aarch64.rpm`, with the same binary, units and
   examples (the examples in `/usr/share/nerva`). **They are not signed** and there is no apt or
@@ -132,9 +133,12 @@ is not in yet.
   `bank` valid, kill and partition nemeses, with its link).
 - **Two adversarial reviews** (P147b): **TO FILL** (each reviewer's verdict, and its
   `release-review` issues).
-- **macOS:** **TO FILL** (the `mac-verify` run on the published v0.7.1: the signed, notarized
-  zip on Apple silicon and on Intel, its Developer ID and hardened runtime, the smoke test and
-  `brew test nerva`, with its link).
+- **macOS:** the owner builds, signs and notarizes the zip on a Mac and uploads it to the draft
+  release. The `mac-verify` workflow then checks it on Apple silicon and on Intel: the zip against
+  its checksum, the binary's version and commit, its Developer ID signature, hardened runtime and
+  secure timestamp, and the smoke test; it is run on the draft before publishing, and once the
+  release is published its run also does `brew install nervalog/tap/nerva && brew test nerva`.
+  Those runs are listed under Actions, "Mac verify", for tag v0.7.1.
 - **Mixed releases** (P275): a v0.7.0 cluster with a v0.7.1 gateway, a rolling upgrade, a
   v0.7.0 gateway on v0.7.1 replicas, and a rollback, run by hand
   ([the audit](https://github.com/NervaLog/nerva/blob/main/docs/releases/v0.7.1-audit.md)).

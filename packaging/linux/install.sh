@@ -244,7 +244,7 @@ echo "installed: $("$bin_dir/nerva" version | head -n1)"
 cat << NEXT
 
 Nothing is formatted, enabled or started. Next, for replica 0 of three (docs/QUICKSTART.md):
-  1. cp /etc/nerva/replica.env.example /etc/nerva/replica-0.env   # then set the addresses and key
+  1. install -m 0600 -o root -g root /etc/nerva/replica.env.example /etc/nerva/replica-0.env   # then set the addresses and key
   2. runuser -u nerva -- $bin_dir/nerva format --cluster=1 --replica=0 --replica-count=3 /var/lib/nerva/0.nerva
   3. systemctl enable --now nerva@0
 NEXT

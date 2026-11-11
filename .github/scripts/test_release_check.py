@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for release_check.sh (NRV-E1112 to NRV-E1116). Run from the repository root:
+"""Tests for release_check.sh (NRV-E1112 to NRV-E1116) and release_notes.sh (NRV-E1117). Run from the repository root:
 python3 .github/scripts/test_release_check.py
 
 A stand-in `nerva` and a stand-in `gh` (a script that answers from files) stand for the real two."""
@@ -127,6 +127,41 @@ class ReleaseCheck(unittest.TestCase):
             fake_gh(d, False, [], ["a.tar.gz", "nerva_0.7.1_rc.1-1_amd64.deb"])
             self.refused(run("assets", "v0.7.1-rc.1", dist, path_dir=d), "NRV-E1115",
                          "does not hold the assets that were built")
+
+
+NOTES = ROOT / ".github/scripts/release_notes.sh"
+
+
+def notes(changelog):
+    """Runs release_notes.sh v0.7.1 in a scratch directory holding `changelog` as CHANGELOG.md."""
+    with tempfile.TemporaryDirectory() as d:
+        Path(d, "CHANGELOG.md").write_text(changelog)
+        return subprocess.run([str(NOTES), "v0.7.1"], cwd=d, capture_output=True, text=True)
+
+
+class ReleaseNotes(unittest.TestCase):
+    def test_a_clean_section_passes(self):
+        result = notes("## v0.7.2 - next\n\nx\n\n## v0.7.1 \u2014 2026-11-12\n\nShipped.\n\n## v0.7.0 \u2014 d\n\nTO FILL\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "Shipped.\n")
+
+    def test_a_placeholder_is_refused(self):
+        result = notes("## v0.7.1 \u2014 2026-11-12\n\n- Jepsen: **TO FILL**\n")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("error[NRV-E1117]: release.yml: the CHANGELOG.md notes for v0.7.1 still hold a TO FILL placeholder", result.stderr)
+        self.assertIn("\n  cause  ", result.stderr)
+        self.assertIn("\n  fix    ", result.stderr)
+        self.assertIn("::error::NRV-E1117", result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_a_placeholder_in_another_section_is_not_this_ones(self):
+        self.assertEqual(notes("## v0.7.1 \u2014 d\n\nok\n\n## v0.7.0 \u2014 d\n\nTO FILL\n").returncode, 0)
+
+    def test_a_missing_or_empty_section_is_refused(self):
+        for text in ("## v0.7.0 \u2014 d\n\nx\n", "## v0.7.1 \u2014 d\n\n\n## v0.7.0 \u2014 d\n\nx\n"):
+            result = notes(text)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("has no notes for v0.7.1", result.stderr)
 
 
 if __name__ == "__main__":
