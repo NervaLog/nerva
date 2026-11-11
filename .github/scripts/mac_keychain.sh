@@ -13,7 +13,11 @@
 # anything is touched. It makes a keychain with a random password, imports the identity, puts the
 # keychain first in the user search list and makes it the default (`mac-release` passes no
 # `--keychain` to security, codesign or notarytool), and stores a notary profile `nerva-notary`.
-# It prints the identities (exactly one valid one is required) and no secret.
+# It prints the identities (exactly one valid one is required) and no secret. `security import -P`
+# has no stdin form, so the .p12 password (and the random keychain password) are in `security`'s
+# argv for a moment, where other processes of the runner's VM can read them: on a hosted runner
+# those are this job's own.
+# Every failure is NRV-E1121 with a headline, a cause and a fix (docs/ERRORS.md).
 #
 # `--skip-notary` is for ci.yml's `mac-keychain` job only: a self-signed test certificate, no
 # notary profile, and any code-signing identity (not only a trusted one) is accepted.
@@ -22,6 +26,8 @@ set -euo pipefail
 kc="${RUNNER_TEMP:?RUNNER_TEMP is not set: this script runs on a GitHub Actions runner}/nerva-signing.keychain-db"
 saved_default="$RUNNER_TEMP/nerva-signing.default-keychain"
 saved_list="$RUNNER_TEMP/nerva-signing.keychain-list"
+p12="$RUNNER_TEMP/nerva-id.p12"
+p8="$RUNNER_TEMP/nerva-notary.p8"
 
 refuse() {
   printf 'error[NRV-E1121]: mac_keychain.sh: %s\n  cause  %s\n  fix    %s\n' "$1" "$2" "$3" >&2
@@ -55,7 +61,8 @@ create() {
   done
 
   umask 077
-  local p12="$RUNNER_TEMP/nerva-id.p12" p8="$RUNNER_TEMP/nerva-notary.p8"
+  # The secret files go on every path, refusals and errors included (they are globals: the trap
+  # fires after create has returned).
   trap 'rm -f "$p12" "$p8"' EXIT
 
   local pw
@@ -65,9 +72,13 @@ create() {
   security default-keychain -d user | sed -e 's/^[[:space:]]*"//' -e 's/"$//' > "$saved_default"
 
   security create-keychain -p "$pw" "$kc"
-  security set-keychain-settings -lut 3600 "$kc"
+  security set-keychain-settings -lu "$kc"
   security unlock-keychain -p "$pw" "$kc"
-  printf '%s' "$APPLE_DEVELOPER_ID_P12" | base64 --decode > "$p12"
+  if ! printf '%s' "$APPLE_DEVELOPER_ID_P12" | base64 --decode > "$p12" 2> /dev/null; then
+    refuse "the signing secret APPLE_DEVELOPER_ID_P12 is not base64" \
+      "it holds something other than the base64 of the .p12 file" \
+      "set it from 'base64 < developer-id.p12' (one line, no quotes) in the environment apple-signing"
+  fi
   if ! security import "$p12" -k "$kc" -f pkcs12 -P "$APPLE_DEVELOPER_ID_P12_PASSWORD" \
     -T /usr/bin/codesign > /dev/null; then
     refuse "the keychain could not import APPLE_DEVELOPER_ID_P12" \
@@ -76,7 +87,11 @@ create() {
   fi
   rm -f "$p12"
   # Without this, codesign fails with errSecInternalComponent: there is no UI to allow it.
-  security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$pw" "$kc" > /dev/null
+  if ! security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$pw" "$kc" > /dev/null 2>&1; then
+    refuse "the keychain's signing key could not be opened for codesign" \
+      "the .p12 holds no private key, so codesign would fail with errSecInternalComponent" \
+      "export the certificate together with its private key (the owner's setup checklist)"
+  fi
 
   # Search list and default keychain: mac-release passes no --keychain to anything it runs.
   local list=("$kc") line
@@ -87,9 +102,19 @@ create() {
   security default-keychain -d user -s "$kc"
 
   if [[ $skip_notary == 0 ]]; then
-    printf '%s' "$APPLE_NOTARY_KEY_P8" | base64 --decode > "$p8"
-    xcrun notarytool store-credentials nerva-notary --key "$p8" \
-      --key-id "$APPLE_NOTARY_KEY_ID" --issuer "$APPLE_NOTARY_ISSUER_ID" --keychain "$kc" > /dev/null
+    if ! printf '%s' "$APPLE_NOTARY_KEY_P8" | base64 --decode > "$p8" 2> /dev/null; then
+      refuse "the signing secret APPLE_NOTARY_KEY_P8 is not base64" \
+        "it holds something other than the base64 of AuthKey_<id>.p8" \
+        "set it from 'base64 < AuthKey_<id>.p8' (one line, no quotes) in the environment apple-signing"
+    fi
+    local stored
+    if ! stored=$(xcrun notarytool store-credentials nerva-notary --key "$p8" \
+      --key-id "$APPLE_NOTARY_KEY_ID" --issuer "$APPLE_NOTARY_ISSUER_ID" --keychain "$kc" 2>&1); then
+      printf 'notarytool: %s\n' "$stored" >&2
+      refuse "the notary profile could not be stored" \
+        "Apple refused the key (a wrong APPLE_NOTARY_KEY_ID or APPLE_NOTARY_ISSUER_ID, a revoked or mistyped .p8) or its service is unreachable" \
+        "check the three notary secrets against App Store Connect (Users and Access, Integrations), then run again"
+    fi
     rm -f "$p8"
   fi
 
