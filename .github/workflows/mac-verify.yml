@@ -1,30 +1,39 @@
-# Checks the macOS zip the owner uploaded to a release (v0.7.1, docs/briefs/v0.7.1.md, step 7).
+# Checks the macOS zip uploaded to a release (v0.7.1, docs/briefs/v0.7.1.md, step 7).
 #
-# The Mac zip is signed with a Developer ID, hardened and notarized on the owner's Mac
-# (`zig build -Drelease mac-release -Dnotarize=true`) and uploaded, with its `.zip.sha256`, to release.yml's
-# draft; the owner then publishes it. No Apple secret is in CI, so this workflow is where the signature
-# is checked, on both architectures, on a runner that never saw the Mac:
+# The Mac zip is signed with a Developer ID, hardened and notarized in CI by mac-sign.yml (or, as the
+# fallback, on the owner's Mac with `zig build -Drelease mac-release -Dnotarize=true`) and uploaded,
+# with its `.zip.sha256`, to release.yml's draft; the owner then publishes it. This verifying runner
+# never sees the Apple secrets, and the check is independent of the signer (another job, another
+# runner, both architectures), so the signature is checked where nothing signed it:
 #   1. the zip matches its `.zip.sha256`, and holds nerva, LICENSE and NOTICE;
 #   2. its `nerva` is this release's: `nerva version` names the commit the release targets (the
-#      commit the tarballs and packages were built from) and ends in `version <VERSION>`; the owner
-#      builds it from a local tag they make by hand (a draft has no tag), so a tag on the wrong commit
-#      shows here;
+#      commit the tarballs and packages were built from) and ends in `version <VERSION>`; a zip
+#      built from a tag on the wrong commit shows here;
 #   3. `codesign -dv` shows a Developer ID Application authority, the hardened runtime and a secure
 #      timestamp (which notarization requires);
 #   4. tests/macos/smoke.py (slice 2: three replicas, the gateway, statsd, SIGTERM) passes on that
 #      binary, with `--expect-signature developer-id`;
 #   5. `brew install nervalog/tap/nerva && brew test nerva`.
-# It runs when a release is published, and by hand with a tag (also against a draft: the assets are
+# It runs when release.yml's `mac` job has uploaded the zip (workflow_call, on the draft), when a
+# release is published, and by hand with a tag (also against a draft: the assets are
 # found through the releases list, which a draft appears in for a token with write access). The owner
 # commits Formula/nerva.rb to the tap only after publishing, so step 5 is skipped on a draft, with a
-# notice: a green dispatch on the draft means steps 1 to 4 passed, and the run on the `release`
-# event does step 5, waiting for the tap to name this version (up to 20 minutes).
+# notice: a green run on the draft means steps 1 to 4 passed, and the run on the `release`
+# event does step 5, waiting for the tap to name this version (up to 20 minutes). When the tap
+# lacks the formula, the brew step's error says where it comes from: mac-sign.yml's run uploads it
+# as the `homebrew-formula` artifact (`gh run download <run> -n homebrew-formula`).
 #
 # The token is given to the download step only (GH_TOKEN), never to the brew, formula or binary
 # steps. `contents: write` is needed only to list a draft release in a dispatch.
 name: Mac verify
 
 on:
+  workflow_call:
+    inputs:
+      tag:
+        description: 'The release tag, v<VERSION>, published or a draft'
+        required: true
+        type: string
   workflow_dispatch:
     inputs:
       tag:
@@ -176,7 +185,7 @@ jobs:
             if [ "$stable" = "$version" ]; then break; fi
             echo "the tap has nerva $stable, not $version (attempt $attempt of $attempts)"
             if [ "$attempt" = "$attempts" ]; then
-              echo "::error::nervalog/tap's nerva is $stable, not $version: commit Formula/nerva.rb"
+              echo "::error::nervalog/tap's nerva is $stable, not $version: commit Formula/nerva.rb (the signing run's artifact: gh run download <run> -n homebrew-formula)"
               exit 1
             fi
             sleep 120
