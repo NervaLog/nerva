@@ -21,6 +21,8 @@ tarball's contents, then checks, against the real units:
       systemctl that cannot list them (NRV-E1102); not with only a failed unit; with only the gateway
       running; over a package's /usr/bin/nerva;
   5c. the unit restarts exit 1 (NRestarts), and its start limit ends the loop as `failed`;
+  5d. `--uninstall` while the units run is refused with NRV-E1118 and NRV-E1102 (#340), and keeps the
+      enable links when a package's /usr/bin/nerva exists;
   6. `install.sh --uninstall` removes the binary, the units and the enable links of the instances
      that were enabled, and leaves /var/lib/nerva.
 Not provoked: a `nerva` on a noexec mount (a script that exits 1 stands for it in NRV-E1107).
@@ -408,6 +410,18 @@ def test_upgrade_while_running(packaging, nerva, tmp, stage):
     refused(broken, 2, "NRV-E1102", "The installer found no running systemd")
     assert "could not list the nerva units" in broken.stderr, broken.stderr
     assert os.access(program, os.X_OK) and sh([program, "--version"]).returncode == 0, "the stub leaked"
+    # --uninstall removes the binary the units run: refused the same way, and changes nothing (#340).
+    for args in (["--uninstall"], ["--uninstall", "--dry-run"]):
+        result = installer(stage, *args, expect=1)
+        refused(result, 1, "NRV-E1118", "install.sh found a replica or gateway unit running, "
+                "and would replace the nerva it executes")
+        assert "an uninstall of /usr/local/bin/nerva while units are running" in result.stderr, result.stderr
+        assert "nerva@0.service" in result.stderr, result.stderr
+    assert snapshot(data=False) == before, "a refused --uninstall changed something"
+    broken = sh(["unshare", "-m", "sh", "-c",
+                 f"mount --bind {stub} {program} && exec sh {stage}/install.sh --uninstall --dry-run"])
+    refused(broken, 2, "NRV-E1102", "The installer found no running systemd")
+    assert "could not list the nerva units" in broken.stderr, broken.stderr
 
 
 def test_upgrade_quiet_and_gateway(packaging, nerva, tmp, stage):
@@ -573,6 +587,13 @@ def test_uninstall(stage):
     assert os.listdir(DATA), "the data directory should hold the data files by now"
     result = installer(stage, "--uninstall", "--dry-run")
     assert "would remove" in result.stdout and "would disable nerva@0.service" in result.stdout
+    # With a package's /usr/bin/nerva its units use the same instances: the links are kept (#340).
+    shutil.copy(BIN, "/usr/bin/nerva")
+    try:
+        kept = installer(stage, "--uninstall", "--dry-run")
+    finally:
+        os.remove("/usr/bin/nerva")
+    assert "keep nerva@0.service" in kept.stdout and "disable" not in kept.stdout, kept.stdout
     assert os.path.exists(BIN) and all(os.path.islink(link) for link in links)
     result = installer(stage, "--uninstall")
     assert "disable nerva-api@0.service" in result.stdout, result.stdout

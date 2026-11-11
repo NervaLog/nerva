@@ -55,7 +55,7 @@ elif [ -e /usr/local/bin/nerva ]; then
     # run a bare nerva, so the replicas would keep running it instead of the package's new binary.
     echo "warning[NRV-W1101]: nerva package: /usr/local/bin/nerva exists and shadows this package's /usr/bin/nerva" >&2
     echo "  cause  /usr/local/bin comes before /usr/bin on the path, and the units run nerva by name, so the replicas run that file and not the package's new nerva" >&2
-    echo "  fix    if it is a tarball install, run install.sh --uninstall from the tarball (it keeps /var/lib/nerva, /etc/nerva and the user); otherwise move or remove the file; then restart the replicas" >&2
+    echo "  fix    keep one install: if it is a tarball install, stop the replicas (systemctl stop 'nerva@*' 'nerva-api@*'), run install.sh --uninstall from the tarball (it keeps /var/lib/nerva, /etc/nerva, the user and, with this package installed, the enabled nerva@N and nerva-api@N instances); otherwise move or remove the file; then start the replicas, and run systemctl enable for any instance that is not enabled" >&2
 fi
 
 if getent passwd "$user" > /dev/null 2>&1; then

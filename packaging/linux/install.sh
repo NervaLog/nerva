@@ -173,7 +173,9 @@ if [ -e "$bin_dir/nerva" ]; then
 elif [ -e /usr/bin/nerva ]; then
     current=/usr/bin/nerva
 fi
-if [ "$uninstall" = 0 ] && [ -n "$current" ] && [ "$(sum_of "$current")" != "$(sum_of "$here/nerva")" ]; then
+# refuse_if_running <what>: NRV-E1118 when a replica or gateway unit runs now, and NRV-E1102 when
+# systemctl cannot say (fail closed).
+refuse_if_running() {
     list=$(systemctl list-units --plain --no-legend --state=active,activating,deactivating,reloading \
         'nerva@*.service' 'nerva-api@*.service' 2> /dev/null) || refuse 2 NRV-E1102 \
         "systemctl could not list the nerva units, so a running replica would not be seen" \
@@ -181,13 +183,21 @@ if [ "$uninstall" = 0 ] && [ -n "$current" ] && [ "$(sum_of "$current")" != "$(s
         "run systemctl list-units 'nerva@*' to see why it fails (no bus, or a chroot), then run install.sh again"
     running=$(printf '%s\n' "$list" | cut -d' ' -f1 | tr '\n' ' ')
     if [ -n "${running% }" ]; then
-        refuse 1 NRV-E1118 "an install over $current while units are running: ${running% }" \
+        refuse 1 NRV-E1118 "$1 while units are running: ${running% }" \
             "install.sh found a replica or gateway unit running, and would replace the nerva it executes" \
-            "stop them (systemctl stop 'nerva@*' 'nerva-api@*'), run install.sh again (--upgrade over a tarball install), then start them; across a protocol release upgrade by export and import (README, Upgrading a cluster)"
+            "stop them (systemctl stop 'nerva@*' 'nerva-api@*'), run install.sh again (--upgrade over a tarball install; --uninstall to remove it), then start them; across a protocol release upgrade by export and import (README, Upgrading a cluster)"
     fi
+}
+if [ "$uninstall" = 0 ] && [ -n "$current" ] && [ "$(sum_of "$current")" != "$(sum_of "$here/nerva")" ]; then
+    refuse_if_running "an install over $current"
+fi
+# --uninstall removes $bin_dir/nerva: a replica that restarts then runs a package's /usr/bin/nerva
+# (another release, #292's hazard) or finds none.
+if [ "$uninstall" = 1 ] && [ -e "$bin_dir/nerva" ]; then
+    refuse_if_running "an uninstall of $bin_dir/nerva"
 fi
 if [ "$uninstall" = 0 ] && [ -e /usr/bin/nerva ]; then
-    printf 'warning[NRV-W1102]: install.sh: /usr/bin/nerva exists and %s/nerva shadows it\n  cause  install.sh found a package'"'"'s /usr/bin/nerva, which the tarball'"'"'s %s/nerva shadows\n  fix    leave the package installed (removing it, or install.sh --uninstall, disables the enabled nerva@N and nerva-api@N instances, so none starts at the next boot; run systemctl enable for each again after either)\n' \
+    printf 'warning[NRV-W1102]: install.sh: /usr/bin/nerva exists and %s/nerva shadows it\n  cause  install.sh found a package'"'"'s /usr/bin/nerva, which the tarball'"'"'s %s/nerva shadows\n  fix    leave the package installed (removing it disables the enabled nerva@N and nerva-api@N instances, so none starts at the next boot; run systemctl enable for each again after; install.sh --uninstall keeps them while the package is installed)\n' \
         "$bin_dir" "$bin_dir" >&2
 fi
 
@@ -200,8 +210,13 @@ if [ "$uninstall" = 1 ]; then
     fi
     # The enable links of instances the operator enabled (nerva@0, nerva-api@0): left behind they
     # dangle, and a later install would make them live again.
+    # A package's /usr/bin/nerva means its units serve the same instances: the links stay (P340).
     for link in "$unit_dir"/*.wants/nerva@*.service "$unit_dir"/*.wants/nerva-api@*.service; do
         [ -L "$link" ] || continue
+        if [ -e /usr/bin/nerva ]; then
+            echo "keep $(basename "$link"): the package's /usr/bin/nerva is installed and uses it"
+            continue
+        fi
         do_ "disable $(basename "$link") (remove the link $link)" \
             systemctl disable "$(basename "$link")"
         changed=1
