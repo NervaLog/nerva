@@ -125,6 +125,24 @@ def check_refusals(repo, binaries, version, tmp):
     print(f"  {len(cases)} wrong-architecture builds refused with NRV-E1110")
 
 
+def check_prerelease(repo, binaries, tmp, epoch):
+    """release.yml packages a prerelease (0.7.1-rc.1) as 0.7.1~rc.1, which sorts before 0.7.1; a
+    bad suffix is refused."""
+    built = build(repo, binaries, "0.7.1~rc.1", f"{tmp}/pre", epoch)
+    deb = built["nerva_0.7.1~rc.1-1_amd64.deb"]
+    assert run(["dpkg-deb", "-f", deb, "Version"]).stdout.strip() == "0.7.1~rc.1-1"
+    assert run(["dpkg", "--compare-versions", "0.7.1~rc.1-1", "lt", "0.7.1-1"], check=False).returncode == 0
+    rpm = built["nerva-0.7.1~rc.1-1.aarch64.rpm"]
+    assert run(["rpm", "-qp", "--qf", "%{VERSION}-%{RELEASE}", rpm]).stdout == "0.7.1~rc.1-1"
+    for name, arch in (("build-deb.sh", "amd64"), ("build-rpm.sh", "x86_64")):
+        for bad in ("0.7.1~", "0.7.1~rc!1", "0.7.1-rc.1", "~rc.1"):
+            result = run(["sh", f"{repo}/packaging/linux/{name}", binaries["x86"], arch, bad,
+                          f"{tmp}/bad"], check=False)
+            assert result.returncode == 1 and "version" in result.stderr, (name, bad, result.stderr)
+            assert not os.path.exists(f"{tmp}/bad"), (name, bad)
+    print("  a prerelease version builds as N.N.N~suffix; a bad suffix is refused")
+
+
 def check_reproducible(first, second):
     for name in first:
         a, b = sha256(first[name]), sha256(second[name])
@@ -523,6 +541,7 @@ def main():
         print("  ok")
         print("4. a binary for another architecture is refused")
         check_refusals(repo, binaries, version, tmp)
+        check_prerelease(repo, binaries, tmp, epoch)
         if not args.no_containers:
             print("5. installed in containers")
             # The next patch version, from the same binary: what an upgrade installs over this one.

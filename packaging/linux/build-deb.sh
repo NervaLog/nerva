@@ -24,10 +24,21 @@ case "$arch" in
     amd64 | arm64) ;;
     *) echo "build-deb.sh: architecture $arch is not amd64 or arm64" >&2; exit 1 ;;
 esac
-case "$version" in
+# N.N.N, or N.N.N~suffix for a prerelease (0.7.1-rc.1 is 0.7.1~rc.1: `~` sorts before the release).
+case "${version%~*}" in
     *[!0-9.]* | "" | .* | *. | *..*)
         echo "build-deb.sh: version $version is not N.N.N" >&2
         exit 1
+        ;;
+esac
+case "$version" in
+    *~*)
+        case "${version#*~}" in
+            "" | *[!0-9A-Za-z.]*)
+                echo "build-deb.sh: version $version has a bad suffix after the ~" >&2
+                exit 1
+                ;;
+        esac
         ;;
 esac
 [ -f "$nerva" ] || { echo "build-deb.sh: $nerva is not a file" >&2; exit 1; }

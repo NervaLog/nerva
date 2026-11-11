@@ -4,6 +4,17 @@
 # The release notes are the version's section of CHANGELOG.md (`## v<VERSION> — <date>`); a
 # version without one is refused before CI runs. Each release carries its software bill of
 # materials, `nerva-v<VERSION>.cdx.json` (CycloneDX, N63), covered by SHA256SUMS.
+#
+# v0.7.1 (docs/briefs/v0.7.1.md, "Release mechanics"): each Linux tarball also holds install.sh, the
+# units and the settings examples (packaging/linux); the four Linux packages (nerva_<v>-1_<arch>.deb
+# and nerva-<v>-1.<arch>.rpm, a prerelease's `-` written `~`) are built from the same binaries and
+# are in SHA256SUMS; and the release is a DRAFT. The owner builds, signs and notarizes the Mac zip
+# on their own Mac, uploads it and its `.zip.sha256` to the draft and publishes it
+# (SHA256SUMS does not cover the zip, which does not exist yet); mac-verify.yml then checks it.
+# Publishing creates the tag on the commit the draft names. The run refuses a second release of a
+# version while a draft of it exists (a draft has no tag), a binary whose `nerva version` says
+# another version than VERSION, and the keys-off test build (.github/scripts/release_check.sh,
+# NRV-E1112 to NRV-E1115).
 name: Release
 
 on:
@@ -23,6 +34,9 @@ jobs:
   version:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
+    # Listing a draft release needs write access; this job only reads (release_check.sh unreleased).
+    permissions:
+      contents: write
     outputs:
       tag: ${{ steps.version.outputs.tag }}
     steps:
@@ -52,15 +66,11 @@ jobs:
           TAG: ${{ steps.version.outputs.tag }}
         run: python3 .github/scripts/sbom.py "$TAG" "$GITHUB_SHA" > /dev/null
 
-      - name: Refuse a version already released
+      - name: Refuse a version already released, or already a draft
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.version.outputs.tag }}
-        run: |
-          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" > /dev/null 2>&1; then
-            echo "::error::$TAG already exists: bump VERSION to release again"
-            exit 1
-          fi
+        run: .github/scripts/release_check.sh unreleased "$TAG"
 
   ci:
     needs: version
@@ -74,7 +84,7 @@ jobs:
   release:
     needs: [version, ci]
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 40
     permissions:
       contents: write
     env:
@@ -89,33 +99,79 @@ jobs:
           .github/scripts/free_disk.sh
           ./zig/download.sh
 
-      # Every target is cross-compiled from Linux. The binary reports `<protocol>+<commit>`: the
-      # protocol is the data file and protocol release (`release` in build.zig), changed
-      # deliberately (N32, N43); VERSION names the release.
+      # Every target is cross-compiled from Linux. The binary's first line is `<protocol>+<commit>`
+      # and its `version` line is VERSION (P259b, P284b); the protocol is the data file and protocol
+      # release (`release` in build.zig), VERSION names the release. A Linux tarball
+      # holds the binary, LICENSE and NOTICE as before and, beside them, slice 4's installer.
       - name: Build
         run: |
           mkdir dist
+          linux_files=(install.sh nerva@.service nerva-api@.service replica.env.example api.env.example)
           for target in x86_64-linux aarch64-linux x86_64-macos aarch64-macos; do
             ./zig/zig build -Drelease -Dtarget="$target"
             name="nerva-$TAG-$target"
             mkdir "$name"
             cp zig-out/bin/nerva LICENSE NOTICE "$name/"
+            mkdir -p "bin/$target"
+            cp zig-out/bin/nerva "bin/$target/nerva"
+            case "$target" in
+              *-linux) for file in "${linux_files[@]}"; do cp -p "packaging/linux/$file" "$name/"; done ;;
+            esac
             tar -czf "dist/$name.tar.gz" "$name"
           done
-          python3 .github/scripts/sbom.py "$TAG" "$GITHUB_SHA" > "dist/nerva-$TAG.cdx.json"
-          (cd dist && sha256sum -- *.tar.gz *.cdx.json > SHA256SUMS)
 
-      - name: Check the Linux x86_64 binary runs
+      - name: Check the Linux x86_64 binary runs, and is this release
         run: |
           tar -xzf "dist/nerva-$TAG-x86_64-linux.tar.gz"
           "./nerva-$TAG-x86_64-linux/nerva" version | tee version.txt
           grep -q "+$(git rev-parse --short=7 HEAD)" version.txt
+          # NRV-E1112: its `version` line is VERSION. NRV-E1113: it is not the keys-off build (#271).
+          .github/scripts/release_check.sh binary "./nerva-$TAG-x86_64-linux/nerva" "${TAG#v}"
           # Only the first line: `nerva version` goes on to print release, format and bundles lines,
           # which an env-file refuses.
           echo "BINARY_VERSION=$(head -n1 version.txt | sed 's/^Nerva version //')" >> "$GITHUB_ENV"
 
-      # Creates the tag on exactly this commit, then the release.
-      - name: Publish
+      # dpkg-deb is on the image. rpmbuild is the `rpm` package, pinned to the version
+      # packages.yml's tests ran against (P284b, P295) and asserted: a runner image change fails here.
+      - name: Install rpmbuild, pinned
+        run: |
+          set -eu
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rpm=4.18.2+dfsg-2.1build2
+          test "$(rpmbuild --version)" = "RPM version 4.18.2"
+          dpkg-deb --version | head -n1
+
+      # The four packages, from the binaries above, by the scripts packages.yml tests
+      # (tests/packaging/packages.py --require-version-line, on this commit). A prerelease's
+      # `0.7.1-rc.1` is `0.7.1~rc.1`, which sorts before 0.7.1.
+      - name: Build the Linux packages
+        run: |
+          set -eu
+          pkgver=$(printf '%s' "${TAG#v}" | sed 's/-/~/')
+          sh packaging/linux/build-deb.sh bin/x86_64-linux/nerva amd64 "$pkgver" dist
+          sh packaging/linux/build-deb.sh bin/aarch64-linux/nerva arm64 "$pkgver" dist
+          sh packaging/linux/build-rpm.sh bin/x86_64-linux/nerva x86_64 "$pkgver" dist
+          sh packaging/linux/build-rpm.sh bin/aarch64-linux/nerva aarch64 "$pkgver" dist
+          for arch in amd64:x86_64:x86_64 arm64:aarch64:aarch64; do
+            IFS=: read -r deb rpm target <<< "$arch"
+            dpkg-deb --fsys-tarfile "dist/nerva_$pkgver-1_$deb.deb" | tar -xO ./usr/bin/nerva \
+              | cmp - "bin/$target-linux/nerva"
+            rpm2archive - < "dist/nerva-$pkgver-1.$rpm.rpm" | tar -xzO ./usr/bin/nerva \
+              | cmp - "bin/$target-linux/nerva"
+          done
+          ls -l dist
+
+      # The Mac zip is not here and not in SHA256SUMS: the owner uploads it with its own
+      # `.zip.sha256`. Everything else is, and the bill of materials.
+      - name: Write the bill of materials and SHA256SUMS
+        run: |
+          python3 .github/scripts/sbom.py "$TAG" "$GITHUB_SHA" > "dist/nerva-$TAG.cdx.json"
+          (cd dist && sha256sum -- *.tar.gz *.deb *.rpm *.cdx.json > SHA256SUMS && sha256sum -c SHA256SUMS)
+          test "$(wc -l < dist/SHA256SUMS)" = 9
+
+      # A DRAFT, not a release: it names this commit as the target and creates no tag until it is
+      # published, by the owner, after they upload the Mac zip (docs/briefs/v0.7.1.md, step 6).
+      - name: Create the draft release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -127,8 +183,16 @@ jobs:
             echo "---"
             echo
             echo "Nerva at commit $GITHUB_SHA. Binaries report \`$BINARY_VERSION\`." \
-              "Check downloads against \`SHA256SUMS\`. What they are built from is in" \
-              "\`nerva-$TAG.cdx.json\` (CycloneDX)."
+              "Check downloads against \`SHA256SUMS\`, which lists the tarballs, the packages and" \
+              "the bill of materials. The macOS zip is checked against its own" \
+              "\`.zip.sha256\`. What the binaries are built from is in \`nerva-$TAG.cdx.json\`" \
+              "(CycloneDX)."
           } > notes.md
-          gh release create "$TAG" dist/* "${prerelease[@]}" --target "$GITHUB_SHA" \
+          gh release create "$TAG" dist/* "${prerelease[@]}" --draft --target "$GITHUB_SHA" \
             --title "Nerva $TAG" --notes-file notes.md
+
+      # GitHub renames a file whose name has a character it does not keep (NRV-E1115).
+      - name: Check the draft holds what was built
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: .github/scripts/release_check.sh assets "$TAG" dist
