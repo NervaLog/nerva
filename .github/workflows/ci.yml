@@ -370,9 +370,14 @@ jobs:
   # and only runs tests/macos/smoke.py on the x86_64 thin and the universal binary, so the
   # ReleaseSafe builds are not repeated on the critical path (P293).
   #
-  # Follow-up (slice 7, not here): swapping the lipo for `zig build -Drelease mac-release` needs
-  # a local tag `v<VERSION>` on a clean tree (#291's preflight refuses otherwise, even ad hoc),
-  # and its output outside the checkout. Slice 7 decides that.
+  # It also runs `zig build -Drelease mac-release -Dsign-identity=-` for real (#315), ad hoc and
+  # not notarized, so that the owner's release-day command has run before release day: the step
+  # needs a clean tree and a local tag `v<VERSION>` on HEAD (#291's preflight), which the job makes
+  # and never pushes, and it writes to `zig-out/mac-release` (ignored by git). The hand-made lipo
+  # binary stays as the smoke test's subject, so a break in either path shows separately. The
+  # step's zip is then checked from outside: its checksum, its architectures, its signature, the
+  # version line and the smoke test. What it cannot run here is the Developer ID signature and
+  # notarization (`-Dnotarize=true`): CI holds no Apple secret.
   macos-arm64:
     needs: changes
     if: ${{ !cancelled() }}
@@ -430,6 +435,36 @@ jobs:
       - name: Smoke test, universal binary
         if: needs.changes.outputs.code != 'false'
         run: python3 tests/macos/smoke.py "$RUNNER_TEMP/macos-out/universal/nerva" --arch arm64 --expect-signature adhoc
+
+      # The owner's release-day step, ad hoc (#315). The tag is local to this runner.
+      - name: mac-release, ad hoc (the owner's command without Apple's secrets)
+        if: needs.changes.outputs.code != 'false'
+        run: |
+          set -eu
+          git tag "v$(cat VERSION)"
+          git status --porcelain
+          ./zig/zig build -Drelease mac-release -Dsign-identity=-
+
+      - name: Check mac-release's zip from outside
+        if: needs.changes.outputs.code != 'false'
+        run: |
+          set -eu
+          version=$(cat VERSION)
+          zip="$PWD/zig-out/mac-release/nerva-v$version-universal-macos.zip"
+          check="$RUNNER_TEMP/mac-release-check"
+          rm -rf "$check"
+          mkdir -p "$check"
+          (cd zig-out/mac-release && shasum -a 256 -c "$(basename "$zip").sha256")
+          unzip -q "$zip" -d "$check"
+          bin="$check/nerva-v$version-universal-macos/nerva"
+          archs=$(lipo -archs "$bin")
+          echo "lipo -archs: $archs"
+          [ "$archs" = "x86_64 arm64" ]
+          codesign -v "$bin"
+          codesign -dv "$bin" 2>&1 | grep -x 'Signature=adhoc'
+          "$bin" version
+          python3 tests/macos/smoke.py "$bin" --arch arm64 --expect-signature adhoc
+          test -f zig-out/mac-release/nerva.rb
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: needs.changes.outputs.code != 'false'

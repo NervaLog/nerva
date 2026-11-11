@@ -3,7 +3,7 @@
 Nerva v0.7.1 is not released yet. This page says how each kind of download installs, so that the
 release can be used from its notes alone. Until the release exists, the file names below are the
 names the release process is set up to give its assets (the release workflow for the Linux
-assets, `zig build mac-release` for the Mac zip), and the Homebrew tap and the packages are
+assets, `zig build -Drelease mac-release` for the Mac zip), and the Homebrew tap and the packages are
 built but not published: check the release page for what it actually lists. Nothing here is
 signed by a Linux key; what is signed or checked is said under each heading.
 
@@ -37,7 +37,7 @@ nerva version
 ```
 
 The tap is `NervaLog/homebrew-tap`. It is not published yet; its formula is generated from
-[`packaging/homebrew/nerva.rb`](../packaging/homebrew/nerva.rb) by `zig build mac-release`, and
+[`packaging/homebrew/nerva.rb`](../packaging/homebrew/nerva.rb) by `zig build -Drelease mac-release`, and
 installs the prebuilt universal binary (arm64 and x86_64) pinned by its SHA-256. It builds nothing
 and needs no `sudo`. The formula's own test is that `nerva version` ends in `version <the
 release>`.
