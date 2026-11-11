@@ -429,8 +429,32 @@ fn fail_at(what: []const u8, path: []const u8, err: anyerror) noreturn {
     fail("cannot {s} {s}: {s}", .{ what, path, file_problem(err) });
 }
 
-fn package(gpa: std.mem.Allocator, options: Options) void {
-    const out = std.fs.path.resolve(gpa, &.{ options.root, options.out }) catch @panic("OOM");
+/// `path` made absolute against `base` (itself absolute), without touching the disk.
+fn absolute(gpa: std.mem.Allocator, base: []const u8, path: []const u8) []u8 {
+    assert(std.fs.path.isAbsolute(base));
+    const result = std.fs.path.resolve(gpa, &.{ base, path }) catch @panic("OOM");
+    assert(std.fs.path.isAbsolute(result));
+    return result;
+}
+
+/// Every path in `options` absolute (#328). `run` starts programs in other directories
+/// (`out`, `root`), so a relative path would be read there, not where it was given; the
+/// thin binaries are relative to this process's directory, the rest to `root`.
+fn absolute_options(gpa: std.mem.Allocator, options: Options) Options {
+    const here = std.fs.cwd().realpathAlloc(gpa, ".") catch |err| fail_at("resolve", ".", err);
+    var result = options;
+    result.root = std.fs.cwd().realpathAlloc(gpa, options.root) catch |err|
+        fail_at("resolve", options.root, err);
+    result.out = absolute(gpa, result.root, options.out);
+    result.template = absolute(gpa, result.root, options.template);
+    result.arm64 = absolute(gpa, here, options.arm64);
+    result.x86_64 = absolute(gpa, here, options.x86_64);
+    return result;
+}
+
+fn package(gpa: std.mem.Allocator, options_given: Options) void {
+    const options = absolute_options(gpa, options_given);
+    const out = options.out;
     std.fs.cwd().deleteTree(out) catch |err| fail_at("empty", out, err);
     var stem_buffer: [archive_stem_max]u8 = undefined;
     const stem = archive_stem(&stem_buffer, options.version);
@@ -558,7 +582,7 @@ fn write_formula(
     sha: []const u8,
     out: []const u8,
 ) void {
-    const template_path = join(gpa, &.{ options.root, options.template });
+    const template_path = options.template;
     const template = std.fs.cwd().readFileAlloc(gpa, template_path, 1 << 20) catch |err|
         fail_at("read", template_path, err);
     const url = print(gpa, "{s}/v{s}/{s}.zip", .{ release_url, options.version, stem });
@@ -572,6 +596,36 @@ fn write_formula(
     const path = join(gpa, &.{ out, "nerva.rb" });
     std.fs.cwd().writeFile(.{ .sub_path = path, .data = filled }) catch |err|
         fail_at("write", path, err);
+}
+
+test "absolute makes relative paths absolute against the base and keeps absolute ones" {
+    const gpa = std.testing.allocator;
+    const cases = [_][2][]const u8{
+        .{ "zig-out/mac-release", "/work/repo/zig-out/mac-release" },
+        .{ "../.zig-cache/o/abc/nerva", "/work/.zig-cache/o/abc/nerva" },
+        .{ "/elsewhere/nerva", "/elsewhere/nerva" },
+    };
+    for (cases) |case| {
+        const got = absolute(gpa, "/work/repo", case[0]);
+        defer gpa.free(got);
+        try std.testing.expectEqualStrings(case[1], got);
+    }
+}
+
+test "absolute_options leaves no relative path for run to double" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const options = absolute_options(arena.allocator(), .{
+        .mode = .package,
+        .version = "0.7.1",
+        .arm64 = ".zig-cache/o/a/nerva",
+        .x86_64 = ".zig-cache/o/b/nerva",
+    });
+    for ([_][]const u8{
+        options.root, options.out, options.template, options.arm64, options.x86_64,
+    }) |path| try std.testing.expect(std.fs.path.isAbsolute(path));
+    try std.testing.expect(std.mem.startsWith(u8, options.out, options.root));
 }
 
 test "archive and tag names" {

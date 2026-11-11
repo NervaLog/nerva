@@ -109,8 +109,10 @@ The README's first line no longer says "toy / research": it gives the label and 
 
 - **#278:** CI had never run Nerva on macOS. CI now builds the universal binary on a Mac, runs a
   smoke test on Apple silicon and on Intel (three replicas, a gateway with `--statsd`, a commit, a
-  lookup, the change feed) and the unit tests on Apple silicon (#293). `zig build mac-release`
-  builds, signs, zips and notarizes the universal binary and writes the Homebrew formula (#291).
+  lookup, the change feed) and the unit tests on Apple silicon (#293). `zig build -Drelease
+  mac-release` builds, signs, zips and notarizes the universal binary and writes the Homebrew
+  formula (#291). CI runs it on a Mac, ad hoc and not notarized (`-Dsign-identity=-`), and checks
+  its zip (#315); the Developer ID signature and the notarization run only on the owner's Mac.
 - **#271:** the release workflow did not check that the binary it publishes deduplicates commit
   keys. It now refuses a binary built with `-Dtest-commit-keys=off`, and checks that the
   `version` line matches the release (#311).

@@ -1,7 +1,7 @@
 # Checks the macOS zip the owner uploaded to a release (v0.7.1, docs/briefs/v0.7.1.md, step 7).
 #
 # The Mac zip is signed with a Developer ID, hardened and notarized on the owner's Mac
-# (`zig build mac-release -Dnotarize=true`) and uploaded, with its `.zip.sha256`, to release.yml's
+# (`zig build -Drelease mac-release -Dnotarize=true`) and uploaded, with its `.zip.sha256`, to release.yml's
 # draft; the owner then publishes it. No Apple secret is in CI, so this workflow is where the signature
 # is checked, on both architectures, on a runner that never saw the Mac:
 #   1. the zip matches its `.zip.sha256`, and holds nerva, LICENSE and NOTICE;
