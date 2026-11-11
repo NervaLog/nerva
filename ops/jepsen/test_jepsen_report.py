@@ -294,6 +294,35 @@ class Statuses(unittest.TestCase):
         rep.read_test(run, os.path.join(named, "2026-11-02T01:00:00Z"))
         self.assertEqual(run.workload, "bank-no-keys")
 
+    def test_a_test_all_run_takes_its_workload_from_the_test_name(self):
+        for name, workload in (("nerva retry kill,pause", "retry"), ("nerva retry", "retry"),
+                               ("nerva bank kill", "bank"), ("nerva keyed", "keyed"),
+                               ("nerva bank no-keys kill", "bank-no-keys")):
+            store = Store(self)
+            directory = store.test("1", VALID, args="")
+            named = os.path.join(store.path, "1", name)
+            os.rename(os.path.dirname(directory), named)
+            run = rep.Run("1")
+            rep.read_test(run, os.path.join(named, "2026-11-02T01:00:00Z"))
+            self.assertEqual((run.workload, run.workload_read), (workload, True), name)
+
+    def test_a_test_all_duplicate_in_retry_is_not_filed_under_bank(self):
+        store = Store(self)
+        directory = store.test("1", invalid(), args="")
+        os.rename(os.path.dirname(directory), os.path.join(store.path, "1", "nerva retry"))
+        github, _, _ = night(self, store)
+        titles = [t for _, t, _ in github.opened]
+        self.assertEqual(titles, ["Jepsen retry: duplicate (checker workload)"])
+
+    def test_a_workload_option_outranks_the_test_name(self):
+        store = Store(self)
+        directory = store.test("1", VALID, args="--workload retry")
+        named = os.path.join(store.path, "1", "nerva bank")
+        os.rename(os.path.dirname(directory), named)
+        run = rep.Run("1")
+        rep.read_test(run, os.path.join(named, "2026-11-02T01:00:00Z"))
+        self.assertEqual(run.workload, "retry")
+
     def test_a_canary_with_only_a_harness_failure_is_blind_and_filed(self):
         store = Store(self)
         store.test("1", HARNESS, args="--workload bank --nemesis gateway")
