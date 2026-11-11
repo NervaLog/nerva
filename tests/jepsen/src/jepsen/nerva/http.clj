@@ -27,7 +27,7 @@
 
 (def api-key
   "The shared key (`NERVA_KEY`) the gateways are started with."
-  "jepsen")
+  "jepsen-gateway-key-0123456789abcdef")
 
 (def timeout-ms
   "How long a request may take. Longer than the gateway's own 30 s cluster timeout, so a

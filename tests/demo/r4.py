@@ -42,7 +42,7 @@ import traceback
 # Replicas authenticate each other with a real cluster key, never the development key (P102).
 os.environ["NERVA_CLUSTER_KEY"] = os.urandom(32).hex()
 
-KEY = "demo-r4-key"
+KEY = "demo-r4-key-0123456789abcdef0123456789"
 ACCOUNTS, SOURCES = 40, 41
 ACCOUNT_ROWS = 4
 FUNDED = 1_000_000  # Per account.

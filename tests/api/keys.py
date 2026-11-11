@@ -17,7 +17,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from api import Cluster  # noqa: E402
 
-OLD, NEW = "key-old", "key-new"
+OLD, NEW = "key-old" + "-" * 28, "key-new" + "-" * 28
 
 
 def status(port, target, key):

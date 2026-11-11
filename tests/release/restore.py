@@ -35,7 +35,7 @@ import time
 # Replicas authenticate each other with a real cluster key, never the development key (P102).
 os.environ["NERVA_CLUSTER_KEY"] = os.urandom(32).hex()
 
-KEY = "restore-test-key"
+KEY = "restore-test-key-0123456789abcdef0123456789"
 SEATS = 5        # A layout, and the view over it.
 ACCOUNTS = 40    # The ledger: available and held, floored at zero.
 SOURCES = 41     # The ledger: balance, no floor.
