@@ -7,7 +7,7 @@ history consistent with source data means CDC pipelines, queues, consumers and b
 Nerva's bet: one ordered, replicated, hash-chained log; base data and every derived view are
 deterministic functions of it, and every read says which log position it reflects.
 
-> Status: **toy / research.** The foundation and the commit core exist — see [Roadmap](#roadmap).
+**Status: Alpha.** What that promises is in [docs/MATURITY.md](docs/MATURITY.md). To install, see [docs/INSTALL.md](docs/INSTALL.md); to start, [docs/QUICKSTART.md](docs/QUICKSTART.md).
 
 New here? [docs/TUTORIAL.md](./docs/TUTORIAL.md) walks through a running cluster, every API
 and the code, step by step.
@@ -124,6 +124,8 @@ history, as-of reads and views see it like a put. The VOPR workload checks every
 in-memory model replayed in op order.
 
 ## Building
+
+Most users install a release instead: see [docs/INSTALL.md](docs/INSTALL.md).
 
 ```bash
 ./zig/download.sh             # Pinned Zig 0.14.1 (falls back to PyPI if ziglang.org is blocked)
