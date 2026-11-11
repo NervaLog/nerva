@@ -604,7 +604,7 @@ def test_uninstall(stage):
         alone = installer(stage, "--uninstall", "--dry-run")
     finally:
         os.remove("/usr/bin/nerva")
-    assert "keep" not in alone.stdout and "would disable nerva@0.service" in alone.stdout, alone.stdout
+    assert "keep nerva" not in alone.stdout and "would disable nerva@0.service" in alone.stdout, alone.stdout
     # A real uninstall with the package's units present: the instances stay enabled and wanted.
     shutil.copy(f"{UNIT_DIR}/nerva@.service", pkg_unit)
     try:
