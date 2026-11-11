@@ -398,6 +398,11 @@ pub const Command = union(enum) {
     };
 };
 
+/// What a flag refusal tells the operator to run (#300). Only `nerva --help` exists: the vendored
+/// parser answers `-h`/`--help` for the top level alone, and refuses `nerva <command> --help` as
+/// an unexpected argument, so no hint may send anyone there.
+pub const help_hint = "run nerva --help, which lists every command and the flags it takes";
+
 /// The vendored flag parser's failures (unknown or repeated flag, missing or malformed value,
 /// unexpected argument) as NRV-E0001, through `stdx.Flags.fatal_hook`.
 fn flag_fatal(message: []const u8) noreturn {
@@ -405,7 +410,7 @@ fn flag_fatal(message: []const u8) noreturn {
         "NRV-E0001",
         "{s}",
         .{message},
-        "run nerva --help, or nerva <command> --help, for the flags it takes",
+        help_hint,
         .{},
     );
 }
@@ -534,7 +539,7 @@ fn flag_range(comptime command: []const u8, err: Error) noreturn {
         "NRV-E0002",
         command ++ ": {s}",
         .{error_message(err)},
-        "nerva " ++ command ++ " --help names every flag and its bounds",
+        help_hint,
         .{},
     );
 }
@@ -566,6 +571,17 @@ pub fn listen_is_loopback(address: std.net.Address) bool {
 }
 
 const loopback_ipv6 = [_]u8{0} ** 15 ++ [_]u8{1};
+
+test "the flag hints name only a command that exists (#300)" {
+    // `nerva <command> --help` is refused by the flag parser, so a hint must not name it.
+    try std.testing.expect(std.mem.indexOf(u8, help_hint, "<command>") == null);
+    try std.testing.expectEqualStrings(
+        "run nerva --help, which lists every command and the flags it takes",
+        help_hint,
+    );
+    // The command the hint names is the one the usage text documents.
+    try std.testing.expect(std.mem.indexOf(u8, CLIArgs.help, "nerva [-h | --help]") != null);
+}
 
 test listen_is_loopback {
     const accepted = [_][]const u8{
