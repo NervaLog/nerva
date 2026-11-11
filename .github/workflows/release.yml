@@ -9,9 +9,14 @@
 # units and the settings examples (packaging/linux); the four Linux packages (nerva_<v>-1_<arch>.deb
 # and nerva-<v>-1.<arch>.rpm; a prerelease's `-` is `~` inside the package and `.` in the file name,
 # because GitHub renames an asset whose name has a `~`, P311) are built from the same binaries and
-# are in SHA256SUMS; and the release is a DRAFT. The owner builds, signs and notarizes the Mac zip
-# on their own Mac, uploads it and its `.zip.sha256` to the draft and publishes it
-# (SHA256SUMS does not cover the zip, which does not exist yet); mac-verify.yml then checks it.
+# are in SHA256SUMS; and the release is a DRAFT. The Mac zip is signed and notarized in CI by the
+# `mac` job (mac-sign.yml, after the draft exists; environment `apple-signing`, so the owner
+# approves the run) and uploaded with its `.zip.sha256` to the draft; `mac-verify` (mac-verify.yml)
+# then checks it, on both architectures. Both run only on main: a prerelease dispatched from a
+# branch skips them, and is rehearsed by dispatching mac-sign.yml from main with the draft's tag.
+# The owner's own Mac (`zig build -Drelease mac-release -Dnotarize=true`) remains the fallback if
+# the runner or Apple's notary service fails. The owner reads the green run and publishes the draft
+# (SHA256SUMS does not cover the zip, which is made after it).
 # Publishing creates the tag on the commit the draft names. The run refuses a second release of a
 # version while a draft of it exists (a draft has no tag; checked again just before the draft is
 # created, because "Re-run failed jobs" does not run the `version` job again), a binary whose
@@ -220,3 +225,28 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: .github/scripts/release_check.sh assets "$TAG" dist
+
+  # Signs and notarizes the Mac zip and uploads it to the draft. Waits for the owner's approval
+  # (environment apple-signing, declared in mac-sign.yml). The `if` below skips this job, and so
+  # mac-verify, on a dispatch from any ref but main; the environment's main-only deployment rule
+  # is a second guard. A prerelease draft may target only main plus VERSION and CHANGELOG.md
+  # (release_check.sh mac-draft, P343). The workflow takes no inherited
+  # secrets: the environment's reach the keychain step directly.
+  mac:
+    needs: [version, release]
+    if: github.ref == 'refs/heads/main'
+    uses: ./.github/workflows/mac-sign.yml
+    permissions:
+      contents: write
+    with:
+      tag: ${{ needs.version.outputs.tag }}
+
+  # The zip's checksum, commit, Developer ID and a smoke test on both architectures, on the draft.
+  # brew is checked by mac-verify.yml's own run when the owner publishes.
+  mac-verify:
+    needs: [version, mac]
+    uses: ./.github/workflows/mac-verify.yml
+    permissions:
+      contents: write
+    with:
+      tag: ${{ needs.version.outputs.tag }}

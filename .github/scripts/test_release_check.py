@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for release_check.sh (NRV-E1112 to NRV-E1116) and release_notes.sh (NRV-E1117). Run from the repository root:
+"""Tests for release_check.sh (NRV-E1112 to NRV-E1116, and mac-draft: NRV-E1119, NRV-E1120, NRV-E1122 to NRV-E1124) and release_notes.sh (NRV-E1117). Run from the repository root:
 python3 .github/scripts/test_release_check.py
 
 A stand-in `nerva` and a stand-in `gh` (a script that answers from files) stand for the real two."""
@@ -134,6 +134,116 @@ class ReleaseCheck(unittest.TestCase):
             fake_gh(d, False, [], ["a.tar.gz", "nerva_0.7.1_rc.1-1_amd64.deb"])
             self.refused(run("assets", "v0.7.1-rc.1", dist, path_dir=d), "NRV-E1115",
                          "does not hold the assets that were built")
+
+
+def fake_gh_draft(directory, releases="true\tabc1234", version="0.7.1", status="behind",
+                  commit_fails=False, version_fails=False, files=(), compare_fails=False):
+    """The calls `mac-draft` makes: the releases list (`releases`, the tab-separated line a real --jq
+    prints, or "" for none), the commit a target resolves to, VERSION at that commit, and the compare
+    status against main."""
+    path = Path(directory) / "gh"
+    path.write_text(f"""#!/bin/sh
+case "$*" in
+  *select*) [ -n "{releases}" ] && printf '{releases}\\n' ;;
+  *commits/*) {'echo "gh: Not Found (HTTP 404)" >&2; exit 1' if commit_fails else "echo 0123456789abcdef0123456789abcdef01234567"} ;;
+  *contents/VERSION*) {'echo "gh: Not Found (HTTP 404)" >&2; exit 1' if version_fails else f'echo "{version}"'} ;;
+  *compare/*) {'echo "gh: Server Error (HTTP 500)" >&2; exit 1' if compare_fails else "printf '" + status + chr(92) + "n" + "".join(f + chr(92) + "n" for f in files) + "'"} ;;
+esac
+exit 0
+""")
+    path.chmod(0o755)
+
+
+class MacDraft(unittest.TestCase):
+    def refused(self, result, code, fragment):
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn(f"error[{code}]: mac-sign.yml: ", result.stderr)
+        self.assertIn(fragment, result.stderr)
+        self.assertIn("\n  cause  ", result.stderr)
+        self.assertIn("\n  fix    ", result.stderr)
+        self.assertIn(f"::error::{code}", result.stderr)
+
+    def test_a_draft_of_the_version_on_main_passes_and_prints_its_commit(self):
+        with tempfile.TemporaryDirectory() as d:
+            fake_gh_draft(d)
+            result = run("mac-draft", "v0.7.1", path_dir=d)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "0123456789abcdef0123456789abcdef01234567\n")
+
+    def test_a_published_release_or_no_release_is_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            fake_gh_draft(d, releases="false\tmain")
+            self.refused(run("mac-draft", "v0.7.1", path_dir=d), "NRV-E1119", "release v0.7.1 is not a draft")
+            fake_gh_draft(d, releases="")
+            self.refused(run("mac-draft", "v0.7.1", path_dir=d), "NRV-E1119", "no draft release named v0.7.1")
+
+    def test_a_target_whose_version_is_not_the_tag_is_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            fake_gh_draft(d, version="0.7.0")
+            self.refused(run("mac-draft", "v0.7.1", path_dir=d), "NRV-E1120",
+                         "whose VERSION is '0.7.0', not 0.7.1")
+
+    def test_a_release_off_main_is_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            for status in ("diverged", "ahead"):
+                fake_gh_draft(d, status=status, files=("VERSION",))
+                self.refused(run("mac-draft", "v0.7.1", path_dir=d), "NRV-E1124",
+                             "v0.7.1 is a release, and its draft targets 0123456, which is not on main")
+            for status in ("identical", "behind"):
+                fake_gh_draft(d, status=status)
+                self.assertEqual(run("mac-draft", "v0.7.1", path_dir=d).returncode, 0)
+
+    def test_a_prerelease_on_main_or_ahead_with_only_the_version_bump_passes(self):
+        with tempfile.TemporaryDirectory() as d:
+            for status, files in (("behind", ()), ("identical", ()), ("ahead", ("VERSION",)),
+                                  ("ahead", ("CHANGELOG.md", "VERSION")), ("diverged", ("VERSION",))):
+                fake_gh_draft(d, version="0.7.1-rc.2", status=status, files=files)
+                result = run("mac-draft", "v0.7.1-rc.2", path_dir=d)
+                self.assertEqual(result.returncode, 0, (status, files, result.stderr))
+
+    def test_a_prerelease_ahead_of_main_with_another_file_is_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            for files in (("VERSION", "build.zig"), ("zig/download.sh",), ("VERSION", "docs/CHANGELOG.md")):
+                fake_gh_draft(d, version="0.7.1-rc.2", status="ahead", files=files)
+                self.refused(run("mac-draft", "v0.7.1-rc.2", path_dir=d), "NRV-E1124",
+                             "v0.7.1-rc.2 is a prerelease, and its draft targets 0123456, which changes "
+                             "more than VERSION and CHANGELOG.md on top of main")
+
+    def test_a_compare_that_fails_is_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            for tag in ("v0.7.1", "v0.7.1-rc.2"):
+                fake_gh_draft(d, version=tag[1:], compare_fails=True)
+                result = run("mac-draft", tag, path_dir=d)
+                self.refused(result, "NRV-E1122",
+                             "cannot compare the commit 0123456, which the draft " + tag + " targets, with main")
+                self.assertNotIn("HTTP 500", result.stderr)
+
+    def test_a_tag_that_is_not_v_version_is_refused(self):
+        for tag in ("main", "0.7.1", "v0.7.1 "):
+            result = run("mac-draft", tag)
+            self.refused(result, "NRV-E1123", f"'{tag}' is not a release tag v<VERSION>")
+
+    def test_a_target_or_version_that_cannot_be_read_is_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            fake_gh_draft(d, commit_fails=True)
+            self.refused(run("mac-draft", "v0.7.1", path_dir=d), "NRV-E1122",
+                         "cannot read the commit abc1234 that the draft v0.7.1 targets")
+            fake_gh_draft(d, version_fails=True)
+            result = run("mac-draft", "v0.7.1", path_dir=d)
+            self.refused(result, "NRV-E1122", "cannot read VERSION at 0123456")
+            self.assertNotIn("HTTP 404", result.stderr)
+
+    def test_the_workflow_checks_the_draft_before_the_secrets_and_again_before_the_upload(self):
+        workflow = (ROOT / ".github/workflows/mac-sign.yml").read_text()
+        call = 'mac-draft "$TAG")'
+        self.assertNotIn(".github/scripts/release_check.sh mac-draft", workflow)
+        self.assertNotIn(".github/scripts/mac_keychain.sh", workflow.split("steps:")[1])
+        keychain = workflow.index('"$RUNNER_TEMP/wf/mac_keychain.sh" create')
+        upload = workflow.index('gh release upload "$TAG"')
+        self.assertEqual(workflow.count(call), 2)
+        self.assertLess(workflow.index(call), keychain)
+        self.assertLess(keychain, workflow.index(call, keychain))
+        self.assertLess(workflow.index(call, keychain), upload)
 
 
 NOTES = ROOT / ".github/scripts/release_notes.sh"
