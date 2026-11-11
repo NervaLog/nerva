@@ -106,7 +106,7 @@ Flags: `--dry-run` (the same checks as a real run, no change), `--upgrade` (repl
 another release: stop the replicas first and start them after; the only upgrade this release states as in place is v0.7.0 to v0.7.1, see
 [OPERATING.md](./OPERATING.md#upgrading), and read
 [Upgrading a cluster](../README.md#upgrading-a-cluster) when the protocol release changes), and
-`--uninstall` (removes the binary and the units; leaves `/var/lib/nerva`, `/etc/nerva` and the
+`--uninstall` (removes the binary and the units, and is refused with NRV-E1118 while replicas or the gateway run: stop them first; leaves `/var/lib/nerva`, `/etc/nerva` and the
 user, so your data stays).
 
 When `install.sh` refuses, it prints one coded block and changes nothing
@@ -123,10 +123,10 @@ When `install.sh` refuses, it prints one coded block and changes nothing
 | NRV-E1107 | 2 | this machine cannot run the tarball's `nerva` (a `noexec` mount such as `/tmp` on a hardened host) | unpack where programs may run |
 | NRV-E1108 | 1 | the tarball is incomplete, or `install.sh` ran outside it | unpack it whole, run from its directory |
 | NRV-E1109 | 2 | no `sha256sum` | install coreutils |
-| NRV-E1118 | 1 | an install over a different `nerva` (the tarball's in `/usr/local/bin`, else a package's in `/usr/bin`) while `nerva@*` or `nerva-api@*` units are running | stop them, install (`--upgrade` over a tarball install), start them |
+| NRV-E1118 | 1 | an install over a different `nerva` (the tarball's in `/usr/local/bin`, else a package's in `/usr/bin`), or an `--uninstall` of `/usr/local/bin/nerva`, while `nerva@*` or `nerva-api@*` units are running | stop them, install (`--upgrade` over a tarball install), start them |
 
 When a package's `/usr/bin/nerva` is installed too, `install.sh` goes on and warns (NRV-W1102): the tarball's
-`/usr/local/bin/nerva` comes first on the path, so it is the one the units run. Leave the package installed: removing it, or `install.sh --uninstall`, disables the enabled `nerva@N` and `nerva-api@N` instances, so enable them again afterwards.
+`/usr/local/bin/nerva` comes first on the path, so it is the one the units run. Leave the package installed: removing it disables the enabled `nerva@N` and `nerva-api@N` instances, so enable them again afterwards. `install.sh --uninstall` keeps those instances while the package's `/usr/bin/nerva` exists.
 
 Recorded: `./install.sh --dry-run`, as root, in a container that is not running systemd:
 
