@@ -30,7 +30,8 @@ amends: P286b
    failures a restart or the boot cures (NRV-E0703 a lock the dead process held, NRV-E0010 a collector
    with no route yet), and 7 and 70 are both bugs. The limit counts every start, not only exit 1: any
    loop that restarts more often than every 15 s (a permanent exit 1, a panic, a signal) ends as
-   `failed` after about 100 s, and a slower one never does. That is about 100 s of retries after a boot,
+   `failed` after about 100 s (20 starts: the first and 19 restarts; systemd refuses the next one, and
+   `Result` stays `exit-code` on systemd 255), and a slower one never does. That is about 100 s of retries after a boot,
    not 10 s, for a route that appears late (DHCP, no `*-wait-online`).
 5. `release_check.sh binary` (NRV-E1113) also fails a `nerva version` that carries `+keys-off` (#271),
    beside the existing check of `commit_keys deduplicate`; no new code.

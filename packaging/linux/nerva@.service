@@ -26,8 +26,9 @@ RestartSec=5
 # the data file's limits, 7 and 70 a bug (NRV-B0003, NRV-B0004), 8 a data file imported from another
 # export (NRV-E0711). Exit 1 restarts: it is a flag or the data file, but also what a restart or a
 # boot can cure (a lock the dead process still held, NRV-E0703; a collector with no route yet,
-# NRV-E0010). A crash (a signal) or any other exit restarts too. Twenty starts in 300 s
-# (5 s apart, so about 100 s of retries after a boot) stop the unit (`failed`), whatever the
+# NRV-E0010). A crash (a signal) or any other exit restarts too. Twenty starts in 300 s are
+# allowed (the first and 19 restarts, 5 s apart: about 100 s of retries after a boot); the next
+# start is refused ("Start request repeated too quickly") and the unit stays `failed`, whatever the
 # exit: a permanent exit 1, or a crash loop faster than every 15 s, does not go on for ever.
 RestartPreventExitStatus=2 3 4 5 6 7 8 70
 LimitMEMLOCK=infinity

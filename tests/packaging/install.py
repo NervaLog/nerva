@@ -459,11 +459,21 @@ def test_restart_policy(tmp):
               f"NERVA_DATA_FILE={DATA}/missing-9.nerva\nNERVA_FLAGS=\n")
     assert systemctl("daemon-reload").returncode == 0
     try:
+        since = time.strftime("%Y-%m-%d %H:%M:%S")
         assert systemctl("start", unit).returncode == 0
         wait("the start limit stops the unit", lambda: show(unit, "ActiveState")["ActiveState"] == "failed")
-        state = show(unit, "Result", "ExecMainStatus", "NRestarts")
-        assert state["Result"] == "start-limit-hit", state
-        assert state["ExecMainStatus"] == "1" and int(state["NRestarts"]) >= 10, state
+        # systemd 255 leaves Result=exit-code here (the refused start is logged, not recorded as
+        # start-limit-hit), so the outcome is read from the states, the counts and the journal.
+        state = show(unit, "ActiveState", "SubState", "ExecMainStatus", "NRestarts")
+        assert state["SubState"] == "failed" and state["ExecMainStatus"] == "1", state
+        log = sh(["journalctl", "-u", unit, "--since", since, "--no-pager", "-o", "cat"]).stdout
+        # StartLimitBurst=20 allows 20 starts (the first and 19 restarts); the 20th restart job's
+        # start is refused.
+        assert log.count("Started nerva@9.service") == 20, log[-2000:]
+        assert "Start request repeated too quickly" in log, log[-2000:]
+        time.sleep(2)  # with RestartSec=100ms, a unit still restarting would have moved by now
+        again = show(unit, "ActiveState", "NRestarts")
+        assert again["ActiveState"] == "failed" and again["NRestarts"] == state["NRestarts"], (state, again)
     finally:
         shutil.rmtree(dropin)
         os.remove(f"{ETC}/replica-9.env")
@@ -598,7 +608,7 @@ def main():
         test_origin_mismatch(tmp, addresses, api)
         print("ok: a wrong-origin replica exits 8 and is not restarted")
         test_restart_policy(tmp)
-        print("ok: exit 1 restarts, and 20 starts in 300 s end as failed")
+        print("ok: exit 1 restarts, and the 21st start in 300 s is refused and the unit stays failed")
         test_upgrade_quiet_and_gateway(packaging, nerva, tmp, stage)
         print("ok: NRV-E1118 is quiet on a failed unit, and refuses for a gateway or a package's nerva")
         test_uninstall(stage)
