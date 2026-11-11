@@ -695,6 +695,58 @@ def step8(demo, a):
         f"first-time, {a.resent['replayed']} replayed")
 
 
+def say_records(records, stopped):
+    """Prints what each request answered after the stop was told: offsets from the stop in seconds
+    (negative: before it), `*` marks a request in flight at the stop (#347)."""
+    print("step 9 records answered after the stop (sent, answered, in flight, status, code, applied):",
+          file=sys.stderr)
+    for sent, answered, status, body in sorted(records, key=lambda r: r[1]):
+        if answered < stopped:
+            continue
+        flag = "*" if sent < stopped else " "
+        print(f"  {sent - stopped:+8.3f} {answered - stopped:+8.3f} {flag} {status} "
+              f"{body.get('code')} {body.get('applied')!r}", file=sys.stderr)
+
+
+def judge_stall(records, inflight, stopped):
+    """The answers to requests around the stop. Returns (worst wait, unknown, refused).
+
+    Which requests are in flight at the stop is a matter of timing: the gateway may have the
+    cluster's replies to a whole group in hand, answering 200 after the stop, and then every
+    request sent before it was settled (#347). What the stop decides is that the first call the
+    gateway sends to the stopped cluster times out, NRV-E0601, applied unknown; the callers keep
+    sending, so that call is made. A request refused applied false (NRV-E0605, E0602, E0606) is one
+    that was not sent, so no such refusal of a request that reached the cluster may exist: the
+    session only breaks by a timeout, which is E0601 first."""
+    worst = 0.0
+    unknown = 0
+    refused = 0
+    for sent, answered, status, body in inflight:
+        if status in (200, 409):  # Answered while the signals were still being delivered.
+            check(answered - stopped < 0.5, f"{status} answered {answered - stopped:.2f} s after the stop")
+            continue
+        # A request sent to the cluster is unknown (E0601); one still waiting to be sent is not.
+        check(status == 503 and (
+            (body.get("code") == "NRV-E0601" and body.get("applied") == "unknown")
+            or (body.get("code") in ("NRV-E0605", "NRV-E0602", "NRV-E0606") and body.get("applied") is False)),
+            (status, body))
+        unknown += body.get("applied") == "unknown"
+        refused += body.get("code") == "NRV-E0606"
+        worst = max(worst, answered - stopped)
+    after = sorted((r for r in records if r[1] > stopped and r[2] == 503), key=lambda r: r[1])
+    check(any(r[3].get("code") == "NRV-E0601" for r in after),
+          "after the stop, no request was answered unknown (NRV-E0601)")
+    first = min(r[1] for r in after if r[3].get("code") == "NRV-E0601")
+    for sent, answered, status, body in after:
+        # The replies of one group are written in a row, and the callers' threads wake in any
+        # order: 0.2 s is slack for that, not for a refusal that came first.
+        if body.get("code") != "NRV-E0602" and answered < first - 0.2:
+            check(False, f"answered {body.get('code')} {body.get('applied')!r} {first - answered:.2f} s "
+                  f"before any call to the stopped cluster timed out: {body}")
+    check(worst <= 4.0, f"an in-flight request waited {worst:.1f} s after the stop")
+    return worst, unknown, refused
+
+
 def step9(demo, a, b):
     started = time.monotonic()
     ga = demo.gateway_ports["A"]
@@ -768,24 +820,11 @@ def step9(demo, a, b):
         check(not thread.is_alive(), "a step 9 caller never finished")
     check(not errors, errors[:3])
     inflight = [r for r in records if r[0] < stopped < r[1]]  # Sent before, answered after.
-    check(inflight, "no request was in flight when the replicas stopped")
-    worst = 0.0
-    unknown = 0
-    refused = 0
-    for sent, answered, status, body in inflight:
-        if status in (200, 409):  # Answered while the signals were still being delivered.
-            check(answered - stopped < 0.5, f"{status} answered {answered - stopped:.2f} s after the stop")
-            continue
-        # A request sent to the cluster is unknown (E0601); one still waiting to be sent is not.
-        check(status == 503 and (
-            (body.get("code") == "NRV-E0601" and body.get("applied") == "unknown")
-            or (body.get("code") in ("NRV-E0605", "NRV-E0602", "NRV-E0606") and body.get("applied") is False)),
-            (status, body))
-        unknown += body.get("applied") == "unknown"
-        refused += body.get("code") == "NRV-E0606"
-        worst = max(worst, answered - stopped)
-    check(unknown > 0, "no in-flight request was answered unknown")
-    check(worst <= 4.0, f"an in-flight request waited {worst:.1f} s after the stop")
+    try:
+        worst, unknown, refused = judge_stall(records, inflight, stopped)
+    except StepFailed:
+        say_records(records, stopped)
+        raise
     for sent, answered, status, body in records:
         check(status in (200, 409) or (status == 503 and body.get("code") in
               ("NRV-E0601", "NRV-E0605", "NRV-E0602", "NRV-E0606")), (status, body))
