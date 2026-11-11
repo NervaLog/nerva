@@ -376,8 +376,10 @@ jobs:
   # and never pushes, and it writes to `zig-out/mac-release` (ignored by git). The hand-made lipo
   # binary stays as the smoke test's subject, so a break in either path shows separately. The
   # step's zip is then checked from outside: its checksum, its architectures, its signature, the
-  # version line and the smoke test. What it cannot run here is the Developer ID signature and
-  # notarization (`-Dnotarize=true`): CI holds no Apple secret.
+  # version line and the smoke test. The formula is checked only to exist: `brew install` and
+  # `brew test` run in `mac-verify.yml` on the published release, not here. What it cannot run
+  # here is the Developer ID signature and notarization (`-Dnotarize=true`): CI holds no Apple
+  # secret.
   macos-arm64:
     needs: changes
     if: ${{ !cancelled() }}
