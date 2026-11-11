@@ -94,7 +94,7 @@ real one.
 its secret in `X-Nerva-Key`.
 
 ```bash
-export NERVA_KEY=secret
+export NERVA_KEY=$(openssl rand -hex 32)
 "$NERVA" api --cluster=1 --addresses=3001,3002,3003 --listen=127.0.0.1:8080 > api.log 2>&1 &
 sleep 5
 n() { curl -s -H "X-Nerva-Key: $NERVA_KEY" "$@"; echo; }
