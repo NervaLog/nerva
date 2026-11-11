@@ -43,7 +43,8 @@ takes you from a download to three replicas, a gateway and a first commit.
   commented settings examples beside the binary. `sudo ./install.sh` installs the binary in
   `/usr/local/bin`, creates the `nerva` user, `/var/lib/nerva` and `/etc/nerva`, and installs the
   units. It formats, enables and starts nothing; `--dry-run` says what it would do. A refusal is
-  one coded line, NRV-E1101 to NRV-E1111.
+  one coded block (headline, cause, fix), NRV-E1101 to NRV-E1109; the packages refuse with
+  NRV-E1105 or NRV-E1111.
 - **Linux packages, new:** `nerva_0.7.1-1_amd64.deb`, `nerva_0.7.1-1_arm64.deb`,
   `nerva-0.7.1-1.x86_64.rpm` and `nerva-0.7.1-1.aarch64.rpm`, with the same binary, units and
   examples (the examples in `/usr/share/nerva`). **They are not signed** and there is no apt or

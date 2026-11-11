@@ -4,7 +4,7 @@ For someone who runs a Nerva cluster they did not build: how much machine it nee
 before production, how to back it up and prove the backup, how to upgrade, how to replace a
 replica, and what to alert on. It links to the README for the details and does not repeat them.
 
-Nerva is labelled toy / research (see the README's status line). This page is advice for running
+Nerva is alpha ([MATURITY.md](./MATURITY.md)). This page is advice for running
 it with that label, not a promise of anything the label does not give.
 
 **Recorded from.** Every output below was run by hand against the v0.7.1 candidate built from

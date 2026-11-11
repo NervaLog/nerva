@@ -11,7 +11,7 @@ your own replies ("Ops move on their own" in the
 [tutorial](./TUTORIAL.md#ops-move-on-their-own)). The three-machine half **was not run**: it needs
 three hosts and systemd, and every output in it is marked as not run. The release re-records both.
 
-Install first: [INSTALL.md](./INSTALL.md). Nerva is a research database; do not put in it data you
+Install first: [INSTALL.md](./INSTALL.md). Nerva is alpha ([MATURITY.md](./MATURITY.md)); do not put in it data you
 cannot lose.
 
 ## One machine
@@ -229,8 +229,7 @@ edit it; the file holds the key, so only root may read it. The example is in `/e
 ```bash
 EX=/etc/nerva/replica.env.example               # after install.sh
 EX=/usr/share/nerva/replica.env.example         # after a .deb or .rpm
-sudo cp "$EX" /etc/nerva/replica-0.env
-sudo chown root:root /etc/nerva/replica-0.env && sudo chmod 0600 /etc/nerva/replica-0.env
+sudo install -m 0600 -o root -g root "$EX" /etc/nerva/replica-0.env
 sudoedit /etc/nerva/replica-0.env
 ```
 ```
