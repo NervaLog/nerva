@@ -117,7 +117,7 @@ The README's first line no longer says "toy / research": it gives the label and 
   lookup, the change feed) and the unit tests on Apple silicon (#293). `zig build -Drelease
   mac-release` builds, signs, zips and notarizes the universal binary and writes the Homebrew
   formula (#291). CI runs it on a Mac, ad hoc and not notarized (`-Dsign-identity=-`), and checks
-  its zip (#315); the Developer ID signature and the notarization run only on the owner's Mac.
+  its zip (#315); the Developer ID signature and the notarization run in the release workflow, behind an environment the owner approves (`mac-sign.yml`).
 - **#271:** the release workflow did not check that the binary it publishes deduplicates commit
   keys. It now refuses a binary built with `-Dtest-commit-keys=off`, and checks that the
   `version` line matches the release (#311).
@@ -140,8 +140,9 @@ is not in yet.
   `bank` valid, kill and partition nemeses, with its link).
 - **Two adversarial reviews** (P147b): **TO FILL** (each reviewer's verdict, and its
   `release-review` issues).
-- **macOS:** the owner builds, signs and notarizes the zip on a Mac and uploads it to the draft
-  release. The `mac-verify` workflow then checks it on Apple silicon and on Intel: the zip against
+- **macOS:** the release workflow's Mac job (`mac-sign.yml`) signs and notarizes the zip after the
+  owner approves the `apple-signing` environment, and uploads it to the draft release; the owner's
+  Mac is the fallback. The `mac-verify` workflow then checks it on Apple silicon and on Intel: the zip against
   its checksum, the binary's version and commit, its Developer ID signature, hardened runtime and
   secure timestamp, and the smoke test; it is run on the draft before publishing, and once the
   release is published its run also does `brew install nervalog/tap/nerva && brew test nerva`.
