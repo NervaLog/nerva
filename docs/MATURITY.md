@@ -12,8 +12,8 @@ promises below are all there are.
 
 - **Within v0.7.x, a newer release is meant to open an older one's data files in place.**
   Upgrade every replica before any gateway (P260). v0.7.1 is meant to change no protocol, data
-  file or state machine format (P284), and slice 7's release audit (to be filled in; it does
-  not exist yet) is what confirms that and checks each such upgrade path. Downgrades are not
+  file or state machine format (P284), and its [release audit](./releases/v0.7.1-audit.md)
+  confirms that and runs v0.7.0 and v0.7.1 side by side, in both directions (P275). Downgrades are not
   promised. v0.6.1, v0.7.0 and v0.7.1 share release `0.0.6` and so one cluster, which is why
   the order matters (#272).
 - **The next protocol release moves by export and import.** The first release that ships rolling
@@ -47,9 +47,12 @@ promises below are all there are.
 
 ## What was tested for this release
 
-_Not filled in yet. The release slice (slice 7 of v0.7.1) fills this section in at release from
-the release commit: the simulation fleet's tracker line, the Jepsen night's result and the two
-reviewers' verdicts. Until then this section holds no numbers._
+Each release's notes say what was tested for it, on the commit it was built from: the
+simulation fleet's soak, the Jepsen night, the two adversarial reviews and their issues, the
+release audit and the macOS check. For this release, read
+[What was tested](../CHANGELOG.md#what-was-tested) in v0.7.1's section of the changelog, which
+is also its GitHub release notes. This page keeps no numbers of its own, so it cannot disagree
+with them (P312).
 
 ## Support
 
