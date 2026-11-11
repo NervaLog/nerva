@@ -154,9 +154,11 @@ jobs:
         if: needs.changes.outputs.code != 'false'
         run: .github/scripts/docs_only_test.sh
 
-      - name: Release scripts (the bill of materials, N63)
+      - name: Release scripts (the bill of materials, N63; the refusals, NRV-E1112 to E1115)
         if: needs.changes.outputs.code != 'false'
-        run: python3 .github/scripts/test_sbom.py
+        run: |
+          python3 .github/scripts/test_sbom.py
+          python3 .github/scripts/test_release_check.py
 
       - name: Nightly perf scripts (the comparison, its issues)
         if: needs.changes.outputs.code != 'false'

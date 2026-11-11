@@ -896,6 +896,9 @@ fn version_write(writer: anytype, verbose: bool) !void {
     } else {
         try writer.writeAll("commit none\n");
     }
+    // Last, so that the lines before it keep their places. release.yml refuses a binary without
+    // `commit_keys deduplicate` (#271): the test build `-Dtest-commit-keys=off` is never shipped.
+    try writer.print("commit_keys {s}\n", .{if (commit_keys_deduplicate) "deduplicate" else "off"});
 }
 
 fn command_view(gpa: std.mem.Allocator, args: *const cli.Command.View) !void {

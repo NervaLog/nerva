@@ -246,6 +246,8 @@ def main():
         version_off = run(nerva_off, ["version"])
         assert version_off.returncode == 0 and \
             version_off.stdout.splitlines()[0].endswith("+keys-off"), version_off.stdout
+        verbose_off = run(nerva_off, ["version", "--verbose"])
+        assert verbose_off.stdout.splitlines()[-1] == "commit_keys off", verbose_off.stdout
         # `version`'s text (R6): the first line is the one the release workflow reads; then what
         # an upgrade compares. No binary bundles a past release yet (slice 3).
         for binary_run in (version, version_off):
@@ -264,8 +266,9 @@ def main():
         lines = verbose.stdout.splitlines()
         assert lines[:6] == version.stdout.splitlines(), verbose.stdout
         assert lines[6:8] == ["format_epoch 1", "superblock_version 2"], verbose.stdout
-        assert re.fullmatch(r"commit ([0-9a-f]{40}|none)", lines[8]) and len(lines) == 9, \
+        assert re.fullmatch(r"commit ([0-9a-f]{40}|none)", lines[8]) and len(lines) == 10, \
             verbose.stdout
+        assert lines[9] == "commit_keys deduplicate", verbose.stdout
         before = sha(data)
         check("start keys off without development",
               ["start", "--addresses=127.0.0.1:1,127.0.0.1:2,127.0.0.1:3", data],
