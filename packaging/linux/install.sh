@@ -156,27 +156,38 @@ for unit in $units; do
     fi
 done
 sum_of() { sha256sum "$1" | cut -d' ' -f1; }
-if [ "$uninstall" = 0 ] && [ -e "$bin_dir/nerva" ]; then
-    if [ "$(sum_of "$bin_dir/nerva")" != "$(sum_of "$here/nerva")" ]; then
-        if [ "$upgrade" = 0 ]; then
-            installed=$("$bin_dir/nerva" version 2> /dev/null | head -n1 || true)
-            refuse 1 NRV-E1103 "$bin_dir/nerva is a different build (${installed:-unknown})" \
-                "A different nerva is already installed" \
-                "pass --upgrade to replace it with this one (stop the replicas first, then restart them)"
-        fi
-        # A replica that restarts runs the new binary: a cluster of two releases, or NRV-E0701 across
-        # a protocol release. Units still starting or stopping count as running.
-        running=$(systemctl list-units --plain --no-legend --state=active,activating,deactivating,reloading \
-            'nerva@*.service' 'nerva-api@*.service' 2> /dev/null | cut -d' ' -f1 | tr '\n' ' ' || true)
-        if [ -n "${running% }" ]; then
-            refuse 1 NRV-E1118 "--upgrade while units are running: ${running% }" \
-                "install.sh --upgrade found a replica or gateway unit running, and would replace the nerva it executes" \
-                "stop them (systemctl stop 'nerva@*' 'nerva-api@*'), run install.sh --upgrade again, then start them; across a protocol release upgrade by export and import (README, Upgrading a cluster)"
-        fi
+if [ "$uninstall" = 0 ] && [ -e "$bin_dir/nerva" ] &&
+    [ "$(sum_of "$bin_dir/nerva")" != "$(sum_of "$here/nerva")" ] && [ "$upgrade" = 0 ]; then
+    installed=$("$bin_dir/nerva" version 2> /dev/null | head -n1 || true)
+    refuse 1 NRV-E1103 "$bin_dir/nerva is a different build (${installed:-unknown})" \
+        "A different nerva is already installed" \
+        "pass --upgrade to replace it with this one (stop the replicas first, then restart them)"
+fi
+# The nerva the units run now: $bin_dir's, else a package's (the units find $bin_dir first). Putting
+# a different one first means a replica that restarts runs the new binary: a cluster of two
+# releases, or NRV-E0701 across a protocol release. Units still starting or stopping count as
+# running. A unit started after this check and before the install is not seen.
+current=
+if [ -e "$bin_dir/nerva" ]; then
+    current=$bin_dir/nerva
+elif [ -e /usr/bin/nerva ]; then
+    current=/usr/bin/nerva
+fi
+if [ "$uninstall" = 0 ] && [ -n "$current" ] && [ "$(sum_of "$current")" != "$(sum_of "$here/nerva")" ]; then
+    list=$(systemctl list-units --plain --no-legend --state=active,activating,deactivating,reloading \
+        'nerva@*.service' 'nerva-api@*.service' 2> /dev/null) || refuse 2 NRV-E1102 \
+        "systemctl could not list the nerva units, so a running replica would not be seen" \
+        "The installer found no running systemd" \
+        "run systemctl list-units 'nerva@*' to see why it fails (no bus, or a chroot), then run install.sh again"
+    running=$(printf '%s\n' "$list" | cut -d' ' -f1 | tr '\n' ' ')
+    if [ -n "${running% }" ]; then
+        refuse 1 NRV-E1118 "an install over $current while units are running: ${running% }" \
+            "install.sh found a replica or gateway unit running, and would replace the nerva it executes" \
+            "stop them (systemctl stop 'nerva@*' 'nerva-api@*'), run install.sh again (--upgrade over a tarball install), then start them; across a protocol release upgrade by export and import (README, Upgrading a cluster)"
     fi
 fi
 if [ "$uninstall" = 0 ] && [ -e /usr/bin/nerva ]; then
-    printf 'warning[NRV-W1102]: install.sh: /usr/bin/nerva exists and %s/nerva shadows it\n  cause  %s comes before /usr/bin on the path, and the units run nerva by name, so a package'"'"'s nerva is not the one that runs\n  fix    remove the package (apt remove nerva, or dnf remove nerva) and keep this install, or run install.sh --uninstall and use the package\n' \
+    printf 'warning[NRV-W1102]: install.sh: /usr/bin/nerva exists and %s/nerva shadows it\n  cause  install.sh found a package'"'"'s /usr/bin/nerva, which the tarball'"'"'s %s/nerva shadows\n  fix    leave the package installed (removing it, or install.sh --uninstall, disables the enabled nerva@N and nerva-api@N instances, so none starts at the next boot; run systemctl enable for each again after either)\n' \
         "$bin_dir" "$bin_dir" >&2
 fi
 

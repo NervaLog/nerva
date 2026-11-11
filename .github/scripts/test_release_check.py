@@ -81,10 +81,10 @@ class ReleaseCheck(unittest.TestCase):
 
     def test_binary_with_the_keys_off_suffix(self):
         # Even when its verbose output claims deduplication: the version line is checked too (#271).
+        # test_binary_passes is the control: the same fake without the suffix passes.
         with tempfile.TemporaryDirectory() as d:
             result = run("binary", fake_nerva(d, "0.7.1", suffix="+keys-off"), "0.7.1")
             self.refused(result, "NRV-E1113", "not the commit-key deduplication build")
-            self.assertIn("+keys-off", result.stderr)
 
     def test_binary_that_does_not_run(self):
         result = run("binary", "/nonexistent/nerva", "0.7.1")

@@ -17,7 +17,10 @@ tarball's contents, then checks, against the real units:
      replica 2 commits while replica 0 is stopped);
   5. a replica imported from another export than its peers exits 8 (NRV-E0711) and systemd does not
      restart it;
-  5b. `--upgrade` while the units run is refused with NRV-E1118 (also with --dry-run);
+  5b. `--upgrade` while the units run is refused with NRV-E1118 (also with --dry-run), and with a
+      systemctl that cannot list them (NRV-E1102); not with only a failed unit; with only the gateway
+      running; over a package's /usr/bin/nerva;
+  5c. the unit restarts exit 1 (NRestarts), and its start limit ends the loop as `failed`;
   6. `install.sh --uninstall` removes the binary, the units and the enable links of the instances
      that were enabled, and leaves /var/lib/nerva.
 Not provoked: a `nerva` on a noexec mount (a script that exits 1 stands for it in NRV-E1107).
@@ -307,8 +310,15 @@ def test_refusals(packaging, nerva, tmp, stage):
     with open(f"{fake}/id", "w") as f:
         f.write("#!/bin/sh\necho 1000\n")
     os.chmod(f"{fake}/id", 0o755)
-    trusted = sh(["sh", f"{stage}/install.sh", "--dry-run"], env={"PATH": fake + ":/usr/bin:/bin", "CDPATH": "/"})
+    trusted = sh(["sh", f"{stage}/install.sh", "--dry-run"], env={"PATH": fake + ":/usr/bin:/bin"})
     assert trusted.returncode == 0 and "nothing was changed" in trusted.stdout, (trusted.stdout, trusted.stderr)
+    # Nor is CDPATH: run by a relative path, `cd stage` would search it first (and print where it
+    # went), and find the empty directory of that name there.
+    decoy = os.path.join(tmp, "cdpath")
+    os.makedirs(os.path.join(decoy, os.path.basename(stage)))
+    relative = sh(["sh", f"{os.path.basename(stage)}/install.sh", "--dry-run"], cwd=tmp,
+                  env={"PATH": "/usr/bin:/bin", "CDPATH": decoy})
+    assert relative.returncode == 0 and "nothing was changed" in relative.stdout, (relative.stdout, relative.stderr)
     # A dry run does not chmod the tarball's nerva (and says it cannot run it).
     plain = stage_tarball(packaging, nerva, tmp, "plain")
     os.chmod(f"{plain}/nerva", 0o644)
@@ -377,12 +387,83 @@ def test_upgrade_while_running(packaging, nerva, tmp, stage):
     before = snapshot()
     for args in ([ "--upgrade"], ["--upgrade", "--dry-run"]):
         result = installer(other, *args, expect=1)
-        refused(result, 1, "NRV-E1118", "install.sh --upgrade found a replica or gateway unit running, "
+        refused(result, 1, "NRV-E1118", "install.sh found a replica or gateway unit running, "
                 "and would replace the nerva it executes")
         assert "nerva@0.service" in result.stderr and "nerva-api@0.service" in result.stderr, result.stderr
     assert snapshot() == before and sha256(BIN) == sha256(f"{stage}/nerva")
     # The same nerva is no replacement: nothing to refuse.
     assert "installed:" in installer(stage, "--upgrade").stdout
+    # A systemctl that cannot list the units: the check cannot tell, so it refuses (exit 2).
+    program = os.path.realpath(shutil.which("systemctl"))
+    stub = os.path.join(tmp, "systemctl-stub")
+    with open(stub, "w") as f:
+        f.write("#!/bin/sh\necho 'Failed to connect to bus' >&2\nexit 1\n")
+    os.chmod(stub, 0o755)
+    broken = sh(["unshare", "-m", "sh", "-c",
+                 f"mount --bind {stub} {program} && exec sh {other}/install.sh --upgrade --dry-run"])
+    refused(broken, 2, "NRV-E1102", "The installer found no running systemd")
+    assert "could not list the nerva units" in broken.stderr, broken.stderr
+    assert os.access(program, os.X_OK) and sh([program, "--version"]).returncode == 0, "the stub leaked"
+
+
+def test_upgrade_quiet_and_gateway(packaging, nerva, tmp, stage):
+    """E1118 is quiet on a failed unit, refuses with only the gateway running, and covers a package's
+    /usr/bin/nerva. Everything is --dry-run: no state changes."""
+    other = stage_tarball(packaging, nerva, tmp, "other-quiet", extra=b"\0")
+    assert show("nerva@9", "ActiveState")["ActiveState"] == "failed", "test_restart_policy leaves nerva@9 failed"
+    assert "nothing was changed" in installer(other, "--upgrade", "--dry-run").stdout
+    assert systemctl("start", "nerva-api@0").returncode == 0
+    try:
+        wait("the gateway is activating or active",
+             lambda: show("nerva-api@0", "ActiveState")["ActiveState"] in ("active", "activating"))
+        result = installer(other, "--upgrade", "--dry-run", expect=1)
+        refused(result, 1, "NRV-E1118", "install.sh found a replica or gateway unit running, "
+                "and would replace the nerva it executes")
+        assert result.stderr.split("\n")[0].endswith("units are running: nerva-api@0.service"), result.stderr
+        # No tarball install, a package's /usr/bin/nerva that differs: the units would run the
+        # tarball's nerva from /usr/local/bin first, so a running unit refuses without --upgrade.
+        assert not os.path.exists("/usr/bin/nerva")
+        os.rename(BIN, f"{tmp}/nerva.saved")
+        shutil.copy(f"{tmp}/nerva.saved", "/usr/bin/nerva")
+        with open("/usr/bin/nerva", "ab") as f:
+            f.write(b"\0")
+        try:
+            result = installer(stage, "--dry-run", expect=1)
+            refused(result, 1, "NRV-E1118", "install.sh found a replica or gateway unit running, "
+                    "and would replace the nerva it executes")
+            assert "over /usr/bin/nerva" in result.stderr, result.stderr
+        finally:
+            os.remove("/usr/bin/nerva")
+            os.rename(f"{tmp}/nerva.saved", BIN)
+    finally:
+        assert systemctl("stop", "nerva-api@0").returncode == 0
+
+
+def test_restart_policy(tmp):
+    """The unit's restart policy under systemd: exit 1 restarts, and a start limit ends it."""
+    unit = "nerva@9"
+    shipped = show(unit, "StartLimitBurst", "StartLimitIntervalUSec", "RestartUSec", "Restart")
+    assert shipped == {"StartLimitBurst": "20", "StartLimitIntervalUSec": "5min", "RestartUSec": "5s",
+                       "Restart": "on-failure"}, shipped
+    # A data file that does not exist is exit 1 (NRV-E0006). Only the delay is shortened here.
+    dropin = f"{UNIT_DIR}/{unit}.service.d"
+    os.makedirs(dropin)
+    write_env(f"{dropin}/fast.conf", "[Service]\nRestartSec=100ms\n")
+    os.chmod(f"{dropin}/fast.conf", 0o644)
+    write_env(f"{ETC}/replica-9.env",
+              f"NERVA_ADDRESSES=127.0.0.1:1\nNERVA_CLUSTER_KEY={CLUSTER_KEY}\n"
+              f"NERVA_DATA_FILE={DATA}/missing-9.nerva\nNERVA_FLAGS=\n")
+    assert systemctl("daemon-reload").returncode == 0
+    try:
+        assert systemctl("start", unit).returncode == 0
+        wait("the start limit stops the unit", lambda: show(unit, "ActiveState")["ActiveState"] == "failed")
+        state = show(unit, "Result", "ExecMainStatus", "NRestarts")
+        assert state["Result"] == "start-limit-hit", state
+        assert state["ExecMainStatus"] == "1" and int(state["NRestarts"]) >= 10, state
+    finally:
+        shutil.rmtree(dropin)
+        os.remove(f"{ETC}/replica-9.env")
+        assert systemctl("daemon-reload").returncode == 0
 
 
 def test_cluster(tmp):
@@ -457,7 +538,7 @@ def test_origin_mismatch(tmp, addresses, api):
     for index in range(3):
         assert systemctl("start", f"nerva@{index}").returncode == 0
     wait("replica 0 stops", lambda: show("nerva@0", "ActiveState")["ActiveState"] == "failed")
-    time.sleep(5)  # Longer than RestartSec: a restart would show by now.
+    time.sleep(8)  # Longer than RestartSec (5 s): a restart would show by now.
     state = show("nerva@0", "ActiveState", "Result", "ExecMainStatus", "NRestarts")
     assert state["ActiveState"] == "failed" and state["Result"] == "exit-code", state
     assert int(state["ExecMainStatus"]) == STATUS_ORIGIN_MISMATCH, state
@@ -512,6 +593,10 @@ def main():
         print("ok: --upgrade while the units run is refused with NRV-E1118")
         test_origin_mismatch(tmp, addresses, api)
         print("ok: a wrong-origin replica exits 8 and is not restarted")
+        test_restart_policy(tmp)
+        print("ok: exit 1 restarts, and 20 starts in 300 s end as failed")
+        test_upgrade_quiet_and_gateway(packaging, nerva, tmp, stage)
+        print("ok: NRV-E1118 is quiet on a failed unit, and refuses for a gateway or a package's nerva")
         test_uninstall(stage)
         print("ok: --uninstall removes the enable links and leaves /var/lib/nerva")
         print(f"packaging: PASS in {time.monotonic() - started:.0f} s")

@@ -9,8 +9,8 @@ Description=Nerva replica %i
 Documentation=https://github.com/NervaLog/nerva
 After=network-online.target
 Wants=network-online.target
-StartLimitIntervalSec=60
-StartLimitBurst=10
+StartLimitIntervalSec=300
+StartLimitBurst=20
 
 [Service]
 Type=exec
@@ -21,13 +21,14 @@ EnvironmentFile=/etc/nerva/replica-%i.env
 # packages. $NERVA_FLAGS splits on spaces; ${NERVA_ADDRESSES} and ${NERVA_DATA_FILE} do not.
 ExecStart=nerva start --addresses=${NERVA_ADDRESSES} $NERVA_FLAGS ${NERVA_DATA_FILE}
 Restart=on-failure
-RestartSec=1
+RestartSec=5
 # A restart cannot fix these `nerva start` exits (docs/ERRORS.md): 2 the disk or the kernel, 3 to 6
 # the data file's limits, 7 and 70 a bug (NRV-B0003, NRV-B0004), 8 a data file imported from another
 # export (NRV-E0711). Exit 1 restarts: it is a flag or the data file, but also what a restart or a
 # boot can cure (a lock the dead process still held, NRV-E0703; a collector with no route yet,
-# NRV-E0010). A crash (a signal) or any other exit restarts too. Ten starts in 60 s stop the unit
-# (`failed`), so a permanent exit 1 does not loop for ever.
+# NRV-E0010). A crash (a signal) or any other exit restarts too. Twenty starts in 300 s
+# (5 s apart, so about 100 s of retries after a boot) stop the unit (`failed`), whatever the
+# exit: a permanent exit 1, or a crash loop faster than every 15 s, does not go on for ever.
 RestartPreventExitStatus=2 3 4 5 6 7 8 70
 LimitMEMLOCK=infinity
 LimitNOFILE=65536
