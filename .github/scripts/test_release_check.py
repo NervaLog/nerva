@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for release_check.sh (NRV-E1112 to NRV-E1116, and mac-draft: NRV-E1119, NRV-E1120) and release_notes.sh (NRV-E1117). Run from the repository root:
+"""Tests for release_check.sh (NRV-E1112 to NRV-E1116, and mac-draft: NRV-E1119, NRV-E1120, NRV-E1122 to NRV-E1124) and release_notes.sh (NRV-E1117). Run from the repository root:
 python3 .github/scripts/test_release_check.py
 
 A stand-in `nerva` and a stand-in `gh` (a script that answers from files) stand for the real two."""
@@ -136,7 +136,8 @@ class ReleaseCheck(unittest.TestCase):
                          "does not hold the assets that were built")
 
 
-def fake_gh_draft(directory, releases="true\tabc1234", version="0.7.1", status="ahead"):
+def fake_gh_draft(directory, releases="true\tabc1234", version="0.7.1", status="ahead",
+                  commit_fails=False, version_fails=False):
     """The calls `mac-draft` makes: the releases list (`releases`, the tab-separated line a real --jq
     prints, or "" for none), the commit a target resolves to, VERSION at that commit, and the compare
     status against main."""
@@ -144,8 +145,8 @@ def fake_gh_draft(directory, releases="true\tabc1234", version="0.7.1", status="
     path.write_text(f"""#!/bin/sh
 case "$*" in
   *select*) [ -n "{releases}" ] && printf '{releases}\\n' ;;
-  *commits/*) echo 0123456789abcdef0123456789abcdef01234567 ;;
-  *contents/VERSION*) echo "{version}" ;;
+  *commits/*) {'echo "gh: Not Found (HTTP 404)" >&2; exit 1' if commit_fails else "echo 0123456789abcdef0123456789abcdef01234567"} ;;
+  *contents/VERSION*) {'echo "gh: Not Found (HTTP 404)" >&2; exit 1' if version_fails else f'echo "{version}"'} ;;
   *compare/*) echo "{status}" ;;
 esac
 exit 0
@@ -186,19 +187,31 @@ class MacDraft(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             for status in ("diverged", "behind"):
                 fake_gh_draft(d, status=status)
-                self.refused(run("mac-draft", "v0.7.1", path_dir=d), "NRV-E1116", "which is not on main")
+                self.refused(run("mac-draft", "v0.7.1", path_dir=d), "NRV-E1124", "which is not on main")
             fake_gh_draft(d, version="0.7.1-rc.1", status="diverged")
             self.assertEqual(run("mac-draft", "v0.7.1-rc.1", path_dir=d).returncode, 0)
 
-    def test_a_tag_that_is_not_a_version_is_a_misuse(self):
-        result = run("mac-draft", "main")
-        self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertIn("not a release tag", result.stderr)
+    def test_a_tag_that_is_not_v_version_is_refused(self):
+        for tag in ("main", "0.7.1", "v0.7.1 "):
+            result = run("mac-draft", tag)
+            self.refused(result, "NRV-E1123", f"'{tag}' is not a release tag v<VERSION>")
+
+    def test_a_target_or_version_that_cannot_be_read_is_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            fake_gh_draft(d, commit_fails=True)
+            self.refused(run("mac-draft", "v0.7.1", path_dir=d), "NRV-E1122",
+                         "cannot read the commit abc1234 that the draft v0.7.1 targets")
+            fake_gh_draft(d, version_fails=True)
+            result = run("mac-draft", "v0.7.1", path_dir=d)
+            self.refused(result, "NRV-E1122", "cannot read VERSION at 0123456")
+            self.assertNotIn("HTTP 404", result.stderr)
 
     def test_the_workflow_checks_the_draft_before_the_secrets_and_again_before_the_upload(self):
         workflow = (ROOT / ".github/workflows/mac-sign.yml").read_text()
         call = 'mac-draft "$TAG")'
-        keychain = workflow.index("run: .github/scripts/mac_keychain.sh create")
+        self.assertNotIn(".github/scripts/release_check.sh mac-draft", workflow)
+        self.assertNotIn(".github/scripts/mac_keychain.sh", workflow.split("steps:")[1])
+        keychain = workflow.index('"$RUNNER_TEMP/wf/mac_keychain.sh" create')
         upload = workflow.index('gh release upload "$TAG"')
         self.assertEqual(workflow.count(call), 2)
         self.assertLess(workflow.index(call), keychain)

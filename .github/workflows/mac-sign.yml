@@ -5,10 +5,13 @@
 # reviewer and `main` as its only deployment branch.
 #
 # The owner approves every run; the environment's secrets reach only the "Create the signing
-# keychain" step, which hands them to .github/scripts/mac_keychain.sh (slice A1) and nothing else.
+# keychain" step, which hands them to mac_keychain.sh (slice A1) and nothing else. That script and
+# release_check.sh are fetched from the workflow's own ref ($GITHUB_SHA, main for an approved run),
+# never from the draft's target. The target's `zig build` still runs with the keychain unlocked:
+# approving a prerelease approves that commit's build.zig (P343).
 # mac-release then reads the keychain, never a secret. The signed commit is the one the draft
 # targets, never the workflow's ref; the draft is checked before any secret is unlocked
-# (release_check.sh mac-draft: NRV-E1119, NRV-E1120, NRV-E1116) and again before the upload. A
+# (release_check.sh mac-draft: NRV-E1119, NRV-E1120, NRV-E1122, NRV-E1123, NRV-E1124) and again before the upload. A
 # re-run replaces an unpublished zip and nothing else. No cache; every action is pinned by SHA.
 name: Mac sign
 
@@ -49,13 +52,18 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -eu
-          # release_check.sh is on the workflow's ref, and the target commit is not checked out yet.
-          # The script needs only gh and GITHUB_REPOSITORY, so fetch this one file from the ref.
-          gh api -H "Accept: application/vnd.github.raw" \
-            "repos/$GITHUB_REPOSITORY/contents/.github/scripts/release_check.sh?ref=$GITHUB_SHA" \
-            > "$RUNNER_TEMP/release_check.sh"
-          chmod +x "$RUNNER_TEMP/release_check.sh"
-          commit=$("$RUNNER_TEMP/release_check.sh" mac-draft "$TAG")
+          # The code that sees the secrets or judges the draft comes from the workflow's own ref
+          # (main: the environment's deployment rule), never from the draft's target, which for a
+          # prerelease can be any commit. Fetch both scripts from $GITHUB_SHA into $RUNNER_TEMP/wf;
+          # the target is checked out after, and its copies of them are never run.
+          mkdir "$RUNNER_TEMP/wf"
+          for f in release_check.sh mac_keychain.sh; do
+            gh api -H "Accept: application/vnd.github.raw" \
+              "repos/$GITHUB_REPOSITORY/contents/.github/scripts/$f?ref=$GITHUB_SHA" \
+              > "$RUNNER_TEMP/wf/$f"
+            chmod +x "$RUNNER_TEMP/wf/$f"
+          done
+          commit=$("$RUNNER_TEMP/wf/release_check.sh" mac-draft "$TAG")
           echo "commit=$commit" >> "$GITHUB_OUTPUT"
           echo "$TAG is a draft targeting $commit"
 
@@ -68,13 +76,15 @@ jobs:
         run: ./zig/download.sh
 
       - name: Create the signing keychain
+        id: keychain
         env:
           APPLE_DEVELOPER_ID_P12: ${{ secrets.APPLE_DEVELOPER_ID_P12 }}
           APPLE_DEVELOPER_ID_P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_P12_PASSWORD }}
           APPLE_NOTARY_KEY_P8: ${{ secrets.APPLE_NOTARY_KEY_P8 }}
           APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
           APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
-        run: .github/scripts/mac_keychain.sh create
+        run: |
+          "$RUNNER_TEMP/wf/mac_keychain.sh" create
 
       - name: mac-release, Developer ID and notarized
         env:
@@ -112,8 +122,10 @@ jobs:
           COMMIT: ${{ steps.draft.outputs.commit }}
         run: |
           set -eu
-          # Still a draft, still the same commit: --clobber replaces only an unpublished zip.
-          again=$(.github/scripts/release_check.sh mac-draft "$TAG")
+          # Still a draft, still the same commit: --clobber replaces only an unpublished zip. A
+          # publish in the seconds between this check and the upload is the owner's act, made only
+          # after a green run, so it is not guarded.
+          again=$("$RUNNER_TEMP/wf/release_check.sh" mac-draft "$TAG")
           if [ "$again" != "$COMMIT" ]; then
             echo "::error::the draft $TAG now targets $again, not $COMMIT, which was signed"
             exit 1
@@ -129,5 +141,6 @@ jobs:
           retention-days: 90
 
       - name: Destroy the keychain
-        if: always()
-        run: .github/scripts/mac_keychain.sh destroy
+        if: always() && steps.keychain.outcome != 'skipped'
+        run: |
+          "$RUNNER_TEMP/wf/mac_keychain.sh" destroy

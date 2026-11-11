@@ -8,6 +8,7 @@
 #   release_check.sh binary <nerva> <version>  <version> is VERSION's text, without the v
 #   release_check.sh assets <tag> <dist-dir>   needs gh, GH_TOKEN and GITHUB_REPOSITORY
 #   release_check.sh mac-draft <tag>           needs gh, GH_TOKEN and GITHUB_REPOSITORY; prints the commit
+#                                              (prints mac-sign.yml: NRV-E1119, E1120, E1122, E1123, E1124)
 #
 # `ref` refuses a version without a suffix (a release, not a prerelease) from any ref but
 # refs/heads/main (NRV-E1116): a dispatch from a branch would draft a release that targets a commit
@@ -90,11 +91,15 @@ case "${1:-}" in
     tag=${2:?usage: release_check.sh mac-draft <tag>}
     where=mac-sign.yml
     if ! [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
-      echo "release_check.sh: '$tag' is not a release tag (v<VERSION>)" >&2
+      refuse NRV-E1123 "'$tag' is not a release tag v<VERSION>" \
+        "the tag input must be v followed by the version (v0.7.1, v0.7.1-rc.1), with no space or other text" \
+        "dispatch again with the draft's tag, as the releases page names it"
+    fi
+    if ! found=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases" \
+      --jq ".[] | select(.tag_name == \"$tag\") | [.draft, .target_commitish] | @tsv" 2> /dev/null | head -n1); then
+      echo "release_check.sh: cannot list the releases of $GITHUB_REPOSITORY (GitHub did not answer); run again" >&2
       exit 2
     fi
-    found=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases" \
-      --jq ".[] | select(.tag_name == \"$tag\") | [.draft, .target_commitish] | @tsv" | head -n1)
     if [[ -z "$found" ]]; then
       refuse NRV-E1119 "there is no draft release named $tag to sign into" \
         "release.yml did not make it, or it was deleted" \
@@ -106,13 +111,17 @@ case "${1:-}" in
         "to correct a published release, cut the next version"
     fi
     target=${found#*$'\t'}
-    commit=$(gh api "repos/$GITHUB_REPOSITORY/commits/$target" --jq .sha)
-    if [[ -z "$commit" ]]; then
-      echo "release_check.sh: cannot resolve $tag's target '$target' to a commit" >&2
-      exit 2
+    if ! commit=$(gh api "repos/$GITHUB_REPOSITORY/commits/$target" --jq .sha 2> /dev/null) || [[ -z "$commit" ]]; then
+      refuse NRV-E1122 "cannot read the commit $target that the draft $tag targets" \
+        "the commit or branch no longer exists (a deleted branch), or GitHub did not answer" \
+        "if the target is gone, delete the draft (gh release delete $tag) and run release.yml on the VERSION commit; otherwise run again"
     fi
-    version=$(gh api -H "Accept: application/vnd.github.raw" \
-      "repos/$GITHUB_REPOSITORY/contents/VERSION?ref=$commit" | head -n1 | tr -d '[:space:]')
+    if ! version=$(gh api -H "Accept: application/vnd.github.raw" \
+      "repos/$GITHUB_REPOSITORY/contents/VERSION?ref=$commit" 2> /dev/null | head -n1 | tr -d '[:space:]'); then
+      refuse NRV-E1122 "cannot read VERSION at ${commit:0:7}, the commit the draft $tag targets" \
+        "the commit has no VERSION file, or GitHub did not answer" \
+        "if the commit has no VERSION, delete the draft (gh release delete $tag) and run release.yml on the VERSION commit; otherwise run again"
+    fi
     if [[ "$version" != "${tag#v}" ]]; then
       refuse NRV-E1120 "the draft $tag targets ${commit:0:7}, whose VERSION is '${version:-none}', not ${tag#v}" \
         "the draft was made from another commit than the VERSION commit, or the tag was mistyped" \
@@ -121,7 +130,7 @@ case "${1:-}" in
     if [[ "$tag" != *-* ]]; then
       status=$(gh api "repos/$GITHUB_REPOSITORY/compare/$commit...main" --jq .status)
       if [[ "$status" != ahead && "$status" != identical ]]; then
-        refuse NRV-E1116 "$tag is a release, and its draft targets ${commit:0:7}, which is not on main" \
+        refuse NRV-E1124 "$tag is a release, and its draft targets ${commit:0:7}, which is not on main" \
           "a release is cut only from a main commit (P147b)" \
           "delete the draft (gh release delete $tag) and run release.yml on main"
       fi
