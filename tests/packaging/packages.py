@@ -150,6 +150,53 @@ def check_prerelease(repo, binaries, tmp, epoch):
     print("  a prerelease builds as N.N.N~suffix in files named N.N.N.suffix; a bad suffix is refused")
 
 
+def check_setup_modes(repo, tmp):
+    """The NRV-E1111 check of package-setup.sh runs on a first install only (#319): a copy with its
+    paths moved under a scratch directory and the tools it calls stubbed, run with the arguments dpkg
+    and rpm pass. Runs here, with no container."""
+    root = f"{tmp}/modes"
+    os.makedirs(f"{root}/bin")
+    os.makedirs(f"{root}/etc/systemd/system")
+    text = read(f"{repo}/packaging/linux/package-setup.sh").decode()
+    for path in ("/usr/local/bin", "/etc/systemd/system"):
+        text = text.replace(path, root + path)
+    # A path added to the script later and not moved here would be checked on the host itself.
+    assert not re.findall(r"(?<!modes)/(?:usr/local|etc/systemd)", text), "a host path is not moved"
+    with open(f"{root}/setup.sh", "w") as out:
+        out.write(text)
+    for tool in ("getent", "useradd", "install", "id"):
+        with open(f"{root}/bin/{tool}", "w") as out:
+            out.write("#!/bin/sh\nexit 1\n" if tool == "getent" else "#!/bin/sh\nexit 0\n")
+        os.chmod(f"{root}/bin/{tool}", 0o755)
+    env = {**os.environ, "PATH": f"{root}/bin:{os.environ['PATH']}"}
+    unit = f"{root}/etc/systemd/system/nerva@.service"
+    open(unit, "w").close()
+    for args, refused in ((["install"], True), (["install", "0.7.0-1"], True), (["1"], True), ([], True),
+                          (["upgrade", "0.7.0-1"], False), (["2"], False), (["10"], False),
+                          (["abort-upgrade"], False)):
+        result = run(["sh", f"{root}/setup.sh", *args], check=False, env=env)
+        assert (result.returncode == 1) == refused, (args, result.returncode, result.stderr)
+        assert ("NRV-E1111" in result.stderr) == refused, (args, result.stderr)
+    os.remove(unit)
+    for args in (["install"], ["upgrade", "0.7.0-1"], ["1"], ["2"]):
+        result = run(["sh", f"{root}/setup.sh", *args], check=False, env=env)
+        assert result.returncode == 0, (args, result.stderr)
+        assert "NRV-W1101" not in result.stderr, (args, result.stderr)
+    binary = f"{root}/usr/local/bin/nerva"
+    os.makedirs(os.path.dirname(binary))
+    open(binary, "w").close()
+    for args, first in ((["install"], True), (["upgrade", "0.7.0-1"], False), (["2"], False),
+                        (["10"], False)):
+        result = run(["sh", f"{root}/setup.sh", *args], check=False, env=env)
+        assert result.returncode == (1 if first else 0), (args, result.returncode, result.stderr)
+        assert ("NRV-W1101" in result.stderr) == (not first), (args, result.stderr)
+        if not first:
+            assert result.stderr.startswith("warning[NRV-W1101]: nerva package: "), result.stderr
+            assert "\n  cause  " in result.stderr and "\n  fix    " in result.stderr, result.stderr
+    print("  NRV-E1111 is checked on a first install (install, rpm 1); an upgrade (upgrade, rpm 2) "
+          "warns NRV-W1101 about /usr/local/bin/nerva and goes on")
+
+
 def check_reproducible(first, second):
     for name in first:
         a, b = sha256(first[name]), sha256(second[name])
@@ -344,11 +391,15 @@ make_state
 apt-get install -y -qq --reinstall --no-install-recommends /tmp/@PKG@ > /dev/null
 check_state
 echo "reinstall kept the data, the settings, the user and the enabled replica"
-apt-get install -y -qq --no-install-recommends /tmp/@PKG2@ > /dev/null
+mkdir -p /etc/systemd/system
+touch /etc/systemd/system/nerva@.service /usr/local/bin/nerva
+apt-get install -y -qq --no-install-recommends /tmp/@PKG2@ > /tmp/upgrade.out 2>&1
+grep -q 'warning.NRV-W1101.: nerva package: /usr/local/bin/nerva exists' /tmp/upgrade.out
 [ "$(dpkg-query -W -f='${Version}' nerva)" = "@VERSION2@-1" ]
 check_state
 apt-get install -y -qq --allow-downgrades --no-install-recommends /tmp/@PKG@ > /dev/null
 [ "$(dpkg-query -W -f='${Version}' nerva)" = "@VERSION@-1" ]
+rm /etc/systemd/system/nerva@.service /usr/local/bin/nerva
 check_state
 echo "upgrade to @VERSION2@ and downgrade back kept the data, the settings, the user and the enabled replica"
 dpkg --verify nerva
@@ -396,11 +447,15 @@ else
 fi
 check_state
 echo "reinstall kept the data, the settings, the user and the enabled replica"
-dnf install -y -q --setopt=install_weak_deps=False /tmp/@PKG2@ > /dev/null
+mkdir -p /etc/systemd/system
+touch /etc/systemd/system/nerva@.service /usr/local/bin/nerva
+dnf install -y -q --setopt=install_weak_deps=False /tmp/@PKG2@ > /tmp/upgrade.out 2>&1
+grep -q 'warning.NRV-W1101.: nerva package: /usr/local/bin/nerva exists' /tmp/upgrade.out
 [ "$(rpm -q --qf '%{VERSION}' nerva)" = "@VERSION2@" ]
 check_state
 rpm -U --oldpackage --nosignature /tmp/@PKG@
 [ "$(rpm -q --qf '%{VERSION}' nerva)" = "@VERSION@" ]
+rm /etc/systemd/system/nerva@.service /usr/local/bin/nerva
 check_state
 echo "upgrade to @VERSION2@ and downgrade back kept the data, the settings, the user and the enabled replica"
 rpm -V nerva
@@ -418,10 +473,11 @@ echo "remove left /var/lib/nerva, /etc/nerva and the user, and disabled the enab
 
 # Conflicts the package refuses before it unpacks anything: (label, setup, message, extra check).
 E1105_CAUSE = "A user, group or unit named nerva exists and is not the one Nerva's installer makes"
-E1111_CAUSE = ("A tarball install of Nerva is still on this machine and would shadow the package's "
-               "binary and units")
-E1111_FIX = ("run install.sh --uninstall from the tarball (it keeps /var/lib/nerva, /etc/nerva and "
-             "the user), then install the package")
+E1111_CAUSE = ("A file that is not this package's (a tarball install, a source build or a full unit "
+               "override) would shadow the package's binary or units")
+E1111_FIX = ("if it is a tarball install, run install.sh --uninstall from the tarball (it keeps "
+             "/var/lib/nerva, /etc/nerva and the user); otherwise move or remove the file (change a "
+             "unit with a drop-in); then install the package")
 FOREIGN = [
     ("a foreign user nerva", "useradd --system --home-dir /nonexistent nerva",
      "NRV-E1105", "nerva package: the user nerva exists, with home /nonexistent", E1105_CAUSE,
@@ -435,10 +491,10 @@ FOREIGN = [
      "remove the group (groupdel nerva), or create the user nerva with it as primary group "
      "(useradd -g nerva ...)"),
     ("a tarball install's binary", "touch /usr/local/bin/nerva",
-     "NRV-E1111", "nerva package: /usr/local/bin/nerva exists, from a tarball install",
+     "NRV-E1111", "nerva package: /usr/local/bin/nerva exists and is not this package's",
      E1111_CAUSE, E1111_FIX),
     ("a tarball install's unit", "mkdir -p /etc/systemd/system; touch /etc/systemd/system/nerva@.service",
-     "NRV-E1111", "nerva package: /etc/systemd/system/nerva@.service exists, from a tarball install",
+     "NRV-E1111", "nerva package: /etc/systemd/system/nerva@.service exists and is not this package's",
      E1111_CAUSE, E1111_FIX),
 ]
 
@@ -541,6 +597,8 @@ def main():
     try:
         print(f"rpmbuild: {run(['rpmbuild', '--version']).stdout.strip()}; "
               f"{run(['dpkg-deb', '--version']).stdout.split(chr(10))[0]}")
+        print("0. the package script's first-install and upgrade modes (no build needed)")
+        check_setup_modes(repo, tmp)
         print("1. built twice, the bytes equal")
         first = build(repo, binaries, version, f"{tmp}/a", epoch)
         second = build(repo, binaries, version, f"{tmp}/b", epoch, reproducibility_probe=True)

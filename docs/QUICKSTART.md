@@ -207,7 +207,7 @@ Before you start:
   tarball, or a package. Both leave the user `nerva`, `/var/lib/nerva`, `/etc/nerva` and the units,
   and start nothing. They differ in two paths: the tarball's `install.sh` puts `nerva` in
   `/usr/local/bin` and the examples in `/etc/nerva`; a package puts `nerva` in `/usr/bin` and the
-  examples in `/usr/share/nerva`. A leftover tarball install makes a package refuse with
+  examples in `/usr/share/nerva`. A leftover tarball install makes a package refuse on a first install with
   NRV-E1111 ([INSTALL.md](./INSTALL.md#the-deb-and-the-rpm)).
 - A file system for `/var/lib/nerva` that supports Direct IO (ext4 and xfs do; tmpfs does not), and
   memory: about 3 GiB a replica at the defaults, 256 MiB for a gateway, and 1.1 GiB of disk for a
