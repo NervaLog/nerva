@@ -281,7 +281,7 @@ NRV-E0901 and NRV-E0902 are in
 
 ## The installer refused
 
-`install.sh` in the Linux release tarball prints `error[NRV-E11xx]: install.sh: <what>`, a `cause`
+`install.sh` in the Linux release tarball (and the `.deb`'s preinst and `.rpm`'s `%pre`, as `nerva package:`) prints `error[NRV-E11xx]: install.sh: <what>`, a `cause`
 and a `fix`, changes nothing, and exits 1 (your input) or 2 (the machine).
 
 ```
@@ -312,6 +312,7 @@ Not run, from ERRORS.md:
 | `/usr/local/bin/nerva is a different build (…)` | NRV-E1103 | Stop the replicas, run `install.sh --upgrade`, restart them |
 | `the nerva in <dir> is for <arch>, and this machine is <arch>` | NRV-E1104 | Use the tarball for this machine |
 | `the user nerva exists, with home <dir>` and its kin | NRV-E1105 | Rename or remove that user, group or unit; change units with a drop-in |
+| `nerva package: <path> exists and is not this package's` (the `.deb` or `.rpm`, on a first install) | NRV-E1111 | A tarball install: `install.sh --uninstall` from the tarball. Otherwise (a source build, a full unit copy from `systemctl edit --full`) move or remove the file; change units with a drop-in. Upgrades are not checked |
 | `the nerva in <dir> cannot run (exit status <n>)` | NRV-E1107 | Unpack where programs may run (not a `noexec` mount) |
 | `<dir>/<file> is missing` | NRV-E1108 | Unpack the tarball whole and run `install.sh` from its directory |
 | `sha256sum is not installed` | NRV-E1109 | Install coreutils |

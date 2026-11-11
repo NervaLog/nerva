@@ -6,13 +6,22 @@
 # A second run changes nothing. A user or group named nerva that is not the one install.sh makes
 # is refused with NRV-E1105, and a tarball install still on the machine (install.sh's binary in
 # /usr/local/bin or its units in /etc/systemd/system, which would shadow the package's) with
-# NRV-E1111, both before the package's files are unpacked. The text never uses a
-# percent sign: the .rpm embeds it in its spec.
+# NRV-E1111, both before the package's files are unpacked. The NRV-E1111 check runs on a first
+# install only (dpkg `install`, with or without an old version; rpm `1`): on an upgrade, a file
+# there is the operator's own (`systemctl edit --full`, a source-built binary), not a tarball
+# install (#319). The text never uses a percent sign: the .rpm embeds it in its spec.
 set -eu
 
 # dpkg calls the preinst with `install`, `upgrade` or `abort-upgrade`; rpm passes a count.
 case "${1:-}" in
     abort-*) exit 0 ;;
+esac
+
+# A first install: dpkg `install` (also passed, with the old version, when reinstalling after a
+# removal without purge) or rpm `1`. dpkg `upgrade` and rpm 2 or more are upgrades.
+case "${1:-}" in
+    upgrade | [2-9] | [1-9][0-9]*) first_install=no ;;
+    *) first_install=yes ;;
 esac
 
 user=nerva
@@ -26,16 +35,20 @@ refuse() { # <headline> <fix>
     exit 1
 }
 
-# install.sh's files shadow the package's: /usr/local/bin comes before /usr/bin on the PATH and
-# /etc/systemd/system overrides /usr/lib/systemd/system. install.sh refuses the same way.
-for left in /usr/local/bin/nerva /etc/systemd/system/nerva@.service /etc/systemd/system/nerva-api@.service; do
-    if [ -e "$left" ]; then
-        echo "error[NRV-E1111]: nerva package: $left exists, from a tarball install" >&2
-        echo "  cause  A tarball install of Nerva is still on this machine and would shadow the package's binary and units" >&2
-        echo "  fix    run install.sh --uninstall from the tarball (it keeps /var/lib/nerva, /etc/nerva and the user), then install the package" >&2
-        exit 1
-    fi
-done
+# A file install.sh would make, or one that overrides the package's, shadows the package's:
+# /usr/local/bin comes before /usr/bin on the PATH and /etc/systemd/system overrides
+# /usr/lib/systemd/system. It is a tarball install's, a source build's or a full unit override.
+# install.sh refuses the reverse the same way.
+if [ "$first_install" = yes ]; then
+    for left in /usr/local/bin/nerva /etc/systemd/system/nerva@.service /etc/systemd/system/nerva-api@.service; do
+        if [ -e "$left" ]; then
+            echo "error[NRV-E1111]: nerva package: $left exists and is not this package's" >&2
+            echo "  cause  A file that is not this package's (a tarball install, a source build or a full unit override) would shadow the package's binary or units" >&2
+            echo "  fix    if it is a tarball install, run install.sh --uninstall from the tarball (it keeps /var/lib/nerva, /etc/nerva and the user); otherwise move or remove the file (change a unit with a drop-in); then install the package" >&2
+            exit 1
+        fi
+    done
+fi
 
 if getent passwd "$user" > /dev/null 2>&1; then
     home=$(getent passwd "$user" | cut -d: -f6)
