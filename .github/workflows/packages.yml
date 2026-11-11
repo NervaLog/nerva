@@ -141,4 +141,4 @@ jobs:
           dpkg-deb --version | head -n1
 
       - name: Build, inspect and install the packages (tests/packaging/packages.py)
-        run: python3 -I tests/packaging/packages.py zig-out/bin/nerva . --aarch64 zig-out-aarch64/bin/nerva
+        run: python3 -I tests/packaging/packages.py zig-out/bin/nerva . --aarch64 zig-out-aarch64/bin/nerva --require-version-line

@@ -415,6 +415,7 @@ pub fn build(b: *std.Build) !void {
         "keys.py",
         "busy.py",
         "metrics.py",
+        "docs_routes.py",
         "../errors/wire.py",
     }) |script| {
         const run_api_test = b.addSystemCommand(&.{ "python3", b.fmt("tests/api/{s}", .{script}) });
