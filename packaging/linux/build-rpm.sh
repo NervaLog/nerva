@@ -4,6 +4,8 @@
 #
 #   build-rpm.sh <nerva> <x86_64|aarch64> <version> <out-dir>
 #
+# <version> is N.N.N, or N.N.N~suffix for a prerelease; the file name has `.` for the `~`.
+#
 # <nerva> is the release binary already built for that architecture; nothing is compiled, so one
 # x86_64 machine builds both (`--target`). Reproducible: SOURCE_DATE_EPOCH (the commit's time;
 # default the HEAD commit's) is the build time and every mtime; the build host is a fixed name.
@@ -42,6 +44,9 @@ case "$version" in
         esac
         ;;
 esac
+# The file name has `.` for `~` (GitHub renames an asset whose name has a `~`, P311); the version
+# inside the package keeps it.
+file_version=$(printf '%s' "$version" | tr '~' '.')
 [ -f "$nerva" ] || { echo "build-rpm.sh: $nerva is not a file" >&2; exit 1; }
 . "$here/check-elf.sh"
 check_elf build-rpm.sh "$nerva" "$arch"
@@ -67,5 +72,5 @@ rpmbuild -bb --target "$arch-linux" \
     exit 1
 }
 mkdir -p "$out"
-cp "$top/RPMS/$arch/nerva-$version-1.$arch.rpm" "$out/"
-echo "$out/nerva-$version-1.$arch.rpm"
+cp "$top/RPMS/$arch/nerva-$version-1.$arch.rpm" "$out/nerva-$file_version-1.$arch.rpm"
+echo "$out/nerva-$file_version-1.$arch.rpm"

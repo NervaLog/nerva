@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
-# The release workflow's refusals that have a code (docs/ERRORS.md, NRV-E1112 to NRV-E1115; v0.7.1
+# The release workflow's refusals that have a code (docs/ERRORS.md, NRV-E1112 to NRV-E1116; v0.7.1
 # slice 7a). Each prints one coded block, `error[<code>]: release.yml: <what>` with a cause and a
 # fix line, and exits 1.
 #
+#   release_check.sh ref <tag> <git-ref>       <git-ref> is GITHUB_REF
 #   release_check.sh unreleased <tag>          needs gh, GH_TOKEN and GITHUB_REPOSITORY
 #   release_check.sh binary <nerva> <version>  <version> is VERSION's text, without the v
 #   release_check.sh assets <tag> <dist-dir>   needs gh, GH_TOKEN and GITHUB_REPOSITORY
 #
-# `unreleased` refuses a tag that exists and a release of that tag, published or a draft (a draft
+# `ref` refuses a version without a suffix (a release, not a prerelease) from any ref but
+# refs/heads/main (NRV-E1116): a dispatch from a branch would draft a release that targets a commit
+# that is not on main. `unreleased` refuses a tag that exists and a release of that tag, published or a draft (a draft
 # has no tag until it is published, so the tag check alone would let a second run build another
 # draft). `binary` refuses a binary whose `nerva version` `version` line is not <version>, and one
 # whose `nerva version --verbose` lacks `commit_keys deduplicate` (#271: the test build
@@ -24,10 +27,14 @@ refuse() {
 case "${1:-}" in
   unreleased)
     tag=${2:?usage: release_check.sh unreleased <tag>}
-    if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" > /dev/null 2>&1; then
+    # Only a 404 means "no such tag": any other failure (401, 5xx, rate limit) stops the run, exit 2.
+    if out=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" 2>&1); then
       refuse NRV-E1114 "the tag $tag already exists" \
         "a release of this version was cut, or its draft was published" \
         "bump VERSION to release again"
+    elif ! grep -q 'HTTP 404' <<< "$out"; then
+      echo "release_check.sh: cannot tell whether the tag $tag exists: $out" >&2
+      exit 2
     fi
     found=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases" \
       --jq ".[] | select(.tag_name == \"$tag\") | if .draft then \"draft\" else \"release\" end")
@@ -35,6 +42,15 @@ case "${1:-}" in
       refuse NRV-E1114 "a $(head -n1 <<< "$found") named $tag already exists" \
         "an earlier run of release.yml left it, and a second run would make another" \
         "publish it, or delete it (gh release delete $tag), or bump VERSION"
+    fi
+    ;;
+  ref)
+    tag=${2:?usage: release_check.sh ref <tag> <git-ref>}
+    ref=${3:?usage: release_check.sh ref <tag> <git-ref>}
+    if [[ "$tag" != *-* && "$ref" != refs/heads/main ]]; then
+      refuse NRV-E1116 "$tag is a release, and this run is on $ref, not main" \
+        "a release is cut only from a main commit (P147b); only a prerelease may be dispatched from a branch" \
+        "dispatch the workflow on main, or test the mechanics with a prerelease VERSION (0.7.1-rc.1)"
     fi
     ;;
   binary)
@@ -66,7 +82,7 @@ case "${1:-}" in
     fi
     ;;
   *)
-    echo "usage: release_check.sh unreleased <tag> | binary <nerva> <version> | assets <tag> <dist-dir>" >&2
+    echo "usage: release_check.sh ref <tag> <git-ref> | unreleased <tag> | binary <nerva> <version> | assets <tag> <dist-dir>" >&2
     exit 2
     ;;
 esac

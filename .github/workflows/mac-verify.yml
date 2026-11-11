@@ -4,15 +4,24 @@
 # (`zig build mac-release -Dnotarize=true`) and uploaded, with its `.zip.sha256`, to release.yml's
 # draft; the owner then publishes it. No Apple secret is in CI, so this workflow is where the signature
 # is checked, on both architectures, on a runner that never saw the Mac:
-#   1. the zip matches its `.zip.sha256`;
-#   2. `codesign -dv` shows a Developer ID Application authority and the hardened runtime;
-#   3. tests/macos/smoke.py (slice 2: three replicas, the gateway, statsd, SIGTERM) passes on that
+#   1. the zip matches its `.zip.sha256`, and holds nerva, LICENSE and NOTICE;
+#   2. its `nerva` is this release's: `nerva version` names the commit the release targets (the
+#      commit the tarballs and packages were built from) and ends in `version <VERSION>`; the owner
+#      builds it from a local tag they make by hand (a draft has no tag), so a tag on the wrong commit
+#      shows here;
+#   3. `codesign -dv` shows a Developer ID Application authority, the hardened runtime and a secure
+#      timestamp (which notarization requires);
+#   4. tests/macos/smoke.py (slice 2: three replicas, the gateway, statsd, SIGTERM) passes on that
 #      binary, with `--expect-signature developer-id`;
-#   4. `brew install nervalog/tap/nerva && brew test nerva`.
+#   5. `brew install nervalog/tap/nerva && brew test nerva`.
 # It runs when a release is published, and by hand with a tag (also against a draft: the assets are
 # found through the releases list, which a draft appears in for a token with write access). The owner
-# commits Formula/nerva.rb to the tap after publishing, so on the `release` event step 4 waits for
-# the tap to name this version (up to 20 minutes); a dispatch does not wait.
+# commits Formula/nerva.rb to the tap only after publishing, so step 5 is skipped on a draft, with a
+# notice: a green dispatch on the draft means steps 1 to 4 passed, and the run on the `release`
+# event does step 5, waiting for the tap to name this version (up to 20 minutes).
+#
+# The token is given to the download step only (GH_TOKEN), never to the brew, formula or binary
+# steps. `contents: write` is needed only to list a draft release in a dispatch.
 name: Mac verify
 
 on:
@@ -48,7 +57,6 @@ jobs:
     timeout-minutes: 45
     env:
       TAG: ${{ inputs.tag || github.event.release.tag_name }}
-      GH_TOKEN: ${{ github.token }}
     steps:
       # The default branch's smoke test and nothing else: a draft has no tag to check out.
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
@@ -63,6 +71,9 @@ jobs:
           fi
 
       - name: Download the zip and its checksum
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -eu
           mkdir "$RUNNER_TEMP/dl"
@@ -71,6 +82,14 @@ jobs:
           gh api --paginate "repos/$GITHUB_REPOSITORY/releases" \
             --jq ".[] | select(.tag_name == \"$TAG\")" > release.json
           test -s release.json || { echo "::error::no release or draft named $TAG"; exit 1; }
+          echo "draft=$(jq -rs '.[0].draft' release.json)" >> "$GITHUB_OUTPUT"
+          # The commit the release targets: the draft was made with --target <sha>, so this is the
+          # commit its tarballs and packages were built from (a branch name is resolved).
+          target=$(jq -rs '.[0].target_commitish' release.json)
+          commit=$(gh api "repos/$GITHUB_REPOSITORY/commits/$target" --jq .sha)
+          test -n "$commit" || { echo "::error::cannot resolve $TAG's target $target to a commit"; exit 1; }
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          echo "$TAG targets $commit"
           for name in "$zip" "$zip.sha256"; do
             id=$(jq -r --arg n "$name" '.assets[] | select(.name == $n) | .id' release.json | head -n1)
             test -n "$id" || { echo "::error::$TAG has no asset $name"; exit 1; }
@@ -86,6 +105,28 @@ jobs:
           unzip -q "nerva-$TAG-universal-macos.zip"
           chmod +x "nerva-$TAG-universal-macos/nerva"
           lipo -archs "nerva-$TAG-universal-macos/nerva"
+          for file in nerva LICENSE NOTICE; do
+            test -f "nerva-$TAG-universal-macos/$file" \
+              || { echo "::error::the zip holds no $file"; exit 1; }
+          done
+
+      # Tied to the release: the owner builds the zip from a tag they make by hand, and a tag on an
+      # earlier candidate (or on main after a later merge) is another build that every other check
+      # here would pass.
+      - name: The zip's nerva is this release's
+        env:
+          COMMIT: ${{ steps.release.outputs.commit }}
+        run: |
+          nerva="$RUNNER_TEMP/dl/nerva-$TAG-universal-macos/nerva"
+          "$nerva" version | tee version.txt
+          if ! head -n1 version.txt | grep -qF "+${COMMIT:0:7}"; then
+            echo "::error::$TAG's nerva was not built from the commit the release targets, ${COMMIT:0:7}: $(head -n1 version.txt)"
+            exit 1
+          fi
+          if [ "$(tail -n1 version.txt)" != "version ${TAG#v}" ]; then
+            echo "::error::$TAG's nerva does not end in 'version ${TAG#v}': $(tail -n1 version.txt)"
+            exit 1
+          fi
 
       # Developer ID Application, and the hardened runtime (`flags=0x10000(runtime)`; an ad hoc
       # signature adds `adhoc` to the flags and has no such authority, so an ad hoc zip fails here).
@@ -98,14 +139,27 @@ jobs:
             || { echo "::error::$TAG's nerva is not signed with a Developer ID Application certificate"; exit 1; }
           grep -Eq 'flags=0x[0-9a-f]+\([^)]*runtime' signature.txt \
             || { echo "::error::$TAG's nerva does not have the hardened runtime"; exit 1; }
+          # Notarization needs a secure timestamp: a zip signed with --timestamp=none, or before
+          # -Dnotarize=true ran, has none. (A bare Mach-O cannot be stapled, and spctl does not judge a
+          # bare command-line binary reliably, so its answer is only printed.)
+          grep -q '^Timestamp=' signature.txt \
+            || { echo "::error::$TAG's nerva has no secure timestamp: it was not signed for notarization"; exit 1; }
           codesign --verify --strict --verbose=2 "$nerva"
+          spctl -a -vv -t install "$nerva" || echo "spctl: informational only, see above"
 
       - name: Smoke test (tests/macos/smoke.py)
         run: |
           python3 tests/macos/smoke.py "$RUNNER_TEMP/dl/nerva-$TAG-universal-macos/nerva" \
             --arch "${{ matrix.arch }}" --expect-signature developer-id
 
+      # The tap is committed to after publishing (brief, step 6): on a draft there is nothing to find.
+      - name: brew is not checked on a draft
+        if: steps.release.outputs.draft == 'true'
+        run: |
+          echo "::notice::$TAG is a draft, and nervalog/tap is not updated until it is published; brew install is checked by the run on the published event"
+
       - name: brew install nervalog/tap/nerva, brew test
+        if: steps.release.outputs.draft != 'true'
         env:
           EVENT: ${{ github.event_name }}
           HOMEBREW_NO_AUTO_UPDATE: '1'

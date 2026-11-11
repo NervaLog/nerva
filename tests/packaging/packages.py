@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """The Linux packages (docs/briefs/v0.7.1.md, slice 5): a .deb (dpkg-deb) and an .rpm (rpmbuild).
 
-Usage: packages.py <nerva> <repository> --aarch64 <nerva-aarch64> [--version N.N.N]
+Usage: packages.py <nerva> <repository> --aarch64 <nerva-aarch64> [--version N.N.N[-suffix]]
                    [--require-version-line] [--no-containers] [--images IMAGE,...]
 
 <nerva> is a release build for x86_64-linux and --aarch64 one for aarch64-linux (`zig build -Drelease
@@ -72,6 +72,12 @@ def read(path):
         return f.read()
 
 
+def file_version(version):
+    """A package's file name has `.` for the `~` of a prerelease's version (GitHub renames an asset
+    whose name has a `~`, P311); the version inside the package keeps it."""
+    return version.replace("~", ".")
+
+
 def build(repo, binaries, version, out, epoch, reproducibility_probe=False):
     """Builds all four packages into `out`; returns {name: path}. `binaries` maps "x86" and "arm"."""
     env = dict(os.environ, SOURCE_DATE_EPOCH=str(epoch))
@@ -94,8 +100,9 @@ def build(repo, binaries, version, out, epoch, reproducibility_probe=False):
     if cwd:
         shutil.rmtree(cwd, ignore_errors=True)
     assert sorted(built) == sorted(
-        [f"nerva_{version}-1_amd64.deb", f"nerva_{version}-1_arm64.deb",
-         f"nerva-{version}-1.x86_64.rpm", f"nerva-{version}-1.aarch64.rpm"]), sorted(built)
+        [f"nerva_{file_version(version)}-1_amd64.deb", f"nerva_{file_version(version)}-1_arm64.deb",
+         f"nerva-{file_version(version)}-1.x86_64.rpm", f"nerva-{file_version(version)}-1.aarch64.rpm"]), \
+        sorted(built)
     return built
 
 
@@ -126,13 +133,13 @@ def check_refusals(repo, binaries, version, tmp):
 
 
 def check_prerelease(repo, binaries, tmp, epoch):
-    """release.yml packages a prerelease (0.7.1-rc.1) as 0.7.1~rc.1, which sorts before 0.7.1; a
-    bad suffix is refused."""
+    """release.yml packages a prerelease (0.7.1-rc.1) as 0.7.1~rc.1, which sorts before 0.7.1, in
+    files named 0.7.1.rc.1; a bad suffix is refused."""
     built = build(repo, binaries, "0.7.1~rc.1", f"{tmp}/pre", epoch)
-    deb = built["nerva_0.7.1~rc.1-1_amd64.deb"]
+    deb = built["nerva_0.7.1.rc.1-1_amd64.deb"]
     assert run(["dpkg-deb", "-f", deb, "Version"]).stdout.strip() == "0.7.1~rc.1-1"
     assert run(["dpkg", "--compare-versions", "0.7.1~rc.1-1", "lt", "0.7.1-1"], check=False).returncode == 0
-    rpm = built["nerva-0.7.1~rc.1-1.aarch64.rpm"]
+    rpm = built["nerva-0.7.1.rc.1-1.aarch64.rpm"]
     assert run(["rpm", "-qp", "--qf", "%{VERSION}-%{RELEASE}", rpm]).stdout == "0.7.1~rc.1-1"
     for name, arch in (("build-deb.sh", "amd64"), ("build-rpm.sh", "x86_64")):
         for bad in ("0.7.1~", "0.7.1~rc!1", "0.7.1-rc.1", "~rc.1"):
@@ -140,7 +147,7 @@ def check_prerelease(repo, binaries, tmp, epoch):
                           f"{tmp}/bad"], check=False)
             assert result.returncode == 1 and "version" in result.stderr, (name, bad, result.stderr)
             assert not os.path.exists(f"{tmp}/bad"), (name, bad)
-    print("  a prerelease version builds as N.N.N~suffix; a bad suffix is refused")
+    print("  a prerelease builds as N.N.N~suffix in files named N.N.N.suffix; a bad suffix is refused")
 
 
 def check_reproducible(first, second):
@@ -260,7 +267,7 @@ check_installed() {
     nerva version > /tmp/version.out
     [ -s /tmp/version.out ]
     if [ "@REQUIRE@" = 1 ]; then
-        [ "$(tail -n1 /tmp/version.out)" = "version @VERSION@" ]
+        [ "$(tail -n1 /tmp/version.out)" = "version @BINVERSION@" ]
     fi
     tail -n1 /tmp/version.out
     [ "$(stat -c '%a %U %G' /usr/bin/nerva)" = "755 root root" ]
@@ -488,10 +495,11 @@ def container(image, dist, repo, script, label):
 def containers(images, dist, repo, version, version2, require_line):
     for image in images:
         kind = IMAGES[image]
-        name = (lambda v: f"nerva_{v}-1_amd64.deb") if kind == "deb" else (lambda v: f"nerva-{v}-1.x86_64.rpm")
+        name = ((lambda v: f"nerva_{file_version(v)}-1_amd64.deb") if kind == "deb"
+                else (lambda v: f"nerva-{file_version(v)}-1.x86_64.rpm"))
 
         def fill(text, **extra):
-            values = {"PKG": name(version), "PKG2": name(version2), "IMAGE": image, "VERSION": version,
+            values = {"PKG": name(version), "PKG2": name(version2), "IMAGE": image, "VERSION": version, "BINVERSION": version.replace("~", "-"),
                       "VERSION2": version2, "REQUIRE": "1" if require_line else "0", **extra}
             for key, value in values.items():
                 text = text.replace(f"@{key}@", value)
@@ -522,8 +530,11 @@ def main():
     args = parser.parse_args()
     repo = os.path.realpath(args.repository)
     binaries = {"x86": os.path.realpath(args.nerva), "arm": os.path.realpath(args.aarch64)}
-    version = args.version or read(f"{repo}/VERSION").decode().strip()
-    major, minor, patch = version.split(".")
+    release = args.version or read(f"{repo}/VERSION").decode().strip()
+    # A prerelease's VERSION (0.7.1-rc.1) is the package version 0.7.1~rc.1 (#313).
+    base, _, suffix = release.partition("-")
+    major, minor, patch = base.split(".")
+    version = base + (f"~{suffix}" if suffix else "")
     version2 = f"{major}.{minor}.{int(patch) + 1}"
     epoch = int(run(["git", "-C", repo, "log", "-1", "--format=%ct"]).stdout)
     tmp = tempfile.mkdtemp(prefix="nerva-packages-")
@@ -536,8 +547,8 @@ def main():
         check_reproducible(first, second)
         print("2. and 3. metadata, files, scripts, units")
         for deb, rpm in PACKAGES:
-            check_deb(first[f"nerva_{version}-1_{deb}.deb"], repo, binaries[BIN[deb]], version, deb, epoch, tmp)
-            check_rpm(first[f"nerva-{version}-1.{rpm}.rpm"], repo, binaries[BIN[rpm]], version, rpm, epoch, tmp)
+            check_deb(first[f"nerva_{file_version(version)}-1_{deb}.deb"], repo, binaries[BIN[deb]], version, deb, epoch, tmp)
+            check_rpm(first[f"nerva-{file_version(version)}-1.{rpm}.rpm"], repo, binaries[BIN[rpm]], version, rpm, epoch, tmp)
         print("  ok")
         print("4. a binary for another architecture is refused")
         check_refusals(repo, binaries, version, tmp)

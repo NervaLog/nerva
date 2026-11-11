@@ -7,14 +7,17 @@
 #
 # v0.7.1 (docs/briefs/v0.7.1.md, "Release mechanics"): each Linux tarball also holds install.sh, the
 # units and the settings examples (packaging/linux); the four Linux packages (nerva_<v>-1_<arch>.deb
-# and nerva-<v>-1.<arch>.rpm, a prerelease's `-` written `~`) are built from the same binaries and
+# and nerva-<v>-1.<arch>.rpm; a prerelease's `-` is `~` inside the package and `.` in the file name,
+# because GitHub renames an asset whose name has a `~`, P311) are built from the same binaries and
 # are in SHA256SUMS; and the release is a DRAFT. The owner builds, signs and notarizes the Mac zip
 # on their own Mac, uploads it and its `.zip.sha256` to the draft and publishes it
 # (SHA256SUMS does not cover the zip, which does not exist yet); mac-verify.yml then checks it.
 # Publishing creates the tag on the commit the draft names. The run refuses a second release of a
-# version while a draft of it exists (a draft has no tag), a binary whose `nerva version` says
-# another version than VERSION, and the keys-off test build (.github/scripts/release_check.sh,
-# NRV-E1112 to NRV-E1115).
+# version while a draft of it exists (a draft has no tag; checked again just before the draft is
+# created, because "Re-run failed jobs" does not run the `version` job again), a binary whose
+# `nerva version` says another version than VERSION, the keys-off test build, and a release (a
+# version without a suffix) dispatched from a ref other than main (.github/scripts/release_check.sh,
+# NRV-E1112 to NRV-E1116).
 name: Release
 
 on:
@@ -65,6 +68,13 @@ jobs:
         env:
           TAG: ${{ steps.version.outputs.tag }}
         run: python3 .github/scripts/sbom.py "$TAG" "$GITHUB_SHA" > /dev/null
+
+      # A suffix-less version is cut only from main (P147b); a prerelease may be a dispatch from a
+      # branch, which is how the draft's mechanics are tested.
+      - name: Refuse a release dispatched from a ref other than main
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: .github/scripts/release_check.sh ref "$TAG" "$GITHUB_REF"
 
       - name: Refuse a version already released, or already a draft
         env:
@@ -120,6 +130,15 @@ jobs:
             tar -czf "dist/$name.tar.gz" "$name"
           done
 
+      # The other three targets cannot run here (no qemu-user on the image), but each is built by
+      # the same command in the same loop: the version is VERSION's text in the binary's data.
+      - name: Check each binary holds this version
+        run: |
+          for binary in bin/*/nerva; do
+            strings -a -n 5 "$binary" | grep -qxF "${TAG#v}" \
+              || { echo "::error::$binary does not hold the version ${TAG#v}"; exit 1; }
+          done
+
       - name: Check the Linux x86_64 binary runs, and is this release
         run: |
           tar -xzf "dist/nerva-$TAG-x86_64-linux.tar.gz"
@@ -143,20 +162,22 @@ jobs:
 
       # The four packages, from the binaries above, by the scripts packages.yml tests
       # (tests/packaging/packages.py --require-version-line, on this commit). A prerelease's
-      # `0.7.1-rc.1` is `0.7.1~rc.1`, which sorts before 0.7.1.
+      # `0.7.1-rc.1` is `0.7.1~rc.1` inside the package, which sorts before 0.7.1, and `0.7.1.rc.1` in
+      # the file name (P311).
       - name: Build the Linux packages
         run: |
           set -eu
           pkgver=$(printf '%s' "${TAG#v}" | sed 's/-/~/')
+          filever=${pkgver//\~/.}
           sh packaging/linux/build-deb.sh bin/x86_64-linux/nerva amd64 "$pkgver" dist
           sh packaging/linux/build-deb.sh bin/aarch64-linux/nerva arm64 "$pkgver" dist
           sh packaging/linux/build-rpm.sh bin/x86_64-linux/nerva x86_64 "$pkgver" dist
           sh packaging/linux/build-rpm.sh bin/aarch64-linux/nerva aarch64 "$pkgver" dist
           for arch in amd64:x86_64:x86_64 arm64:aarch64:aarch64; do
             IFS=: read -r deb rpm target <<< "$arch"
-            dpkg-deb --fsys-tarfile "dist/nerva_$pkgver-1_$deb.deb" | tar -xO ./usr/bin/nerva \
+            dpkg-deb --fsys-tarfile "dist/nerva_$filever-1_$deb.deb" | tar -xO ./usr/bin/nerva \
               | cmp - "bin/$target-linux/nerva"
-            rpm2archive - < "dist/nerva-$pkgver-1.$rpm.rpm" | tar -xzO ./usr/bin/nerva \
+            rpm2archive - < "dist/nerva-$filever-1.$rpm.rpm" | tar -xzO ./usr/bin/nerva \
               | cmp - "bin/$target-linux/nerva"
           done
           ls -l dist
@@ -171,10 +192,13 @@ jobs:
 
       # A DRAFT, not a release: it names this commit as the target and creates no tag until it is
       # published, by the owner, after they upload the Mac zip (docs/briefs/v0.7.1.md, step 6).
+      # "Re-run failed jobs" re-runs only this job and reuses the `version` job's result, so the
+      # check runs again here, just before the draft is made: a second run must not make a second draft.
       - name: Create the draft release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          .github/scripts/release_check.sh unreleased "$TAG"
           prerelease=()
           case "$TAG" in *-*) prerelease=(--prerelease) ;; esac
           {

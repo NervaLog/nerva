@@ -3,6 +3,8 @@
 #
 #   build-deb.sh <nerva> <amd64|arm64> <version> <out-dir>
 #
+# <version> is N.N.N, or N.N.N~suffix for a prerelease; the file name has `.` for the `~`.
+#
 # <nerva> is the release binary already built for that architecture: nothing is compiled. The
 # units and examples come from this directory (slice 4's files, byte for byte), and the maintainer scripts are
 # package-setup.sh (preinst), package-prerm.sh and package-reload.sh (postinst and postrm). The build is reproducible: SOURCE_DATE_EPOCH (the commit's time; default the
@@ -41,6 +43,9 @@ case "$version" in
         esac
         ;;
 esac
+# The file name has `.` for `~` (GitHub renames an asset whose name has a `~`, P311); the version
+# inside the package keeps it.
+file_version=$(printf '%s' "$version" | tr '~' '.')
 [ -f "$nerva" ] || { echo "build-deb.sh: $nerva is not a file" >&2; exit 1; }
 . "$here/check-elf.sh"
 check_elf build-deb.sh "$nerva" "$([ "$arch" = amd64 ] && echo x86_64 || echo aarch64)"
@@ -101,5 +106,5 @@ chmod 644 "$pkg/DEBIAN/control"
 find "$pkg" -exec touch -h -d "@$SOURCE_DATE_EPOCH" {} +
 
 mkdir -p "$out"
-dpkg-deb --root-owner-group -Zxz --build "$pkg" "$out/nerva_$version-1_$arch.deb" > /dev/null
-echo "$out/nerva_$version-1_$arch.deb"
+dpkg-deb --root-owner-group -Zxz --build "$pkg" "$out/nerva_$file_version-1_$arch.deb" > /dev/null
+echo "$out/nerva_$file_version-1_$arch.deb"
