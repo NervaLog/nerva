@@ -387,6 +387,17 @@ class Reads(Case):
         self.srv.objects["x/z"] = (b"bytes", {})  # no hash stored: nothing to check
         self.assertEqual(self.run_r2("get", "x/z", dest), 0)
 
+    def test_get_lenient_reports_a_mismatch_as_exit_4_without_a_code(self):
+        self.srv.objects["x/y"] = (b"bytes", {"x-amz-meta-sha256": "0" * 64})
+        dest = os.path.join(self.tmp.name, "out")
+        self.assertEqual(self.run_r2("get-lenient", "x/y", dest), 4)
+        self.assertNotIn("NRV-E1143", self.last[1])
+        self.assertFalse(os.path.exists(dest))
+        self.assertEqual(self.run_r2("get-lenient", "no/such", dest), 2)
+        self.srv.objects["x/z"] = (b"bytes", {"x-amz-meta-sha256": hashlib.sha256(b"bytes").hexdigest()})
+        self.assertEqual(self.run_r2("get-lenient", "x/z", dest), 0)
+        self.assertEqual(Path(dest).read_bytes(), b"bytes")
+
     def test_head_without_a_stored_hash_prints_dash(self):
         self.srv.objects["x/z"] = (b"bytes", {})
         self.assertEqual(self.run_r2("head", "x/z"), 0)

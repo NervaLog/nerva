@@ -7,12 +7,14 @@ Environment (never argv): R2_ENDPOINT, R2_BUCKET, R2_ACCESS_KEY_ID, R2_SECRET_AC
   list <prefix>           stdout: one `<key><TAB><size>` per object, every page (at most 100)
   head <key>              stdout: `<size><TAB><x-amz-meta-sha256 or ->`
   get <key> <file>        writes <file>; checks x-amz-meta-sha256 when the object has one
+  get-lenient <key> <file>  as get, but a metadata mismatch is exit 4 and no NRV-E1143
   put-new <key> <file>    If-None-Match: *; "exists" is a 412 or the pinned lock refusal
   put <key> <file>        only a name a run replaces, or a content-named index file
   probe-locked <key> <file>   unconditional put; R2 must answer with the pinned lock refusal
 
 Exit: 0 done, 1 failed (NRV-E1143, or NRV-E1139 for the environment), 2 absent, 3 exists
-(put-new), 4 lock rule missing (probe-locked: R2 accepted the put), 5 listing truncated at 100
+(put-new), 4 lock rule missing (probe-locked: R2 accepted the put) or, for get-lenient, bytes that
+do not match the object's metadata, 5 listing truncated at 100
 pages, 64 usage, 70 a name `put` refuses (NRV-B0005). A failure prints `error[NRV-E....]: r2.py:
 <what>` and a `cause` and a `fix` line; the message names the operation, the key and the HTTP
 status, never a header or a credential."""
@@ -296,7 +298,7 @@ def cmd_head(c, key):
     return 0
 
 
-def cmd_get(c, key, path):
+def cmd_get(c, key, path, lenient=False):
     status, h, data = c.call("get", key, "GET")
     if status == 404:
         return 2
@@ -304,12 +306,21 @@ def cmd_get(c, key, path):
         raise refuse("get", key, status, data)
     want = h.get("x-amz-meta-sha256")
     if want and want != hashlib.sha256(data).hexdigest():
+        if lenient:
+            # An object whose bytes lie about its metadata: the caller notes it and goes on.
+            sys.stderr.write(f"r2.py: get-lenient {key}: the bytes do not match the object's "
+                             "x-amz-meta-sha256 (the caller notes it)\n")
+            return 4
         raise fail("get", key, "the bytes do not match the object's x-amz-meta-sha256")
     tmp = path + ".part"
     with open(tmp, "wb") as f:
         f.write(data)
     os.replace(tmp, path)
     return 0
+
+
+def cmd_get_lenient(c, key, path):
+    return cmd_get(c, key, path, lenient=True)
 
 
 def cmd_put_new(c, key, path):
@@ -360,6 +371,7 @@ def cmd_probe_locked(c, key, path):
 
 
 COMMANDS = {"list": (cmd_list, 1), "head": (cmd_head, 1), "get": (cmd_get, 2),
+            "get-lenient": (cmd_get_lenient, 2),
             "put-new": (cmd_put_new, 2), "put": (cmd_put, 2),
             "probe-locked": (cmd_probe_locked, 2)}
 
@@ -368,6 +380,7 @@ def main(argv, env=None):
     env = os.environ if env is None else env
     if not argv or argv[0] not in COMMANDS or len(argv) != COMMANDS[argv[0]][1] + 1:
         sys.stderr.write("usage: r2.py list <prefix> | head <key> | get <key> <file> | "
+                         "get-lenient <key> <file> | "
                          "put-new <key> <file> | put <key> <file> | probe-locked <key> <file>\n")
         return 64
     try:
