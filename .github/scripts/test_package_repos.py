@@ -268,6 +268,7 @@ class Base(unittest.TestCase):
         return e
 
     def run_script(self, *args, **extra):
+        (self.gh_dir / "count").unlink(missing_ok=True)
         p = subprocess.run(["bash", str(SCRIPT), *args], env=self.env(**extra), capture_output=True,
                            text=True, timeout=300)
         self.last = p
@@ -430,6 +431,24 @@ class Base(unittest.TestCase):
         return tag
 
 
+def bound_cache(self, tag):
+    """The baseline bucket plus `tag` bound (ready) by an approved run, its release published."""
+    self.baseline()
+    key = ("bound", tag)
+    self.release(tag, "draft")
+    if key not in _baselines:
+        rc, _, err = self.ready(tag)
+        assert rc == 0, err
+        _baselines[key] = copy.deepcopy(self.s3.objects)
+    self.s3.objects = copy.deepcopy(_baselines[key])
+    self.set_state(tag, "published")
+    self.s3.log.clear()
+    return tag
+
+
+Base.bound = bound_cache
+
+
 class Happy(Base):
     def test_a_release_binds_publishes_and_verifies(self):
         self.release("v0.7.1")
@@ -580,6 +599,209 @@ class Ready(Base):
         self.release("v0.7.1", salt="2")
         rc, _, err = self.ready("v0.7.1", GITHUB_RUN_ATTEMPT="2", MAC_ATTEMPT="2")
         self.assert_diag(rc, err, "NRV-E1141")
+HIDE = """import os, subprocess, sys
+r = subprocess.run([sys.executable, "-I", os.environ["REAL_R2"], *sys.argv[1:]], capture_output=True, text=True)
+out = r.stdout
+if sys.argv[1:2] == ["list"] and sys.argv[2:3] == ["manifest/"]:
+    hide = os.environ["HIDE_KEY"]
+    out = "".join(l for l in out.splitlines(True) if not l.startswith(hide))
+sys.stdout.write(out)
+sys.stderr.write(r.stderr)
+sys.exit(r.returncode)
+"""
+
+
+class Bucket(Base):
+    def refresh_red(self, code="NRV-E1142"):
+        rc, _, err = self.refresh()
+        self.assert_diag(rc, err, code)
+        return err
+
+    def snapshot(self, prefix):
+        return {k: v[0] for k, v in self.s3.objects.items() if k.startswith(prefix)}
+
+    def test_a_refresh_of_a_clean_bucket_writes_a_new_generation_and_changes_no_package(self):
+        self.baseline()
+        before = self.keys_under("apt/pool/") + self.keys_under("rpm/stable/packages/")
+        n = len(self.manifest_keys())
+        rc, _, err = self.refresh()
+        self.assertEqual(rc, 0, err)
+        self.assertGreater(len(self.manifest_keys()), n)
+        self.assertEqual(before, self.keys_under("apt/pool/") + self.keys_under("rpm/stable/packages/"))
+        self.assertIn("state complete", self.manifest())
+        self.assert_no_secrets(self.last.stdout, self.last.stderr)
+
+    def tamper_and_heal(self, mutate, name):
+        self.baseline()
+        good = self.s3.objects[name][0] if name in self.s3.objects else None
+        mutate(name)
+        self.refresh_red()
+        self.assertEqual(self.s3.objects[name][0] != b"", True)
+        rc, _, err = self.refresh()
+        self.assertEqual(rc, 0, err)
+        return good
+
+    def test_an_index_replaced_deleted_or_copied_across_channels_is_healed_then_e1142(self):
+        name = "apt/dists/stable/InRelease"
+        other = "apt/dists/rc/InRelease"
+        for how in ("replace", "delete", "copy"):
+            self.baseline()
+            if how == "replace":
+                self.put_raw(name, b"junk")
+            elif how == "delete":
+                del self.s3.objects[name]
+            else:
+                self.s3.objects[name] = self.s3.objects[other]
+            self.refresh_red()
+            self.assertNotEqual(self.s3.objects[name][0], b"junk")
+            self.assertTrue(self.s3.objects[name][0].startswith(b"-----BEGIN PGP SIGNED MESSAGE"), how)
+            self.assertEqual(self.refresh()[0], 0, how)
+
+    def test_a_copied_index_of_another_channel_is_not_accepted_for_a_channel_that_read_it_before(self):
+        self.baseline()
+        self.s3.objects["apt/dists/stable/Release"] = self.s3.objects["apt/dists/rc/Release"]
+        err = self.refresh_red()
+        self.assertIn("apt/dists/stable/Release", err)
+
+    def test_a_by_hash_or_hashed_repodata_file_with_wrong_content_is_replaced_and_noted(self):
+        self.baseline()
+        keys = [k for k in self.keys_under("apt/dists/stable/main/binary-amd64/by-hash/")]
+        keys += [k for k in self.keys_under("rpm/stable/repodata/") if k.endswith("-primary.xml.gz")]
+        self.assertGreaterEqual(len(keys), 2)
+        want = {k: self.s3.objects[k][0] for k in keys}
+        for k in keys:
+            self.put_raw(k, b"wrong")
+        rc, _, err = self.refresh()
+        self.assertEqual(rc, 1, err)
+        self.assertIn("::notice::noted", err)
+        for k in keys:
+            self.assertEqual(self.s3.objects[k][0], want[k], k)
+
+    def test_a_lock_rule_that_is_gone_is_e1149(self):
+        self.baseline()
+        self.s3.locks = ()
+        rc, _, err = self.refresh()
+        self.assert_diag(rc, err, "NRV-E1149", fix="Add the bucket lock rule in Cloudflare, then run again")
+
+    def test_a_lock_refusal_with_another_status_is_e1143(self):
+        self.baseline()
+        self.s3.faults = [403]
+        rc, _, err = self.refresh()
+        self.assertEqual(rc, 1, err)
+        self.assertIn("NRV-E1143", err)
+
+    def test_junk_under_each_locked_prefix_is_noted_skipped_and_the_run_ends_red(self):
+        for prefix in ("apt/pool/main/n/nerva/", "rpm/stable/packages/", "rpm/rc/packages/"):
+            self.baseline()
+            self.put_raw(prefix + "stray.bin", b"x")
+            n = len(self.manifest_keys())
+            rc, _, err = self.refresh()
+            self.assert_diag(rc, err, "NRV-E1142")
+            self.assertIn("stray.bin", err)
+            self.assertGreater(len(self.manifest_keys()), n, "the run finished: a complete manifest")
+            self.assertIn("state complete", self.manifest())
+
+    def test_junk_in_manifest_under_the_wanted_name_moves_the_run_to_the_next_name(self):
+        self.baseline()
+        top = int(self.manifest_keys()[-1][9:19])
+        self.put_raw(f"manifest/{top + 1:010d}.asc", b"not a manifest")
+        rc, _, err = self.refresh()
+        self.assert_diag(rc, err, "NRV-E1142")
+        self.assertIn(f"manifest/{top + 2:010d}.asc", self.manifest_keys())
+
+    def test_a_verified_manifest_at_the_wanted_name_is_e1147_and_nothing_more_is_written(self):
+        self.baseline()
+        top = self.manifest_keys()[-1]
+        wrapper = self.tmp / "hide_r2.py"
+        wrapper.write_text(HIDE)
+        before = dict(self.s3.objects)
+        rc, _, err = self.refresh(R2_PY=str(wrapper), REAL_R2=str(SCRIPT.parent / "r2.py"), HIDE_KEY=top)
+        self.assert_diag(rc, err, "NRV-E1147")
+        self.assertEqual(before, self.s3.objects)
+
+    def test_a_manifest_prefix_with_only_objects_that_do_not_verify_is_refused(self):
+        self.put_raw("manifest/0000000001.asc", b"junk")
+        self.release("v0.7.1")
+        rc, _, err = self.ready("v0.7.1")
+        self.assert_diag(rc, err, "NRV-E1142")
+        rc, _, err = self.refresh()
+        self.assert_diag(rc, err, "NRV-E1142")
+        self.assertEqual(self.keys_under("apt/"), [])
+
+    def test_a_candidate_under_stable_is_e1142(self):
+        self.baseline()
+        self.put_raw("rpm/stable/packages/nerva-0.7.2.rc.1-1.x86_64.rpm", b"x")
+        rc, _, err = self.refresh()
+        self.assert_diag(rc, err, "NRV-E1142", what="candidate")
+
+    def test_the_two_thousand_entry_limit(self):
+        ents = [("pending", sha(b"%d" % i), "1", f"apt/pool/main/n/nerva/nerva_9.9.{i}-1_amd64.deb",
+                 sha(b"%d" % i), "v9.9.9", COMMIT) for i in range(2001)]
+        ents.sort(key=lambda e: e[3])
+        self.sign_manifest(self.mtext(1, "complete", pk=ents), "a", "manifest/0000000001.asc")
+        rc, _, err = self.refresh()
+        self.assert_diag(rc, err, "NRV-E1142", what="2001 entries")
+        self.assertEqual(self.writes(), [])
+
+    def test_too_little_disk_is_e1156(self):
+        self.baseline()
+        rc, _, err = self.refresh(PACKAGE_REPOS_FREE_KIB="1")
+        self.assert_diag(rc, err, "NRV-E1156")
+        self.assertEqual(self.writes(), [])
+
+    def test_a_refresh_with_nothing_bound(self):
+        rc, _, err = self.refresh()
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self.entries(), {})
+
+    def test_a_publish_of_a_tag_nothing_bound_is_e1148(self):
+        self.baseline()
+        rc, _, err = self.publish("v0.9.9")
+        self.assert_diag(rc, err, "NRV-E1148")
+
+    def test_a_quiet_repository_is_e1150_after_45_days_but_the_run_still_publishes(self):
+        self.baseline()
+        self.commit_age(46)
+        n = len(self.manifest_keys())
+        rc, _, err = self.refresh()
+        self.assert_diag(rc, err, "NRV-E1150")
+        self.assertGreater(len(self.manifest_keys()), n)
+        self.commit_age(44)
+        self.assertEqual(self.refresh()[0], 0)
+
+    def test_stable_holding_no_candidate_and_rc_holding_both(self):
+        self.baseline("v0.7.1")
+        self.release("v0.8.0-rc.1")
+        self.assertEqual(self.ready("v0.8.0-rc.1")[0], 0)
+        self.set_state("v0.8.0-rc.1", "published")
+        rc, _, err = self.publish("v0.8.0-rc.1")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual([k for k in self.keys_under("rpm/stable/packages/") if "rc" in k], [])
+        self.assertTrue([k for k in self.keys_under("rpm/rc/packages/") if "0.8.0.rc.1" in k])
+        stable = self.s3.objects["apt/dists/stable/main/binary-amd64/Packages"][0]
+        self.assertNotIn(b"0.8.0~rc.1", stable)
+        rc_ = self.s3.objects["apt/dists/rc/main/binary-amd64/Packages"][0]
+        self.assertIn(b"0.8.0~rc.1", rc_)
+
+    def test_a_dual_signed_inrelease_verifies_with_either_key_alone(self):
+        self.set_keys(current="a", next="b")
+        self.release("v0.7.1")
+        self.assertEqual(self.ready("v0.7.1")[0], 0)
+        self.set_state("v0.7.1", "published")
+        rc, _, err = self.publish("v0.7.1")
+        self.assertEqual(rc, 0, err)
+        data = self.s3.objects["apt/dists/stable/InRelease"][0]
+        f = self.tmp / "InRelease"
+        f.write_bytes(data)
+        for n in "ab":
+            ring = self.tmp / f"{n}.gpg"
+            ring.write_bytes(subprocess.run(["gpg", "--dearmor"], input=self.k[n][2].encode(),
+                                            capture_output=True, check=True).stdout)
+            p = subprocess.run(["gpgv", "--keyring", str(ring), str(f)], capture_output=True, text=True)
+            self.assertEqual(p.returncode, 0, p.stderr)
+            self.assertIn(self.k[n][0][-16:], p.stderr)
+        self.assert_no_secrets(self.last.stdout, self.last.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()
