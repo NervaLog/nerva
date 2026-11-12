@@ -50,11 +50,16 @@ environmental, see UPSTREAM.md. Every other test must pass.
 
 CI (`.github/workflows/ci.yml`) runs the same steps on every push and pull request to `main`
 that changes more than Markdown (N68). A
-commit that changes `VERSION` publishes release `v<VERSION>` (`release.yml`) after CI passes: to
-release, add the version's "what's new" section to `CHANGELOG.md` (`## v<VERSION> — <date>`,
+commit that changes `VERSION` starts `release.yml`, which publishes release `v<VERSION>` after CI
+passes. To release, add the version's "what's new" section to `CHANGELOG.md` (`## v<VERSION> — <date>`,
 written for people running Nerva: new capabilities with examples, fixes with their issues, and
-upgrade steps), then bump `VERSION` (and add a worklog note, `worklog/<number>.md`) in its own commit. The section
-becomes the GitHub release notes; a version without one is refused.
+upgrade steps), then bump `VERSION` (and add a worklog note, `worklog/<number>.md`) in its own commit.
+The section becomes the GitHub release notes; a version without one is refused. The `VERSION` commit
+then runs the rest unattended: the draft, then `release-finish.yml`, which signs the Mac zip and
+checks it, publishes the draft, commits the Homebrew formula to the tap and opens the site's pull
+request. The owner's single approval of the `apple-signing` environment ships all of it. If a run
+stops, `release-finish.yml` can be started by hand from `main` with the tag, to recover it.
+A session never approves a deployment (an environment's required review); only the owner does (P360).
 
 **Before every release, the release gate** (P147b, amending P105). A release is cut only from a
 `main` commit that is sim-clean (once R2's fleet runs: 24 hours of the fleet on that commit and no
