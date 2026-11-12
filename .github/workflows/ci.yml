@@ -162,6 +162,7 @@ jobs:
           python3 .github/scripts/test_mac_sign.py
           python3 -I .github/scripts/test_site_release.py
           python3 -I .github/scripts/test_release_finish.py
+          python3 -I .github/scripts/test_r2.py
 
       - name: Nightly perf scripts (the comparison, its issues)
         if: needs.changes.outputs.code != 'false'
