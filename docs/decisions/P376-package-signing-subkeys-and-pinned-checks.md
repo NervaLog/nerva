@@ -5,6 +5,10 @@ area: Releases
 amends: P365, P368
 ---
 
+**Order.** #376 merges after #368, which carries P368 and slice 2's `package_repos.sh`. The
+amendment of P368 is to slice 2's `verify_manifest` (the `$NF` check) and its signing setup,
+and slice 2b makes it.
+
 # Package signing: an offline primary with a CI subkey, tested first; pinned checks, verification before upload, served bytes, alarms and WKD
 
 **The owner's decisions (owner, 2026-11-12, on the Zigbox team's review of the pipeline).** The
@@ -21,8 +25,8 @@ and P376c (the Intel Mac runner) are separate decisions.
      two encrypted media held apart. Its passphrase and its revocation certificate are in the
      owner's password manager. `packaging/keys/fingerprints` pins the primary's fingerprint, and
      that pin never changes.
-   - **CI subkey.** CI holds only one RSA 4096 signing subkey, which expires one year after it is
-     made. The secret export holds the subkey and a stub of the primary
+   - **CI subkey.** CI holds one RSA 4096 signing subkey, or two during a rotation's overlap
+     (`current` and `next`), never the primary. A subkey expires one year after it is made. The secret export holds the subkey and a stub of the primary
      (`--export-secret-subkeys <fpr>!`). It is re-protected with a CI passphrase of its own.
    - **Rotation, once a year.** At least 120 days before the subkey expires, the owner certifies
      the next subkey offline. The pull request that adds it lists it as `next` and replaces the
@@ -53,10 +57,16 @@ and P376c (the Intel Mac runner) are separate decisions.
      - an rpm whose subkey expired after it signed;
      - a revoked subkey;
      - a signature by the primary itself, which the job's check must refuse.
-   - **Which branch is taken.** The subkey model is adopted if every cell installs, and the
-     rotation works with no user step beyond one INSTALL.md documents. If any cell fails, Rocky 9
-     included, the model falls back to the single key of P365 point 12. That fallback keeps
-     every other point of this decision. If an rpm whose subkey has since expired no longer
+   - **Which branch is taken.** The subkey model is adopted if every cell installs, and across
+     a rotation `dnf upgrade nerva` succeeds, and `apt update` succeeds after INSTALL.md's own
+     `curl` line, with no other command. A step that can be documented but is a command (for
+     example `rpm -e gpg-pubkey-<id>`) is a failure. Slice K runs exactly this on rpm 4.16, 4.18
+     and 6. If any cell fails, Rocky 9 included, the model falls back to the single key of P365
+     point 12. That fallback keeps every other point of this decision.
+   - **What the fallback means.** "Only the subkey is in GitHub, and the primary is offline"
+     holds under the subkey model only. Under the fallback, the one key, which is also the
+     trust anchor, is the secret `REPO_SIGNING_KEY` in GitHub, as P365 has it today. A leak
+     then means rotating the key itself, with a new fingerprint for every user. If an rpm whose subkey has since expired no longer
      verifies on some cell, the subkeys are made without expiry instead: rotation becomes a
      policy, and revocation is the bound. Slice K's pull request records the branch taken as a
      decision that amends this one.
@@ -68,15 +78,22 @@ and P376c (the Intel Mac runner) are separate decisions.
      signature). The output has no `BADSIG`, `ERRSIG`, `EXPSIG`, `EXPKEYSIG` or `REVKEYSIG`, and
      exactly one `VALIDSIG`, or two for a dual-signed `InRelease` or `Release.gpg`. In the
      fallback, `$3` equals `$12`, and both are listed.
-   - **rpms.** The issuer Key ID, from `rpm -qp --qf '%{RSAHEADER:pgpsig}'`, must be the low
-     64 bits of `current`, never the primary's.
-3. **Verify before upload (adds a step to `repos`, NRV-E1161).** Before the run uploads anything,
-   and before it writes the promoted manifest, it checks its own output:
+   - **rpms.** The issuer Key ID and digest, from `rpm -qp --qf '%{RSAHEADER:pgpsig}'`, must be
+     `SHA512` and the low 64 bits of `current`, never the primary's.
+3. **Verify before upload (adds a step to `repos`, NRV-E1161).** Before anything is written to a
+   locked or immutable prefix, and before the run writes the promoted manifest, it checks its
+   own output. An rpm is checked in step 4, before its hash is recorded and before it is put,
+   because the locks make a bad object permanent. An rpm already in the bucket that fails
+   later is marked `excluded` in the manifest and left out of the indexes (step 5b). The rest is
+   checked in step 5b:
    - `gpgv` checks `InRelease`, `Release.gpg` and `repomd.xml.asc`, under an empty `GNUPGHOME`,
      against a keyring made only from `packaging/keys/`.
    - The text `gpgv` prints from `InRelease` must equal `Release` byte for byte.
    - `rpmkeys --dbpath <scratch> --import` loads the pinned key file into a scratch rpm
-     database, then `rpmkeys --dbpath <scratch> -K` checks every rpm the indexes list. That
+     database, then `rpmkeys --dbpath <scratch> -K` checks each rpm before step 4 records it,
+     and again every rpm the indexes list. It runs on the runner's rpm 4.18, so it checks
+     signatures and the Key ID, not rpm 6's policy or an expired subkey; slice K and
+     `repos-verify` check those. That
      database holds no other key. Fedora's rpm 6 refuses a key it has not imported, so the
      import is part of the check.
    - The manifests already verify before they are put, and the NEVRA and payload checks
@@ -93,10 +110,12 @@ and P376c (the Intel Mac runner) are separate decisions.
    the run wrote. That is about 40 MB a release; the manifest's 4 GiB bound applies in the worst
    case. The cost is about a minute. R2 egress is free.
 5. **Refresh alarms (amends P365 point 10's threshold).** When `repos`, `repos-verify`, the
-   refresh or `repos-fresh` fails or is cancelled, an `alarm` job runs. It uses the
+   refresh or `repos-fresh` fails, an `alarm` job runs. A cancelled run does not alarm:
+   `ci.yml` cancels a superseded run on `main`, and the two clocks below catch a missing run. It uses the
    `GITHUB_TOKEN` with `permissions: issues: write` only, and no environment or secret.
-   - If an open issue labelled `package-repos` exists, the job comments on it. Otherwise it opens
-     one, so there is at most one open alarm.
+   - If an open issue labelled `package-repos` exists, the job comments on it, at most once a
+     day per (workflow, job, code). Otherwise it opens one, assigned to the owner, so there is
+     at most one open alarm.
    - The comment quotes the code and the run's link.
    - A failure of the alarm itself is warning NRV-W1103 and never changes the run's verdict.
    - The refresh also comments when the `InRelease` it finds was signed more than 8 days
@@ -105,14 +124,17 @@ and P376c (the Intel Mac runner) are separate decisions.
      days left, so under 10 means at least one refresh did not happen.
    - The 60-day rule stays. It catches only a schedule that GitHub disabled.
 6. **WKD on `nerva.pro` (amends P365 point 3: the site now carries the key, as a second channel).**
-   - The site repository serves the key by WKD's direct method:
+   - The site repository serves the key by WKD's direct method, with a `404.html` and a
+     `_headers` rule (`Access-Control-Allow-Origin: *`), and it is adopted only if the
+     rehearsal shows Pages serves the dot-directory and answers an unknown hash with 404:
      - `.well-known/openpgpkey/policy`, an empty file;
      - `.well-known/openpgpkey/hu/ndqm47zydhyqyzabecddtdk1q3bponab`, the hash of `nerva`. It
        holds the binary form of `packaging/keys/nerva-release.asc`.
    - The build command copies exactly those two files and refuses a symlink.
-   - `site_check.mjs` compares the file with Nerva's `main` on every site pull request.
-     `release_finish.sh site-live` compares the served file with the release commit's key file.
-     A difference is NRV-E1162.
+   - Both checks use one reference, the key file at the commit the site's `RELEASES` names as
+     the latest release: `site_check.mjs` on every site pull request, and `release_finish.sh
+     site-live` after a release. A difference is NRV-E1162. `release-finish.yml`'s `site` job
+     opens the pull request that updates the WKD file.
    - INSTALL.md tells users to check that the primary fingerprints from GitHub and from WKD
      agree.
    - The job never reads the site's key.
@@ -139,7 +161,8 @@ and P376c (the Intel Mac runner) are separate decisions.
 - A yearly key-file fetch for apt users until a keyring package exists. A user who misses it gets
   `NO_PUBKEY` at the swap.
 - About a minute more per write run.
-- A site pull request at every rotation.
+- The WKD file changes with a release, not with a key change on `main`.
 - Four codes (NRV-E1160 to NRV-E1162, and the warning NRV-W1103).
+- Under the fallback, the primary key itself is in GitHub, and a leak means rotating it.
 - WKD does not protect against a merge to Nerva's `main`. That merge already reaches the CI
   subkey through the workflows, but it cannot make a new subkey without the offline primary.

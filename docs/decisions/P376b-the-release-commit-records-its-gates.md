@@ -12,13 +12,18 @@ people follow, and nothing enforces them yet. A new check, `release_check.sh gat
 <commit>` (NRV-E1159), enforces their form. It reads the version's CHANGELOG section at
 `<commit>` and requires its `### What was tested` block to hold these three lines:
 
-- **Simulation.** The line quotes, in backticks, the line that `sim_fleet.py soak --commit
+- **Simulation.** The line takes one of two forms, and the check accepts no other. The first quotes, in backticks, the line that `sim_fleet.py soak --commit
   <candidate>` printed, which reads `soak <7 hex>: <H> h, ...; <F> failures, <T> past the
   deadline, <K> killed by the host; sim-fleet issues its rounds hit: none`. `<H>` is at least
   24.0, and `<F>`, `<T>` and `<K>` are each `0`. The 7 hex digits are a prefix of
-  `release/candidate`'s SHA where that file exists (P374).
-- **Jepsen.** The line quotes `` `jepsen/nightly success <40 hex>` ``, where the SHA is
-  `release/candidate`'s, followed by a link to the run on `github.com/NervaLog/nerva`.
+  `release/candidate`'s SHA where that file exists (P374). The second form is for a release
+  that P147b or P259e exempts: `soak: skipped (P259e, revert of <tag>)`, where `<tag>` is an
+  existing tag and the release reverts it, or `soak: not yet running (P147b)`, which the check
+  refuses once R2's fleet has printed a tracker line.
+- **Jepsen.** The line takes one of two forms. The first quotes `` `jepsen/nightly success <40 hex>` ``,
+  where the SHA is `release/candidate`'s, followed by a link to the run on
+  `github.com/NervaLog/nerva`. The second is `jepsen: not yet running (P147b)`, which the check
+  refuses once R1's nightly has a successful run.
 - **Two adversarial reviews.** The line holds two verdicts. Each is one of `ship`,
   `ship after fixes` or `do not ship`, followed by a link to a `github.com/NervaLog/nerva` issue
   or pull request, and the two links differ. A `do not ship` passes only with a `waived:` link to
@@ -45,7 +50,8 @@ says, and the owner checks them at the approval. That is the recommendation, and
 these:
 
 - The release freeze holds, and v0.7.1 waits only on the packages' rehearsal.
-- G touches `release_check.sh`, its test and both release workflows, which #374 is changing now.
+- G touches `release_check.sh`, its test and both release workflows, and builds on #374 as
+  merged (bb827d9).
 - A new refusal added on the release path right before the tag is itself a release risk.
 
 **Reason.** The rule was written down but nothing refused a release without it. A format check

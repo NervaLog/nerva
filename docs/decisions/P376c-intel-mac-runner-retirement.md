@@ -33,4 +33,6 @@ starts, runs its smoke test and verifies its signature. The release keeps the un
 **Cost.**
 - Rosetta is not native Intel hardware. A fault that occurs only on a real Intel CPU, such as a
   CPU-feature mismatch, would no longer be caught.
-- Rosetta itself may be retired by Apple later.
+- Apple has announced that Rosetta 2 becomes limited after macOS 27 (secondary sources; confirm
+  the date). That date bounds this Rosetta smoke test, and the x86_64 binary's check then needs
+  another host or a decision.

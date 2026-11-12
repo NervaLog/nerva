@@ -66,9 +66,13 @@ project built from a repository runs that repository's `functions/` directory as
 `wrangler.json`, `wrangler.jsonc`) in it (Cloudflare's Pages Functions and configuration docs).
 A binding could name any R2 bucket of the account, with `put` and `delete`: there is no read-only
 binding. So the project's build command, set in the dashboard (setup step 2), refuses a tree that
-holds any of those names, then copies three named files into an empty `dist/`, the output
-directory: `index.html`, and the two WKD files (see "The key by WKD"). It copies nothing else,
-and refuses any of the three that is missing or is a symlink.
+holds any of those names, then copies five named files into an empty `dist/`, the output
+directory: `index.html`, `404.html`, `_headers`, and the two WKD files (see "The key by WKD").
+It copies nothing else, and refuses any of the five that is missing or is a symlink.
+`404.html` makes Pages answer an unknown path with 404; without one, Pages treats the project
+as a single-page app and answers any path, including another WKD hash, with `index.html` and
+status 200. `_headers` gives `/.well-known/openpgpkey/*` the headers WKD clients expect:
+`Content-Type: application/octet-stream` and `Access-Control-Allow-Origin: *`.
 
 **Cloudflare installs dependencies before the build command runs.** Its build image runs
 `npm install` (or the Python, Ruby or other tool) when it finds a `package.json`, a lock file or a
@@ -141,11 +145,18 @@ nothing here, and GnuPG falls back to the direct method when that host does not 
   the primary, its subkeys, and any revocations.
 - **Who keeps it equal:** every change to `packaging/keys/` here is followed, the same day, by a
   site pull request that replaces the file.
-  - `site_check.mjs` fetches `packaging/keys/nerva-release.asc` from Nerva's `main`, dearmors it
-    and compares, on every site pull request. A difference is **NRV-E1162**, so the site cannot
-    drift, and its next pull request is blocked until it matches.
+  - **One reference for both checks: the key file at the commit that the site's `RELEASES` data
+    names as the latest release.** The WKD file changes only with a release.
+  - `site_check.mjs` fetches `packaging/keys/nerva-release.asc` at that commit, dearmors it and
+    compares, on every site pull request. A difference is **NRV-E1162**.
   - At release time, `release_finish.sh site-live` fetches the served WKD file, without cache
-    busting, and compares it with the key file at the release commit (NRV-E1162).
+    busting, and compares it with the key file at the release commit (NRV-E1162), which is the
+    same reference once the site pull request has merged.
+  - **Who opens the site pull request:** `release-finish.yml`'s `site` job, which already opens
+    the site's pull request for the release, and which now also replaces the WKD file with the
+    dearmored key file of the release commit. A key change on `main` between releases does not
+    block the site, and the WKD file lags `main` by design. For a revocation that cannot wait,
+    the owner cuts a patch release (see "Compromise"), which is the one path.
 - **INSTALL.md** asks users to compare the primary fingerprint of the key from GitHub with the
   one from WKD (see "Install instructions").
 - **It is a second channel, never a source.** No job reads the site's key. The manifest, the
@@ -295,8 +306,9 @@ index-was <sha256> <key>
   under a new, higher name therefore does not verify, and is noted as junk.
 - **`state`** is `writing` until the run has uploaded the indexes and `served` has checked them.
   Then the run writes one more generation, the same with `state complete`.
-- **`package` lines,** one per package object, sorted by key. `<state>` is `pending` or
-  `published`. `<sha256>` and `<size>` are the stored object's. For a deb they equal the
+- **`package` lines,** one per package object, sorted by key. `<state>` is `pending`,
+  `published` or `excluded` (P376: the object is locked and stays, but no index lists it; it is
+  set only by step 5b, and is never reversed). `<sha256>` and `<size>` are the stored object's. For a deb they equal the
   release file's. For an rpm they are the signed copy's, and `-` until a run has signed it (step 4
   of `repos`). `<source-sha256>` is the release asset's, as the approved run read it from the
   draft. `<tag>` and `<commit>` are the release's tag and the commit `publish-ready` checked.
@@ -784,18 +796,33 @@ ship, or a candidate is deleted (P343 7b). The rule:
          the entry has a recorded hash (not `-`) and the other channel's object exists with it,
          put those bytes. Otherwise download the release's rpm, check `<source-sha256>`
          (NRV-E1148), sign it (see "Signing"), and check that the signed copy has the release
-         file's NEVRA and payload digest (NRV-E1144). A new signature differs, so the run
+         file's NEVRA and payload digest (NRV-E1144), and **verify its signature** ("Verify an
+         rpm first", below, NRV-E1161). A new signature differs, so the run
          **first** writes a manifest generation that records the new `<sha256>` and `<size>` on
          **every** entry of that file, in both `rc` and `stable`, and copies `state`, `index` and
          `index-was` (see "The manifest"). **Only then** does it put the objects, each with
          `put-new`. A crash between the two puts leaves both entries recorded, so the next run
          finds the missing object's entry hash and copies the bytes of the one that exists.
 
+     **Verify an rpm first (P376, NRV-E1161).** Before the run records an rpm's hash in a
+     manifest or puts it, including a copy of the other channel's object, it checks the exact
+     bytes it is about to put, in a scratch rpm database it made at the start of this step
+     (`rpmdb --initdb --dbpath <scratch>`, then `rpmkeys --dbpath <scratch> --import
+     packaging/keys/nerva-release.asc`, which must leave exactly one `gpg-pubkey`):
+     - `rpmkeys --dbpath <scratch> -K <rpm>` exits 0 and reports `digests signatures OK`;
+     - `rpm -qp --qf '%{RSAHEADER:pgpsig}\n' <rpm>` reads `RSA/SHA512, <date>, Key ID <16 hex>`,
+       with the digest `SHA512` and the Key ID as "The manifest" says.
+
+     An rpm that fails is not recorded and not put. The run stops with NRV-E1161, and the bucket
+     and the manifests hold nothing of it. So no object that fails this check ever reaches a
+     locked prefix, and the locks never keep a bad one. The signing run's own key, secret and
+     passphrase are the usual cause, so fixing them and re-running signs the rpm again.
+
      So every package object the job ever writes is listed in a signed manifest before it exists.
      A download from GitHub that fails for another reason (the network, the API) is NRV-E1155.
   5. **Indexes.** It regenerates both channels of both formats from the entries whose objects are
-     all present with their SHA-256 (they are about to be `published`), and never from anything
-     else: `stable` from the releases, `rc` from everything. A failure of `apt-ftparchive` or
+     all present with their SHA-256 and not `excluded` (they are about to be `published`), and
+     never from anything else: `stable` from the releases, `rc` from everything. A failure of `apt-ftparchive` or
      `createrepo_c` is NRV-E1156.
      - **apt:** for each channel it makes a staging tree of hard links to that channel's debs and
        runs `apt-ftparchive -a <arch> packages pool/main/n/nerva` for `amd64` and `arm64`, writing
@@ -814,8 +841,12 @@ ship, or a candidate is deleted (P343 7b). The rule:
        rpms, then runs `createrepo_c --general-compress-type=gz --checksum=sha256 --no-database
        --revision <now, epoch seconds>`, which gives unique names for everything but
        `repomd.xml`, and signs `repomd.xml.asc` (detached, armored).
-  5b. **Verify before upload (P376, NRV-E1161).** Nothing has been uploaded yet. The run checks
-      its own output as a user's machine would, using only the public key file:
+  5b. **Verify before upload (P376, NRV-E1161).** Nothing of the indexes has been uploaded yet.
+      The run checks its own output against the public key file alone. It uses the runner's
+      rpm 4.18 and gpgv, so it checks signatures, digests and the Key ID, not the policy of rpm 6
+      or Sequoia, nor an expired or revoked subkey, which rpm 4.18 does not judge as they do.
+      Those are checked only by slice K's cells and by `repos-verify`, which install on real
+      distributions. This step is the gate before upload, not a substitute for them:
       - **A public-key-only home.** It makes a new, empty `GNUPGHOME` under `$RUNNER_TEMP`, with
         no secret key and no agent. The only keyring is the `gpg --dearmor` of
         `packaging/keys/nerva-release.asc`, passed with `--keyring`.
@@ -823,19 +854,23 @@ ship, or a candidate is deleted (P343 7b). The rule:
         must equal `Release` byte for byte. Then `gpgv --status-fd 3 Release.gpg Release`.
       - **dnf, for each channel.** `gpgv --status-fd 3 repomd.xml.asc repomd.xml`.
       - **Each status** must pass the signature check of "The manifest" for its kind.
-      - **rpms.** It makes a scratch rpm database (`rpmdb --initdb --dbpath <scratch>`) and runs
-        `rpmkeys --dbpath <scratch> --import packaging/keys/nerva-release.asc`. The import must
-        succeed and leave exactly one `gpg-pubkey`. Fedora's rpm 6 refuses to check against a
-        key it has not imported, so the import is part of the check. Then, for every rpm that
-        either channel's `repodata` lists, it runs `rpmkeys --dbpath <scratch> -K <rpm>`, which
-        must exit 0 and report `digests signatures OK`. The rpm's Key ID must be as "The
-        manifest" says.
+      - **rpms.** It runs step 4's check again, with the same scratch database, on every rpm that
+        either channel's `repodata` lists, including rpms put by earlier runs.
       - **What was already checked.** The manifests are verified before each put (see "The
-        manifest"), and each signed rpm's NEVRA and payload are checked against the release's
-        file (step 4, NRV-E1144). Those checks stay. This step adds the indexes and every
-        indexed rpm, in one place and under one key file.
-      - **On a failure** the run stops with NRV-E1161 and has written nothing for this step. The
-        manifests and packages from step 4 stay, and the next run finishes them.
+        manifest"), and each rpm's signature, NEVRA and payload are checked in step 4 before it
+        is recorded or put (NRV-E1161, NRV-E1144). This step adds the indexes, and re-checks every
+        indexed rpm in one place under one key file.
+      - **On a failure of an index signature** the run stops with NRV-E1161 and has written
+        nothing for this step. The manifests and packages from step 4 stay, and the next run
+        finishes them.
+      - **On a failure of an rpm that is already in the bucket** (a key revoked since, or an
+        object put before this check existed), the run does not stop, because the object is
+        locked and cannot be replaced. It writes a manifest generation that marks every entry
+        of that file `excluded` (copying `state`, `index` and `index-was` as step 4's generations
+        do), redoes steps 5 and 5b without it, and ends red with NRV-E1161 after step 10. An
+        `excluded` entry is never indexed and its object stays where it is. The other releases'
+        packages are indexed and signed as usual, so apt and dnf keep working and `Valid-Until`
+        is renewed. The release the rpm belongs to gets a decision, normally a patch release.
   6. **Promote and record.** It writes the next manifest generation, `state writing`: those
      entries as `published`, `index` lines with the SHA-256 of every replaceable file from step 5,
      and `index-was` lines as "The manifest" says.
@@ -890,7 +925,9 @@ A run stopped at any step leaves the bucket in a state the next write run accept
 | an rpm's first channel put in step 4 | both entries recorded, one object | copies that object's bytes to the other channel |
 | part of step 4 | some objects of pending entries | puts the rest; adopts what is there with the entry's SHA-256 |
 | step 4 | all objects, entries pending | indexes, then promotes |
-| step 5b (NRV-E1161) | the same: nothing of step 5 was uploaded | indexes and verifies again; a lasting failure is a finding |
+| step 4's rpm check (NRV-E1161) | nothing of that rpm: no manifest line, no object | signs it again; a lasting failure is a finding |
+| step 5b, an index signature (NRV-E1161) | the same: nothing of step 5 was uploaded | indexes and verifies again; a lasting failure is a finding |
+| step 5b, an rpm already in the bucket (NRV-E1161) | an `excluded` generation, the object still there | indexes without it, and ends red; the owner decides the release |
 | step 6 | the promoted manifest (`writing`), the old indexes (`index-was`) | accepts them, rewrites every index |
 | part of step 7 | new content-named files, each replaceable name at `index` or `index-was` | accepts them, rewrites every index |
 | step 7 or 8 | the new indexes, a `writing` manifest | accepts them, rewrites every index |
@@ -929,7 +966,12 @@ Each workflow that can leave the repositories stale or unchecked ends with one m
 
 The job:
 
-- **Runs** with `if: ${{ always() && (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')) }}`.
+- **Runs** with `if: ${{ always() && contains(needs.*.result, 'failure') }}`, and **never on
+  `cancelled`**. `ci.yml` cancels a superseded run on `main` (`cancel-in-progress: true`), so two
+  merges close together cancel the first run, which is not a fault. The write jobs use
+  `cancel-in-progress: false`, so only a person cancels them. A run that never happens is found
+  by the two clocks, not by the alarm: the refresh reports an `InRelease` signed more than 8 days
+  earlier, and `repos-fresh` fails at under 10 days left, and both are `failure`.
   The refresh's job also sets the output `missed`, and the alarm runs when it is `true`. It never
   runs on pull requests. `repos-fresh` runs only on `push` to `main`, and `release-finish.yml`
   and the refresh never run on pull requests.
@@ -943,15 +985,21 @@ The job:
   it ended with to `$GITHUB_OUTPUT`; `unknown` if the job died before that). The script reads,
   through REST only, `gh api 'repos/{owner}/{repo}/issues?labels=package-repos&state=open&per_page=1'`.
   - **An open issue exists:** it adds one comment, "`<workflow>` / `<job>` failed with `<code>`:
-    `<run-url>`". One comment per run, never more.
+    `<run-url>`", unless that issue already has a comment for the same (workflow, job, code)
+    from the last 24 hours, read from the issue's last 100 comments. So there is at most one
+    comment per (workflow, job, code) per day, and a Cloudflare or R2 outage, or the 106-day
+    window of NRV-E1160, adds a few lines a day, not one per merge. The count of runs skipped
+    is in the next comment that is posted.
   - **None is open:** it opens one, titled "Package repositories: `<workflow>` failed
-    (`<code>`)", labelled `package-repos`, with the same line and a pointer to this document's
-    "Recovery". There is never more than one open alarm issue. Later failures, of any kind,
+    (`<code>`)", labelled `package-repos` and **assigned to the owner** (the login in the
+    repository variable `PACKAGE_REPOS_OWNER`, setup step 6), with the same line and a pointer to
+    this document's "Recovery". Assigning notifies the owner whatever their watch settings are. There is never more than one open alarm issue. Later failures, of any kind,
     become comments on it, until the owner closes it after the fix.
 - **Its own failure** (GitHub down, the label missing) prints **NRV-W1103**, "the alarm could not
   be filed", and the job uses `continue-on-error: true`. An alarm never turns a run green or red.
   The failed job is still red, and the scheduled run's e-mail still goes out.
-- **The label** `package-repos` is made once, in setup step 6.
+- **The label** `package-repos` and the variable `PACKAGE_REPOS_OWNER` are made once, in setup
+  step 6.
 - **A test.** The refresh's `workflow_dispatch` takes a boolean input `alarm_test`. With it, the
   job fails at once with the code `alarm-test`, before it reads a secret or touches R2, so the
   rehearsal tests the alarm without writing anything.
@@ -1090,7 +1138,7 @@ Yes, the release checks that `nerva.pro` shows it. It is its own job, not a step
 | The weekly refresh failed, or was cancelled | Re-run it, or let the next writer run. apt users have at least a week before `Valid-Until` |
 | The refresh or `repos-fresh` failed NRV-E1150 | As in "The 60-day rule" |
 | A write run or `repos-fresh` ended NRV-E1160 | The CI subkey expires soon. Follow "Rotation" from the step it names: certify `next`, or swap. The run itself re-signed and is otherwise done |
-| `repos` or the refresh stopped NRV-E1161 | Its own signatures do not verify against `packaging/keys/`. Nothing of the indexes was uploaded. Suspect a key file and secret that disagree (a rotation done halfway) or a tool change. Fix it, then re-run. It is a finding until explained |
+| `repos` or the refresh stopped NRV-E1161 | Its own signatures do not verify against `packaging/keys/`: an rpm in step 4 (nothing of it was recorded or put), or an index in step 5b (nothing of the indexes was uploaded). Suspect a key file and secret that disagree (a rotation done halfway) or a tool change. Fix it, then re-run. It is a finding until explained. If it ended red after writing an `excluded` generation, the rpm was already in the bucket: see "Compromise" |
 | `site-verify`, or a site pull request, failed NRV-E1162 | The WKD file in the site repository differs from `packaging/keys/`. Open a site pull request with the `gpg --dearmor` of the key file. If nobody here changed the key, treat it as a compromise of the site and check its history |
 | An issue labelled `package-repos` was opened or commented on | Read its runs' codes and recover each as this table says. Close the issue once a later run is green. NRV-W1103 in a run means the alarm itself failed: check the label exists and GitHub's status |
 
@@ -1127,7 +1175,8 @@ one key" says. Every other part of this spec works with either.
   `packaging/keys/fingerprints`. **That pin never changes:** it is the fingerprint users check
   once.
 - **The signing subkey** is an RSA 4096 subkey with signing capability only, which **expires one
-  year** after it is made. CI holds this subkey and nothing more: `REPO_SIGNING_KEY` is an export
+  year** after it is made. CI holds this subkey, or two during a rotation's overlap, and nothing
+  more: `REPO_SIGNING_KEY` is an export
   of the subkey alone, in which the primary is a stub with no secret part (GnuPG shows `sec#`).
   It is `current` in `fingerprints`.
 - **Why RSA 4096, not Ed25519.** apt (`gpgv` on Debian 12 and Ubuntu, `sqv` on Debian 13),
@@ -1204,9 +1253,10 @@ to users").
    brings the primary online and certifies the next subkey (setup step 4's `--quick-add-key`
    line). The owner exports it as setup step 4 does, and sets it as `REPO_SIGNING_KEY_NEXT` and
    `REPO_SIGNING_PASSPHRASE_NEXT` in `package-repos`.
-2. **The same day, two pull requests.** One here lists the new subkey as `next` and replaces
-   `nerva-release.asc` with the export that now holds both subkeys. One in the site repository
-   replaces the WKD file (NRV-E1162 otherwise). From the next write run, `InRelease` and
+2. **The same day, one pull request here,** which lists the new subkey as `next` and replaces
+   `nerva-release.asc` with the export that now holds both subkeys. The WKD file follows with
+   the next release's site pull request, and the rotation's overlap is at least 120 days, so a
+   release falls inside it. From the next write run, `InRelease` and
    `Release.gpg` carry **two signatures**, by `current` and by `next`. apt accepts a file when one
    signature verifies with a key in `Signed-By` and ignores a signature whose key it lacks, as
    Debian's own archive does with its several keys, so old and new key files both work.
@@ -1219,11 +1269,10 @@ to users").
    NRV-E1139, which is expected. From then on, everything is signed by the new subkey. Old rpms
    keep their old signatures, so the old subkey stays in the key file as `retired`, for good.
 4. **dnf hosts** meet the new subkey at the swap, in `repomd.xml.asc` and in new rpms. Slice K
-   records what rpm 4.16 and rpm 6 do with a new subkey of a primary already imported (the
-   rotation test). INSTALL.md then documents the one step, if any, that a dnf user takes at a
-   rotation. For example, rpm 4.16 may need `sudo rpm -e gpg-pubkey-<id>`, after which dnf
-   re-imports the key from `gpgkey=`. A cell where no documented step works means the fallback
-   (see "Slices", K).
+   tests exactly this, on rpm 4.16, 4.18 and 6: `dnf upgrade nerva` must succeed across the swap
+   with no command beyond the ones in the original install. A cell that needs `sudo rpm -e
+   gpg-pubkey-<id>`, a second import, or any other step means the fallback (see "Slices", K),
+   because a step that can be documented is not a step users take.
 5. **An apt host that never re-fetched the key file** fails `apt update` from the swap on, with
    `NO_PUBKEY` naming the new subkey. It would have failed at the old subkey's expiry 14 days
    later anyway. The fix is INSTALL.md's `curl` line again, and the pinned fingerprint is
@@ -1243,14 +1292,14 @@ it, every apt user re-fetches the key file once a year.
   online and revokes the subkey (`gpg --edit-key <primary>`, `key N`, `revkey`, reason "Key
   is compromised"). The owner then certifies a new subkey and
   replaces the secrets. The pull request here lists the old subkey as `revoked`, the new one as
-  `current`, and ships the key file with the revocation. A site pull request follows the same
-  day.
+  `current`, and ships the key file with the revocation. The WKD file follows with a
+  patch release's site pull request.
   - **apt** hosts that fetch the key file get the revocation. Hosts that do not stop accepting
     the subkey when it expires, which is the bound the expiry gives.
   - **rpms already signed** by the revoked subkey can no longer be verified wherever the
     revocation is known (rpm 6 rejects all its signatures). The locks forbid re-signing them, so
-    the job leaves them out of the indexes, and each release they belonged to gets a decision at
-    the time, normally a new patch release.
+    the job marks them `excluded` (step 5b), which leaves them out of the indexes, and each
+    release they belonged to gets a decision at the time, normally a new patch release.
   - **Manifests.** If the current manifest was signed by the revoked subkey, no manifest
     verifies any more. The owner picks the last manifest known good (by date, before the leak)
     and adds `anchor <generation> <sha256>` to `fingerprints`. The next run accepts that one
@@ -1276,8 +1325,14 @@ be documented, the key model is P365's:
   `Release.gpg`. At the swap, `previous` keeps verifying old rpms, and apt users fetch the key
   file again, **with a new fingerprint to check**. There is no expiry alarm, and NRV-E1160 is
   registered as retired and unused.
-- **A leak** of the key is a leak of the trust anchor: a new key, a new fingerprint for every
-  user, and a new decision.
+- **The single key is in GitHub.** "CI holds only the subkey, and the primary stays offline"
+  holds under the subkey model and under no other. Under this fallback the one key, which is
+  also the trust anchor every user has pinned, is the secret `REPO_SIGNING_KEY` in the
+  environment `package-repos`, as P365 has it today. Its custody is the one P365 set (the
+  environment, the passphrase, the approved run attempt), and nothing stronger.
+- **A leak** of the key is a leak of the trust anchor: the owner rotates the key itself, not a
+  subkey. That means a new key, a new fingerprint for every user to check, and a new decision.
+  This is the cost of the fallback, and the reason the subkey model is tried first.
 - Everything else in P376 stays: the pinned check, verification before upload, the served check,
   alarms and WKD.
 
@@ -1360,7 +1415,8 @@ but it imports the key into your keyring.)
   - **apt:** run the `curl` line above again, in the weeks the CHANGELOG and the pinned issue
     name. If you miss it, `apt update` fails with `NO_PUBKEY` after the switch, and the same line
     fixes it.
-  - **dnf:** the step slice K recorded, if any (filled in by slice 5 from the test's result).
+  - **dnf:** nothing. The subkey model is adopted only if `dnf upgrade nerva` works across the
+    swap with no extra command (slice K).
 
   In the single-key fallback, this becomes a new key every two years, with a new fingerprint to
   compare.
@@ -1455,7 +1511,7 @@ the other release codes.
 | NRV-E1157 | `repos-verify` could not set up a distribution's container or its prerequisites (an image pull, a mirror), before any check of the repository ran | `repo_install_check.sh` (`repos-verify`) | the environment (a registry or mirror) |
 | NRV-E1159 | The release commit does not record its gates in the form P376b requires: the soak line, the Jepsen line or the two review verdicts is missing or malformed, names another commit, or `TO FILL` is left in the version's section (registered by slice G) | `release_check.sh gates` (`release.yml`'s `version`, `release-finish.yml`'s `publish`) | release maintainer |
 | NRV-E1160 | The CI signing subkey expires soon: under 120 days and no `next` listed, or under 30 days and not swapped. Noted; the run finishes its work, then ends red (retired, unused, if slice K takes the fallback) | `package_repos.sh publish`, `refresh`, `ci.yml`'s `repos-fresh` | the key's owner |
-| NRV-E1161 | The run's own output does not verify before upload: `InRelease`, `Release.gpg` or `repomd.xml.asc` under a keyring of `packaging/keys/` only, `InRelease`'s text against `Release`, or an rpm under `rpmkeys -K` in a scratch database. Nothing of the indexes is uploaded | `package_repos.sh publish`, `refresh` | release maintainer (a key file and secret that disagree, or a tool change) |
+| NRV-E1161 | The run's own output does not verify before upload: `InRelease`, `Release.gpg` or `repomd.xml.asc` under a keyring of `packaging/keys/` only, `InRelease`'s text against `Release`, or an rpm under `rpmkeys -K` in a scratch database, which step 4 checks before the rpm is recorded or put (a bad rpm already in the bucket is marked `excluded` instead). Nothing of the indexes is uploaded | `package_repos.sh publish`, `refresh` | release maintainer (a key file and secret that disagree, or a tool change) |
 | NRV-E1162 | The WKD key on `nerva.pro` is not `packaging/keys/nerva-release.asc` | the site's `site_check.mjs`, `release_finish.sh site-live` (`site-verify`) | whoever changed either key file without the other; if nobody did, the site's repository or Pages project |
 | NRV-W1103 | The `alarm` job could not open or comment on the `package-repos` issue. A warning: it never changes the run's verdict | `.github/scripts/repos_alarm.sh` | GitHub, or a missing label |
 
@@ -1530,7 +1586,12 @@ took subkeys without expiry, follow 4A with `never` in place of `1y`.
 
 **4A. An offline primary and a CI subkey.** You need two USB drives, each formatted in Disk
 Utility as **APFS (Encrypted)** with a long passphrase of its own, kept in the password manager.
-On your Mac, with GnuPG (`brew install gnupg`, which brings pinentry), in a throwaway keyring:
+On your Mac, with GnuPG (`brew install gnupg`, which brings pinentry). **Turn Wi-Fi off and
+unplug any network cable before you start, and keep it off until the last step of this section.**
+Quit every other application, and do the work in a throwaway keyring (a temporary
+`GNUPGHOME`, wiped at the end). The primary is never offline while it is made, but it should be
+nowhere near the network while it exists in the clear. Better, do it on a fresh macOS user
+account with no iCloud sync, or from a live USB:
 
 ```bash
 export GNUPGHOME="$(mktemp -d)"
@@ -1568,22 +1629,31 @@ as a file, not through the clipboard (Universal Clipboard would copy it to your 
 Eject both drives and keep them in two places.
 
 Then the export CI gets: the subkey and a stub of the primary, under a **CI passphrase** of its
-own, made in a second throwaway keyring. (`printf '\041'` is a `!`, which forces that exact
-subkey; zsh would read a typed one as history.)
+own. The passphrase is changed **before** the primary is stripped, on a copy of the keyring
+(`--passwd` on a keyring whose primary is already a stub may fail or ask for a passphrase it
+cannot use). (`printf '\041'` is a `!`, which forces that exact subkey; zsh would read a typed
+one as history.)
 
 ```bash
-gpg --armor --export-secret-subkeys "$sub$(printf '\041')" > "$HOME/nerva-ci-subkey.asc"
 export CIHOME="$(mktemp -d)"
 chmod 700 "$CIHOME"
-gpg --homedir "$CIHOME" --import "$HOME/nerva-ci-subkey.asc"
+cp -R "$GNUPGHOME"/. "$CIHOME"/
 gpg --homedir "$CIHOME" --passwd "$fpr"
-gpg --homedir "$CIHOME" --list-secret-keys
+gpg --homedir "$CIHOME" --armor --export-secret-subkeys "$sub$(printf '\041')" > "$HOME/nerva-ci-subkey.asc"
+export CICHECK="$(mktemp -d)"
+chmod 700 "$CICHECK"
+gpg --homedir "$CICHECK" --import "$HOME/nerva-ci-subkey.asc"
+gpg --homedir "$CICHECK" --list-secret-keys
 ```
 
 `--passwd` asks for the primary's passphrase (the old one), then for a new one: make a second
 long random passphrase, the CI passphrase, and keep it in its own password manager item. The
-listing must show `sec#` (no secret primary) and one `ssb`. Anything else, stop. Keep this
-terminal open: step 6 sets the secret from `CIHOME`.
+listing of `CICHECK`, which holds only the export, must show `sec#` (no secret primary) and
+one `ssb`, and the export must unlock with the CI passphrase and not with the primary's.
+Anything else, stop. Slice K's pull request runs this exact sequence in a throwaway first, so
+the owner does not meet its first run. Keep this terminal open: step 6 sets the secret from
+`~/nerva-ci-subkey.asc`. When step 6 is done, wipe every throwaway home (`rm -rf "$GNUPGHOME"
+"$CIHOME" "$CICHECK" ~/nerva-ci-subkey.asc`), empty the Trash, and turn the network back on.
 
 Give the supervisor `~/nerva-release.asc` and both fingerprints (the `echo` above). They are
 public; slice 3 commits them to `packaging/keys/` as `primary` and `current`. Compare the
@@ -1713,7 +1783,11 @@ The label the alarm job files under (see "Alarms"):
 
 ```bash
 gh label create package-repos --repo NervaLog/nerva --color B60205 --description 'A package repository run failed or a refresh was missed'
+gh variable set PACKAGE_REPOS_OWNER --repo NervaLog/nerva --body '<your GitHub login>'
 ```
+
+The variable names who the alarm issue is assigned to (P376), so a real alarm notifies you
+whatever your watch settings are.
 
 Now delete the files and the throwaway keyrings. **4A:**
 
@@ -1807,8 +1881,8 @@ gh label list --repo NervaLog/nerva --search package-repos
 
 Expect: a 200 from `nerva.pro`; a 404 from `nervalog.github.io`; a 404 from `packages.nerva.pro`
 (served by R2: the bucket is empty); four secrets (`R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`,
-`REPO_SIGNING_KEY`, `REPO_SIGNING_PASSPHRASE`) and three variables (`R2_ENDPOINT`, `R2_BUCKET`,
-`PACKAGES_BASE_URL`); `false`, `true` and `branch_policy`; `false`; `pages exit 1` (Pages is
+`REPO_SIGNING_KEY`, `REPO_SIGNING_PASSPHRASE`) and four variables (`R2_ENDPOINT`, `R2_BUCKET`,
+`PACKAGES_BASE_URL`, `PACKAGE_REPOS_OWNER`); `false`, `true` and `branch_policy`; `false`; `pages exit 1` (Pages is
 off); and the label `package-repos`. Then tell the supervisor.
 
 **Rotating the R2 token** (yearly, or if it may have leaked): create a new token as in step 5, set
@@ -1821,8 +1895,10 @@ fails with NRV-E1143 and is re-run.
   that only `main` can deploy and admins cannot bypass, and it reaches the `package_repos.sh`
   steps only. Nothing else in GitHub holds any Cloudflare credential.
 - **The bucket's public host** is read-only by construction: R2 public access has no write path.
-- **The signing key:** CI holds only the signing subkey, under a CI passphrase, and never the
-  primary, which is offline on two encrypted drives (P376; in the fallback, the one key). It sits
+- **The signing key:** under the subkey model, CI holds only the signing subkey (two during a
+  rotation's overlap), under a CI passphrase, and never the primary, which is offline on two
+  encrypted drives (P376). Under the fallback, CI holds the single key, as P365 has it, and a
+  leak means rotating the key itself. It sits
   in the same environment, reaches the same steps, and signs new package content only as bound
   by the approved run attempt, while the release is a draft. A leaked subkey is revoked offline,
   and the pinned primary stays.
@@ -1960,8 +2036,10 @@ containers):
 - Cloudflare Pages: that it reads `wrangler.toml` and `functions/` only for a deployment whose
   build passed, so the gate holds; and that it builds no pull request from a fork.
 - Cloudflare Pages serving `dist/.well-known/`, a dot-directory, and the `Content-Type` it gives
-  the WKD file. If it does not serve it, P376 point 6 needs a decision before v0.7.1 (the key
-  stays on GitHub only, and INSTALL.md's second channel is cut).
+  the WKD file, and answering an unknown path under `/.well-known/openpgpkey/hu/` with 404 and
+  `policy` with 200. **WKD is adopted only if all of this passes in the rehearsal.** If not,
+  P376 point 6 is cut by a decision before v0.7.1: the key stays on GitHub only, and INSTALL.md's
+  second channel goes.
 - The `alarm` job's `if` on a cancelled run, and `issues: write` being enough to add a label
   that exists.
 
@@ -1982,12 +2060,12 @@ CLAUDE.md (P148b).
 | 0 | Register NRV-E1139 to NRV-E1157 from the table above (NRV-E1154 as "retired, unused", so the number is never reused): entries with surface, blame, cause and fix, plus the intro paragraph of the 11xx section naming the scripts and the Cloudflare build that print them | `docs/ERRORS.md` | mechanical; supervisor checks the diff | first; small, merges before 1 and 2 |
 | 1 | `r2.py` and its tests. The tests run a fake S3 server (`http.server`, in the test file) that also enforces lock prefixes, check the SigV4 signature against AWS's published test vectors, and cover `If-None-Match` and 412, `put-new` of an existing object under a locked prefix answered with 412 and, in a second mode of the fake server, with the pinned lock refusal (exit 3 both times), listing across pages and the 100-page assert, `probe-locked` both ways, the replaceable-name refusal, the stored `Content-Type` and `Cache-Control`, retries, NRV-E1143's text, and that no credential appears in argv or any message. One line in `ci.yml`'s release-scripts step | `.github/scripts/r2.py`, `.github/scripts/test_r2.py`, `.github/workflows/ci.yml` (one line) | implementation; review | after 0 |
 | 2 | `package_repos.sh` (`ready`, `publish`, `refresh`, `served`, `cleanup`) and `repo_install_check.sh`. Tests with real `gpg`, `gpgv`, `apt-ftparchive`, `createrepo_c` and `rpmsign`, throwaway keys and a throwaway `packaging/keys/` directory, a stand-in `gh`, and `r2.py` against slice 1's fake server. They cover every code from NRV-E1139 to NRV-E1156 but E1143, E1146, E1151, E1152 and the retired E1154; the strict manifest parsing (appended and prepended text, two blocks, dash-escaping, a listed-key-file key that is not in `fingerprints`); a manifest copied to a higher generation; an index replaced, deleted, or copied across channels (healed, then NRV-E1142); `ready` on a release that reads published while `PUBLISHED` is false (NRV-E1148); `ready` binding a draft in an attempt other than `mac`'s (NRV-E1153), and a dispatch with `PUBLISHED` true in any attempt (not checked); the binding, and a re-bind by a later approved attempt when no object of the tag exists, refused (NRV-E1141) when one does; a missing lock rule (NRV-E1149), and a lock refusal with another status than the pinned one (NRV-E1143); junk under each locked prefix, noted and skipped, with the run still finishing and ending red (NRV-E1142), and junk at a name the run must write (refused); a manifest name taken by junk (the run takes the next one); a verified manifest at the name the run wanted (NRV-E1147, nothing more written); `manifest/` holding only objects that do not verify (NRV-E1142, refused); a first run killed before its first manifest, then a run that starts from generation 0; a pending entry whose release is a draft or answers 404 (skipped with a notice, the run green), and a GitHub error on one (NRV-E1155, the entry still `pending`, the other entries published); a generation that changes only `package` lines copying `state`, `index` and `index-was`; a run that stops after its `writing` manifest, and a later `complete` one that refuses `index-was`; a by-hash or hashed `repodata` file with wrong content (replaced, noted); too little disk (NRV-E1156); the quiet-repository check (NRV-E1150); a kill after each step of `publish` (each row of the idempotence table), including between the `writing` manifest of step 6 and the upload, and between the upload and the `complete` manifest; a run with nothing bound; the 2,000-entry limit; that `stable` holds no candidate; and a dual-signed `InRelease`. `tests/packaging/repos.py` serves the generated trees over local HTTP to the debian 12 and 13, ubuntu 22.04 and 24.04, rocky and fedora 43 and 44 containers in `packages.yml` through `repo_install_check.sh` (NRV-E1146 and NRV-E1157 included, dnf 5 without `rpm --import`, and the "must not list" check on an empty `stable`), checks apt's refusal of a copied channel on a host that read `stable` before, checks a dual-signed `InRelease` with only one key on the host (gpgv and sqv), and checks that its commands equal this spec's install block (slice 5 switches the source to INSTALL.md). `ci.yml` installs the pinned tools for the scripts step | `.github/scripts/package_repos.sh`, `.github/scripts/repo_install_check.sh`, `.github/scripts/test_package_repos.py`, `tests/packaging/repos.py`, `.github/workflows/ci.yml` (the tools and one line), `.github/workflows/packages.yml` (one step) | implementation; review (security focus: secrets, argv, refusals, the binding, the manifest parser) | after 1 |
-| K | The key-model test (P376 point 1). A throwaway certify-only primary and signing subkeys S1 and S2, made in the test. It signs a small apt repository (`InRelease`, `Release.gpg`) and a dnf repository (`repomd.xml.asc`, one rpm) with S1, and installs from them on Debian 12 (gpgv), Debian 13 (sqv), Ubuntu 22.04 and 24.04, Rocky 9 (rpm 4.16), Fedora 43 and 44 (rpm 6) and the runner's rpm 4.18, on amd64 and arm64. Then: a rotation (a host holding {primary, S1} meets a dual-signed `InRelease` and rpms signed by S2, before and after it fetches the new key file; on dnf, with the primary already imported); an rpm whose subkey expired after it signed (with a faked clock, `faketime` or a short-expiry subkey and a wait); a revoked subkey (refused by apt and dnf once the key file carries the revocation); and a signature by the primary itself, which the P376 check refuses. Its pull request reports each cell and records the branch taken as a decision amending P376 (subkeys, subkeys without expiry, or the fallback), and the dnf rotation step, if any | `tests/packaging/subkeys.py`, `.github/workflows/key-model.yml` (new, so it does not touch `packages.yml`) | implementation; review | now, parallel with 2; before 2b, 3 and setup step 4 |
+| K | The key-model test (P376 point 1). A throwaway certify-only primary and signing subkeys S1 and S2, made in the test. It signs a small apt repository (`InRelease`, `Release.gpg`) and a dnf repository (`repomd.xml.asc`, one rpm) with S1, and installs from them on Debian 12 (gpgv), Debian 13 (sqv), Ubuntu 22.04 and 24.04, Rocky 9 (rpm 4.16), Fedora 43 and 44 (rpm 6) and the runner's rpm 4.18, on amd64 and arm64. Then: a rotation (a host holding {primary, S1} meets a dual-signed `InRelease` and rpms signed by S2, before and after it fetches the new key file; on dnf, with the primary already imported, `dnf upgrade nerva` must succeed with no other command, on rpm 4.16, 4.18 and 6, and on apt `apt update` must succeed after INSTALL.md's `curl` line alone; any other command is a failed cell); an rpm whose subkey expired after it signed (with a faked clock, `faketime` or a short-expiry subkey and a wait); a revoked subkey (refused by apt and dnf once the key file carries the revocation); and a signature by the primary itself, which the P376 check refuses. Its pull request reports each cell and records the branch taken as a decision amending P376 (subkeys, subkeys without expiry, or the fallback). It also runs setup step 4A's exact commands in a throwaway, `--passwd` and the `sec#` listing included, with the output pasted | `tests/packaging/subkeys.py`, `.github/workflows/key-model.yml` (new, so it does not touch `packages.yml`) | implementation; review | now, parallel with 2; before 2b, 3 and setup step 4 |
 | 0b | Register NRV-E1160 to NRV-E1162 and NRV-W1103 from the table above, amend the texts of NRV-E1139, E1145, E1150 and E1152, and the 11xx intro (adds `repos_alarm.sh`). If K took the fallback, E1160 is registered "retired, unused" | `docs/ERRORS.md` | mechanical; supervisor checks the diff | after K's branch is known; before 2b |
-| 2b | `package_repos.sh` amended to P376: the pinned check (`VALIDSIG` `$12` is `primary`, `$3` a subkey listed for the file kind, RSA, SHA-512, the class, no `EXPKEYSIG` or `REVKEYSIG`; replaces slice 2's `$NF` check), the roles of `fingerprints` (`primary`, `current`, `next`, `retired`, `revoked`, `anchor`, or the fallback's), the secret's `sec#` check and `_NEXT` pair, dual signing, the rpm Key ID, NRV-E1160, step 5b (NRV-E1161), step 8's fetch-back of everything written, `Date` from the run and `SOURCE_DATE_EPOCH` refused, each step's `code` output, and `.github/scripts/repos_alarm.sh` with its test (a stand-in `gh`: open, comment, NRV-W1103). Tests add: a primary-signed file refused; a subkey not listed for the kind refused; an expired and a revoked subkey; a secret holding the primary refused; a key file and secret that disagree (NRV-E1161, nothing uploaded); a served object that differs (NRV-E1145); the expiry thresholds | `.github/scripts/package_repos.sh`, `.github/scripts/test_package_repos.py`, `.github/scripts/repos_alarm.sh`, `.github/scripts/test_repos_alarm.py` | implementation; review (security focus: the check, the roles, the anchor) | after 2, K and 0b |
+| 2b | `package_repos.sh` amended to P376: the pinned check (`VALIDSIG` `$12` is `primary`, `$3` a subkey listed for the file kind, RSA, SHA-512, the class, no `EXPKEYSIG` or `REVKEYSIG`; replaces slice 2's `$NF` check), the roles of `fingerprints` (`primary`, `current`, `next`, `retired`, `revoked`, `anchor`, or the fallback's), the secret's `sec#` check and `_NEXT` pair, dual signing, the rpm Key ID, NRV-E1160, step 4's rpm check and step 5b (NRV-E1161) with the `excluded` state, step 8's fetch-back of everything written, `Date` from the run and `SOURCE_DATE_EPOCH` refused, each step's `code` output, and `.github/scripts/repos_alarm.sh` with its test (a stand-in `gh`: open, assigned to `PACKAGE_REPOS_OWNER`, comment, one comment a day per (workflow, job, code), NRV-W1103; no alarm on `cancelled`). Tests add: a badly signed rpm never recorded or put; a bad rpm already in the bucket `excluded` and indexed without; a primary-signed file refused; a subkey not listed for the kind refused; an expired and a revoked subkey; a secret holding the primary refused; a key file and secret that disagree (NRV-E1161, nothing uploaded); a served object that differs (NRV-E1145); the expiry thresholds | `.github/scripts/package_repos.sh`, `.github/scripts/test_package_repos.py`, `.github/scripts/repos_alarm.sh`, `.github/scripts/test_repos_alarm.py` | implementation; review (security focus: the check, the roles, the anchor) | after 2, K and 0b |
 | 3 | `packaging/keys/nerva-release.asc` and `packaging/keys/fingerprints` (`primary <fpr>` and `current <subkey fpr>`; in the fallback, `current <fpr>`), from setup step 4 | `packaging/keys/*` | mechanical; supervisor checks both fingerprints against the owner's and against `gpg --show-keys` | after K and setup step 4; parallel with 2b |
 | 4 | `release-finish.yml`: jobs `repos-ready` and `repos` (gated on `public`), both in the concurrency group `nerva-packages-bucket` with `cancel-in-progress: false`, `repos-verify`, `site-verify`; `publish`'s `needs`, `if`, last step and output `public`; `mac-sign.yml`'s new output `attempt` (`github.run_attempt` of its signing job), which `repos-ready` compares; the header comment (which still says "the site's auto-merge"; P364 merges directly); images pinned by digest. `release_finish.sh site-live` and its test. `package-repos-refresh.yml`: the weekly schedule and dispatch, its job in the same group. `ci.yml`'s `repos-fresh` job, behind `REPOS_LIVE`, failing at under 10 days and on NRV-E1160. The `alarm` job in all three workflows (P376: `issues: write` only, `continue-on-error`), the refresh's `missed` output and `alarm_test` input. `site-live` also compares the served WKD file with the release commit's key file (NRV-E1162). Tried with a dispatch on a published candidate before review where possible: `repos-ready` then refuses NRV-E1139 cleanly while the environment is not set up | `.github/workflows/release-finish.yml`, `.github/workflows/mac-sign.yml` (one output), `.github/workflows/package-repos-refresh.yml`, `.github/workflows/ci.yml` (one job), `.github/scripts/release_finish.sh` (`site-live`), `.github/scripts/test_release_finish.py` | implementation; review (security focus: environments, `needs`/`if`, outputs, `!cancelled()`, the shared concurrency group on every job that writes the bucket and on no other) | after 2 |
-| 5 | The fingerprint in INSTALL.md's new section (the `primary` line; the dnf 5 notes, pinning by Origin, the signing sentence, the two-channel WKD check, the yearly key-file fetch and K's dnf step), CLAUDE.md (the site line, the release line, the environment fact), automation.md's hook section as a pointer here, the source of slice 2's install-block test switched from this spec to INSTALL.md (one line), and the worklog. In the site repository, one pull request: CLAUDE.md and README (Cloudflare Pages, "no key on the page", the refused names), `.github/CODEOWNERS` deleted, the WKD files (`.well-known/openpgpkey/policy`, empty, and `hu/ndqm47zydhyqyzabecddtdk1q3bponab`, the `gpg --dearmor` of the key file; the hash rechecked with `gpg-wks-client --print-wkd-hash nerva@nerva.pro`), and `site_check.mjs` refusing every name the build command refuses (NRV-E1152), dangling symlinks included, and comparing the WKD file with Nerva's `main` (NRV-E1162), with its test | `docs/INSTALL.md`, `CLAUDE.md`, `docs/releases/automation.md`, `tests/packaging/repos.py` (one line); the site's `CLAUDE.md`, `README.md`, `.github/CODEOWNERS`, `.well-known/openpgpkey/*`, `site_check.mjs` and its test | mechanical, except the `site_check.mjs` change (implementation); supervisor checks | after 2 and 3, and after setup steps 2 and 8 |
+| 5 | The fingerprint in INSTALL.md's new section (the `primary` line; the dnf 5 notes, pinning by Origin, the signing sentence, the two-channel WKD check, and the yearly key-file fetch), CLAUDE.md (the site line, the release line, the environment fact), automation.md's hook section as a pointer here, the source of slice 2's install-block test switched from this spec to INSTALL.md (one line), and the worklog. In the site repository, one pull request: CLAUDE.md and README (Cloudflare Pages, "no key on the page", the refused names), `.github/CODEOWNERS` deleted, the WKD files (`.well-known/openpgpkey/policy`, empty, and `hu/ndqm47zydhyqyzabecddtdk1q3bponab`, the `gpg --dearmor` of the key file; the hash rechecked with `gpg-wks-client --print-wkd-hash nerva@nerva.pro`), and `site_check.mjs` refusing every name the build command refuses (NRV-E1152), dangling symlinks included, and comparing the WKD file with Nerva's `main` (NRV-E1162), with its test | `docs/INSTALL.md`, `CLAUDE.md`, `docs/releases/automation.md`, `tests/packaging/repos.py` (one line); the site's `CLAUDE.md`, `README.md`, `.github/CODEOWNERS`, `.well-known/openpgpkey/*`, `site_check.mjs` and its test | mechanical, except the `site_check.mjs` change (implementation); supervisor checks | after 2 and 3, and after setup steps 2 and 8 |
 | E | Setup steps 1 to 10 | Cloudflare, GitHub | owner | in order; step 4 after K and before slice 3; step 7 only after step 3's check |
 | F | The rehearsal, its run link recorded, and `REPOS_LIVE` set | worklog, a repository variable | supervisor | after 0 to 5, 0b, 2b, K and E |
 | G | P376b: `release_check.sh gates` (NRV-E1159) and its tests, called in `release.yml`'s `version` job and `release-finish.yml`'s `publish`; NRV-E1159 in `docs/ERRORS.md` | `.github/scripts/release_check.sh`, `.github/scripts/test_release_check.py`, `.github/workflows/release.yml`, `.github/workflows/release-finish.yml` (one step each), `docs/ERRORS.md` | implementation; review | after #374 merges and after the v0.7.1 tag |
