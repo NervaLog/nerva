@@ -274,6 +274,7 @@ restarts the service.
 5. Run R2's canary (a scratch-branch fault, filed once, then commented on and not filed again).
 6. Run R1's teeth night (`--expect-invalid` on the keys-off build files one `jepsen` issue). A
    fleet that has never filed anything passes the gate silently; steps 5 and 6 prove it would not.
+   For v0.7.1 the owner skipped step 4 and ran steps 5 and 6 during the soak (P359).
 
 The Jepsen clause of the same soak is in [ops/jepsen](../jepsen/README.md#release-soak). Jepsen
 stops the fleet for about 2.5 h a night, so 24 hours of rounds take about 27 of wall time.
