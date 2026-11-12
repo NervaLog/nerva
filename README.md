@@ -12,6 +12,11 @@ deterministic functions of it, and every read says which log position it reflect
 New here? [docs/TUTORIAL.md](./docs/TUTORIAL.md) walks through a running cluster, every API
 and the code, step by step.
 
+The project site, published to GitHub Pages from `main` by `.github/workflows/pages.yml`, shows
+this README, the tutorial, the [1.0 goals and milestones](./docs/GOALS-1.0.md) and the
+[changelog](./CHANGELOG.md). It is public although the repository is private, so `site/build.py`
+publishes only the pages it lists (P145).
+
 ## Design in one picture
 
 ```
