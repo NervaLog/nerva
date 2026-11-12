@@ -150,7 +150,7 @@ Sections: [01xx](ERRORS.md#01xx--the-gateway-transport-keys-routes-requests),
 
 ```
 error[NRV-E0008]: api: set NERVA_KEY
-  cause  `NERVA_KEY` is missing or invalid
+  cause  `NERVA_KEY` is missing, shorter than 32 bytes, the example's placeholder, or invalid
   fix    set NERVA_KEY; during a rotation NERVA_KEY_NEXT differs from it
 ```
 

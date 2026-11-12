@@ -147,6 +147,18 @@ pub fn key_matches(key_header: ?[]const u8, key: []const u8) bool {
 /// `openssl rand -hex 32` makes 64 characters.
 pub const key_length_min = peer_auth.key_length_min;
 
+/// Whether a header can carry `key` unchanged: no leading or trailing SP or HTAB (the parser
+/// trims them) and no control byte (#335). A key that fails could never match a request.
+fn key_sendable(key: []const u8) bool {
+    assert(key.len > 0);
+    if (key[0] == ' ' or key[0] == '\t') return false;
+    if (key[key.len - 1] == ' ' or key[key.len - 1] == '\t') return false;
+    for (key) |byte| {
+        if ((byte < 0x20 and byte != '\t') or byte == 0x7f) return false;
+    }
+    return true;
+}
+
 /// A gateway's keys (P96): `X-Nerva-Key` must equal `current` or, during a rotation, `next`.
 pub const Keys = struct {
     current: []const u8,
@@ -158,9 +170,11 @@ pub const Keys = struct {
     pub fn invalid(current: []const u8, next: ?[]const u8) ?[]const u8 {
         if (current.len == 0) return "set NERVA_KEY";
         if (current.len < key_length_min) return "NERVA_KEY is shorter than 32 bytes";
+        if (!key_sendable(current)) return "NERVA_KEY starts or ends with a space or tab, or holds a control byte";
         const key_next = next orelse return null;
         if (key_next.len == 0) return "NERVA_KEY_NEXT is set but empty";
         if (key_next.len < key_length_min) return "NERVA_KEY_NEXT is shorter than 32 bytes";
+        if (!key_sendable(key_next)) return "NERVA_KEY_NEXT starts or ends with a space or tab, or holds a control byte";
         if (std.mem.eql(u8, current, key_next)) return "NERVA_KEY_NEXT equals NERVA_KEY";
         return null;
     }
@@ -986,6 +1000,27 @@ test "Keys.invalid" {
         Keys.invalid(test_key_a, test_key_b[1..]).?,
     );
     try testing.expectEqual(null, Keys.invalid(test_key_a, test_key_b));
+    // #335: a key the header parser would trim, or with a control byte, could never match.
+    const spaced = test_key_a ++ " ";
+    try testing.expectEqualStrings(
+        "NERVA_KEY starts or ends with a space or tab, or holds a control byte",
+        Keys.invalid(spaced, null).?,
+    );
+    try testing.expectEqualStrings(
+        "NERVA_KEY_NEXT starts or ends with a space or tab, or holds a control byte",
+        Keys.invalid(test_key_a, "\t" ++ test_key_b).?,
+    );
+    try testing.expect(Keys.invalid(test_key_a ++ "\r\n", null) != null);
+    try testing.expectEqual(null, Keys.invalid(test_key_a ++ " x", test_key_b));
+    // No message names a key.
+    for ([_]?[]const u8{
+        Keys.invalid(test_key_a[1..], null),
+        Keys.invalid(test_key_a, test_key_b[1..]),
+        Keys.invalid(test_key_a ++ " ", null),
+    }) |message| {
+        try testing.expect(std.mem.indexOf(u8, message.?, test_key_a) == null);
+        try testing.expect(std.mem.indexOf(u8, message.?, test_key_b) == null);
+    }
 }
 
 fn test_connect(receiver: *const Receiver) !std.net.Stream {
