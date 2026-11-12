@@ -20,7 +20,7 @@
 # `publish-ready` checked), and for `ready` MAC_ATTEMPT and GITHUB_RUN_ATTEMPT. No secret is ever in
 # an argument: key and passphrase travel through stdin, a 0600 file and gpg-agent.
 #
-# Testing overrides, none of them set on a runner: PACKAGE_KEYS_DIR (packaging/keys), R2_PY (r2.py),
+# Testing overrides, refused (NRV-E1139) when GITHUB_ACTIONS is set: PACKAGE_KEYS_DIR (packaging/keys), R2_PY (r2.py),
 # PACKAGE_REPOS_FREE_KIB (the free disk, instead of df), PACKAGE_REPOS_KILL_AT=<point>[:<n>] (kill -9
 # at the nth pass through a named point, for the idempotence table).
 set -euo pipefail
@@ -49,6 +49,17 @@ refuse() { block "$@" >&2; echo "::error::$1 $2" >&2; exit 1; }
 defer() { block "$@" >>"$W/deferred"; }
 notice() { echo "::notice::$*" >&2; }
 junk() { echo "$1" >>"$W/junk"; notice "noted: $1"; }
+
+if [ -n "${GITHUB_ACTIONS:-}" ]; then
+  for v in PACKAGE_KEYS_DIR R2_PY PACKAGE_REPOS_FREE_KIB PACKAGE_REPOS_KILL_AT; do
+    if [ -n "${!v:-}" ]; then
+      block NRV-E1139 "$v is set on a runner" "$v exists for the tests only" \
+        "Remove $v from the workflow's environment" >&2
+      echo "::error::NRV-E1139 $v is set on a runner" >&2
+      exit 1
+    fi
+  done
+fi
 
 kill_point() {
   local want=${PACKAGE_REPOS_KILL_AT:-} name n=1
@@ -113,7 +124,7 @@ build_keyring() {
   [ -f "$keys_dir/nerva-release.asc" ] || e1139 "$keys_dir/nerva-release.asc is missing" "the public keys are part of the repository"
   want=$(listed_fprs); have=$(primaries_of "$keys_dir/nerva-release.asc")
   [ "$want" = "$have" ] || e1139 "$keys_dir/nerva-release.asc does not hold exactly the keys fingerprints lists" \
-    "listed: $(echo "$want"); in the file: $(echo "$have")"
+    "listed: $want; in the file: $have"
   gpg --batch --dearmor <"$keys_dir/nerva-release.asc" >"$W/ring.gpg"
 }
 
@@ -132,7 +143,7 @@ setup_keys() {
     e1139 "REPO_SIGNING_KEY does not import" "the secret must be one armored secret key"
   got=$(secret_primaries)
   [ "$got" = "$FP_CURRENT" ] || e1139 "the signing key is not the current pinned key" \
-    "fingerprint $(echo "$got"), but packaging/keys/fingerprints has current $FP_CURRENT"
+    "fingerprint $got, but packaging/keys/fingerprints has current $FP_CURRENT"
   SIGN_U=(-u "$FP_CURRENT")
   if [ -n "$FP_NEXT" ] || [ -n "${REPO_SIGNING_KEY_NEXT:-}" ]; then
     need_env REPO_SIGNING_KEY_NEXT REPO_SIGNING_PASSPHRASE_NEXT
@@ -361,14 +372,14 @@ e1142_now() { refuse NRV-E1142 "$1" "$2" "$e1142_fix"; }
 
 # Steps 3 of `repos`: refusals before any write, and the notes.
 bucket_check() { # <with-bounds: 0|1>
-  local st sha size key src tag commit rc head_out prefix n bytes
+  local st sha size key src tag rc head_out prefix n bytes
   n=$(wc -l <"$W/pk"); bytes=$(awk -F'\t' '$3 != "-" {s += $3} END {print s + 0}' "$W/pk")
   if [ "$n" -gt "$limit_entries" ] || [ "$bytes" -gt "$limit_bytes" ]; then
     e1142_now "the manifest holds $n entries and $bytes bytes, over the bound of $limit_entries and 4 GiB" \
       "a pruning policy or indexes built without downloading the packages needs a decision"
   fi
   # A HEAD of every published object: a locked object cannot change, so this is enough.
-  while IFS=$'\t' read -r st sha size key src tag commit; do
+  while IFS=$'\t' read -r st sha size key src tag _; do
     [ "$st" = published ] || continue
     rc=0; head_out=$(r2 head "$key") || rc=$?
     case $rc in 0) ;; 2) e1142_now "the listed object $key is missing" "the locks make that impossible, so the locks have failed" ;; *) exit 1 ;; esac
@@ -457,7 +468,7 @@ served_manifest() {
 }
 
 served_all() { # <tag or empty>
-  local c name key st sha size src tag commit
+  local c name key st sha size src tag
   served_manifest
   for c in "${channels[@]}"; do
     for name in "apt/dists/$c/InRelease" "rpm/$c/repodata/repomd.xml"; do
@@ -467,7 +478,7 @@ served_all() { # <tag or empty>
     done
   done
   [ -n "$1" ] || return 0
-  while IFS=$'\t' read -r st sha size key src tag commit; do
+  while IFS=$'\t' read -r st sha size key src tag _; do
     [ "$tag" = "$1" ] && [ "$st" = published ] || continue
     fetch_served "$key" "$W/sv.served"
     [ "$(sha_of "$W/sv.served")" = "$sha" ] || e1145 "$key is served with another SHA-256 than the manifest's"
@@ -501,7 +512,7 @@ cmd_ready() {
   # exactly four packages, matching SHA256SUMS
   names=$(package_names "$tag" | sort)
   [ "$(awk '$1=="A" && $3 ~ /^nerva[_-].*\.(deb|rpm)$/ {print $3}' "$W/rel.$tag" | sort)" = "$names" ] ||
-    e1140 "the draft does not hold exactly the four packages" "expected $(echo "$names")"
+    e1140 "the draft does not hold exactly the four packages" "expected $names"
   mkdir -p "$W/draft"
   n=0
   for name in SHA256SUMS $names; do
@@ -626,7 +637,7 @@ sign_rpm() { # <file>: rpmsign in place, then the NEVRA and payload digest check
 
 # Step 4 for one pending entry's tag file.
 put_pending() {
-  local tag key base other file rc st recorded sha srcsha size obj otherkey
+  local tag key base file rc st recorded sha srcsha size obj
   : >"$W/pending.keys"
   awk -F'\t' '$1 == "pending" {print $4}' "$W/pk" >"$W/pending.keys"
   while read -r key; do
@@ -668,7 +679,7 @@ fetch_source() { # <tag> <name> <source-sha> <file>
 }
 
 put_rpm() { # <key> <tag> <base> <source-sha>
-  local key=$1 tag=$2 base=$3 srcsha=$4 c k sha size have="" obj other copied=0
+  local key=$1 tag=$2 base=$3 srcsha=$4 c k sha size have="" obj
   local keys=() recorded=-
   for c in rc stable; do
     k=$(rpm_key "$c" "$base")
@@ -713,11 +724,11 @@ channel_has() { # <channel> <key> <tag>
 }
 
 make_indexes() {
-  local c a key st sha size src tag commit f now stage
+  local c a key st sha size src tag f now stage
   rm -rf "$W/stage" "$W/pk.files"; mkdir -p "$W/stage" "$W/pk.files"
   now=$(date -u +%s)
   # every package on disk (published entries and the pending ones about to be)
-  while IFS=$'\t' read -r st sha size key src tag commit; do
+  while IFS=$'\t' read -r st sha size key src tag _; do
     [ "$st" = published ] || [ "$(obj_state "$key")" = "$sha" ] || continue
     [ "$sha" != - ] || continue
     mkdir -p "$W/pk.files/$(dirname "$key")"
@@ -728,8 +739,10 @@ make_indexes() {
   for c in "${channels[@]}"; do
     stage=$W/stage/apt/$c
     mkdir -p "$stage/pool/main/n/nerva"
-    while IFS=$'\t' read -r st sha size key src tag commit; do
-      [[ $key == apt/* ]] && [ -f "$W/pk.files/$key" ] && channel_has "$c" "$key" "$tag" || continue
+    while IFS=$'\t' read -r st sha size key src tag _; do
+      [[ $key == apt/* ]] || continue
+      [ -f "$W/pk.files/$key" ] || continue
+      channel_has "$c" "$key" "$tag" || continue
       ln "$W/pk.files/$key" "$stage/pool/main/n/nerva/${key##*/}"
     done <"$W/pk"
     (
@@ -756,7 +769,7 @@ make_indexes() {
     # dnf
     stage=$W/stage/rpm/$c
     mkdir -p "$stage/packages"
-    while IFS=$'\t' read -r st sha size key src tag commit; do
+    while IFS=$'\t' read -r st sha size key src tag _; do
       [[ $key == rpm/$c/* ]] && [ -f "$W/pk.files/$key" ] || continue
       ln "$W/pk.files/$key" "$stage/packages/${key##*/}"
     done <"$W/pk"
@@ -815,7 +828,7 @@ upload_indexes() {
 }
 
 cmd_publish() { # <tag or empty> <refresh: 0|1>
-  local tag=$1 refresh=$2 st sha size key src tag2 commit name h was age
+  local tag=$1 refresh=$2 st sha size key name h was age
   need_env PACKAGES_BASE_URL GH_TOKEN GITHUB_REPOSITORY
   [ -z "$tag" ] || [[ $tag =~ $tag_re ]] || e1139 "the tag $tag is not a version tag" "publish takes vX.Y.Z or vX.Y.Z-rc.N"
   need_tools gpg gpgv python3 gh curl jq sha256sum rpm rpmsign apt-ftparchive createrepo_c gzip
@@ -830,7 +843,7 @@ cmd_publish() { # <tag or empty> <refresh: 0|1>
   kill_point checked
   put_pending
   # promote what is complete: a pending entry whose object exists with its hash
-  while IFS=$'\t' read -r st sha size key src tag2 commit; do
+  while IFS=$'\t' read -r st sha size key _; do
     [ "$st" = pending ] && [ "$sha" != - ] || continue
     [ "$(obj_state "$key")" = "$sha" ] && set_entry "$key" published "$sha" "$size"
   done < <(cat "$W/pk")

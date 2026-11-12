@@ -569,6 +569,25 @@ class Ready(Base):
         self.assert_diag(rc, err, "NRV-E1139")
         self.assert_no_secrets(err)
 
+    def test_a_missing_tool_is_e1139(self):
+        self.release("v0.7.1")
+        bare = self.tmp / "nojq"
+        bare.mkdir()
+        for d in os.environ["PATH"].split(":"):
+            for f in (os.scandir(d) if os.path.isdir(d) else ()):
+                if f.name != "jq" and not (bare / f.name).exists():
+                    os.symlink(f.path, bare / f.name)
+        rc, _, err = self.ready("v0.7.1", PATH=f"{self.tmp}/bin:{bare}")
+        self.assert_diag(rc, err, "NRV-E1139")
+        self.assertIn("jq", err)
+
+    def test_a_testing_override_on_a_runner_is_e1139(self):
+        self.release("v0.7.1")
+        for v in ("PACKAGE_KEYS_DIR", "R2_PY", "PACKAGE_REPOS_FREE_KIB", "PACKAGE_REPOS_KILL_AT"):
+            rc, _, err = self.ready("v0.7.1", GITHUB_ACTIONS="true", **{v: "1"})
+            self.assert_diag(rc, err, "NRV-E1139")
+            self.assertIn("is set on a runner", err)
+
     def test_an_unlisted_secret_key_is_e1139(self):
         self.release("v0.7.1")
         rc, _, err = self.ready("v0.7.1", REPO_SIGNING_KEY=self.k["b"][1], REPO_SIGNING_PASSPHRASE=PASS["b"])
@@ -784,6 +803,17 @@ class Bucket(Base):
         rc_ = self.s3.objects["apt/dists/rc/main/binary-amd64/Packages"][0]
         self.assertIn(b"0.8.0~rc.1", rc_)
 
+    def sqv_accepts(self, inrelease, ring):
+        """Debian 13's apt-sequoia checks the clearsigned text with sqv: split it as sqv wants it."""
+        head, _, rest = inrelease.partition(b"\n\n")
+        text, _, sig = rest.partition(b"\n-----BEGIN PGP SIGNATURE-----")
+        lines = [(ln[2:] if ln.startswith(b"- ") else ln).rstrip(b" \t\r") for ln in text.split(b"\n")]
+        (self.tmp / "text").write_bytes(b"\r\n".join(lines))
+        (self.tmp / "text.sig").write_bytes(b"-----BEGIN PGP SIGNATURE-----" + sig)
+        p = subprocess.run(["sqv", "--keyring", str(ring), str(self.tmp / "text.sig"), str(self.tmp / "text")],
+                           capture_output=True, text=True)
+        self.assertEqual(p.returncode, 0, p.stderr)
+
     def test_a_dual_signed_inrelease_verifies_with_either_key_alone(self):
         self.set_keys(current="a", next="b")
         self.release("v0.7.1")
@@ -802,6 +832,8 @@ class Bucket(Base):
             p = subprocess.run(["gpgv", "--status-fd", "1", "--keyring", str(ring), str(f)],
                                capture_output=True, text=True)
             self.assertRegex(p.stdout, rf"VALIDSIG {self.k[n][0]} ")
+            if shutil.which("sqv"):
+                self.sqv_accepts(data, ring)
         self.assert_no_secrets(self.last.stdout, self.last.stderr)
 
 
@@ -839,7 +871,7 @@ class Publish(Base):
         self.assertEqual(rc, -9, err)
         self.assertIn("state writing", self.manifest())
         self.finish("v0.7.2")
-        self.assertNotIn("index-was", self.manifest())
+        self.assertIn("state complete", self.manifest())
 
     def test_a_package_lines_only_generation_copies_state_index_and_index_was(self):
         self.bound("v0.7.2")
@@ -913,7 +945,9 @@ class Publish(Base):
         self.replace_asset("v0.7.2", name, b"swapped")
         rc, _, err = self.publish("v0.7.2")
         self.assert_diag(rc, err, "NRV-E1148")
-        self.assertEqual([k for k in self.keys_under("apt/pool/") if "0.7.2" in k], [])
+        # the other deb matches its entry and is put (spec, "Put"); the swapped one never is
+        self.assertNotIn(f"apt/pool/main/n/nerva/{name}", self.keys_under("apt/pool/"))
+        self.assertTrue(all(v[0] == "pending" for k, v in self.entries().items() if k.endswith(name)))
 
     def test_a_signature_that_is_not_by_the_current_key_is_e1144(self):
         self.bound("v0.7.2")
@@ -946,13 +980,13 @@ class Publish(Base):
         self.assert_no_secrets(self.last.stdout, self.last.stderr, (self.gh_dir / "log").read_text())
         self.assertNotIn("+ ", err, "no set -x output")
 
-    def test_a_complete_manifest_with_index_was_does_not_verify(self):
+    def test_a_complete_manifest_may_carry_index_was_lines(self):
         text = self.mtext(1, "complete", iw=[(sha(b"x"), "apt/dists/stable/InRelease")])
         data = self.sign_manifest(text)
         f = self.tmp / "v.asc"
         f.write_bytes(data)
         p = subprocess.run(["bash", str(SCRIPT), "verify-manifest", str(f), "1"], env=self.env())
-        self.assertNotEqual(p.returncode, 0)
+        self.assertEqual(p.returncode, 0)  # a package-lines-only generation copies them (spec, "The manifest")
 
 
 if __name__ == "__main__":
