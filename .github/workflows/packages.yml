@@ -158,7 +158,7 @@ jobs:
             createrepo-c=0.17.3-2ubuntu3 rpm=4.18.2+dfsg-2.1build2 sqv=1.1.0-1build2 gnupg jq
           tool_is() { # <tool> <expected first line>
             got=$("$1" --version 2>&1 | head -n1)
-            case $got in "$2"*) ;; *) echo "error[NRV-E1139]: packages.yml: $1 reads '$got', not '$2'" >&2; exit 1 ;; esac
+            case $got in "$2" | "$2"[!0-9.]*) ;; *) echo "error[NRV-E1139]: packages.yml: $1 reads '$got', not '$2'" >&2; exit 1 ;; esac
           }
           tool_is apt-ftparchive "apt 2.8.4"
           tool_is createrepo_c "Version: 0.17.3"
