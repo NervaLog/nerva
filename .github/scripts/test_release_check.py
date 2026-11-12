@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for release_check.sh (NRV-E1112 to NRV-E1116, and mac-draft: NRV-E1119, NRV-E1120, NRV-E1122 to NRV-E1124) and release_notes.sh (NRV-E1117). Run from the repository root:
+"""Tests for release_check.sh (NRV-E1112 to NRV-E1116, mac-draft: NRV-E1119, NRV-E1120, NRV-E1122 to NRV-E1124, and publish-ready: NRV-E1131) and release_notes.sh (NRV-E1117, and `site`: NRV-E1130). Run from the repository root:
 python3 .github/scripts/test_release_check.py
 
 A stand-in `nerva` and a stand-in `gh` (a script that answers from files) stand for the real two."""
@@ -246,6 +246,80 @@ class MacDraft(unittest.TestCase):
         self.assertLess(workflow.index(call, keychain), upload)
 
 
+def release_assets(tag, extra=(), without=()):
+    """The twelve names a release is published with, as the comma-joined list `gh` prints."""
+    filever = tag[1:].replace("-", ".")
+    names = [f"nerva-{tag}-{t}.tar.gz" for t in ("x86_64-linux", "aarch64-linux", "x86_64-macos", "aarch64-macos")]
+    names += [f"nerva_{filever}-1_amd64.deb", f"nerva_{filever}-1_arm64.deb",
+              f"nerva-{filever}-1.x86_64.rpm", f"nerva-{filever}-1.aarch64.rpm",
+              f"nerva-{tag}.cdx.json", "SHA256SUMS",
+              f"nerva-{tag}-universal-macos.zip", f"nerva-{tag}-universal-macos.zip.sha256"]
+    return ",".join([n for n in names if n not in without] + list(extra))
+
+
+class PublishReady(unittest.TestCase):
+    """`publish-ready` shares mac-draft's target checks, which print as release.yml's."""
+
+    def refused(self, result, code, fragment):
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn(f"error[{code}]: release.yml: ", result.stderr)
+        self.assertIn(fragment, result.stderr)
+        self.assertIn("\n  cause  ", result.stderr)
+        self.assertIn("\n  fix    ", result.stderr)
+        self.assertIn(f"::error::{code}", result.stderr)
+
+    def gh(self, d, tag="v0.7.1", draft="true", assets=None, **kwargs):
+        names = release_assets(tag) if assets is None else assets
+        fake_gh_draft(d, releases=f"{draft}\\tabc1234\\t{names}", version=tag[1:], **kwargs)
+
+    def test_a_draft_with_every_asset_on_main_passes_and_prints_its_commit(self):
+        with tempfile.TemporaryDirectory() as d:
+            for tag in ("v0.7.1", "v0.7.1-rc.1"):
+                self.gh(d, tag)
+                result = run("publish-ready", tag, path_dir=d)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, "0123456789abcdef0123456789abcdef01234567\n")
+
+    def test_a_release_that_is_already_published_carries_on(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.gh(d, draft="false")
+            self.assertEqual(run("publish-ready", "v0.7.1", path_dir=d).returncode, 0)
+
+    def test_no_release_is_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            fake_gh_draft(d, releases="")
+            self.refused(run("publish-ready", "v0.7.1", path_dir=d), "NRV-E1131",
+                         "there is no release named v0.7.1 to publish")
+
+    def test_a_missing_or_extra_asset_is_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.gh(d, assets=release_assets("v0.7.1", without=("nerva-v0.7.1-universal-macos.zip",)))
+            result = run("publish-ready", "v0.7.1", path_dir=d)
+            self.refused(result, "NRV-E1131", "does not hold exactly the assets it is published with")
+            self.assertIn("nerva-v0.7.1-universal-macos.zip", result.stderr)
+            self.gh(d, assets=release_assets("v0.7.1", extra=("stray.txt",)))
+            self.refused(run("publish-ready", "v0.7.1", path_dir=d), "NRV-E1131", "stray.txt")
+
+    def test_a_target_off_main_or_with_the_wrong_version_is_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.gh(d, status="diverged", files=("VERSION",))
+            self.refused(run("publish-ready", "v0.7.1", path_dir=d), "NRV-E1124", "which is not on main")
+            fake_gh_draft(d, releases=f"true\\tabc1234\\t{release_assets('v0.7.1')}", version="0.7.0")
+            self.refused(run("publish-ready", "v0.7.1", path_dir=d), "NRV-E1120", "whose VERSION is '0.7.0'")
+
+    def test_a_tag_that_is_not_v_version_is_refused(self):
+        for tag in ("main", "0.7.1", "v0.7.1 "):
+            self.refused(run("publish-ready", tag), "NRV-E1131", f"'{tag}' is not a release tag v<VERSION>")
+
+    def test_a_release_the_script_cannot_list_stops_the_run(self):
+        with tempfile.TemporaryDirectory() as d:
+            Path(d, "gh").write_text('#!/bin/sh\necho "gh: Server Error (HTTP 500)" >&2\nexit 1\n')
+            Path(d, "gh").chmod(0o755)
+            result = run("publish-ready", "v0.7.1", path_dir=d)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn("cannot list the releases", result.stderr)
+
+
 NOTES = ROOT / ".github/scripts/release_notes.sh"
 
 
@@ -279,6 +353,51 @@ class ReleaseNotes(unittest.TestCase):
             result = notes(text)
             self.assertEqual(result.returncode, 1)
             self.assertIn("has no notes for v0.7.1", result.stderr)
+
+
+SITE_LINE = "<!-- site: The first release for outside users: a signed Mac binary. -->"
+
+
+def site(changelog, tag="v0.7.1"):
+    with tempfile.TemporaryDirectory() as d:
+        Path(d, "CHANGELOG.md").write_text(changelog)
+        return subprocess.run([str(NOTES), "site", tag], cwd=d, capture_output=True, text=True)
+
+
+class SiteLine(unittest.TestCase):
+    def refused(self, result, fragment):
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("error[NRV-E1130]: release.yml: ", result.stderr)
+        self.assertIn(fragment, result.stderr)
+        self.assertIn("\n  cause  ", result.stderr)
+        self.assertIn("\n  fix    ", result.stderr)
+        self.assertIn("::error::NRV-E1130", result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_the_line_is_printed_and_dropped_from_the_notes(self):
+        changelog = f"## v0.7.2 \u2014 d\n{SITE_LINE.replace('first', 'other')}\nx\n\n## v0.7.1 \u2014 2026-11-13\n{SITE_LINE}\n\nShipped.\n"
+        result = site(changelog)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "The first release for outside users: a signed Mac binary.\n")
+        result = notes(changelog)
+        self.assertEqual(result.stdout, "Shipped.\n")
+
+    def test_a_missing_line_is_refused_for_a_release_and_defaulted_for_a_prerelease(self):
+        self.refused(site("## v0.7.1 \u2014 d\n\nShipped.\n"), "the CHANGELOG.md section of v0.7.1 has no site line")
+        self.refused(site("## v0.7.0 \u2014 d\n" + SITE_LINE + "\n"), "has no site line")
+        result = site("## v0.7.1-rc.1 \u2014 d\n\nShipped.\n", "v0.7.1-rc.1")
+        self.assertEqual((result.returncode, result.stdout), (0, "Release candidate v0.7.1-rc.1.\n"))
+
+    def test_an_empty_long_or_unsafe_line_is_refused(self):
+        for text, fragment in (("<!-- site: -->", "is empty"), ("<!-- site:    -->", "is empty"),
+                               (f"<!-- site: {'x' * 301} -->", "301 characters, over the limit of 300"),
+                               ('<!-- site: it says "hi" -->', 'holds a " or a \\'),
+                               ("<!-- site: a \\ b -->", 'holds a " or a \\'),
+                               ("<!-- site: TO FILL -->", "still holds a TO FILL")):
+            self.refused(site(f"## v0.7.1 \u2014 d\n{text}\n\nx\n"), fragment)
+        self.assertEqual(site(f"## v0.7.1 \u2014 d\n<!-- site: {'x' * 300} -->\n\nx\n").returncode, 0)
+        # A prerelease's bad line is still refused: only a missing one is defaulted.
+        self.refused(site('## v0.7.1-rc.1 \u2014 d\n<!-- site: "x" -->\n', "v0.7.1-rc.1"), 'holds a " or a \\')
 
 
 if __name__ == "__main__":
