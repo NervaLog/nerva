@@ -52,9 +52,11 @@ jobs:
     outputs:
       tag: ${{ steps.version.outputs.tag }}
     steps:
+      # The full history: `candidate` asks whether the candidate is an ancestor of this commit.
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           persist-credentials: false
+          fetch-depth: 0
 
       - name: Read VERSION
         id: version
@@ -91,6 +93,14 @@ jobs:
         env:
           TAG: ${{ steps.version.outputs.tag }}
         run: .github/scripts/release_check.sh ref "$TAG" "$GITHUB_REF"
+
+      # The code freeze (NRV-E1158): the commit may differ from the soaked candidate named by
+      # release/candidate only outside src/, build.zig, build.zig.zon and zig/. A prerelease with no
+      # such file passes, and one with it is checked, so the rehearsal exercises this.
+      - name: Refuse a commit whose code is not the candidate's
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: .github/scripts/release_check.sh candidate "$TAG" "$GITHUB_SHA"
 
       - name: Refuse a version already released, or already a draft
         env:

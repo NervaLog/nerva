@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for release_check.sh (NRV-E1112 to NRV-E1116, mac-draft: NRV-E1119, NRV-E1120, NRV-E1122 to NRV-E1124, and publish-ready: NRV-E1131) and release_notes.sh (NRV-E1117, and `site`: NRV-E1130). Run from the repository root:
+"""Tests for release_check.sh (NRV-E1112 to NRV-E1116, mac-draft: NRV-E1119, NRV-E1120, NRV-E1122 to NRV-E1124, publish-ready: NRV-E1131, and candidate: NRV-E1158) and release_notes.sh (NRV-E1117, and `site`: NRV-E1130). Run from the repository root:
 python3 .github/scripts/test_release_check.py
 
 A stand-in `nerva` and a stand-in `gh` (a script that answers from files) stand for the real two."""
@@ -255,6 +255,127 @@ def release_assets(tag, extra=(), without=()):
               f"nerva-{tag}.cdx.json", "SHA256SUMS",
               f"nerva-{tag}-universal-macos.zip", f"nerva-{tag}-universal-macos.zip.sha256"]
     return ",".join([n for n in names if n not in without] + list(extra))
+
+
+def git(repo, *args):
+    return subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t",
+                           "-c", "commit.gpgsign=false", *args],
+                          capture_output=True, text=True, check=True).stdout.strip()
+
+
+class Candidate(unittest.TestCase):
+    """`candidate` (NRV-E1158) in a throwaway repository: a candidate commit, then a release commit."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.repo = Path(self._tmp.name)
+        git(self.repo, "init", "-q", "-b", "main")
+        for name in ("src/a.zig", "build.zig", "zig/download.sh", "docs/x.md", "packaging/i.sh", "VERSION"):
+            self.write(name, "1\n")
+        self.candidate = self.commit("candidate")
+
+    def write(self, name, text):
+        path = self.repo / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+
+    def commit(self, message):
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-q", "--allow-empty", "-m", message)
+        return git(self.repo, "rev-parse", "HEAD")
+
+    def pin(self, text=None):
+        self.write("release/candidate", (text if text is not None else self.candidate) + "\n")
+
+    def check(self, tag="v0.7.1", commit=None):
+        commit = commit or git(self.repo, "rev-parse", "HEAD")
+        env = dict(os.environ, GITHUB_REPOSITORY="o/r")
+        return subprocess.run([str(SCRIPT), "candidate", tag, commit], capture_output=True, text=True,
+                              env=env, cwd=self.repo)
+
+    def refused(self, result, fragment):
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("error[NRV-E1158]: release.yml: ", result.stderr)
+        self.assertIn(fragment, result.stderr)
+        self.assertIn("\n  cause  ", result.stderr)
+        self.assertIn("\n  fix    ", result.stderr)
+
+    def test_identical_pinned_paths_pass_with_packaging_docs_and_version_changed(self):
+        self.pin()
+        self.write("packaging/i.sh", "2\n")
+        self.write("docs/x.md", "2\n")
+        self.write(".github/workflows/release.yml", "x\n")
+        self.write("VERSION", "2\n")
+        self.commit("release")
+        result = self.check()
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_a_drifted_pinned_path_is_refused_and_named(self):
+        for n, path in enumerate(("src/a.zig", "build.zig", "zig/download.sh", "build.zig.zon", "src/new/b.zig")):
+            git(self.repo, "checkout", "-q", "-B", f"t{n}", self.candidate)
+            self.pin()
+            self.write(path, "changed\n")
+            self.commit("drift")
+            result = self.check()
+            self.refused(result, "pinned path")
+            self.assertIn(path, result.stderr)
+
+    def test_a_pinned_path_changed_and_changed_back_passes(self):
+        self.pin()
+        self.write("src/a.zig", "2\n")
+        self.commit("change")
+        self.write("src/a.zig", "1\n")
+        self.commit("back")
+        self.assertEqual(self.check().returncode, 0)
+
+    def test_a_missing_file_is_refused_for_a_release_and_passed_for_a_prerelease(self):
+        self.write("docs/x.md", "2\n")
+        self.commit("no pin")
+        self.refused(self.check(), "release/candidate is missing")
+        self.assertEqual(self.check("v0.7.1-rc.1").returncode, 0)
+
+    def test_a_prerelease_with_the_file_is_checked(self):
+        self.pin()
+        self.write("src/a.zig", "2\n")
+        self.commit("drift")
+        self.refused(self.check("v0.7.1-rc.1"), "pinned path")
+
+    def test_a_malformed_file_is_refused(self):
+        for text in ("5d7d806", self.candidate.upper(), self.candidate + "\n" + self.candidate, "x" * 40):
+            self.pin(text)
+            self.commit("pin " + text[:8])
+            self.refused(self.check(), "is not one line of 40 lowercase hex characters")
+
+    def test_a_candidate_that_is_not_an_ancestor_is_refused(self):
+        git(self.repo, "checkout", "-q", "-b", "other", self.candidate)
+        self.write("docs/x.md", "other\n")
+        other = self.commit("other")
+        git(self.repo, "checkout", "-q", "main")
+        self.pin(other)
+        self.commit("pin the other branch")
+        self.refused(self.check(), "is not an ancestor")
+
+    def test_a_candidate_that_does_not_exist_is_refused(self):
+        self.pin("0" * 40)
+        self.commit("pin nothing")
+        self.refused(self.check(), "is not an ancestor")
+
+    def test_an_unknown_commit_is_refused(self):
+        self.refused(self.check(commit="1" * 40), "cannot read the commit")
+
+    def test_the_workflows_run_it(self):
+        release = (ROOT / ".github/workflows/release.yml").read_text()
+        call = 'release_check.sh candidate "$TAG" "$GITHUB_SHA"'
+        self.assertIn("fetch-depth: 0", release.split("  ci:")[0])
+        self.assertLess(release.index(call), release.index("  ci:"))
+        finish = (ROOT / ".github/workflows/release-finish.yml").read_text()
+        self.assertIn('release_check.sh candidate "$TAG" "$COMMIT"', finish)
+        self.assertLess(finish.index("publish-ready"), finish.index("release_check.sh candidate"))
+
+    def test_the_file_in_the_repository_is_a_full_sha(self):
+        text = (ROOT / "release/candidate").read_text()
+        self.assertRegex(text, r"^[0-9a-f]{40}\n$")
 
 
 class PublishReady(unittest.TestCase):

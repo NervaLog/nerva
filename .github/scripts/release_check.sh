@@ -13,7 +13,14 @@
 #   release_check.sh mac-upload <tag> <dir>    needs gh, GH_TOKEN; mac-sign.yml: NRV-E1129
 #   release_check.sh publish-ready <tag>       needs gh, GH_TOKEN and GITHUB_REPOSITORY; prints the commit
 #                                              (the publish job: NRV-E1131, and E1120, E1122, E1124 for the target)
+#   release_check.sh candidate <tag> <commit>  needs git with the full history (the release commit's
+#                                              ancestors); NRV-E1158, P<N>
 #
+# `candidate` enforces the code freeze (P147b amended): `release/candidate` at <commit> names the
+# full SHA of the candidate that was soaked, Jepsen-tested and reviewed, and <commit> must be that
+# candidate's descendant whose `git diff --name-only` lists no pinned path: src/, build.zig,
+# build.zig.zon and zig/ (everything that goes into the binary and the toolchain that builds it).
+# A prerelease whose commit has no `release/candidate` passes; a release without one is refused.
 # `ref` refuses a version without a suffix (a release, not a prerelease) from any ref but
 # refs/heads/main (NRV-E1116): a dispatch from a branch would draft a release that targets a commit
 # that is not on main. `unreleased` refuses a tag that exists and a release of that tag, published or a draft (a draft
@@ -127,6 +134,46 @@ case "${1:-}" in
       refuse NRV-E1113 "the built nerva is not the commit-key deduplication build" \
         "'nerva version --verbose' has no 'commit_keys deduplicate' line, or 'nerva version' carries '+keys-off': this is the test build -Dtest-commit-keys=off (#271), or an older nerva" \
         "build the release without -Dtest-commit-keys=off"
+    fi
+    ;;
+  candidate)
+    tag=${2:?usage: release_check.sh candidate <tag> <commit>}
+    commit=${3:?usage: release_check.sh candidate <tag> <commit>}
+    short=${commit:0:7}
+    if ! git cat-file -e "$commit^{commit}" 2> /dev/null; then
+      refuse NRV-E1158 "cannot read the commit $commit" \
+        "the checkout has no such commit (a shallow clone, or a mistyped commit)" \
+        "check out the full history (fetch-depth: 0) and run again"
+    fi
+    if ! file=$(git show "$commit:release/candidate" 2> /dev/null); then
+      # A prerelease may be rehearsed on a commit that names no candidate; a release may not.
+      if [[ "$tag" == *-* ]]; then
+        echo "release_check.sh: $short has no release/candidate; $tag is a prerelease, so nothing is pinned" >&2
+        exit 0
+      fi
+      refuse NRV-E1158 "release/candidate is missing at $short" \
+        "a release is cut only from the candidate that was soaked and tested, and the file that names it is not on this commit (P147b)" \
+        "write the candidate's full SHA to release/candidate on main (one line), review it, and release from a commit that holds it"
+    fi
+    if ! [[ "$file" =~ ^[0-9a-f]{40}$ ]]; then
+      refuse NRV-E1158 "release/candidate at $short is not one line of 40 lowercase hex characters" \
+        "the file must hold the candidate's full SHA and nothing else" \
+        "write the candidate's full SHA to release/candidate (git rev-parse <candidate>)"
+    fi
+    cand=$file
+    if ! git cat-file -e "$cand^{commit}" 2> /dev/null ||
+      ! git merge-base --is-ancestor "$cand" "$commit" 2> /dev/null; then
+      refuse NRV-E1158 "the candidate ${cand:0:7} is not an ancestor of the release commit $short" \
+        "release/candidate names a commit that is not in this commit's history (a rewritten or mistyped SHA, or a shallow clone)" \
+        "name the candidate that main contains, or fetch the full history and run again"
+    fi
+    drift=$(git diff --no-renames --name-only "$cand" "$commit" |
+      grep -E '^(src/|build\.zig$|build\.zig\.zon$|zig/)' || true)
+    if [[ -n "$drift" ]]; then
+      printf 'release_check.sh: pinned paths changed since the candidate %s:\n%s\n' "${cand:0:7}" "$drift" >&2
+      refuse NRV-E1158 "the release commit $short changes $(wc -l <<< "$drift") pinned path(s) since the candidate ${cand:0:7}: $(head -n3 <<< "$drift" | tr '\n' ' ')" \
+        "the soak and Jepsen covered the candidate's code, and src/, build.zig, build.zig.zon and zig/ must be identical to it (P147b amended); only packaging, docs and workflow changes may follow" \
+        "release the candidate's code (revert the paths above), or choose a new candidate and restart the soak and Jepsen on it"
     fi
     ;;
   assets)
@@ -243,7 +290,7 @@ case "${1:-}" in
     fi
     ;;
   *)
-    echo "usage: release_check.sh ref <tag> <git-ref> | unreleased <tag> | binary <nerva> <version> | assets <tag> <dist-dir> | mac-draft <tag> | mac-same <tag> <signed> <now> | mac-upload <tag> <dir> | publish-ready <tag>" >&2
+    echo "usage: release_check.sh ref <tag> <git-ref> | unreleased <tag> | binary <nerva> <version> | assets <tag> <dist-dir> | mac-draft <tag> | mac-same <tag> <signed> <now> | mac-upload <tag> <dir> | publish-ready <tag> | candidate <tag> <commit>" >&2
     exit 2
     ;;
 esac
