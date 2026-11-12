@@ -13,7 +13,15 @@
 #   release_check.sh mac-upload <tag> <dir>    needs gh, GH_TOKEN; mac-sign.yml: NRV-E1129
 #   release_check.sh publish-ready <tag>       needs gh, GH_TOKEN and GITHUB_REPOSITORY; prints the commit
 #                                              (the publish job: NRV-E1131, and E1120, E1122, E1124 for the target)
+#   release_check.sh candidate <tag> <commit>  needs git with the full history (the release commit's
+#                                              ancestors); NRV-E1158, P374
 #
+# `candidate` enforces the code freeze (P147b amended): `release/candidate` at <commit> names the
+# full SHA of the candidate that was soaked, Jepsen-tested and reviewed, and <commit> must be that
+# candidate's descendant that changes no pinned path: src/, build.zig, build.zig.zon, zig/,
+# .gitmodules and every .gitattributes (what `zig build` reads, and what can rewrite it at checkout).
+# The file is read at <commit>'s first parent, and <commit> may not change it. A prerelease whose
+# parent has no `release/candidate` (and that does not add it) passes; a release without one is refused.
 # `ref` refuses a version without a suffix (a release, not a prerelease) from any ref but
 # refs/heads/main (NRV-E1116): a dispatch from a branch would draft a release that targets a commit
 # that is not on main. `unreleased` refuses a tag that exists and a release of that tag, published or a draft (a draft
@@ -127,6 +135,104 @@ case "${1:-}" in
       refuse NRV-E1113 "the built nerva is not the commit-key deduplication build" \
         "'nerva version --verbose' has no 'commit_keys deduplicate' line, or 'nerva version' carries '+keys-off': this is the test build -Dtest-commit-keys=off (#271), or an older nerva" \
         "build the release without -Dtest-commit-keys=off"
+    fi
+    ;;
+  candidate)
+    tag=${2:?usage: release_check.sh candidate <tag> <commit> [<before>]}
+    commit=${3:?usage: release_check.sh candidate <tag> <commit> [<before>]}
+    # <before> is the main head before the push that brought the commit (release.yml passes
+    # github.event.before, empty on a dispatch). Absent: no push event exists (release-finish.yml).
+    short=${commit:0:7}
+    if ! git cat-file -e "$commit^{commit}" 2> /dev/null; then
+      refuse NRV-E1158 "cannot read the commit $commit" \
+        "the checkout has no such commit (a shallow clone, or a mistyped commit)" \
+        "check out the full history (fetch-depth: 0) and run again"
+    fi
+    # The candidate is read from the commit's first parent, and the commit may not change the file:
+    # otherwise the release commit could repoint it at an unsoaked commit (the candidate must be on
+    # main before the VERSION commit; P374).
+    if ! parent=$(git rev-parse --verify --quiet "$commit^1^{commit}" 2> /dev/null); then
+      if [[ "$(git rev-parse --is-shallow-repository 2> /dev/null)" == true ]]; then
+        refuse NRV-E1158 "the release commit $short has no readable parent in this shallow clone" \
+          "the candidate is read from the first parent, and a shallow clone does not hold it" \
+          "check out the full history (fetch-depth: 0) and run again"
+      fi
+      refuse NRV-E1158 "the release commit $short has no parent" \
+        "the candidate is read from the first parent, and a root commit has none" \
+        "release from a commit on main that follows the one that named the candidate"
+    fi
+    # A rebase merge or a multi-commit push can land a repoint and the VERSION bump in one push,
+    # and the first parent then already holds the repoint. So the file must also be unchanged
+    # since the head main had before the push (P374). Fail closed when that head is unusable.
+    if [[ $# -ge 4 ]]; then
+      before=$4
+      if [[ -z "$before" ]]; then
+        if [[ "$tag" != *-* ]]; then
+          refuse NRV-E1158 "there is no push to check $tag against (a dispatch has no 'before')" \
+            "a release is checked against the main head before the push that brought it, so that one push cannot repoint release/candidate and bump VERSION" \
+            "release by merging the VERSION commit to main (the push starts release.yml)"
+        fi
+        echo "release_check.sh: no 'before' (a dispatch); $tag is a prerelease, so only the first parent is checked" >&2
+      elif [[ "$before" =~ ^0+$ ]] || ! git cat-file -e "$before^{commit}" 2> /dev/null; then
+        refuse NRV-E1158 "the main head before the push (${before:0:7}) is missing, all zeros or not in this checkout" \
+          "without it the check cannot tell whether this push changed release/candidate" \
+          "check out the full history (fetch-depth: 0), or release from a push that updates an existing main"
+      elif ! git merge-base --is-ancestor "$before" "$commit" 2> /dev/null; then
+        refuse NRV-E1158 "the main head before the push (${before:0:7}) is not an ancestor of the release commit $short" \
+          "main was rewritten or the push was forced, so the push's changes cannot be listed" \
+          "release from a commit that follows main's previous head"
+      else
+        rc=0
+        git diff --quiet "$before" "$commit" -- release/candidate 2> /dev/null || rc=$?
+        if [[ $rc -ne 0 ]]; then
+          refuse NRV-E1158 "release/candidate changed within the push that brought the release commit $short (${before:0:7}..$short)" \
+            "the candidate must be on main in an earlier push than the VERSION commit; a rebase merge or a multi-commit push lands both together and would let the release repoint it (P374)" \
+            "merge the release/candidate change first, in its own push, then merge the VERSION commit"
+        fi
+      fi
+    fi
+    if ! file=$(git show "$parent:release/candidate" 2> /dev/null); then
+      # A prerelease may be rehearsed on a commit that names no candidate; a release may not.
+      if [[ "$tag" == *-* ]] && git diff --quiet "$parent" "$commit" -- release/candidate 2> /dev/null; then
+        echo "release_check.sh: ${parent:0:7} has no release/candidate; $tag is a prerelease, so nothing is pinned" >&2
+        exit 0
+      fi
+      refuse NRV-E1158 "release/candidate is missing at the parent ${parent:0:7} of $short" \
+        "a release is cut only from the candidate that was soaked and tested, and the file that names it must already be on main before the release commit (P147b, P374)" \
+        "merge the candidate's full SHA in release/candidate to main (one line), review it, and release from a later commit"
+    fi
+    if ! git diff --quiet "$parent" "$commit" -- release/candidate; then
+      refuse NRV-E1158 "the release commit $short changes release/candidate" \
+        "the candidate is chosen before the release commit, on main, so that nobody repoints it in the same commit that ships (P374)" \
+        "move the release/candidate change to its own commit before the VERSION commit, or leave the file as it was"
+    fi
+    if ! [[ "$file" =~ ^[0-9a-f]{40}$ ]]; then
+      refuse NRV-E1158 "release/candidate at $short is not one line of 40 lowercase hex characters" \
+        "the file must hold the candidate's full SHA and nothing else" \
+        "write the candidate's full SHA to release/candidate (git rev-parse <candidate>)"
+    fi
+    cand=$file
+    if ! git cat-file -e "$cand^{commit}" 2> /dev/null ||
+      ! git merge-base --is-ancestor "$cand" "$commit" 2> /dev/null; then
+      refuse NRV-E1158 "the candidate ${cand:0:7} is not an ancestor of the release commit $short" \
+        "release/candidate names a commit that is not in this commit's history (a rewritten or mistyped SHA, or a shallow clone)" \
+        "name the candidate that main contains, or fetch the full history and run again"
+    fi
+    # Not parsed: git's exit status decides (0 same, 1 drift, anything else is git failing).
+    pinned=(src build.zig build.zig.zon zig .gitmodules ':(glob)**/.gitattributes')
+    rc=0
+    git diff --quiet --no-renames "$cand" "$commit" -- "${pinned[@]}" 2> /dev/null || rc=$?
+    if [[ $rc -gt 1 ]]; then
+      refuse NRV-E1158 "git could not compare the candidate ${cand:0:7} with the release commit $short" \
+        "git diff failed (exit $rc), usually a shallow or partial clone" \
+        "check out the full history (fetch-depth: 0) and run again"
+    fi
+    if [[ $rc -eq 1 ]]; then
+      drift=$(git -c core.quotePath=false diff --no-renames --name-only "$cand" "$commit" -- "${pinned[@]}")
+      printf 'release_check.sh: pinned paths changed since the candidate %s:\n%s\n' "${cand:0:7}" "$drift" >&2
+      refuse NRV-E1158 "the release commit $short changes $(wc -l <<< "$drift") pinned path(s) since the candidate ${cand:0:7}: $(head -n3 <<< "$drift" | tr '\n' ' ')" \
+        "the soak and Jepsen covered the candidate's code, and src/, build.zig, build.zig.zon, zig/, .gitmodules and every .gitattributes must be identical to it (P147b amended); only packaging, docs and workflow changes may follow" \
+        "release the candidate's code (revert the paths above), or choose a new candidate and restart the soak and Jepsen on it"
     fi
     ;;
   assets)
@@ -243,7 +349,7 @@ case "${1:-}" in
     fi
     ;;
   *)
-    echo "usage: release_check.sh ref <tag> <git-ref> | unreleased <tag> | binary <nerva> <version> | assets <tag> <dist-dir> | mac-draft <tag> | mac-same <tag> <signed> <now> | mac-upload <tag> <dir> | publish-ready <tag>" >&2
+    echo "usage: release_check.sh ref <tag> <git-ref> | unreleased <tag> | binary <nerva> <version> | assets <tag> <dist-dir> | mac-draft <tag> | mac-same <tag> <signed> <now> | mac-upload <tag> <dir> | publish-ready <tag> | candidate <tag> <commit>" >&2
     exit 2
     ;;
 esac

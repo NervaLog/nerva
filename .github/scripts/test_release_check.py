@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Tests for release_check.sh (NRV-E1112 to NRV-E1116, mac-draft: NRV-E1119, NRV-E1120, NRV-E1122 to NRV-E1124, and publish-ready: NRV-E1131) and release_notes.sh (NRV-E1117, and `site`: NRV-E1130). Run from the repository root:
+"""Tests for release_check.sh (NRV-E1112 to NRV-E1116, mac-draft: NRV-E1119, NRV-E1120, NRV-E1122 to NRV-E1124, publish-ready: NRV-E1131, and candidate: NRV-E1158) and release_notes.sh (NRV-E1117, and `site`: NRV-E1130). Run from the repository root:
 python3 .github/scripts/test_release_check.py
 
 A stand-in `nerva` and a stand-in `gh` (a script that answers from files) stand for the real two."""
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -255,6 +256,273 @@ def release_assets(tag, extra=(), without=()):
               f"nerva-{tag}.cdx.json", "SHA256SUMS",
               f"nerva-{tag}-universal-macos.zip", f"nerva-{tag}-universal-macos.zip.sha256"]
     return ",".join([n for n in names if n not in without] + list(extra))
+
+
+def git(repo, *args):
+    return subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t",
+                           "-c", "commit.gpgsign=false", *args],
+                          capture_output=True, text=True, check=True).stdout.strip()
+
+
+class Candidate(unittest.TestCase):
+    """`candidate` (NRV-E1158) in a throwaway repository: a candidate commit, then a release commit."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.repo = Path(self._tmp.name)
+        git(self.repo, "init", "-q", "-b", "main")
+        for name in ("src/a.zig", "build.zig", "zig/download.sh", "docs/x.md", "packaging/i.sh", "VERSION"):
+            self.write(name, "1\n")
+        self.candidate = self.commit("candidate")
+
+    def write(self, name, text):
+        path = self.repo / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+
+    def commit(self, message):
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-q", "--allow-empty", "-m", message)
+        return git(self.repo, "rev-parse", "HEAD")
+
+    def pin(self, text=None):
+        """Name the candidate on main, in a commit of its own (the release commit follows)."""
+        self.write("release/candidate", (text if text is not None else self.candidate) + "\n")
+        return self.commit("pin the candidate")
+
+    def check(self, tag="v0.7.1", commit=None, *before):
+        commit = commit or git(self.repo, "rev-parse", "HEAD")
+        env = dict(os.environ, GITHUB_REPOSITORY="o/r")
+        return subprocess.run([str(SCRIPT), "candidate", tag, commit, *before], capture_output=True, text=True,
+                              env=env, cwd=self.repo)
+
+    def refused(self, result, fragment):
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("error[NRV-E1158]: release.yml: ", result.stderr)
+        self.assertIn(fragment, result.stderr)
+        self.assertIn("\n  cause  ", result.stderr)
+        self.assertIn("\n  fix    ", result.stderr)
+
+    def test_identical_pinned_paths_pass_with_packaging_docs_and_version_changed(self):
+        self.pin()
+        self.write("packaging/i.sh", "2\n")
+        self.write("docs/x.md", "2\n")
+        self.write(".github/workflows/release.yml", "x\n")
+        self.write("VERSION", "2\n")
+        self.commit("release")
+        result = self.check()
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def drifted(self, change, name):
+        self.pin()
+        change()
+        self.commit("drift")
+        result = self.check()
+        self.refused(result, "pinned path")
+        self.assertIn(name, result.stderr)
+
+    def test_a_drifted_pinned_path_is_refused_and_named(self):
+        for n, path in enumerate(("src/a.zig", "build.zig", "zig/download.sh", "build.zig.zon", "src/new/b.zig")):
+            git(self.repo, "checkout", "-q", "-B", f"t{n}", self.candidate)
+            self.drifted(lambda: self.write(path, "changed\n"), path)
+
+    def test_a_non_ascii_path_under_src_is_refused_and_named_unquoted(self):
+        self.drifted(lambda: self.write("src/\u00e9.zig", "x\n"), "src/\u00e9.zig")
+
+    def test_a_path_with_a_quote_under_src_is_refused(self):
+        self.drifted(lambda: self.write('src/a"b.zig', "x\n"), "pinned path")
+
+    def test_a_deleted_pinned_path_is_refused(self):
+        self.drifted(lambda: (self.repo / "src/a.zig").unlink(), "src/a.zig")
+
+    def test_a_rename_out_of_src_is_refused(self):
+        self.drifted(lambda: (self.repo / "src/a.zig").rename(self.repo / "docs/a.zig"), "src/a.zig")
+
+    def test_a_gitattributes_anywhere_is_refused(self):
+        for path in (".gitattributes", "src/.gitattributes", "docs/.gitattributes", ".gitmodules"):
+            git(self.repo, "checkout", "-q", "-B", "ga", self.candidate)
+            self.drifted(lambda: self.write(path, "src/** eol=crlf\n"), path)
+
+    def test_a_git_failure_is_refused_not_passed(self):
+        self.pin()
+        self.write("src/a.zig", "2\n")
+        drift = self.commit("drift")
+        blob = git(self.repo, "rev-parse", f"{drift}:src/a.zig")
+        (self.repo / ".git/objects" / blob[:2] / blob[2:]).unlink()
+        result = self.check()
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("error[NRV-E1158]", result.stderr)
+
+    def test_a_pinned_path_changed_and_changed_back_passes(self):
+        self.pin()
+        self.write("src/a.zig", "2\n")
+        self.commit("change")
+        self.write("src/a.zig", "1\n")
+        self.commit("back")
+        self.assertEqual(self.check().returncode, 0)
+
+    def test_a_missing_file_is_refused_for_a_release_and_passed_for_a_prerelease(self):
+        self.write("docs/x.md", "2\n")
+        self.commit("no pin")
+        self.refused(self.check(), "release/candidate is missing")
+        self.assertEqual(self.check("v0.7.1-rc.1").returncode, 0)
+
+    def test_a_prerelease_with_the_file_is_checked(self):
+        self.pin()
+        self.write("src/a.zig", "2\n")
+        self.commit("drift")
+        self.refused(self.check("v0.7.1-rc.1"), "pinned path")
+
+    def test_a_malformed_file_is_refused(self):
+        for text in ("5d7d806", self.candidate.upper(), self.candidate + "\n" + self.candidate, "x" * 40):
+            self.pin(text)
+            self.commit("release " + text[:8])
+            self.refused(self.check(), "is not one line of 40 lowercase hex characters")
+
+    def test_a_candidate_that_is_not_an_ancestor_is_refused(self):
+        git(self.repo, "checkout", "-q", "-b", "other", self.candidate)
+        self.write("docs/x.md", "other\n")
+        other = self.commit("other")
+        git(self.repo, "checkout", "-q", "main")
+        self.pin(other)
+        self.commit("release")
+        self.refused(self.check(), "is not an ancestor")
+
+    def test_a_candidate_that_does_not_exist_is_refused(self):
+        self.pin("0" * 40)
+        self.commit("release")
+        self.refused(self.check(), "is not an ancestor")
+
+    def test_an_unknown_commit_is_refused(self):
+        self.refused(self.check(commit="1" * 40), "cannot read the commit")
+
+    def test_a_root_commit_is_refused(self):
+        self.refused(self.check(commit=self.candidate), "has no parent")
+
+    def swap(self, squash):
+        """The attack: a fix lands after the soaked candidate, then the release commit repoints the file."""
+        self.pin()
+        self.write("src/a.zig", "fix\n")
+        fix = self.commit("unsoaked fix")
+        if squash:
+            self.write("release/candidate", fix + "\n")
+            self.write("VERSION", "2\n")
+            self.commit("release")
+        else:
+            git(self.repo, "checkout", "-q", "-b", "pr", "HEAD")
+            self.write("release/candidate", fix + "\n")
+            self.commit("repoint")
+            self.write("VERSION", "2\n")
+            self.commit("bump")
+            git(self.repo, "checkout", "-q", "main")
+            git(self.repo, "merge", "-q", "--no-ff", "-m", "merge", "pr")
+
+    def test_the_release_commit_may_not_repoint_the_candidate_squash(self):
+        self.swap(squash=True)
+        self.refused(self.check(), "changes release/candidate")
+
+    def test_the_release_commit_may_not_repoint_the_candidate_merge_commit(self):
+        self.swap(squash=False)
+        self.refused(self.check(), "changes release/candidate")
+
+    def test_a_release_commit_that_adds_the_file_is_refused_even_for_a_prerelease(self):
+        self.write("docs/x.md", "2\n")
+        self.commit("main")
+        self.pin()
+        self.refused(self.check("v0.7.1-rc.1"), "release/candidate is missing")
+
+    def rebase_merged(self):
+        """A rebase merge: `repoint` and `bump` both land on main, in one push."""
+        self.pin()
+        before = git(self.repo, "rev-parse", "HEAD")
+        self.write("src/a.zig", "fix\n")
+        fix = self.commit("unsoaked fix")
+        self.write("release/candidate", fix + "\n")
+        self.commit("repoint")
+        self.write("VERSION", "2\n")
+        self.commit("bump")
+        return before
+
+    def test_a_rebase_merged_repoint_and_bump_in_one_push_is_refused(self):
+        before = self.rebase_merged()
+        # The first parent rule alone is blind to it: this is why the push's `before` is checked.
+        self.assertEqual(self.check().returncode, 0)
+        self.refused(self.check("v0.7.1", None, before), "changed within the push")
+
+    def test_a_candidate_repointed_in_an_earlier_push_is_honoured(self):
+        self.write("src/a.zig", "fix\n")
+        fix = self.commit("fix")
+        self.pin(fix)
+        before = git(self.repo, "rev-parse", "HEAD")
+        self.write("VERSION", "2\n")
+        self.commit("release")
+        self.assertEqual(self.check("v0.7.1", None, before).returncode, 0)
+
+    def test_a_before_of_all_zeros_is_refused(self):
+        self.pin()
+        self.write("VERSION", "2\n")
+        self.commit("release")
+        self.refused(self.check("v0.7.1", None, "0" * 40), "all zeros")
+
+    def test_a_before_that_is_not_an_ancestor_is_refused(self):
+        self.pin()
+        self.write("VERSION", "2\n")
+        self.commit("release")
+        git(self.repo, "checkout", "-q", "-b", "side", self.candidate)
+        self.write("docs/x.md", "side\n")
+        side = self.commit("side")
+        git(self.repo, "checkout", "-q", "main")
+        self.refused(self.check("v0.7.1", None, side), "not an ancestor")
+
+    def test_a_before_that_is_not_fetchable_is_refused(self):
+        self.pin()
+        self.write("VERSION", "2\n")
+        self.commit("release")
+        self.refused(self.check("v0.7.1", None, "1" * 40), "not in this checkout")
+
+    def test_a_dispatch_has_no_before_and_a_release_is_refused(self):
+        self.pin()
+        self.write("VERSION", "2\n")
+        self.commit("release")
+        self.refused(self.check("v0.7.1", None, ""), "no push to check")
+
+    def test_a_prerelease_dispatch_is_checked_at_the_first_parent_only(self):
+        self.pin()
+        self.write("VERSION", "2\n")
+        self.commit("release")
+        result = self.check("v0.7.1-rc.1", None, "")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("a dispatch", result.stderr)
+
+    def test_a_shallow_clone_is_named(self):
+        self.pin()
+        self.write("VERSION", "2\n")
+        self.commit("release")
+        shallow = Path(self._tmp.name + "-shallow")
+        self.addCleanup(shutil.rmtree, shallow, True)
+        git(self.repo.parent, "clone", "-q", "--depth", "1", "file://" + str(self.repo), str(shallow))
+        env = dict(os.environ, GITHUB_REPOSITORY="o/r")
+        head = git(shallow, "rev-parse", "HEAD")
+        result = subprocess.run([str(SCRIPT), "candidate", "v0.7.1", head], capture_output=True,
+                                text=True, env=env, cwd=shallow)
+        self.refused(result, "shallow clone")
+
+    def test_the_workflows_run_it(self):
+        release = (ROOT / ".github/workflows/release.yml").read_text()
+        call = 'release_check.sh candidate "$TAG" "$GITHUB_SHA" "$BEFORE"'
+        self.assertIn("fetch-depth: 0", release.split("  ci:")[0])
+        self.assertIn("BEFORE: ${{ github.event.before }}", release.split("  ci:")[0])
+        self.assertLess(release.index(call), release.index("  ci:"))
+        finish = (ROOT / ".github/workflows/release-finish.yml").read_text()
+        self.assertIn('release_check.sh candidate "$TAG" "$COMMIT"', finish)
+        self.assertLess(finish.index("publish-ready"), finish.index("release_check.sh candidate"))
+        self.assertLess(finish.index("release_check.sh candidate"),
+                        finish.index('release_finish.sh publish "$TAG"'))
+
+    def test_the_file_in_the_repository_is_a_full_sha(self):
+        text = (ROOT / "release/candidate").read_text()
+        self.assertRegex(text, r"^[0-9a-f]{40}\n$")
 
 
 class PublishReady(unittest.TestCase):

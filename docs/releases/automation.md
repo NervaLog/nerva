@@ -462,8 +462,21 @@ with `branch_policy` only. Then tell the supervisor, and the rehearsal follows.
 
 ## A release afterwards
 
+0. **Choosing a candidate writes `release/candidate`** (P374, "code pinned"): the full SHA, one
+   line, merged to `main` before the soak starts. The soak, Jepsen and the reviews run on that SHA.
+   A later change to `src/`, `build.zig`, `build.zig.zon`, `zig/`, `.gitmodules` or a
+   `.gitattributes` means a new candidate and a new soak; packaging, docs and workflow changes need
+   none. The `VERSION` commit may not change `release/candidate`: the check reads it at that
+   commit's first parent, so the file is on `main` before the bump.
 1. The gates pass (P147b): the soak, Jepsen and both review verdicts. The supervisor merges the
-   `VERSION` PR, whose CHANGELOG section has its site line.
+   `VERSION` PR, whose CHANGELOG section has its site line. **The freeze is enforced:**
+   `release.yml`'s `version` job runs `release_check.sh candidate <tag> $GITHUB_SHA <before>` (full
+   history; `before` is the push's `github.event.before`) before CI and any build, and `release-finish.yml`'s `publish` job runs it on the
+   draft's target before the draft is published, so a hand-dispatched finish cannot publish an
+   unpinned commit. It refuses (NRV-E1158) a missing or malformed file, a candidate that is not an
+   ancestor of the release commit, a release commit that changes `release/candidate`, or a push that changed it together with the bump (a rebase merge; a release dispatched with no push is refused), and any
+   pinned path that differs from the candidate (it prints the paths). A prerelease with no
+   `release/candidate` passes; with one it is checked, so a rehearsal exercises the check.
 2. `release.yml` runs `version`, `ci` and `release`. The draft appears with ten assets, and
    `mac` waits.
 3. **The owner reads the draft and approves `mac` once.** That approval ships the release.
