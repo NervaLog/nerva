@@ -96,9 +96,12 @@ one.
 - Filed fingerprints are in `/var/lib/sim-fleet/state/state.json`. If that file is missing, the
   issue markers rebuild it (the latest 500 issues labelled `sim-fleet`). A state file that exists
   but cannot be read is an error (exit 2); it is never taken for empty.
-- Exit codes of `sim_fleet.py`: 0 done, 1 bad input (the round is refused whole, nothing
-  counted), 2 environment (state file, token, GitHub). The state is saved whatever GitHub
-  answered; a round it did not finish is kept in `state/last-failed-round/`.
+- Exit codes of `sim_fleet.py`: 0 done, 1 bad input (the round is refused whole: no seed is
+  counted, but the round is counted against its commit as `refused`, and `soak` reads that commit
+  as not clean, #370), 2 environment (state file, token, GitHub), 70 a bug in the reporter. The
+  state is saved whatever GitHub answered; a round it did not finish is kept in
+  `state/last-failed-round/`, and one it never counted (its timeout, a kill, exit 70) is counted
+  as refused by `sim_fleet.py refuse`, which `run.sh` runs.
 - Every collection is bounded (`sim_fleet.py`, the constants at the top): seeds and failing seeds
   per round, bytes read of a log, lines in an issue, fingerprints remembered (2048), days kept
   (31), pages scanned on a rebuild (5).
@@ -236,7 +239,9 @@ soak 1a2b3c4: 24.6 h, vopr-nerva 182,311 seeds, vopr-testing 15,020, fuzz 9,874;
 is the full SHA or a prefix of at least 7 hex digits.) Exit 0 if the commit ran and is clean; 1 if the state
 has no round of it (the line then says `0.0 h`), the prefix names two commits, or the commit is not
 clean: any failing seed, any seed past its deadline or killed by the host (a candidate that hangs
-its seeds is not clean, however many hours they fill), or any failure fingerprint hit; 2 if the
+its seeds is not clean, however many hours they fill), any failure fingerprint hit, or any round refused or lost (a round the reporter refused,
+e.g. past 4096 failing seeds, or never finished; the line then ends `; N rounds refused or lost
+by the reporter, their seeds unknown`); 2 if the
 state file is missing or unreadable. "Failures" counts failing seeds, not distinct bugs. "Issues
 its rounds hit" lists the issue of every failure fingerprint the commit's rounds hit, from the
 rounds' own records and so independent of throttling, a hold or a rate limit (`not filed (...)`

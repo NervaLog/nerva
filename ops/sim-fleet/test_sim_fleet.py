@@ -387,7 +387,11 @@ class StateFile(unittest.TestCase):
             code = fleet.main(["ingest", "--round", rnd.path, "--commit", "abcdef1",
                                "--state", self.path, "--dry-run"], now=DAY_ONE)
         self.assertEqual(code, 1)
-        self.assertFalse(os.path.exists(self.path))
+        # No seed is counted, but the round is: against its commit, as refused (#370).
+        state = fleet.load_state(self.path)
+        self.assertEqual(state["days"], {})
+        self.assertEqual(state["commits"]["abcdef1"]["refused"], 1)
+        self.assertEqual(state["commits"]["abcdef1"]["rounds"], 0)
 
 
 SHA_A = "1a2b3c4" + "0" * 33
@@ -517,6 +521,114 @@ class Soak(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(fleet.main(["soak", "--commit", SHA_A, "--state",
                                          "/nonexistent/state.json"]), 2)
+
+    def run_main(self, *argv):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = fleet.main(list(argv), now=DAY_ONE)
+        return code, out.getvalue().strip(), err.getvalue()
+
+    def state_path(self):
+        path = os.path.join(tempfile.mkdtemp(), "state.json")
+        self.addCleanup(lambda: [os.path.exists(f) and os.unlink(f) for f in (path, path + ".new")])
+        return path
+
+    def ingest_main(self, path, rnd, commit=SHA_A):
+        return self.run_main("ingest", "--round", rnd.path, "--commit", commit, "--state", path,
+                             "--dry-run")
+
+    def too_many_failures(self):
+        rnd = Round(self)
+        wdir = os.path.join(rnd.path, "w0")
+        os.makedirs(wdir)
+        with open(os.path.join(wdir, "results"), "w") as file:
+            for seed in range(fleet.ROUND_FAILURES_MAX + 1):
+                file.write(f"vopr-nerva {seed} 134 2\n")
+        return rnd
+
+    def clean_round(self):
+        rnd = Round(self)
+        for seed in range(300):
+            rnd.seed(0, "vopr-nerva", seed, 0, seconds=1)
+        return rnd
+
+    def test_a_refused_round_then_a_clean_one_is_not_a_clean_soak(self):
+        path = self.state_path()
+        code, _, err = self.ingest_main(path, self.too_many_failures())
+        self.assertEqual(code, 1)
+        self.assertIn("refused", err)
+        self.assertEqual(self.ingest_main(path, self.clean_round())[0], 0)
+        code, line, err = self.run_main("soak", "--commit", SHA_A, "--state", path)
+        self.assertEqual(code, 1)
+        self.assertIn("vopr-nerva 300 seeds", line)
+        self.assertTrue(line.endswith("; 1 rounds refused or lost by the reporter, "
+                                      "their seeds unknown"), line)
+        self.assertIn("not clean", err)
+
+    def test_a_malformed_results_line_is_a_refused_round_too(self):
+        path = self.state_path()
+        rnd = self.clean_round()
+        with open(os.path.join(rnd.path, "w0", "results"), "a") as file:
+            file.write("vopr-nerva not-a-seed\n")
+        self.assertEqual(self.ingest_main(path, rnd)[0], 1)
+        self.assertEqual(self.ingest_main(path, self.clean_round())[0], 0)
+        self.assertEqual(self.run_main("soak", "--commit", SHA_A, "--state", path)[0], 1)
+
+    def test_a_refused_round_counts_against_its_own_commit_only(self):
+        path = self.state_path()
+        self.assertEqual(self.ingest_main(path, self.clean_round(), SHA_B)[0], 0)
+        self.assertEqual(self.ingest_main(path, self.too_many_failures(), SHA_A)[0], 1)
+        self.assertEqual(self.run_main("soak", "--commit", SHA_B, "--state", path)[0], 0)
+        self.assertEqual(self.run_main("soak", "--commit", SHA_A, "--state", path)[0], 1)
+
+    def test_a_commit_with_only_a_refused_round_is_exit_1_and_says_why(self):
+        path = self.state_path()
+        self.ingest_main(path, self.too_many_failures())
+        code, line, err = self.run_main("soak", "--commit", SHA_A, "--state", path)
+        self.assertEqual(code, 1)
+        self.assertIn("0.0 h", line)
+        self.assertIn("1 rounds refused", line)
+        self.assertNotIn("no rounds of", err)
+
+    def test_refuse_counts_a_round_the_reporter_lost(self):
+        path = self.state_path()
+        self.assertEqual(self.ingest_main(path, self.clean_round())[0], 0)
+        self.assertEqual(self.run_main("soak", "--commit", SHA_A, "--state", path)[0], 0)
+        for _ in range(2):
+            self.assertEqual(self.run_main("refuse", "--commit", SHA_A, "--state", path)[0], 0)
+        code, line, _ = self.run_main("soak", "--commit", SHA_A, "--state", path)
+        self.assertEqual(code, 1)
+        self.assertIn("; 2 rounds refused or lost", line)
+        self.assertEqual(self.run_main("refuse", "--commit", "xyz", "--state", path)[0], 1)
+
+    def test_a_refusal_with_no_state_starts_one_the_next_ingest_rebuilds(self):
+        path = self.state_path()
+        self.assertEqual(self.run_main("refuse", "--commit", SHA_A, "--state", path)[0], 0)
+        self.assertEqual(self.run_main("soak", "--commit", SHA_A, "--state", path)[0], 1)
+        code, _, err = self.ingest_main(path, self.clean_round())
+        self.assertEqual(code, 0)
+        self.assertIn("the state file was missing: rebuilt", err)
+        state = fleet.load_state(path)
+        self.assertNotIn("rebuild", state)
+        self.assertEqual(state["commits"][SHA_A]["refused"], 1)
+        self.assertNotIn("the state file was missing", self.ingest_main(path, self.clean_round())[2])
+
+    def test_an_unreadable_state_is_not_overwritten_by_a_refusal(self):
+        path = self.state_path()
+        with open(path, "w") as file:
+            file.write("not json")
+        self.assertEqual(self.run_main("refuse", "--commit", SHA_A, "--state", path)[0], 2)
+        with open(path) as file:
+            self.assertEqual(file.read(), "not json")
+        self.assertEqual(self.ingest_main(path, self.too_many_failures())[0], 2)
+
+    def test_a_state_written_before_the_counter_loads_and_reads_clean(self):
+        github, state = Recorder(), fleet.new_state()
+        rnd = Round(self)
+        rnd.seed(0, "vopr-nerva", 1, 0, seconds=3600)
+        ingest(self, github, state, rnd, SHA_A, DAY_ONE)
+        del state["commits"][SHA_A]["refused"]
+        self.assertEqual(soak(self, state, SHA_A)[0], 0)
 
     def test_the_65th_commit_drops_the_oldest(self):
         github, state = Recorder(), fleet.new_state()

@@ -378,7 +378,8 @@ worker() {
 }
 
 # Hands the round to the reporter of the commit the round ran. A round it refused or could not
-# report is kept for a look; its failures recur in later rounds if they are real.
+# report is kept for a look; its failures recur in later rounds if they are real. A round lost
+# or refused counts against its commit (`refused` in the state), so `soak` reads it not clean.
 ingest() {
     local code=0
     set -- ingest --round "$round" --commit "$built" --state "$STATE/state.json" \
@@ -395,6 +396,15 @@ ingest() {
     rm -rf "$STATE/last-failed-round"
     mv "$round" "$STATE/last-failed-round"
     log "sim_fleet.py ingest exited $code; the round is in $STATE/last-failed-round"
+    # Exit 1 (the round was refused) and 2 (state, token or GitHub) are recorded or counted by the
+    # reporter itself. Any other end (the timeout's 124, a kill, 70 for a crash) lost the round
+    # before it was counted: count it against its commit as refused, so `soak` cannot read the
+    # commit clean (#370).
+    if (( code != 1 && code != 2 )); then
+        timeout "$SIM_FLEET_REPORT_TIMEOUT" "$SIM_FLEET_PYTHON" -I "$bin/sim_fleet.py" refuse \
+            --commit "$built" --state "$STATE/state.json" ||
+            log "sim_fleet.py refuse failed; the round of $built is not counted"
+    fi
 }
 
 # Sourced by the tests, which call the functions above.

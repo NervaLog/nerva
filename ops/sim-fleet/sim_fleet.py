@@ -4,6 +4,7 @@
     sim_fleet.py ingest --round DIR --commit SHA --state FILE [--source-root DIR]
                         [--repo OWNER/NAME --token-file FILE] [--tracker N] [--dry-run]
     sim_fleet.py soak --commit SHA --state FILE
+    sim_fleet.py refuse --commit SHA --state FILE
 
 Reads one round that `run.sh` wrote: each worker's directory `DIR/w<N>/` holds `results`, one
 line per seed run (`<target> <seed> <exit code> <seconds>`), and for each failing seed a
@@ -30,10 +31,15 @@ their issues). A seed counts for at most SEED_SECONDS_MAX seconds. A round's hou
 are its busiest worker's seconds (the sum of the `<seconds>` column of that worker's `results`),
 so they come from the rounds' own records and never from wall time. Exit 0 if the commit ran
 and is clean; 1 if the state has no round of it (`0.0 h`), or any seed of it failed, ran past its
-deadline or was killed by the host, or a rounds' failure fingerprint was hit.
+deadline or was killed by the host, or a rounds' failure fingerprint was hit, or a round of it was
+refused or lost (#370). A round `ingest` refuses (more than ROUND_FAILURES_MAX failing seeds, a
+malformed `results` line) is counted against its commit as `refused`, since its seeds are
+unknown; `run.sh` runs `refuse` for a round the reporter never finished (killed by its timeout, a
+crash, exit 70), which counts one the same way.
 
-Exit codes: 0 done, 1 usage or bad input, 2 environment (state file, token, GitHub). The state is
-saved whenever it was read, whatever GitHub answered. Standard library only.
+Exit codes: 0 done, 1 usage or bad input (a refused round is counted as above), 2 environment
+(state file, token, GitHub), 70 a bug in the reporter. The state is saved whenever it was read,
+whatever GitHub answered. Standard library only.
 """
 
 import argparse
@@ -44,6 +50,7 @@ import os
 import re
 import sys
 import time
+import traceback
 import urllib.error
 import urllib.request
 
@@ -486,7 +493,7 @@ def commit_entry(entries, commit, sequence):
             oldest = min(entries, key=lambda sha: entries[sha]["last"])
             del entries[oldest]
         entry = {"last": sequence, "seconds": 0, "rounds": 0, "kinds": {}, "fingerprints": [],
-                 "dropped": 0}
+                 "dropped": 0, "refused": 0}
         entries[commit] = entry
     entry["last"] = sequence
     assert len(entries) <= COMMITS_KEPT
@@ -502,6 +509,16 @@ def add_round(entry, counts):
         for key in ("seeds", "failed", "timeouts", "host"):
             kind[key] = kind.get(key, 0) + count[key]
     assert len(entry["kinds"]) <= len(KINDS)
+
+
+def refuse_round(state, commit):
+    """Counts a round the reporter could not read against `commit`: its seeds are unknown, so it
+    makes the commit not clean for `soak` instead of vanishing (#370). A counter, so it is
+    bounded by the rounds the fleet runs."""
+    state["sequence"] += 1
+    entry = commit_entry(state["commits"], commit, state["sequence"])
+    entry["refused"] = entry.get("refused", 0) + 1
+    assert entry["refused"] > 0
 
 
 def count_round(day, counts, commit, state=None):
@@ -576,6 +593,7 @@ def soak_line(state, commit):
              (" seeds" if index == 0 else "") for index, kind in enumerate(KINDS)]
     sums = {key: sum(kind.get(key, 0) for kind in entry["kinds"].values())
             for key in ("failed", "timeouts", "host")}
+    refused = entry.get("refused", 0)
     hit = []
     for fingerprint in entry.get("fingerprints", []):
         filed = state["filed"].get(fingerprint)
@@ -586,8 +604,10 @@ def soak_line(state, commit):
             f"{sums['failed']} failures, {sums['timeouts']} past the deadline, "
             f"{sums['host']} killed by the host; sim-fleet issues its rounds hit: "
             f"{', '.join(hit) or 'none'}")
-    ran = len(matches) == 1 and entry["seconds"] > 0
-    return line, ran, not (any(sums.values()) or hit)
+    if refused:
+        line += f"; {refused} rounds refused or lost by the reporter, their seeds unknown"
+    ran = len(matches) == 1 and (entry["seconds"] > 0 or refused > 0)
+    return line, ran, not (any(sums.values()) or hit or refused)
 
 
 def totals_text(state, ymd_day, day):
@@ -883,9 +903,38 @@ def soak_main(args, log):
     if not ran:
         log(f"no rounds of {args.commit[:7]} in the state (or its prefix names two commits)")
     elif not clean:
-        log(f"{args.commit[:7]} is not clean: a seed failed, hung or was killed, or a failure "
-            f"was hit")
+        log(f"{args.commit[:7]} is not clean: a seed failed, hung or was killed, a failure "
+            f"was hit, or a round was refused or lost")
     return 0 if ran and clean else 1
+
+
+def record_refused(args, log):
+    """Writes the refusal of a round of `args.commit` into the state; False if it could not
+    (the state is unreadable or unwritable: the caller exits 2 and run.sh keeps the round)."""
+    try:
+        state = load_state(args.state)
+    except Environment as err:
+        log(str(err))
+        return False
+    if state is None:
+        # A state started here knows no filed failure: `rebuild` makes the next ingest read the
+        # issue markers, as it does for a missing file, so nothing is filed twice.
+        state = new_state()
+        state["rebuild"] = True
+    refuse_round(state, args.commit)
+    try:
+        save_state(args.state, state)
+    except OSError as err:
+        log(f"cannot save the state file: {err}")
+        return False
+    return True
+
+
+def refuse_main(args, log):
+    if not re.fullmatch(r"[0-9a-f]{7,64}", args.commit):
+        log("--commit must be a hex commit")
+        return 1
+    return 0 if record_refused(args, log) else 2
 
 
 def main(argv, now=None):
@@ -894,6 +943,9 @@ def main(argv, now=None):
     soak = sub.add_parser("soak")
     soak.add_argument("--commit", required=True)
     soak.add_argument("--state", required=True)
+    refuse = sub.add_parser("refuse")
+    refuse.add_argument("--commit", required=True)
+    refuse.add_argument("--state", required=True)
     cmd = sub.add_parser("ingest")
     cmd.add_argument("--round", required=True)
     cmd.add_argument("--commit", required=True)
@@ -911,6 +963,8 @@ def main(argv, now=None):
 
     if args.command == "soak":
         return soak_main(args, log)
+    if args.command == "refuse":
+        return refuse_main(args, log)
     if not re.fullmatch(r"[0-9a-f]{7,64}", args.commit):
         log("--commit must be a hex commit")
         return 1
@@ -923,8 +977,8 @@ def main(argv, now=None):
     try:
         counts, failures = read_round(args.round, args.source_root)
     except BadInput as err:
-        log(f"round refused, nothing counted: {err}")
-        return 1
+        log(f"round refused, counted against {args.commit[:7]} as refused: {err}")
+        return 1 if record_refused(args, log) else 2
     try:
         if args.dry_run:
             github = DryRun(print)
@@ -934,8 +988,13 @@ def main(argv, now=None):
     except Environment as err:
         log(str(err))
         return 2
-    if state is None:
-        state = new_state()
+    if state is not None and state.pop("rebuild", False):
+        state["filed"] = {}
+        state_missing = True
+    else:
+        state_missing = state is None
+    if state_missing:
+        state = state or new_state()
         try:
             for fingerprint, number in github.markers().items():
                 if len(state["filed"]) < FILED_MAX:
@@ -957,4 +1016,8 @@ def main(argv, now=None):
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except Exception:  # A bug in the reporter: exit 70 so run.sh counts the round as lost.
+        traceback.print_exc()
+        sys.exit(70)
