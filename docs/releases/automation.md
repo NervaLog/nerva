@@ -48,7 +48,7 @@ VERSION commit merged to main (CHANGELOG section with its site line, P360)
                                   ├─ publish the draft  → GitHub creates tag v<V> at the target
                                   ├─ tap:  Formula/nerva.rb → NervaLog/homebrew-tap main   (App token)
                                   │        (a prerelease: branch rc/v<V>, never main)
-                                  └─ site: PR to NervaLog/nervalog.github.io, auto-merge  (App token)
+                                  └─ site: PR to NervaLog/nervalog.github.io, merged after site-check  (App token)
                                            (a prerelease: PR opened, no auto-merge)
                                   └─ verify  (mac-verify.yml on the published release:
                                               arm64 + x86_64, brew install from the tap, nerva version, brew test)
@@ -112,7 +112,7 @@ full commit SHA, as today.
 - **`mac-verify`:** `needs: mac`, `uses: ./.github/workflows/mac-verify.yml` with `tag`,
   `permissions: contents: write` (listing a draft). This is the existing check of the draft on
   `macos-15` and `macos-15-intel`, where `brew` is skipped.
-- **`publish`** (new): `needs: [mac, mac-verify]`, `runs-on: ubuntu-24.04`, `timeout-minutes: 30`,
+- **`publish`** (new): `needs: [mac, mac-verify]`, `runs-on: ubuntu-24.04`, `timeout-minutes: 45`,
   `environment: release-publish`, `permissions: contents: write` (the draft in `NervaLog/nerva`
   only). `env: TAG`. The steps, each idempotent, so "Re-run failed jobs" finishes a half-done
   publish:
@@ -154,9 +154,15 @@ full commit SHA, as today.
      unless `const SITE = {`, `const RELEASES = [` and each of those three keys occur exactly once,
      and it does nothing if `RELEASES` already holds `<V>`. The step pushes branch
      `release/v<V>` and opens a pull request, `Release v<V>`, whose body links the release.
-     - For a release, `gh pr merge --auto --squash`, then wait up to 20 minutes for the merge.
-       Fail if it does not merge, and say so in one coded line. The release itself is out by then,
-       and the site PR can be merged by hand.
+     - For a release, wait for the site's `site-check` on the PR's head commit to succeed (failure or
+       no result in time: NRV-E1136, PR left open), then `gh pr merge --squash --match-head-commit
+       <sha>`, with `--auto` only as the fallback if that is refused (P364), then wait up to
+       the merge. Both waits share one 20-minute deadline (`SITE_DEADLINE`), inside the job's 45
+       minutes. Fail if it does not merge, and say so in one coded line. The release itself is out by
+       then, and the site PR can be merged by hand. Only `check.yml`'s `site-check` from GitHub Actions
+       counts. The `--auto` fallback pins the head commit only when auto-merge is turned on; what stops a
+       later push from merging unchecked is the site's ruleset (required `site-check`, no bypass), and
+       `site-wait` refuses a merge whose head has no passing check.
      - For a prerelease, the PR is opened without auto-merge, and the step waits for its check to
        pass. The supervisor closes it after the rehearsal.
      - An open PR for the same branch is reused.
