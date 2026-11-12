@@ -27,7 +27,8 @@
 # Secrets arrive in the environment only (GH_TOKEN). Git reads the token from there through a
 # credential helper that names the variable, never through a URL or an argument. Testing overrides:
 # TAP_URL, SITE_URL (the repositories' clone URLs), SITE_REPO (owner/name for gh), and
-# SITE_WAIT_SECONDS and SITE_POLL_SECONDS.
+# SITE_WAIT_SECONDS and SITE_POLL_SECONDS (at least 1); SITE_DEADLINE (epoch seconds) is the end of the
+# one wait the `site` and `site-wait` steps share.
 set -euo pipefail
 
 where=release-finish.yml
@@ -145,7 +146,18 @@ tap_run() {
 # (no such run yet, or GitHub did not answer: the caller asks again).
 site_check_result() {
   gh api "repos/$site_repo/commits/$1/check-runs" \
-    --jq '[.check_runs[] | select(.name == "site-check") | .conclusion] | first // ""' 2> /dev/null || true
+    --jq '[.check_runs[] | select(.name == "site-check" and .app.slug == "github-actions")] | sort_by(.id) | last | .conclusion // ""' 2> /dev/null || true
+}
+
+# site_deadline: the epoch second at which the whole wait for the site ends. `site` and `site-wait`
+# (two steps of one job) share it through SITE_DEADLINE; alone, a step starts its own.
+site_deadline() {
+  if [[ ! "$poll_seconds" =~ ^[1-9][0-9]*$ || ! "$wait_seconds" =~ ^[0-9]+$ ]]; then
+    refuse NRV-E1136 "SITE_POLL_SECONDS '$poll_seconds' or SITE_WAIT_SECONDS '$wait_seconds' is not a whole number of seconds (poll at least 1)" \
+      "the wait for the site's check needs a poll interval of at least a second" \
+      "unset them, or set whole numbers"
+  fi
+  echo "${SITE_DEADLINE:-$(($(date +%s) + wait_seconds))}"
 }
 
 # site_clone <work>: clone the site into <work>/site and enter it.
@@ -391,14 +403,13 @@ case "${1:-}" in
     # pull request open. A prerelease's is never merged.
     if [[ "$tag" != *-* ]]; then
       result=
-      waited=0
+      deadline=$(site_deadline)
       while :; do
         result=$(site_check_result "$head_sha")
-        if [[ -n "$result" && "$result" != null ]] || ((waited >= wait_seconds)); then
+        if [[ -n "$result" && "$result" != null ]] || (($(date +%s) >= deadline)); then
           break
         fi
         sleep "$poll_seconds"
-        waited=$((waited + poll_seconds))
       done
       if [[ "$result" != success ]]; then
         refuse NRV-E1136 "the site's check on pull request #$pr is '${result:-missing}' at ${head_sha:0:7}" \
@@ -420,7 +431,7 @@ case "${1:-}" in
   site-wait)
     pr=${2:?usage: release_finish.sh site-wait <pr> <release|prerelease>}
     mode=${3:?usage: release_finish.sh site-wait <pr> <release|prerelease>}
-    waited=0
+    deadline=$(site_deadline)
     merged_seen=
     while :; do
       # A failed call is "not yet": the next poll asks again.
@@ -446,11 +457,10 @@ case "${1:-}" in
         echo "release_finish.sh: the site's pull request #$pr passed site-check"
         exit 0
       fi
-      if ((waited >= wait_seconds)); then
+      if (($(date +%s) >= deadline)); then
         break
       fi
       sleep "$poll_seconds"
-      waited=$((waited + poll_seconds))
     done
     if [[ -n "$merged_seen" ]]; then
       refuse NRV-E1136 "the site's pull request #$pr is merged, but site-check has no result on its head" \

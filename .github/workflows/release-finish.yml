@@ -107,7 +107,7 @@ jobs:
       && contains(fromJSON('["success", "skipped"]'), needs.mac.result)
       && needs.mac-verify.result == 'success' }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 45
     environment: release-publish
     permissions:
       contents: write # publishes the draft in this repository; the other repositories use the App's token
@@ -237,6 +237,11 @@ jobs:
           LINE: ${{ steps.site.outputs.line }}
         run: |
           set -euo pipefail
+          # One deadline for this step's wait for site-check and the next step's wait: 20 minutes
+          # from now, well inside the job's 45 (P364b).
+          SITE_DEADLINE=$(($(date +%s) + 1200))
+          export SITE_DEADLINE
+          echo "SITE_DEADLINE=$SITE_DEADLINE" >> "$GITHUB_ENV"
           number=$(.github/scripts/release_finish.sh site "$TAG" "$DATE" "$LINE")
           echo "number=$number" >> "$GITHUB_OUTPUT"
 
