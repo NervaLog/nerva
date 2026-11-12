@@ -49,7 +49,7 @@ pub fn kind_of(reason: vsr.Header.Eviction.Reason) ?Kind {
 }
 
 /// The refusal an eviction of `reason` is, or null for any other reason.
-fn refusal_of(
+pub fn refusal_of(
     reason: vsr.Header.Eviction.Reason,
     client: vsr.Release,
     cluster: vsr.Release,
@@ -87,7 +87,7 @@ pub fn record(
         ),
         .too_low => log.err(
             "NRV-E0610: this client runs release {s}, below the {s} cluster's " ++
-                "release_client_min; upgrade the client (nerva version prints the minimum)",
+                "release_client_min; upgrade the client to at least that release",
             .{ refusal.client(), refusal.cluster() },
         ),
     }
