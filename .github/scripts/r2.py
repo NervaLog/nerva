@@ -11,10 +11,11 @@ Environment (never argv): R2_ENDPOINT, R2_BUCKET, R2_ACCESS_KEY_ID, R2_SECRET_AC
   put <key> <file>        only a name a run replaces, or a content-named index file
   probe-locked <key> <file>   unconditional put; R2 must answer with the pinned lock refusal
 
-Exit: 0 done, 1 failed (NRV-E1143), 2 absent, 3 exists (put-new), 4 lock rule missing
-(probe-locked: R2 accepted the put), 5 listing truncated at 100 pages, 64 usage or a name `put`
-refuses. A message names the operation, the key and the HTTP status; never a header or a
-credential."""
+Exit: 0 done, 1 failed (NRV-E1143, or NRV-E1139 for the environment), 2 absent, 3 exists
+(put-new), 4 lock rule missing (probe-locked: R2 accepted the put), 5 listing truncated at 100
+pages, 64 usage, 70 a name `put` refuses (NRV-B0005). A failure prints `error[NRV-E....]: r2.py:
+<what>` and a `cause` and a `fix` line; the message names the operation, the key and the HTTP
+status, never a header or a credential."""
 import datetime
 import hashlib
 import hmac
@@ -38,6 +39,8 @@ LOCK_STATUS = 409
 LOCK_CODE = "ObjectLockedByBucketPolicy"
 IMMUTABLE = "public, max-age=31536000, immutable"
 NO_CACHE = "no-cache"
+
+LOOPBACK = ("127.0.0.1", "localhost", "::1")
 
 _sleep = time.sleep  # tests replace it
 
@@ -63,8 +66,24 @@ class Failure(Exception):
         self.text = text
 
 
+def diagnostic(kind, code, what, cause, fix):
+    return f"{kind}[{code}]: r2.py: {what}\n  cause  {cause}\n  fix    {fix}"
+
+
+E1143_CAUSE = "the bucket refused or failed an operation"
+E1143_FIX = "Check the bucket token and the bucket's state in Cloudflare, then run again"
+E1139_CAUSE = "the package-repos environment is incomplete"
+E1139_FIX = ("Set R2_ENDPOINT (the account's S3 endpoint, no path), R2_BUCKET, R2_ACCESS_KEY_ID "
+             "and R2_SECRET_ACCESS_KEY in the environment, then run again")
+
+
 def fail(op, key, what):
-    return Failure(1, f"error[NRV-E1143]: r2 {op} {key}: {what}")
+    return Failure(1, diagnostic("error", "NRV-E1143", f"{f'{op} {key}'.strip()}: {what}",
+                                 E1143_CAUSE, E1143_FIX))
+
+
+def env_failure(what):
+    return Failure(1, diagnostic("error", "NRV-E1139", what, E1139_CAUSE, E1139_FIX))
 
 
 def replaceable(key):
@@ -135,15 +154,20 @@ class Client:
         names = ("R2_ENDPOINT", "R2_BUCKET", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY")
         missing = [n for n in names if not env.get(n)]
         if missing:
-            raise Failure(64, "error[NRV-E1143]: r2: not set in the environment: "
-                          + ", ".join(missing))
+            raise env_failure("not set in the environment: " + ", ".join(missing))
         u = urllib.parse.urlsplit(env["R2_ENDPOINT"])
         if u.scheme not in ("http", "https") or not u.netloc:
-            raise Failure(64, "error[NRV-E1143]: r2: R2_ENDPOINT is not an http(s) URL")
+            raise env_failure("R2_ENDPOINT is not an http(s) URL")
+        if u.path not in ("", "/") or u.query or u.fragment:
+            raise env_failure("R2_ENDPOINT has a path, query or fragment; the bucket is "
+                              "R2_BUCKET, not part of the endpoint")
+        if u.scheme == "http" and u.hostname not in LOOPBACK:
+            raise env_failure("R2_ENDPOINT is http on a host that is not loopback; use https")
         self.scheme, self.host = u.scheme, u.netloc
         self.bucket = env["R2_BUCKET"]
         self.akid = env["R2_ACCESS_KEY_ID"]
         self.secret = env["R2_SECRET_ACCESS_KEY"]
+        self.attempts = 0  # requests sent by the last call(), retries included
 
     def _once(self, method, key, query, extra, body):
         path = "/" + _quote(self.bucket) + ("/" + urllib.parse.quote(key, safe="/-_.~")
@@ -174,6 +198,7 @@ class Client:
         broken connection that outlasts the retries."""
         last = "no answer"
         for attempt in range(RETRIES + 1):
+            self.attempts = attempt + 1
             if attempt:
                 _sleep(BACKOFF_SECONDS[attempt - 1])
             try:
@@ -215,6 +240,16 @@ def put_headers(key, body):
             "x-amz-meta-sha256": hashlib.sha256(body).hexdigest()}
 
 
+def listing_line(prefix, key, size):
+    """One `<key><TAB><size>` line. A key with a control character (TAB, newline) would forge
+    other lines, and a size that is not a decimal is not an S3 answer: both are refused."""
+    if not key or any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in key):
+        raise fail("list", prefix, "an object's key is empty or has a control character")
+    if size is None or not re.fullmatch(r"[0-9]{1,18}", size):
+        raise fail("list", prefix, "an object has no size, or one that is not a decimal")
+    return f"{key}\t{size}"
+
+
 def cmd_list(c, prefix):
     out, token, pages = [], None, 0
     truncated = False
@@ -232,18 +267,21 @@ def cmd_list(c, prefix):
             raise fail("list", prefix, "the answer is not XML")
         ns = root.tag[:root.tag.index("}") + 1] if root.tag.startswith("{") else ""
         for item in root.findall(f"{ns}Contents"):
-            out.append(f"{item.findtext(f'{ns}Key')}\t{item.findtext(f'{ns}Size')}")
+            out.append(listing_line(prefix, item.findtext(f"{ns}Key"),
+                                    item.findtext(f"{ns}Size")))
         token = root.findtext(f"{ns}NextContinuationToken")
-        if root.findtext(f"{ns}IsTruncated") != "true" or not token:
+        if root.findtext(f"{ns}IsTruncated") != "true":
             break
+        if not token:
+            raise fail("list", prefix, "the listing is truncated and gives no continuation token")
         if pages >= PAGES_MAX:
             truncated = True
             break
     for line in out:
         print(line)
     if truncated:
-        sys.stderr.write(f"error[NRV-E1143]: r2 list {prefix}: truncated, more than "
-                         f"{PAGES_MAX} pages of keys\n")
+        sys.stderr.write(fail("list", prefix, f"truncated, more than {PAGES_MAX} pages of keys").text
+                         + "\n")
         return 5
     return 0
 
@@ -282,13 +320,26 @@ def cmd_put_new(c, key, path):
     if 200 <= status < 300:
         return 0
     if status == 412 or is_lock(status, data):
+        # After a retry, "exists" may be this run's own write whose answer was lost: those
+        # bytes are written, not a second writer's.
+        if c.attempts > 1 and landed(c, key, body):
+            return 0
         return 3
     raise refuse("put-new", key, status, data)
 
 
+def landed(c, key, body):
+    status, h, _ = c.call("put-new", key, "HEAD")
+    return (status == 200 and h.get("x-amz-meta-sha256") == hashlib.sha256(body).hexdigest()
+            and h.get("content-length") == str(len(body)))
+
+
 def cmd_put(c, key, path):
     if not replaceable(key):
-        raise Failure(64, f"r2 put {key}: refused, not a name a run replaces")
+        raise Failure(70, diagnostic(
+            "bug", "NRV-B0005", f"put {key}: refused, not a name a run replaces",
+            "the calling script asked to replace an object whose name is never replaced",
+            "Report it; the script's naming of the objects it replaces is wrong"))
     body = read_file(path)
     status, _, data = c.call("put", key, "PUT", extra=put_headers(key, body), body=body)
     if 200 <= status < 300:
@@ -302,7 +353,7 @@ def cmd_probe_locked(c, key, path):
     if is_lock(status, data):
         return 0
     if 200 <= status < 300:
-        sys.stderr.write(f"error: r2 probe-locked {key}: R2 accepted an overwrite under a locked "
+        sys.stderr.write(f"r2.py: probe-locked {key}: R2 accepted an overwrite under a locked "
                          "prefix; the bucket lock rule is missing (the caller reports NRV-E1149)\n")
         return 4
     raise refuse("probe-locked", key, status, data)
@@ -325,8 +376,8 @@ def main(argv, env=None):
         sys.stderr.write(f.text + "\n")
         return f.code
     except OSError as e:
-        sys.stderr.write(f"error[NRV-E1143]: r2 {argv[0]}: cannot read or write a local file "
-                         f"({type(e).__name__})\n")
+        sys.stderr.write(fail(argv[0], "", "cannot read or write a local file "
+                              f"({type(e).__name__})").text + "\n")
         return 1
 
 

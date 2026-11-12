@@ -6,6 +6,7 @@ A fake S3 server (http.server, in this file) checks every SigV4 signature, keeps
 memory, enforces the bucket locks and can fail on demand. SigV4 itself is checked against the
 examples in AWS's documentation ("Signature Calculations for the Authorization Header")."""
 import contextlib
+import datetime
 import hashlib
 import io
 import os
@@ -13,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import types
 import unittest
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -93,6 +95,11 @@ class Handler(BaseHTTPRequestHandler):
         with srv.mutex:
             if srv.faults:
                 f = srv.faults.pop(0)
+                if f == "store_drop":  # the write lands, the answer is lost
+                    u = urllib.parse.urlsplit(self.path)
+                    srv.objects[urllib.parse.unquote(u.path).split("/", 2)[2]] = (
+                        body, {k.lower(): v for k, v in self.headers.items()})
+                    f = "drop"
                 if f == "drop":
                     self.close_connection = True
                     self.connection.close()
@@ -175,6 +182,10 @@ class Case(unittest.TestCase):
             code = r2.main(list(argv), self.srv.env if env is None else env)
         self.last = (out.getvalue(), err.getvalue())
         return code
+
+    def assert_diag(self, headline, cause=r2.E1143_CAUSE, fix=r2.E1143_FIX):
+        """stderr is exactly the registered form: headline, a cause line and a fix line."""
+        self.assertEqual(self.last[1], f"{headline}\n  cause  {cause}\n  fix    {fix}\n")
 
     def assert_clean(self, text):
         for secret in (SECRET, AKID):
@@ -273,10 +284,39 @@ class Puts(Case):
             self.assertEqual(self.srv.objects[key][0], b"one")
             self.assertEqual(self.last, ("", ""))
 
+    def test_put_new_whose_answer_was_lost_is_done_not_exists(self):
+        data = b"manifest"
+        for key, mode in (("manifest/0000000002.asc", "412"), ("manifest/0000000002.asc", "409"),
+                          ("apt/dists/stable/main/binary-amd64/by-hash/SHA256/" + "a" * 64, "412")):
+            self.srv.objects.clear()
+            self.srv.lock_mode = mode
+            self.srv.faults = ["store_drop"]
+            self.assertEqual(self.run_r2("put-new", key, self.file(data)), 0, (key, mode))
+            self.assertEqual(self.srv.objects[key][0], data)
+            self.assertEqual(self.sleeps[-1], 1)
+
+    def test_put_new_exists_after_a_retry_with_other_bytes_is_exists(self):
+        key = "manifest/0000000002.asc"
+        for stored in (b"another writer", b"manifes!", b"manifest+"):
+            self.srv.objects[key] = (stored, {"x-amz-meta-sha256":
+                                              hashlib.sha256(stored).hexdigest()})
+            self.srv.faults = ["drop"]  # a retry happens, the object is not ours
+            self.assertEqual(self.run_r2("put-new", key, self.file(b"manifest")), 3, stored)
+        self.srv.objects[key] = (b"manifest", {})  # right size, no recorded hash
+        self.srv.faults = ["drop"]
+        self.assertEqual(self.run_r2("put-new", key, self.file(b"manifest")), 3)
+
+    def test_put_new_exists_on_the_first_attempt_is_exists_without_a_head(self):
+        key = "manifest/0000000002.asc"
+        self.assertEqual(self.run_r2("put-new", key, self.file(b"same")), 0)
+        self.srv.log.clear()
+        self.assertEqual(self.run_r2("put-new", key, self.file(b"same")), 3)
+        self.assertEqual([m for m, _, _ in self.srv.log], ["PUT"])
+
     def test_put_new_other_4xx_is_e1143(self):
         wrong = dict(self.srv.env, R2_BUCKET="nope")
         self.assertEqual(self.run_r2("put-new", "a/b", self.file(b"x"), env=wrong), 1)
-        self.assertIn("error[NRV-E1143]: r2 put-new a/b: HTTP 404 NoSuchBucket", self.last[1])
+        self.assert_diag("error[NRV-E1143]: r2.py: put-new a/b: HTTP 404 NoSuchBucket")
 
     def test_put_refuses_names_outside_the_replaceable_set(self):
         for key in ("apt/pool/main/n/nerva/nerva_0.7.1-1_amd64.deb",
@@ -286,9 +326,12 @@ class Puts(Case):
                     "rpm/stable/repodata/" + "c" * 64 + "-primary.xml",
                     "apt/dists/stable/main/binary-i386/Packages", "lock/x", ""):
             self.srv.log.clear()
-            self.assertEqual(self.run_r2("put", key, self.file(b"x")), 64, key)
+            self.assertEqual(self.run_r2("put", key, self.file(b"x")), 70, key)
             self.assertEqual(self.srv.log, [], key)  # refused before any request
-            self.assertIn("refused", self.last[1])
+            self.assert_diag(
+                f"bug[NRV-B0005]: r2.py: put {key}: refused, not a name a run replaces",
+                "the calling script asked to replace an object whose name is never replaced",
+                "Report it; the script's naming of the objects it replaces is wrong")
 
     def test_put_replaces_a_replaceable_name(self):
         key = "apt/dists/stable/InRelease"
@@ -305,14 +348,14 @@ class Puts(Case):
         self.srv.locks = ()  # the lock rule is gone
         self.assertEqual(self.run_r2("probe-locked", key, self.file(data)), 4)
         self.assertIn("lock rule is missing", self.last[1])
+        self.assertNotIn("error", self.last[1])  # the caller owns the code (NRV-E1149)
 
     def test_probe_locked_any_other_answer_is_e1143(self):
         key = "manifest/0000000001.asc"
         self.srv.faults = [403]  # not the pinned pair, and not retried
         self.srv.secret = "different"
         self.assertEqual(self.run_r2("probe-locked", key, self.file(b"x")), 1)
-        self.assertIn("error[NRV-E1143]: r2 probe-locked manifest/0000000001.asc: HTTP 403",
-                      self.last[1])
+        self.assert_diag("error[NRV-E1143]: r2.py: probe-locked manifest/0000000001.asc: HTTP 403 InternalError")
         self.srv.secret = SECRET
         # a 409 with another code, or the pinned code with another status, is not the pin
         for status, code in ((409, "OperationAborted"), (403, r2.LOCK_CODE)):
@@ -368,10 +411,120 @@ class Reads(Case):
         self.assertEqual(self.run_r2("list", "p/"), 5)
         self.assertEqual(len(self.last[0].splitlines()), 100)
         self.assertEqual(len(self.srv.log), 100)
-        self.assertIn("error[NRV-E1143]: r2 list p/: truncated, more than 100 pages", self.last[1])
+        self.assert_diag("error[NRV-E1143]: r2.py: list p/: truncated, more than 100 pages of keys")
         del self.srv.objects["p/0100"]  # exactly 100 pages is complete, not truncated
         self.assertEqual(self.run_r2("list", "p/"), 0)
         self.assertEqual(len(self.last[0].splitlines()), 100)
+
+
+class Listing(Case):
+    """A listing the fake builds by hand: the bucket's token holder can add any key."""
+
+    def page(self, body, truncated="false", token=""):
+        ns = "http://s3.amazonaws.com/doc/2006-03-01/"
+        tok = f"<NextContinuationToken>{token}</NextContinuationToken>" if token else ""
+        xml = (f'<ListBucketResult xmlns="{ns}"><IsTruncated>{truncated}</IsTruncated>'
+               f"{body}{tok}</ListBucketResult>").encode()
+        self.srv.do_list_override = xml
+
+    def run_list(self):
+        orig = Handler.do_list
+        Handler.do_list = lambda h, u: h.reply(200, self.srv.do_list_override)
+        self.addCleanup(setattr, Handler, "do_list", orig)
+        return self.run_r2("list", "p/")
+
+    def test_truncated_with_no_token_is_e1143(self):
+        self.page("<Contents><Key>p/a</Key><Size>1</Size></Contents>", truncated="true")
+        self.assertEqual(self.run_list(), 1)
+        self.assertEqual(self.last[0], "")
+        self.assert_diag("error[NRV-E1143]: r2.py: list p/: the listing is truncated and "
+                         "gives no continuation token")
+
+    def test_a_key_with_a_control_character_is_refused(self):
+        for bad in ("p/a&#9;1&#10;p/b", "p/a&#13;", "p/a&#127;"):
+            self.page(f"<Contents><Key>{bad}</Key><Size>999</Size></Contents>")
+            self.assertEqual(self.run_list(), 1, bad)
+            self.assertEqual(self.last[0], "")
+            self.assertIn("control character", self.last[1])
+
+    def test_a_key_xml_cannot_carry_is_refused(self):
+        self.page("<Contents><Key>p/a&#1;</Key><Size>1</Size></Contents>")
+        self.assertEqual(self.run_list(), 1)
+        self.assertEqual(self.last[0], "")
+
+    def test_a_missing_or_malformed_size_is_refused(self):
+        for size in ("", "<Size></Size>", "<Size>None</Size>", "<Size>-1</Size>",
+                     "<Size>1.5</Size>"):
+            self.page(f"<Contents><Key>p/a</Key>{size}</Contents>")
+            self.assertEqual(self.run_list(), 1, size)
+            self.assertEqual(self.last[0], "")
+            self.assertIn("no size, or one that is not a decimal", self.last[1])
+
+    def test_a_good_page_lists(self):
+        self.page("<Contents><Key>p/a b</Key><Size>7</Size></Contents>")
+        self.assertEqual(self.run_list(), 0)
+        self.assertEqual(self.last[0], "p/a b\t7\n")
+
+
+class Encoding(unittest.TestCase):
+    """What goes on the wire for awkward keys, checked against hand-written expectations (the
+    fake server verifies signatures with r2.sigv4 itself, so it cannot catch a wrong path or
+    query encoding). The signatures are pinned at a fixed clock, so a change to the encoding
+    shows. The review cross-checked this encoding against botocore 1.44.1's S3SigV4Auth (region
+    `auto`) on requests of the same kind."""
+
+    def test_special_key_and_token_wire_form_and_signature(self):
+        seen = {}
+
+        class Resp:
+            status = 200
+
+            def getheaders(self):
+                return []
+
+            def read(self):
+                return b""
+
+        class Conn:
+            def __init__(self, host, timeout=None):
+                seen["host"] = host
+
+            def request(self, method, target, body=None, headers=None):
+                seen.update(target=target, headers=dict(headers))
+
+            def getresponse(self):
+                return Resp()
+
+            def close(self):
+                pass
+
+        class Now:
+            @staticmethod
+            def now(tz=None):
+                return datetime.datetime(2026, 11, 12, 20, 0, 0, tzinfo=datetime.timezone.utc)
+
+        saved = (r2.http.client.HTTPSConnection, r2.datetime)
+        r2.http.client.HTTPSConnection = Conn
+        r2.datetime = types.SimpleNamespace(datetime=Now, timezone=datetime.timezone)
+        try:
+            c = r2.Client({"R2_ENDPOINT": "https://acct.r2.cloudflarestorage.com",
+                           "R2_BUCKET": "nerva-packages", "R2_ACCESS_KEY_ID": "AKID",
+                           "R2_SECRET_ACCESS_KEY": "SECRET/+x"})
+            c._once("GET", "we ird+key/\u00fc/a=b&c?d#e%41*(),'!:@$;", [], {}, b"")
+            key_target = seen["target"]
+            key_auth = seen["headers"]["authorization"]
+            c._once("GET", "", [("list-type", "2"), ("prefix", "apt/pool/ x+y"),
+                                ("continuation-token", "1a/b+c=d==")], {}, b"")
+        finally:
+            r2.http.client.HTTPSConnection, r2.datetime = saved
+        self.assertEqual(
+            key_target, "/nerva-packages/we%20ird%2Bkey/%C3%BC/a%3Db%26c%3Fd%23e%2541"
+                        "%2A%28%29%2C%27%21%3A%40%24%3B")
+        self.assertEqual(
+            seen["target"], "/nerva-packages?continuation-token=1a%2Fb%2Bc%3Dd%3D%3D"
+                            "&list-type=2&prefix=apt%2Fpool%2F%20x%2By")
+        self.assertIn("Signature=d0bb528aacc4586aa1684d61df0759f7395c16ad6d9e9fe70ff45304c05f7aa5", key_auth)
+        self.assertIn("Signature=839bda920452d4ff36026ea820c5104611580267de7049b923e16c9384d140a6", seen["headers"]["authorization"])
 
 
 class Failures(Case):
@@ -385,14 +538,14 @@ class Failures(Case):
         self.srv.faults = [500, 500, 500, 500, 500]
         self.assertEqual(self.run_r2("head", "k/v"), 1)
         self.assertEqual(self.sleeps, [1, 2, 4])
-        self.assertIn("error[NRV-E1143]: r2 head k/v: HTTP 500 after 3 retries", self.last[1])
+        self.assert_diag("error[NRV-E1143]: r2.py: head k/v: HTTP 500 after 3 retries")
         self.assertEqual(len(self.srv.faults), 1)  # 4 attempts, no more
 
     def test_connection_refused_is_e1143(self):
         self.srv.shutdown()
         self.srv.server_close()
         self.assertEqual(self.run_r2("head", "k/v"), 1)
-        self.assertIn("error[NRV-E1143]: r2 head k/v: connection failed", self.last[1])
+        self.assertIn("error[NRV-E1143]: r2.py: head k/v: connection failed", self.last[1])
 
     def test_a_4xx_is_not_retried(self):
         self.srv.secret = "other"
@@ -403,14 +556,29 @@ class Failures(Case):
     def test_the_environment_is_required(self):
         env = dict(self.srv.env)
         del env["R2_SECRET_ACCESS_KEY"]
-        self.assertEqual(self.run_r2("head", "k", env=env), 64)
-        self.assertIn("R2_SECRET_ACCESS_KEY", self.last[1])
+        self.assertEqual(self.run_r2("head", "k", env=env), 1)
+        self.assert_diag("error[NRV-E1139]: r2.py: not set in the environment: "
+                         "R2_SECRET_ACCESS_KEY", r2.E1139_CAUSE, r2.E1139_FIX)
         self.assertEqual(self.run_r2("nosuch"), 64)
         self.assertEqual(self.run_r2("put-new", "only-a-key"), 64)
 
+    def test_a_bad_endpoint_is_e1139(self):
+        for url, what in (("ftp://x", "is not an http(s) URL"),
+                          ("https://acct.r2.cloudflarestorage.com/nerva-packages", "has a path"),
+                          ("https://acct.r2.cloudflarestorage.com/?a=b", "has a path"),
+                          ("http://acct.r2.cloudflarestorage.com", "not loopback")):
+            env = dict(self.srv.env, R2_ENDPOINT=url)
+            self.assertEqual(self.run_r2("head", "k", env=env), 1, url)
+            self.assertIn("error[NRV-E1139]: r2.py: R2_ENDPOINT", self.last[1])
+            self.assertIn(what, self.last[1])
+        for url in ("https://acct.r2.cloudflarestorage.com", "https://x.example/",
+                    "http://localhost:9000", "http://[::1]:9000"):
+            r2.Client(dict(self.srv.env, R2_ENDPOINT=url))
+
     def test_a_missing_local_file_is_e1143(self):
         self.assertEqual(self.run_r2("put-new", "k/v", "/nonexistent/file"), 1)
-        self.assertIn("NRV-E1143", self.last[1])
+        self.assertIn("error[NRV-E1143]: r2.py: put-new: cannot read or write a local file",
+                      self.last[1])
 
     def test_no_credential_in_any_message(self):
         data = self.file(b"x")
@@ -441,8 +609,9 @@ class Failures(Case):
             self.assertNotIn(AKID, a)
         p = subprocess.run(argv, env={"PATH": env["PATH"]}, capture_output=True, text=True,
                            timeout=30)
-        self.assertEqual(p.returncode, 64)
+        self.assertEqual(p.returncode, 1)
         self.assertEqual(p.stdout, "")
+        self.assertIn("error[NRV-E1139]: r2.py: not set in the environment", p.stderr)
 
 
 class Pins(unittest.TestCase):
@@ -450,9 +619,10 @@ class Pins(unittest.TestCase):
         self.assertEqual((r2.LOCK_STATUS, r2.LOCK_CODE), (409, "ObjectLockedByBucketPolicy"))
         self.assertEqual((r2.PAGES_MAX, r2.RETRIES), (100, 3))
 
-    def test_e1143_text_is_one_line_with_operation_key_status(self):
+    def test_e1143_is_the_registered_form(self):
         e = r2.fail("put-new", "a/b", "HTTP 400")
-        self.assertEqual(e.text, "error[NRV-E1143]: r2 put-new a/b: HTTP 400")
+        self.assertEqual(e.text, "error[NRV-E1143]: r2.py: put-new a/b: HTTP 400\n"
+                         f"  cause  {r2.E1143_CAUSE}\n  fix    {r2.E1143_FIX}")
         self.assertEqual(e.code, 1)
 
 
