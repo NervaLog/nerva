@@ -5,11 +5,11 @@ area: Releases
 amends: P365, P368
 ---
 
+# Package signing: an offline primary with a CI subkey, tested first; pinned checks, verification before upload, served bytes, alarms and WKD
+
 **Order.** #376 merges after #368, which carries P368 and slice 2's `package_repos.sh`. The
 amendment of P368 is to slice 2's `verify_manifest` (the `$NF` check) and its signing setup,
 and slice 2b makes it.
-
-# Package signing: an offline primary with a CI subkey, tested first; pinned checks, verification before upload, served bytes, alarms and WKD
 
 **The owner's decisions (owner, 2026-11-12, on the Zigbox team's review of the pipeline).** The
 key model is "test, then subkey". Every signature is checked against the pinned primary. The run
@@ -40,8 +40,9 @@ and P376c (the Intel Mac runner) are separate decisions.
      that `Signed-By` names. To get it without a keyring package, the user runs INSTALL.md's
      `curl` line again, and the CHANGELOG announces it in the overlap. Whether to ship a keyring
      package after v0.7.1 is the owner's question, and it must be answered before the first
-     `next` (about 2027-07). On dnf, slice K records what rpm 4.16 and rpm 6 do with a new
-     subkey of a primary already imported. INSTALL.md documents the step that test shows.
+     `next` (about 2027-07). On dnf, slice K tests what rpm 4.16 and rpm 6 do with a new
+     subkey of a primary already imported, against the criterion under "Which branch is taken":
+     a step the user must take is a failure, not a documentation item.
    - **A leaked subkey.** The owner revokes it offline and certifies a new one. The key file
      ships the revocation, and the pinned primary stays the same. If the current manifest was
      signed by the revoked subkey, an `anchor <generation> <sha256>` line in `fingerprints`
@@ -84,7 +85,11 @@ and P376c (the Intel Mac runner) are separate decisions.
    locked or immutable prefix, and before the run writes the promoted manifest, it checks its
    own output. An rpm is checked in step 4, before its hash is recorded and before it is put,
    because the locks make a bad object permanent. An rpm already in the bucket that fails
-   later is marked `excluded` in the manifest and left out of the indexes (step 5b). The rest is
+   in step 5b is marked `excluded` and left out of the indexes only if its signing subkey is
+   listed `revoked` in `packaging/keys/` (an explicit state the owner made), at most 16 rpms a
+   run, and a later run returns it to `published` when it no longer qualifies. Any other rpm
+   failure stops the run and writes nothing (no manifest generation, no index upload), so a
+   fault in the run, such as a bad `fingerprints` edit, cannot drop rpms for good. The rest is
    checked in step 5b:
    - `gpgv` checks `InRelease`, `Release.gpg` and `repomd.xml.asc`, under an empty `GNUPGHOME`,
      against a keyring made only from `packaging/keys/`.
@@ -110,8 +115,10 @@ and P376c (the Intel Mac runner) are separate decisions.
    the run wrote. That is about 40 MB a release; the manifest's 4 GiB bound applies in the worst
    case. The cost is about a minute. R2 egress is free.
 5. **Refresh alarms (amends P365 point 10's threshold).** When `repos`, `repos-verify`, the
-   refresh or `repos-fresh` fails, an `alarm` job runs. A cancelled run does not alarm:
-   `ci.yml` cancels a superseded run on `main`, and the two clocks below catch a missing run. It uses the
+   refresh or `repos-fresh` fails, an `alarm` job runs. A cancelled write job (`repos-ready`,
+   `repos`, the refresh; they never use `cancel-in-progress`) alarms too, because a cancelled
+   `repos-ready` is a release with no packages and no clock sees it. A cancelled `repos-fresh` or
+   `ci.yml` run does not (`ci.yml` cancels a superseded run on `main`). It uses the
    `GITHUB_TOKEN` with `permissions: issues: write` only, and no environment or secret.
    - If an open issue labelled `package-repos` exists, the job comments on it, at most once a
      day per (workflow, job, code). Otherwise it opens one, assigned to the owner, so there is
@@ -120,6 +127,8 @@ and P376c (the Intel Mac runner) are separate decisions.
    - A failure of the alarm itself is warning NRV-W1103 and never changes the run's verdict.
    - The refresh also comments when the `InRelease` it finds was signed more than 8 days
      earlier, which means a refresh was missed.
+   - A daily `package-repos-watch.yml`, a file of its own, runs the same check as `repos-fresh`,
+     so a refresh that never starts is seen within a day even when `main` is quiet.
    - `repos-fresh` fails at under **10** days left, not 7. A healthy `InRelease` has 14 to 21
      days left, so under 10 means at least one refresh did not happen.
    - The 60-day rule stays. It catches only a schedule that GitHub disabled.
@@ -131,8 +140,8 @@ and P376c (the Intel Mac runner) are separate decisions.
      - `.well-known/openpgpkey/hu/ndqm47zydhyqyzabecddtdk1q3bponab`, the hash of `nerva`. It
        holds the binary form of `packaging/keys/nerva-release.asc`.
    - The build command copies exactly those two files and refuses a symlink.
-   - Both checks use one reference, the key file at the commit the site's `RELEASES` names as
-     the latest release: `site_check.mjs` on every site pull request, and `release_finish.sh
+   - Both checks use one reference, taken from Nerva and never from the pull request checked, the
+     key file at the newest `v*` tag (so a site pull request cannot roll the WKD file back): `site_check.mjs` on every site pull request, and `release_finish.sh
      site-live` after a release. A difference is NRV-E1162. `release-finish.yml`'s `site` job
      opens the pull request that updates the WKD file.
    - INSTALL.md tells users to check that the primary fingerprints from GitHub and from WKD
