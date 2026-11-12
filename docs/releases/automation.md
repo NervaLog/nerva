@@ -422,6 +422,16 @@ printf '%s' '{"name":"main","target":"branch","enforcement":"active","bypass_act
 (`actor_id` 5 is the repository admin role, so your own direct pushes still go through. The
 App's pull requests wait for `site-check`.)
 
+The site's `check.yml` accepts a release pull request only from the App, and reads the App's login
+from the site repository's variable `RELEASE_APP_LOGIN`: `<app-slug>[bot]`, which is
+`nerva-release[bot]` for the App named `Nerva Release`. Without it that author rule does not hold.
+
+```bash
+printf '%s' 'nerva-release[bot]' | gh variable set RELEASE_APP_LOGIN --repo NervaLog/nervalog.github.io
+```
+
+(Check the slug on the App's settings page; it is the name in lower case with dashes.)
+
 **7. Check.**
 
 ```bash
@@ -433,11 +443,15 @@ gh secret list --env release-publish --repo NervaLog/nerva && gh variable list -
 ```
 
 ```bash
+gh variable list --repo NervaLog/nervalog.github.io
+```
+
+```bash
 gh api repos/NervaLog/nerva/environments --jq '.environments[] | [.name, (.protection_rules | map(.type) | join(","))] | @tsv'
 ```
 
 Expect five Apple secrets in `apple-signing`, `RELEASE_APP_PRIVATE_KEY` and `RELEASE_APP_ID` in
-`release-publish`, `apple-signing` with `required_reviewers,branch_policy`, and `release-publish`
+`release-publish`, `RELEASE_APP_LOGIN` on the site, `apple-signing` with `required_reviewers,branch_policy`, and `release-publish`
 with `branch_policy` only. Then tell the supervisor, and the rehearsal follows.
 
 ## A release afterwards
@@ -453,7 +467,14 @@ with `branch_policy` only. Then tell the supervisor, and the rehearsal follows.
    day and updates the README and the site's prose (`SITE.stage`, `NEXT`) in its status PR.
 
 If a job fails, "Re-run failed jobs" resumes it. If the run itself is gone, dispatch
-`release-finish.yml` from `main` with the tag. Each job is idempotent. A draft that cannot be
+`release-finish.yml` from `main` with the tag. Each job is idempotent. For a release that is
+already published the dispatch skips `mac` (nothing is signed twice), still runs `mac-verify`
+on the published zip (steps 1 to 4, `brew: 'no'`, since the tap has no formula yet) and carries
+on with `publish`, which publishes nothing again but checks the tag, then the tap, the site and
+`verify`; the formula is then made from the template and the zip's published checksum. Everything
+that can refuse without writing (the App's token, the site's sentence, the tap's diff, the site's
+edit, a release older than the latest one, and a tag that already exists at another commit) runs before the draft is published, so a setup
+mistake leaves a draft and not a half-finished release. A draft that cannot be
 signed in CI falls back to the owner's Mac, as P311 and P343 describe. After uploading the zip, the
 owner dispatches `release-finish.yml` again; its `mac` job approval is then the only click, and it
 replaces the zip with CI's.
