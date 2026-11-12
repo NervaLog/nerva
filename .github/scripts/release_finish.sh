@@ -385,30 +385,33 @@ case "${1:-}" in
       fi
       pr=${url##*/}
     fi
-    # A release asks for the merge once its check passes; a prerelease's is never merged. Without
-    # auto-merge, the pull request is merged only after the site's check run on its head commit has
-    # concluded success (site-check is not a required check until the site's setup is done), and
-    # only at that commit. A failed or missing check leaves the pull request open.
+    # A release is merged only after the site's check run on its head commit has concluded success
+    # (site-check may not be a required check, and a pull request that is already clean is merged by
+    # `gh pr merge` at once, not queued), and only at that commit. A failed or missing check leaves the
+    # pull request open. A prerelease's is never merged.
     if [[ "$tag" != *-* ]]; then
-      if ! out=$(gh pr merge "$pr" --repo "$site_repo" --auto --squash 2>&1); then
-        result=
-        waited=0
-        while :; do
-          result=$(site_check_result "$head_sha")
-          if [[ -n "$result" && "$result" != null ]] || ((waited >= wait_seconds)); then
-            break
-          fi
-          sleep "$poll_seconds"
-          waited=$((waited + poll_seconds))
-        done
-        if [[ "$result" != success ]]; then
-          refuse NRV-E1136 "cannot ask for the merge of the site's pull request #$pr" \
-            "gh said: $(tr '\n' ' ' <<< "$out"); the site's check on ${head_sha:0:7} is '${result:-missing}', so it is not merged without it" \
-            "allow auto-merge on $site_repo and require site-check in its ruleset (setup guide, step 6), then merge #$pr by hand; the release is already published"
+      result=
+      waited=0
+      while :; do
+        result=$(site_check_result "$head_sha")
+        if [[ -n "$result" && "$result" != null ]] || ((waited >= wait_seconds)); then
+          break
         fi
-        if ! out=$(gh pr merge "$pr" --repo "$site_repo" --squash --match-head-commit "$head_sha" 2>&1); then
-          refuse NRV-E1136 "cannot merge the site's pull request #$pr" "gh said: $(tr '\n' ' ' <<< "$out")" \
-            "merge #$pr by hand once its check has passed; the release is already published"
+        sleep "$poll_seconds"
+        waited=$((waited + poll_seconds))
+      done
+      if [[ "$result" != success ]]; then
+        refuse NRV-E1136 "the site's check on pull request #$pr is '${result:-missing}' at ${head_sha:0:7}" \
+          "the pull request is not merged without site-check passing" \
+          "look at #$pr on $site_repo and merge it by hand once its check has passed; the release is already published"
+      fi
+      # Merge now, at the commit that was checked. Only if that is refused (a pending rule, such as a
+      # required check still queued) is auto-merge asked for, at the same commit.
+      if ! out=$(gh pr merge "$pr" --repo "$site_repo" --squash --match-head-commit "$head_sha" 2>&1); then
+        if ! out2=$(gh pr merge "$pr" --repo "$site_repo" --auto --squash --match-head-commit "$head_sha" 2>&1); then
+          refuse NRV-E1136 "cannot merge the site's pull request #$pr" \
+            "gh said: $(tr '\n' ' ' <<< "$out") then, for auto-merge: $(tr '\n' ' ' <<< "$out2")" \
+            "merge #$pr by hand; the release is already published"
         fi
       fi
     fi
