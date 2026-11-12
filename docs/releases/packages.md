@@ -473,7 +473,13 @@ Every job that writes the bucket runs under one GitHub Actions concurrency group
 concurrency:
   group: nerva-packages-bucket
   cancel-in-progress: false
+  queue: max
 ```
+
+`queue: max` (GitHub, 2026-05-07) lets up to 100 jobs wait in order, and cancels none of them. It
+is valid only with `cancel-in-progress: false`. Whether GitHub honours it on a job-level group
+is not documented; the rehearsal checks it (see "Not verified"). If it does not, the design falls
+back to the default queue, described under "The trap".
 
 It is set on the job, not the workflow, on exactly three jobs: `repos-ready` and `repos` in
 `release-finish.yml` (a release run and a dispatch alike), and the one job of
@@ -483,8 +489,9 @@ no lock search, no stale or wait timer. The old lock budget (the 30-minute wait,
 takeover) no longer applies. A queued writer waits in GitHub's queue for as long as the running job
 takes, at most its `timeout-minutes` (90).
 
-**The trap.** GitHub keeps one running and at most one *pending* job per group. When a third
-queues, it cancels the older pending one. So a refresh that queues behind a release's pending
+**The trap (the fallback, if `queue: max` is not honoured).** With the default queue, GitHub keeps
+one running and at most one *pending* job per group. When a third queues, it cancels the older
+pending one. So a refresh that queues behind a release's pending
 `repos` can cancel it. The design makes that harmless:
 
 - **Every write run does all the work there is.** `repos`, a dispatch and the refresh all finish
@@ -549,6 +556,10 @@ and P365 lists it as a cost.
 
 #### Pending entries of a release that never published
 
+A binding stays armed until its release is deleted: whoever publishes the draft by hand, anyone
+with `contents: write`, puts the bytes the owner approved into `stable` at the next write run.
+The owner disarms a release they will not ship by deleting the draft and its tag (see Recovery).
+
 `repos-ready` writes the binding before `publish`, so a release can be bound and then never
 published: `publish` fails before its publish step and nobody re-runs it, the owner decides not to
 ship, or a candidate is deleted (P343 7b). The rule:
@@ -591,6 +602,8 @@ ship, or a candidate is deleted (P343 7b). The rule:
      - **`manifest/` is empty:** the run starts from generation 0. Objects under the package
        prefixes are noted as junk, as everywhere else. This is the first run, and also any run
        after a first run that stopped before it wrote its first manifest: that run wrote nothing.
+       There is no object to probe yet, so the first run's step 3 skips the lock probe. The
+       rehearsal checks the locks instead: its second write run probes them (see "The rehearsal").
      - **`manifest/` holds objects but none verifies:** it refuses before writing (NRV-E1142). It
        cannot tell junk from a manifest it cannot read. This pipeline verifies every manifest
        before it puts it, so neither a crash nor a failed run of it causes this: the R2 token
@@ -637,13 +650,16 @@ ship, or a candidate is deleted (P343 7b). The rule:
        says. Otherwise:
        - a deb: download it from the release, check its SHA-256 against `<source-sha256>`
          (NRV-E1148), put it with `put-new`;
-       - an rpm: if another copy of the same file (the other channel) exists with the entry's
-         SHA-256, put those bytes. Otherwise download the release's rpm, check `<source-sha256>`
+       - an rpm has one entry per channel, `rpm/rc/` and `rpm/stable/`, both for the same file. If
+         the entry has a recorded hash (not `-`) and the other channel's object exists with it,
+         put those bytes. Otherwise download the release's rpm, check `<source-sha256>`
          (NRV-E1148), sign it (see "Signing"), and check that the signed copy has the release
          file's NEVRA and payload digest (NRV-E1144). A new signature differs, so the run
-         **first** writes a manifest generation with the entry's new `<sha256>` and `<size>`,
-         copying `state`, `index` and `index-was` (see "The manifest"), **then** puts the object
-         with `put-new`.
+         **first** writes a manifest generation that records the new `<sha256>` and `<size>` on
+         **every** entry of that file, in both `rc` and `stable`, and copies `state`, `index` and
+         `index-was` (see "The manifest"). **Only then** does it put the objects, each with
+         `put-new`. A crash between the two puts leaves both entries recorded, so the next run
+         finds the missing object's entry hash and copies the bytes of the one that exists.
 
      So every package object the job ever writes is listed in a signed manifest before it exists.
      A download from GitHub that fails for another reason (the network, the API) is NRV-E1155.
@@ -694,7 +710,8 @@ A run stopped at any step leaves the bucket in a state the next write run accept
 |---|---|---|
 | anything before the first manifest of the first run | nothing | starts from generation 0 |
 | `repos-ready`'s binding manifest | entries, no objects | puts them (step 4) once the release is public |
-| an rpm's new-signature manifest in step 4 | that entry's new hash, no object | signs again, records the newer hash, puts it |
+| an rpm's new-signature manifest in step 4 | the new hash on both channels' entries, no object | puts the bytes of whichever object exists, else signs again and records the newer hash on both |
+| an rpm's first channel put in step 4 | both entries recorded, one object | copies that object's bytes to the other channel |
 | part of step 4 | some objects of pending entries | puts the rest; adopts what is there with the entry's SHA-256 |
 | step 4 | all objects, entries pending | indexes, then promotes |
 | step 6 | the promoted manifest (`writing`), the old indexes (`index-was`) | accepts them, rewrites every index |
@@ -814,11 +831,13 @@ Yes, the release checks that `nerva.pro` shows it. It is its own job, not a step
 |---|---|
 | `repos-ready` refused NRV-E1139, NRV-E1140, NRV-E1145 or NRV-E1155 | Fix the setup it names (or wait for GitHub), then "Re-run all jobs": it re-runs `mac` and asks the owner to approve again. "Re-run failed jobs" would only fail with NRV-E1153. Nothing was published or written |
 | `repos-ready` refused NRV-E1143 (R2 unreachable) | The draft waits. "Re-run all jobs" when R2 answers (a new approval). To ship without packages instead, the owner decides; that is a new decision, and the tag is then never bound |
+| `mac-verify` failed (a brew or network fault on the Mac runner) | Use "Re-run all jobs" and approve again. "Re-run failed jobs" re-runs `repos-ready` against `mac`'s old `attempt` and ends in NRV-E1153. Nothing was written |
 | `repos-ready` refused NRV-E1153, or was cancelled while pending (see "One writer at a time") | Use "Re-run all jobs" and approve again. Nothing was written |
 | `repos-ready` refused NRV-E1141 or NRV-E1142 | Stop. The bucket holds something no signed manifest allows. The owner rotates the R2 token and decides. The draft waits |
 | `repos-ready` refused NRV-E1148 (the release was already public) | Someone re-ran `repos-ready` alone after publication. If its binding manifest was written, nothing is needed: re-run `repos` or wait for the refresh. If not, the tag was never bound: the owner decides |
 | `publish` failed after the release went public (NRV-E1135, E1136, E1138) | `repos` runs anyway (`public` is `true`). Recover the tap or the site as P362 and P364 say |
 | `publish` failed before the release went public | Re-run it as P362 says. The binding waits in the manifest, inert, until the release is public (see "Pending entries of a release that never published") |
+| The owner decides not to ship a bound release | Delete the draft release and its tag. The run then reads a 404, skips the entries, and they stay inert. Until that is done the binding is armed: anyone who publishes the draft puts it into `stable` at the next write run |
 | `repos` stopped part way, was cancelled while pending, or failed with NRV-E1143, NRV-E1155 or NRV-E1156 | "Re-run failed jobs" of the same run, or a dispatch of the tag, at any time; the weekly refresh also finishes it. It converges (the table above). No approval is needed: the binding is in the manifest |
 | `repos` or the refresh failed NRV-E1147 | Two writers ran at once: something wrote the bucket outside the concurrency group. Find the run or workflow without the group and fix it, then re-run. Nothing was half written: the loser stopped before its next write |
 | `repos` refused NRV-E1148 for its own tag | The bytes on the release differ from what the approved run read, or nothing was bound (a release published before the repositories, or a binding that was never written). Stop: the owner decides (a new patch release, normally). The release's files still install by hand |
@@ -1399,6 +1418,9 @@ packages (a dispatch for a published release would stop with NRV-E1148):
   (no NRV-E1149). `served` is green. The run's log shows which answer `put-new` got for a name
   under a locked prefix that exists (412 or the lock refusal), from a deliberate second
   `put-new` of one deb; it is recorded in the worklog.
+- The locks are tested after the first run wrote the manifest and the first packages: a second
+  write run (a dispatch of the same tag) probes every locked prefix (no NRV-E1149). The first run
+  itself is unprobed, because an empty bucket has no object to probe.
 - `repos-verify` is green in all fourteen cells (sixteen with Fedora 45), on amd64 and arm64: `nerva version` ends with
   `version 0.7.1-rc.N`, and `stable` offers no candidate.
 - **A dispatch** of the same tag (no approval) writes no package object, stops nowhere, and
@@ -1434,9 +1456,10 @@ containers):
   which answer a `put-new` of an existing locked object gets (412 or the lock refusal; either is
   "exists"); and that an "Object Read & Write" token cannot change lock rules.
 - The concurrency group: that a job-level group spans `release-finish.yml` and
-  `package-repos-refresh.yml`, and that a third queued job cancels the pending one, as GitHub
-  documents. Slice 2 cannot test this locally; the design does not depend on which job is
-  cancelled.
+  `package-repos-refresh.yml`, and that with `queue: max` a third queued job waits and is not
+  cancelled. Slice 2 cannot test this locally. If GitHub refuses or ignores `queue` at job level,
+  remove it and keep the design as it is: a third job then cancels the pending one, which the
+  design survives (see "The trap"), at the rare cost of a second approval.
 - That `mac-sign.yml`'s new output `attempt` reaches `release-finish.yml` after a partial re-run.
   If GitHub drops it, `ready` refuses with NRV-E1153, which fails closed.
 - That `mac-sign.yml`, re-run by "Re-run all jobs" against a draft that already holds the signed

@@ -81,9 +81,10 @@ amends: P360, P148, P364
    bucket, any later write run (a re-run, a dispatch, the weekly refresh) finishes the packages;
    there is no 30-day limit.
 9. **One writer at a time, by one GitHub Actions concurrency group.** `repos-ready`, `repos` and
-   the refresh job are in the group `nerva-packages-bucket`, `cancel-in-progress: false`. There
-   is no lock in the bucket. GitHub keeps one pending job per group and cancels the older one;
-   that is harmless, because every write run does all the work there is and the binding is in
+   the refresh job are in the group `nerva-packages-bucket`, `cancel-in-progress: false`, with
+   `queue: max`, so GitHub cancels none of them. The rehearsal checks that a job-level group
+   honours `queue`. If not, the fallback is the default queue, where a third job cancels the
+   pending one; that is harmless, because every write run does all the work there is and the binding is in
    the bucket. Guarantee: at most one job writes at a time; a cancelled `repos` or refresh loses
    nothing; a cancelled `repos-ready` wrote nothing, and the draft waits for "Re-run all jobs".
    A verified manifest at the name a run wanted means the group was bypassed (NRV-E1147). Every
@@ -141,9 +142,15 @@ amends: P360, P148, P364
   GitHub release, the tap and the site wait too, though they do not depend on the packages.
 - **Failures land after the release is public.** Any later write run fixes them. A release
   published without a binding needs a new decision; its files install by hand.
-- **A failed or cancelled `repos-ready` costs a second approval.** "Re-run failed jobs" would
-  bind from an attempt the owner did not approve, so it is refused; only "Re-run all jobs" binds.
-  A cancel needs two other write jobs queued at once, and is rare.
+- **A failed or cancelled `repos-ready`, or a failed `mac-verify`, costs a second approval.**
+  "Re-run failed jobs" would bind from an attempt the owner did not approve, so it ends in
+  NRV-E1153; only "Re-run all jobs" binds. A transient R2 or GitHub error in `repos-ready` costs
+  the same. With `queue: max` nothing is cancelled; without it, a cancel needs two other write
+  jobs queued at once, and is rare.
+- **A binding stays armed until its release is deleted.** If the owner decides not to ship a
+  bound release, they delete the draft and its tag; until then, anyone who can publish releases
+  can put it into `stable` by publishing the draft. Only someone with `contents: write` can do
+  that, and the bytes are ones the owner approved. A 404 then keeps the entries inert.
 - **Writers wait in GitHub's queue** for as long as the running write job takes, up to its
   90-minute timeout. The group is a GitHub setting, not a check in the bucket: a workflow without
   it could race, and is caught only at the next manifest name (NRV-E1147).
