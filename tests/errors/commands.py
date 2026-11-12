@@ -5,8 +5,10 @@ Usage: commands.py <nerva> [<nerva built with -Dtest-commit-keys=off>]
 
 For each code a command emits (docs/ERRORS.md, 00xx, 06xx, 08xx, 09xx), triggers it and checks
 the first line (`error[NRV-…]: …`), the `cause` and `fix` lines, the exit status, and that no
-stack trace and no raw Zig error name (`error.Name`) is printed. NRV-E0701 is in `tests/release/mixed.py` (it needs a binary of another release), NRV-E0704
-and E0705 need a file system without direct IO and a kernel older than 5.11, so only unit tests of
+stack trace and no raw Zig error name (`error.Name`) is printed. NRV-E0701 is here for the keys-off build's file and, for two real releases, in
+`tests/release/mixed.py` (it needs a binary of another release), NRV-E0609 for the keys-off
+build's clients against a release cluster (E0610 has a unit test only: no build here runs below
+`release_client_min`), NRV-E0704 and E0705 need a file system without direct IO and a kernel older than 5.11, so only unit tests of
 `src/nerva/preflight.zig` cover their parts. Codes that need a failing disk
 or an export whose checks fail (NRV-E0706, E0708, E0803, E0807) are covered by unit tests of
 `src/nerva/diagnostic.zig` only.
@@ -246,19 +248,29 @@ def main():
         version_off = run(nerva_off, ["version"])
         assert version_off.returncode == 0 and \
             version_off.stdout.splitlines()[0].endswith("+keys-off"), version_off.stdout
-        # It runs another release than a release build (#222): replicas of the two ignore each
-        # other (N61) instead of diverging on a resent key, and neither opens the other's file.
+        # It runs another release than a release build (#222), so a release build refuses its
+        # data file, and the other way round, with the releases named. That replicas of two
+        # releases ignore each other (N61) is `tests/release/mixed.py`'s and
+        # `src/nerva/release_peers.zig`'s: no run here has a keys-off and a release replica
+        # in one cluster.
         release_line = [l for l in version.stdout.splitlines() if l.startswith("release ")][0]
         release_line_off = [l for l in version_off.stdout.splitlines()
                             if l.startswith("release ")][0]
         assert release_line != release_line_off, (release_line, release_line_off)
+        release_text, release_text_off = release_line[8:], release_line_off[8:]
         data_off = os.path.join(tmp, "keys-off.nerva")
         assert run(nerva_off, fmt + [data_off]).returncode == 0
-        check("start a keys-off file with a release build",
-              ["start", "--addresses=127.0.0.1:1,127.0.0.1:2,127.0.0.1:3", "--development",
-               data_off], "NRV-E0701", 1, "was written by release " + release_line_off[8:])
-        assert run(nerva_off, ["start", "--addresses=127.0.0.1:1,127.0.0.1:2,127.0.0.1:3",
-                               "--development", data]).stderr.count("NRV-E0701") == 1
+        digest_off = sha(data_off)
+        digest = sha(data)
+        check("start a keys-off file with a release build", start + [data_off],
+              "NRV-E0701", 1, f"was written by release {release_text_off}, and this is "
+              f"release {release_text}")
+        check("start a release file with a keys-off build", start + [data], "NRV-E0701",
+              1, f"was written by release {release_text}, and this is release {release_text_off}",
+              nerva=nerva_off)
+        assert sha(data_off) == digest_off
+        assert sha(data) == digest
+        os.remove(data_off)
         verbose_off = run(nerva_off, ["version", "--verbose"])
         assert verbose_off.stdout.splitlines()[-1] == "commit_keys off", verbose_off.stdout
         # `version`'s text (R6): the first line is the one the release workflow reads; then what
@@ -333,6 +345,19 @@ def main():
             first = run(nerva, export + ["--output=" + out])
             assert first.returncode == 0, first.stderr[-2000:]
             check("export exists", export + ["--output=" + out], "NRV-E0004", 1, "exists")
+            # The keys-off build's own clients run its release, above this cluster's: the
+            # replica evicts them (`client_release_too_high`), a refusal with its own code (#222).
+            too_new = f"this is release {release_text_off} and the cluster runs release " \
+                f"{release_text}: it evicted this client"
+            check("export from a newer release", export + ["--output=" + os.path.join(tmp, "n")],
+                  "NRV-E0609", 1, too_new, nerva=nerva_off)
+            assert not os.path.exists(os.path.join(tmp, "n"))
+            for command in ("api", "view"):
+                check(f"{command} from a newer release",
+                      [command, "--cluster=0", f"--addresses={cluster.address}",
+                       "--listen=127.0.0.1:0"], "NRV-E0609", 1, too_new,
+                      env={"NERVA_KEY": KEY}, nerva=nerva_off)
+            seen.append("NRV-E0609")
             check("export as-of ahead", export + ["--as-of=99999999",
                                                   "--output=" + os.path.join(tmp, "f")],
                   "NRV-E0802", 1, "--as-of")

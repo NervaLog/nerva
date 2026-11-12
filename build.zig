@@ -18,16 +18,31 @@ const release = "0.0.6";
 const release_client_min = "0.0.4";
 // Only `zig build test:release` builds this release, to run a cluster of two releases (N61).
 const release_test_other = "0.0.200";
-// The release of the test build `-Dtest-commit-keys=off` (#222): above every real release and
-// apart from `release_test_other`, so that replicas of that build and of a release build ignore
-// each other (N61) rather than diverge on the first resent key, and neither opens the other's
-// data file (NRV-E0701). Clients of any release from `release_client_min` up still reach it.
-const release_keys_off = "0.0.201";
+// The release of the test build `-Dtest-commit-keys=off` (#222, P354): this release with its
+// patch plus 201, so that replicas of that build and of a release build ignore each other (N61)
+// rather than diverge on the first resent key, and neither opens the other's data file
+// (NRV-E0701). Derived, so that it follows `release` (R6, P259b: `release` becomes `VERSION` from
+// vR on) and stays one above R6's `release_test_next` (patch plus 200). Clients of the release
+// builds reach a keys-off cluster (their release is lower); the keys-off build's own clients are
+// evicted by a release cluster (NRV-E0609).
+const release_keys_off = release_with_patch_offset(release, 201);
 // The one past release a binary bundles, so that a cluster can move from it to `release` one
 // replica at a time (R6, P259). None until the packer exists (R6 slice 3). A release that rolls
 // keeps `release_client_min` at or below the bundled release, so that the past release's clients
 // stay valid after the switch.
 const release_bundled: ?[]const u8 = null;
+
+/// `base` with `offset` added to its patch; a build error when the sum does not fit the release's
+/// `u8` patch.
+fn release_with_patch_offset(comptime base: []const u8, comptime offset: u8) []const u8 {
+    const version = std.SemanticVersion.parse(base) catch unreachable;
+    assert(version.patch + offset <= std.math.maxInt(u8));
+    return std.fmt.comptimePrint("{}.{}.{}", .{
+        version.major,
+        version.minor,
+        version.patch + offset,
+    });
+}
 
 comptime {
     @setEvalBranchQuota(10_000);
@@ -36,9 +51,9 @@ comptime {
     assert(client_min.order(current) != .gt);
     const keys_off = std.SemanticVersion.parse(release_keys_off) catch unreachable;
     const other = std.SemanticVersion.parse(release_test_other) catch unreachable;
-    // Out-of-band test releases stay above every real release, so that none sorts as an upgrade
-    // target (R6, P259), and apart from each other.
-    assert(current.order(other) == .lt and other.order(keys_off) == .lt);
+    // The keys-off build is above this release and is not `test:release`'s other release.
+    assert(current.order(keys_off) == .lt);
+    assert(other.order(keys_off) != .eq);
     if (release_bundled) |bundled_text| {
         const bundled = std.SemanticVersion.parse(bundled_text) catch unreachable;
         assert(bundled.order(current) == .lt);

@@ -53,6 +53,7 @@ comptime {
     _ = @import("nerva/peer_auth.zig");
     _ = @import("nerva/preflight.zig");
     _ = @import("nerva/recover.zig");
+    _ = @import("nerva/release_eviction.zig");
     _ = @import("nerva/release_peers.zig");
     _ = @import("nerva/state_machine_tests.zig");
     _ = @import("nerva/timings.zig");

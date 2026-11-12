@@ -208,7 +208,9 @@ pub fn refuse(path: []const u8, refusal: Refusal) noreturn {
             "NRV-E0701",
             "{s}: {s} was written by release {}, and this is release {}",
             .{ diagnostic.command, path, release, constants.config.process.release },
-            "upgrade by export and import (README, \"Upgrading a cluster\"); nothing was changed",
+            "upgrade by export and import (README, \"Upgrading a cluster\"), except a file of a " ++
+                "test build with commit keys off: start the build that wrote it, and never " ++
+                "import its state into a release cluster; nothing was changed",
             .{},
         ),
         .locked => diagnostic.fail(
