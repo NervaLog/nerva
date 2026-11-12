@@ -7,6 +7,7 @@ throwaway packaging/keys/ directory, a stand-in `gh` (a Python script that answe
 r2.py against test_r2.py's fake S3 server, which also enforces the bucket locks. packages.nerva.pro is
 a second local server that serves the fake bucket's objects."""
 import copy
+import datetime
 import hashlib
 import json
 import os
@@ -609,6 +610,34 @@ class Ready(Base):
         self.assertEqual(rc, 0, err)
         self.assertTrue(all(v[0] == "pending" for v in self.entries().values()))
 
+    def test_a_changed_asset_is_refused_when_an_object_of_the_tag_exists_at_another_name(self):
+        """The spec: the entries are replaced only when no object of the tag's old entries exists."""
+        self.release("v0.7.1")
+        self.assertEqual(self.ready("v0.7.1")[0], 0)
+        old = packages("v0.7.1")
+        rpms = [n for n in old if n.endswith(".rpm")]
+        key = next(k for k in self.entries() if k.startswith("rpm/rc/") and k.endswith(rpms[0]))
+        self.put_raw(key, old[rpms[0]])
+        # only the debs change; the rpms are the bound ones, so the entries at their names agree
+        self.release("v0.7.1", salt="2")
+        new = packages("v0.7.1", "2")
+        mixed = {n: (old[n] if n in rpms else new[n]) for n in new if n != "SHA256SUMS"}
+        for n, b in mixed.items():
+            self.replace_asset("v0.7.1", n, b)
+        self.replace_asset("v0.7.1", "SHA256SUMS", "".join(
+            f"{hashlib.sha256(b).hexdigest()}  {n}\n" for n, b in sorted(mixed.items())).encode())
+        before = self.manifest()
+        rc, _, err = self.ready("v0.7.1", GITHUB_RUN_ATTEMPT="2", MAC_ATTEMPT="2")
+        self.assert_diag(rc, err, "NRV-E1141")
+        self.assertEqual(self.manifest(), before)
+
+    def test_ready_for_a_published_release_writes_nothing_not_even_a_lock_probe(self):
+        self.baseline()
+        self.s3.log.clear()
+        rc, _, err = self.ready("v0.7.1", published=True)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self.writes(), [])
+
     def test_a_rebind_is_refused_when_an_object_of_the_tag_exists(self):
         self.release("v0.7.1")
         self.assertEqual(self.ready("v0.7.1")[0], 0)
@@ -939,6 +968,39 @@ class Publish(Base):
         self.assertEqual(self.s3.objects[deb][0], b"junk")
         self.assertTrue(any(v[0] == "pending" and v[3] == deb for v in self.entries().values()))
 
+    def test_lying_metadata_at_a_pending_deb_is_noted_and_the_indexes_are_still_re_signed(self):
+        """An object is adopted on its bytes, not its x-amz-meta-sha256 (P368b)."""
+        self.bound("v0.7.2")
+        deb = "apt/pool/main/n/nerva/nerva_0.7.2-1_amd64.deb"
+        sha_ = next(v[1] for v in self.entries().values() if v[3] == deb)
+        self.s3.objects[deb] = (b"junk", {"x-amz-meta-sha256": sha_})
+        for run in (lambda: self.publish("v0.7.2"), self.refresh):
+            self.s3.log.clear()
+            rc, _, err = run()
+            self.assert_diag(rc, err, "NRV-E1142")
+            self.assertNotIn("NRV-E1143", err)
+            self.assertIn(deb, err)
+            put = [k for _, k in self.writes()]
+            for name in ("apt/dists/stable/InRelease", "apt/dists/rc/InRelease",
+                         "rpm/stable/repodata/repomd.xml", "rpm/rc/repodata/repomd.xml"):
+                self.assertIn(name, put)
+            self.assertEqual(self.s3.objects[deb][0], b"junk")
+            self.assertTrue(any(v[0] == "pending" and v[3] == deb for v in self.entries().values()))
+            listed = self.s3.objects["apt/dists/stable/main/binary-amd64/Packages"][0].decode()
+            self.assertNotIn("nerva_0.7.2-1_amd64.deb", listed)
+
+    def test_the_release_file_names_the_repository_and_expires_after_21_days(self):
+        self.bound("v0.7.2")
+        self.finish("v0.7.2")
+        for c, label in (("stable", "Nerva"), ("rc", "Nerva candidates")):
+            text = self.s3.objects[f"apt/dists/{c}/InRelease"][0].decode()
+            f = dict(l.split(": ", 1) for l in text.splitlines() if re.match(r"^[A-Za-z-]+: ", l))
+            self.assertEqual((f["Origin"], f["Label"], f["Suite"], f["Codename"]),
+                             ("Nerva", label, c, f"nerva-{c}"))
+            fmt = "%a, %d %b %Y %H:%M:%S %z"
+            date, until = (datetime.datetime.strptime(f[k], fmt) for k in ("Date", "Valid-Until"))
+            self.assertEqual(until - date, datetime.timedelta(days=21))
+
     def test_a_package_the_release_no_longer_matches_is_e1148_and_nothing_is_published_from_it(self):
         self.bound("v0.7.2")
         name = [n for n in packages("v0.7.2") if n.endswith(".deb")][0]
@@ -951,7 +1013,7 @@ class Publish(Base):
 
     def test_a_signature_that_is_not_by_the_current_key_is_e1144(self):
         self.bound("v0.7.2")
-        (self.tmp / "bin/rpmsign").write_text("#!/bin/sh\nexit 0\n")
+        (self.tmp / "bin/rpmsign").write_text('#!/bin/sh\n[ "$1" = --version ] && echo "RPM version 4.18.2"\nexit 0\n')
         (self.tmp / "bin/rpmsign").chmod(0o755)
         rc, _, err = self.publish("v0.7.2")
         self.assert_diag(rc, err, "NRV-E1144")

@@ -47,6 +47,11 @@ block() { printf 'error[%s]: %s: %s\n  cause  %s\n  fix    %s\n' "$1" "$where" "
 refuse() { block "$@" >&2; echo "::error::$1 $2" >&2; exit 1; }
 # A fault the run reports at its end, after it has finished everything else.
 defer() { block "$@" >>"$W/deferred"; }
+# An assertion of the script's own bounds: a bug in it, never the operator's input.
+bug() {
+  printf 'bug[NRV-B0006]: %s: %s\n  cause  a loop of the script ran past its own bound\n  fix    Report it; the script'"'"'s bound or its input is wrong\n' "$where" "$1" >&2
+  echo "::error::NRV-B0006 $1" >&2; exit 70
+}
 notice() { echo "::notice::$*" >&2; }
 junk() { echo "$1" >>"$W/junk"; notice "noted: $1"; }
 
@@ -82,6 +87,12 @@ need_env() {
   done
 }
 
+tool_is() { # <tool> <the first line its --version starts with>
+  local got
+  got=$("$1" --version 2>&1 | head -n1)
+  case $got in "$2"*) ;; *) e1139 "$1 reads '$got', not '$2'" "the pinned tools were not installed on this runner" ;; esac
+}
+
 need_tools() {
   local t
   for t in "$@"; do
@@ -89,6 +100,13 @@ need_tools() {
   done
   python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)' ||
     e1139 "python3 is older than 3.12" "r2.py is pinned to the runner's Python 3.12"
+  for t in "$@"; do
+    case $t in
+      apt-ftparchive) tool_is apt-ftparchive "apt 2.8.4" ;;
+      createrepo_c) tool_is createrepo_c "Version: 0.17.3" ;;
+      rpmsign) tool_is rpmsign "RPM version 4.18.2" ;;
+    esac
+  done
   gpg --version | head -n1 | grep -q ' 2\.4\.' ||
     e1139 "gpg is not 2.4.x" "the signing commands are pinned to gpg 2.4"
 }
@@ -371,7 +389,7 @@ e1142_fix="Find who changed the bucket outside the pipeline, restore the listed 
 e1142_now() { refuse NRV-E1142 "$1" "$2" "$e1142_fix"; }
 
 # Steps 3 of `repos`: refusals before any write, and the notes.
-bucket_check() { # <with-bounds: 0|1>
+bucket_check() { # <with-bounds: 0|1> [noprobe: write nothing]
   local st sha size key src tag rc head_out prefix n bytes
   n=$(wc -l <"$W/pk"); bytes=$(awk -F'\t' '$3 != "-" {s += $3} END {print s + 0}' "$W/pk")
   if [ "$n" -gt "$limit_entries" ] || [ "$bytes" -gt "$limit_bytes" ]; then
@@ -387,11 +405,13 @@ bucket_check() { # <with-bounds: 0|1>
       e1142_now "the listed object $key differs from its entry" "its size or x-amz-meta-sha256 is not what the manifest records"
   done <"$W/pk"
   # The locks: re-put the current manifest over itself, and one listed object under each other prefix.
-  if [ "$CUR_GEN" -gt 0 ]; then probe_lock "$(mkey "$CUR_GEN")"; fi
-  for prefix in apt/pool/ rpm/stable/packages/ rpm/rc/packages/; do
-    key=$(awk -F'\t' -v p="$prefix" '$1 == "published" && index($4, p) == 1 {print $4; exit}' "$W/pk")
-    [ -z "$key" ] || probe_lock "$key"
-  done
+  if [ "${2:-}" != noprobe ]; then
+    if [ "$CUR_GEN" -gt 0 ]; then probe_lock "$(mkey "$CUR_GEN")"; fi
+    for prefix in apt/pool/ rpm/stable/packages/ rpm/rc/packages/; do
+      key=$(awk -F'\t' -v p="$prefix" '$1 == "published" && index($4, p) == 1 {print $4; exit}' "$W/pk")
+      [ -z "$key" ] || probe_lock "$key"
+    done
+  fi
   # Objects no entry lists, and a candidate under stable.
   for prefix in apt/pool/ rpm/stable/packages/ rpm/rc/packages/; do
     rc=0; r2 list "$prefix" >"$W/plist" || rc=$?
@@ -489,6 +509,17 @@ served_all() { # <tag or empty>
 
 e1140() { refuse NRV-E1140 "$1" "$2" "Make the release's packages and SHA256SUMS agree, then run again"; }
 
+# The draft's assets changed: its old entries may be replaced only when none of them is published
+# and no object of the tag exists at any of their names (a key the new set no longer wants included).
+tag_untouched() { # <tag>
+  local key rc
+  ! awk -F'\t' -v t="$1" '$6 == t && $1 == "published" {f = 1} END {exit !f}' "$W/pk" || return 1
+  while read -r key; do
+    rc=0; r2 head "$key" >/dev/null || rc=$?
+    case $rc in 0) return 1 ;; 2) ;; *) exit 1 ;; esac
+  done < <(awk -F'\t' -v t="$1" '$6 == t {print $4}' "$W/pk")
+}
+
 cmd_ready() {
   local tag=$1 published=$2 names n draft_ids ids2 name want got key src entry changed=0 exist
   [[ $tag =~ $tag_re ]] || e1139 "the tag $tag is not a version tag" "ready takes vX.Y.Z or vX.Y.Z-rc.N"
@@ -498,7 +529,7 @@ cmd_ready() {
   need_tools gpg gpgv python3 gh curl jq sha256sum
   mkdir -p "$W"; setup_keys
   find_current
-  bucket_check 1
+  if [ "$published" = true ]; then bucket_check 1 noprobe; else bucket_check 1; fi
   served_manifest
   if [ "$published" = true ]; then notice "a dispatch for a published release binds nothing"; finish; return; fi
   [ "${MAC_ATTEMPT:-}" = "${GITHUB_RUN_ATTEMPT:-unset}" ] ||
@@ -516,7 +547,7 @@ cmd_ready() {
   mkdir -p "$W/draft"
   n=0
   for name in SHA256SUMS $names; do
-    n=$((n + 1)); [ "$n" -le 5 ]
+    n=$((n + 1)); [ "$n" -le 5 ] || bug "ready counted more than five assets"
     local rc=0; rel_download "$tag" "$name" "$W/draft/$name" || rc=$?
     case $rc in 0) ;; 2) e1140 "the draft has no $name" "expected five assets" ;; *) e1155_now "downloading $name failed" ;; esac
   done
@@ -550,7 +581,7 @@ cmd_ready() {
     case $rc in 0) exist=1 ;; 2) exist=0 ;; *) exit 1 ;; esac
     if [ -n "$entry" ]; then
       [ "$entry" = "$src" ] && continue
-      [ "$exist" = 0 ] && ! awk -F'\t' -v t="$tag" '$6 == t && $1 == "published" {f = 1} END {exit !f}' "$W/pk" && { changed=1; continue; }
+      tag_untouched "$tag" && { changed=1; continue; }
       refuse NRV-E1141 "$key is already listed with other content" "published packages are never replaced" \
         "Published packages are not replaced: release a new version under a new name"
     fi
@@ -608,13 +639,30 @@ obj_state() { # <key> -> prints `absent` or the object's sha256 (x-amz-meta-sha2
   case $rc in 0) printf '%s' "${out#*$'\t'}" ;; 2) printf absent ;; *) exit 1 ;; esac
 }
 
+# Never trust an object for being there: download it and hash the bytes. 0 the bytes are <want>,
+# 1 they are not (r2.py's metadata check included), 2 no such object; the file is left only on 0.
+verify_obj() { # <key> <want-sha> <file>
+  local rc=0
+  rm -f "$3"; mkdir -p "$(dirname "$3")"
+  r2 get-lenient "$1" "$3" 2>"$W/get.err" || rc=$?
+  case $rc in
+    0) [ "$(sha_of "$3")" = "$2" ] || { rm -f "$3"; return 1; }; echo "$1" >>"$W/ok" ;;
+    2) return 2 ;;
+    4) rm -f "$3"; return 1 ;;
+    *) cat "$W/get.err" >&2; exit 1 ;;
+  esac
+}
+
 put_object() { # <key> <file> <sha>: put-new; a taken name is adopted only with the same bytes
   local rc=0 cur
   r2 put-new "$1" "$2" || rc=$?
   case $rc in
-    0) return 0 ;;
+    0) echo "$1" >>"$W/ok"; return 0 ;;
     3) cur=$(obj_state "$1")
-       if [ "$cur" = "$3" ]; then return 0; fi
+       if [ "$cur" = "$3" ]; then
+         rc=0; verify_obj "$1" "$3" "$W/adopt.bin" || rc=$?
+         [ "$rc" != 0 ] || return 0
+       fi
        junk "object $1 exists with other content than its entry"; return 1 ;;
     *) exit 1 ;;
   esac
@@ -646,7 +694,10 @@ put_pending() {
     base=${key##*/}
     obj=$(obj_state "$key")
     if [ "$obj" != absent ]; then
-      if [ "$sha" != - ] && [ "$obj" = "$sha" ]; then continue; fi
+      if [ "$sha" != - ] && [ "$obj" = "$sha" ]; then
+        rc=0; verify_obj "$key" "$sha" "$W/adopt.bin" || rc=$?
+        [ "$rc" != 0 ] || continue
+      fi
       junk "object $key exists with other content than its entry"; continue
     fi
     # The release must read published.
@@ -693,10 +744,12 @@ put_rpm() { # <key> <tag> <base> <source-sha>
   if [ "$recorded" != - ]; then
     for k in "${keys[@]}"; do
       obj=$(obj_state "$k")
-      if [ "$obj" = "$recorded" ]; then have=$k; break; fi
+      [ "$obj" = "$recorded" ] || continue
+      mkdir -p "$W/dl"
+      if verify_obj "$k" "$recorded" "$W/dl/copy.rpm"; then have=$k; break; fi
+      junk "object $k exists with other content than its entry"
     done
     if [ -n "$have" ]; then
-      r2need get "$have" "$W/dl/copy.rpm" 2>/dev/null || { mkdir -p "$W/dl"; r2need get "$have" "$W/dl/copy.rpm"; }
       for k in "${keys[@]}"; do
         [ "$k" != "$have" ] || continue
         [ "$(obj_state "$k")" = absent ] || continue
@@ -724,7 +777,7 @@ channel_has() { # <channel> <key> <tag>
 }
 
 make_indexes() {
-  local c a key st sha size src tag f now stage
+  local c a key st sha size src tag f now stage rc
   rm -rf "$W/stage" "$W/pk.files"; mkdir -p "$W/stage" "$W/pk.files"
   now=$(date -u +%s)
   # every package on disk (published entries and the pending ones about to be)
@@ -732,8 +785,8 @@ make_indexes() {
     [ "$st" = published ] || [ "$(obj_state "$key")" = "$sha" ] || continue
     [ "$sha" != - ] || continue
     mkdir -p "$W/pk.files/$(dirname "$key")"
-    r2need get "$key" "$W/pk.files/$key"
-    [ "$(sha_of "$W/pk.files/$key")" = "$sha" ] || { junk "object $key differs from its entry"; rm -f "$W/pk.files/$key"; continue; }
+    rc=0; verify_obj "$key" "$sha" "$W/pk.files/$key" || rc=$?
+    [ "$rc" = 0 ] || { junk "object $key differs from its entry"; continue; }
     touch -d @0 "$W/pk.files/$key" # createrepo_c records mtimes: the same packages give the same repodata names
   done <"$W/pk"
   for c in "${channels[@]}"; do
@@ -799,19 +852,18 @@ content_named() {
 }
 
 upload_indexes() {
-  local key file want rc name n=0
+  local key file rc name n=0
   while IFS=$'\t' read -r key file; do
     rc=0; r2 put-new "$key" "$file" || rc=$?
     case $rc in 0) ;; 3)
-        r2need get "$key" "$W/idx.bin" || true
-        want=$(basename "$key"); want=${want%%-*}
-        if [ "$(sha_of "$W/idx.bin")" != "$(sha_of "$file")" ]; then
+        rc=0; verify_obj "$key" "$(sha_of "$file")" "$W/idx.bin" || rc=$?
+        if [ "$rc" != 0 ]; then
           junk "content-named object $key holds other bytes than its name says"
           r2need put "$key" "$file"
         fi ;;
       *) exit 1 ;;
     esac
-    n=$((n + 1)); [ "$n" -lt 10000 ]
+    n=$((n + 1)); [ "$n" -lt 10000 ] || bug "more than 10000 content-named objects"
   done < <(content_named)
   kill_point content_named
   replaceable_names
@@ -845,7 +897,10 @@ cmd_publish() { # <tag or empty> <refresh: 0|1>
   # promote what is complete: a pending entry whose object exists with its hash
   while IFS=$'\t' read -r st sha size key _; do
     [ "$st" = pending ] && [ "$sha" != - ] || continue
-    [ "$(obj_state "$key")" = "$sha" ] && set_entry "$key" published "$sha" "$size"
+    [ "$(obj_state "$key")" = "$sha" ] || continue
+    # the HEAD says what the uploader chose to say: the bytes must be the entry's (P368b)
+    grep -qxF "$key" "$W/ok" || verify_obj "$key" "$sha" "$W/adopt.bin" || continue
+    set_entry "$key" published "$sha" "$size"
   done < <(cat "$W/pk")
   make_indexes
   # index lines: the new hashes; index-was: what was found and accepted, else the previous index hash
@@ -917,7 +972,7 @@ main() {
   case $cmd in
     cleanup) cmd_cleanup; return ;;
   esac
-  rm -rf "$W"; mkdir -p "$W"; : >"$W/junk"; : >"$W/deferred"
+  rm -rf "$W"; mkdir -p "$W"; : >"$W/junk"; : >"$W/deferred"; : >"$W/ok"
   case $cmd in
     ready) [ $# = 3 ] || usage; cmd_ready "$2" "$3" ;;
     publish) [ $# = 2 ] || usage; cmd_publish "$2" 0 ;;

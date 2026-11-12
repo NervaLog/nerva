@@ -311,6 +311,7 @@ For `release.yml`'s own refusals (NRV-E1112 to NRV-E1116, printed as `error[NRV-
 | NRV-B0003 | A replica stopped on an unknown protocol command | Exit 7, `unknown VSR command, crashing for safety` (#111) | Report it |
 | NRV-B0004 | A `nerva` command hit an error it did not expect | `bug[NRV-B0004]: <command> hit an error it did not expect`, exit 70; the Zig error name only on a `detail` line under `--log-debug` | Report it with the command's output under `--log-debug` |
 | NRV-B0005 | `r2.py put` was asked to replace an object whose name a run never replaces (a package, a manifest, a name outside the replaceable set) | `bug[NRV-B0005]: r2.py: put <key>: refused, not a name a run replaces`, with a `cause` and a `fix` line, exit 70 | Report it: the script that called `put` names the wrong object (`docs/releases/packages.md`) |
+| NRV-B0006 | A loop of `package_repos.sh` ran past its own bound (five assets of a draft, or 10,000 content-named index objects) | `bug[NRV-B0006]: package_repos.sh: <what>`, with a `cause` and a `fix` line, exit 70 | Report it: the script's bound or its input is wrong (`docs/releases/packages.md`) |
 
 ## What the codes change, and when
 

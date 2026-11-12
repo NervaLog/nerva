@@ -30,7 +30,7 @@ case $CHANNEL in stable | rc) ;; *) usage ;; esac
 [[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]] || usage
 if [ "$(id -u)" = 0 ]; then SUDO=; else SUDO=sudo; fi
 APT_VER=${version/-rc./~rc.}-1
-RPM_VER=${version/-rc./.rc.}-1
+RPM_VER=${version/-rc./~rc.}-1
 log=$(mktemp)
 trap 'rm -f "$log"' EXIT
 
@@ -89,7 +89,8 @@ apt_install() { step "apt-get update and install nerva=$APT_VER from $CHANNEL" a
 apt_not_stable() {
   CHANNEL=stable apt_config >/dev/null 2>&1 || check_failed "writing the stable sources file"
   step "apt-get update with stable configured" $SUDO apt-get update
-  if apt-cache policy nerva 2>&1 | grep -qF "$APT_VER"; then
+  # Only what the configured sources list: an empty dpkg status keeps the installed candidate out.
+  if apt-cache -o Dir::State::status=/dev/null madison nerva 2>&1 | grep -qF "$APT_VER"; then
     check_failed "stable lists the candidate $APT_VER"
   fi
 }
@@ -132,7 +133,8 @@ dnf_not_stable() {
   dnf clean all >/dev/null 2>&1 || true
   # The output, never the exit status: on an empty channel `dnf list` exits 1 with
   # "No matching packages to list", which is the right answer here.
-  if dnf list --showduplicates nerva 2>&1 | grep -qF "$RPM_VER"; then
+  # --available --repo: only what the repository lists, never the installed package.
+  if dnf list --available --showduplicates --repo nerva nerva 2>&1 | grep -qF "$RPM_VER"; then
     check_failed "stable lists the candidate $RPM_VER"
   fi
 }
