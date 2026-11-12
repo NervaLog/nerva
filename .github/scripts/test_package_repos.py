@@ -102,7 +102,8 @@ def packages(tag, salt=""):
         spec.write_text(
             f"Name: nerva\nVersion: {pv}\nRelease: 1\nSummary: t\nLicense: Apache-2.0\nBuildArch: noarch\n"
             f"%description\nt\n%install\nmkdir -p %{{buildroot}}/usr/bin\n"
-            f"echo 'version {v} {rarch} {salt}' > %{{buildroot}}/usr/bin/nerva\n%files\n/usr/bin/nerva\n")
+            f"printf '#!/bin/sh\\necho version {v}\\n# {rarch} {salt}\\n' > %{{buildroot}}/usr/bin/nerva\n"
+            f"%files\n%attr(0755,root,root) /usr/bin/nerva\n")
         sh("rpmbuild", "-bb", "--target", "noarch", "--define", f"_topdir {top}", "--define",
            "debug_package %{nil}", "--define", "_build_id_links none", "--define",
            "_binary_payload w9.gzdio", str(spec))
@@ -1017,6 +1018,29 @@ class Publish(Base):
         (self.tmp / "bin/rpmsign").chmod(0o755)
         rc, _, err = self.publish("v0.7.2")
         self.assert_diag(rc, err, "NRV-E1144")
+
+    def test_a_tool_of_another_version_is_e1139(self):
+        self.bound("v0.7.2")
+        for ver in ("RPM version 4.19.1", "RPM version 4.18.20"):
+            (self.tmp / "bin/rpmsign").write_text(f'#!/bin/sh\n[ "$1" = --version ] && echo "{ver}"\nexit 0\n')
+            (self.tmp / "bin/rpmsign").chmod(0o755)
+            rc, _, err = self.publish("v0.7.2")
+            self.assert_diag(rc, err, "NRV-E1139")
+            self.assertIn("rpmsign", err)
+
+    def test_lying_metadata_at_a_replaceable_index_name_is_noted_and_overwritten(self):
+        """A replaceable name is overwritten, never trusted or refused (P368b)."""
+        self.bound("v0.7.2")
+        self.finish("v0.7.2")
+        for name in ("apt/dists/stable/Release", "rpm/stable/repodata/repomd.xml"):
+            self.s3.objects[name] = (b"junk", {"x-amz-meta-sha256": "0" * 64})
+            self.s3.log.clear()
+            rc, _, err = self.refresh()
+            self.assert_diag(rc, err, "NRV-E1142")
+            self.assertNotIn("NRV-E1143", err)
+            self.assertIn(name, err)
+            self.assertIn("apt/dists/stable/InRelease", [k for _, k in self.writes()])
+            self.assertNotEqual(self.s3.objects[name][0], b"junk")
 
     def test_a_site_that_serves_other_bytes_is_e1145(self):
         self.bound("v0.7.2")

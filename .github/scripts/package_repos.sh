@@ -90,7 +90,7 @@ need_env() {
 tool_is() { # <tool> <the first line its --version starts with>
   local got
   got=$("$1" --version 2>&1 | head -n1)
-  case $got in "$2"*) ;; *) e1139 "$1 reads '$got', not '$2'" "the pinned tools were not installed on this runner" ;; esac
+  case $got in "$2" | "$2"[!0-9]*) ;; *) e1139 "$1 reads '$got', not '$2'" "the pinned tools were not installed on this runner" ;; esac
 }
 
 need_tools() {
@@ -446,13 +446,17 @@ index_check() {
   : >"$W/found"; : >"$W/accepted"
   st=$(cat "$W/state")
   for name in "${REPLACEABLE[@]}"; do
-    rc=0; r2 get "$name" "$W/idx.bin" || rc=$?
+    rc=0; r2 get-lenient "$name" "$W/idx.bin" 2>"$W/get.err" || rc=$?
     want=$(awk -F'\t' -v k="$name" '$2 == k {print $1}' "$W/ix")
+    if [ "$rc" = 4 ]; then # replaceable: lying metadata is junk the run overwrites, never a stop
+      junk "index $name does not match its own x-amz-meta-sha256"
+      continue
+    fi
     if [ "$rc" = 2 ]; then
       [ -z "$want" ] || junk "index $name is missing though the manifest lists it"
       continue
     fi
-    [ "$rc" = 0 ] || exit 1
+    [ "$rc" = 0 ] || { cat "$W/get.err" >&2; exit 1; }
     h=$(sha_of "$W/idx.bin")
     printf '%s\t%s\n' "$h" "$name" >>"$W/found"
     if [ "$h" = "$want" ] || { [ "$st" = writing ] && awk -F'\t' -v k="$name" -v h="$h" '$2 == k && $1 == h {f = 1} END {exit !f}' "$W/iw"; }; then
@@ -582,7 +586,7 @@ cmd_ready() {
     if [ -n "$entry" ]; then
       [ "$entry" = "$src" ] && continue
       tag_untouched "$tag" && { changed=1; continue; }
-      refuse NRV-E1141 "$key is already listed with other content" "published packages are never replaced" \
+      refuse NRV-E1141 "$key is already listed with other content, or an object of $tag already exists in the bucket" "published packages are never replaced" \
         "Published packages are not replaced: release a new version under a new name"
     fi
     if [ "$exist" = 1 ]; then

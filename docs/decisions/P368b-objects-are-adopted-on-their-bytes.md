@@ -37,3 +37,8 @@ spec's "Signing" table asks.
 
 New code: NRV-B0006, a loop of `package_repos.sh` ran past its own bound (an assertion of the script,
 exit 70).
+
+Replaceable index names follow the same rule (second review): `index_check` reads them with
+`get-lenient`, and a name whose bytes do not match its own `x-amz-meta-sha256` is noted (NRV-E1142)
+and left out of `accepted`, so the run overwrites it with fresh output. Only the locked names
+(packages, manifests) are ever adopted; a replaceable name is never trusted or the reason to stop.
