@@ -151,6 +151,18 @@ pub const placeholder_key = "replace-with-a-long-random-key";
 /// `openssl rand -hex 32` makes 64 characters.
 pub const key_length_min = peer_auth.key_length_min;
 
+/// Whether a header can carry `key` unchanged: no leading or trailing SP or HTAB (the parser
+/// trims them) and no control byte (#335). A key that fails could never match a request.
+fn key_sendable(key: []const u8) bool {
+    assert(key.len > 0);
+    if (key[0] == ' ' or key[0] == '\t') return false;
+    if (key[key.len - 1] == ' ' or key[key.len - 1] == '\t') return false;
+    for (key) |byte| {
+        if ((byte < 0x20 and byte != '\t') or byte == 0x7f) return false;
+    }
+    return true;
+}
+
 /// A gateway's keys (P96): `X-Nerva-Key` must equal `current` or, during a rotation, `next`.
 pub const Keys = struct {
     current: []const u8,
@@ -166,6 +178,7 @@ pub const Keys = struct {
                 "make a key with openssl rand -hex 32";
         }
         if (current.len < key_length_min) return "NERVA_KEY is shorter than 32 bytes";
+        if (!key_sendable(current)) return "NERVA_KEY starts or ends with a space or tab, or holds a control byte";
         const key_next = next orelse return null;
         if (key_next.len == 0) return "NERVA_KEY_NEXT is set but empty";
         if (std.mem.eql(u8, key_next, placeholder_key)) {
@@ -173,6 +186,7 @@ pub const Keys = struct {
                 "make a key with openssl rand -hex 32";
         }
         if (key_next.len < key_length_min) return "NERVA_KEY_NEXT is shorter than 32 bytes";
+        if (!key_sendable(key_next)) return "NERVA_KEY_NEXT starts or ends with a space or tab, or holds a control byte";
         if (std.mem.eql(u8, current, key_next)) return "NERVA_KEY_NEXT equals NERVA_KEY";
         return null;
     }
@@ -998,6 +1012,18 @@ test "Keys.invalid" {
         Keys.invalid(test_key_a, test_key_b[1..]).?,
     );
     try testing.expectEqual(null, Keys.invalid(test_key_a, test_key_b));
+    // #335: a key the header parser would trim, or with a control byte, could never match.
+    const spaced = test_key_a ++ " ";
+    try testing.expectEqualStrings(
+        "NERVA_KEY starts or ends with a space or tab, or holds a control byte",
+        Keys.invalid(spaced, null).?,
+    );
+    try testing.expectEqualStrings(
+        "NERVA_KEY_NEXT starts or ends with a space or tab, or holds a control byte",
+        Keys.invalid(test_key_a, "\t" ++ test_key_b).?,
+    );
+    try testing.expect(Keys.invalid(test_key_a ++ "\r\n", null) != null);
+    try testing.expectEqual(null, Keys.invalid(test_key_a ++ " x", test_key_b));
     // #306: the example's published placeholder is refused, as current or as next.
     try testing.expectEqualStrings(
         "NERVA_KEY is the example's placeholder: make a key with openssl rand -hex 32",

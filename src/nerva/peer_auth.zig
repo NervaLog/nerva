@@ -107,13 +107,17 @@ pub fn keys_resolve(
     }
     if (Keys.invalid(current.?, next)) |reason| return .{ .refused = reason };
     // #336: the development key is published, so set explicitly it still guards only loopback.
-    const published = std.mem.eql(u8, current.?, development_key) or
-        (next != null and std.mem.eql(u8, next.?, development_key));
-    if (published) {
+    const current_published = std.mem.eql(u8, current.?, development_key);
+    const next_published = next != null and std.mem.eql(u8, next.?, development_key);
+    if (current_published or next_published) {
         for (addresses) |address| {
             if (!loopback(address)) {
-                return .{ .refused = "NERVA_CLUSTER_KEY is the public development key; " ++
-                    "it is accepted only when every address is a loopback address" };
+                return .{ .refused = if (current_published)
+                    "NERVA_CLUSTER_KEY is the public development key; " ++
+                        "it is accepted only when every address is a loopback address"
+                else
+                    "NERVA_CLUSTER_KEY_NEXT is the public development key; " ++
+                        "it is accepted only when every address is a loopback address" };
             }
         }
     }
@@ -368,7 +372,12 @@ test "peer_auth: keys_resolve" {
         refused_current.refused,
     );
     try testing.expect(keys_resolve(development_key, null, true, &wildcard) == .refused);
-    try testing.expect(keys_resolve(key_a, development_key, false, &mixed) == .refused);
+    const refused_next = keys_resolve(key_a, development_key, false, &mixed);
+    try testing.expectEqualStrings(
+        "NERVA_CLUSTER_KEY_NEXT is the public development key; " ++
+            "it is accepted only when every address is a loopback address",
+        refused_next.refused,
+    );
     try testing.expect(keys_resolve(key_a, key_a, false, &mixed) == .refused);
 
     try testing.expect(loopback(.{ .ip = .ip("127.255.0.1"), .port = 1 }));

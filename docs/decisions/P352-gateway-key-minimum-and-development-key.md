@@ -22,5 +22,7 @@ upgrade: the release's upgrade note says to set a longer key (rotate through `NE
 before upgrading to avoid refusing clients). Length is the only strength rule; a long guessable key
 passes. The docs' `NERVA_KEY=secret` examples became `openssl rand -hex 32`.
 
-**Question.** Is 32 bytes the right minimum for the gateway key, given it stops short-key
-deployments from starting? Chosen: yes, as the issue proposes.
+**Owner's answer.** 32 bytes is the minimum for the gateway key, as chosen here.
+
+**Also refused.** A key with leading or trailing space or tab, or a control byte, is refused under
+NRV-E0008 too: the header parser trims those, so no client could ever present such a key.
