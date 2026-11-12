@@ -69,8 +69,9 @@ quotes the fleet's tracker line, the Jepsen result and both verdicts. **Code pin
 2026-11-12; P374): choosing a candidate means writing its full SHA to `release/candidate` on `main`
 (one line). The release check (`release_check.sh candidate`, NRV-E1158, in `release.yml`'s
 `version` job and `release-finish.yml`'s `publish` job) refuses a `VERSION` commit that is not that
-candidate's descendant or that changes `src/`, `build.zig`, `build.zig.zon` or `zig/` since it;
-packaging, docs and workflow changes may follow the candidate. Within a day of the release,
+candidate's descendant, that changes `src/`, `build.zig`, `build.zig.zon`, `zig/`, `.gitmodules` or
+a `.gitattributes` since it, or that changes `release/candidate` itself (it is read at the commit's
+first parent); packaging, docs and workflow changes may follow the candidate. Within a day of the release,
 a short retro goes in `docs/retros/<version>.md`: which assumptions were wrong, what each cost,
 and what changes; a rule it changes lands here or in `docs/decisions/` in the same PR.
 

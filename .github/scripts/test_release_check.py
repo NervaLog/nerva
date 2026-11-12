@@ -286,7 +286,9 @@ class Candidate(unittest.TestCase):
         return git(self.repo, "rev-parse", "HEAD")
 
     def pin(self, text=None):
+        """Name the candidate on main, in a commit of its own (the release commit follows)."""
         self.write("release/candidate", (text if text is not None else self.candidate) + "\n")
+        return self.commit("pin the candidate")
 
     def check(self, tag="v0.7.1", commit=None):
         commit = commit or git(self.repo, "rev-parse", "HEAD")
@@ -311,15 +313,45 @@ class Candidate(unittest.TestCase):
         result = self.check()
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def drifted(self, change, name):
+        self.pin()
+        change()
+        self.commit("drift")
+        result = self.check()
+        self.refused(result, "pinned path")
+        self.assertIn(name, result.stderr)
+
     def test_a_drifted_pinned_path_is_refused_and_named(self):
         for n, path in enumerate(("src/a.zig", "build.zig", "zig/download.sh", "build.zig.zon", "src/new/b.zig")):
             git(self.repo, "checkout", "-q", "-B", f"t{n}", self.candidate)
-            self.pin()
-            self.write(path, "changed\n")
-            self.commit("drift")
-            result = self.check()
-            self.refused(result, "pinned path")
-            self.assertIn(path, result.stderr)
+            self.drifted(lambda: self.write(path, "changed\n"), path)
+
+    def test_a_non_ascii_path_under_src_is_refused_and_named_unquoted(self):
+        self.drifted(lambda: self.write("src/\u00e9.zig", "x\n"), "src/\u00e9.zig")
+
+    def test_a_path_with_a_quote_under_src_is_refused(self):
+        self.drifted(lambda: self.write('src/a"b.zig', "x\n"), "pinned path")
+
+    def test_a_deleted_pinned_path_is_refused(self):
+        self.drifted(lambda: (self.repo / "src/a.zig").unlink(), "src/a.zig")
+
+    def test_a_rename_out_of_src_is_refused(self):
+        self.drifted(lambda: (self.repo / "src/a.zig").rename(self.repo / "docs/a.zig"), "src/a.zig")
+
+    def test_a_gitattributes_anywhere_is_refused(self):
+        for path in (".gitattributes", "src/.gitattributes", "docs/.gitattributes", ".gitmodules"):
+            git(self.repo, "checkout", "-q", "-B", "ga", self.candidate)
+            self.drifted(lambda: self.write(path, "src/** eol=crlf\n"), path)
+
+    def test_a_git_failure_is_refused_not_passed(self):
+        self.pin()
+        self.write("src/a.zig", "2\n")
+        drift = self.commit("drift")
+        blob = git(self.repo, "rev-parse", f"{drift}:src/a.zig")
+        (self.repo / ".git/objects" / blob[:2] / blob[2:]).unlink()
+        result = self.check()
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("error[NRV-E1158]", result.stderr)
 
     def test_a_pinned_path_changed_and_changed_back_passes(self):
         self.pin()
@@ -344,7 +376,7 @@ class Candidate(unittest.TestCase):
     def test_a_malformed_file_is_refused(self):
         for text in ("5d7d806", self.candidate.upper(), self.candidate + "\n" + self.candidate, "x" * 40):
             self.pin(text)
-            self.commit("pin " + text[:8])
+            self.commit("release " + text[:8])
             self.refused(self.check(), "is not one line of 40 lowercase hex characters")
 
     def test_a_candidate_that_is_not_an_ancestor_is_refused(self):
@@ -353,16 +385,61 @@ class Candidate(unittest.TestCase):
         other = self.commit("other")
         git(self.repo, "checkout", "-q", "main")
         self.pin(other)
-        self.commit("pin the other branch")
+        self.commit("release")
         self.refused(self.check(), "is not an ancestor")
 
     def test_a_candidate_that_does_not_exist_is_refused(self):
         self.pin("0" * 40)
-        self.commit("pin nothing")
+        self.commit("release")
         self.refused(self.check(), "is not an ancestor")
 
     def test_an_unknown_commit_is_refused(self):
         self.refused(self.check(commit="1" * 40), "cannot read the commit")
+
+    def test_a_root_commit_is_refused(self):
+        self.refused(self.check(commit=self.candidate), "has no parent")
+
+    def swap(self, squash):
+        """The attack: a fix lands after the soaked candidate, then the release commit repoints the file."""
+        self.pin()
+        self.write("src/a.zig", "fix\n")
+        fix = self.commit("unsoaked fix")
+        if squash:
+            self.write("release/candidate", fix + "\n")
+            self.write("VERSION", "2\n")
+            self.commit("release")
+        else:
+            git(self.repo, "checkout", "-q", "-b", "pr", "HEAD")
+            self.write("release/candidate", fix + "\n")
+            self.commit("repoint")
+            self.write("VERSION", "2\n")
+            self.commit("bump")
+            git(self.repo, "checkout", "-q", "main")
+            git(self.repo, "merge", "-q", "--no-ff", "-m", "merge", "pr")
+
+    def test_the_release_commit_may_not_repoint_the_candidate_squash(self):
+        self.swap(squash=True)
+        self.refused(self.check(), "changes release/candidate")
+
+    def test_the_release_commit_may_not_repoint_the_candidate_merge_commit(self):
+        self.swap(squash=False)
+        self.refused(self.check(), "changes release/candidate")
+
+    def test_a_release_commit_that_adds_the_file_is_refused_even_for_a_prerelease(self):
+        self.write("docs/x.md", "2\n")
+        self.commit("main")
+        self.pin()
+        self.refused(self.check("v0.7.1-rc.1"), "release/candidate is missing")
+
+    def test_a_candidate_repointed_on_main_before_the_release_commit_is_honoured(self):
+        # The file is on main one commit earlier: the check then names the new candidate, and the
+        # fix after the old one is covered by it.
+        self.write("src/a.zig", "fix\n")
+        fix = self.commit("fix")
+        self.pin(fix)
+        self.write("VERSION", "2\n")
+        self.commit("release")
+        self.assertEqual(self.check().returncode, 0)
 
     def test_the_workflows_run_it(self):
         release = (ROOT / ".github/workflows/release.yml").read_text()
@@ -372,6 +449,8 @@ class Candidate(unittest.TestCase):
         finish = (ROOT / ".github/workflows/release-finish.yml").read_text()
         self.assertIn('release_check.sh candidate "$TAG" "$COMMIT"', finish)
         self.assertLess(finish.index("publish-ready"), finish.index("release_check.sh candidate"))
+        self.assertLess(finish.index("release_check.sh candidate"),
+                        finish.index('release_finish.sh publish "$TAG"'))
 
     def test_the_file_in_the_repository_is_a_full_sha(self):
         text = (ROOT / "release/candidate").read_text()

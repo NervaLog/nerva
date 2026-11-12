@@ -18,9 +18,10 @@
 #
 # `candidate` enforces the code freeze (P147b amended): `release/candidate` at <commit> names the
 # full SHA of the candidate that was soaked, Jepsen-tested and reviewed, and <commit> must be that
-# candidate's descendant whose `git diff --name-only` lists no pinned path: src/, build.zig,
-# build.zig.zon and zig/ (everything that goes into the binary and the toolchain that builds it).
-# A prerelease whose commit has no `release/candidate` passes; a release without one is refused.
+# candidate's descendant that changes no pinned path: src/, build.zig, build.zig.zon, zig/,
+# .gitmodules and every .gitattributes (what `zig build` reads, and what can rewrite it at checkout).
+# The file is read at <commit>'s first parent, and <commit> may not change it. A prerelease whose
+# parent has no `release/candidate` (and that does not add it) passes; a release without one is refused.
 # `ref` refuses a version without a suffix (a release, not a prerelease) from any ref but
 # refs/heads/main (NRV-E1116): a dispatch from a branch would draft a release that targets a commit
 # that is not on main. `unreleased` refuses a tag that exists and a release of that tag, published or a draft (a draft
@@ -145,15 +146,28 @@ case "${1:-}" in
         "the checkout has no such commit (a shallow clone, or a mistyped commit)" \
         "check out the full history (fetch-depth: 0) and run again"
     fi
-    if ! file=$(git show "$commit:release/candidate" 2> /dev/null); then
+    # The candidate is read from the commit's first parent, and the commit may not change the file:
+    # otherwise the release commit could repoint it at an unsoaked commit (the candidate must be on
+    # main before the VERSION commit; P374).
+    if ! parent=$(git rev-parse --verify --quiet "$commit^1^{commit}" 2> /dev/null); then
+      refuse NRV-E1158 "the release commit $short has no parent" \
+        "the candidate is read from the first parent, and a root commit has none" \
+        "release from a commit on main that follows the one that named the candidate"
+    fi
+    if ! file=$(git show "$parent:release/candidate" 2> /dev/null); then
       # A prerelease may be rehearsed on a commit that names no candidate; a release may not.
-      if [[ "$tag" == *-* ]]; then
-        echo "release_check.sh: $short has no release/candidate; $tag is a prerelease, so nothing is pinned" >&2
+      if [[ "$tag" == *-* ]] && git diff --quiet "$parent" "$commit" -- release/candidate 2> /dev/null; then
+        echo "release_check.sh: ${parent:0:7} has no release/candidate; $tag is a prerelease, so nothing is pinned" >&2
         exit 0
       fi
-      refuse NRV-E1158 "release/candidate is missing at $short" \
-        "a release is cut only from the candidate that was soaked and tested, and the file that names it is not on this commit (P147b)" \
-        "write the candidate's full SHA to release/candidate on main (one line), review it, and release from a commit that holds it"
+      refuse NRV-E1158 "release/candidate is missing at the parent ${parent:0:7} of $short" \
+        "a release is cut only from the candidate that was soaked and tested, and the file that names it must already be on main before the release commit (P147b, P374)" \
+        "merge the candidate's full SHA in release/candidate to main (one line), review it, and release from a later commit"
+    fi
+    if ! git diff --quiet "$parent" "$commit" -- release/candidate; then
+      refuse NRV-E1158 "the release commit $short changes release/candidate" \
+        "the candidate is chosen before the release commit, on main, so that nobody repoints it in the same commit that ships (P374)" \
+        "move the release/candidate change to its own commit before the VERSION commit, or leave the file as it was"
     fi
     if ! [[ "$file" =~ ^[0-9a-f]{40}$ ]]; then
       refuse NRV-E1158 "release/candidate at $short is not one line of 40 lowercase hex characters" \
@@ -167,12 +181,20 @@ case "${1:-}" in
         "release/candidate names a commit that is not in this commit's history (a rewritten or mistyped SHA, or a shallow clone)" \
         "name the candidate that main contains, or fetch the full history and run again"
     fi
-    drift=$(git diff --no-renames --name-only "$cand" "$commit" |
-      grep -E '^(src/|build\.zig$|build\.zig\.zon$|zig/)' || true)
-    if [[ -n "$drift" ]]; then
+    # Not parsed: git's exit status decides (0 same, 1 drift, anything else is git failing).
+    pinned=(src build.zig build.zig.zon zig .gitmodules ':(glob)**/.gitattributes')
+    rc=0
+    git diff --quiet --no-renames "$cand" "$commit" -- "${pinned[@]}" 2> /dev/null || rc=$?
+    if [[ $rc -gt 1 ]]; then
+      refuse NRV-E1158 "git could not compare the candidate ${cand:0:7} with the release commit $short" \
+        "git diff failed (exit $rc), usually a shallow or partial clone" \
+        "check out the full history (fetch-depth: 0) and run again"
+    fi
+    if [[ $rc -eq 1 ]]; then
+      drift=$(git -c core.quotePath=false diff --no-renames --name-only "$cand" "$commit" -- "${pinned[@]}")
       printf 'release_check.sh: pinned paths changed since the candidate %s:\n%s\n' "${cand:0:7}" "$drift" >&2
       refuse NRV-E1158 "the release commit $short changes $(wc -l <<< "$drift") pinned path(s) since the candidate ${cand:0:7}: $(head -n3 <<< "$drift" | tr '\n' ' ')" \
-        "the soak and Jepsen covered the candidate's code, and src/, build.zig, build.zig.zon and zig/ must be identical to it (P147b amended); only packaging, docs and workflow changes may follow" \
+        "the soak and Jepsen covered the candidate's code, and src/, build.zig, build.zig.zon, zig/, .gitmodules and every .gitattributes must be identical to it (P147b amended); only packaging, docs and workflow changes may follow" \
         "release the candidate's code (revert the paths above), or choose a new candidate and restart the soak and Jepsen on it"
     fi
     ;;
