@@ -1,6 +1,6 @@
 # Signs, notarizes and uploads the universal macOS zip to a DRAFT release (v0.7.1; amends P284, P311
-# and P325). Called by release.yml after its draft exists (slice A3), or dispatched from main with a
-# draft's tag (a re-run, a rehearsal). It is inert until the environment `apple-signing` exists: a job
+# and P325). Called by release-finish.yml's `mac` job after release.yml's draft exists, or dispatched
+# from main with a draft's tag (a re-run, a rehearsal). It is inert until the environment `apple-signing` exists: a job
 # that names a missing environment creates it empty, so create it first, with the owner as required
 # reviewer and `main` as its only deployment branch.
 #

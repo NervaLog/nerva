@@ -30,6 +30,10 @@
 # step 5 too, since the tap has not been written yet: steps 1 to 4 then check the published zip
 # before the formula reaches the tap's main.
 #
+# Inputs: `tag` names the release (a draft or a published one). `tap-ref` (default `main`) is the
+# tap branch step 5 checks out: `main`, or `rc/v<VERSION>` for a prerelease. `brew` (default 'yes')
+# is 'no' only when release-finish.yml passes it; a dispatch takes `tag` and `tap-ref` alone.
+#
 # The token is given to the download step only (GH_TOKEN), never to the brew, formula or binary
 # steps. `contents: write` is needed only to list a draft release in a dispatch.
 name: Mac verify
