@@ -24,7 +24,7 @@ import sys
 import tempfile
 import time
 
-KEY = "addresses-test-key"
+KEY = "addresses-test-key-0123456789abcdef0123456789"
 
 
 def ipv6_present():

@@ -25,7 +25,7 @@ import time
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "api"))
 from api import Cluster  # noqa: E402
 
-KEY = "errors-test-key"
+KEY = "errors-test-key-0123456789abcdef0123456789"
 # The format digest of a `nerva` build (R6, P259b): what `nerva version` prints. It moves with any
 # change to a wire or storage layout (the state machine's, the message headers', the superblock's),
 # a tree id, the cluster config, the superblock version, the outputs of the pure key and id
@@ -128,6 +128,10 @@ def main():
                       "NRV-E0009", 1, "is not loopback", env={"NERVA_KEY": KEY})
             check(f"{command} key", [command, "--cluster=0", "--addresses=127.0.0.1:1",
                                      "--listen=127.0.0.1:0"], "NRV-E0008", 1, "NERVA_KEY")
+            # #335: a gateway key shorter than 32 bytes is refused.
+            check(f"{command} short key", [command, "--cluster=0", "--addresses=127.0.0.1:1",
+                                           "--listen=127.0.0.1:0"], "NRV-E0008", 1,
+                  "shorter than 32 bytes", env={"NERVA_KEY": "short"})
         # The vendored flag parser's own failures (stdx/flags.zig `fatal`, through the hook).
         check("unknown subcommand", ["frobnicate"], "NRV-E0001", 1, "unknown subcommand")
         check("no subcommand", [], "NRV-E0001", 1, "subcommand required")
@@ -147,6 +151,11 @@ def main():
                             data], "NRV-E0710", 1, "--addresses")
         check("cluster key", ["start", "--addresses=10.0.0.1:1,10.0.0.2:2,10.0.0.3:3", data],
               "NRV-E0901", 1, "NERVA_CLUSTER_KEY")
+        # #336: the published development key, set explicitly, is refused off loopback.
+        check("development key off loopback",
+              ["start", "--addresses=10.0.0.1:1,10.0.0.2:2,10.0.0.3:3", data],
+              "NRV-E0901", 1, "is the public development key",
+              env={"NERVA_CLUSTER_KEY": "nerva-development-cluster-key-public-do-not-use"})
         trace = os.path.join(tmp, "trace")
         open(trace, "w").close()
         check("trace exists", ["start", "--addresses=127.0.0.1:1,127.0.0.1:2,127.0.0.1:3",

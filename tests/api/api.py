@@ -49,8 +49,8 @@ import http.client, json, os, random, select, shutil, signal, socket, subprocess
 # Replicas authenticate each other with a real cluster key, never the development key (P102).
 os.environ["NERVA_CLUSTER_KEY"] = os.urandom(32).hex()
 
-KEY = "api-test-key"
-KEY_NEXT = "api-test-key-next"
+KEY = "api-test-key-0123456789abcdef0123456789"
+KEY_NEXT = "api-test-key-next-0123456789abcdef0123456789"
 TABLES = (1, 2)
 IDS = 12
 
@@ -734,7 +734,9 @@ def check_key_rotation(cluster):
     # Keys that cannot be used stop the gateway before it listens, and it never prints them.
     for env, reason in (({"NERVA_KEY": KEY, "NERVA_KEY_NEXT": KEY}, "equals NERVA_KEY"),
                         ({"NERVA_KEY": KEY, "NERVA_KEY_NEXT": ""}, "set but empty"),
-                        ({"NERVA_KEY": "", "NERVA_KEY_NEXT": KEY_NEXT}, "set NERVA_KEY")):
+                        ({"NERVA_KEY": "", "NERVA_KEY_NEXT": KEY_NEXT}, "set NERVA_KEY"),
+                        ({"NERVA_KEY": "k"}, "shorter than 32 bytes"),
+                        ({"NERVA_KEY": KEY, "NERVA_KEY_NEXT": "n"}, "shorter than 32 bytes")):
         result = subprocess.run([cluster.nerva, "api", "--cluster=0",
                                  f"--addresses={cluster.address}", "--listen=127.0.0.1:0"],
                                 env={**os.environ, **env}, capture_output=True, text=True,

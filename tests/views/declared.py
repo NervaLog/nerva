@@ -27,7 +27,7 @@ import hashlib, http.client, json, os, random, shutil, signal, socket, subproces
 # Replicas authenticate each other with a real cluster key, never the development key (P102).
 os.environ["NERVA_CLUSTER_KEY"] = os.urandom(32).hex()
 
-KEY = "views-test-key"
+KEY = "views-test-key-0123456789abcdef0123456789"
 TABLE = 5
 LAYOUT = {"name": "seats", "fields": [{"name": "section", "type": "u8"},
                                       {"name": "price", "type": "u64"},

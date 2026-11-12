@@ -334,7 +334,7 @@ const FakeFeed = struct {
 };
 
 fn request_get(target: []const u8) http_connection.Request {
-    return .{ .method = .get, .target = target, .key = "k", .body = "" };
+    return .{ .method = .get, .target = target, .key = "k" ** 32, .body = "" };
 }
 
 test "view: a catch-up the window ends is NRV-E0606, and the next request resumes from the cursor" {
@@ -355,7 +355,7 @@ test "view: a catch-up the window ends is NRV-E0606, and the next request resume
         .allocator = std.testing.allocator,
         .options = .{ .cluster = 0, .addresses = &.{}, .timeout = .{ .ns = std.time.ns_per_s } },
     };
-    const options: Options = .{ .listen = undefined, .keys = .{ .current = "k" } };
+    const options: Options = .{ .listen = undefined, .keys = .{ .current = "k" ** 32 } };
 
     // The window ends after two pages: E0606, no write, the session kept, the cursor kept.
     const first = request_get("/v1/views/x?min_op=3");

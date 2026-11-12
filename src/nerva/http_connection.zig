@@ -19,6 +19,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const peer_auth = @import("peer_auth.zig");
 const assert = std.debug.assert;
 const posix = std.posix;
 const log = std.log.scoped(.http);
@@ -146,25 +147,46 @@ pub fn key_matches(key_header: ?[]const u8, key: []const u8) bool {
 /// repository, so it is refused (#306).
 pub const placeholder_key = "replace-with-a-long-random-key";
 
+/// The shortest gateway key: the cluster key's own minimum (`peer_auth.key_length_min`, #335).
+/// `openssl rand -hex 32` makes 64 characters.
+pub const key_length_min = peer_auth.key_length_min;
+
+/// Whether a header can carry `key` unchanged: no leading or trailing SP or HTAB (the parser
+/// trims them) and no control byte (#335). A key that fails could never match a request.
+fn key_sendable(key: []const u8) bool {
+    assert(key.len > 0);
+    if (key[0] == ' ' or key[0] == '\t') return false;
+    if (key[key.len - 1] == ' ' or key[key.len - 1] == '\t') return false;
+    for (key) |byte| {
+        if ((byte < 0x20 and byte != '\t') or byte == 0x7f) return false;
+    }
+    return true;
+}
+
 /// A gateway's keys (P96): `X-Nerva-Key` must equal `current` or, during a rotation, `next`.
 pub const Keys = struct {
     current: []const u8,
     next: ?[]const u8 = null,
 
     /// Why `NERVA_KEY` (`current`) and `NERVA_KEY_NEXT` (`next`) cannot be used, if they cannot:
-    /// each set key is non-empty, and `next` differs from `current`. The message names no key.
+    /// each set key is at least `key_length_min` bytes and not the placeholder, and `next` differs
+    /// from `current`. The message names no key.
     pub fn invalid(current: []const u8, next: ?[]const u8) ?[]const u8 {
         if (current.len == 0) return "set NERVA_KEY";
         if (std.mem.eql(u8, current, placeholder_key)) {
             return "NERVA_KEY is the example's placeholder: " ++
                 "make a key with openssl rand -hex 32";
         }
+        if (current.len < key_length_min) return "NERVA_KEY is shorter than 32 bytes";
+        if (!key_sendable(current)) return "NERVA_KEY starts or ends with a space or tab, or holds a control byte";
         const key_next = next orelse return null;
         if (key_next.len == 0) return "NERVA_KEY_NEXT is set but empty";
         if (std.mem.eql(u8, key_next, placeholder_key)) {
             return "NERVA_KEY_NEXT is the example's placeholder: " ++
                 "make a key with openssl rand -hex 32";
         }
+        if (key_next.len < key_length_min) return "NERVA_KEY_NEXT is shorter than 32 bytes";
+        if (!key_sendable(key_next)) return "NERVA_KEY_NEXT starts or ends with a space or tab, or holds a control byte";
         if (std.mem.eql(u8, current, key_next)) return "NERVA_KEY_NEXT equals NERVA_KEY";
         return null;
     }
@@ -891,6 +913,11 @@ fn reason_phrase(status: u16) []const u8 {
 
 const testing = std.testing;
 
+const test_key_a = "a" ** 32;
+const test_key_b = "b" ** 32;
+const test_key_b_case = "b" ** 31 ++ "B";
+const test_key_other = "c" ** 32;
+
 test reason_phrase {
     // Every status the gateways answer has its phrase (RFC 9110), so no status line goes bare.
     for ([_]u16{ 200, 400, 401, 404, 405, 409, 413, 500, 503, 504 }) |status| {
@@ -950,31 +977,53 @@ test key_matches {
 }
 
 test key_accepted {
-    const current_only: Keys = .{ .current = "current-key" };
-    try testing.expect(key_accepted(current_only, "current-key"));
-    try testing.expect(!key_accepted(current_only, "next-key"));
+    const current_only: Keys = .{ .current = test_key_a };
+    try testing.expect(key_accepted(current_only, test_key_a));
+    try testing.expect(!key_accepted(current_only, test_key_b));
     try testing.expect(!key_accepted(current_only, ""));
     try testing.expect(!key_accepted(current_only, null));
 
-    const rotating: Keys = .{ .current = "current-key", .next = "next-key" };
-    try testing.expect(key_accepted(rotating, "current-key"));
-    try testing.expect(key_accepted(rotating, "next-key"));
-    try testing.expect(!key_accepted(rotating, "other-key"));
-    try testing.expect(!key_accepted(rotating, "next-keY"));
+    const rotating: Keys = .{ .current = test_key_a, .next = test_key_b };
+    try testing.expect(key_accepted(rotating, test_key_a));
+    try testing.expect(key_accepted(rotating, test_key_b));
+    try testing.expect(!key_accepted(rotating, test_key_other));
+    try testing.expect(!key_accepted(rotating, test_key_b_case));
     try testing.expect(!key_accepted(rotating, ""));
     try testing.expect(!key_accepted(rotating, null));
 }
 
 test "Keys.invalid" {
-    try testing.expectEqual(null, Keys.invalid("current-key", null));
-    try testing.expectEqual(null, Keys.invalid("current-key", "next-key"));
+    try testing.expectEqual(null, Keys.invalid(test_key_a, null));
+    try testing.expectEqual(null, Keys.invalid(test_key_a, test_key_b));
     try testing.expectEqualStrings("set NERVA_KEY", Keys.invalid("", null).?);
-    try testing.expectEqualStrings("set NERVA_KEY", Keys.invalid("", "next-key").?);
-    try testing.expect(Keys.invalid("current-key", "") != null);
+    try testing.expectEqualStrings("set NERVA_KEY", Keys.invalid("", test_key_b).?);
+    try testing.expect(Keys.invalid(test_key_a, "") != null);
     try testing.expectEqualStrings(
         "NERVA_KEY_NEXT equals NERVA_KEY",
-        Keys.invalid("same-key", "same-key").?,
+        Keys.invalid(test_key_a, test_key_a).?,
     );
+    // #335: a key shorter than 32 bytes is refused, as current or as next; 32 is accepted.
+    try testing.expectEqualStrings(
+        "NERVA_KEY is shorter than 32 bytes",
+        Keys.invalid(test_key_a[1..], null).?,
+    );
+    try testing.expectEqualStrings(
+        "NERVA_KEY_NEXT is shorter than 32 bytes",
+        Keys.invalid(test_key_a, test_key_b[1..]).?,
+    );
+    try testing.expectEqual(null, Keys.invalid(test_key_a, test_key_b));
+    // #335: a key the header parser would trim, or with a control byte, could never match.
+    const spaced = test_key_a ++ " ";
+    try testing.expectEqualStrings(
+        "NERVA_KEY starts or ends with a space or tab, or holds a control byte",
+        Keys.invalid(spaced, null).?,
+    );
+    try testing.expectEqualStrings(
+        "NERVA_KEY_NEXT starts or ends with a space or tab, or holds a control byte",
+        Keys.invalid(test_key_a, "\t" ++ test_key_b).?,
+    );
+    try testing.expect(Keys.invalid(test_key_a ++ "\r\n", null) != null);
+    try testing.expectEqual(null, Keys.invalid(test_key_a ++ " x", test_key_b));
     // #306: the example's published placeholder is refused, as current or as next.
     try testing.expectEqualStrings(
         "NERVA_KEY is the example's placeholder: make a key with openssl rand -hex 32",
@@ -982,15 +1031,15 @@ test "Keys.invalid" {
     );
     try testing.expectEqualStrings(
         "NERVA_KEY_NEXT is the example's placeholder: make a key with openssl rand -hex 32",
-        Keys.invalid("current-key", placeholder_key).?,
+        Keys.invalid(test_key_a, placeholder_key).?,
     );
     // No message names a key.
     for ([_]?[]const u8{
         Keys.invalid(placeholder_key, null),
-        Keys.invalid("current-key", placeholder_key),
+        Keys.invalid(test_key_a, placeholder_key),
     }) |message| {
         try testing.expect(std.mem.indexOf(u8, message.?, placeholder_key) == null);
-        try testing.expect(std.mem.indexOf(u8, message.?, "current-key") == null);
+        try testing.expect(std.mem.indexOf(u8, message.?, test_key_a) == null);
     }
 }
 

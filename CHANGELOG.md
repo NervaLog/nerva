@@ -5,6 +5,19 @@ publishes a version's section as its GitHub release notes, and refuses to releas
 without one. Design reasons are in [docs/DECISIONS.md](./docs/DECISIONS.md); the full log of
 work is [WORKLOG.md](./WORKLOG.md).
 
+## Unreleased (v0.7.2)
+
+### Upgrading from v0.7.1
+
+- **Gateway keys need 32 bytes (#335).** `nerva api` and `nerva view` refuse a `NERVA_KEY` or
+  `NERVA_KEY_NEXT` shorter than 32 bytes, or one with leading or trailing space or tab or a control
+  byte (`NRV-E0008`). Before upgrading, rotate a gateway key shorter than 32 bytes through
+  `NERVA_KEY_NEXT`: set `NERVA_KEY_NEXT=$(openssl rand -hex 32)`, move clients to it, then make it
+  `NERVA_KEY` ([README, Limits](./README.md#limits)).
+- **The development cluster key is refused off loopback (#336).** `nerva start` refuses
+  `NERVA_CLUSTER_KEY` or `NERVA_CLUSTER_KEY_NEXT` equal to the published development key unless
+  every address is loopback (`NRV-E0901`).
+
 ## v0.7.1 — 2026-11-11
 
 The first Nerva release for people outside the project. It changes no data file, protocol or
