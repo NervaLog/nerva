@@ -12,13 +12,34 @@ amends: P360
    calls a reusable workflow cannot hold steps, so the spec's "first job" refusal needs a job of its own.
 2. A fifth code, NRV-E1138, covers a failed publication or a tag not at the checked commit; the spec
    names four codes.
-3. The site entry's date is the release's `published_at`, so a rerun on another day writes the same line.
+3. The site entry's date is the release's `published_at` (UTC), so a rerun on another day writes the same
+   line. It can be a day after the CHANGELOG heading's date (a release published after 00:00 UTC): the
+   two are different facts, the heading says when the section was written and the entry when the
+   release became public, and the difference is not to be "fixed" by hand.
 4. The tap and site logic lives in `.github/scripts/release_finish.sh`, so it is tested locally with a
    stand-in `gh` and real git, not only by reading YAML.
-5. A prerelease's site pull request is not merged; `verify` waits for the site's `site-check` check-run
-   (read over REST, since the repository is public) to succeed.
+5. A prerelease's site pull request is not merged; the last step of `publish` waits for the site's
+   `site-check` check-run (read over REST, since the repository is public) to succeed. A release's
+   wait ends at once on a failed check.
 6. `mac-verify.yml` takes a `tap-ref` input (`main` or `rc/v<version>`) and fetches that ref instead of
-   pulling main. Its header comment and `release.yml`'s are left for slice C.
+   pulling main. Header comments of `release.yml` and `mac-verify.yml` that this slice leaves stale are
+   slice C's.
+7. Review of #362: the site's pull request is found through the REST list with `head=<owner>:<branch>`
+   and kept only if its head repository is the site, its author is the App and (for an open one) its
+   head is the commit just pushed. Auto-merge that cannot be asked is a refusal (NRV-E1136), not a
+   plain merge, except for a pull request already `clean`.
+8. Everything that can refuse without writing runs before the draft is published (latest-release check,
+   site sentence, App token, tap diff, site edit on a scratch clone, which stands in today's UTC date).
+9. A release is refused (NRV-E1138) when a published release is newer, and the tap's `main` is never
+   taken to an older version (NRV-E1135). Versions are compared with `sort -V`; a candidate is exempt.
+10. A dispatch for a release that is already published skips `mac` and `mac-verify`; `publish` then
+    makes the formula from the template and the zip's published checksum, because no signing run
+    produced one.
+11. Only `v<X>.<Y>.<Z>` and `v<X>.<Y>.<Z>-rc.<N>` pass the guard (P361).
+12. No step writes a command substitution inside `echo >> $GITHUB_OUTPUT` (it hides the failure), and
+    `release-finish.yml` runs every step with `bash -eo pipefail`; a test refuses both. `release.yml`,
+    `mac-verify.yml` and `mac-sign.yml` keep `set -eu`: some of their pipelines (`strings | grep -q`)
+    would fail on a closed pipe under `pipefail`.
 
 **Reason.** Closest to the existing scripts and tests; each choice keeps a failure coded and testable.
 

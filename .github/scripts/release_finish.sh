@@ -5,15 +5,22 @@
 #
 #   release_finish.sh ref <github-ref> <tag>       NRV-E1137: only main, only a version tag
 #   release_finish.sh tap-ref <tag>                prints main, or rc/<tag> for a prerelease
+#   release_finish.sh state <tag>                  prints published, or draft (also when there is no
+#                                                  release: the next step refuses); needs gh, GH_TOKEN
+#   release_finish.sh make-formula <tag> <sha-file> <out>   fills packaging/homebrew/nerva.rb (for a
+#                                                  release that is already published: no signing run)
 #   release_finish.sh fetch-sha <tag> <out>        needs gh, GH_TOKEN, GITHUB_REPOSITORY; writes
 #                                                  the first field of the release's .zip.sha256
 #   release_finish.sh formula <tag> <formula> <sha-file>   NRV-E1134: url, version, sha256
 #   release_finish.sh tap-diff <old> <new>         NRV-E1135: only url, version, sha256 may change
+#   release_finish.sh latest-check <tag>           NRV-E1138: no newer release is Latest already
+#   release_finish.sh tap-check <tag> <formula>    NRV-E1135: tap <tag> <formula> without the write
 #   release_finish.sh tap <tag> <formula>          NRV-E1135: commit the formula to the tap; needs
 #                                                  git, GH_TOKEN, BOT_NAME, BOT_EMAIL
 #   release_finish.sh publish <tag> <commit>       NRV-E1138: publish the draft, check its tag
+#   release_finish.sh site-check <tag> <line>      NRV-E1132: the site's edit on a scratch clone, no write
 #   release_finish.sh site <tag> <date> <line>     NRV-E1136, E1132: the site's pull request;
-#                                                  prints its number. needs gh, git, GH_TOKEN
+#                                                  prints its number. needs gh, git, GH_TOKEN, BOT_NAME
 #   release_finish.sh site-wait <pr> <release|prerelease>   NRV-E1136: wait for the merge (a release)
 #                                                  or for the site check (a prerelease)
 #
@@ -26,6 +33,7 @@ set -euo pipefail
 where=release-finish.yml
 tap_url=${TAP_URL:-https://github.com/NervaLog/homebrew-tap.git}
 site_repo=${SITE_REPO:-NervaLog/nervalog.github.io}
+site_owner=${site_repo%%/*}
 site_url=${SITE_URL:-https://github.com/$site_repo.git}
 wait_seconds=${SITE_WAIT_SECONDS:-1200}
 poll_seconds=${SITE_POLL_SECONDS:-20}
@@ -36,7 +44,8 @@ refuse() {
   exit 1
 }
 
-version_re='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'
+# A release or a release candidate, nothing else (P361: release_notes.sh site takes only -rc.N).
+version_re='^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$'
 
 # git with the credential helper that reads GH_TOKEN from the environment. The helper's text names
 # the variable; the token is never in the argument.
@@ -68,6 +77,77 @@ one_value() {
     return 0
   fi
   sed -E 's/^[[:space:]]*[a-z0-9]+[[:space:]]+"([^"]*)".*$/\1/' <<< "$lines"
+}
+
+# ver_gt <a> <b>: a is a later version than b (both without the v).
+ver_gt() {
+  [[ "$1" != "$2" && "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n1)" == "$1" ]]
+}
+
+# The last line of git's or gh's complaint with any credential in a URL removed.
+scrub() { tr '\n' ' ' < "$1" | sed -E 's#(https?://)[^/@ ]*@#\1#g'; }
+
+# tap_run <tag> <formula> <write>: clone the tap, check the formula against what it holds, and with
+# write=yes commit it to its ref (main, or rc/<tag> for a prerelease) and push.
+tap_run() {
+  local tag=$1 formula=$2 write=$3 ref old
+  ref=$("$0" tap-ref "$tag")
+  # work is global: the EXIT trap runs after this function has returned
+  work=$(mktemp -d)
+  trap 'rm -rf "$work"' EXIT
+  if ! git_auth clone --quiet --depth 1 "$tap_url" "$work/tap" 2> "$work/err"; then
+    refuse NRV-E1135 "cannot clone the tap" "$(scrub "$work/err")" \
+      "check that the App is installed on NervaLog/homebrew-tap, and run the failed job again"
+  fi
+  cd "$work/tap"
+  # A release never takes the tap back to an older version.
+  if [[ "$tag" != *-* && -f Formula/nerva.rb ]]; then
+    old=$(one_value Formula/nerva.rb version)
+    if [[ -n "$old" ]] && ver_gt "$old" "${tag#v}"; then
+      refuse NRV-E1135 "the tap holds version $old, which is newer than $tag" \
+        "an older release was finished after a newer one; the tap's main would go back to ${tag#v}" \
+        "do not publish $tag as the latest release; if it is wanted, commit its formula to the tap by hand"
+    fi
+  fi
+  # A prerelease goes to its own branch: the one that exists (a re-run), or a new one from main.
+  if [[ "$ref" != main ]]; then
+    if git_auth ls-remote --exit-code --heads origin "$ref" > /dev/null 2>&1; then
+      git_auth fetch --quiet --depth 1 origin "$ref"
+      git checkout --quiet -B "$ref" FETCH_HEAD
+    else
+      git checkout --quiet -b "$ref"
+    fi
+  fi
+  mkdir -p Formula
+  if [[ -f Formula/nerva.rb ]]; then
+    tap_diff Formula/nerva.rb "$formula"
+  fi
+  if [[ "$write" != yes ]]; then
+    echo "release_finish.sh: the tap would take the formula on $ref"
+    return 0
+  fi
+  cp "$formula" Formula/nerva.rb
+  if [[ -z "$(git status --porcelain -- Formula/nerva.rb)" ]]; then
+    echo "release_finish.sh: the tap already holds this formula on $ref; nothing to commit"
+    return 0
+  fi
+  git add Formula/nerva.rb
+  git -c "user.name=${BOT_NAME:?BOT_NAME is not set}" -c "user.email=${BOT_EMAIL:?BOT_EMAIL is not set}" \
+    commit --quiet -m "nerva ${tag#v}"
+  if ! git_auth push --quiet origin "HEAD:refs/heads/$ref" 2> "$work/err"; then
+    refuse NRV-E1135 "the tap refused the push to $ref" "$(scrub "$work/err")" \
+      "the tap's main changed meanwhile, or the App cannot write to it; run the failed job again, or commit Formula/nerva.rb by hand"
+  fi
+  echo "release_finish.sh: committed nerva ${tag#v} to the tap's $ref"
+}
+
+# site_clone <work>: clone the site into <work>/site and enter it.
+site_clone() {
+  if ! git_auth clone --quiet --depth 1 "$site_url" "$1/site" 2> "$1/err"; then
+    refuse NRV-E1136 "cannot clone the site" "$(scrub "$1/err")" \
+      "check that the App is installed on $site_repo, and run the failed job again"
+  fi
+  cd "$1/site"
 }
 
 case "${1:-}" in
@@ -130,45 +210,49 @@ case "${1:-}" in
   tap-diff)
     tap_diff "${2:?usage: release_finish.sh tap-diff <old> <new>}" "${3:?usage: release_finish.sh tap-diff <old> <new>}"
     ;;
-  tap)
-    tag=${2:?usage: release_finish.sh tap <tag> <formula>}
-    formula=${3:?usage: release_finish.sh tap <tag> <formula>}
-    ref=$("$0" tap-ref "$tag")
-    work=$(mktemp -d)
-    trap 'rm -rf "$work"' EXIT
-    if ! git_auth clone --quiet --depth 1 "$tap_url" "$work/tap" 2> "$work/err"; then
-      refuse NRV-E1135 "cannot clone the tap" \
-        "$(tr '\n' ' ' < "$work/err" | sed -E 's#(https?://)[^/@ ]*@#\1#g')" \
-        "check that the App is installed on NervaLog/homebrew-tap, and run the failed job again"
+  state)
+    tag=${2:?usage: release_finish.sh state <tag>}
+    if ! draft=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases" \
+      --jq ".[] | select(.tag_name == \"$tag\") | .draft" | head -n1); then
+      echo "release_finish.sh: cannot list the releases of $GITHUB_REPOSITORY (GitHub did not answer); run again" >&2
+      exit 2
     fi
-    cd "$work/tap"
-    # A prerelease goes to its own branch: the one that exists (a re-run), or a new one from main.
-    if [[ "$ref" != main ]]; then
-      if git_auth ls-remote --exit-code --heads origin "$ref" > /dev/null 2>&1; then
-        git_auth fetch --quiet --depth 1 origin "$ref"
-        git checkout --quiet -B "$ref" FETCH_HEAD
-      else
-        git checkout --quiet -b "$ref"
+    # No release at all is left to mac-sign.yml and publish-ready, which refuse it with a code.
+    if [[ "$draft" == false ]]; then echo published; else echo draft; fi
+    ;;
+  make-formula)
+    tag=${2:?usage: release_finish.sh make-formula <tag> <sha-file> <out>}
+    shafile=${3:?usage: release_finish.sh make-formula <tag> <sha-file> <out>}
+    out=${4:?usage: release_finish.sh make-formula <tag> <sha-file> <out>}
+    sha=$(head -n1 "$shafile" | awk '{ print $1 }')
+    url="https://github.com/NervaLog/nerva/releases/download/$tag/nerva-$tag-universal-macos.zip"
+    sed -e "s#@URL@#$url#" -e "s#@VERSION@#${tag#v}#" -e "s#@SHA256@#$sha#" \
+      "$(dirname "$0")/../../packaging/homebrew/nerva.rb" > "$out"
+    ;;
+  latest-check)
+    tag=${2:?usage: release_finish.sh latest-check <tag>}
+    # A prerelease is never Latest.
+    if [[ "$tag" != *-* ]]; then
+      if ! published=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases" \
+        --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name' 2> /dev/null); then
+        refuse NRV-E1138 "cannot list the published releases" \
+          "GitHub did not answer, so it is not known whether $tag would be older than the latest release" \
+          "run the failed job again"
       fi
+      while read -r other; do
+        if [[ -n "$other" && "$other" != "$tag" ]] && ver_gt "${other#v}" "${tag#v}"; then
+          refuse NRV-E1138 "$tag is not newer than the latest release $other" \
+            "publishing it would make it Latest and move the tap's main back to ${tag#v}" \
+            "finish the newest release instead; publish $tag by hand only if it must exist, as a prerelease"
+        fi
+      done <<< "$published"
     fi
-    mkdir -p Formula
-    if [[ -f Formula/nerva.rb ]]; then
-      tap_diff Formula/nerva.rb "$formula"
-    fi
-    cp "$formula" Formula/nerva.rb
-    if [[ -z "$(git status --porcelain -- Formula/nerva.rb)" ]]; then
-      echo "release_finish.sh: the tap already holds this formula on $ref; nothing to commit"
-      exit 0
-    fi
-    git add Formula/nerva.rb
-    git -c "user.name=${BOT_NAME:?BOT_NAME is not set}" -c "user.email=${BOT_EMAIL:?BOT_EMAIL is not set}" \
-      commit --quiet -m "nerva ${tag#v}"
-    if ! git_auth push --quiet origin "HEAD:refs/heads/$ref" 2> "$work/err"; then
-      refuse NRV-E1135 "the tap refused the push to $ref" \
-        "$(tr '\n' ' ' < "$work/err" | sed -E 's#(https?://)[^/@ ]*@#\1#g')" \
-        "the tap's main changed meanwhile, or the App cannot write to it; run the failed job again, or commit Formula/nerva.rb by hand"
-    fi
-    echo "release_finish.sh: committed nerva ${tag#v} to the tap's $ref"
+    ;;
+  tap-check)
+    tap_run "${2:?usage: release_finish.sh tap-check <tag> <formula>}" "${3:?usage: release_finish.sh tap-check <tag> <formula>}" no
+    ;;
+  tap)
+    tap_run "${2:?usage: release_finish.sh tap <tag> <formula>}" "${3:?usage: release_finish.sh tap <tag> <formula>}" yes
     ;;
   publish)
     tag=${2:?usage: release_finish.sh publish <tag> <commit>}
@@ -177,6 +261,7 @@ case "${1:-}" in
       --jq ".[] | select(.tag_name == \"$tag\") | .draft" | head -n1)
     # A published release is where an earlier run stopped: carry on to the tag check.
     if [[ "$draft" == true ]]; then
+      "$0" latest-check "$tag"
       flags=(--draft=false)
       [[ "$tag" == *-* ]] || flags+=(--latest)
       if ! out=$(gh release edit "$tag" "${flags[@]}" 2>&1); then
@@ -186,6 +271,7 @@ case "${1:-}" in
       fi
     fi
     # The tag is made by the publication, at the draft's target; the ref can take a moment to appear.
+    at=
     for _ in 1 2 3 4 5 6; do
       at=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" --jq .object.sha 2> /dev/null || true)
       [[ -n "$at" ]] && break
@@ -198,20 +284,26 @@ case "${1:-}" in
     fi
     echo "release_finish.sh: $tag is published at $commit"
     ;;
+  site-check)
+    tag=${2:?usage: release_finish.sh site-check <tag> <line>}
+    line=${3:?usage: release_finish.sh site-check <tag> <line>}
+    work=$(mktemp -d)
+    trap 'rm -rf "$work"' EXIT
+    site_clone "$work"
+    # The publication date is not known yet; today's stands in, and only the shape is checked.
+    python3 -I "$(dirname "$0")/site_release.py" index.html "${tag#v}" "$(date -u +%F)" "$line" >&2
+    echo "release_finish.sh: the site would take the entry for $tag"
+    ;;
   site)
     tag=${2:?usage: release_finish.sh site <tag> <date> <line>}
     date=${3:?usage: release_finish.sh site <tag> <date> <line>}
     line=${4:?usage: release_finish.sh site <tag> <date> <line>}
+    bot=${BOT_NAME:?BOT_NAME is not set}
     version=${tag#v}
     branch="release/$tag"
     work=$(mktemp -d)
     trap 'rm -rf "$work"' EXIT
-    if ! git_auth clone --quiet --depth 1 "$site_url" "$work/site" 2> "$work/err"; then
-      refuse NRV-E1136 "cannot clone the site" \
-        "$(tr '\n' ' ' < "$work/err" | sed -E 's#(https?://)[^/@ ]*@#\1#g')" \
-        "check that the App is installed on $site_repo, and run the failed job again"
-    fi
-    cd "$work/site"
+    site_clone "$work"
     # A branch from an earlier run is continued, so its open pull request is reused.
     if git_auth ls-remote --exit-code --heads origin "$branch" > /dev/null 2>&1; then
       git_auth fetch --quiet --depth 1 origin "$branch"
@@ -222,32 +314,52 @@ case "${1:-}" in
     python3 -I "$(dirname "$0")/site_release.py" index.html "$version" "$date" "$line" >&2
     if ! git diff --quiet; then
       git add index.html
-      git -c "user.name=${BOT_NAME:?BOT_NAME is not set}" -c "user.email=${BOT_EMAIL:?BOT_EMAIL is not set}" \
+      git -c "user.name=$bot" -c "user.email=${BOT_EMAIL:?BOT_EMAIL is not set}" \
         commit --quiet -m "Release $tag"
       if ! git_auth push --quiet origin "HEAD:refs/heads/$branch" 2> "$work/err"; then
-        refuse NRV-E1136 "the site refused the push to $branch" \
-          "$(tr '\n' ' ' < "$work/err" | sed -E 's#(https?://)[^/@ ]*@#\1#g')" \
+        refuse NRV-E1136 "the site refused the push to $branch" "$(scrub "$work/err")" \
           "run the failed job again, or open the pull request by hand"
       fi
     fi
-    pr=$(gh pr list --repo "$site_repo" --head "$branch" --state open --json number --jq '.[0].number // empty')
+    head_sha=$(git rev-parse HEAD)
+    # Our pull request is the one from this repository's own branch (not a fork's branch of the same
+    # name: gh's --head takes no owner), opened by the App, at the commit just pushed.
+    # site_pull <state> <jq filter>: the first number it selects.
+    site_pull() {
+      local out
+      if ! out=$(gh api "repos/$site_repo/pulls?head=$site_owner:$branch&state=$1&per_page=100" --jq "$2" 2> "$work/err"); then
+        refuse NRV-E1136 "cannot list the site's pull requests" "$(scrub "$work/err")" \
+          "run the failed job again"
+      fi
+      head -n1 <<< "$out"
+    }
+    ours=".head.repo.full_name == \"$site_repo\" and .user.login == \"$bot\""
+    pr=$(site_pull open ".[] | select($ours and .head.sha == \"$head_sha\") | .number")
     if [[ -z "$pr" ]]; then
-      if merged=$(gh pr list --repo "$site_repo" --head "$branch" --state merged --json number --jq '.[0].number // empty') && [[ -n "$merged" ]]; then
+      merged=$(site_pull closed ".[] | select($ours and .merged_at != null) | .number")
+      if [[ -n "$merged" ]]; then
         echo "$merged"
         exit 0
       fi
       body="Nerva $tag is released: https://github.com/NervaLog/nerva/releases/tag/$tag. This changes only the RELEASES entry and SITE.version, SITE.released and SITE.updated (docs/releases/automation.md)."
       if ! url=$(gh pr create --repo "$site_repo" --base main --head "$branch" --title "Release $tag" --body "$body" 2> "$work/err"); then
-        refuse NRV-E1136 "cannot open the site's pull request for $tag" \
-          "$(tr '\n' ' ' < "$work/err")" \
+        refuse NRV-E1136 "cannot open the site's pull request for $tag" "$(scrub "$work/err")" \
           "open a pull request from $branch by hand (the release is already published)"
       fi
       pr=${url##*/}
     fi
-    # A release asks for the merge once its check passes; a prerelease's is never merged.
+    # A release asks for the merge once its check passes; a prerelease's is never merged. Without
+    # auto-merge there is no merge: the pull request stays open for the owner. Only a pull request
+    # whose checks have already passed (clean) is merged at once, as a re-run finds it.
     if [[ "$tag" != *-* ]]; then
-      gh pr merge "$pr" --repo "$site_repo" --auto --squash > /dev/null 2>&1 ||
-        gh pr merge "$pr" --repo "$site_repo" --squash > /dev/null 2>&1 || true
+      if ! out=$(gh pr merge "$pr" --repo "$site_repo" --auto --squash 2>&1); then
+        state=$(gh api "repos/$site_repo/pulls/$pr" --jq .mergeable_state 2> /dev/null || true)
+        if [[ "$state" != clean ]] || ! out=$(gh pr merge "$pr" --repo "$site_repo" --squash 2>&1); then
+          refuse NRV-E1136 "cannot ask for the merge of the site's pull request #$pr" \
+            "gh said: $(tr '\n' ' ' <<< "$out")" \
+            "allow auto-merge on $site_repo and require site-check in its ruleset (setup guide, step 6), then merge #$pr by hand; the release is already published"
+        fi
+      fi
     fi
     echo "$pr"
     ;;
@@ -256,24 +368,28 @@ case "${1:-}" in
     mode=${3:?usage: release_finish.sh site-wait <pr> <release|prerelease>}
     waited=0
     while :; do
+      # A failed call is "not yet": the next poll asks again.
       if [[ "$mode" == release ]]; then
-        if [[ "$(gh api "repos/$site_repo/pulls/$pr" --jq .merged)" == true ]]; then
+        merged=$(gh api "repos/$site_repo/pulls/$pr" --jq .merged 2> /dev/null || true)
+        if [[ "$merged" == true ]]; then
           echo "release_finish.sh: the site's pull request #$pr merged"
           exit 0
         fi
-      else
-        head=$(gh api "repos/$site_repo/pulls/$pr" --jq .head.sha)
+      fi
+      head=$(gh api "repos/$site_repo/pulls/$pr" --jq .head.sha 2> /dev/null || true)
+      result=
+      if [[ -n "$head" ]]; then
         result=$(gh api "repos/$site_repo/commits/$head/check-runs" \
-          --jq '[.check_runs[] | select(.name == "site-check") | .conclusion] | first // ""')
-        if [[ "$result" == success ]]; then
-          echo "release_finish.sh: the site's pull request #$pr passed site-check"
-          exit 0
-        fi
-        if [[ -n "$result" && "$result" != null ]]; then
-          refuse NRV-E1136 "the site's check on pull request #$pr ended $result" \
-            "the page the release added does not pass the site's own check" \
-            "fix the site's pull request by hand (the release is already published)"
-        fi
+          --jq '[.check_runs[] | select(.name == "site-check") | .conclusion] | first // ""' 2> /dev/null || true)
+      fi
+      if [[ "$mode" != release && "$result" == success ]]; then
+        echo "release_finish.sh: the site's pull request #$pr passed site-check"
+        exit 0
+      fi
+      if [[ -n "$result" && "$result" != null && "$result" != success ]]; then
+        refuse NRV-E1136 "the site's check on pull request #$pr ended $result" \
+          "the page the release added does not pass the site's own check" \
+          "fix the site's pull request by hand (the release is already published)"
       fi
       if ((waited >= wait_seconds)); then
         break
@@ -291,7 +407,7 @@ case "${1:-}" in
       "the release is already published; look at the pull request and merge it by hand"
     ;;
   *)
-    echo "usage: release_finish.sh ref <ref> <tag> | tap-ref <tag> | fetch-sha <tag> <out> | formula <tag> <formula> <sha-file> | tap-diff <old> <new> | tap <tag> <formula> | publish <tag> <commit> | site <tag> <date> <line> | site-wait <pr> <release|prerelease>" >&2
+    echo "usage: release_finish.sh ref <ref> <tag> | tap-ref <tag> | state <tag> | make-formula <tag> <sha-file> <out> | latest-check <tag> | tap-check <tag> <formula> | site-check <tag> <line> | fetch-sha <tag> <out> | formula <tag> <formula> <sha-file> | tap-diff <old> <new> | tap <tag> <formula> | publish <tag> <commit> | site <tag> <date> <line> | site-wait <pr> <release|prerelease>" >&2
     exit 2
     ;;
 esac

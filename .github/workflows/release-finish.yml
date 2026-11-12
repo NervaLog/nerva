@@ -4,11 +4,16 @@
 # environment release-publish: main only, no reviewers), then installs from the tap (`verify`).
 # Called by release.yml on main after its draft, or dispatched from main with a draft's tag: that
 # is how a prerelease drafted from a branch is rehearsed, and how a run that stopped is finished.
+# A dispatch for a release that is already published skips the signing (`mac`, `mac-verify`: the
+# zip is public and is never signed again) and carries on with the tap, the site and `verify`; the
+# formula is then made from the template and the zip's published checksum.
 #
 # Only main may run it (`guard`, NRV-E1137); each environment's main-only deployment rule is the
 # second guard. The scripts come from the workflow's own ref, never from the draft's target. If a
-# Mac check fails, nothing is published. Every step of `publish` is idempotent, so "Re-run failed
-# jobs" finishes a half-done publish. A release goes to the tap's main and the site's auto-merge;
+# Mac check fails, nothing is published. Everything that can refuse without writing (the token, the
+# site's sentence, the tap's diff, the site's edit, an older version) runs before the draft is
+# published. Every step of `publish` is idempotent, so "Re-run failed jobs", or a dispatch, finishes
+# a half-done publish. A release goes to the tap's main and the site's auto-merge;
 # a prerelease to the tap's branch rc/<tag> and an unmerged site pull request, so it never reaches
 # users. The App's token (NervaLog/homebrew-tap and NervaLog/nervalog.github.io only, contents and
 # pull requests) is given only to the steps that write there; writes to this repository use
@@ -31,6 +36,11 @@ on:
 permissions:
   contents: read
 
+# `bash` here is `bash -eo pipefail`: a failing command in a pipeline fails the step.
+defaults:
+  run:
+    shell: bash
+
 concurrency:
   group: release-finish-${{ inputs.tag }}
   cancel-in-progress: false
@@ -45,6 +55,7 @@ jobs:
       contents: read
     outputs:
       tap-ref: ${{ steps.refs.outputs.tap-ref }}
+      published: ${{ steps.refs.outputs.published }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
@@ -54,14 +65,21 @@ jobs:
         id: refs
         env:
           TAG: ${{ inputs.tag }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          set -eu
+          set -euo pipefail
           .github/scripts/release_finish.sh ref "$GITHUB_REF" "$TAG"
-          echo "tap-ref=$(.github/scripts/release_finish.sh tap-ref "$TAG")" >> "$GITHUB_OUTPUT"
+          tap_ref=$(.github/scripts/release_finish.sh tap-ref "$TAG")
+          state=$(.github/scripts/release_finish.sh state "$TAG")
+          published=false
+          if [ "$state" = published ]; then published=true; fi
+          echo "tap-ref=$tap_ref" >> "$GITHUB_OUTPUT"
+          echo "published=$published" >> "$GITHUB_OUTPUT"
 
   # The existing signing job, as it is: environment apple-signing, so the owner approves the run.
   mac:
     needs: guard
+    if: needs.guard.outputs.published != 'true'
     uses: ./.github/workflows/mac-sign.yml
     permissions:
       contents: write
@@ -71,6 +89,7 @@ jobs:
   # The zip on the draft, on both architectures. brew waits for the published release (`verify`).
   mac-verify:
     needs: [guard, mac]
+    if: needs.guard.outputs.published != 'true'
     uses: ./.github/workflows/mac-verify.yml
     permissions:
       contents: write
@@ -78,8 +97,13 @@ jobs:
       tag: ${{ inputs.tag }}
       tap-ref: ${{ needs.guard.outputs.tap-ref }}
 
+  # Runs when the Mac checks passed, or were skipped because the release is already published.
   publish:
     needs: [guard, mac, mac-verify]
+    if: >-
+      ${{ !cancelled() && needs.guard.result == 'success'
+      && contains(fromJSON('["success", "skipped"]'), needs.mac.result)
+      && contains(fromJSON('["success", "skipped"]'), needs.mac-verify.result) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     environment: release-publish
@@ -88,6 +112,7 @@ jobs:
     env:
       TAG: ${{ inputs.tag }}
       TAP_REF: ${{ needs.guard.outputs.tap-ref }}
+      PUBLISHED: ${{ needs.guard.outputs.published }}
     steps:
       # The workflow's own ref (main): the scripts run here are never the draft target's.
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
@@ -99,12 +124,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          set -eu
+          set -euo pipefail
           commit=$(.github/scripts/release_check.sh publish-ready "$TAG")
           echo "commit=$commit" >> "$GITHUB_OUTPUT"
           echo "$TAG is ready, at $commit"
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        if: env.PUBLISHED != 'true'
         with:
           name: homebrew-formula
           path: formula
@@ -113,30 +139,32 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          set -eu
+          set -euo pipefail
           .github/scripts/release_finish.sh fetch-sha "$TAG" "$RUNNER_TEMP/zip.sha256"
+          if [ "$PUBLISHED" = true ]; then
+            # No signing run in this one: the template, filled from the published checksum.
+            mkdir formula
+            .github/scripts/release_finish.sh make-formula "$TAG" "$RUNNER_TEMP/zip.sha256" formula/nerva.rb
+          fi
           .github/scripts/release_finish.sh formula "$TAG" formula/nerva.rb "$RUNNER_TEMP/zip.sha256"
 
-      # The tap and the site name the release's URLs, so they come after the draft is public.
-      - name: Publish the draft, which creates the tag
-        id: publish
+      # Everything below up to the publication can refuse without having written anything: a failure
+      # leaves an unpublished draft, and "Re-run failed jobs" finishes it.
+      - name: No newer release is the latest
         env:
           GH_TOKEN: ${{ github.token }}
-          COMMIT: ${{ steps.ready.outputs.commit }}
         run: |
-          set -eu
-          .github/scripts/release_finish.sh publish "$TAG" "$COMMIT"
-          date=$(gh api "repos/$GITHUB_REPOSITORY/releases" --paginate \
-            --jq ".[] | select(.tag_name == \"$TAG\") | .published_at[:10]" | head -n1)
-          echo "date=$date" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          .github/scripts/release_finish.sh latest-check "$TAG"
 
       - name: The site's sentence
         id: site
         run: |
-          set -eu
+          set -euo pipefail
           # CHANGELOG.md at main: a release's section is there, and a prerelease drafted from a
           # branch gets the default line (release_notes.sh site).
-          echo "line=$(.github/scripts/release_notes.sh site "$TAG")" >> "$GITHUB_OUTPUT"
+          line=$(.github/scripts/release_notes.sh site "$TAG")
+          echo "line=$line" >> "$GITHUB_OUTPUT"
 
       - name: Mint the App's token for the tap and the site
         id: app
@@ -155,17 +183,42 @@ jobs:
           GH_TOKEN: ${{ steps.app.outputs.token }}
           SLUG: ${{ steps.app.outputs.app-slug }}
         run: |
-          set -eu
+          set -euo pipefail
           id=$(gh api "users/${SLUG}[bot]" --jq .id)
           echo "name=${SLUG}[bot]" >> "$GITHUB_OUTPUT"
           echo "email=${id}+${SLUG}[bot]@users.noreply.github.com" >> "$GITHUB_OUTPUT"
+
+      - name: The tap and the site take the release
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          LINE: ${{ steps.site.outputs.line }}
+        run: |
+          set -euo pipefail
+          .github/scripts/release_finish.sh tap-check "$TAG" formula/nerva.rb
+          .github/scripts/release_finish.sh site-check "$TAG" "$LINE"
+
+      # The tap and the site name the release's URLs, so they are written after the draft is public.
+      - name: Publish the draft, which creates the tag
+        id: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMIT: ${{ steps.ready.outputs.commit }}
+        run: |
+          set -euo pipefail
+          .github/scripts/release_finish.sh publish "$TAG" "$COMMIT"
+          date=$(gh api "repos/$GITHUB_REPOSITORY/releases" --paginate \
+            --jq ".[] | select(.tag_name == \"$TAG\") | .published_at[:10]" | head -n1)
+          test -n "$date" || { echo "::error::cannot read when $TAG was published"; exit 1; }
+          echo "date=$date" >> "$GITHUB_OUTPUT"
 
       - name: Commit the formula to the tap
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
           BOT_NAME: ${{ steps.bot.outputs.name }}
           BOT_EMAIL: ${{ steps.bot.outputs.email }}
-        run: .github/scripts/release_finish.sh tap "$TAG" formula/nerva.rb
+        run: |
+          set -euo pipefail
+          .github/scripts/release_finish.sh tap "$TAG" formula/nerva.rb
 
       - name: Open the site's pull request
         id: pr
@@ -176,8 +229,9 @@ jobs:
           DATE: ${{ steps.publish.outputs.date }}
           LINE: ${{ steps.site.outputs.line }}
         run: |
-          set -eu
-          echo "number=$(.github/scripts/release_finish.sh site "$TAG" "$DATE" "$LINE")" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          number=$(.github/scripts/release_finish.sh site "$TAG" "$DATE" "$LINE")
+          echo "number=$number" >> "$GITHUB_OUTPUT"
 
       # The release is out by now: a failure here says so, and the pull request can be merged by hand.
       - name: Wait for the site's pull request
@@ -185,7 +239,7 @@ jobs:
           GH_TOKEN: ${{ steps.app.outputs.token }}
           PR: ${{ steps.pr.outputs.number }}
         run: |
-          set -eu
+          set -euo pipefail
           mode=release
           case "$TAG" in *-*) mode=prerelease ;; esac
           .github/scripts/release_finish.sh site-wait "$PR" "$mode"

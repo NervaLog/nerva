@@ -109,7 +109,8 @@ jobs:
           gh api --paginate "repos/$GITHUB_REPOSITORY/releases" \
             --jq ".[] | select(.tag_name == \"$TAG\")" > release.json
           test -s release.json || { echo "::error::no release or draft named $TAG"; exit 1; }
-          echo "draft=$(jq -rs '.[0].draft' release.json)" >> "$GITHUB_OUTPUT"
+          draft=$(jq -rs '.[0].draft' release.json)
+          echo "draft=$draft" >> "$GITHUB_OUTPUT"
           # The commit the release targets: the draft was made with --target <sha>, so this is the
           # commit its tarballs and packages were built from (a branch name is resolved).
           target=$(jq -rs '.[0].target_commitish' release.json)

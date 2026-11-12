@@ -5,6 +5,7 @@ repository root: python3 -I .github/scripts/test_release_finish.py
 A stand-in `gh` (a script that logs its arguments and answers from environment variables) stands for
 the real one; the tap and the site are bare git repositories in a temporary directory, so the real
 `git` clones, commits and pushes to them."""
+import json
 import os
 import re
 import subprocess
@@ -42,20 +43,31 @@ const RELEASES = [
 
 # Answers by the first words of the call. DRAFT is true or false, TAG_AT the commit a tag ref
 # resolves to ("" for none), MERGED the pull request's merged flag, CHECK the site-check conclusion,
-# OPEN_PR a number or "", ASSET_SHA the zip checksum file's content.
+# MSTATE its mergeable_state, ASSET_SHA the zip checksum file's content, PUBLISHED the tags of the
+# published releases (one a line). PULLS_OPEN and PULLS_CLOSED are the JSON the pull request list
+# returns for each state: the call's own --jq filter is run on them with the real jq. AUTO_FAILS and
+# MERGE_FAILS make `pr merge --auto` and a plain `pr merge` fail, API_FAILS every `api` call.
 GH = r"""#!/bin/sh
 printf '%s\n' "$*" >> "$GH_LOG"
+[ -n "$API_FAILS" ] && [ "$1" = api ] && { echo "gh: HTTP 502" >&2; exit 1; }
 case "$*" in
-  "pr list"*"--state open"*) [ -n "$OPEN_PR" ] && echo "$OPEN_PR" ;;
-  "pr list"*) ;;
   "pr create"*) echo "https://github.com/o/site/pull/7" ;;
-  "pr merge"*) exit 0 ;;
+  "pr merge"*--auto*) [ -n "$AUTO_FAILS" ] && { echo "gh: auto merge is not allowed (HTTP 422)" >&2; exit 1; }; exit 0 ;;
+  "pr merge"*) [ -n "$MERGE_FAILS" ] && { echo "gh: not mergeable" >&2; exit 1; }; exit 0 ;;
   "release edit"*) [ -n "$EDIT_FAILS" ] && { echo "gh: boom (HTTP 422)" >&2; exit 1; }; exit 0 ;;
+  *"pulls?head="*)
+    f=; p=
+    for a in "$@"; do [ "$p" = --jq ] && f=$a; p=$a; done
+    case "$*" in *state=open*) j=$PULLS_OPEN ;; *) j=$PULLS_CLOSED ;; esac
+    [ -n "$j" ] && printf '%s' "$j" | jq -r "$f"
+    exit 0 ;;
   *git/ref/tags*) [ -n "$TAG_AT" ] && echo "$TAG_AT" || exit 1 ;;
   *releases/assets/*) printf '%s' "$ASSET_SHA" ;;
+  *releases*"prerelease == false"*) [ -n "$PUBLISHED" ] && printf '%s\n' "$PUBLISHED" ;;
   *releases*"select(.tag_name"*"assets[]"*) [ -n "$ASSET_ID" ] && echo "$ASSET_ID" ;;
   *releases*) echo "$DRAFT" ;;
   *check-runs*) echo "$CHECK" ;;
+  *pulls/*"mergeable_state"*) echo "$MSTATE" ;;
   *pulls/*"head.sha"*) echo deadbeef ;;
   *pulls/*) echo "$MERGED" ;;
 esac
@@ -83,8 +95,8 @@ class Finish(unittest.TestCase):
             PATH=f"{self.bin}:{os.environ['PATH']}", BOT_NAME="nerva-release[bot]",
             BOT_EMAIL="1+nerva-release[bot]@users.noreply.github.com", SITE_REPO="o/site",
             SITE_WAIT_SECONDS="1", SITE_POLL_SECONDS="1", TAG_POLL_SECONDS="0",
-            DRAFT="true", TAG_AT="", MERGED="false", CHECK="", OPEN_PR="", ASSET_SHA="", ASSET_ID="",
-            EDIT_FAILS="", GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_SYSTEM="/dev/null",
+            DRAFT="true", TAG_AT="", MERGED="false", CHECK="", MSTATE="", ASSET_SHA="", ASSET_ID="",
+            EDIT_FAILS="", PUBLISHED="", PULLS_OPEN="", PULLS_CLOSED="", AUTO_FAILS="", MERGE_FAILS="", API_FAILS="", GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_SYSTEM="/dev/null",
         )
 
     def run_script(self, *args, **env):
@@ -128,6 +140,10 @@ class Finish(unittest.TestCase):
         self.refused(self.run_script("ref", "refs/tags/v0.7.1", "v0.7.1"), "NRV-E1137", "not main")
         self.refused(self.run_script("ref", "refs/heads/main", "0.7.1; rm -rf"), "NRV-E1137",
                      "is not a release tag")
+
+    def test_ref_takes_only_a_version_or_a_release_candidate(self):
+        for tag in ("v0.7.1-beta.1", "v0.7.1-rc", "v0.7.1-rc.1.2", "v0.7.1-rc.x", "v0.7.1-"):
+            self.refused(self.run_script("ref", "refs/heads/main", tag), "NRV-E1137", "is not a release tag")
 
     def test_tap_ref(self):
         self.assertEqual(self.run_script("tap-ref", "v0.7.1").stdout, "main\n")
@@ -227,6 +243,54 @@ class Finish(unittest.TestCase):
         self.assertNotIn("x-access-token:", text)
         self.assertIn("password=$GH_TOKEN", text)
 
+    def test_a_tap_that_is_newer_is_not_taken_back(self):
+        newer = FORMULA.replace("0.7.1", "0.7.2").replace(SHA, "c" * 64)
+        url, bare = self.bare("tap", {"Formula/nerva.rb": newer})
+        f, _ = self.formula()
+        for cmd in ("tap-check", "tap"):
+            self.refused(self.run_script(cmd, "v0.7.1", f, TAP_URL=url), "NRV-E1135", "holds version 0.7.2")
+        self.assertEqual(git("rev-list", "--count", "main", cwd=bare).strip(), "1")
+        # a candidate goes to its own branch and may be older than main
+        rc, _ = self.formula(FORMULA.replace("0.7.1", "0.7.1-rc.2"))
+        self.assertEqual(self.run_script("tap", "v0.7.1-rc.2", rc, TAP_URL=url).returncode, 0)
+
+    def test_tap_check_commits_and_pushes_nothing(self):
+        old = FORMULA.replace("0.7.1", "0.7.0").replace(SHA, "c" * 64)
+        url, bare = self.bare("tap", {"Formula/nerva.rb": old})
+        f, _ = self.formula()
+        self.assertEqual(self.run_script("tap-check", "v0.7.1", f, TAP_URL=url).returncode, 0)
+        self.assertEqual(git("show", "main:Formula/nerva.rb", cwd=bare), old)
+        bad = self.dir / "bad.rb"
+        bad.write_text(FORMULA + "  depends_on :macos\n")
+        self.refused(self.run_script("tap-check", "v0.7.1", str(bad), TAP_URL=url), "NRV-E1135", "more than")
+
+    def test_make_formula_fills_the_template_and_passes_the_formula_check(self):
+        sha = self.dir / "sha"
+        sha.write_text(f"{SHA}  x.zip\n")
+        out = self.dir / "made.rb"
+        self.assertEqual(self.run_script("make-formula", "v0.7.1", str(sha), str(out)).returncode, 0)
+        self.assertEqual(self.run_script("formula", "v0.7.1", str(out), str(sha)).returncode, 0)
+        self.assertNotIn("@", out.read_text().replace("@macos", ""))
+
+    def test_state_says_published_or_draft(self):
+        self.assertEqual(self.run_script("state", "v0.7.1", DRAFT="false").stdout, "published\n")
+        self.assertEqual(self.run_script("state", "v0.7.1", DRAFT="true").stdout, "draft\n")
+        self.assertEqual(self.run_script("state", "v0.7.1", DRAFT="").stdout, "draft\n")
+        self.assertEqual(self.run_script("state", "v0.7.1", API_FAILS="1").returncode, 2)
+
+    def test_an_older_release_is_not_made_latest(self):
+        self.assertEqual(self.run_script("latest-check", "v0.7.1", PUBLISHED="v0.7.0\nv0.7.1").returncode, 0)
+        self.assertEqual(self.run_script("latest-check", "v0.7.1", PUBLISHED="").returncode, 0)
+        self.assertEqual(self.run_script("latest-check", "v0.7.1-rc.2", PUBLISHED="v0.7.2").returncode, 0)
+        newer = dict(PUBLISHED="v0.7.2\nv0.7.0")
+        self.refused(self.run_script("latest-check", "v0.7.1", **newer), "NRV-E1138",
+                     "not newer than the latest release v0.7.2")
+        self.refused(self.run_script("latest-check", "v0.7.10", PUBLISHED="v0.7.11"), "NRV-E1138", "v0.7.11")
+        self.refused(self.run_script("latest-check", "v0.7.1", API_FAILS="1"), "NRV-E1138", "cannot list")
+        result = self.run_script("publish", "v0.7.1", COMMIT, TAG_AT=COMMIT, **newer)
+        self.refused(result, "NRV-E1138", "not newer")
+        self.assertNotIn("release edit", self.calls())
+
     # publishing (NRV-E1138)
     def test_a_draft_is_published_and_a_release_is_latest(self):
         result = self.run_script("publish", "v0.7.1", COMMIT, TAG_AT=COMMIT)
@@ -268,15 +332,80 @@ class Finish(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("pr merge", self.calls())
 
+    BOT = "nerva-release[bot]"
+
+    def pull(self, number, sha, login=BOT, repo="o/site", merged=False):
+        return {"number": number, "head": {"sha": sha, "repo": {"full_name": repo}},
+                "user": {"login": login}, "merged_at": "2026-11-13T00:00:00Z" if merged else None}
+
     def test_a_rerun_reuses_the_branch_and_the_open_pull_request(self):
         url, bare = self.bare("site", {"index.html": PAGE})
         self.run_script("site", "v0.7.1", "2026-11-13", "A line.", SITE_URL=url)
-        before = git("rev-parse", "release/v0.7.1", cwd=bare)
+        tip = git("rev-parse", "release/v0.7.1", cwd=bare).strip()
         self.log.write_text("")
-        result = self.run_script("site", "v0.7.1", "2026-11-14", "A line.", SITE_URL=url, OPEN_PR="7")
+        open_prs = json.dumps([self.pull(7, tip)])
+        result = self.run_script("site", "v0.7.1", "2026-11-14", "A line.", SITE_URL=url, PULLS_OPEN=open_prs)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(git("rev-parse", "release/v0.7.1", cwd=bare), before)
+        self.assertEqual(result.stdout.strip(), "7")
+        self.assertEqual(git("rev-parse", "release/v0.7.1", cwd=bare).strip(), tip)
         self.assertNotIn("pr create", self.calls())
+        # the list is asked for by owner and branch, not by the branch name alone
+        self.assertIn("pulls?head=o:release/v0.7.1&state=open", self.calls())
+
+    def test_a_fork_pull_request_of_the_same_branch_name_is_never_ours(self):
+        url, _ = self.bare("site", {"index.html": PAGE})
+        fork = self.pull(99, "f" * 40, login="mallory", repo="fork/site")
+        # a fork's open pull request, and a fork's merged one, are both passed over
+        result = self.run_script("site", "v0.7.1", "2026-11-13", "A line.", SITE_URL=url,
+                                 PULLS_OPEN=json.dumps([fork]), PULLS_CLOSED=json.dumps([dict(fork, merged_at="2026-11-01T00:00:00Z")]))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "7")
+        self.assertIn("pr create --repo o/site", self.calls())
+        self.assertIn("pr merge 7 --repo o/site --auto --squash", self.calls())
+        self.assertNotIn("pr merge 99", self.calls())
+
+    def test_a_pull_request_by_another_author_or_at_another_commit_is_not_ours(self):
+        url, bare = self.bare("site", {"index.html": PAGE})
+        self.run_script("site", "v0.7.1", "2026-11-13", "A line.", SITE_URL=url)
+        tip = git("rev-parse", "release/v0.7.1", cwd=bare).strip()
+        for prs in ([self.pull(5, tip, login="someone")], [self.pull(5, "e" * 40)]):
+            self.log.write_text("")
+            result = self.run_script("site", "v0.7.1", "2026-11-13", "A line.", SITE_URL=url, PULLS_OPEN=json.dumps(prs))
+            self.assertEqual(result.stdout.strip(), "7", result.stderr)
+            self.assertIn("pr create", self.calls())
+            self.assertNotIn("pr merge 5", self.calls())
+
+    def test_our_merged_pull_request_ends_the_step(self):
+        url, _ = self.bare("site", {"index.html": PAGE})
+        result = self.run_script("site", "v0.7.1", "2026-11-13", "A line.", SITE_URL=url,
+                                 PULLS_CLOSED=json.dumps([self.pull(4, "a" * 40, merged=True)]))
+        self.assertEqual(result.stdout.strip(), "4", result.stderr)
+        self.assertNotIn("pr create", self.calls())
+
+    def test_without_auto_merge_the_pull_request_stays_open_and_is_not_merged_at_once(self):
+        url, _ = self.bare("site", {"index.html": PAGE})
+        result = self.run_script("site", "v0.7.1", "2026-11-13", "A line.", SITE_URL=url,
+                                 AUTO_FAILS="1", MSTATE="blocked")
+        self.refused(result, "NRV-E1136", "cannot ask for the merge of the site's pull request #7")
+        self.assertIn("auto merge is not allowed", result.stderr)
+        self.assertNotIn("pr merge 7 --repo o/site --squash", self.calls())
+
+    def test_a_pull_request_that_is_already_clean_is_merged_when_auto_merge_cannot_be_asked(self):
+        url, _ = self.bare("site", {"index.html": PAGE})
+        result = self.run_script("site", "v0.7.1", "2026-11-13", "A line.", SITE_URL=url,
+                                 AUTO_FAILS="1", MSTATE="clean")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("pr merge 7 --repo o/site --squash", self.calls())
+
+    def test_site_check_edits_a_scratch_clone_and_writes_nothing(self):
+        url, bare = self.bare("site", {"index.html": PAGE})
+        result = self.run_script("site-check", "v0.7.1", "A line.", SITE_URL=url)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(git("branch", "--format=%(refname:short)", cwd=bare).split(), ["main"])
+        self.assertEqual(self.calls(), "")
+        bad = self.run_script("site-check", "v0.6.0", "A line.", SITE_URL=url)
+        self.assertEqual(bad.returncode, 1)
+        self.assertIn("error[NRV-E1132]: site_release.py: ", bad.stderr)
 
     def test_a_site_edit_that_is_refused_pushes_nothing(self):
         url, bare = self.bare("site", {"index.html": PAGE})
@@ -295,6 +424,14 @@ class Finish(unittest.TestCase):
     def test_wait_gives_up_and_says_so(self):
         self.refused(self.run_script("site-wait", "7", "release"), "NRV-E1136",
                      "#7 did not merge in 0 minutes")
+
+    def test_a_failed_site_check_ends_a_release_wait_at_once(self):
+        result = self.run_script("site-wait", "7", "release", CHECK="failure", SITE_WAIT_SECONDS="600")
+        self.refused(result, "NRV-E1136", "ended failure")
+
+    def test_a_failing_call_is_not_yet_and_ends_in_a_coded_refusal(self):
+        self.refused(self.run_script("site-wait", "7", "release", API_FAILS="1"), "NRV-E1136", "did not merge")
+        self.refused(self.run_script("site-wait", "7", "prerelease", API_FAILS="1"), "NRV-E1136", "did not pass site-check")
 
     def test_a_prerelease_waits_for_the_site_check(self):
         self.assertEqual(self.run_script("site-wait", "7", "prerelease", CHECK="success").returncode, 0)
@@ -325,7 +462,7 @@ class Workflow(unittest.TestCase):
 
     def test_the_app_token_reaches_only_the_steps_that_write_to_the_tap_and_the_site(self):
         used = [step for step in self.text.split("\n      - ")[1:] if "steps.app.outputs.token" in step]
-        self.assertEqual(len(used), 4)  # the identity, the tap, the pull request and its wait
+        self.assertEqual(len(used), 5)  # the identity, the two checks, the tap, the pull request and its wait
         for step in used:
             self.assertRegex(step, r"release_finish\.sh (tap|site|site-wait)\b|users/\$\{SLUG\}", step)
         self.assertEqual(self.text.count("secrets.RELEASE_APP_PRIVATE_KEY"), 1)
@@ -336,8 +473,37 @@ class Workflow(unittest.TestCase):
         self.assertIn("needs: [guard, mac, mac-verify]", publish)
         self.assertIn("environment: release-publish", publish)
         # the tap and the site come after the draft is public
-        self.assertLess(publish.index("release_finish.sh publish"), publish.index("release_finish.sh tap"))
+        self.assertLess(publish.index('release_finish.sh publish "$TAG"'), publish.index('release_finish.sh tap "$TAG"'))
+        self.assertLess(publish.index('release_finish.sh publish "$TAG"'), publish.index('release_finish.sh site "$TAG"'))
+        # what can refuse without writing runs first: the token, the sentence, the tap and the site checks
+        for early in ("latest-check", "release_notes.sh site", "create-github-app-token", "tap-check", "site-check"):
+            self.assertLess(publish.index(early), publish.index('release_finish.sh publish "$TAG"'), early)
         self.assertLess(publish.index("release_check.sh publish-ready"), publish.index("release_finish.sh publish"))
+
+    def test_every_script_step_fails_on_any_error(self):
+        self.assertRegex(self.text, r"(?m)^defaults:\n  run:\n    shell: bash\n")
+        for block in re.findall(r"(?m)^        run: \|\n((?:          .*\n|\n)+)", self.text):
+            self.assertTrue(block.startswith("          set -euo pipefail\n"), block[:60])
+
+    def test_no_workflow_writes_a_command_substitution_straight_into_an_output(self):
+        # `echo "x=$(cmd)" >> $GITHUB_OUTPUT` succeeds when cmd fails (set -e does not see it)
+        for path in sorted((ROOT / ".github/workflows").glob("*.yml")):
+            for n, line in enumerate(path.read_text().splitlines(), 1):
+                if re.search(r"(echo|printf)\b.*\$\(", line) and re.search(r"GITHUB_(OUTPUT|ENV|STEP_SUMMARY)", line):
+                    self.fail(f"{path.name}:{n}: {line.strip()}")
+        for path in sorted((ROOT / ".github/scripts").glob("*.sh")):
+            for n, line in enumerate(path.read_text().splitlines(), 1):
+                if re.search(r"GITHUB_(OUTPUT|ENV)", line) and "$(" in line:
+                    self.fail(f"{path.name}:{n}: {line.strip()}")
+
+    def test_a_published_release_skips_the_signing_and_publish_still_runs(self):
+        self.assertIn("published: ${{ steps.refs.outputs.published }}", self.text)
+        for job in ("mac", "mac-verify"):
+            body = self.text.split(f"\n  {job}:\n")[1].split("\n\n")[0]
+            self.assertIn("if: needs.guard.outputs.published != 'true'", body, job)
+        publish = self.text.split("\n  publish:\n")[1].split("\n  verify:\n")[0]
+        self.assertIn("'[\"success\", \"skipped\"]'", publish)
+        self.assertIn("make-formula", publish)
 
     def test_release_yml_calls_finish_after_its_draft_and_refuses_a_missing_site_line_early(self):
         release = (ROOT / ".github/workflows/release.yml").read_text()
