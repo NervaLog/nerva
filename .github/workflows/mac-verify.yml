@@ -2,7 +2,8 @@
 #
 # The Mac zip is signed with a Developer ID, hardened and notarized in CI by mac-sign.yml (or, as the
 # fallback, on the owner's Mac with `zig build -Drelease mac-release -Dnotarize=true`) and uploaded,
-# with its `.zip.sha256`, to release.yml's draft; the owner then publishes it. This verifying runner
+# with its `.zip.sha256`, to release.yml's draft; release-finish.yml then publishes it (or the owner
+# does, by hand, if the run is not used). This verifying runner
 # never sees the Apple secrets, and the check is independent of the signer (another job, another
 # runner, both architectures), so the signature is checked where nothing signed it:
 #   1. the zip matches its `.zip.sha256`, and holds nerva, LICENSE and NOTICE;
@@ -13,15 +14,17 @@
 #      timestamp (which notarization requires);
 #   4. tests/macos/smoke.py (slice 2: three replicas, the gateway, statsd, SIGTERM) passes on that
 #      binary, with `--expect-signature developer-id`;
-#   5. `brew install nervalog/tap/nerva && brew test nerva`.
-# It runs when release.yml's `mac` job has uploaded the zip (workflow_call, on the draft), when a
-# release is published, and by hand with a tag (also against a draft: the assets are
-# found through the releases list, which a draft appears in for a token with write access). The owner
-# commits Formula/nerva.rb to the tap only after publishing, so step 5 is skipped on a draft, with a
-# notice: a green run on the draft means steps 1 to 4 passed, and the run on the `release`
-# event does step 5, waiting for the tap to name this version (up to 20 minutes). When the tap
-# lacks the formula, the brew step's error says where it comes from: mac-sign.yml's run uploads it
-# as the `homebrew-formula` artifact (`gh run download <run> -n homebrew-formula`).
+#   5. `brew install nervalog/tap/nerva && brew test nerva`, with the tap at `tap-ref` (main, or
+#      rc/v<VERSION> for a prerelease, whose formula never reaches the tap's main).
+# It runs twice in release-finish.yml (workflow_call): `mac-verify` on the draft, and `verify` on the
+# published release once `publish` has committed the formula to the tap. It also runs when a release
+# is published by hand (the `release` event), and by hand with a tag (also against a draft: the
+# assets are found through the releases list, which a draft appears in for a token with write
+# access). Step 5 is skipped on a draft, with a notice: a green run on the draft means steps 1 to 4
+# passed. On the `release` event step 5 waits for the tap to name this version (up to 20 minutes):
+# a publish with GITHUB_TOKEN, as release-finish.yml does, starts no such run. When the tap lacks
+# the formula, the brew step's error says where it comes from: mac-sign.yml's run uploads it as the
+# `homebrew-formula` artifact (`gh run download <run> -n homebrew-formula`).
 #
 # The token is given to the download step only (GH_TOKEN), never to the brew, formula or binary
 # steps. `contents: write` is needed only to list a draft release in a dispatch.
@@ -34,11 +37,21 @@ on:
         description: 'The release tag, v<VERSION>, published or a draft'
         required: true
         type: string
+      tap-ref:
+        description: 'The branch of nervalog/tap that holds the formula: main, or rc/v<VERSION> for a prerelease'
+        required: false
+        default: main
+        type: string
   workflow_dispatch:
     inputs:
       tag:
         description: 'The release tag, v<VERSION>, published or a draft'
         required: true
+        type: string
+      tap-ref:
+        description: 'The branch of nervalog/tap that holds the formula: main, or rc/v<VERSION> for a prerelease'
+        required: false
+        default: main
         type: string
   release:
     types: [published]
@@ -66,6 +79,7 @@ jobs:
     timeout-minutes: 45
     env:
       TAG: ${{ inputs.tag || github.event.release.tag_name }}
+      TAP_REF: ${{ inputs.tap-ref || 'main' }}
     steps:
       # The default branch's smoke test and nothing else: a draft has no tag to check out.
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
@@ -76,6 +90,10 @@ jobs:
         run: |
           if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
             echo "::error::'$TAG' is not a release tag (v<VERSION>)"
+            exit 1
+          fi
+          if [ "$TAP_REF" != main ] && ! [[ "$TAP_REF" =~ ^rc/v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "::error::'$TAP_REF' is not a tap ref (main, or rc/v<VERSION>)"
             exit 1
           fi
 
@@ -179,8 +197,11 @@ jobs:
           attempts=1
           if [ "$EVENT" = release ]; then attempts=10; fi
           brew tap nervalog/tap
+          tap=$(brew --repository nervalog/tap)
           for attempt in $(seq 1 "$attempts"); do
-            git -C "$(brew --repository nervalog/tap)" pull --quiet
+            # TAP_REF: main for a release, rc/v<VERSION> for a prerelease (release-finish.yml).
+            git -C "$tap" fetch --quiet origin "$TAP_REF"
+            git -C "$tap" checkout --quiet --detach FETCH_HEAD
             stable=$(brew info --json=v2 nervalog/tap/nerva | jq -r '.formulae[0].versions.stable')
             if [ "$stable" = "$version" ]; then break; fi
             echo "the tap has nerva $stable, not $version (attempt $attempt of $attempts)"

@@ -69,6 +69,13 @@ jobs:
           .github/scripts/release_notes.sh "$TAG" > notes.md
           cat notes.md
 
+      # The site's RELEASES sentence (NRV-E1130): the publish job needs it after the release is
+      # public, so a missing one is refused here, before anything is built.
+      - name: Refuse a version without a site line
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: .github/scripts/release_notes.sh site "$TAG"
+
       - name: Refuse a version whose bill of materials cannot be written
         env:
           TAG: ${{ steps.version.outputs.tag }}
@@ -226,26 +233,19 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: .github/scripts/release_check.sh assets "$TAG" dist
 
-  # Signs and notarizes the Mac zip and uploads it to the draft. Waits for the owner's approval
-  # (environment apple-signing, declared in mac-sign.yml). The `if` below skips this job, and so
-  # mac-verify, on a dispatch from any ref but main; the environment's main-only deployment rule
-  # is a second guard. A prerelease draft may target only main plus VERSION and CHANGELOG.md
-  # (release_check.sh mac-draft, P343). The workflow takes no inherited
-  # secrets: the environment's reach the keychain step directly.
-  mac:
+  # Everything after the draft is release-finish.yml (P360): `mac` signs and notarizes the zip and
+  # waits for the owner's one approval (environment apple-signing), `mac-verify` checks it on both
+  # architectures, `publish` publishes the draft, commits the formula to the tap and opens the
+  # site's pull request (environment release-publish), and `verify` installs from the tap. The `if`
+  # skips it on a dispatch from any ref but main, so a prerelease dispatched from a branch makes its
+  # draft and stops there (it is finished by dispatching release-finish.yml from main with its tag);
+  # the workflow's own `guard` and each environment's main-only deployment rule are the other guards.
+  # A prerelease draft may target only main plus VERSION and CHANGELOG.md (release_check.sh
+  # mac-draft, P343). The workflow takes no inherited secrets.
+  finish:
     needs: [version, release]
     if: github.ref == 'refs/heads/main'
-    uses: ./.github/workflows/mac-sign.yml
-    permissions:
-      contents: write
-    with:
-      tag: ${{ needs.version.outputs.tag }}
-
-  # The zip's checksum, commit, Developer ID and a smoke test on both architectures, on the draft.
-  # brew is checked by mac-verify.yml's own run when the owner publishes.
-  mac-verify:
-    needs: [version, mac]
-    uses: ./.github/workflows/mac-verify.yml
+    uses: ./.github/workflows/release-finish.yml
     permissions:
       contents: write
     with:
