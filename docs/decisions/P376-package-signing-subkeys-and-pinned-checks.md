@@ -92,7 +92,8 @@ left to slice G, after v0.7.1, which proposes its own decision in its own pull r
    `fingerprints` edit, cannot drop packages. A lasting fault stops every run until a person
    acts; the alarm and `Valid-Until`'s 10-day margin (point 5) bound the damage. When the cause
    is a key (a revoked subkey, or in the fallback a key that left `fingerprints`), the owner
-   dispatches the refresh with the input `rpm_key` set to `exclude <Key ID>`. That run marks
+   dispatches the refresh with the input `rpm_key` set to `exclude <Key ID>` (refused, NRV-E1139, unless
+   `github.triggering_actor` equals `vars.PACKAGE_REPOS_OWNER`). That run marks
    every rpm signed by it `excluded` in the manifest, with no count bound because a person
    started it, and later runs keep it so. `restore <Key ID>` reverses a mistaken exclusion, and
    is refused for a subkey that is revoked. The rest is
@@ -147,8 +148,11 @@ left to slice G, after v0.7.1, which proposes its own decision in its own pull r
        holds the binary form of `packaging/keys/nerva-release.asc`.
    - The build command copies exactly those two files and refuses a symlink.
    - Both checks use one reference, taken from Nerva and never from the pull request checked:
-     the key file at the tag of Nerva's newest published release, prereleases included (so a
-     site pull request cannot roll the WKD file back, and a candidate's pull request passes).
+     the key file at the newest published `v*` tag whose commit is an ancestor of `main`
+     (`git merge-base --is-ancestor <tag> origin/main`), prereleases included (so a site pull
+     request cannot roll the WKD file back, and a candidate's pull request passes). A
+     prerelease tagged on a branch (P311, P343) never counts: its key file can be older than
+     `main`'s or missing.
      `site_check.mjs` runs on every site pull request and does not read `RELEASES`;
      `release_finish.sh site-live` runs after a release. A difference is NRV-E1162.
      `release-finish.yml`'s `site` job writes the WKD file into the site pull request it opens,
