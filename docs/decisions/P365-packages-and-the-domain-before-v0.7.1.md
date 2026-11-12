@@ -2,7 +2,7 @@
 id: P365
 date: 2026-11-12
 area: Releases
-amends: P360, P148
+amends: P360, P148, P364
 ---
 
 # Signed apt and dnf repositories, and the site at nerva.pro, ship in v0.7.1
@@ -17,96 +17,116 @@ amends: P360, P148
 - Workers Paid is bought only if the free quota is hit. (With the design below no Worker serves
   anything, so there is no quota to hit.)
 
+**The owner's later decisions (owner, 2026-11-12, after the first rework).**
+
+- Cloudflare owns the site's deploy: Cloudflare Pages builds and deploys the site repository's
+  `main` through its Git integration, and GitHub Pages is turned off. Cloudflare's GitHub App is
+  installed on the site repository only. No Cloudflare token for the site is in GitHub; the only
+  Cloudflare credential in GitHub is the R2 token in `package-repos`.
+- `nerva.pro` is the Pages project's custom domain. `site-check` and the ruleset still gate the
+  site's `main`.
+
 **Decision.** The design is `docs/releases/packages.md`. In short:
 
-1. **The site stays on GitHub Pages, at `https://nerva.pro/` (amends P148).** The site repository's
-   `main` is still served by GitHub Pages and a merge is still a deploy, now under the custom
-   domain `nerva.pro`, verified for the organisation. GitHub answers `https://nervalog.github.io/`
-   with a 301 to the new address. The release pull request flow does not change. `nerva.pro`'s DNS
-   is a Cloudflare zone, with the site's records DNS only.
-2. **Nothing the packages' trust depends on is in the site repository.** The public key and the
-   pinned fingerprints are `packaging/keys/` in this repository, and the code that writes and
-   checks the repositories is here too, under the guard that already protects the release
-   workflows. The site page carries no key or repository line and links to INSTALL.md. Someone who
-   can merge to the site can change the page, nothing else. The site's code-owner rule, which
-   could never be met by the App or by `topwombat` on their own pull requests and which owned
-   nothing, is turned off, and its CODEOWNERS file is removed.
-3. **The repositories are the R2 bucket `nerva-packages`, served by R2's public access through
-   the custom domain `packages.nerva.pro`.** Public access is read-only by construction: it serves
-   GET and HEAD of stored objects, with the `Content-Type` and `Cache-Control` the job stored. No
-   Worker or Pages Function is in the path. There is no read-only R2 binding, and a Pages project
-   built from the site repository could bind the bucket through a `wrangler.toml` in it, so the
-   first draft's Pages Function was dropped. Each dnf channel has its own physical copy of its
-   rpms, so no path needs mapping.
-4. **The manifest's signature is pinned.** `manifest/pool.asc` is verified only against the keys
-   in `packaging/keys/nerva-release.asc` whose fingerprints `packaging/keys/fingerprints` lists.
-   The signing key's fingerprint must be the `current` one. Nothing read from the bucket, the site
-   or the network is a trusted key.
-5. **New package content is bound to the approved run.** `repos-ready`, after the owner approves
-   `mac` and before `publish`, reads the four packages' digests from the draft (`bound`). `repos`
-   lists and signs only bytes equal to `bound`, or bytes equal to an entry already in the signed
-   manifest. A dispatch, a "Re-run all jobs" or the weekly refresh binds nothing new: it finishes
-   pending entries and re-signs indexes. Mutable release assets therefore cannot get new content
-   signed (NRV-E1148). Older releases are not backfilled.
-6. **Writes are ordered so that re-runs converge.** Every package object is listed as `pending` in
-   a signed manifest before it is written, put only if absent, compared before it is adopted, then
-   promoted to `published`; indexes are regenerated from the published entries, `InRelease` and
-   `repomd.xml` last. A crash at any step leaves a bucket the next write run accepts. Published
-   package objects are never replaced or deleted (NRV-E1141, NRV-E1142).
-7. **Write runs queue on a lock in the bucket, never cancel.** `repos` has no concurrency group.
-   The lock is a sequence of write-if-absent objects `lock/<generation>`, with a 60-minute stale
-   takeover and a 45-minute holder deadline (NRV-E1147).
-8. **apt's `Release` carries `Valid-Until`, 21 days on,** and a weekly workflow,
-   `package-repos-refresh.yml`, re-signs both channels without a release.
-9. **Channels are told apart where apt checks.** `stable` and `rc` have their own Label, Suite and
-   Codename (`nerva-stable`, `nerva-rc`), so apt on a host that has read `stable` refuses a copied
-   `rc` `InRelease`. dnf's `stable` directory never holds a candidate's file.
-10. **Three jobs in `release-finish.yml` (amends P360 point 10, which planned one),** `repos-ready`,
-    `repos`, `repos-verify`, in their own environment, `package-repos`, which only `main` can
-    deploy and which has no reviewer. It holds an R2 token for one bucket and the signing key. The
-    release stays one approval, `apple-signing`. `repos-verify` installs on Debian 12 and 13,
-    Ubuntu 24.04, Rocky 9 and Fedora 43, on amd64 and arm64.
-11. **One OpenPGP key, RSA 4096, sign-only, SHA-512, no expiry, no subkeys,** made by the owner in
-    a throwaway keyring, its secret part and passphrase in `package-repos` only, never in an argv
-    or the log. Rotation every two years, through `next` and `previous` in `fingerprints`. The
-    release's own assets stay unsigned (P295); the repository's rpms are signed copies, its debs
-    the release's files.
-12. NRV-E1139 to NRV-E1148 are reserved for these failures.
+1. **The site is built and deployed by Cloudflare Pages, at `https://nerva.pro/` (amends P148).**
+   The project `nerva-site` builds the site repository's `main`; a merge is still a deploy. The
+   release pull request flow does not change; P364's "published" now means that Cloudflare
+   deployed the merge (amends P364). `www.nerva.pro` is a 301 to the apex by a Cloudflare redirect
+   rule. GitHub Pages is off, and `https://nervalog.github.io/` answers 404: a redirect would need
+   Pages kept on or the site repository renamed, for few inbound links.
+2. **The Pages build command is the gate.** Set in the dashboard, where no pull request can change
+   it, it refuses `functions/`, `_worker.js`, `_routes.json` and `wrangler.*` (NRV-E1152) and
+   copies `index.html` alone into the output directory. So a site merge cannot run code on
+   Cloudflare or bind the bucket. Preview deployments are on for pull requests, with the same
+   gate, and Cloudflare's check is not required.
+3. **Nothing the packages' trust depends on is in the site repository.** The public key and the
+   pinned fingerprints are `packaging/keys/` in this repository, with the code that writes and
+   checks the repositories, under the guard that protects the release workflows. The site's
+   code-owner rule, which owned nothing and could never be met, is turned off, and its CODEOWNERS
+   file is removed.
+4. **The repositories are the R2 bucket `nerva-packages`, served read-only by R2's public custom
+   domain `packages.nerva.pro`.** No Worker or Function is in the path. Each dnf channel has its
+   own copy of its rpms.
+5. **Bucket locks make packages, manifests and lock objects permanent.** Five lock rules with
+   indefinite retention cover `apt/pool/`, `rpm/stable/packages/`, `rpm/rc/packages/`,
+   `manifest/` and `lock/`. The bucket token is "Object Read & Write" and cannot change them.
+   Every write run probes that they hold (NRV-E1149).
+6. **The manifest is a locked series.** Each write is a new `manifest/<generation>.asc`, written
+   if absent, with its generation inside; the highest is current, so it cannot be rolled back. It
+   is verified only against the keys `packaging/keys/fingerprints` pins, parsed strictly (one
+   signed block, one valid signature, only `gpgv`'s output), and it records the SHA-256 of every
+   index file a run replaces (`index`) and of what the run found (`index-was`). An index that
+   matches neither is rewritten, then the run ends red (NRV-E1142).
+7. **New package content is bound to the approved run, while the release is a draft.**
+   `repos-ready` binds the draft's four packages only if the release reads `draft: true` when it
+   checks (NRV-E1148 otherwise). `repos` signs only bytes equal to that binding or to an entry of
+   the signed manifest. A dispatch, a "Re-run all jobs" or the refresh binds nothing new.
+8. **`repos` waits for the publication, not for `publish`'s success.** `publish` gains the output
+   `public`, read from the release after the publish step under `if: always()`; `repos` runs when
+   it is `true`, even if the tap or the site failed afterwards. The recovery, "Re-run failed jobs",
+   is open for GitHub's 30 days.
+9. **Writes converge, and runs queue on a lock in the bucket, never cancel** (NRV-E1147). Every
+   package object is listed as `pending` in a signed manifest before it is written.
+10. **apt's `Release` carries `Valid-Until`, 21 days on, and a weekly workflow re-signs.** Against
+    GitHub's 60-day disabling of schedules, the refresh fails from day 45 without a commit, and a
+    `repos-fresh` job in `ci.yml` (pushes to `main` only, not required) fails when `Valid-Until`
+    is within 7 days (NRV-E1150).
+11. **Four jobs in `release-finish.yml` (amends P360 point 10, which planned one):** `repos-ready`,
+    `repos`, `repos-verify` in the environment `package-repos` (only `main`, no reviewer, no admin
+    bypass), and `site-verify`, which polls `nerva.pro` for the release for 15 minutes
+    (NRV-E1151). The release stays one approval. `repos-verify` runs INSTALL.md's commands on
+    Debian 12 and 13, Ubuntu 24.04, Rocky 9 and Fedora 43 (dnf5 5.2.18.0-4.fc43 or later, no
+    `rpm --import`), on amd64 and arm64.
+12. **One OpenPGP key, RSA 4096, sign-only, SHA-512, no expiry, no subkeys.** Its secret part and
+    passphrase are in `package-repos` only. Rotation every two years: during the overlap apt's
+    metadata is signed by both keys, and `previous` stays for good.
+13. NRV-E1139 to NRV-E1152 are reserved for these failures (the spec first took E1139 to E1148).
 
 **Reason.**
 
 - Users get `apt install nerva` and `dnf install nerva`, and later upgrades, from v0.7.1.
 - One guard, merging to Nerva's `main`, already protects the release workflows and the signing
-  environments; putting the key, the fingerprints and the serving decision behind it adds no
-  second place an attacker could aim at. The site repository is merged by bots and needs no
-  security role.
-- R2's public custom domain has no write path and no code, so no merge anywhere can turn the
-  reader into a writer. R2 gives a credential for one bucket, write-if-absent puts and no egress
-  fee.
-- Binding to the approved run, not to release assets, is the only fixed record of what the owner
-  approved.
+  environments. Putting the key, the fingerprints and the writer behind it adds no second target.
+  The site repository is merged by bots and needs no security role.
+- Cloudflare deploying the site keeps the domain, the site and the packages in one account,
+  without a Cloudflare token in GitHub for the site. The build gate takes away the one way a site
+  merge could reach Cloudflare resources.
+- R2's public custom domain has no write path and no code. The locks take deletion and
+  replacement away from the token, so rollback and freeze need no outside anchor.
+- Binding to the approved run while the release is a draft is the only fixed record of what the
+  owner approved.
 - The `rc` channel lets the rehearsal run every write, signature and install check against the
-  real bucket and host before v0.7.1, without touching `stable`.
+  real bucket and host before v0.7.1.
 
 **Cost.**
 
-- **More moving parts at the release.** A Cloudflare zone, a bucket and its public host, a weekly
-  workflow, and a key whose custody is the owner's.
-- **Failures land after the release is public.** A failure in `repos` or `repos-verify` happens
-  then; the fix is "Re-run failed jobs" of the same run. A release whose approved run never wrote
-  its entries cannot be added later without a new decision.
+- **More moving parts at the release.** A Cloudflare zone, a Pages project, a bucket with locks,
+  a weekly workflow, a CI job, and a key whose custody is the owner's.
+- **The site's gate lives in a dashboard.** Adding a file to the site means the owner extends the
+  build command. If Cloudflare starts reading a config file under a new name, a site merge could
+  gain the bucket token's power until the command is extended.
+- **`https://nervalog.github.io/` breaks,** bookmarks and outside links included.
+- **`repos-ready` blocks the release on a bucket fault.** With R2 down or an object planted, the
+  GitHub release, the tap and the site wait too, though they do not depend on the packages.
+- **Failures land after the release is public.** The fix is "Re-run failed jobs" of the same run,
+  within 30 days. After that, an unbound release needs a new decision; its files install by hand.
+- **Nothing in the bucket can be deleted.** Candidates' packages, every manifest and every lock
+  object stay for good. Above 2,000 packages, 8 GiB, 100,000 manifests or 20,000 lock objects the
+  job refuses and a pruning decision is needed.
+- **The R2 token can still deny service:** it can delete or replace the index files, which the next
+  write run repairs and reports, and it can replay an older signed index set, which apt's
+  `Valid-Until` bounds and dnf does not, until the next write run (at most a week). It can replay
+  the previous run's set unnoticed.
 - **Two copies of each release's rpm** (about 14 MB), to keep dnf paths physical.
-- **A short window for dnf.** A client can read `repomd.xml` and `repomd.xml.asc` from two runs,
-  and fails once.
-- **dnf has no signed expiry,** so a replayed `repomd.xml` works until the next write run (at most
-  a week); apt's is bounded by `Valid-Until`. A cached apt host refuses a channel swap; a fresh one
-  only warns, and dnf does not check.
-- **Two failed refreshes in a row** before `Valid-Until` runs out break `apt update` for everyone.
-- **The R2 token can delete.** R2 has no write-only grant; deletion is a denial of service the
-  next run reports.
-- **The bucket is public,** manifest and lock included; they hold only what releases and runs
+- **A short window for dnf** between `repomd.xml` and its signature.
+- **Two failed refreshes in a row,** or a quiet repository ignored past day 60, break `apt update`
+  for everyone after `Valid-Until`.
+- **dnf 5 on Fedora 41 to 44 needs a recent dnf5** for `repo_gpgcheck`; the fallback,
+  `repo_gpgcheck=0`, keeps per-rpm signatures but loses signed metadata.
+- **A key rotation breaks apt users who never fetch the key again,** at the end of the overlap.
+  Shipping the key in a package is the fix, a decision for before the first rotation.
+- **A key compromise needs a new decision,** because locked rpms cannot be re-signed.
+- **The bucket is public,** manifests and locks included; they hold only what releases and runs
   already show.
-- **Candidates' packages stay in the bucket for good.**
-- **A key compromise needs a new decision,** because signed rpms cannot be re-signed in place.
-- **Not exercised before v0.7.1.** The first write to `stable` runs for the first time on v0.7.1
-  itself.
+- **Not exercised before v0.7.1.** The first write to `stable` and `site-verify` run for the first
+  time on v0.7.1 itself.
