@@ -10,6 +10,7 @@ import os
 import re
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -52,6 +53,7 @@ printf '%s\n' "$*" >> "$GH_LOG"
 [ -n "$API_FAILS" ] && [ "$1" = api ] && { echo "gh: HTTP 502" >&2; exit 1; }
 case "$*" in
   "pr create"*) echo "https://github.com/o/site/pull/7" ;;
+  "pr merge"*--match-head-commit*) [ -n "$HEAD_MOVED" ] && { echo "gh: head branch was modified" >&2; exit 1; }; case "$*" in *--auto*) [ -n "$AUTO_FAILS" ] && { echo "gh: auto merge is not allowed (HTTP 422)" >&2; exit 1; } ;; *) [ -n "$MERGE_FAILS" ] && { echo "gh: not mergeable" >&2; exit 1; } ;; esac; exit 0 ;;
   "pr merge"*--auto*) [ -n "$AUTO_FAILS" ] && { echo "gh: auto merge is not allowed (HTTP 422)" >&2; exit 1; }; exit 0 ;;
   "pr merge"*) [ -n "$MERGE_FAILS" ] && { echo "gh: not mergeable" >&2; exit 1; }; exit 0 ;;
   "release edit"*) [ -n "$EDIT_FAILS" ] && { echo "gh: boom (HTTP 422)" >&2; exit 1; }; exit 0 ;;
@@ -66,7 +68,15 @@ case "$*" in
   *releases*"prerelease == false"*) [ -n "$PUBLISHED" ] && printf '%s\n' "$PUBLISHED" ;;
   *releases*"select(.tag_name"*"assets[]"*) [ -n "$ASSET_ID" ] && echo "$ASSET_ID" ;;
   *releases*) echo "$DRAFT" ;;
-  *check-runs*) echo "$CHECK" ;;
+  *check-runs*)
+    n=$(cat "$GH_LOG.n" 2>/dev/null || echo 0); n=$((n + 1)); echo $n > "$GH_LOG.n"
+    f=; p=
+    for a in "$@"; do [ "$p" = --jq ] && f=$a; p=$a; done
+    c=$CHECK; [ -n "$CHECK_AFTER" ] && [ "$n" -gt 1 ] && c=$CHECK_AFTER
+    j=$CHECK_RUNS
+    [ -z "$j" ] && j="{\"check_runs\":[{\"id\":1,\"name\":\"site-check\",\"app\":{\"slug\":\"github-actions\"},\"conclusion\":$([ -n "$c" ] && echo "\"$c\"" || echo null)}]}"
+    printf '%s' "$j" | jq -r "$f"
+    exit 0 ;;
   *pulls/*"mergeable_state"*) echo "$MSTATE" ;;
   *pulls/*"head.sha"*) echo deadbeef ;;
   *pulls/*) echo "$MERGED" ;;
@@ -96,7 +106,7 @@ class Finish(unittest.TestCase):
             BOT_EMAIL="1+nerva-release[bot]@users.noreply.github.com", SITE_REPO="o/site",
             SITE_WAIT_SECONDS="1", SITE_POLL_SECONDS="1", TAG_POLL_SECONDS="0",
             DRAFT="true", TAG_AT="", MERGED="false", CHECK="", MSTATE="", ASSET_SHA="", ASSET_ID="",
-            EDIT_FAILS="", PUBLISHED="", PULLS_OPEN="", PULLS_CLOSED="", AUTO_FAILS="", MERGE_FAILS="", API_FAILS="", GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_SYSTEM="/dev/null",
+            EDIT_FAILS="", PUBLISHED="", PULLS_OPEN="", PULLS_CLOSED="", AUTO_FAILS="", MERGE_FAILS="", CHECK_AFTER="", CHECK_RUNS="", HEAD_MOVED="", API_FAILS="", GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_SYSTEM="/dev/null",
         )
 
     def run_script(self, *args, **env):
@@ -329,16 +339,18 @@ class Finish(unittest.TestCase):
                      "could not be published")
 
     # the site (NRV-E1136, E1132)
-    def test_a_release_opens_the_site_pull_request_and_asks_for_auto_merge(self):
+    def test_a_release_opens_the_site_pull_request_and_merges_it_at_the_checked_commit(self):
         url, bare = self.bare("site", {"index.html": PAGE})
-        result = self.run_script("site", "v0.7.1", "2026-11-13", "A line.", SITE_URL=url)
+        result = self.run_script("site", "v0.7.1", "2026-11-13", "A line.", SITE_URL=url, CHECK="success")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), "7")
         page = git("show", "release/v0.7.1:index.html", cwd=bare)
         self.assertIn('{v:"0.7.1", date:"2026-11-13", d:"A line."}', page)
         self.assertEqual(git("show", "main:index.html", cwd=bare), PAGE)
         self.assertIn("pr create --repo o/site --base main --head release/v0.7.1", self.calls())
-        self.assertIn("pr merge 7 --repo o/site --auto --squash", self.calls())
+        tip = git("rev-parse", "release/v0.7.1", cwd=bare).strip()
+        self.assertIn(f"pr merge 7 --repo o/site --squash --match-head-commit {tip}", self.calls())
+        self.assertNotIn("--auto", self.calls())
 
     def test_a_prerelease_pull_request_is_not_merged(self):
         url, _ = self.bare("site", {"index.html": PAGE})
@@ -354,11 +366,11 @@ class Finish(unittest.TestCase):
 
     def test_a_rerun_reuses_the_branch_and_the_open_pull_request(self):
         url, bare = self.bare("site", {"index.html": PAGE})
-        self.run_script("site", "v0.7.1", "2026-11-13", "A line.", SITE_URL=url)
+        self.run_script("site", "v0.7.1", "2026-11-13", "A line.", SITE_URL=url, CHECK="success")
         tip = git("rev-parse", "release/v0.7.1", cwd=bare).strip()
         self.log.write_text("")
         open_prs = json.dumps([self.pull(7, tip)])
-        result = self.run_script("site", "v0.7.1", "2026-11-14", "A line.", SITE_URL=url, PULLS_OPEN=open_prs)
+        result = self.run_script("site", "v0.7.1", "2026-11-14", "A line.", SITE_URL=url, CHECK="success", PULLS_OPEN=open_prs)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), "7")
         self.assertEqual(git("rev-parse", "release/v0.7.1", cwd=bare).strip(), tip)
@@ -371,28 +383,28 @@ class Finish(unittest.TestCase):
         # The author is the App's, so only the head repository tells a fork's pull request apart.
         fork = self.pull(99, "f" * 40, login=self.BOT, repo="fork/site")
         # a fork's open pull request, and a fork's merged one, are both passed over
-        result = self.run_script("site", "v0.7.1", "2026-11-13", "A line.", SITE_URL=url,
+        result = self.run_script("site", "v0.7.1", "2026-11-13", "A line.", SITE_URL=url, CHECK="success",
                                  PULLS_OPEN=json.dumps([fork]), PULLS_CLOSED=json.dumps([dict(fork, merged_at="2026-11-01T00:00:00Z")]))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), "7")
         self.assertIn("pr create --repo o/site", self.calls())
-        self.assertIn("pr merge 7 --repo o/site --auto --squash", self.calls())
+        self.assertIn("pr merge 7 --repo o/site --squash --match-head-commit", self.calls())
         self.assertNotIn("pr merge 99", self.calls())
 
     def test_a_closed_pull_request_that_was_not_merged_is_not_a_merged_one(self):
         url, _ = self.bare("site", {"index.html": PAGE})
         closed = dict(self.pull(4, "a" * 40), merged_at=None)
-        result = self.run_script("site", "v0.7.1", "2026-11-13", "A line.", SITE_URL=url, PULLS_CLOSED=json.dumps([closed]))
+        result = self.run_script("site", "v0.7.1", "2026-11-13", "A line.", SITE_URL=url, CHECK="success", PULLS_CLOSED=json.dumps([closed]))
         self.assertEqual(result.stdout.strip(), "7", result.stderr)
         self.assertIn("pr create", self.calls())
 
     def test_a_pull_request_by_another_author_or_at_another_commit_is_not_ours(self):
         url, bare = self.bare("site", {"index.html": PAGE})
-        self.run_script("site", "v0.7.1", "2026-11-13", "A line.", SITE_URL=url)
+        self.run_script("site", "v0.7.1", "2026-11-13", "A line.", SITE_URL=url, CHECK="success")
         tip = git("rev-parse", "release/v0.7.1", cwd=bare).strip()
         for prs in ([self.pull(5, tip, login="someone")], [self.pull(5, "e" * 40)]):
             self.log.write_text("")
-            result = self.run_script("site", "v0.7.1", "2026-11-13", "A line.", SITE_URL=url, PULLS_OPEN=json.dumps(prs))
+            result = self.run_script("site", "v0.7.1", "2026-11-13", "A line.", SITE_URL=url, CHECK="success", PULLS_OPEN=json.dumps(prs))
             self.assertEqual(result.stdout.strip(), "7", result.stderr)
             self.assertIn("pr create", self.calls())
             self.assertNotIn("pr merge 5", self.calls())
@@ -404,34 +416,87 @@ class Finish(unittest.TestCase):
         self.assertEqual(result.stdout.strip(), "4", result.stderr)
         self.assertNotIn("pr create", self.calls())
 
-    def test_without_auto_merge_the_pull_request_stays_open_and_is_not_merged_at_once(self):
+    def test_a_failed_site_check_is_not_merged_and_is_refused(self):
         url, _ = self.bare("site", {"index.html": PAGE})
         result = self.run_script("site", "v0.7.1", "2026-11-13", "A line.", SITE_URL=url,
-                                 AUTO_FAILS="1", MSTATE="blocked")
-        self.refused(result, "NRV-E1136", "cannot ask for the merge of the site's pull request #7")
-        self.assertIn("auto merge is not allowed", result.stderr)
-        self.assertNotIn("pr merge 7 --repo o/site --squash", self.calls())
+                                 MSTATE="clean", CHECK="failure")
+        self.refused(result, "NRV-E1136", "is 'failure'")
+        self.assertNotIn("pr merge", self.calls())
 
-    def test_without_auto_merge_a_passed_site_check_allows_a_merge_at_that_commit(self):
+    def test_a_site_check_still_pending_at_the_deadline_is_not_merged_and_is_refused(self):
+        url, _ = self.bare("site", {"index.html": PAGE})
+        result = self.run_script("site", "v0.7.1", "2026-11-13", "A line.", SITE_URL=url,
+                                 MSTATE="clean", CHECK="")
+        self.refused(result, "NRV-E1136", "is 'missing'")
+        self.assertNotIn("pr merge", self.calls())
+
+    def test_the_check_run_is_the_latest_site_check_of_github_actions(self):
+        url, _ = self.bare("site", {"index.html": PAGE})
+        runs = lambda *r: json.dumps({"check_runs": [
+            {"id": i, "name": n, "app": {"slug": a}, "conclusion": c} for i, n, a, c in r]})
+        gha = "github-actions"
+        for expected, rs in (
+            ("is 'missing'", runs((5, "site-check", "evil-app", "success"))),
+            ("is 'missing'", runs((5, "other", gha, "success"))),
+            ("is 'failure'", runs((2, "site-check", gha, "success"), (3, "site-check", gha, "failure"))),
+            ("is 'failure'", runs((3, "site-check", gha, "failure"), (2, "site-check", gha, "success"))),
+            ("is 'missing'", runs((2, "site-check", gha, "success"), (3, "site-check", gha, None))),
+        ):
+            self.log.write_text("")
+            result = self.run_script("site", "v0.7.1", "2026-11-13", "A line.", SITE_URL=url, CHECK_RUNS=rs)
+            self.refused(result, "NRV-E1136", expected)
+            self.assertNotIn("pr merge", self.calls())
+        self.log.write_text("")
+        ok = runs((2, "site-check", gha, "failure"), (3, "site-check", gha, "success"), (9, "site-check", "evil-app", "failure"))
+        self.assertEqual(self.run_script("site", "v0.7.1", "2026-11-13", "A line.", SITE_URL=url, CHECK_RUNS=ok).returncode, 0)
+
+    def test_every_conclusion_but_success_is_refused(self):
+        url, _ = self.bare("site", {"index.html": PAGE})
+        for conclusion in ("cancelled", "skipped", "neutral", "timed_out", "action_required", "stale"):
+            self.log.write_text("")
+            result = self.run_script("site", "v0.7.1", "2026-11-13", "A line.", SITE_URL=url, CHECK=conclusion)
+            self.refused(result, "NRV-E1136", f"is '{conclusion}'")
+            self.assertNotIn("pr merge", self.calls())
+
+    def test_a_pending_check_that_then_passes_is_waited_for_and_merged(self):
+        url, _ = self.bare("site", {"index.html": PAGE})
+        result = self.run_script("site", "v0.7.1", "2026-11-13", "A line.", SITE_URL=url,
+                                 CHECK="", CHECK_AFTER="success", SITE_WAIT_SECONDS="30")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("pr merge 7", self.calls())
+
+    def test_a_head_that_moved_after_the_check_is_not_merged(self):
+        url, _ = self.bare("site", {"index.html": PAGE})
+        result = self.run_script("site", "v0.7.1", "2026-11-13", "A line.", SITE_URL=url,
+                                 CHECK="success", HEAD_MOVED="1")
+        self.refused(result, "NRV-E1136", "cannot merge the site's pull request #7")
+        self.assertIn("head branch was modified", result.stderr)
+
+    def test_a_poll_interval_below_one_second_is_refused(self):
+        for bad in ("0", "x", "-1", "1.5"):
+            result = self.run_script("site-wait", "7", "release", SITE_POLL_SECONDS=bad)
+            self.refused(result, "NRV-E1136", "is not a whole number of seconds")
+        result = self.run_script("site-wait", "7", "release", SITE_WAIT_SECONDS="x")
+        self.refused(result, "NRV-E1136", "is not a whole number of seconds")
+
+    def test_the_wait_ends_at_the_shared_deadline(self):
+        past = str(int(time.time()) - 5)
+        result = self.run_script("site-wait", "7", "release", SITE_DEADLINE=past, SITE_WAIT_SECONDS="600")
+        self.refused(result, "NRV-E1136", "did not merge in 10 minutes")
+
+    def test_a_pending_rule_falls_back_to_auto_merge_at_the_same_commit(self):
         url, bare = self.bare("site", {"index.html": PAGE})
         result = self.run_script("site", "v0.7.1", "2026-11-13", "A line.", SITE_URL=url,
-                                 AUTO_FAILS="1", MSTATE="clean", CHECK="success")
+                                 MERGE_FAILS="1", CHECK="success")
         self.assertEqual(result.returncode, 0, result.stderr)
         tip = git("rev-parse", "release/v0.7.1", cwd=bare).strip()
-        self.assertIn(f"pr merge 7 --repo o/site --squash --match-head-commit {tip}", self.calls())
+        calls = self.calls()
+        plain = f"pr merge 7 --repo o/site --squash --match-head-commit {tip}"
+        auto = f"pr merge 7 --repo o/site --auto --squash --match-head-commit {tip}"
+        self.assertIn(auto, calls)
+        self.assertLess(calls.index(plain), calls.index(auto))
 
-    def test_a_failed_or_missing_site_check_is_never_merged_even_when_the_state_is_clean(self):
-        for check in ("failure", ""):
-            url, _ = self.bare("site" + check, {"index.html": PAGE})
-            self.log.write_text("")
-            result = self.run_script("site", "v0.7.1", "2026-11-13", "A line.", SITE_URL=url,
-                                     AUTO_FAILS="1", MSTATE="clean", CHECK=check)
-            self.refused(result, "NRV-E1136", "cannot ask for the merge of the site's pull request #7")
-            self.assertIn(f"is '{check or 'missing'}'", result.stderr)
-            self.assertNotIn("--squash --match-head-commit", self.calls())
-            self.assertNotIn("pr merge 7 --repo o/site --squash", self.calls())
-
-    def test_a_merge_that_gh_refuses_after_a_passed_check_is_coded(self):
+    def test_a_merge_that_gh_refuses_both_ways_after_a_passed_check_is_coded(self):
         url, _ = self.bare("site", {"index.html": PAGE})
         result = self.run_script("site", "v0.7.1", "2026-11-13", "A line.", SITE_URL=url,
                                  AUTO_FAILS="1", MERGE_FAILS="1", CHECK="success")

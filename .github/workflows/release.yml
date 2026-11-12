@@ -1,5 +1,7 @@
-# A commit to main that changes VERSION publishes release v<VERSION> (docs/DECISIONS.md N40):
-# CI on that commit, then binaries for four targets, then the tag and the GitHub release.
+# A commit to main that changes VERSION publishes release v<VERSION> (docs/DECISIONS.md N40). The
+# jobs run in order: version, then ci (on that commit), then release (binaries for four targets, and
+# a draft release), then finish (release-finish.yml, on main), which publishes it once the owner has
+# approved `apple-signing` (P360).
 # A version with a suffix (0.2.0-rc.1) is a prerelease. Releasing a version twice fails.
 # The release notes are the version's section of CHANGELOG.md (`## v<VERSION> — <date>`); a
 # version without one is refused before CI runs. Each release carries its software bill of
@@ -9,14 +11,16 @@
 # units and the settings examples (packaging/linux); the four Linux packages (nerva_<v>-1_<arch>.deb
 # and nerva-<v>-1.<arch>.rpm; a prerelease's `-` is `~` inside the package and `.` in the file name,
 # because GitHub renames an asset whose name has a `~`, P311) are built from the same binaries and
-# are in SHA256SUMS; and the release is a DRAFT. The Mac zip is signed and notarized in CI by the
-# `mac` job (mac-sign.yml, after the draft exists; environment `apple-signing`, so the owner
-# approves the run) and uploaded with its `.zip.sha256` to the draft; `mac-verify` (mac-verify.yml)
-# then checks it, on both architectures. Both run only on main: a prerelease dispatched from a
-# branch skips them, and is rehearsed by dispatching mac-sign.yml from main with the draft's tag.
-# The owner's own Mac (`zig build -Drelease mac-release -Dnotarize=true`) remains the fallback if
-# the runner or Apple's notary service fails. The owner reads the green run and publishes the draft
-# (SHA256SUMS does not cover the zip, which is made after it).
+# are in SHA256SUMS; and the release is a DRAFT. `finish` then runs on main: its `mac` job signs and
+# notarizes the Mac zip (mac-sign.yml; environment `apple-signing`, so the owner's one approval of
+# that run ships the release) and uploads it, with its `.zip.sha256`, to the draft; `mac-verify`
+# (mac-verify.yml) checks it on both architectures. Only then `publish` publishes the draft, commits
+# the Homebrew formula to the tap and opens the site's pull request, and `verify` installs from the
+# tap. A prerelease dispatched from a branch stops at its draft, since `finish` runs only on main;
+# release-finish.yml dispatched from main with the draft's tag rehearses it, or finishes a run that
+# stopped. The owner's own Mac (`zig build -Drelease mac-release -Dnotarize=true`) remains the
+# fallback if the runner or Apple's notary service fails. (SHA256SUMS does not cover the zip, which
+# is made after it.)
 # Publishing creates the tag on the commit the draft names. The run refuses a second release of a
 # version while a draft of it exists (a draft has no tag; checked again just before the draft is
 # created, because "Re-run failed jobs" does not run the `version` job again), a binary whose
