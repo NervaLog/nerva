@@ -71,7 +71,7 @@ quotes the fleet's tracker line, the Jepsen result and both verdicts. **Code pin
 `version` job and `release-finish.yml`'s `publish` job) refuses a `VERSION` commit that is not that
 candidate's descendant, that changes `src/`, `build.zig`, `build.zig.zon`, `zig/`, `.gitmodules` or
 a `.gitattributes` since it, or that changes `release/candidate` itself (it is read at the commit's
-first parent); packaging, docs and workflow changes may follow the candidate. Within a day of the release,
+first parent, and must be unchanged since main's head before the push); packaging, docs and workflow changes may follow the candidate. Within a day of the release,
 a short retro goes in `docs/retros/<version>.md`: which assumptions were wrong, what each cost,
 and what changes; a rule it changes lands here or in `docs/decisions/` in the same PR.
 

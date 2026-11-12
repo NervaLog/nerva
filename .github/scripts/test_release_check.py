@@ -4,6 +4,7 @@ python3 .github/scripts/test_release_check.py
 
 A stand-in `nerva` and a stand-in `gh` (a script that answers from files) stand for the real two."""
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -290,10 +291,10 @@ class Candidate(unittest.TestCase):
         self.write("release/candidate", (text if text is not None else self.candidate) + "\n")
         return self.commit("pin the candidate")
 
-    def check(self, tag="v0.7.1", commit=None):
+    def check(self, tag="v0.7.1", commit=None, *before):
         commit = commit or git(self.repo, "rev-parse", "HEAD")
         env = dict(os.environ, GITHUB_REPOSITORY="o/r")
-        return subprocess.run([str(SCRIPT), "candidate", tag, commit], capture_output=True, text=True,
+        return subprocess.run([str(SCRIPT), "candidate", tag, commit, *before], capture_output=True, text=True,
                               env=env, cwd=self.repo)
 
     def refused(self, result, fragment):
@@ -431,20 +432,87 @@ class Candidate(unittest.TestCase):
         self.pin()
         self.refused(self.check("v0.7.1-rc.1"), "release/candidate is missing")
 
-    def test_a_candidate_repointed_on_main_before_the_release_commit_is_honoured(self):
-        # The file is on main one commit earlier: the check then names the new candidate, and the
-        # fix after the old one is covered by it.
+    def rebase_merged(self):
+        """A rebase merge: `repoint` and `bump` both land on main, in one push."""
+        self.pin()
+        before = git(self.repo, "rev-parse", "HEAD")
+        self.write("src/a.zig", "fix\n")
+        fix = self.commit("unsoaked fix")
+        self.write("release/candidate", fix + "\n")
+        self.commit("repoint")
+        self.write("VERSION", "2\n")
+        self.commit("bump")
+        return before
+
+    def test_a_rebase_merged_repoint_and_bump_in_one_push_is_refused(self):
+        before = self.rebase_merged()
+        # The first parent rule alone is blind to it: this is why the push's `before` is checked.
+        self.assertEqual(self.check().returncode, 0)
+        self.refused(self.check("v0.7.1", None, before), "changed within the push")
+
+    def test_a_candidate_repointed_in_an_earlier_push_is_honoured(self):
         self.write("src/a.zig", "fix\n")
         fix = self.commit("fix")
         self.pin(fix)
+        before = git(self.repo, "rev-parse", "HEAD")
         self.write("VERSION", "2\n")
         self.commit("release")
-        self.assertEqual(self.check().returncode, 0)
+        self.assertEqual(self.check("v0.7.1", None, before).returncode, 0)
+
+    def test_a_before_of_all_zeros_is_refused(self):
+        self.pin()
+        self.write("VERSION", "2\n")
+        self.commit("release")
+        self.refused(self.check("v0.7.1", None, "0" * 40), "all zeros")
+
+    def test_a_before_that_is_not_an_ancestor_is_refused(self):
+        self.pin()
+        self.write("VERSION", "2\n")
+        self.commit("release")
+        git(self.repo, "checkout", "-q", "-b", "side", self.candidate)
+        self.write("docs/x.md", "side\n")
+        side = self.commit("side")
+        git(self.repo, "checkout", "-q", "main")
+        self.refused(self.check("v0.7.1", None, side), "not an ancestor")
+
+    def test_a_before_that_is_not_fetchable_is_refused(self):
+        self.pin()
+        self.write("VERSION", "2\n")
+        self.commit("release")
+        self.refused(self.check("v0.7.1", None, "1" * 40), "not in this checkout")
+
+    def test_a_dispatch_has_no_before_and_a_release_is_refused(self):
+        self.pin()
+        self.write("VERSION", "2\n")
+        self.commit("release")
+        self.refused(self.check("v0.7.1", None, ""), "no push to check")
+
+    def test_a_prerelease_dispatch_is_checked_at_the_first_parent_only(self):
+        self.pin()
+        self.write("VERSION", "2\n")
+        self.commit("release")
+        result = self.check("v0.7.1-rc.1", None, "")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("a dispatch", result.stderr)
+
+    def test_a_shallow_clone_is_named(self):
+        self.pin()
+        self.write("VERSION", "2\n")
+        self.commit("release")
+        shallow = Path(self._tmp.name + "-shallow")
+        self.addCleanup(shutil.rmtree, shallow, True)
+        git(self.repo.parent, "clone", "-q", "--depth", "1", "file://" + str(self.repo), str(shallow))
+        env = dict(os.environ, GITHUB_REPOSITORY="o/r")
+        head = git(shallow, "rev-parse", "HEAD")
+        result = subprocess.run([str(SCRIPT), "candidate", "v0.7.1", head], capture_output=True,
+                                text=True, env=env, cwd=shallow)
+        self.refused(result, "shallow clone")
 
     def test_the_workflows_run_it(self):
         release = (ROOT / ".github/workflows/release.yml").read_text()
-        call = 'release_check.sh candidate "$TAG" "$GITHUB_SHA"'
+        call = 'release_check.sh candidate "$TAG" "$GITHUB_SHA" "$BEFORE"'
         self.assertIn("fetch-depth: 0", release.split("  ci:")[0])
+        self.assertIn("BEFORE: ${{ github.event.before }}", release.split("  ci:")[0])
         self.assertLess(release.index(call), release.index("  ci:"))
         finish = (ROOT / ".github/workflows/release-finish.yml").read_text()
         self.assertIn('release_check.sh candidate "$TAG" "$COMMIT"', finish)

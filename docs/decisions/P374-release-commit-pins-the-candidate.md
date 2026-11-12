@@ -18,7 +18,20 @@ The candidate is named on `main`, in `release/candidate`: its full SHA, one line
 candidate means writing that file, in a commit **before** the `VERSION` commit.
 `release_check.sh candidate <tag> <commit>` (NRV-E1158) reads the file at the release commit's
 **first parent** and refuses a release commit that changes it at all, so the release commit cannot
-repoint the candidate (a squash or a merge commit alike). It also refuses a missing or malformed
+repoint the candidate (a squash or a merge commit alike).
+
+That alone is not enough: a **rebase merge** (this repository allows it) or a multi-commit push
+lands a `repoint` commit and the `VERSION` bump in one push, and the bump's first parent already
+holds the repoint. So `release.yml` also passes the push's `github.event.before` (main's head
+before the push) as a fourth argument, and the check refuses when `release/candidate` differs
+between `before` and the release commit, that is, when the same push changed it. It fails closed
+when `before` is empty, all zeros, not in the checkout, or not an ancestor of the commit. A
+`workflow_dispatch` of `release.yml` has no `before`: a release (no suffix) is refused then, and
+must come from the push that merges the `VERSION` commit; a prerelease rehearsal is checked at the
+first parent only, with a note. `release-finish.yml`'s `publish` has no push event and keeps the
+first-parent rule; `release.yml`'s `version` job, which ran on the push that created the draft, is
+the gate. Turning off rebase merging for the repository would close the shape at its source; it is
+an owner setting, recommended here, and the check does not depend on it. It also refuses a missing or malformed
 file, a candidate that is not an ancestor of the commit, and any difference under the pinned paths
 (decided by `git diff --quiet`'s exit status, never by parsing names, so a quoted or non-ASCII path
 or a git failure cannot pass; the names are listed only for the message). It runs in
@@ -34,9 +47,10 @@ prerelease whose parent has no file passes; with it, the check runs, so rehearsa
 without touching a pinned path. Only `-Dtest-commit-keys=off` is caught (`binary`, #271). Each
 release reviewer therefore diffs the `zig build` lines of those two workflows against the
 candidate's. Nor is the binary byte-identical to the candidate's: `build.zig` reads
-`git rev-parse HEAD`, so the shipped binary names the release commit, not the candidate. A change
-to `release/candidate` in a PR merged just before the bump is still possible; the supervisor and
-the two reviewers read that file's history, which now is one line in its own commit.
+`git rev-parse HEAD`, so the shipped binary names the release commit, not the candidate. A
+`release/candidate` change merged in an earlier push than the bump is still possible (the release
+reviewers review the candidate before the `VERSION` PR exists); the supervisor and the two
+reviewers read that file's history, which now is one line in its own commit.
 
 **P259e (revert release).** A revert release is N's tree with the next `release` string in
 `build.zig`, so it differs from N in a pinned path. It names itself as the candidate: the revert

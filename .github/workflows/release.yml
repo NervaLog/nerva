@@ -100,7 +100,9 @@ jobs:
       - name: Refuse a commit whose code is not the candidate's
         env:
           TAG: ${{ steps.version.outputs.tag }}
-        run: .github/scripts/release_check.sh candidate "$TAG" "$GITHUB_SHA"
+          # The main head before this push; empty on a dispatch, which a release then refuses.
+          BEFORE: ${{ github.event.before }}
+        run: .github/scripts/release_check.sh candidate "$TAG" "$GITHUB_SHA" "$BEFORE"
 
       - name: Refuse a version already released, or already a draft
         env:

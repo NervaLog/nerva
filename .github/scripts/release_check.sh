@@ -138,8 +138,10 @@ case "${1:-}" in
     fi
     ;;
   candidate)
-    tag=${2:?usage: release_check.sh candidate <tag> <commit>}
-    commit=${3:?usage: release_check.sh candidate <tag> <commit>}
+    tag=${2:?usage: release_check.sh candidate <tag> <commit> [<before>]}
+    commit=${3:?usage: release_check.sh candidate <tag> <commit> [<before>]}
+    # <before> is the main head before the push that brought the commit (release.yml passes
+    # github.event.before, empty on a dispatch). Absent: no push event exists (release-finish.yml).
     short=${commit:0:7}
     if ! git cat-file -e "$commit^{commit}" 2> /dev/null; then
       refuse NRV-E1158 "cannot read the commit $commit" \
@@ -150,9 +152,44 @@ case "${1:-}" in
     # otherwise the release commit could repoint it at an unsoaked commit (the candidate must be on
     # main before the VERSION commit; P374).
     if ! parent=$(git rev-parse --verify --quiet "$commit^1^{commit}" 2> /dev/null); then
+      if [[ "$(git rev-parse --is-shallow-repository 2> /dev/null)" == true ]]; then
+        refuse NRV-E1158 "the release commit $short has no readable parent in this shallow clone" \
+          "the candidate is read from the first parent, and a shallow clone does not hold it" \
+          "check out the full history (fetch-depth: 0) and run again"
+      fi
       refuse NRV-E1158 "the release commit $short has no parent" \
         "the candidate is read from the first parent, and a root commit has none" \
         "release from a commit on main that follows the one that named the candidate"
+    fi
+    # A rebase merge or a multi-commit push can land a repoint and the VERSION bump in one push,
+    # and the first parent then already holds the repoint. So the file must also be unchanged
+    # since the head main had before the push (P374). Fail closed when that head is unusable.
+    if [[ $# -ge 4 ]]; then
+      before=$4
+      if [[ -z "$before" ]]; then
+        if [[ "$tag" != *-* ]]; then
+          refuse NRV-E1158 "there is no push to check $tag against (a dispatch has no 'before')" \
+            "a release is checked against the main head before the push that brought it, so that one push cannot repoint release/candidate and bump VERSION" \
+            "release by merging the VERSION commit to main (the push starts release.yml)"
+        fi
+        echo "release_check.sh: no 'before' (a dispatch); $tag is a prerelease, so only the first parent is checked" >&2
+      elif [[ "$before" =~ ^0+$ ]] || ! git cat-file -e "$before^{commit}" 2> /dev/null; then
+        refuse NRV-E1158 "the main head before the push (${before:0:7}) is missing, all zeros or not in this checkout" \
+          "without it the check cannot tell whether this push changed release/candidate" \
+          "check out the full history (fetch-depth: 0), or release from a push that updates an existing main"
+      elif ! git merge-base --is-ancestor "$before" "$commit" 2> /dev/null; then
+        refuse NRV-E1158 "the main head before the push (${before:0:7}) is not an ancestor of the release commit $short" \
+          "main was rewritten or the push was forced, so the push's changes cannot be listed" \
+          "release from a commit that follows main's previous head"
+      else
+        rc=0
+        git diff --quiet "$before" "$commit" -- release/candidate 2> /dev/null || rc=$?
+        if [[ $rc -ne 0 ]]; then
+          refuse NRV-E1158 "release/candidate changed within the push that brought the release commit $short (${before:0:7}..$short)" \
+            "the candidate must be on main in an earlier push than the VERSION commit; a rebase merge or a multi-commit push lands both together and would let the release repoint it (P374)" \
+            "merge the release/candidate change first, in its own push, then merge the VERSION commit"
+        fi
+      fi
     fi
     if ! file=$(git show "$parent:release/candidate" 2> /dev/null); then
       # A prerelease may be rehearsed on a commit that names no candidate; a release may not.
