@@ -182,6 +182,20 @@ def check_setup_modes(repo, tmp):
         result = run(["sh", f"{root}/setup.sh", *args], check=False, env=env)
         assert result.returncode == 0, (args, result.stderr)
         assert "NRV-W1101" not in result.stderr, (args, result.stderr)
+    # useradd, then install -d, that fail: NRV-E1163 after the tool's own line, exit 1 (#378).
+    for tool, what in (("useradd", "create the system user nerva"),
+                       ("install", "make the directory /etc/nerva")):
+        os.makedirs(f"{root}/failing-{tool}")
+        with open(f"{root}/failing-{tool}/{tool}", "w") as out:
+            out.write(f"#!/bin/sh\necho '{tool}: stub failure' >&2\nexit 1\n")
+        os.chmod(f"{root}/failing-{tool}/{tool}", 0o755)
+        failing = {**env, "PATH": f"{root}/failing-{tool}:{env['PATH']}"}
+        result = run(["sh", f"{root}/setup.sh", "install"], check=False, env=failing)
+        lines = result.stderr.strip().split("\n")
+        assert result.returncode == 1 and len(lines) == 4, (tool, result.returncode, result.stderr)
+        assert lines[0] == f"{tool}: stub failure", lines
+        assert lines[1] == f"error[NRV-E1163]: nerva package: could not {what}", lines
+        assert lines[2].startswith("  cause  ") and lines[3].startswith("  fix    "), lines
     binary = f"{root}/usr/local/bin/nerva"
     os.makedirs(os.path.dirname(binary))
     open(binary, "w").close()
@@ -197,6 +211,7 @@ def check_setup_modes(repo, tmp):
             # enabled instances survive (or are enabled again).
             assert "keep one install" in result.stderr and "stop the nerva@N and nerva-api@N replicas" in result.stderr, result.stderr
             assert "Enable any instance that is not enabled" in result.stderr, result.stderr
+    print("  a failing useradd or install -d is refused with NRV-E1163")
     print("  NRV-E1111 is checked on a first install (install, rpm 1); an upgrade (upgrade, rpm 2) "
           "warns NRV-W1101 about /usr/local/bin/nerva and goes on")
 
@@ -259,7 +274,7 @@ def check_script(text, repo, name):
     assert verbs <= SCRIPTS[name], f"{name} runs systemctl {verbs - SCRIPTS[name]}"
     assert "%" not in code, f"{name} has a percent sign: the .rpm embeds it in its spec"
     if name == "package-setup.sh":
-        assert "useradd" in code and "NRV-E1105" in code and "NRV-E1111" in code
+        assert "useradd" in code and "NRV-E1105" in code and "NRV-E1111" in code and "NRV-E1163" in code
 
 
 def check_rpm(path, repo, binary, version, arch, epoch, tmp):

@@ -11,6 +11,8 @@ tarball's contents, then checks, against the real units:
   3. every refusal, NRV-E1101 to NRV-E1109, with its code, exit status and three-line block; a
      fixed PATH; a dry run that does not chmod; NRV-W1102 (a package's /usr/bin/nerva); a symlinked
      /var/lib/nerva left alone;
+  3b. a `useradd` and an `install -d` that fail (stubs, in a mount namespace) are refused with
+     NRV-E1163 after the tool's own message, exit 1, and the failed run is rerun clean;
   4. the gateway nerva-api@0 started while the cluster is down fails with NRV-E0604 and is restarted,
      and serves once three replicas, formatted as `nerva` and run as nerva@0..2, are up; a commit and a
      lookup; `systemctl kill -s KILL nerva@1` is restarted and catches up (a quorum of it and
@@ -233,6 +235,52 @@ def test_early_refusals(stage):
     finally:
         assert sh(["groupdel", "nerva"]).returncode == 0
     assert sh(["getent", "passwd", "nerva"]).returncode != 0
+
+
+def failing_tool(tmp, name, stage, *args):
+    """Runs install.sh with `name` (found on the script's fixed PATH) replaced by a stub that prints
+    its own message and exits 1, in a mount namespace of its own, so nothing leaks to the host."""
+    program = os.path.realpath(shutil.which(name, path="/usr/sbin:/usr/bin:/sbin:/bin"))
+    stub = os.path.join(tmp, f"{name}-stub")
+    with open(stub, "w") as f:
+        f.write(f"#!/bin/sh\necho '{name}: stub failure' >&2\nexit 1\n")
+    os.chmod(stub, 0o755)
+    result = sh(["unshare", "-m", "sh", "-c",
+                 f"mount --bind {stub} {program} && exec sh {stage}/install.sh " + " ".join(args)])
+    assert os.access(program, os.X_OK) and sh([program, "--version"]).returncode == 0, "the stub leaked"
+    return result
+
+
+def refused_after_tool(result, name, headline, summary):
+    """The tool's own line, then one coded block (NRV-E1163), exit 1."""
+    lines = result.stderr.strip().split("\n")
+    assert result.returncode == 1, (result.returncode, result.stderr)
+    assert len(lines) == 4 and lines[0] == f"{name}: stub failure", result.stderr
+    assert lines[1] == f"error[NRV-E1163]: install.sh: {headline}", lines[1]
+    assert lines[2] == f"  cause  {summary}", lines[2]
+    assert lines[3].startswith("  fix    "), lines[3]
+    assert "error." not in result.stderr and "Traceback" not in result.stderr, result.stderr
+
+
+def test_setup_failures(tmp, stage):
+    """`useradd` and `install -d` fail: one NRV-E1163 block after the tool's message, exit 1 (#378)."""
+    summary = ("A tool that creates the service user, a directory or a file the installer makes "
+               "refused; its own message is printed just above")
+    assert sh(["getent", "passwd", "nerva"]).returncode != 0
+    before = snapshot()
+    result = failing_tool(tmp, "useradd", stage)
+    refused_after_tool(result, "useradd", "could not create the system user nerva", summary)
+    assert snapshot() == before, "a refused useradd changed something"
+    # A dry run does not run the tool, so it cannot fail.
+    assert "nothing was changed" in installer(stage, "--dry-run").stdout
+    # The user is made, then the first directory fails; the rerun finds the user and goes on.
+    result = failing_tool(tmp, "install", stage)
+    refused_after_tool(result, "install", f"could not make the directory {ETC}", summary)
+    assert sh(["getent", "passwd", "nerva"]).returncode == 0
+    assert not os.path.exists(ETC) and not os.path.exists(BIN), "a refused install -d went on"
+    assert sh(["userdel", "nerva"]).returncode == 0
+    assert sh(["getent", "group", "nerva"]).returncode != 0
+    assert snapshot() == before, "the failed runs left something behind"
 
 
 def test_dry_run_and_install(stage):
@@ -649,6 +697,8 @@ def main():
     try:
         stage = stage_tarball(packaging, nerva, tmp, "stage")
         test_early_refusals(stage)
+        test_setup_failures(tmp, stage)
+        print("ok: a failing useradd and install -d are refused with NRV-E1163")
         test_dry_run_and_install(stage)
         print("ok: --dry-run changes nothing; install; a second install changes nothing")
         test_refusals(packaging, nerva, tmp, stage)

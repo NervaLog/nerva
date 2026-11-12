@@ -35,6 +35,14 @@ refuse() {
     exit "$1"
 }
 
+# setup_failed <what> <fix>: NRV-E1163, when the tool that makes the user, a directory or a file
+# fails. Its own message is already on stderr, above this block.
+setup_failed() {
+    refuse 1 NRV-E1163 "could not $1" \
+        "A tool that creates the service user, a directory or a file the installer makes refused; its own message is printed just above" \
+        "$2"
+}
+
 dry=0
 upgrade=0
 uninstall=0
@@ -249,21 +257,26 @@ fi
 if ! getent passwd "$user" > /dev/null 2>&1; then
     do_ "create the system user $user (home $data_dir, no login)" \
         useradd --system --user-group --home-dir "$data_dir" --no-create-home \
-        --shell /usr/sbin/nologin "$user"
+        --shell /usr/sbin/nologin "$user" ||
+        setup_failed "create the system user $user" \
+            "find why useradd refused (its message is above: /etc/passwd read-only or managed by LDAP, no free system uid, SELinux), or create the user yourself (useradd --system --user-group --home-dir $data_dir --no-create-home --shell /usr/sbin/nologin $user), then run install.sh again"
 fi
 if [ "$dry" = 1 ] && ! getent passwd "$user" > /dev/null 2>&1; then
     owner=root
 else
     owner=$user
 fi
+dir_fix="find why install -d refused (its message is above: a read-only file system, no space, a path that is a file), fix that, then run install.sh again"
 ensure_dir() { # <path> <mode> <group>
     if [ ! -d "$1" ] || [ "$(stat -L -c '%a %U %G' "$1")" != "$2 root $3" ]; then
-        do_ "make $1 ($2, root:$3)" install -d -m "$2" -o root -g "$3" "$1"
+        do_ "make $1 ($2, root:$3)" install -d -m "$2" -o root -g "$3" "$1" ||
+            setup_failed "make the directory $1" "$dir_fix"
     fi
 }
 ensure_dir "$etc_dir" 750 "$owner"
 if [ ! -d "$data_dir" ] || [ "$(stat -L -c '%a %U %G' "$data_dir")" != "750 $owner $owner" ]; then
-    do_ "make $data_dir (750, $owner:$owner)" install -d -m 750 -o "$owner" -g "$owner" "$data_dir"
+    do_ "make $data_dir (750, $owner:$owner)" install -d -m 750 -o "$owner" -g "$owner" "$data_dir" ||
+        setup_failed "make the directory $data_dir" "$dir_fix"
 fi
 
 # put <source> <destination> <mode>: copies when the destination is missing or different, and
@@ -277,8 +290,11 @@ put() {
         echo "would install $2"
     else
         echo "install $2"
-        install -m "$3" -o root -g root "$1" "$base/.install.$$"
-        mv -f "$base/.install.$$" "$2"
+        if ! { install -m "$3" -o root -g root "$1" "$base/.install.$$" && mv -f "$base/.install.$$" "$2"; }; then
+            rm -f "$base/.install.$$"
+            setup_failed "install $2" \
+                "find why install refused (its message is above: a read-only file system, no space), fix that, then run install.sh again"
+        fi
     fi
     changed=1
 }
