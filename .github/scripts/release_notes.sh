@@ -8,8 +8,9 @@
 #   release_notes.sh site <tag>   the text of the site line, for the site's RELEASES entry
 #                                 (docs/releases/automation.md); refused with NRV-E1130 when the
 #                                 section has none, an empty one, one of more than 300 characters,
-#                                 one holding a `"`, a `\` or a `TO FILL`; a prerelease (a tag with
-#                                 a `-`) with no site line gets `Release candidate <tag>.`
+#                                 one holding a non-printable or non-ASCII character or one of
+#                                 < > & \ ` " or a `TO FILL`; a prerelease (a tag
+#                                 with a `-`) with no site line gets `Release candidate <tag>.`
 set -euo pipefail
 
 # The lines of the section of tag $1, without its heading.
@@ -23,7 +24,7 @@ section() {
 
 site_refuse() {
   printf 'error[NRV-E1130]: release.yml: %s\n  cause  %s\n  fix    %s\n' "$1" "$2" \
-    "write the line as the first line of the section, <!-- site: <one sentence, at most 300 characters, no \" or \\> -->, then run again" >&2
+    'write the line as the first line of the section, <!-- site: <one sentence, at most 300 characters, printable ASCII without < > & \ ` "> -->, then run again' >&2
   echo "::error::NRV-E1130 $1" >&2
   exit 1
 }
@@ -50,9 +51,11 @@ if [[ "${1:-}" == site ]]; then
     site_refuse "the site line of $tag is ${#text} characters, over the limit of 300" \
       "the site's release list shows one sentence"
   fi
-  if [[ "$text" == *'"'* || "$text" == *'\'* ]]; then
-    site_refuse "the site line of $tag holds a \" or a \\" \
-      "the line is written into the site's script as a string, where either would break it"
+  # Printable ASCII, and none of < > & \ ` ": the site writes the sentence into a string in its script
+  # and into HTML (NervaLog/nervalog.github.io's site check holds the same rule).
+  if LC_ALL=C grep -q '[^ -~]' <<< "$text" || [[ "$text" == *['<>&\`"']* ]]; then
+    site_refuse "the site line of $tag holds a character the site does not take" \
+      'the sentence must be printable ASCII without < > & \ ` or ", because the site writes it into its script and its HTML'
   fi
   if [[ "$text" == *'TO FILL'* ]]; then
     site_refuse "the site line of $tag still holds a TO FILL placeholder" \

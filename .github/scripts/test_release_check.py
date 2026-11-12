@@ -391,13 +391,13 @@ class SiteLine(unittest.TestCase):
     def test_an_empty_long_or_unsafe_line_is_refused(self):
         for text, fragment in (("<!-- site: -->", "is empty"), ("<!-- site:    -->", "is empty"),
                                (f"<!-- site: {'x' * 301} -->", "301 characters, over the limit of 300"),
-                               ('<!-- site: it says "hi" -->', 'holds a " or a \\'),
-                               ("<!-- site: a \\ b -->", 'holds a " or a \\'),
+                               *((f"<!-- site: a{c}b -->", "a character the site does not take")
+                                 for c in ('"', "\\", "<", ">", "&", "`", "\x01", "\u00e9", "\u2014")),
                                ("<!-- site: TO FILL -->", "still holds a TO FILL")):
             self.refused(site(f"## v0.7.1 \u2014 d\n{text}\n\nx\n"), fragment)
         self.assertEqual(site(f"## v0.7.1 \u2014 d\n<!-- site: {'x' * 300} -->\n\nx\n").returncode, 0)
         # A prerelease's bad line is still refused: only a missing one is defaulted.
-        self.refused(site('## v0.7.1-rc.1 \u2014 d\n<!-- site: "x" -->\n', "v0.7.1-rc.1"), 'holds a " or a \\')
+        self.refused(site('## v0.7.1-rc.1 \u2014 d\n<!-- site: "x" -->\n', "v0.7.1-rc.1"), "a character the site does not take")
 
 
 if __name__ == "__main__":

@@ -25,14 +25,15 @@ def refuse(headline, cause, fix):
 
 
 def check_arguments(version, date, line):
-    if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?", version):
+    if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?", version):
         refuse(f"'{version}' is not a version", "the version is VERSION's text, like 0.7.1 or 0.7.1-rc.1, with no v",
                "pass the tag without its v")
     if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", date):
         refuse(f"'{date}' is not a date", "the date is written YYYY-MM-DD", "pass the release's date")
-    if not line.strip() or len(line) > 300 or '"' in line or "\\" in line or "\n" in line:
-        refuse("the site line is empty, over 300 characters, or holds a quote, a backslash or a newline",
-               "it is written into the site's script as a string", "pass the output of release_notes.sh site")
+    if not line.strip() or len(line) > 300 or not re.fullmatch(r"[ -~]+", line) or re.search(r"[<>&\\`\"]", line):
+        refuse("the site line is empty, over 300 characters, or holds a character the site does not take",
+               "it must be printable ASCII without < > & \\ ` or \", because it is written into the site's script and HTML",
+               "pass the output of release_notes.sh site")
 
 
 def block(text, opener, closer):

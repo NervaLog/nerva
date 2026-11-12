@@ -2,6 +2,7 @@
 """Tests for site_release.py (NRV-E1132). Run from the repository root:
 python3 -I .github/scripts/test_site_release.py"""
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -101,8 +102,9 @@ class SiteRelease(unittest.TestCase):
             (("0.7", "2026-11-13", "x"), "'0.7' is not a version"),
             (("0.7.1", "13 Nov", "x"), "'13 Nov' is not a date"),
             (("0.7.1", "2026-11-13", ""), "the site line is empty"),
-            (("0.7.1", "2026-11-13", 'say "hi"'), "holds a quote"),
-            (("0.7.1", "2026-11-13", "a\\b"), "holds a quote"),
+            (("0.7.1-beta", "2026-11-13", "x"), "is not a version"),
+            *((("0.7.1", "2026-11-13", f"a{c}b"), "a character the site does not take")
+              for c in ('"', "\\", "<", ">", "&", "`", "\t", "\x01", "\u00e9", "\u2014")),
             (("0.7.1", "2026-11-13", "x" * 301), "over 300 characters"),
         ):
             self.refused(self.run_script(*args), fragment)
@@ -110,6 +112,28 @@ class SiteRelease(unittest.TestCase):
 
     def test_a_site_line_of_exactly_300_characters_passes(self):
         self.assertEqual(self.run_script("0.7.1", "2026-11-13", "x" * 300).returncode, 0)
+
+    def test_the_output_passes_the_sites_own_checker_when_it_is_reachable(self):
+        """Runs NervaLog/nervalog.github.io's site_check.mjs (branch claude/site-check, or main once
+        merged) on the output, against the page before. Skipped, and the skip says so, when the
+        checkout or node is not there (SITE_REPO names the checkout)."""
+        repo = Path(os.environ.get("SITE_REPO", "/home/user/nervalog.github.io"))
+        node = shutil.which("node")
+        shown = subprocess.run(["git", "-C", str(repo), "show", "origin/claude/site-check:.github/scripts/site_check.mjs"],
+                               capture_output=True, text=True) if repo.is_dir() else None
+        page = subprocess.run(["git", "-C", str(repo), "show", "origin/main:index.html"],
+                              capture_output=True, text=True) if repo.is_dir() else None
+        if not node or not shown or shown.returncode or page.returncode:
+            self.skipTest("site_check.mjs (origin/claude/site-check of the site checkout) or node is not reachable")
+        checker = Path(self.tmp.name) / "site_check.mjs"
+        checker.write_text(shown.stdout)
+        base = Path(self.tmp.name) / "base.html"
+        base.write_text(page.stdout)
+        self.page.write_text(page.stdout)
+        self.assertEqual(self.run_script("9.9.9", "2099-01-01", "A sentence, with (punctuation): 1-2 and 'quotes'.").returncode, 0)
+        checked = subprocess.run([node, str(checker), str(self.page), "--release", str(base), "index.html"],
+                                 capture_output=True, text=True)
+        self.assertEqual(checked.returncode, 0, checked.stdout + checked.stderr)
 
     def test_the_usage_is_exit_2(self):
         result = subprocess.run([sys.executable, "-I", str(SCRIPT)], capture_output=True, text=True)
