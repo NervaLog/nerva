@@ -1,6 +1,7 @@
 # The domain, and the apt and dnf repositories: spec, setup, slices
 
-Status: spec, 2026-11-12 (P365, which amends P360 point 10, P364 and P148). Reworked four times
+Status: spec, 2026-11-12 (P365, which amends P360 point 10, P364 and P148; amended the same day
+after the Zigbox team's review of the pipeline, ZIGDECISION). Reworked four times
 the same day after adversarial reviews, and after the owner's decision that Cloudflare deploys the
 site. The fourth rework cut the lock in the bucket: one GitHub concurrency group keeps the writers
 apart instead. Nothing here is built yet. It is the last change before the v0.7.1 tag: the owner moved the
