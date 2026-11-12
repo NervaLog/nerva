@@ -7,7 +7,7 @@ amends: P365, P368
 
 # Package signing: an offline primary with a CI subkey, tested first; pinned checks, verification before upload, served bytes, alarms and WKD
 
-**Order.** #376 merges after #368, which carries P368 and slice 2's `package_repos.sh`. The
+**Order.** #368, which carries P368 and slice 2's `package_repos.sh`, has merged. The
 amendment of P368 is to slice 2's `verify_manifest` (the `$NF` check) and its signing setup,
 and slice 2b makes it.
 
@@ -15,15 +15,16 @@ and slice 2b makes it.
 key model is "test, then subkey". Every signature is checked against the pinned primary. The run
 verifies its output before uploading it, and checks that the served bytes equal the bytes it
 signed. A failed refresh raises an issue. The primary key is published through WKD on
-`nerva.pro` as a second channel. `docs/releases/packages.md` gives the full design. P376b (gates)
-and P376c (the Intel Mac runner) are separate decisions.
+`nerva.pro` as a second channel. `docs/releases/packages.md` gives the full design. P376c (the
+Intel Mac runner) is a separate decision. The review's point on recording the release gates is
+left to slice G, after v0.7.1, which proposes its own decision in its own pull request.
 
 **Decision.**
 
 1. **The key model (amends P365 point 12), adopted only if slice K passes.**
    - **Primary.** An RSA 4096 primary key, certify-only, with no expiry. It is kept offline, on
-     two encrypted media held apart. Its passphrase and its revocation certificate are in the
-     owner's password manager. `packaging/keys/fingerprints` pins the primary's fingerprint, and
+     two encrypted media held apart, with its revocation certificate, which never stays on the
+     ceremony's Mac. Its passphrase is in the owner's password manager. `packaging/keys/fingerprints` pins the primary's fingerprint, and
      that pin never changes.
    - **CI subkey.** CI holds one RSA 4096 signing subkey, or two during a rotation's overlap
      (`current` and `next`), never the primary. A subkey expires one year after it is made. The secret export holds the subkey and a stub of the primary
@@ -47,8 +48,9 @@ and P376c (the Intel Mac runner) are separate decisions.
      ships the revocation, and the pinned primary stays the same. If the current manifest was
      signed by the revoked subkey, an `anchor <generation> <sha256>` line in `fingerprints`
      restarts the chain from a manifest the owner names by its hash. rpms signed by the revoked
-     subkey are left out of the indexes, because the locks forbid re-signing them. Their
-     releases get a decision at the time, normally a patch release.
+     subkey cannot be re-signed, because of the locks. The owner leaves them out of the indexes
+     with a dispatch of the refresh that names the subkey's Key ID (point 3). Their releases get
+     a decision at the time, normally a patch release.
    - **Slice K tests the model first.** It runs before slice 3 and before the owner makes the
      key. It signs test repositories and rpms with a subkey of a throwaway primary, then installs
      from them on Debian 12 (gpgv), Debian 13 (sqv), Ubuntu 22.04 and 24.04, Rocky 9 (rpm 4.16),
@@ -84,12 +86,16 @@ and P376c (the Intel Mac runner) are separate decisions.
 3. **Verify before upload (adds a step to `repos`, NRV-E1161).** Before anything is written to a
    locked or immutable prefix, and before the run writes the promoted manifest, it checks its
    own output. An rpm is checked in step 4, before its hash is recorded and before it is put,
-   because the locks make a bad object permanent. An rpm already in the bucket that fails
-   in step 5b is marked `excluded` and left out of the indexes only if its signing subkey is
-   listed `revoked` in `packaging/keys/` (an explicit state the owner made), at most 16 rpms a
-   run, and a later run returns it to `published` when it no longer qualifies. Any other rpm
-   failure stops the run and writes nothing (no manifest generation, no index upload), so a
-   fault in the run, such as a bad `fingerprints` edit, cannot drop rpms for good. The rest is
+   because the locks make a bad object permanent. Any failure in step 5b, of an index or of an
+   rpm already in the bucket, stops the run and writes nothing (no manifest generation, no index
+   upload). The job never leaves an rpm out on its own, so a fault of the run, such as a bad
+   `fingerprints` edit, cannot drop packages. A lasting fault stops every run until a person
+   acts; the alarm and `Valid-Until`'s 10-day margin (point 5) bound the damage. When the cause
+   is a key (a revoked subkey, or in the fallback a key that left `fingerprints`), the owner
+   dispatches the refresh with the input `rpm_key` set to `exclude <Key ID>`. That run marks
+   every rpm signed by it `excluded` in the manifest, with no count bound because a person
+   started it, and later runs keep it so. `restore <Key ID>` reverses a mistaken exclusion, and
+   is refused for a subkey that is revoked. The rest is
    checked in step 5b:
    - `gpgv` checks `InRelease`, `Release.gpg` and `repomd.xml.asc`, under an empty `GNUPGHOME`,
      against a keyring made only from `packaging/keys/`.
@@ -115,10 +121,10 @@ and P376c (the Intel Mac runner) are separate decisions.
    the run wrote. That is about 40 MB a release; the manifest's 4 GiB bound applies in the worst
    case. The cost is about a minute. R2 egress is free.
 5. **Refresh alarms (amends P365 point 10's threshold).** When `repos`, `repos-verify`, the
-   refresh or `repos-fresh` fails, an `alarm` job runs. A cancelled write job (`repos-ready`,
-   `repos`, the refresh; they never use `cancel-in-progress`) alarms too, because a cancelled
-   `repos-ready` is a release with no packages and no clock sees it. A cancelled `repos-fresh` or
-   `ci.yml` run does not (`ci.yml` cancels a superseded run on `main`). It uses the
+   refresh or `repos-fresh` fails, an `alarm` job runs. A cancelled `repos-ready` or `repos` in
+   `release-finish.yml` alarms too: nothing supersedes them (`cancel-in-progress: false`), and a
+   cancelled `repos-ready` is a release with no packages that no clock sees. No other cancelled
+   job alarms (`ci.yml` cancels a superseded run on `main`). It uses the
    `GITHUB_TOKEN` with `permissions: issues: write` only, and no environment or secret.
    - If an open issue labelled `package-repos` exists, the job comments on it, at most once a
      day per (workflow, job, code). Otherwise it opens one, assigned to the owner, so there is
@@ -140,10 +146,13 @@ and P376c (the Intel Mac runner) are separate decisions.
      - `.well-known/openpgpkey/hu/ndqm47zydhyqyzabecddtdk1q3bponab`, the hash of `nerva`. It
        holds the binary form of `packaging/keys/nerva-release.asc`.
    - The build command copies exactly those two files and refuses a symlink.
-   - Both checks use one reference, taken from Nerva and never from the pull request checked, the
-     key file at the newest `v*` tag (so a site pull request cannot roll the WKD file back): `site_check.mjs` on every site pull request, and `release_finish.sh
-     site-live` after a release. A difference is NRV-E1162. `release-finish.yml`'s `site` job
-     opens the pull request that updates the WKD file.
+   - Both checks use one reference, taken from Nerva and never from the pull request checked:
+     the key file at the tag of Nerva's newest published release, prereleases included (so a
+     site pull request cannot roll the WKD file back, and a candidate's pull request passes).
+     `site_check.mjs` runs on every site pull request and does not read `RELEASES`;
+     `release_finish.sh site-live` runs after a release. A difference is NRV-E1162.
+     `release-finish.yml`'s `site` job writes the WKD file into the site pull request it opens,
+     for a release and for a candidate.
    - INSTALL.md tells users to check that the primary fingerprints from GitHub and from WKD
      agree.
    - The job never reads the site's key.
@@ -170,6 +179,7 @@ and P376c (the Intel Mac runner) are separate decisions.
 - A yearly key-file fetch for apt users until a keyring package exists. A user who misses it gets
   `NO_PUBKEY` at the swap.
 - About a minute more per write run.
+- A lasting rpm fault stops every write run until the owner acts, by hand.
 - The WKD file changes with a release, not with a key change on `main`.
 - Four codes (NRV-E1160 to NRV-E1162, and the warning NRV-W1103).
 - Under the fallback, the primary key itself is in GitHub, and a leak means rotating it.
