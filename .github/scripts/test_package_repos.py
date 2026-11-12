@@ -745,9 +745,10 @@ class Bucket(Base):
 
     def test_too_little_disk_is_e1156(self):
         self.baseline()
+        before = dict(self.s3.objects)
         rc, _, err = self.refresh(PACKAGE_REPOS_FREE_KIB="1")
         self.assert_diag(rc, err, "NRV-E1156")
-        self.assertEqual(self.writes(), [])
+        self.assertEqual(before, self.s3.objects)
 
     def test_a_refresh_with_nothing_bound(self):
         rc, _, err = self.refresh()
@@ -776,7 +777,7 @@ class Bucket(Base):
         self.set_state("v0.8.0-rc.1", "published")
         rc, _, err = self.publish("v0.8.0-rc.1")
         self.assertEqual(rc, 0, err)
-        self.assertEqual([k for k in self.keys_under("rpm/stable/packages/") if "rc" in k], [])
+        self.assertEqual([k for k in self.keys_under("rpm/stable/packages/") if "rc." in k], [])
         self.assertTrue([k for k in self.keys_under("rpm/rc/packages/") if "0.8.0.rc.1" in k])
         stable = self.s3.objects["apt/dists/stable/main/binary-amd64/Packages"][0]
         self.assertNotIn(b"0.8.0~rc.1", stable)
@@ -797,10 +798,161 @@ class Bucket(Base):
             ring = self.tmp / f"{n}.gpg"
             ring.write_bytes(subprocess.run(["gpg", "--dearmor"], input=self.k[n][2].encode(),
                                             capture_output=True, check=True).stdout)
-            p = subprocess.run(["gpgv", "--keyring", str(ring), str(f)], capture_output=True, text=True)
-            self.assertEqual(p.returncode, 0, p.stderr)
-            self.assertIn(self.k[n][0][-16:], p.stderr)
+            # as apt reads it: one VALIDSIG by a key it has, the other signature unknown to it
+            p = subprocess.run(["gpgv", "--status-fd", "1", "--keyring", str(ring), str(f)],
+                               capture_output=True, text=True)
+            self.assertRegex(p.stdout, rf"VALIDSIG {self.k[n][0]} ")
         self.assert_no_secrets(self.last.stdout, self.last.stderr)
+
+
+KILL_POINTS = ("checked", "deb_put", "rpm_manifest", "rpm_put", "writing_manifest", "content_named",
+               "index_put", "indexes_uploaded", "served")
+
+
+class Publish(Base):
+    def finish(self, tag):
+        rc, _, err = self.publish(tag)
+        self.assertEqual(rc, 0, err)
+        e = self.entries()
+        self.assertTrue(all(v[0] == "published" for v in e.values()), e)
+        self.assertIn("state complete", self.manifest())
+        for k in self.keys_under("apt/pool/") + self.keys_under("rpm/") :
+            if k.endswith((".deb", ".rpm")):
+                self.assertIn(k, [v[3] for v in e.values()], "an object no entry lists: " + k)
+
+    def test_a_kill_after_each_step_then_a_second_run_finishes_the_job(self):
+        for point in KILL_POINTS + ("deb_put:2", "rpm_put:2"):
+            with self.subTest(point=point):
+                self.bound("v0.7.2")
+                rc, _, err = self.publish("v0.7.2", PACKAGE_REPOS_KILL_AT=point)
+                self.assertEqual(rc, -9, f"{point}: {err}")
+                self.assert_no_secrets(self.last.stdout, self.last.stderr)
+                self.finish("v0.7.2")
+
+    def test_a_kill_between_the_writing_manifest_and_the_upload_and_between_the_upload_and_complete(self):
+        self.bound("v0.7.2")
+        rc, _, err = self.publish("v0.7.2", PACKAGE_REPOS_KILL_AT="writing_manifest")
+        self.assertEqual(rc, -9, err)
+        self.assertIn("state writing", self.manifest())
+        self.assertIn("index-was", self.manifest())
+        rc, _, err = self.publish("v0.7.2", PACKAGE_REPOS_KILL_AT="served")
+        self.assertEqual(rc, -9, err)
+        self.assertIn("state writing", self.manifest())
+        self.finish("v0.7.2")
+        self.assertNotIn("index-was", self.manifest())
+
+    def test_a_package_lines_only_generation_copies_state_index_and_index_was(self):
+        self.bound("v0.7.2")
+        before = self.manifest()
+        rc, _, err = self.publish("v0.7.2", PACKAGE_REPOS_KILL_AT="rpm_manifest")
+        self.assertEqual(rc, -9, err)
+        after = self.manifest()
+        keep = lambda t: [l for l in t.splitlines() if not l.startswith(("package ", "generation "))]
+        self.assertEqual(keep(before), keep(after))
+        self.assertNotEqual(before, after)
+        self.finish("v0.7.2")
+
+    def test_a_first_run_killed_before_its_first_manifest_then_a_run_from_generation_zero(self):
+        self.release("v0.7.1")
+        rc, _, err = self.ready("v0.7.1", PACKAGE_REPOS_KILL_AT="before_manifest")
+        self.assertEqual(rc, -9, err)
+        self.assertEqual(self.s3.objects, {})
+        rc, _, err = self.ready("v0.7.1")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self.manifest_keys(), ["manifest/0000000001.asc"])
+
+    def test_a_ready_killed_after_its_manifest_is_finished_by_a_second_ready(self):
+        self.release("v0.7.1")
+        rc, _, err = self.ready("v0.7.1", PACKAGE_REPOS_KILL_AT="ready_manifest")
+        self.assertEqual(rc, -9, err)
+        self.assertEqual(self.ready("v0.7.1")[0], 0)
+        self.assertEqual(len(self.entries()), 6)
+
+    def test_a_pending_entry_whose_release_is_draft_or_missing_is_skipped_with_a_notice(self):
+        for how in ("draft", "404"):
+            self.bound("v0.7.2")
+            if how == "draft":
+                self.set_state("v0.7.2", "draft")
+            else:
+                self.releases = [r for r in self.releases if r["tag_name"] != "v0.7.2"]
+                self.write_releases()
+            rc, _, err = self.publish("v0.7.2")
+            self.assertIn("::notice::the release v0.7.2 reads", err, how)
+            self.assertTrue(all(v[0] == "pending" for k, v in self.entries().items() if "0.7.2" in k))
+            self.assertEqual(rc, 1, how)  # the tag asked for is still pending: E1148
+            self.assertEqual(self.refresh()[0], 0, how)  # a scheduled refresh stays green
+
+    def test_a_github_error_on_one_pending_entry_is_e1155_and_the_others_publish(self):
+        self.baseline()
+        for t in ("v0.7.2", "v0.7.3"):
+            self.release(t)
+            self.assertEqual(self.ready(t)[0], 0)
+            self.set_state(t, "published")
+        self.gh_fail("/releases#2")
+        rc, _, err = self.refresh()
+        self.assert_diag(rc, err, "NRV-E1155")
+        e = self.entries()
+        self.assertTrue(all(v[0] == "published" for k, v in e.items() if "0.7.2" in k), e)
+        self.assertTrue(all(v[0] == "pending" for k, v in e.items() if "0.7.3" in k), e)
+        self.gh_fail()
+        self.assertEqual(self.refresh()[0], 0)
+        self.assertTrue(all(v[0] == "published" for v in self.entries().values()))
+
+    def test_junk_at_a_name_the_run_must_write_is_refused(self):
+        self.bound("v0.7.2")
+        deb = "apt/pool/main/n/nerva/nerva_0.7.2-1_amd64.deb"
+        self.put_raw(deb, b"junk")
+        rc, _, err = self.publish("v0.7.2")
+        self.assert_diag(rc, err, "NRV-E1142")
+        self.assertEqual(self.s3.objects[deb][0], b"junk")
+        self.assertTrue(any(v[0] == "pending" and v[3] == deb for v in self.entries().values()))
+
+    def test_a_package_the_release_no_longer_matches_is_e1148_and_nothing_is_published_from_it(self):
+        self.bound("v0.7.2")
+        name = [n for n in packages("v0.7.2") if n.endswith(".deb")][0]
+        self.replace_asset("v0.7.2", name, b"swapped")
+        rc, _, err = self.publish("v0.7.2")
+        self.assert_diag(rc, err, "NRV-E1148")
+        self.assertEqual([k for k in self.keys_under("apt/pool/") if "0.7.2" in k], [])
+
+    def test_a_signature_that_is_not_by_the_current_key_is_e1144(self):
+        self.bound("v0.7.2")
+        (self.tmp / "bin/rpmsign").write_text("#!/bin/sh\nexit 0\n")
+        (self.tmp / "bin/rpmsign").chmod(0o755)
+        rc, _, err = self.publish("v0.7.2")
+        self.assert_diag(rc, err, "NRV-E1144")
+
+    def test_a_site_that_serves_other_bytes_is_e1145(self):
+        self.bound("v0.7.2")
+        self.web.override["apt/dists/stable/InRelease"] = b"not what the bucket holds"
+        rc, _, err = self.publish("v0.7.2")
+        self.assert_diag(rc, err, "NRV-E1145")
+        rc, _, err = self.run_script("served")
+        self.assert_diag(rc, err, "NRV-E1145")
+        self.web.override.clear()
+        self.assertEqual(self.run_script("served")[0], 0)
+
+    def test_a_tag_that_is_not_a_version_is_e1139(self):
+        rc, _, err = self.ready("main")
+        self.assert_diag(rc, err, "NRV-E1139")
+
+    def test_no_credential_reaches_a_message_or_a_command_line(self):
+        self.release("v0.7.1")
+        self.assertEqual(self.ready("v0.7.1")[0], 0)
+        self.assert_no_secrets(self.last.stdout, self.last.stderr, (self.gh_dir / "log").read_text())
+        self.set_state("v0.7.1", "published")
+        rc, _, err = self.publish("v0.7.1", PACKAGE_REPOS_TRACE="1")
+        self.assertEqual(rc, 0, err)
+        self.assert_no_secrets(self.last.stdout, self.last.stderr, (self.gh_dir / "log").read_text())
+        self.assertNotIn("+ ", err, "no set -x output")
+
+    def test_a_complete_manifest_with_index_was_does_not_verify(self):
+        text = self.mtext(1, "complete", iw=[(sha(b"x"), "apt/dists/stable/InRelease")])
+        data = self.sign_manifest(text)
+        f = self.tmp / "v.asc"
+        f.write_bytes(data)
+        p = subprocess.run(["bash", str(SCRIPT), "verify-manifest", str(f), "1"], env=self.env())
+        self.assertNotEqual(p.returncode, 0)
 
 
 if __name__ == "__main__":

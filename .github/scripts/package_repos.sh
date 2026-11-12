@@ -722,7 +722,8 @@ make_indexes() {
     [ "$sha" != - ] || continue
     mkdir -p "$W/pk.files/$(dirname "$key")"
     r2need get "$key" "$W/pk.files/$key"
-    [ "$(sha_of "$W/pk.files/$key")" = "$sha" ] || { junk "object $key differs from its entry"; rm -f "$W/pk.files/$key"; }
+    [ "$(sha_of "$W/pk.files/$key")" = "$sha" ] || { junk "object $key differs from its entry"; rm -f "$W/pk.files/$key"; continue; }
+    touch -d @0 "$W/pk.files/$key" # createrepo_c records mtimes: the same packages give the same repodata names
   done <"$W/pk"
   for c in "${channels[@]}"; do
     stage=$W/stage/apt/$c
