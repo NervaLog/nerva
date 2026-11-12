@@ -36,7 +36,9 @@ comptime {
     assert(client_min.order(current) != .gt);
     const keys_off = std.SemanticVersion.parse(release_keys_off) catch unreachable;
     const other = std.SemanticVersion.parse(release_test_other) catch unreachable;
-    assert(keys_off.order(current) == .gt and keys_off.order(other) != .eq);
+    // Out-of-band test releases stay above every real release, so that none sorts as an upgrade
+    // target (R6, P259), and apart from each other.
+    assert(current.order(other) == .lt and other.order(keys_off) == .lt);
     if (release_bundled) |bundled_text| {
         const bundled = std.SemanticVersion.parse(bundled_text) catch unreachable;
         assert(bundled.order(current) == .lt);
