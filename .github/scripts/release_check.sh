@@ -11,6 +11,8 @@
 #                                              (prints mac-sign.yml: NRV-E1119, E1120, E1122, E1123, E1124)
 #   release_check.sh mac-same <tag> <signed-commit> <commit-now>   mac-sign.yml: NRV-E1128
 #   release_check.sh mac-upload <tag> <dir>    needs gh, GH_TOKEN; mac-sign.yml: NRV-E1129
+#   release_check.sh publish-ready <tag>       needs gh, GH_TOKEN and GITHUB_REPOSITORY; prints the commit
+#                                              (the publish job: NRV-E1131, and E1120, E1122, E1124 for the target)
 #
 # `ref` refuses a version without a suffix (a release, not a prerelease) from any ref but
 # refs/heads/main (NRV-E1116): a dispatch from a branch would draft a release that targets a commit
@@ -20,6 +22,10 @@
 # whose `nerva version --verbose` lacks `commit_keys deduplicate` (#271: the test build
 # `-Dtest-commit-keys=off` is never shipped). `assets` refuses a draft whose asset names are not
 # exactly the files of <dist-dir>: GitHub renames a file whose name has a character it does not keep.
+# `publish-ready` (the publish job of release-finish.yml) refuses a release that is missing or does
+# not hold exactly the twelve assets it is published with, the ten of `release` and the Mac zip with
+# its checksum (NRV-E1131), and applies mac-draft's checks of the target commit (NRV-E1120, E1122,
+# E1124); a release that is already published passes, so a re-run carries on.
 set -euo pipefail
 
 where=release.yml
@@ -28,6 +34,53 @@ refuse() {
   printf 'error[%s]: %s: %s\n  cause  %s\n  fix    %s\n' "$1" "$where" "$2" "$3" "$4" >&2
   echo "::error::$1 $2" >&2
   exit 1
+}
+
+# target_commit <tag> <target>: the commit a draft's target resolves to, printed, after the
+# checks that make it one a release may be signed or published from (NRV-E1120, E1122, E1124).
+target_commit() {
+  local tag=$1 target=$2 commit version compared status
+  if ! commit=$(gh api "repos/$GITHUB_REPOSITORY/commits/$target" --jq .sha 2> /dev/null) || [[ -z "$commit" ]]; then
+    refuse NRV-E1122 "cannot read the commit $target that the draft $tag targets" \
+      "the commit or branch no longer exists (a deleted branch), or GitHub did not answer" \
+      "if the target is gone, delete the draft (gh release delete $tag) and run release.yml on the VERSION commit; otherwise run again"
+  fi
+  if ! version=$(gh api -H "Accept: application/vnd.github.raw" \
+    "repos/$GITHUB_REPOSITORY/contents/VERSION?ref=$commit" 2> /dev/null | head -n1 | tr -d '[:space:]'); then
+    refuse NRV-E1122 "cannot read VERSION at ${commit:0:7}, the commit the draft $tag targets" \
+      "the commit has no VERSION file, or GitHub did not answer" \
+      "if the commit has no VERSION, delete the draft (gh release delete $tag) and run release.yml on the VERSION commit; otherwise run again"
+  fi
+  if [[ "$version" != "${tag#v}" ]]; then
+    refuse NRV-E1120 "the draft $tag targets ${commit:0:7}, whose VERSION is '${version:-none}', not ${tag#v}" \
+      "the draft was made from another commit than the VERSION commit, or the tag was mistyped" \
+      "delete the draft (gh release delete $tag) and run release.yml on the VERSION commit"
+  fi
+  # Is the commit on main? Compare main with it: `identical` or `behind` means it is on main. The
+  # files are relative to the merge base, which is on main (a first page of 30 cannot hide a file
+  # beyond VERSION and CHANGELOG.md in a list of at most two).
+  if ! compared=$(gh api "repos/$GITHUB_REPOSITORY/compare/main...$commit" \
+    --jq '.status, (.files[]? | .filename)' 2> /dev/null) || [[ -z "$compared" ]]; then
+    refuse NRV-E1122 "cannot compare the commit ${commit:0:7}, which the draft $tag targets, with main" \
+      "GitHub did not answer the compare call, so it is not known whether the commit is on main" \
+      "run again"
+  fi
+  status=$(head -n1 <<< "$compared")
+  if [[ "$status" != identical && "$status" != behind ]]; then
+    if [[ "$tag" != *-* ]]; then
+      refuse NRV-E1124 "$tag is a release, and its draft targets ${commit:0:7}, which is not on main" \
+        "a release is cut only from a main commit (P147b)" \
+        "delete the draft (gh release delete $tag) and run release.yml on main"
+    fi
+    # A prerelease may add the version bump to main, and nothing else: its build.zig and
+    # zig/download.sh run with the keychain unlocked, so they must be main's (P343).
+    if tail -n +2 <<< "$compared" | grep -qvxE 'VERSION|CHANGELOG\.md'; then
+      refuse NRV-E1124 "$tag is a prerelease, and its draft targets ${commit:0:7}, which changes more than VERSION and CHANGELOG.md on top of main" \
+        "the code that runs with the signing keychain unlocked must be main's; a prerelease may add only the version bump to it (P343)" \
+        "delete the draft (gh release delete $tag) and run release.yml on main, or on a commit that changes only VERSION and CHANGELOG.md"
+    fi
+  fi
+  echo "$commit"
 }
 
 case "${1:-}" in
@@ -112,47 +165,57 @@ case "${1:-}" in
         "it was published, and a published release's assets are not replaced" \
         "to correct a published release, cut the next version"
     fi
-    target=${found#*$'\t'}
-    if ! commit=$(gh api "repos/$GITHUB_REPOSITORY/commits/$target" --jq .sha 2> /dev/null) || [[ -z "$commit" ]]; then
-      refuse NRV-E1122 "cannot read the commit $target that the draft $tag targets" \
-        "the commit or branch no longer exists (a deleted branch), or GitHub did not answer" \
-        "if the target is gone, delete the draft (gh release delete $tag) and run release.yml on the VERSION commit; otherwise run again"
+    commit=$(target_commit "$tag" "${found#*$'\t'}")
+    echo "$commit"
+    ;;
+  publish-ready)
+    tag=${2:?usage: release_check.sh publish-ready <tag>}
+    if ! [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+      refuse NRV-E1131 "'$tag' is not a release tag v<VERSION>" \
+        "the tag must be v followed by the version (v0.7.1, v0.7.1-rc.1), with no space or other text" \
+        "run the workflow for the tag the release job made"
     fi
-    if ! version=$(gh api -H "Accept: application/vnd.github.raw" \
-      "repos/$GITHUB_REPOSITORY/contents/VERSION?ref=$commit" 2> /dev/null | head -n1 | tr -d '[:space:]'); then
-      refuse NRV-E1122 "cannot read VERSION at ${commit:0:7}, the commit the draft $tag targets" \
-        "the commit has no VERSION file, or GitHub did not answer" \
-        "if the commit has no VERSION, delete the draft (gh release delete $tag) and run release.yml on the VERSION commit; otherwise run again"
+    if ! found=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases" \
+      --jq ".[] | select(.tag_name == \"$tag\") | [.draft, .target_commitish, .prerelease, (.assets | map(.name) | join(\",\"))] | @tsv" \
+      2> /dev/null | head -n1); then
+      echo "release_check.sh: cannot list the releases of $GITHUB_REPOSITORY (GitHub did not answer); run again" >&2
+      exit 2
     fi
-    if [[ "$version" != "${tag#v}" ]]; then
-      refuse NRV-E1120 "the draft $tag targets ${commit:0:7}, whose VERSION is '${version:-none}', not ${tag#v}" \
-        "the draft was made from another commit than the VERSION commit, or the tag was mistyped" \
-        "delete the draft (gh release delete $tag) and run release.yml on the VERSION commit"
+    if [[ -z "$found" ]]; then
+      refuse NRV-E1131 "there is no release named $tag to publish" \
+        "the draft was deleted, or release.yml did not make it" \
+        "run release.yml again on the VERSION commit"
     fi
-    # Is the commit on main? Compare main with it: `identical` or `behind` means it is on main. The
-    # files are relative to the merge base, which is on main (a first page of 30 cannot hide a file
-    # beyond VERSION and CHANGELOG.md in a list of at most two).
-    if ! compared=$(gh api "repos/$GITHUB_REPOSITORY/compare/main...$commit" \
-      --jq '.status, (.files[]? | .filename)' 2> /dev/null) || [[ -z "$compared" ]]; then
-      refuse NRV-E1122 "cannot compare the commit ${commit:0:7}, which the draft $tag targets, with main" \
-        "GitHub did not answer the compare call, so it is not known whether the commit is on main" \
-        "run again"
+    # A published release is where an earlier run of the publish job stopped: it carries on.
+    IFS=$'\t' read -r _ target prerelease names <<< "$found"
+    # The prerelease flag is the tag's suffix: step 4 picks --latest from the tag, so a hand-edited
+    # flag would make a candidate Latest or publish a release as a prerelease.
+    want=false
+    [[ "$tag" == *-* ]] && want=true
+    if [[ "$prerelease" != "$want" ]]; then
+      refuse NRV-E1133 "the release $tag is marked prerelease=$prerelease, and its tag says $want" \
+        "the 'Set as a pre-release' box was changed by hand, or release.yml did not set it from the version" \
+        "set it (gh release edit $tag --prerelease=$want) and run the failed job again"
     fi
-    status=$(head -n1 <<< "$compared")
-    if [[ "$status" != identical && "$status" != behind ]]; then
-      if [[ "$tag" != *-* ]]; then
-        refuse NRV-E1124 "$tag is a release, and its draft targets ${commit:0:7}, which is not on main" \
-          "a release is cut only from a main commit (P147b)" \
-          "delete the draft (gh release delete $tag) and run release.yml on main"
-      fi
-      # A prerelease may add the version bump to main, and nothing else: its build.zig and
-      # zig/download.sh run with the keychain unlocked, so they must be main's (P343).
-      if tail -n +2 <<< "$compared" | grep -qvxE 'VERSION|CHANGELOG\.md'; then
-        refuse NRV-E1124 "$tag is a prerelease, and its draft targets ${commit:0:7}, which changes more than VERSION and CHANGELOG.md on top of main" \
-          "the code that runs with the signing keychain unlocked must be main's; a prerelease may add only the version bump to it (P343)" \
-          "delete the draft (gh release delete $tag) and run release.yml on main, or on a commit that changes only VERSION and CHANGELOG.md"
-      fi
+    # The ten files `release` builds (release.yml's dist/: four tarballs, four packages, the bill
+    # of materials and SHA256SUMS, which lists nine of them) and the two of the Mac zip.
+    ver=${tag#v}
+    filever=${ver//-/.}
+    expected=$(printf '%s\n' \
+      "nerva-$tag-x86_64-linux.tar.gz" "nerva-$tag-aarch64-linux.tar.gz" \
+      "nerva-$tag-x86_64-macos.tar.gz" "nerva-$tag-aarch64-macos.tar.gz" \
+      "nerva_$filever-1_amd64.deb" "nerva_$filever-1_arm64.deb" \
+      "nerva-$filever-1.x86_64.rpm" "nerva-$filever-1.aarch64.rpm" \
+      "nerva-$tag.cdx.json" SHA256SUMS \
+      "nerva-$tag-universal-macos.zip" "nerva-$tag-universal-macos.zip.sha256" | LC_ALL=C sort)
+    uploaded=$(tr ',' '\n' <<< "$names" | LC_ALL=C sort)
+    if [[ "$uploaded" != "$expected" ]]; then
+      diff=$(diff <(echo "$expected") <(echo "$uploaded") | tr '\n' ' ' || true)
+      refuse NRV-E1131 "the release $tag does not hold exactly the assets it is published with ($diff)" \
+        "an upload is missing (the Mac zip comes from mac-sign.yml's job), or a file was added or renamed" \
+        "run the failed job again; if the draft is wrong, delete it (gh release delete $tag) and run release.yml again"
     fi
+    commit=$(target_commit "$tag" "$target")
     echo "$commit"
     ;;
   mac-same)
@@ -180,7 +243,7 @@ case "${1:-}" in
     fi
     ;;
   *)
-    echo "usage: release_check.sh ref <tag> <git-ref> | unreleased <tag> | binary <nerva> <version> | assets <tag> <dist-dir> | mac-draft <tag> | mac-same <tag> <signed> <now> | mac-upload <tag> <dir>" >&2
+    echo "usage: release_check.sh ref <tag> <git-ref> | unreleased <tag> | binary <nerva> <version> | assets <tag> <dist-dir> | mac-draft <tag> | mac-same <tag> <signed> <now> | mac-upload <tag> <dir> | publish-ready <tag>" >&2
     exit 2
     ;;
 esac

@@ -23,7 +23,7 @@ The release gates (P147b) do not change. The fleet soak, Jepsen and the two adve
 still come before the `VERSION` commit, and the release PR still quotes them. What changes is what
 the approval means. Today it means "sign this draft", and the owner publishes later. From now on
 it means **"ship this release"**: once the Mac jobs are green, the draft is published without
-another look. The draft, with its notes and its nine assets, already exists when the approval
+another look. The draft, with its notes and its ten assets (the zip and its checksum join them in `mac`), already exists when the approval
 prompt appears, so the owner can read it before they click.
 
 Today the owner does four things after the draft exists: approve `mac`, read the green
@@ -44,7 +44,7 @@ VERSION commit merged to main (CHANGELOG section with its site line, P360)
                         │           mac_zip_check.sh, upload zip + .zip.sha256, artifact homebrew-formula)
                         └─ mac-verify  (mac-verify.yml on the draft: arm64 + x86_64; brew skipped)
                              └─ publish  env release-publish (main only, no reviewers)
-                                  ├─ release_check.sh publish-ready: draft, same commit, 11 assets
+                                  ├─ release_check.sh publish-ready: draft, same commit, 12 assets, prerelease flag = tag (P361)
                                   ├─ publish the draft  → GitHub creates tag v<V> at the target
                                   ├─ tap:  Formula/nerva.rb → NervaLog/homebrew-tap main   (App token)
                                   │        (a prerelease: branch rc/v<V>, never main)
@@ -122,7 +122,7 @@ full commit SHA, as today.
      `github.token`. It refuses unless all of these hold: the release is a draft (or already
      published, which a re-run continues past), its target resolves to the commit `mac-draft`
      accepts (main for a release; main plus `VERSION` and `CHANGELOG.md` for a prerelease), and
-     its assets are exactly the nine `release` built plus `nerva-<tag>-universal-macos.zip` and
+     its `prerelease` flag is true exactly when the tag has a `-` (NRV-E1133), its assets are exactly the ten `release` built (P361; `SHA256SUMS` lists nine of them) plus `nerva-<tag>-universal-macos.zip` and
      its `.zip.sha256`. It prints the commit.
   3. Download the `homebrew-formula` artifact (`actions/download-artifact`, pinned). Refuse,
      with a new code, unless its `url` is
@@ -194,9 +194,12 @@ line:
 <!-- site: The first release for outside users: a signed and notarized Mac binary with a Homebrew tap, Linux packages and an installer. -->
 ```
 
-`release_notes.sh <tag>` drops that line. `release_notes.sh site <tag>` prints its text and fails
-(new code) when it is missing, empty, longer than 300 characters or holds a `"` or a `\`. The
-check runs in `version`, before CI. The supervisor writes the line in the `VERSION` PR, as it
+`release_notes.sh <tag>` drops that line, and only that one. `release_notes.sh site <tag>` prints
+its text and fails (NRV-E1130) when it is missing, there are two (only a line outside a fenced
+code block counts, so a section may show the convention in one), it is empty, longer than 300
+characters, or holds a `"`, a `\`, or a `--` (a `-->` inside the sentence would end the comment
+early). It also refuses a tag that is not `v<X.Y.Z>` or `v<X.Y.Z>-rc.<N>`: only `-rc.N`
+prereleases are published by the automation (P361). The check runs in `version`, before CI. The supervisor writes the line in the `VERSION` PR, as it
 writes the rest of the section.
 
 ### `NervaLog/nervalog.github.io` (new file there)
@@ -441,7 +444,7 @@ with `branch_policy` only. Then tell the supervisor, and the rehearsal follows.
 
 1. The gates pass (P147b): the soak, Jepsen and both review verdicts. The supervisor merges the
    `VERSION` PR, whose CHANGELOG section has its site line.
-2. `release.yml` runs `version`, `ci` and `release`. The draft appears with nine assets, and
+2. `release.yml` runs `version`, `ci` and `release`. The draft appears with ten assets, and
    `mac` waits.
 3. **The owner reads the draft and approves `mac` once.** That approval ships the release.
 4. `mac`, `mac-verify`, `publish` and `verify` run. The tag, the tap's `main` and the site's
@@ -464,7 +467,7 @@ the owner deletes afterwards. It now covers the whole graph.
 2. The supervisor makes branch `rehearsal/v0.7.1-rc.2` from `main`. It changes only `VERSION`
    (`0.7.1-rc.2`) and `CHANGELOG.md` (a `## v0.7.1-rc.2 — <date>` section with a site line).
 3. The supervisor dispatches `release.yml` from that branch. Expect `version`, `ci` and `release`
-   green, a prerelease draft with nine assets, and `finish` skipped (not main).
+   green, a prerelease draft with ten assets, and `finish` skipped (not main).
 4. The supervisor dispatches `release-finish.yml` from `main` with `tag=v0.7.1-rc.2`. The owner
    approves `mac` once.
 5. **Pass:**
