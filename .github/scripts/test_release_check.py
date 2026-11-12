@@ -268,9 +268,10 @@ class PublishReady(unittest.TestCase):
         self.assertIn("\n  fix    ", result.stderr)
         self.assertIn(f"::error::{code}", result.stderr)
 
-    def gh(self, d, tag="v0.7.1", draft="true", assets=None, **kwargs):
+    def gh(self, d, tag="v0.7.1", draft="true", assets=None, prerelease=None, **kwargs):
         names = release_assets(tag) if assets is None else assets
-        fake_gh_draft(d, releases=f"{draft}\\tabc1234\\t{names}", version=tag[1:], **kwargs)
+        flag = ("true" if "-" in tag else "false") if prerelease is None else prerelease
+        fake_gh_draft(d, releases=f"{draft}\\tabc1234\\t{flag}\\t{names}", version=tag[1:], **kwargs)
 
     def test_a_draft_with_every_asset_on_main_passes_and_prints_its_commit(self):
         with tempfile.TemporaryDirectory() as d:
@@ -304,8 +305,18 @@ class PublishReady(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             self.gh(d, status="diverged", files=("VERSION",))
             self.refused(run("publish-ready", "v0.7.1", path_dir=d), "NRV-E1124", "which is not on main")
-            fake_gh_draft(d, releases=f"true\\tabc1234\\t{release_assets('v0.7.1')}", version="0.7.0")
+            fake_gh_draft(d, releases=f"true\\tabc1234\\tfalse\\t{release_assets('v0.7.1')}", version="0.7.0")
             self.refused(run("publish-ready", "v0.7.1", path_dir=d), "NRV-E1120", "whose VERSION is '0.7.0'")
+
+    def test_a_prerelease_flag_that_disagrees_with_the_tag_is_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.gh(d, "v0.7.1", prerelease="true")
+            self.refused(run("publish-ready", "v0.7.1", path_dir=d), "NRV-E1133",
+                         "the release v0.7.1 is marked prerelease=true, and its tag says false")
+            self.gh(d, "v0.7.1-rc.2", prerelease="false")
+            result = run("publish-ready", "v0.7.1-rc.2", path_dir=d)
+            self.refused(result, "NRV-E1133", "the release v0.7.1-rc.2 is marked prerelease=false, and its tag says true")
+            self.assertIn("gh release edit v0.7.1-rc.2 --prerelease=true", result.stderr)
 
     def test_a_tag_that_is_not_v_version_is_refused(self):
         for tag in ("main", "0.7.1", "v0.7.1 "):
@@ -396,8 +407,27 @@ class SiteLine(unittest.TestCase):
                                ("<!-- site: TO FILL -->", "still holds a TO FILL")):
             self.refused(site(f"## v0.7.1 \u2014 d\n{text}\n\nx\n"), fragment)
         self.assertEqual(site(f"## v0.7.1 \u2014 d\n<!-- site: {'x' * 300} -->\n\nx\n").returncode, 0)
+        self.refused(site("## v0.7.1 \u2014 d\n<!-- site: a -- b -->\n\nx\n"), "holds '--'")
+        # `-->` inside the sentence is refused too (it holds a `>`), never cut at the first one.
+        self.refused(site("## v0.7.1 \u2014 d\n<!-- site: a --> b -->\n\nx\n"), "a character the site does not take")
         # A prerelease's bad line is still refused: only a missing one is defaulted.
         self.refused(site('## v0.7.1-rc.1 \u2014 d\n<!-- site: "x" -->\n', "v0.7.1-rc.1"), "a character the site does not take")
+
+    def test_two_site_lines_are_refused_and_a_fenced_one_does_not_count(self):
+        self.refused(site(f"## v0.7.1 \u2014 d\n<!-- site: One. -->\n<!-- site: Two. -->\n\nx\n"),
+                     "has more than one site line")
+        fenced = "```\n<!-- site: Example sentence. -->\n```\n"
+        self.refused(site(f"## v0.7.1 \u2014 d\n\nHow:\n{fenced}"), "has no site line")
+        both = f"## v0.7.1 \u2014 d\n<!-- site: Real. -->\n\n{fenced}\n<!-- site: Other. -->\n"
+        self.refused(site(both), "has more than one site line")
+        one = f"## v0.7.1 \u2014 d\n<!-- site: Real. -->\n\nHow:\n{fenced}"
+        self.assertEqual(site(one).stdout, "Real.\n")
+        # The notes drop that line only: the example inside the fence stays.
+        self.assertEqual(notes(one).stdout, "How:\n" + fenced)
+
+    def test_only_the_release_and_rc_versions_are_taken(self):
+        for tag in ("v0.8.0-beta.1", "v0.7.1-rc", "v0.7.1-rc.1.2", "0.7.1", "v0.7"):
+            self.refused(site(f"## {tag} \u2014 d\n{SITE_LINE}\n", tag), f"'{tag}' is not a version the site can show")
 
 
 if __name__ == "__main__":

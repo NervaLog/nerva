@@ -176,7 +176,7 @@ case "${1:-}" in
         "run the workflow for the tag the release job made"
     fi
     if ! found=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases" \
-      --jq ".[] | select(.tag_name == \"$tag\") | [.draft, .target_commitish, (.assets | map(.name) | join(\",\"))] | @tsv" \
+      --jq ".[] | select(.tag_name == \"$tag\") | [.draft, .target_commitish, .prerelease, (.assets | map(.name) | join(\",\"))] | @tsv" \
       2> /dev/null | head -n1); then
       echo "release_check.sh: cannot list the releases of $GITHUB_REPOSITORY (GitHub did not answer); run again" >&2
       exit 2
@@ -187,7 +187,16 @@ case "${1:-}" in
         "run release.yml again on the VERSION commit"
     fi
     # A published release is where an earlier run of the publish job stopped: it carries on.
-    IFS=$'\t' read -r _ target names <<< "$found"
+    IFS=$'\t' read -r _ target prerelease names <<< "$found"
+    # The prerelease flag is the tag's suffix: step 4 picks --latest from the tag, so a hand-edited
+    # flag would make a candidate Latest or publish a release as a prerelease.
+    want=false
+    [[ "$tag" == *-* ]] && want=true
+    if [[ "$prerelease" != "$want" ]]; then
+      refuse NRV-E1133 "the release $tag is marked prerelease=$prerelease, and its tag says $want" \
+        "the 'Set as a pre-release' box was changed by hand, or release.yml did not set it from the version" \
+        "set it (gh release edit $tag --prerelease=$want) and run the failed job again"
+    fi
     # The ten files `release` builds (release.yml's dist/: four tarballs, four packages, the bill
     # of materials and SHA256SUMS, which lists nine of them) and the two of the Mac zip.
     ver=${tag#v}

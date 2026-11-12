@@ -101,6 +101,10 @@ class SiteRelease(unittest.TestCase):
             (("v0.7.1", "2026-11-13", "x"), "'v0.7.1' is not a version"),
             (("0.7", "2026-11-13", "x"), "'0.7' is not a version"),
             (("0.7.1", "13 Nov", "x"), "'13 Nov' is not a date"),
+            (("0.7.1", "2026-02-31", "x"), "'2026-02-31' is not a date"),
+            (("0.7.1", "2026-13-01", "x"), "'2026-13-01' is not a date"),
+            (("0.7.1", "2026-11-13", "a -- b"), "the site line is empty"),
+            (("0.7.1", "2026-11-13", "a --> b"), "the site line is empty"),
             (("0.7.1", "2026-11-13", ""), "the site line is empty"),
             (("0.7.1-beta", "2026-11-13", "x"), "is not a version"),
             *((("0.7.1", "2026-11-13", f"a{c}b"), "a character the site does not take")
@@ -109,6 +113,29 @@ class SiteRelease(unittest.TestCase):
         ):
             self.refused(self.run_script(*args), fragment)
             self.assertEqual(self.page.read_text(), PAGE)
+
+    def test_a_version_not_newer_or_a_date_earlier_than_the_newest_release_is_refused(self):
+        for args, fragment in (
+            (("0.6.2", "2026-11-13", "x"), "0.6.2 is not newer than 0.7.0"),
+            (("0.7.0-rc.3", "2026-11-13", "x"), "0.7.0-rc.3 is not newer than 0.7.0"),
+            (("0.7.1", "2026-11-01", "x"), "the date 2026-11-01 is earlier than 2026-11-10"),
+        ):
+            self.refused(self.run_script(*args), fragment)
+            self.assertEqual(self.page.read_text(), PAGE)
+        # The same date is allowed (the site's check refuses only an increase down the list).
+        self.assertEqual(self.run_script("0.7.1", "2026-11-10", "x").returncode, 0)
+
+    def test_candidates_are_ordered_numerically_and_a_release_is_newer_than_them(self):
+        page = PAGE.replace('{v:"0.7.0", date:"2026-11-10", d:"Older."}', '{v:"0.7.1-rc.2", date:"2026-11-10", d:"Older."}')
+        for version, ok in (("0.7.1-rc.1", False), ("0.7.1-rc.10", True), ("0.7.1", True)):
+            self.page.write_text(page)
+            result = self.run_script(version, "2026-11-13", "x")
+            if ok:
+                self.assertEqual(result.returncode, 0, (version, result.stderr))
+            else:
+                self.refused(result, f"{version} is not newer than 0.7.1-rc.2")
+        self.page.write_text(PAGE.replace('{v:"0.7.0"', '{v:"0.7.1"'))
+        self.refused(self.run_script("0.7.1-rc.9", "2026-11-13", "x"), "0.7.1-rc.9 is not newer than 0.7.1")
 
     def test_a_site_line_of_exactly_300_characters_passes(self):
         self.assertEqual(self.run_script("0.7.1", "2026-11-13", "x" * 300).returncode, 0)

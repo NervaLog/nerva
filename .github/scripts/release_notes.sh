@@ -6,11 +6,14 @@
 #
 #   release_notes.sh <tag>        the notes
 #   release_notes.sh site <tag>   the text of the site line, for the site's RELEASES entry
-#                                 (docs/releases/automation.md); refused with NRV-E1130 when the
-#                                 section has none, an empty one, one of more than 300 characters,
-#                                 one holding a non-printable or non-ASCII character or one of
-#                                 < > & \ ` " or a `TO FILL`; a prerelease (a tag
-#                                 with a `-`) with no site line gets `Release candidate <tag>.`
+#                                 (docs/releases/automation.md); refused with NRV-E1130 when the tag
+#                                 is not v<X.Y.Z> or v<X.Y.Z>-rc.<N> (the only versions the site
+#                                 takes), or the section has none, two or more (only a line outside
+#                                 a fenced code block counts), an empty one, one of more than 300
+#                                 characters, one holding a non-printable or non-ASCII character, `--`
+#                                 or one of < > & \ ` " or a `TO FILL`; a prerelease (a tag with a
+#                                 `-`) with no site line gets `Release candidate <tag>.`
+#                                 The notes drop that one line only.
 set -euo pipefail
 
 # The lines of the section of tag $1, without its heading.
@@ -22,16 +25,33 @@ section() {
   ' CHANGELOG.md
 }
 
+# The site lines of the section of tag $1: those outside a fenced code block, one per output line.
+site_lines() {
+  section "$1" | awk '
+    /^ *(```|~~~)/ { fenced = !fenced; next }
+    !fenced && /^<!-- site:.*-->[[:space:]]*$/ { print }
+  '
+}
+
 site_refuse() {
   printf 'error[NRV-E1130]: release.yml: %s\n  cause  %s\n  fix    %s\n' "$1" "$2" \
-    'write the line as the first line of the section, <!-- site: <one sentence, at most 300 characters, printable ASCII without < > & \ ` "> -->, then run again' >&2
+    'write one line, the first of the section, <!-- site: <one sentence, at most 300 characters, printable ASCII without < > & \ ` " or --> -->, then run again' >&2
   echo "::error::NRV-E1130 $1" >&2
   exit 1
 }
 
 if [[ "${1:-}" == site ]]; then
   tag=${2:?usage: release_notes.sh site <tag>}
-  line=$(section "$tag" | grep -m1 -E '^<!-- site:.*-->[[:space:]]*$' || true)
+  if ! [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]; then
+    site_refuse "'$tag' is not a version the site can show" \
+      "the site's release list takes v<X.Y.Z> or v<X.Y.Z>-rc.<N>, and only a -rc.<N> prerelease can be published by the automation"
+  fi
+  lines=$(site_lines "$tag")
+  if (($(grep -c . <<< "$lines") > 1)); then
+    site_refuse "the CHANGELOG.md section of $tag has more than one site line" \
+      "the site takes one sentence, and a second '<!-- site:' line outside a code block is ambiguous"
+  fi
+  line=$lines
   if [[ -z "$line" ]]; then
     # A prerelease is never merged into the site: its line is a default.
     if [[ "$tag" == *-* ]]; then
@@ -42,7 +62,8 @@ if [[ "${1:-}" == site ]]; then
       "the site's release list takes one sentence from the section, and this release has none"
   fi
   text=${line#'<!-- site:'}
-  text=${text%%-->*}
+  text=${text%"${text##*[![:space:]]}"}
+  text=${text%'-->'}
   text=$(sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' <<< "$text")
   if [[ -z "$text" ]]; then
     site_refuse "the site line of $tag is empty" "the comment holds no text"
@@ -57,6 +78,11 @@ if [[ "${1:-}" == site ]]; then
     site_refuse "the site line of $tag holds a character the site does not take" \
       'the sentence must be printable ASCII without < > & \ ` or ", because the site writes it into its script and its HTML'
   fi
+  # A `--` could end the comment early (`-->` inside the sentence), so it is refused, not cut.
+  if [[ "$text" == *--* ]]; then
+    site_refuse "the site line of $tag holds '--'" \
+      "a '--' (or '-->') inside the sentence would end the HTML comment early"
+  fi
   if [[ "$text" == *'TO FILL'* ]]; then
     site_refuse "the site line of $tag still holds a TO FILL placeholder" \
       "the line was not completed before the VERSION commit, and it is published on the site"
@@ -66,7 +92,12 @@ if [[ "${1:-}" == site ]]; then
 fi
 
 tag="$1"
-notes=$(section "$tag" | grep -v -E '^<!-- site:.*-->[[:space:]]*$' || true)
+# Only the site line (the first one outside a fenced code block) is dropped.
+notes=$(section "$tag" | awk '
+  /^ *(```|~~~)/ { fenced = !fenced }
+  !fenced && !dropped && /^<!-- site:.*-->[[:space:]]*$/ { dropped = 1; next }
+  { print }
+')
 if [[ -z "${notes//[[:space:]]/}" ]]; then
   echo "::error::CHANGELOG.md has no notes for $tag: add a '## $tag — <date>' section" >&2
   exit 1

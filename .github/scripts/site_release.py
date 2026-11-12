@@ -9,7 +9,12 @@ NervaLog/nervalog.github.io that the publish job edits:
 `RELEASES` and sets `SITE.version`, `SITE.released` and `SITE.updated`. It does nothing, and exits 0,
 if `RELEASES` already holds <V> (a re-run). It refuses with NRV-E1132, changing nothing, unless
 `const SITE = {` and `const RELEASES = [` occur exactly once and `updated`, `version` and `released`
-occur exactly once in SITE, each with a string value; or if an argument is not well formed."""
+occur exactly once in SITE, each with a string value; if an argument is not well formed (the
+version is `X.Y.Z` or `X.Y.Z-rc.N`, the date a real calendar date); or if the version is not newer
+than RELEASES[0]'s (SemVer, `-rc.N` numerically, a release newer than its candidates) or the date is
+earlier than its date: the site's checker refuses both, and this refuses them before the release is
+published."""
+import datetime
 import os
 import re
 import sys
@@ -24,15 +29,29 @@ def refuse(headline, cause, fix):
     sys.exit(1)
 
 
+def version_key(version):
+    """SemVer order for X.Y.Z and X.Y.Z-rc.N: a release is newer than its candidates."""
+    m = re.fullmatch(r"([0-9]+)\.([0-9]+)\.([0-9]+)(?:-rc\.([0-9]+))?", version)
+    if not m:
+        return None
+    major, minor, patch, rc = m.groups()
+    return (int(major), int(minor), int(patch), 0 if rc is not None else 1, int(rc or 0))
+
+
 def check_arguments(version, date, line):
     if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?", version):
         refuse(f"'{version}' is not a version", "the version is VERSION's text, like 0.7.1 or 0.7.1-rc.1, with no v",
                "pass the tag without its v")
     if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", date):
         refuse(f"'{date}' is not a date", "the date is written YYYY-MM-DD", "pass the release's date")
-    if not line.strip() or len(line) > 300 or not re.fullmatch(r"[ -~]+", line) or re.search(r"[<>&\\`\"]", line):
+    try:
+        datetime.date.fromisoformat(date)
+    except ValueError:
+        refuse(f"'{date}' is not a date", "it is not a day on the calendar", "pass the release's date")
+    if (not line.strip() or len(line) > 300 or not re.fullmatch(r"[ -~]+", line)
+            or re.search(r"[<>&\\`\"]", line) or "--" in line):
         refuse("the site line is empty, over 300 characters, or holds a character the site does not take",
-               "it must be printable ASCII without < > & \\ ` or \", because it is written into the site's script and HTML",
+               "it must be printable ASCII without < > & \\ ` \" or --, because it is written into the site's script and HTML",
                "pass the output of release_notes.sh site")
 
 
@@ -62,6 +81,16 @@ def edit(text, version, date, line):
                    "edit the page by hand, and update this script and its test to the new shape")
     if re.search(rf'(?m)^[ \t]*\{{[ \t]*v:[ \t]*"{re.escape(version)}"', text[r_start:r_end]):
         return None
+    first = re.search(r'\{[ \t]*v:[ \t]*"([^"\n]*)"[ \t]*,[ \t]*date:[ \t]*"([^"\n]*)"', text[r_start:r_end])
+    if first and version_key(first.group(1)) is not None:
+        if version_key(version) <= version_key(first.group(1)):
+            refuse(f"{version} is not newer than {first.group(1)}, the newest release on the site",
+                   "the site's RELEASES list is newest first, and its check refuses any other order",
+                   "release a version above the site's newest, or edit the site by hand")
+        if date < first.group(2):
+            refuse(f"the date {date} is earlier than {first.group(2)}, the newest release's date",
+                   "the site's RELEASES dates must not increase down the list",
+                   "pass the release's real date")
     for key, value in (("updated", date), ("version", version), ("released", date)):
         site = re.sub(rf'(?m)^([ \t]*{key}:[ \t]*)"[^"\n]*"', lambda m: f'{m.group(1)}"{value}"', site)
     entry = f'\n  {{v:"{version}", date:"{date}", d:"{line}"}},'

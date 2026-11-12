@@ -159,7 +159,7 @@ create() {
   fi
   local throwaway
   if ! throwaway=$(openssl rand -base64 32 2> /dev/null) || [[ -z "$throwaway" ]]; then
-    fail NRV-E1125 "a random keychain password could not be made" \
+    fail NRV-E1125 "a random password for the re-wrapped .p12 could not be made" \
       "'openssl rand' failed or printed nothing" \
       "run again; if it repeats, the runner image is broken"
   fi
