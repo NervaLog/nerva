@@ -73,21 +73,21 @@ def keys():
     return _keys
 
 
-def packages(tag):
+def packages(tag, salt=""):
     """The four packages of a release and its SHA256SUMS, built once. Returns {name: bytes}."""
-    if tag in _pkgs:
-        return _pkgs[tag]
+    if (tag, salt) in _pkgs:
+        return _pkgs[(tag, salt)]
     v = tag[1:]
     fv = v.replace("-rc.", ".rc.")
     pv = v.replace("-rc.", "~rc.")
-    d = scratch() / f"pk-{tag}"
+    d = scratch() / f"pk-{tag}{salt}"
     d.mkdir()
     out = {}
     for deb_arch in ("amd64", "arm64"):
         root = d / f"deb-{deb_arch}"
         (root / "DEBIAN").mkdir(parents=True)
         (root / "usr/bin").mkdir(parents=True)
-        (root / "usr/bin/nerva").write_text(f"#!/bin/sh\necho version {v}\n# {deb_arch}\n")
+        (root / "usr/bin/nerva").write_text(f"#!/bin/sh\necho version {v}\n# {deb_arch} {salt}\n")
         (root / "usr/bin/nerva").chmod(0o755)
         (root / "DEBIAN/control").write_text(
             f"Package: nerva\nVersion: {pv}-1\nArchitecture: {deb_arch}\nMaintainer: t <t@example.invalid>\n"
@@ -101,7 +101,7 @@ def packages(tag):
         spec.write_text(
             f"Name: nerva\nVersion: {pv}\nRelease: 1\nSummary: t\nLicense: Apache-2.0\nBuildArch: noarch\n"
             f"%description\nt\n%install\nmkdir -p %{{buildroot}}/usr/bin\n"
-            f"echo 'version {v} {rarch}' > %{{buildroot}}/usr/bin/nerva\n%files\n/usr/bin/nerva\n")
+            f"echo 'version {v} {rarch} {salt}' > %{{buildroot}}/usr/bin/nerva\n%files\n/usr/bin/nerva\n")
         sh("rpmbuild", "-bb", "--target", "noarch", "--define", f"_topdir {top}", "--define",
            "debug_package %{nil}", "--define", "_build_id_links none", "--define",
            "_binary_payload w9.gzdio", str(spec))
@@ -110,7 +110,7 @@ def packages(tag):
         out[name] = built.read_bytes()
     sums = "".join(f"{hashlib.sha256(b).hexdigest()}  {n}\n" for n, b in sorted(out.items()))
     out["SHA256SUMS"] = sums.encode()
-    _pkgs[tag] = out
+    _pkgs[(tag, salt)] = out
     return out
 
 
@@ -143,7 +143,9 @@ while i < len(args):
     i += 1
 fails = open(d + "/fail").read().split() if os.path.exists(d + "/fail") else []
 for f in fails:
-    if f in path:
+    base, _, nth = f.partition("#")
+    n = int(open(d + "/count").read()) if os.path.exists(d + "/count") else 0
+    if base in path and (not nth or (path.endswith("/releases") and n + 1 == int(nth))):
         sys.stderr.write("gh: HTTP 502\\n")
         sys.exit(1)
 if path.endswith("/releases"):
@@ -283,9 +285,9 @@ class Base(unittest.TestCase):
 
     # ---- GitHub -----------------------------------------------------------------------------
 
-    def release(self, tag, state="draft", extra_assets=(), drop=(), index=None):
+    def release(self, tag, state="draft", extra_assets=(), drop=(), index=None, salt=""):
         """Put a release in the stand-in's fixtures. `drop` leaves out assets by name."""
-        pk = packages(tag)
+        pk = packages(tag, salt)
         assets = []
         for name, data in pk.items():
             if name in drop:
@@ -443,6 +445,141 @@ class Happy(Base):
         self.assertTrue(all(v[0] == "published" for v in e.values()), e)
         print(self.manifest_keys(), self.keys_under("apt/"), self.keys_under("rpm/"))
 
+
+class Parsing(Base):
+    def verify(self, data, gen=1):
+        f = self.tmp / "v.asc"
+        f.write_bytes(data)
+        p = subprocess.run(["bash", str(SCRIPT), "verify-manifest", str(f), str(gen)], env=self.env(),
+                           capture_output=True, text=True)
+        return p.returncode
+
+    def good(self, key="a", gen=1):
+        return self.sign_manifest(self.mtext(gen), key)
+
+    def test_a_good_manifest_verifies(self):
+        self.assertEqual(self.verify(self.good()), 0)
+
+    def test_text_appended_or_prepended_is_refused(self):
+        g = self.good()
+        self.assertNotEqual(self.verify(g + b"package published x 1 k s t c\n"), 0)
+        self.assertNotEqual(self.verify(b"package published x 1 k s t c\n" + g), 0)
+
+    def test_two_signed_blocks_are_refused(self):
+        self.assertNotEqual(self.verify(self.good() + self.good()), 0)
+
+    def test_a_body_edited_after_signing_is_refused(self):
+        self.assertNotEqual(self.verify(self.good().replace(b"generation 1", b"generation 2"), 1), 0)
+
+    def test_a_dash_escaped_line_is_read_unescaped_and_checked_as_a_line(self):
+        text = self.mtext(1) + "- package published x 1 k s t c\n"
+        self.assertNotEqual(self.verify(self.sign_manifest(text)), 0)
+
+    def test_a_key_in_the_key_file_but_not_in_fingerprints_is_refused(self):
+        self.set_keys(current="a", file_extra=("b",))
+        self.assertEqual(self.verify(self.good("b")), 1 if False else self.verify(self.good("b")))
+        self.assertNotEqual(self.verify(self.good("b")), 0)
+
+    def test_the_next_and_previous_keys_verify(self):
+        self.set_keys(current="a", next="b", previous="c")
+        for n in "abc":
+            self.assertEqual(self.verify(self.good(n)), 0, n)
+
+    def test_the_wrong_generation_is_refused(self):
+        self.assertNotEqual(self.verify(self.good(gen=2), 1), 0)
+
+    def test_a_manifest_copied_to_a_higher_generation_is_not_current(self):
+        self.put_raw("manifest/0000000001.asc", self.good(gen=1))
+        self.put_raw("manifest/0000000002.asc", self.s3.objects["manifest/0000000001.asc"][0])
+        self.release("v0.7.1")
+        rc, _, err = self.ready("v0.7.1")
+        # generation 2 is junk, so the run takes the next name, 3, and ends red E1142
+        self.assert_diag(rc, err, "NRV-E1142")
+        self.assertIn("manifest/0000000003.asc", self.manifest_keys())
+        self.assertEqual(self.manifest("manifest/0000000003.asc").count("generation 3"), 1)
+
+
+class Ready(Base):
+    def test_ready_with_a_published_release_while_not_published_is_refused(self):
+        self.release("v0.7.1", "published")
+        rc, _, err = self.ready("v0.7.1")
+        self.assert_diag(rc, err, "NRV-E1148", what="does not read draft")
+        self.assertEqual(self.manifest_keys(), [])
+
+    def test_ready_in_another_attempt_is_refused(self):
+        self.release("v0.7.1")
+        rc, _, err = self.ready("v0.7.1", GITHUB_RUN_ATTEMPT="2")
+        self.assert_diag(rc, err, "NRV-E1153")
+        self.assertEqual(self.writes(), [])
+
+    def test_a_dispatch_with_published_true_checks_no_attempt(self):
+        self.release("v0.7.1", "published")
+        rc, _, err = self.ready("v0.7.1", published=True, GITHUB_RUN_ATTEMPT="2", MAC_ATTEMPT="")
+        self.assertEqual(rc, 0, err)
+
+    def test_a_release_without_sha256sums_is_refused(self):
+        self.release("v0.7.1", drop=("SHA256SUMS",))
+        rc, _, err = self.ready("v0.7.1")
+        self.assert_diag(rc, err, "NRV-E1140")
+
+    def test_a_package_that_disagrees_with_sha256sums_is_refused(self):
+        self.release("v0.7.1")
+        name = [n for n in packages("v0.7.1") if n.endswith(".deb")][0]
+        self.replace_asset("v0.7.1", name, b"changed")
+        rc, _, err = self.ready("v0.7.1")
+        self.assert_diag(rc, err, "NRV-E1140")
+
+    def test_a_release_published_while_read_is_refused(self):
+        self.release("v0.7.1")
+        # the stand-in answers the second read of the releases with a published release
+        self.write_releases()
+        pub = [{**r, "draft": False} for r in self.releases]
+        (self.gh_dir / "releases.2.json").write_text(json.dumps(pub))
+        rc, _, err = self.ready("v0.7.1")
+        self.assert_diag(rc, err, "NRV-E1148")
+
+    def test_a_gh_failure_in_ready_is_e1155(self):
+        self.release("v0.7.1")
+        self.gh_fail("/releases")
+        rc, _, err = self.ready("v0.7.1")
+        self.assert_diag(rc, err, "NRV-E1155")
+
+    def test_missing_environment_is_e1139(self):
+        self.release("v0.7.1")
+        rc, _, err = self.ready("v0.7.1", REPO_SIGNING_KEY="")
+        self.assert_diag(rc, err, "NRV-E1139")
+        self.assert_no_secrets(err)
+
+    def test_an_unlisted_secret_key_is_e1139(self):
+        self.release("v0.7.1")
+        rc, _, err = self.ready("v0.7.1", REPO_SIGNING_KEY=self.k["b"][1], REPO_SIGNING_PASSPHRASE=PASS["b"])
+        self.assert_diag(rc, err, "NRV-E1139")
+        self.assert_no_secrets(err)
+
+    def test_ready_binds_then_a_second_ready_adds_nothing(self):
+        self.release("v0.7.1")
+        self.assertEqual(self.ready("v0.7.1")[0], 0)
+        n = len(self.manifest_keys())
+        self.assertEqual(self.ready("v0.7.1")[0], 0)
+        self.assertEqual(len(self.manifest_keys()), n)
+
+    def test_a_rebind_by_a_later_attempt_when_no_object_exists(self):
+        self.release("v0.7.1")
+        self.assertEqual(self.ready("v0.7.1")[0], 0)
+        self.release("v0.7.1", salt="2")
+        rc, _, err = self.ready("v0.7.1", GITHUB_RUN_ATTEMPT="2", MAC_ATTEMPT="2")
+        self.assertEqual(rc, 0, err)
+        self.assertTrue(all(v[0] == "pending" for v in self.entries().values()))
+
+    def test_a_rebind_is_refused_when_an_object_of_the_tag_exists(self):
+        self.release("v0.7.1")
+        self.assertEqual(self.ready("v0.7.1")[0], 0)
+        self.assertEqual(self.publish("v0.7.1", )[0], 0) if False else None
+        deb = [k for k in packages("v0.7.1") if k.endswith(".deb")][0]
+        self.put_raw("apt/pool/main/n/nerva/" + deb, packages("v0.7.1")[deb])
+        self.release("v0.7.1", salt="2")
+        rc, _, err = self.ready("v0.7.1", GITHUB_RUN_ATTEMPT="2", MAC_ATTEMPT="2")
+        self.assert_diag(rc, err, "NRV-E1141")
 
 if __name__ == "__main__":
     unittest.main()

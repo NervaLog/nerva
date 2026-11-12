@@ -282,6 +282,7 @@ manifest_text() { # <generation> <state>
 # first free name above the current one.
 write_manifest() {
   local st=$1 g tries=0 rc
+  kill_point before_manifest
   g=$((CUR_GEN + 1))
   while :; do
     tries=$((tries + 1))
