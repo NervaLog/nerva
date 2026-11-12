@@ -66,7 +66,7 @@ A session never approves a deployment (an environment's required review); only t
 open `sim-fleet` issue against it), Jepsen-clean (once R1's nightly runs: the suite passes on that
 commit), and reviewed adversarially by **two** independent reviewers, as below. The release PR
 quotes the fleet's tracker line, the Jepsen result and both verdicts. **Code pinned** (owner,
-2026-11-12; P<N>): choosing a candidate means writing its full SHA to `release/candidate` on `main`
+2026-11-12; P374): choosing a candidate means writing its full SHA to `release/candidate` on `main`
 (one line). The release check (`release_check.sh candidate`, NRV-E1158, in `release.yml`'s
 `version` job and `release-finish.yml`'s `publish` job) refuses a `VERSION` commit that is not that
 candidate's descendant or that changes `src/`, `build.zig`, `build.zig.zon` or `zig/` since it;

@@ -462,7 +462,7 @@ with `branch_policy` only. Then tell the supervisor, and the rehearsal follows.
 
 ## A release afterwards
 
-0. **Choosing a candidate writes `release/candidate`** (P<N>, "code pinned"): the full SHA, one
+0. **Choosing a candidate writes `release/candidate`** (P374, "code pinned"): the full SHA, one
    line, merged to `main` before the soak starts. The soak, Jepsen and the reviews run on that SHA.
    A later change to `src/`, `build.zig`, `build.zig.zon` or `zig/` means a new candidate and a
    new soak; packaging, docs and workflow changes need none.

@@ -14,7 +14,7 @@
 #   release_check.sh publish-ready <tag>       needs gh, GH_TOKEN and GITHUB_REPOSITORY; prints the commit
 #                                              (the publish job: NRV-E1131, and E1120, E1122, E1124 for the target)
 #   release_check.sh candidate <tag> <commit>  needs git with the full history (the release commit's
-#                                              ancestors); NRV-E1158, P<N>
+#                                              ancestors); NRV-E1158, P374
 #
 # `candidate` enforces the code freeze (P147b amended): `release/candidate` at <commit> names the
 # full SHA of the candidate that was soaked, Jepsen-tested and reviewed, and <commit> must be that
