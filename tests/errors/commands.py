@@ -246,6 +246,19 @@ def main():
         version_off = run(nerva_off, ["version"])
         assert version_off.returncode == 0 and \
             version_off.stdout.splitlines()[0].endswith("+keys-off"), version_off.stdout
+        # It runs another release than a release build (#222): replicas of the two ignore each
+        # other (N61) instead of diverging on a resent key, and neither opens the other's file.
+        release_line = [l for l in version.stdout.splitlines() if l.startswith("release ")][0]
+        release_line_off = [l for l in version_off.stdout.splitlines()
+                            if l.startswith("release ")][0]
+        assert release_line != release_line_off, (release_line, release_line_off)
+        data_off = os.path.join(tmp, "keys-off.nerva")
+        assert run(nerva_off, fmt + [data_off]).returncode == 0
+        check("start a keys-off file with a release build",
+              ["start", "--addresses=127.0.0.1:1,127.0.0.1:2,127.0.0.1:3", "--development",
+               data_off], "NRV-E0701", 1, "was written by release " + release_line_off[8:])
+        assert run(nerva_off, ["start", "--addresses=127.0.0.1:1,127.0.0.1:2,127.0.0.1:3",
+                               "--development", data]).stderr.count("NRV-E0701") == 1
         verbose_off = run(nerva_off, ["version", "--verbose"])
         assert verbose_off.stdout.splitlines()[-1] == "commit_keys off", verbose_off.stdout
         # `version`'s text (R6): the first line is the one the release workflow reads; then what

@@ -18,6 +18,11 @@ const release = "0.0.6";
 const release_client_min = "0.0.4";
 // Only `zig build test:release` builds this release, to run a cluster of two releases (N61).
 const release_test_other = "0.0.200";
+// The release of the test build `-Dtest-commit-keys=off` (#222): above every real release and
+// apart from `release_test_other`, so that replicas of that build and of a release build ignore
+// each other (N61) rather than diverge on the first resent key, and neither opens the other's
+// data file (NRV-E0701). Clients of any release from `release_client_min` up still reach it.
+const release_keys_off = "0.0.201";
 // The one past release a binary bundles, so that a cluster can move from it to `release` one
 // replica at a time (R6, P259). None until the packer exists (R6 slice 3). A release that rolls
 // keeps `release_client_min` at or below the bundled release, so that the past release's clients
@@ -29,6 +34,9 @@ comptime {
     const current = std.SemanticVersion.parse(release) catch unreachable;
     const client_min = std.SemanticVersion.parse(release_client_min) catch unreachable;
     assert(client_min.order(current) != .gt);
+    const keys_off = std.SemanticVersion.parse(release_keys_off) catch unreachable;
+    const other = std.SemanticVersion.parse(release_test_other) catch unreachable;
+    assert(keys_off.order(current) == .gt and keys_off.order(other) != .eq);
     if (release_bundled) |bundled_text| {
         const bundled = std.SemanticVersion.parse(bundled_text) catch unreachable;
         assert(bundled.order(current) == .lt);
@@ -190,6 +198,13 @@ pub fn build(b: *std.Build) !void {
     vsr_options.addOption([]const u8, "release", release);
     vsr_options.addOption([]const u8, "release_client_min", release_client_min);
 
+    // The test build with commit-key deduplication off runs another release (#222).
+    const vsr_options_keys_off = b.addOptions();
+    vsr_options_keys_off.addOption(?[40]u8, "git_commit", options.git_commit[0..40].*);
+    vsr_options_keys_off.addOption(bool, "config_verify", options.config_verify);
+    vsr_options_keys_off.addOption([]const u8, "release", release_keys_off);
+    vsr_options_keys_off.addOption([]const u8, "release_client_min", release_client_min);
+
     // Tests and simulators always run with extra assertions.
     const vsr_options_test = b.addOptions();
     vsr_options_test.addOption(?[40]u8, "git_commit", options.git_commit[0..40].*);
@@ -215,7 +230,7 @@ pub fn build(b: *std.Build) !void {
     // zig build, zig build run
     const nerva = nerva_executable(b, .{
         .stdx_module = stdx_module,
-        .vsr_options = vsr_options,
+        .vsr_options = if (options.test_commit_keys == .on) vsr_options else vsr_options_keys_off,
         .target = target,
         .mode = mode,
         .version = options.version,
@@ -226,7 +241,7 @@ pub fn build(b: *std.Build) !void {
     // installed; when `-Dtest-commit-keys=off`, `nerva` itself is that build.
     const nerva_keys_off = nerva_executable(b, .{
         .stdx_module = stdx_module,
-        .vsr_options = vsr_options,
+        .vsr_options = vsr_options_keys_off,
         .target = target,
         .mode = mode,
         .version = options.version,
