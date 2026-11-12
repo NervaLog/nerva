@@ -1,8 +1,9 @@
 # The domain, and the apt and dnf repositories: spec, setup, slices
 
-Status: spec, 2026-11-12 (P365, which amends P360 point 10, P364 and P148). Reworked twice the
-same day after adversarial reviews, and after the owner's decision that Cloudflare deploys the
-site. Nothing here is built yet. It is the last change before the v0.7.1 tag: the owner moved the
+Status: spec, 2026-11-12 (P365, which amends P360 point 10, P364 and P148). Reworked four times
+the same day after adversarial reviews, and after the owner's decision that Cloudflare deploys the
+site. The fourth rework cut the lock in the bucket: one GitHub concurrency group keeps the writers
+apart instead. Nothing here is built yet. It is the last change before the v0.7.1 tag: the owner moved the
 repositories from v0.7.2 to v0.7.1 and named the domain, `nerva.pro` (owner, 2026-11-12).
 
 The freeze holds. Nothing here touches `src/` or `build.zig`. The change is workflows, scripts,
@@ -148,34 +149,37 @@ token can change nothing in it, whatever they merge anywhere.
 
 The two things a Worker could add are handled in the layout instead. Each dnf channel has its own
 copy of its rpms (below), so no path is mapped. And what a channel may hold is enforced by the job
-that writes it, which is checked on every run (step 4 of `repos`), not by the server.
+that writes it, which is checked on every run (steps 3 and 5 of `repos`), not by the server.
 
 The owner's answer to the Workers Paid question (owner, 2026-11-12: only if the free quota is
 hit) stands, and with this design there is no Worker quota to hit.
 
-The bucket is public, so its manifests and its lock objects are readable by anyone. They hold only
-hashes, names, run ids and times, which the public releases and runs already show.
+The bucket is public, so its manifests are readable by anyone. They hold only hashes, names and
+tags, which the public releases already show.
 
-**Bucket locks.** The bucket has five R2 bucket lock rules, each with indefinite retention, on the
-prefixes `apt/pool/`, `rpm/stable/packages/`, `rpm/rc/packages/`, `manifest/` and `lock/` (setup
-step 5). R2 then refuses to delete or overwrite any object under them, whoever asks. The bucket
-token is "Object Read & Write" and cannot change lock rules, which needs an admin permission. So
-the token can add objects there, but cannot remove or replace a package, a manifest or a lock
-object. Every write run checks that the locks are in force (step 4 of `repos`, NRV-E1149). The
-names a run replaces (the indexes) cannot be locked, and the manifest records their hashes instead
-(below).
+**Bucket locks.** The bucket has four R2 bucket lock rules, each with indefinite retention, on the
+prefixes `apt/pool/`, `rpm/stable/packages/`, `rpm/rc/packages/` and `manifest/` (setup step 5).
+R2 then refuses to delete or overwrite any object under them, whoever asks. The bucket token is
+"Object Read & Write" and cannot change lock rules, which needs an admin permission. So the token
+can add objects there, but cannot remove or replace a package or a manifest. Every write run
+checks that the locks are in force (step 3 of `repos`, NRV-E1149). The names a run replaces (the
+indexes) cannot be locked, and the manifest records their hashes instead (below).
+
+The rules stay on packages and manifests because they still earn their place: without them the
+token could delete a published package or roll the manifest back, and the job could not tell. The
+fifth rule, on `lock/`, is cut with the lock in the bucket (see "One writer at a time").
 
 **The token can add objects that nobody can remove without the owner.** A locked object is
 permanent, junk included. So the job never trusts an object for being there, and an object it
 does not expect never stops it from re-signing:
 
 - an object under a locked prefix that no signed manifest lists, a manifest object that does not
-  verify, or a lock object it cannot parse is **noted and ignored**: never indexed, never signed.
+  verify, is **noted and ignored**: never indexed, never signed.
   The run re-signs what the current manifest allows, then ends red with NRV-E1142 and names each
   one;
-- a name the job wants to write that junk already holds is skipped: the next manifest or lock
-  object takes the next free name, and a package entry whose name is taken stays `pending` and is
-  not indexed (noted, NRV-E1142);
+- a name the job wants to write that junk already holds is skipped: the next manifest takes the
+  next free name, and a package entry whose name is taken stays `pending` and is not indexed
+  (noted, NRV-E1142);
 - the owner removes junk with "Removing an object from a locked prefix" (under "Recovery").
 
 What this does not promise: a token holder can still deny service, for example by deleting the
@@ -195,7 +199,6 @@ nerva-packages/
   rpm/<stable|rc>/repodata/<hex>-<primary|filelists|other>.xml.gz            written once (unique names)
   rpm/<stable|rc>/repodata/repomd.xml, repomd.xml.asc                        replaced by each write run (signed)
   manifest/<generation, ten digits>.asc                                      locked, one per manifest write (clearsigned)
-  lock/<generation, ten digits>                                              locked, the write lock (below)
 ```
 
 `<filever>` is the version in the release's file names (`0.7.1`, or `0.7.1.rc.2` for a candidate,
@@ -221,13 +224,14 @@ with the highest generation that verifies** (below); an object under `manifest/`
 verify is noted and skipped. Nothing can roll it back: an older manifest cannot be put back over a
 newer one (locked), the newer one cannot be deleted (locked), and a copy of an older one under a
 higher name fails its `generation` line. A run writes its next manifest at the first free name
-above the current one. It is clearsigned text:
+above the current one. Before it puts a manifest, the run verifies its own file exactly as a reader
+would (below), so this pipeline never writes a manifest object that does not verify. It is
+clearsigned text:
 
 ```
-nerva-packages manifest 3
+nerva-packages manifest 4
 generation <n>
 state <writing|complete>
-lock <n>
 package <state> <sha256> <size> <key> <source-sha256> <tag> <commit>
 ...
 index <sha256> <key>
@@ -240,23 +244,26 @@ index-was <sha256> <key>
   under a new, higher name therefore does not verify, and is noted as junk.
 - **`state`** is `writing` until the run has uploaded the indexes and `served` has checked them.
   Then the run writes one more generation, the same with `state complete`.
-- **`lock`** is the lock object the writing run held (see step 3 of `repos`). The next run starts
-  its search for the lock there.
-- **`package` lines,** one per package object, sorted by key. `<state>` is `pending`,
-  `published` or `abandoned` (the source release is gone; never indexed, see step 6 of `repos`).
-  `<sha256>` and `<size>` are the stored object's (for an rpm, the signed copy).
-  `<source-sha256>` is the release asset's, as the approved run read it from the draft. `<tag>`
-  and `<commit>` are the release's tag and the commit `publish-ready` checked.
+- **`package` lines,** one per package object, sorted by key. `<state>` is `pending` or
+  `published`. `<sha256>` and `<size>` are the stored object's. For a deb they equal the
+  release file's. For an rpm they are the signed copy's, and `-` until a run has signed it (step 4
+  of `repos`). `<source-sha256>` is the release asset's, as the approved run read it from the
+  draft. `<tag>` and `<commit>` are the release's tag and the commit `publish-ready` checked.
 - **`index` lines** give the SHA-256 of every name a run replaces (`InRelease`, `Release`,
   `Release.gpg`, `Packages`, `Packages.gz`, `repomd.xml`, `repomd.xml.asc`, for each channel and
   architecture), as this run uploads them. **`index-was` lines** give, for each name, the hash
   the run found and accepted, or the previous manifest's `index` hash where it found something
   else. A hash the run noted as tampered is never recorded.
+- **A generation that changes only `package` lines** (the binding in `repos-ready`, or an rpm's
+  new signature in step 4 of `repos`) copies the current manifest's `state`, `index` and
+  `index-was` lines unchanged. So it never widens what the next run accepts: after a `complete`
+  manifest, it is still `complete`.
 - **Which index hashes the next run accepts.** After a `complete` manifest, only its `index`
   hashes. After a `writing` one (a run stopped between writing it and finishing), its `index` or
   its `index-was` hash, name by name. Anything else is tampering (see "The R2 token leaks"). So a
   replay of an older index set is caught by the next run, whatever its age.
-- **Bound:** generations are ten digits. A release run writes three or four, a refresh two.
+- **Bound:** generations are ten digits. A release writes one in `repos-ready` and two to four in
+  `repos`; a refresh two.
 
 **It is verified only against the pinned fingerprints.** `packaging/keys/fingerprints` in this
 repository lists the fingerprints the job trusts, each with a role:
@@ -362,10 +369,6 @@ refused (NRV-E1141).
   - **Junk under a locked prefix** is permanent until the owner removes it. It is ignored and
     reported, never trusted (see "Bucket locks"). Junk at the name of a coming release's package
     stops that package until the owner removes it (`repos-ready` refuses, NRV-E1142).
-  - **Lock objects.** The holder can write lock objects too, so it can make one of this
-    pipeline's runs wait, or two of them overlap. An overlap can end a run red (NRV-E1147 or
-    NRV-E1142); it cannot get anything signed that the manifest does not allow. A lock object it
-    cannot parse, or whose time is in the future, holds nothing.
   - **The key file** is not in the bucket, so the token cannot change it.
 - **The signing key leaks:** the one compromise that reaches users. See "Rotation and
   compromise".
@@ -375,8 +378,8 @@ refused (NRV-E1141).
 `release-finish.yml` (P360, P362, P364) gains four jobs and one output:
 
 ```
-guard ── mac (apple-signing: THE ONE APPROVAL) ── mac-verify ─┬─ repos-ready (package-repos) ─┐
-                                                               └───────────────────────────────┴─ publish (release-publish; output public)
+guard ── mac (apple-signing: THE ONE APPROVAL) ── mac-verify ─┬─ repos-ready (package-repos; binds) ─┐
+                                                               └──────────────────────────────────────┴─ publish (release-publish; output public)
                                                                                                     ├─ verify        (brew; unchanged)
                                                                                                     ├─ site-verify   (no environment; a release only)
                                                                                                     └─ repos (package-repos; runs if public, even when publish failed later)
@@ -399,10 +402,10 @@ A new workflow, `package-repos-refresh.yml`, runs the same writer weekly without
   A tap or site failure after the release is public no longer stops the packages from being
   bound. (Before this, `repos` needed the whole `publish` job to be green.)
 - `verify` does not wait for `repos`, and `repos` does not wait for `verify`.
-- A failure in `repos` or `repos-verify` happens after the release is public. Its fix is **"Re-run
-  failed jobs" of the same run**, which keeps the digests `repos-ready` read from the draft (see
-  "What the key signs, and who can make it sign"). GitHub allows a re-run for 30 days after the
-  run. After that, only a dispatch is left, and a dispatch binds nothing new (see "Recovery").
+- A failure in `repos` or `repos-verify` happens after the release is public. By then
+  `repos-ready` has written the binding into a signed manifest in the bucket (see "What the key
+  signs, and who can make it sign"), so **any later write run finishes it**: "Re-run failed jobs"
+  of the same run, a dispatch of the tag, or the weekly refresh. There is no 30-day limit.
 
 ### What the key signs, and who can make it sign
 
@@ -411,8 +414,10 @@ it proves nothing after the fact. A dispatch for a published release skips `mac`
 and needs no approval. The design therefore binds **new** package content to the approved run
 attempt itself, and only while the release is still a draft:
 
-1. **`repos-ready` reads the four packages from the draft,** in the same run attempt as the `mac`
-   job the owner approved, so after the approval and before `publish`. Two checks hold it there:
+1. **`repos-ready` reads the four packages from the draft and writes the binding,** in the same
+   run attempt as the `mac` job the owner approved, so after the approval and before `publish`.
+   These checks apply only when `guard` found a draft (`PUBLISHED` is `false`). On a dispatch for
+   a published release, `ready` checks neither, binds nothing and writes nothing.
    - **The attempt.** `mac` gains the output `attempt` (`$GITHUB_RUN_ATTEMPT`). `ready` refuses
      with **NRV-E1153** unless it equals its own `GITHUB_RUN_ATTEMPT`. A re-run that does not
      re-run `mac` keeps `mac`'s old output, so a re-run of a failed `repos-ready`, or a "Re-run
@@ -421,34 +426,35 @@ attempt itself, and only while the release is still a draft:
      owner again.
    - **The draft.** It binds only if the release reads `draft: true`, from its own `gh api` call,
      made before it downloads the packages and again after it has hashed them. It never trusts
-     `guard`'s output for this. Where `guard` found the release already published (a dispatch),
-     `bound` is empty. Where `guard` found a draft but the release now reads published, `ready`
-     refuses with NRV-E1148.
+     `guard`'s output for this. Where `guard` found a draft but the release now reads published,
+     `ready` refuses with NRV-E1148.
 
-   It checks the packages against the draft's `SHA256SUMS` (NRV-E1140) and sets the job output
-   `bound`: the four file names, their SHA-256 and the commit `publish-ready` checked. A green
-   `repos-ready` is never re-run by "Re-run failed jobs", so a later re-run of `publish` or `repos`
-   keeps the `bound` of the approved attempt.
-2. **`repos` signs and lists a package only if its bytes equal `bound`.** It downloads them from
-   the now-public release, compares (NRV-E1148), and its first write is a manifest with those
-   packages as `pending` entries, signed. From then on the signed manifest carries the binding,
-   so any later write run can finish those entries from the release's assets, but only with bytes
-   whose SHA-256 equals the entry's `<source-sha256>` (NRV-E1148 otherwise).
-3. **A run with nothing bound adds nothing.** A dispatch for a published release, a "Re-run all
-   jobs" (which re-runs `guard`, now seeing a published release), or the weekly refresh: each
-   finishes `pending` entries, re-signs the indexes from the manifest, and stops with NRV-E1148
-   for a tag that has neither `bound` digests nor manifest entries. A release published before
-   the repositories existed is therefore not backfilled; its files install by hand.
+   It checks the packages against the draft's `SHA256SUMS` (NRV-E1140). Then it writes the next
+   manifest generation with the tag's packages as `pending` entries: each deb once, each rpm
+   under `rpm/rc/packages/`, and for a release also under `rpm/stable/packages/`. That manifest is
+   its only write. It copies the current manifest's `state`, `index` and `index-was` (see "The
+   manifest"). If the tag already has entries with the same `<source-sha256>` (a "Re-run all
+   jobs"), it writes nothing. If they differ, see "Pending entries of a release that never
+   published".
+2. **From then on the signed manifest carries the binding.** Any write run finishes those
+   entries from the release's assets once the release is public, but only with bytes whose SHA-256
+   equals the entry's `<source-sha256>` (NRV-E1148 otherwise).
+3. **A run outside the approved attempt adds no entry.** A dispatch for a published release, a
+   "Re-run all jobs" after publication (which re-runs `guard`, now seeing a published release), or
+   the weekly refresh: each finishes `pending` entries and re-signs the indexes from the manifest.
+   `repos` stops with NRV-E1148 for a tag the manifest has no entries for. A release published
+   before the repositories existed is therefore not backfilled; its files install by hand.
 
 So the key signs:
 
 | What | Who can cause it | Bounded by |
 |---|---|---|
-| A new rpm, or a new manifest entry | only the run attempt whose `mac` the owner approved, while the release is a draft; later re-runs of `publish` or `repos` (anyone with write access can press the button) only use that attempt's `bound` | `bound`, read from the draft in the approved attempt, fixed for the run |
-| An rpm again, for a `pending` entry whose object never landed | any write run | the entry's `<source-sha256>`, in a manifest signed by a pinned key |
+| A new manifest entry | only `repos-ready` in the run attempt whose `mac` the owner approved, while the release is a draft | the bytes read from the draft in that attempt, recorded at once as `<source-sha256>` |
+| An rpm, for a `pending` entry | any write run, once the release is public | the entry's `<source-sha256>`, in a manifest signed by a pinned key |
 | `InRelease`, `Release.gpg`, `repomd.xml.asc`, a manifest | any write run: a release run, a dispatch, a re-run, the weekly refresh | a deterministic function of the signed manifest, after the bucket is checked against it |
 
-What the draft held when the approved attempt read it is what gets signed. Anyone who can change a
+What the draft held when the approved attempt read it is what gets signed. The approval binds the
+run attempt, not the bytes: the owner approves `mac` before any hash of a deb or rpm is read. Anyone who can change a
 draft's assets before the approval can already change what the release ships (the Mac zip apart,
 which `mac` signs). That is the existing risk of the release, and this spec does not widen it.
 Anyone who can merge to `main` here can change the workflows and scripts, and with them all of
@@ -459,36 +465,77 @@ Not chosen: GitHub's immutable releases (published assets cannot change). Its ef
 cleanup of a candidate, which deletes the release and its tag, was not checked, and the binding
 above does not need it. It can be added later as a second layer.
 
+### One writer at a time
+
+Every job that writes the bucket runs under one GitHub Actions concurrency group:
+
+```yaml
+concurrency:
+  group: nerva-packages-bucket
+  cancel-in-progress: false
+```
+
+It is set on the job, not the workflow, on exactly three jobs: `repos-ready` and `repos` in
+`release-finish.yml` (a release run and a dispatch alike), and the one job of
+`package-repos-refresh.yml`. A concurrency group is per repository, so it spans both workflows. No
+other job, workflow or person writes the bucket. There is no lock in the bucket: no `lock/` prefix,
+no lock search, no stale or wait timer. The old lock budget (the 30-minute wait, the 100-minute
+takeover) no longer applies. A queued writer waits in GitHub's queue for as long as the running job
+takes, at most its `timeout-minutes` (90).
+
+**The trap.** GitHub keeps one running and at most one *pending* job per group. When a third
+queues, it cancels the older pending one. So a refresh that queues behind a release's pending
+`repos` can cancel it. The design makes that harmless:
+
+- **Every write run does all the work there is.** `repos`, a dispatch and the refresh all finish
+  every `pending` entry whose release is public, and re-sign both channels from the manifest.
+  None of them needs the job output of another run.
+- **The binding is in the bucket before the release is public.** `repos-ready` writes it into a
+  signed manifest (see "What the key signs"), and `repos` reads it from there.
+
+**The guarantee.** At most one job writes the bucket at a time. A cancelled `repos` or refresh
+loses nothing: the job that replaced it, or the next one to run (the weekly refresh at the latest,
+or "Re-run failed jobs", or a dispatch), finishes its work without a new approval. A cancelled
+`repos-ready` has written nothing, so the draft waits; "Re-run all jobs" binds it, with a second
+approval. That needs two other write jobs at once, one running and one queuing, and is rare.
+
+If the group is ever bypassed (a workflow without it), two writers race on the next manifest name.
+`put-new` lets only one of them write it, and the other stops with NRV-E1147 before it writes
+anything more (step 2 of `repos`).
+
 ### `repos-ready`
 
 - `needs: [guard, mac, mac-verify]`, with the same `if` as `publish`. It runs after the approval,
   because `publish-ready` checks the draft's target (P343), and the twelve assets exist only after
   `mac` (P361).
 - `runs-on: ubuntu-24.04`, `timeout-minutes: 15`, `environment: package-repos`,
-  `permissions: contents: write` (reading a draft's assets needs it, P311). **No `concurrency`:**
-  it writes nothing and takes no lock.
-- `outputs: bound` (see above). It reads `needs.mac.outputs.attempt`.
+  `permissions: contents: write` (reading a draft's assets needs it, P311), and the concurrency
+  group above. It reads `needs.mac.outputs.attempt`.
 - Steps:
   1. Check out the workflow's own ref, with `persist-credentials: false`.
   2. `release_check.sh publish-ready "$TAG"`. It is unchanged.
   3. Install the pinned tools (see "Tools"). A tool that does not install or does not report its
      pinned version is NRV-E1139.
   4. `package_repos.sh ready "$TAG" "$PUBLISHED"`. The environment's secrets and variables reach
-     this step only, through `env:`. It writes nothing. It refuses with a code:
+     this step only, through `env:`. It runs steps 1 to 3 of `repos` (keys, the current manifest,
+     the bucket check, without the disk and own-tag checks), then binds as "What the key signs" says. Its one write is the binding
+     manifest, after every check below has passed. It refuses with a code:
      - an environment that lacks a secret, a variable or a pinned tool, a key that does not
        import, a key whose fingerprint is not the `current` one in `packaging/keys/fingerprints`,
        or a key file that does not hold exactly the listed keys (NRV-E1139);
      - a draft without exactly its four packages, or a package that does not match `SHA256SUMS`
        (NRV-E1140);
-     - a package name the manifest already lists with another `<source-sha256>` (NRV-E1141);
+     - a package name the manifest already lists with another `<source-sha256>`, where any object
+       of that tag exists (NRV-E1141);
      - an object already at one of the tag's package names that the manifest does not list, or a
-       bucket that step 4 of `repos` refuses before writing (NRV-E1142). Other junk is only
+       bucket that step 3 of `repos` refuses before writing (NRV-E1142). Other junk is only
        noted: it does not block the release;
      - a bucket that cannot be listed or read with the token (NRV-E1143);
      - the current manifest served at `https://packages.nerva.pro/manifest/<generation>.asc` that
        differs from the bucket's object (NRV-E1145);
+     - a manifest name taken by a manifest that verifies (NRV-E1147, "One writer at a time");
      - `PUBLISHED` false while the release reads published (NRV-E1148, above);
-     - a run attempt other than `mac`'s (NRV-E1153, above);
+     - with `PUBLISHED` false, a run attempt other than `mac`'s (NRV-E1153, above);
      - a GitHub API call or a download that fails for a reason other than a mismatch
        (NRV-E1155).
   5. Under `if: always()`: `package_repos.sh cleanup`. It runs `gpgconf --kill all` and removes
@@ -500,18 +547,38 @@ none of them depend on the repositories. This keeps P362 point 8 (refuse before 
 release is never published while its packages cannot follow. The recovery is in the table below,
 and P365 lists it as a cost.
 
+#### Pending entries of a release that never published
+
+`repos-ready` writes the binding before `publish`, so a release can be bound and then never
+published: `publish` fails before its publish step and nobody re-runs it, the owner decides not to
+ship, or a candidate is deleted (P343 7b). The rule:
+
+- **A run puts a `pending` entry's object only when its release reads published** (`draft:
+  false`). A release that reads draft, or answers 404, is skipped: its entries stay `pending`, are
+  never indexed, and the run says so in its log as a notice. It is not an error, and it never
+  stops or slows any other entry or run. Nothing is ever marked dropped: if the release is
+  published later, the next write run finishes it.
+- **A GitHub error is never a verdict.** A call that fails for any other reason leaves that tag's
+  entries `pending`; the run finishes everything else, then ends with NRV-E1155. A stable release
+  is therefore never dropped or wedged by GitHub: at worst it lands one run later.
+- **The release's own run is stricter.** `repos` exists to land its own tag, so it ends red if any
+  of that tag's entries is still `pending` at the end: NRV-E1155 for a GitHub error, NRV-E1148 for
+  a mismatch.
+- **Cleanup is not needed.** An inert entry costs one manifest line and one GitHub read per run,
+  within the 2,000-entry bound. The one case that needs a change cleans itself up: if the approved
+  attempt of the same tag later reads other bytes from the draft (a draft deleted and made again),
+  and no object of the tag's old entries exists, `repos-ready` replaces those entries in its
+  binding manifest. The old binding was never served, because objects are put only from a public
+  release. If any object of the tag exists, it refuses with NRV-E1141: published packages are
+  never replaced.
+
 ### `repos`
 
 - `needs: [guard, repos-ready, publish]`, with the `if` above, `runs-on: ubuntu-24.04`,
   `timeout-minutes: 90`, `environment: package-repos`, `permissions: contents: read` (the release
-  is public now).
-- **No `concurrency` group.** GitHub's concurrency keeps one pending job per group and cancels the
-  older pending one, which would leave a public release with no packages and a "cancelled" job
-  that pages nobody. Write runs queue on the bucket's own lock instead (step 3), and are never
-  cancelled. (The workflow's own group, `release-finish-<tag>`, can still replace a pending run of
-  the **same** tag by a newer one, which does the same work.)
-- Steps 1 and 3 as in `repos-ready`. Then `package_repos.sh publish "$TAG"`, with
-  `BOUND: ${{ needs.repos-ready.outputs.bound }}` and the same `env:` as before. In this order:
+  is public now), and the concurrency group above.
+- Steps 1 and 3 as in `repos-ready`. Then `package_repos.sh publish "$TAG"`, with the same `env:`
+  as before. In this order:
   1. **Keys.** It imports the key into a fresh `GNUPGHOME` under `$RUNNER_TEMP` (mode 0700). It
      writes the passphrase from the environment with `printf`, a shell builtin, so it is never in
      an argv, to `$GNUPGHOME/passphrase` (mode 0600). `gpg.conf` gets `pinentry-mode loopback` and
@@ -520,35 +587,20 @@ and P365 lists it as a cost.
      verifies (see "The manifest"). It ignores names that are not ten digits and `.asc`, and
      verifies the others from the highest down. Every object it skips is noted. After 50 that do
      not verify, or a listing past `r2.py`'s page bound, it stops (NRV-E1142): the prefix is
-     flooded, and the owner removes the junk. If none verifies, the
-     bucket must hold no object under any locked prefix: it is empty, and the run starts from
-     generation 0. Otherwise it refuses before writing (NRV-E1142), because it cannot tell junk
-     from a manifest it cannot read. That can only happen before the first run.
-  3. **The lock.** Lock objects are `lock/<n>`, ten digits, with the body `held <run>/<attempt>
-     <epoch>` or `free <run>/<attempt> <epoch>`. The search starts at the current manifest's
-     `lock` line, `m` (0 with no manifest). It reads `lock/<m+1>`, `lock/<m+2>` and on, by GET,
-     never by listing, until the first name that is absent, `lock/<k>`. At most 50 names: past
-     that it stops with NRV-E1147. Of the objects it read, it ignores (and notes) any it cannot
-     parse, and any whose epoch is more than 5 minutes in the future. The last one left decides:
-     - none, or `free`, or `held` with an epoch more than **100 minutes** old: it puts `lock/<k>`
-       with `held <run id>/<attempt> <now>`, write-if-absent. A 412 means another run won; it
-       searches again;
-     - `held` and younger: it waits 30 seconds and searches again, for at most 30 minutes, then
-       stops with NRV-E1147. Nothing was written. The message names the time at which that lock
-       turns stale.
+     flooded, and the owner removes the junk. Then:
+     - **`manifest/` is empty:** the run starts from generation 0. Objects under the package
+       prefixes are noted as junk, as everywhere else. This is the first run, and also any run
+       after a first run that stopped before it wrote its first manifest: that run wrote nothing.
+     - **`manifest/` holds objects but none verifies:** it refuses before writing (NRV-E1142). It
+       cannot tell junk from a manifest it cannot read. This pipeline verifies every manifest
+       before it puts it, so neither a crash nor a failed run of it causes this: the R2 token
+       wrote there, or `packaging/keys/` lost a key that signed the manifests.
 
-     **Why 100 minutes is safe.** Each write job has `timeout-minutes: 90`, and GitHub kills a job
-     at its timeout. A holder writes its epoch after its job started, so no holder is alive 100
-     minutes after its epoch. A takeover therefore never races a live holder of this pipeline.
-     Before **every** write to the bucket, `put-new` included, the holder also checks that
-     `lock/<k+1>` is absent, and stops with NRV-E1147 if it exists. At the end, and under
-     `if: always()` in `cleanup`, it puts the first free name after `lock/<k>` with
-     `free <run id>/<attempt> <now>`. The job never deletes a lock object.
-
-     The token holder can write lock objects too, so this lock orders this pipeline's own runs,
-     not an attacker's. See "The R2 token leaks".
-  4. **Check the bucket.** It reads the current manifest again (a run may have written one while
-     this one waited). Then:
+     Every later put of a manifest is `put-new` at the first free name above the current one. If
+     that name answers "exists" and the object there verifies, another writer is running (the
+     concurrency group was bypassed): the run stops with NRV-E1147 and writes nothing more.
+     Otherwise it is junk: noted, and the run takes the next free name.
+  3. **Check the bucket.** Then:
      - **Refused before any write (NRV-E1142):** a listed object that is missing, or whose size or
        `x-amz-meta-sha256` differs from its entry (the locks make both impossible, so the locks
        have failed). A locked object cannot change, so a HEAD of each `published` object is
@@ -565,44 +617,37 @@ and P365 lists it as a cost.
      - **The indexes, noted, not refused.** It reads each replaceable name and compares its
        SHA-256 with the hashes the current manifest accepts (see "The manifest"). A name that
        matches none, or that is missing while the manifest lists it, is noted. The run carries on,
-       rewrites every index in step 9, and ends with NRV-E1142 (see "The R2 token leaks").
+       rewrites every index in step 7, and ends with NRV-E1142 (see "The R2 token leaks").
      - **Bound:** at most 2,000 entries and 4 GiB in the manifest. Above that the job refuses
        (NRV-E1142) and a decision is needed: a pruning policy, or indexes built without
        downloading the packages. At about 38 MB a release (the rpms twice), and less for a
        candidate, that is about 100 releases away. Junk does not count towards it.
      - **Disk.** Before it downloads anything it checks that the runner has free space of twice
-       the manifest's package bytes plus 2 GiB, and stops with NRV-E1156 otherwise. Step 7 needs
+       the manifest's package bytes plus 2 GiB, and stops with NRV-E1156 otherwise. Step 5 needs
        every package on disk.
-  5. **Bind.** If the tag has no entries yet: with `BOUND` empty, it stops (NRV-E1148). Otherwise
-     it downloads the four packages from the published release and compares each with `BOUND`
-     (NRV-E1148). It signs each rpm (see "Signing"), checks that the signed copy has the release
-     file's NEVRA and payload digest (NRV-E1144), and writes the next manifest generation, `state
-     writing`, with the new entries as `pending`: each deb once, each rpm under
-     `rpm/rc/packages/`, and for a release also under `rpm/stable/packages/`. Its `index` and
-     `index-was` lines are the current manifest's. **This manifest is the run's first write to the
-     bucket,** so every package object the job ever writes is listed in a signed manifest before it
-     exists. If the tag has entries already (a re-run), their `<source-sha256>` must equal `BOUND`
-     where `BOUND` is set (NRV-E1141), and nothing is re-bound.
-  6. **Put.** For every `pending` entry, of any tag:
+     - **Its own tag.** `repos` stops with NRV-E1148 if the manifest has no entry for `$TAG`
+       (nothing was bound). The refresh has no tag and skips this.
+  4. **Put.** For every `pending` entry, of any tag:
      - the object exists with the entry's SHA-256: nothing to do (an earlier run put it);
      - it exists with other content: noted (NRV-E1142 at the end). The entry stays `pending` and is
        not indexed, until the owner removes the object ("Removing an object from a locked
        prefix");
-     - it is absent, and the entry's release no longer exists (`gh api` answers 404 for its tag,
-       for example after P343 7b's cleanup of a candidate): the run writes a manifest generation
-       that marks every `pending` entry of that tag `abandoned`, carries on, and ends with
-       **NRV-E1154**. An abandoned entry is never indexed, and its tag is never bound again;
-     - it is absent, and it is a deb: download it from the entry's release, check its SHA-256
-       against `<source-sha256>` (NRV-E1148), put it write-if-absent;
-     - it is absent, and it is an rpm: if another copy of the same file (the other channel) exists
-       with the entry's SHA-256, put those bytes. Otherwise this run's signed copy from step 5 if
-       it has one; otherwise download the release's rpm, check `<source-sha256>` (NRV-E1148), and
-       sign it again. A new signature differs, so the run **first** writes a manifest generation
-       with the entry's new `<sha256>` and `<size>`, **then** puts the object write-if-absent.
+     - it is absent: the run reads the entry's release. If it does not read published, or the
+       read fails, the entry is skipped as "Pending entries of a release that never published"
+       says. Otherwise:
+       - a deb: download it from the release, check its SHA-256 against `<source-sha256>`
+         (NRV-E1148), put it with `put-new`;
+       - an rpm: if another copy of the same file (the other channel) exists with the entry's
+         SHA-256, put those bytes. Otherwise download the release's rpm, check `<source-sha256>`
+         (NRV-E1148), sign it (see "Signing"), and check that the signed copy has the release
+         file's NEVRA and payload digest (NRV-E1144). A new signature differs, so the run
+         **first** writes a manifest generation with the entry's new `<sha256>` and `<size>`,
+         copying `state`, `index` and `index-was` (see "The manifest"), **then** puts the object
+         with `put-new`.
 
-     A download from GitHub that fails for another reason (the network, the API) is NRV-E1155,
-     and the run stops; a re-run finishes it.
-  7. **Indexes.** It regenerates both channels of both formats from the entries whose objects are
+     So every package object the job ever writes is listed in a signed manifest before it exists.
+     A download from GitHub that fails for another reason (the network, the API) is NRV-E1155.
+  5. **Indexes.** It regenerates both channels of both formats from the entries whose objects are
      all present with their SHA-256 (they are about to be `published`), and never from anything
      else: `stable` from the releases, `rc` from everything. A failure of `apt-ftparchive` or
      `createrepo_c` is NRV-E1156.
@@ -619,30 +664,27 @@ and P365 lists it as a cost.
        rpms, then runs `createrepo_c --general-compress-type=gz --checksum=sha256 --no-database
        --revision <now, epoch seconds>`, which gives unique names for everything but
        `repomd.xml`, and signs `repomd.xml.asc` (detached, armored).
-  8. **Promote and record.** It writes the next manifest generation, `state writing`: those
-     entries as `published`, `index` lines with the SHA-256 of every replaceable file from step 7,
+  6. **Promote and record.** It writes the next manifest generation, `state writing`: those
+     entries as `published`, `index` lines with the SHA-256 of every replaceable file from step 5,
      and `index-was` lines as "The manifest" says.
-  9. **Upload the indexes.** First every content-named file (`by-hash/...`, the hashed `repodata`
-     files), each write-if-absent. When one already exists, the job GETs it and compares its
+  7. **Upload the indexes.** First every content-named file (`by-hash/...`, the hashed `repodata`
+     files), each with `put-new`. When one already exists, the job GETs it and compares its
      SHA-256 with the name's. A mismatch is noted (NRV-E1142 at the end), and the job replaces it
      with `put`: these names are in `put`'s replaceable set, because their content is fixed by
      their name. Then the names a run replaces: apt's `Packages`, `Packages.gz`, `Release` and
      `Release.gpg` for each channel, with `InRelease` last; then for each channel `repomd.xml.asc`
      and `repomd.xml`, back to back, last of all. `r2.py put` refuses any name outside the
      replaceable set, so a bug cannot overwrite a package, and the locks refuse it too.
-  10. **Served.** It fetches over `https://packages.nerva.pro`: each channel's `InRelease` and
-      `repomd.xml`, and the current manifest, must equal the bytes just uploaded, and the tag's
-      packages must be served with their SHA-256 (NRV-E1145). This runs while the run still
-      holds the lock, so no later writer can change those bytes under it.
-  11. **Complete.** It writes the next manifest generation, the same as step 8's with
-      `state complete`.
-  12. **Unlock** (step 3). Then, if anything was noted, it ends with NRV-E1142 and names each
-      object and its hash. An abandonment ends with NRV-E1154 (both, if both happened).
-- A `put-new` of a manifest generation that answers 412 (the name exists): if the object there
-  verifies, another run of this pipeline wrote it, so this run has lost the lock (NRV-E1147, and
-  it writes nothing more). Otherwise it is junk: noted, and the run takes the next free name.
-- `package_repos.sh cleanup` runs under `if: always()`; it also frees the lock if this run holds
-  it.
+  8. **Served.** It fetches over `https://packages.nerva.pro`: each channel's `InRelease` and
+     `repomd.xml`, and the current manifest, must equal the bytes just uploaded, and the tag's
+     packages must be served with their SHA-256 (NRV-E1145). The run is still the group's one
+     writer, so no other run can change those bytes under it.
+  9. **Complete.** It writes the next manifest generation, the same as step 6's with
+     `state complete`.
+  10. **End.** If anything was noted, it ends with NRV-E1142 and names each object and its hash.
+      If a GitHub read failed, NRV-E1155. For `repos`, if an entry of `$TAG` is still `pending`,
+      NRV-E1155 or NRV-E1148 as its cause was.
+- `package_repos.sh cleanup` runs under `if: always()`.
 
 **Idempotence.** Every write is a signed manifest that lists what will exist before it exists, a
 write-if-absent put of content the job compares first, or indexes regenerated from the manifest.
@@ -650,29 +692,28 @@ A run stopped at any step leaves the bucket in a state the next write run accept
 
 | Stopped after | The bucket holds | The next write run |
 |---|---|---|
-| step 3 (lock taken) | a held lock | waits until it is stale (100 minutes after its epoch), then takes it over |
-| step 5 (pending manifest) | entries, no objects | puts them (step 6), re-signing absent rpms |
-| part of step 6 | some objects of pending entries | puts the rest; adopts what is there with the entry's SHA-256 |
-| step 6 | all objects, entries pending | indexes, then promotes |
-| step 8 | the promoted manifest (`writing`), the old indexes (`index-was`) | accepts them, rewrites every index |
-| part of step 9 | new content-named files, each replaceable name at `index` or `index-was` | accepts them, rewrites every index |
-| step 9 or 10 | the new indexes, a `writing` manifest | accepts them, rewrites every index |
+| anything before the first manifest of the first run | nothing | starts from generation 0 |
+| `repos-ready`'s binding manifest | entries, no objects | puts them (step 4) once the release is public |
+| an rpm's new-signature manifest in step 4 | that entry's new hash, no object | signs again, records the newer hash, puts it |
+| part of step 4 | some objects of pending entries | puts the rest; adopts what is there with the entry's SHA-256 |
+| step 4 | all objects, entries pending | indexes, then promotes |
+| step 6 | the promoted manifest (`writing`), the old indexes (`index-was`) | accepts them, rewrites every index |
+| part of step 7 | new content-named files, each replaceable name at `index` or `index-was` | accepts them, rewrites every index |
+| step 7 or 8 | the new indexes, a `writing` manifest | accepts them, rewrites every index |
 
 A second run of a finished release writes no package object; it writes manifests and the indexes
 again, with the same content but new dates and signatures. The job never replaces or deletes a
-package object, a manifest or a lock object.
+package object or a manifest.
 
 ### `Valid-Until`, and the weekly refresh
 
 apt's `Release` carries `Valid-Until`, 21 days after `Date`, so a replayed `InRelease` stops
 working at most 21 days after it was signed. Something must therefore re-sign within 21 days even
 when no release happens: `package-repos-refresh.yml` runs `package_repos.sh refresh` every Monday
-at 05:17 UTC (and by `workflow_dispatch`), from `main`, in `package-repos`, under
-`concurrency: { group: package-repos-refresh, cancel-in-progress: false }` (a newer pending refresh
-replacing an older one loses nothing), with `timeout-minutes: 90` like `repos`. `refresh` is
-`publish` without step 5: it takes the lock,
-checks the bucket, finishes `pending` entries, promotes, and re-signs both channels. Every release
-run does the same. Two refreshes can fail in a row before users see "Release file … is expired".
+at 05:17 UTC (and by `workflow_dispatch`), from `main`, in `package-repos`, under the shared
+concurrency group (see "One writer at a time"), with `timeout-minutes: 90` like `repos`. `refresh`
+is `publish` without a tag: it checks the bucket, finishes `pending` entries of public releases,
+promotes, and re-signs both channels. Every release run does the same. Two refreshes can fail in a row before users see "Release file … is expired".
 A failed scheduled run e-mails the account that last changed the workflow's `schedule` line, which
 is `topwombat`, and its fix is a re-run. dnf has no signed expiry: the cost stays as P365 lists it.
 
@@ -773,20 +814,21 @@ Yes, the release checks that `nerva.pro` shows it. It is its own job, not a step
 |---|---|
 | `repos-ready` refused NRV-E1139, NRV-E1140, NRV-E1145 or NRV-E1155 | Fix the setup it names (or wait for GitHub), then "Re-run all jobs": it re-runs `mac` and asks the owner to approve again. "Re-run failed jobs" would only fail with NRV-E1153. Nothing was published or written |
 | `repos-ready` refused NRV-E1143 (R2 unreachable) | The draft waits. "Re-run all jobs" when R2 answers (a new approval). To ship without packages instead, the owner decides; that is a new decision, and the tag is then never bound |
-| `repos-ready` refused NRV-E1153 | Someone used "Re-run failed jobs" or "Re-run this job". Use "Re-run all jobs" and approve again |
+| `repos-ready` refused NRV-E1153, or was cancelled while pending (see "One writer at a time") | Use "Re-run all jobs" and approve again. Nothing was written |
 | `repos-ready` refused NRV-E1141 or NRV-E1142 | Stop. The bucket holds something no signed manifest allows. The owner rotates the R2 token and decides. The draft waits |
-| `repos-ready` refused NRV-E1148 (the release was already public) | Someone re-ran `repos-ready` alone after publication. Use "Re-run failed jobs" of that run instead; if `repos` already bound the tag, nothing is needed |
+| `repos-ready` refused NRV-E1148 (the release was already public) | Someone re-ran `repos-ready` alone after publication. If its binding manifest was written, nothing is needed: re-run `repos` or wait for the refresh. If not, the tag was never bound: the owner decides |
 | `publish` failed after the release went public (NRV-E1135, E1136, E1138) | `repos` runs anyway (`public` is `true`). Recover the tap or the site as P362 and P364 say |
-| `repos` stopped part way, or failed with NRV-E1143, NRV-E1147, NRV-E1155 or NRV-E1156 | "Re-run failed jobs" of the **same** run, within GitHub's 30 days. It converges (the table above). A dispatch or the weekly refresh also finishes whatever the manifest already lists. A lock left by a dead run is taken over 100 minutes after its time; NRV-E1147's message names that time |
-| `repos` or the refresh ended NRV-E1154 | A candidate was deleted before its packages landed. Its entries are `abandoned` and never served. Nothing to do |
-| `repos` refused NRV-E1148 for a release whose run never wrote its entries | The bytes on the release differ from what the approved run read, or nothing was bound (a dispatch, "Re-run all jobs", or a re-run after 30 days). Stop: the owner decides (a new patch release, normally). The release's files still install by hand |
-| `repos` refused NRV-E1141 or NRV-E1142 before writing | Stop. A listed object is missing or changed, an unlisted object holds a name the run must write, or no manifest verifies. A crash or overlap of this pipeline never causes these, so suspect the R2 token: the owner rotates it and decides. Junk at a name the run must write is removed as in "Removing an object from a locked prefix" below |
+| `publish` failed before the release went public | Re-run it as P362 says. The binding waits in the manifest, inert, until the release is public (see "Pending entries of a release that never published") |
+| `repos` stopped part way, was cancelled while pending, or failed with NRV-E1143, NRV-E1155 or NRV-E1156 | "Re-run failed jobs" of the same run, or a dispatch of the tag, at any time; the weekly refresh also finishes it. It converges (the table above). No approval is needed: the binding is in the manifest |
+| `repos` or the refresh failed NRV-E1147 | Two writers ran at once: something wrote the bucket outside the concurrency group. Find the run or workflow without the group and fix it, then re-run. Nothing was half written: the loser stopped before its next write |
+| `repos` refused NRV-E1148 for its own tag | The bytes on the release differ from what the approved run read, or nothing was bound (a release published before the repositories, or a binding that was never written). Stop: the owner decides (a new patch release, normally). The release's files still install by hand |
+| `repos` refused NRV-E1141 or NRV-E1142 before writing | Stop. A listed object is missing or changed, an unlisted object holds a name the run must write, or `manifest/` holds objects and none verifies. A crash of this pipeline never causes these, so suspect the R2 token (or a key removed from `packaging/keys/`): the owner rotates the token and decides. Junk at a name the run must write is removed as in "Removing an object from a locked prefix" below |
 | `repos` or the refresh ended NRV-E1142 after it finished | Something outside a run wrote to the bucket: an index replaced or deleted (users are already healed), or junk under a locked prefix (ignored, and its name skipped). The owner rotates the R2 token. Junk stays until the owner removes it as below; until then every run ends red with the same note |
 | NRV-E1149 | A bucket lock rule is gone. The owner restores it as setup step 5 says, and checks the account's audit log for who removed it |
 | `repos-verify` failed NRV-E1157 | The environment (a registry or a mirror). Re-run it |
 | `repos-verify` failed NRV-E1146 | A finding: file it. The release is already public |
 | `site-verify` failed NRV-E1151 | As in "`site-verify`" above |
-| The weekly refresh failed | Re-run it. apt users have at least a week before `Valid-Until` |
+| The weekly refresh failed, or was cancelled | Re-run it, or let the next writer run. apt users have at least a week before `Valid-Until` |
 | The refresh or `repos-fresh` failed NRV-E1150 | As in "The 60-day rule" |
 
 #### Removing an object from a locked prefix
@@ -797,14 +839,15 @@ follows these steps in order:
 
 1. Rotate the R2 write token first ("Rotating the R2 token", under Setup), so whoever wrote the
    junk cannot write during the gap.
-2. Make sure no write run is in progress (Actions, `repos` and the refresh).
+2. Make sure no write job is running or pending (Actions: `repos-ready`, `repos` and the
+   refresh).
 3. In the bucket's **Settings**, **Bucket lock rules**, delete the rule for the prefix that holds
    the object.
 4. Delete the object or objects. Nothing else.
 5. Add the rule again exactly as setup step 5 says (prefix, indefinite retention).
 6. Check the account's audit log: the rule was removed and re-added, and nothing else changed.
-7. Re-run the run that stopped, or dispatch `packages.yml`. Its step 4 probes the lock again
-   (NRV-E1149 if the rule is not back).
+7. Re-run the run that stopped, or dispatch `package-repos-refresh.yml`. Its step 3 probes the
+   lock rules again (NRV-E1149 if the rule is not back).
 
 ## Signing
 
@@ -969,10 +1012,14 @@ does for `rpm`. An install or version assertion that fails is NRV-E1139.
 
 - `list <prefix>` follows `ListObjectsV2`'s continuation token through every page of 1,000 keys,
   and stops after 100 pages with exit 5 ("truncated"). The caller decides what that means: for
-  `manifest/` a refusal, for the package prefixes a note (step 4 of `repos`);
+  `manifest/` a refusal, for the package prefixes a note (step 3 of `repos`);
 - `head <key>` prints the size and `x-amz-meta-sha256` (exit 2 when absent);
 - `get <key> <file>` checks `x-amz-meta-sha256` when present (exit 2 when absent);
-- `put-new <key> <file>` sends `If-None-Match: *` (exit 0 written, 3 exists);
+- `put-new <key> <file>` sends `If-None-Match: *`. Exit 0 written, 3 exists. "Exists" is a 412,
+  **or** the pinned lock refusal: under a locked prefix R2 may check the lock before the
+  condition, and either answer means the name is taken. The caller then HEADs or GETs the object
+  and decides as each step says. So the design is correct whichever answer R2 gives, and the
+  rehearsal records which one it gave;
 - `put <key> <file>` is allowed only on the names a run replaces and on the content-named index
   files (`by-hash/SHA256/<hex>`, `repodata/<hex>-*`), whose content their name fixes;
 - `probe-locked <key> <file>` sends an unconditional put of bytes the caller has just read from
@@ -984,7 +1031,7 @@ does for `rpm`. An install or version assertion that fails is NRV-E1139.
 
 Every put sends `x-amz-content-sha256` (a signed payload), `x-amz-meta-sha256`, `Content-Type` and
 `Cache-Control` for the key's kind. It retries a 5xx or a broken connection three times with
-backoff, and fails on any other 4xx than 412 (and than the pinned lock refusal in
+backoff, and fails on any other 4xx than 412 and the pinned lock refusal (in `put-new` and
 `probe-locked`) with NRV-E1143. Its message names the operation, the key and the HTTP status,
 never a header or a credential.
 
@@ -992,7 +1039,9 @@ never a header or a credential.
 
 The highest code on `origin/main` is NRV-E1138. This spec first took **NRV-E1139 to NRV-E1148**.
 The second review and the move of the site to Cloudflare needed four more, and the third review
-five more, so it now takes **NRV-E1139 to NRV-E1157** (E1149 to E1157 are free on `main`). Each is printed as
+five more, so it takes **NRV-E1139 to NRV-E1157** (E1149 to E1157 are free on `main`). The fourth
+rework cut the lock in the bucket and the `abandoned` state: NRV-E1154 is **retired, unused**, and
+NRV-E1147 keeps only its overlap meaning. No code is renumbered. Each is printed as
 `error[NRV-E11xx]: <script or host>: <what>`, with a `cause` and a `fix` line, and exits 1, like
 the other release codes.
 
@@ -1001,20 +1050,20 @@ the other release codes.
 | NRV-E1139 | The package-repos environment is incomplete (a secret, a variable, a pinned tool), its key is not the `current` pinned key, or `packaging/keys/` does not hold exactly the listed keys | `package_repos.sh ready`, `publish`, `refresh` | release maintainer |
 | NRV-E1140 | The release's packages are missing, extra, or do not match `SHA256SUMS` | `package_repos.sh ready` | release maintainer |
 | NRV-E1141 | A package of the same name is already listed with other content (published packages are never replaced) | `package_repos.sh ready`, `publish` | release maintainer |
-| NRV-E1142 | The bucket does not match its manifest. Refused before any write: a listed object that is missing or changed, an unlisted object at a name the run must write, a candidate under `stable`, no manifest that verifies in a bucket that is not empty, or the bucket over its bound. Noted, and the run ends red after it has finished: an unlisted object anywhere else under a locked prefix, an index file the run replaced, or a manifest object that does not verify | `package_repos.sh ready`, `publish`, `refresh`, `served` | the bucket token's holder (no crash or overlap of this pipeline's runs causes it) |
-| NRV-E1143 | The bucket refused or failed an operation, a listing ran past 100 pages, or a locked object's overwrite was answered with anything but the pinned lock refusal | `r2.py` | release maintainer / Cloudflare |
+| NRV-E1142 | The bucket does not match its manifest. Refused before any write: a listed object that is missing or changed, an unlisted object at a name the run must write, a candidate under `stable`, objects under `manifest/` of which none verifies, or the bucket over its bound. Noted, and the run ends red after it has finished: an unlisted object anywhere else under a locked prefix, an index file the run replaced, or a manifest object that does not verify | `package_repos.sh ready`, `publish`, `refresh`, `served` | the bucket token's holder (no crash or failed run of this pipeline causes it; overlap is NRV-E1147) |
+| NRV-E1143 | The bucket refused or failed an operation (a 412 and the pinned lock refusal excepted), a listing ran past 100 pages, or a locked object's overwrite was answered with anything but the pinned lock refusal | `r2.py` | release maintainer / Cloudflare |
 | NRV-E1144 | Signing failed, or a signed rpm differs from the release's file in NEVRA or payload | `package_repos.sh publish`, `refresh` | release maintainer |
 | NRV-E1145 | `packages.nerva.pro` does not serve what is in the bucket | `package_repos.sh ready`, `served` | release maintainer / Cloudflare |
 | NRV-E1146 | Installing from the repository failed on a supported distribution | `repo_install_check.sh` (`repos-verify`) | release maintainer |
-| NRV-E1147 | The bucket's write lock was not acquired within 30 minutes, more than 50 lock names were searched, or the run lost the lock (a newer lock object, or another run's manifest at the name it wanted) | `package_repos.sh publish`, `refresh` | release maintainer (another write run, or a dead one) |
-| NRV-E1148 | A package is not what the approved run bound: its bytes differ from the draft's or the manifest's, nothing was bound for the tag, or `repos-ready` ran after the release was published | `package_repos.sh ready`, `publish`, `refresh` | release maintainer (or whoever changed a release asset) |
+| NRV-E1147 | Two writers ran at once: a manifest that verifies holds the name this run wanted, so something wrote the bucket outside the concurrency group `nerva-packages-bucket`. (Its earlier meanings, a lock wait and a lock search, are cut with the lock) | `package_repos.sh ready`, `publish`, `refresh` | release maintainer (a workflow without the group) |
+| NRV-E1148 | A package is not what the approved run bound: its bytes differ from the manifest's `<source-sha256>`, `repos` found no entry for its tag, or `repos-ready` found the release published while `guard` saw a draft | `package_repos.sh ready`, `publish`, `refresh` | release maintainer (or whoever changed a release asset) |
 | NRV-E1149 | A bucket lock rule is missing: R2 accepted an overwrite under a locked prefix | `package_repos.sh publish`, `refresh` | the Cloudflare account's admin |
 | NRV-E1150 | The repositories' signatures expire within 7 days, or this repository has had no commit for 45 days and GitHub will disable the refresh at 60 | `package_repos.sh refresh`, `ci.yml`'s `repos-fresh` | release maintainer |
 | NRV-E1151 | `nerva.pro` does not show the release 15 minutes after the site's pull request merged | `release_finish.sh site-live` (`site-verify`) | release maintainer / Cloudflare |
 | NRV-E1152 | The site's build refused: a file that would run code or bind resources on Cloudflare (`functions/`, `_worker.js`, `_routes.json`, `wrangler.*`), a package manifest, lock file or version file that would make Cloudflare install dependencies, or `SKIP_DEPENDENCY_INSTALL` not set to `1` | the `nerva-site` build command (Cloudflare), and the site's `site_check.mjs` | whoever added the file to the site repository, or changed the Pages project's variables |
-| NRV-E1153 | `repos-ready` ran in another run attempt than the `mac` job the owner approved | `package_repos.sh ready` | whoever re-ran the job; use "Re-run all jobs" |
-| NRV-E1154 | A `pending` entry's release is gone (deleted, so its assets answer 404). The entry is marked `abandoned` and is never indexed | `package_repos.sh publish`, `refresh` | release maintainer (a candidate deleted before its packages landed) |
-| NRV-E1155 | A GitHub API call or a download from GitHub failed (the network, an outage, a rate limit), not a hash mismatch; also the refresh's read of the last commit's date | `package_repos.sh ready`, `publish`, `refresh` | GitHub |
+| NRV-E1153 | `repos-ready`, binding a draft, ran in another run attempt than the `mac` job the owner approved (a dispatch for a published release is not checked) | `package_repos.sh ready` | whoever re-ran the job; use "Re-run all jobs" |
+| NRV-E1154 | **Retired, unused.** It was the `abandoned` state, cut in the fourth rework: a pending entry of a release that is not public is now skipped, never marked | none | none |
+| NRV-E1155 | A GitHub API call or a download from GitHub failed (the network, an outage, a rate limit), not a hash mismatch or a release that reads draft or 404; also the refresh's read of the last commit's date. The affected entries stay `pending` | `package_repos.sh ready`, `publish`, `refresh` | GitHub |
 | NRV-E1156 | Index generation failed (`apt-ftparchive`, `createrepo_c`), or the runner has less free disk than the run needs | `package_repos.sh publish`, `refresh` | release maintainer |
 | NRV-E1157 | `repos-verify` could not set up a distribution's container or its prerequisites (an image pull, a mirror), before any check of the repository ran | `repo_install_check.sh` (`repos-verify`) | the environment (a registry or mirror) |
 
@@ -1133,7 +1182,7 @@ slice 3 commits them to `packaging/keys/`.
 - In the bucket's **Settings**, **Public access**: under **Custom Domains**, **Connect Domain**,
   enter `packages.nerva.pro`, and confirm the DNS record Cloudflare proposes. Leave the
   **R2.dev subdomain** disabled.
-- In the bucket's **Settings**, **Bucket lock rules**, **Add rule**, five times, each with
+- In the bucket's **Settings**, **Bucket lock rules**, **Add rule**, four times, each with
   retention **Indefinite**:
 
   | Rule name | Prefix |
@@ -1142,7 +1191,6 @@ slice 3 commits them to `packaging/keys/`.
   | `rpm-stable-packages` | `rpm/stable/packages/` |
   | `rpm-rc-packages` | `rpm/rc/packages/` |
   | `manifests` | `manifest/` |
-  | `locks` | `lock/` |
 
   No other prefix: the index names must stay replaceable.
 - **Manage R2 API Tokens**, then **Create Account API token**:
@@ -1345,10 +1393,12 @@ packages (a dispatch for a published release would stop with NRV-E1148):
 **Pass:**
 
 - `repos-ready` is green before `publish`.
-- `repos` writes the pending manifest first, then two debs and two rpms (under `rpm/rc/` only),
+- `repos-ready` writes the binding manifest, and nothing else, before `publish`. `repos` puts two debs and two rpms (under `rpm/rc/` only),
   then the promoted manifest and both channels of both formats. `stable` is signed and empty,
   because no release has packages yet; that exercises the channel rule. The lock probe passes
-  (no NRV-E1149). `served` is green.
+  (no NRV-E1149). `served` is green. The run's log shows which answer `put-new` got for a name
+  under a locked prefix that exists (412 or the lock refusal), from a deliberate second
+  `put-new` of one deb; it is recorded in the worklog.
 - `repos-verify` is green in all fourteen cells (sixteen with Fedora 45), on amd64 and arm64: `nerva version` ends with
   `version 0.7.1-rc.N`, and `stable` offers no candidate.
 - **A dispatch** of the same tag (no approval) writes no package object, stops nowhere, and
@@ -1381,7 +1431,16 @@ containers):
 - R2's bucket locks: that an unconditional put under a locked prefix is refused with the status
   and error code `r2.py` pins from Cloudflare's documentation (`probe-locked` fails closed on any
   other answer, NRV-E1143, so a wrong pin stops the rehearsal and is corrected before v0.7.1);
-  and that an "Object Read & Write" token cannot change lock rules.
+  which answer a `put-new` of an existing locked object gets (412 or the lock refusal; either is
+  "exists"); and that an "Object Read & Write" token cannot change lock rules.
+- The concurrency group: that a job-level group spans `release-finish.yml` and
+  `package-repos-refresh.yml`, and that a third queued job cancels the pending one, as GitHub
+  documents. Slice 2 cannot test this locally; the design does not depend on which job is
+  cancelled.
+- That `mac-sign.yml`'s new output `attempt` reaches `release-finish.yml` after a partial re-run.
+  If GitHub drops it, `ready` refuses with NRV-E1153, which fails closed.
+- That `mac-sign.yml`, re-run by "Re-run all jobs" against a draft that already holds the signed
+  zip, behaves as P361 says.
 - That "Re-run all jobs" asks the owner to approve `mac` again, and that a "Re-run failed jobs"
   of `repos-ready` sees `mac`'s old `attempt` output (NRV-E1153).
 - R2's custom-domain public access: `Range`, `ETag`, `If-None-Match`, and Cloudflare's cache
@@ -1389,8 +1448,7 @@ containers):
 - Cloudflare's security features against apt's and dnf's user agents, from GitHub's runners.
 - The environment `package-repos`, its secrets, and the key's import with the passphrase file on
   the runner.
-- That "Re-run failed jobs" keeps `repos-ready`'s `bound` output (GitHub keeps the outputs of jobs
-  that are not re-run), and that a failed `publish` job's `public` output reaches `repos`.
+- That a failed `publish` job's `public` output reaches `repos`.
 - `ubuntu-24.04-arm` running the arm64 cells.
 - Cloudflare Pages: that it reads `wrangler.toml` and `functions/` only for a deployment whose
   build passed, so the gate holds; and that it builds no pull request from a fork.
@@ -1409,11 +1467,11 @@ CLAUDE.md (P148b).
 
 | Slice | What | Files | Tier | Order |
 |---|---|---|---|---|
-| 0 | Register NRV-E1139 to NRV-E1157 from the table above: entries with surface, blame, cause and fix, plus the intro paragraph of the 11xx section naming the scripts and the Cloudflare build that print them | `docs/ERRORS.md` | mechanical; supervisor checks the diff | first; small, merges before 1 and 2 |
-| 1 | `r2.py` and its tests. The tests run a fake S3 server (`http.server`, in the test file) that also enforces lock prefixes, check the SigV4 signature against AWS's published test vectors, and cover `If-None-Match` and 412, listing across pages and the 100-page assert, `probe-locked` both ways, the replaceable-name refusal, the stored `Content-Type` and `Cache-Control`, retries, NRV-E1143's text, and that no credential appears in argv or any message. One line in `ci.yml`'s release-scripts step | `.github/scripts/r2.py`, `.github/scripts/test_r2.py`, `.github/workflows/ci.yml` (one line) | implementation; review | after 0 |
-| 2 | `package_repos.sh` (`ready`, `publish`, `refresh`, `served`, `cleanup`) and `repo_install_check.sh`. Tests with real `gpg`, `gpgv`, `apt-ftparchive`, `createrepo_c` and `rpmsign`, throwaway keys and a throwaway `packaging/keys/` directory, a stand-in `gh`, and `r2.py` against slice 1's fake server. They cover every code from NRV-E1139 to NRV-E1156 but E1143, E1146, E1151 and E1152; the strict manifest parsing (appended and prepended text, two blocks, dash-escaping, a listed-key-file key that is not in `fingerprints`); a manifest copied to a higher generation; an index replaced, deleted, or copied across channels (healed, then NRV-E1142); `ready` on a release that reads published while `PUBLISHED` is false (NRV-E1148); a missing lock rule (NRV-E1149), and a lock refusal with another status than the pinned one (NRV-E1143); `ready` in an attempt other than `mac`'s (NRV-E1153); junk under each locked prefix, noted and skipped, with the run still finishing and ending red (NRV-E1142), and junk at a name the run must write (refused); a manifest name taken by junk (the run takes the next one); a deleted candidate (`abandoned`, NRV-E1154); a run that stops after its `writing` manifest, and a later `complete` one that refuses `index-was`; a by-hash or hashed `repodata` file with wrong content (replaced, noted); a lock with an epoch in the future and with an unparseable body (ignored); a GitHub failure (NRV-E1155); too little disk (NRV-E1156); the quiet-repository check (NRV-E1150); a kill after each step of `publish` (each row of the idempotence table), including between the `writing` manifest of step 8 and the upload, and between the upload and the `complete` manifest; the lock's wait, takeover of a stale lock (100 minutes), its 30-minute wait limit, and loss detected before a write; a run with nothing bound; the bound; that `stable` holds no candidate; and a dual-signed `InRelease`. `tests/packaging/repos.py` serves the generated trees over local HTTP to the debian 12 and 13, ubuntu 22.04 and 24.04, rocky and fedora 43 and 44 containers in `packages.yml` through `repo_install_check.sh` (NRV-E1146 and NRV-E1157 included, dnf 5 without `rpm --import`, and the "must not list" check on an empty `stable`), checks apt's refusal of a copied channel on a host that read `stable` before, checks a dual-signed `InRelease` with only one key on the host (gpgv and sqv), and checks that its commands equal this spec's install block (slice 5 switches the source to INSTALL.md). `ci.yml` installs the pinned tools for the scripts step | `.github/scripts/package_repos.sh`, `.github/scripts/repo_install_check.sh`, `.github/scripts/test_package_repos.py`, `tests/packaging/repos.py`, `.github/workflows/ci.yml` (the tools and one line), `.github/workflows/packages.yml` (one step) | implementation; review (security focus: secrets, argv, refusals, the binding, the manifest parser) | after 1 |
+| 0 | Register NRV-E1139 to NRV-E1157 from the table above (NRV-E1154 as "retired, unused", so the number is never reused): entries with surface, blame, cause and fix, plus the intro paragraph of the 11xx section naming the scripts and the Cloudflare build that print them | `docs/ERRORS.md` | mechanical; supervisor checks the diff | first; small, merges before 1 and 2 |
+| 1 | `r2.py` and its tests. The tests run a fake S3 server (`http.server`, in the test file) that also enforces lock prefixes, check the SigV4 signature against AWS's published test vectors, and cover `If-None-Match` and 412, `put-new` of an existing object under a locked prefix answered with 412 and, in a second mode of the fake server, with the pinned lock refusal (exit 3 both times), listing across pages and the 100-page assert, `probe-locked` both ways, the replaceable-name refusal, the stored `Content-Type` and `Cache-Control`, retries, NRV-E1143's text, and that no credential appears in argv or any message. One line in `ci.yml`'s release-scripts step | `.github/scripts/r2.py`, `.github/scripts/test_r2.py`, `.github/workflows/ci.yml` (one line) | implementation; review | after 0 |
+| 2 | `package_repos.sh` (`ready`, `publish`, `refresh`, `served`, `cleanup`) and `repo_install_check.sh`. Tests with real `gpg`, `gpgv`, `apt-ftparchive`, `createrepo_c` and `rpmsign`, throwaway keys and a throwaway `packaging/keys/` directory, a stand-in `gh`, and `r2.py` against slice 1's fake server. They cover every code from NRV-E1139 to NRV-E1156 but E1143, E1146, E1151, E1152 and the retired E1154; the strict manifest parsing (appended and prepended text, two blocks, dash-escaping, a listed-key-file key that is not in `fingerprints`); a manifest copied to a higher generation; an index replaced, deleted, or copied across channels (healed, then NRV-E1142); `ready` on a release that reads published while `PUBLISHED` is false (NRV-E1148); `ready` binding a draft in an attempt other than `mac`'s (NRV-E1153), and a dispatch with `PUBLISHED` true in any attempt (not checked); the binding, and a re-bind by a later approved attempt when no object of the tag exists, refused (NRV-E1141) when one does; a missing lock rule (NRV-E1149), and a lock refusal with another status than the pinned one (NRV-E1143); junk under each locked prefix, noted and skipped, with the run still finishing and ending red (NRV-E1142), and junk at a name the run must write (refused); a manifest name taken by junk (the run takes the next one); a verified manifest at the name the run wanted (NRV-E1147, nothing more written); `manifest/` holding only objects that do not verify (NRV-E1142, refused); a first run killed before its first manifest, then a run that starts from generation 0; a pending entry whose release is a draft or answers 404 (skipped with a notice, the run green), and a GitHub error on one (NRV-E1155, the entry still `pending`, the other entries published); a generation that changes only `package` lines copying `state`, `index` and `index-was`; a run that stops after its `writing` manifest, and a later `complete` one that refuses `index-was`; a by-hash or hashed `repodata` file with wrong content (replaced, noted); too little disk (NRV-E1156); the quiet-repository check (NRV-E1150); a kill after each step of `publish` (each row of the idempotence table), including between the `writing` manifest of step 6 and the upload, and between the upload and the `complete` manifest; a run with nothing bound; the 2,000-entry limit; that `stable` holds no candidate; and a dual-signed `InRelease`. `tests/packaging/repos.py` serves the generated trees over local HTTP to the debian 12 and 13, ubuntu 22.04 and 24.04, rocky and fedora 43 and 44 containers in `packages.yml` through `repo_install_check.sh` (NRV-E1146 and NRV-E1157 included, dnf 5 without `rpm --import`, and the "must not list" check on an empty `stable`), checks apt's refusal of a copied channel on a host that read `stable` before, checks a dual-signed `InRelease` with only one key on the host (gpgv and sqv), and checks that its commands equal this spec's install block (slice 5 switches the source to INSTALL.md). `ci.yml` installs the pinned tools for the scripts step | `.github/scripts/package_repos.sh`, `.github/scripts/repo_install_check.sh`, `.github/scripts/test_package_repos.py`, `tests/packaging/repos.py`, `.github/workflows/ci.yml` (the tools and one line), `.github/workflows/packages.yml` (one step) | implementation; review (security focus: secrets, argv, refusals, the binding, the manifest parser) | after 1 |
 | 3 | `packaging/keys/nerva-release.asc` and `packaging/keys/fingerprints` (`current <fpr>`), from setup step 4 | `packaging/keys/*` | mechanical; supervisor checks the fingerprint against the owner's | after setup step 4; parallel with 1 and 2 |
-| 4 | `release-finish.yml`: jobs `repos-ready` (with output `bound`), `repos` (gated on `public`), `repos-verify`, `site-verify`; `publish`'s `needs`, `if`, last step and output `public`; the header comment (which still says "the site's auto-merge"; P364 merges directly); images pinned by digest. `release_finish.sh site-live` and its test. `package-repos-refresh.yml`: the weekly schedule and dispatch. `ci.yml`'s `repos-fresh` job, behind `REPOS_LIVE`. Tried with a dispatch on a published candidate before review where possible: `repos-ready` then refuses NRV-E1139 cleanly while the environment is not set up | `.github/workflows/release-finish.yml`, `.github/workflows/package-repos-refresh.yml`, `.github/workflows/ci.yml` (one job), `.github/scripts/release_finish.sh` (`site-live`), `.github/scripts/test_release_finish.py` | implementation; review (security focus: environments, `needs`/`if`, outputs, `!cancelled()`, no concurrency group on `repos`) | after 2 |
+| 4 | `release-finish.yml`: jobs `repos-ready` and `repos` (gated on `public`), both in the concurrency group `nerva-packages-bucket` with `cancel-in-progress: false`, `repos-verify`, `site-verify`; `publish`'s `needs`, `if`, last step and output `public`; `mac-sign.yml`'s new output `attempt` (`github.run_attempt` of its signing job), which `repos-ready` compares; the header comment (which still says "the site's auto-merge"; P364 merges directly); images pinned by digest. `release_finish.sh site-live` and its test. `package-repos-refresh.yml`: the weekly schedule and dispatch, its job in the same group. `ci.yml`'s `repos-fresh` job, behind `REPOS_LIVE`. Tried with a dispatch on a published candidate before review where possible: `repos-ready` then refuses NRV-E1139 cleanly while the environment is not set up | `.github/workflows/release-finish.yml`, `.github/workflows/mac-sign.yml` (one output), `.github/workflows/package-repos-refresh.yml`, `.github/workflows/ci.yml` (one job), `.github/scripts/release_finish.sh` (`site-live`), `.github/scripts/test_release_finish.py` | implementation; review (security focus: environments, `needs`/`if`, outputs, `!cancelled()`, the shared concurrency group on every job that writes the bucket and on no other) | after 2 |
 | 5 | The fingerprint in INSTALL.md's new section (the dnf 5 notes, pinning by Origin, the signing sentence), CLAUDE.md (the site line, the release line, the environment fact), automation.md's hook section as a pointer here, the source of slice 2's install-block test switched from this spec to INSTALL.md (one line), and the worklog. In the site repository, one pull request: CLAUDE.md and README (Cloudflare Pages, "no key on the page", the refused names), `.github/CODEOWNERS` deleted, and `site_check.mjs` refusing every name the build command refuses (NRV-E1152), dangling symlinks included, with its test | `docs/INSTALL.md`, `CLAUDE.md`, `docs/releases/automation.md`, `tests/packaging/repos.py` (one line); the site's `CLAUDE.md`, `README.md`, `.github/CODEOWNERS`, `site_check.mjs` and its test | mechanical, except the `site_check.mjs` change (implementation); supervisor checks | after 2 and 3, and after setup steps 2 and 8 |
 | E | Setup steps 1 to 10 | Cloudflare, GitHub | owner | in order; step 4 before slice 3; step 7 only after step 3's check |
 | F | The rehearsal, its run link recorded, and `REPOS_LIVE` set | worklog, a repository variable | supervisor | after 0 to 5 and E |
