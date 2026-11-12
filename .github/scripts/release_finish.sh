@@ -141,6 +141,13 @@ tap_run() {
   echo "release_finish.sh: committed nerva ${tag#v} to the tap's $ref"
 }
 
+# site_check_result <sha>: the conclusion of the site's `site-check` run on that commit, or nothing
+# (no such run yet, or GitHub did not answer: the caller asks again).
+site_check_result() {
+  gh api "repos/$site_repo/commits/$1/check-runs" \
+    --jq '[.check_runs[] | select(.name == "site-check") | .conclusion] | first // ""' 2> /dev/null || true
+}
+
 # site_clone <work>: clone the site into <work>/site and enter it.
 site_clone() {
   if ! git_auth clone --quiet --depth 1 "$site_url" "$1/site" 2> "$1/err"; then
@@ -175,15 +182,23 @@ case "${1:-}" in
     out=${3:?usage: release_finish.sh fetch-sha <tag> <out>}
     name="nerva-$tag-universal-macos.zip.sha256"
     # The draft's assets are found through the releases list (a draft has no tag to look up).
-    id=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases" \
-      --jq ".[] | select(.tag_name == \"$tag\") | .assets[] | select(.name == \"$name\") | .id" | head -n1)
+    if ! id=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases" \
+      --jq ".[] | select(.tag_name == \"$tag\") | .assets[] | select(.name == \"$name\") | .id" | head -n1); then
+      refuse NRV-E1134 "cannot list the releases of $GITHUB_REPOSITORY" \
+        "GitHub did not answer, so the formula's hash has nothing to be checked against" \
+        "run the failed job again"
+    fi
     if [[ -z "$id" ]]; then
       refuse NRV-E1134 "the release $tag has no $name" \
         "mac-sign.yml's upload is missing, so the formula's hash has nothing to be checked against" \
         "run the failed job again; publish-ready should have refused first (NRV-E1131)"
     fi
-    gh api -H "Accept: application/octet-stream" "repos/$GITHUB_REPOSITORY/releases/assets/$id" |
-      awk 'NR == 1 { print $1 }' > "$out"
+    if ! sums=$(gh api -H "Accept: application/octet-stream" "repos/$GITHUB_REPOSITORY/releases/assets/$id"); then
+      refuse NRV-E1134 "cannot download $name" \
+        "GitHub did not answer, so the formula's hash has nothing to be checked against" \
+        "run the failed job again"
+    fi
+    awk 'NR == 1 { print $1 }' <<< "$sums" > "$out"
     ;;
   formula)
     tag=${2:?usage: release_finish.sh formula <tag> <formula> <sha-file>}
@@ -214,8 +229,9 @@ case "${1:-}" in
     tag=${2:?usage: release_finish.sh state <tag>}
     if ! draft=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases" \
       --jq ".[] | select(.tag_name == \"$tag\") | .draft" | head -n1); then
-      echo "release_finish.sh: cannot list the releases of $GITHUB_REPOSITORY (GitHub did not answer); run again" >&2
-      exit 2
+      refuse NRV-E1137 "cannot list the releases of $GITHUB_REPOSITORY" \
+        "GitHub did not answer, so it is not known whether $tag is a draft or published" \
+        "run the failed job again"
     fi
     # No release at all is left to mac-sign.yml and publish-ready, which refuse it with a code.
     if [[ "$draft" == false ]]; then echo published; else echo draft; fi
@@ -257,11 +273,32 @@ case "${1:-}" in
   publish)
     tag=${2:?usage: release_finish.sh publish <tag> <commit>}
     commit=${3:?usage: release_finish.sh publish <tag> <commit>}
-    draft=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases" \
-      --jq ".[] | select(.tag_name == \"$tag\") | .draft" | head -n1)
+    if ! draft=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases" \
+      --jq ".[] | select(.tag_name == \"$tag\") | .draft" | head -n1); then
+      refuse NRV-E1138 "cannot list the releases of $GITHUB_REPOSITORY" \
+        "GitHub did not answer, so it is not known whether $tag is still a draft" \
+        "run the failed job again; nothing was published"
+    fi
     # A published release is where an earlier run stopped: carry on to the tag check.
     if [[ "$draft" == true ]]; then
       "$0" latest-check "$tag"
+      # Publishing a draft attaches it to an existing tag: a tag at another commit is refused first.
+      work=$(mktemp -d)
+      trap 'rm -rf "$work"' EXIT
+      existing=
+      if ! existing=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" --jq .object.sha 2> "$work/err"); then
+        # Only "not found" means there is no tag; any other failure is not known to be safe.
+        if ! grep -q 'HTTP 404\|Not Found' "$work/err"; then
+          refuse NRV-E1138 "cannot read the tag $tag" "$(scrub "$work/err")" \
+            "run the failed job again; nothing was published"
+        fi
+        existing=
+      fi
+      if [[ -n "$existing" && "$existing" != "$commit" ]]; then
+        refuse NRV-E1138 "the tag $tag already exists at $existing, not at $commit, the draft's target" \
+          "publishing the draft would attach the release to that tag, so it would go public on the wrong commit" \
+          "look at the tag and delete it if it was a mistake; nothing was published"
+      fi
       flags=(--draft=false)
       [[ "$tag" == *-* ]] || flags+=(--latest)
       if ! out=$(gh release edit "$tag" "${flags[@]}" 2>&1); then
@@ -349,15 +386,29 @@ case "${1:-}" in
       pr=${url##*/}
     fi
     # A release asks for the merge once its check passes; a prerelease's is never merged. Without
-    # auto-merge there is no merge: the pull request stays open for the owner. Only a pull request
-    # whose checks have already passed (clean) is merged at once, as a re-run finds it.
+    # auto-merge, the pull request is merged only after the site's check run on its head commit has
+    # concluded success (site-check is not a required check until the site's setup is done), and
+    # only at that commit. A failed or missing check leaves the pull request open.
     if [[ "$tag" != *-* ]]; then
       if ! out=$(gh pr merge "$pr" --repo "$site_repo" --auto --squash 2>&1); then
-        state=$(gh api "repos/$site_repo/pulls/$pr" --jq .mergeable_state 2> /dev/null || true)
-        if [[ "$state" != clean ]] || ! out=$(gh pr merge "$pr" --repo "$site_repo" --squash 2>&1); then
+        result=
+        waited=0
+        while :; do
+          result=$(site_check_result "$head_sha")
+          if [[ -n "$result" && "$result" != null ]] || ((waited >= wait_seconds)); then
+            break
+          fi
+          sleep "$poll_seconds"
+          waited=$((waited + poll_seconds))
+        done
+        if [[ "$result" != success ]]; then
           refuse NRV-E1136 "cannot ask for the merge of the site's pull request #$pr" \
-            "gh said: $(tr '\n' ' ' <<< "$out")" \
+            "gh said: $(tr '\n' ' ' <<< "$out"); the site's check on ${head_sha:0:7} is '${result:-missing}', so it is not merged without it" \
             "allow auto-merge on $site_repo and require site-check in its ruleset (setup guide, step 6), then merge #$pr by hand; the release is already published"
+        fi
+        if ! out=$(gh pr merge "$pr" --repo "$site_repo" --squash --match-head-commit "$head_sha" 2>&1); then
+          refuse NRV-E1136 "cannot merge the site's pull request #$pr" "gh said: $(tr '\n' ' ' <<< "$out")" \
+            "merge #$pr by hand once its check has passed; the release is already published"
         fi
       fi
     fi
@@ -367,29 +418,30 @@ case "${1:-}" in
     pr=${2:?usage: release_finish.sh site-wait <pr> <release|prerelease>}
     mode=${3:?usage: release_finish.sh site-wait <pr> <release|prerelease>}
     waited=0
+    merged_seen=
     while :; do
       # A failed call is "not yet": the next poll asks again.
-      if [[ "$mode" == release ]]; then
-        merged=$(gh api "repos/$site_repo/pulls/$pr" --jq .merged 2> /dev/null || true)
-        if [[ "$merged" == true ]]; then
-          echo "release_finish.sh: the site's pull request #$pr merged"
-          exit 0
-        fi
-      fi
       head=$(gh api "repos/$site_repo/pulls/$pr" --jq .head.sha 2> /dev/null || true)
       result=
       if [[ -n "$head" ]]; then
-        result=$(gh api "repos/$site_repo/commits/$head/check-runs" \
-          --jq '[.check_runs[] | select(.name == "site-check") | .conclusion] | first // ""' 2> /dev/null || true)
-      fi
-      if [[ "$mode" != release && "$result" == success ]]; then
-        echo "release_finish.sh: the site's pull request #$pr passed site-check"
-        exit 0
+        result=$(site_check_result "$head")
       fi
       if [[ -n "$result" && "$result" != null && "$result" != success ]]; then
         refuse NRV-E1136 "the site's check on pull request #$pr ended $result" \
           "the page the release added does not pass the site's own check" \
           "fix the site's pull request by hand (the release is already published)"
+      fi
+      if [[ "$mode" == release ]]; then
+        merged=$(gh api "repos/$site_repo/pulls/$pr" --jq .merged 2> /dev/null || true)
+        # A merge counts only with a passing check on the head that was merged.
+        if [[ "$merged" == true && "$result" == success ]]; then
+          echo "release_finish.sh: the site's pull request #$pr merged, after site-check passed"
+          exit 0
+        fi
+        [[ "$merged" == true ]] && merged_seen=yes
+      elif [[ "$result" == success ]]; then
+        echo "release_finish.sh: the site's pull request #$pr passed site-check"
+        exit 0
       fi
       if ((waited >= wait_seconds)); then
         break
@@ -397,6 +449,11 @@ case "${1:-}" in
       sleep "$poll_seconds"
       waited=$((waited + poll_seconds))
     done
+    if [[ -n "$merged_seen" ]]; then
+      refuse NRV-E1136 "the site's pull request #$pr is merged, but site-check has no result on its head" \
+        "the page went live without the site's own check having passed" \
+        "look at the site's page, and fix or revert it by hand"
+    fi
     if [[ "$mode" == release ]]; then
       what="merge"
     else

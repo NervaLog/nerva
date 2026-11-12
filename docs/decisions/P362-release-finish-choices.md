@@ -26,15 +26,22 @@ amends: P360
    slice C's.
 7. Review of #362: the site's pull request is found through the REST list with `head=<owner>:<branch>`
    and kept only if its head repository is the site, its author is the App and (for an open one) its
-   head is the commit just pushed. Auto-merge that cannot be asked is a refusal (NRV-E1136), not a
-   plain merge, except for a pull request already `clean`.
+   head is the commit just pushed. Auto-merge that cannot be asked is a refusal (NRV-E1136) unless
+   the site's `site-check` run on the pull request's head has concluded `success` (not
+   `mergeable_state`: `site-check` is not a required check until the site's setup is done); then the
+   pull request is merged with `--match-head-commit`. `site-wait` accepts a merge in release mode only
+   with a `success` check on the merged head.
 8. Everything that can refuse without writing runs before the draft is published (latest-release check,
    site sentence, App token, tap diff, site edit on a scratch clone, which stands in today's UTC date).
 9. A release is refused (NRV-E1138) when a published release is newer, and the tap's `main` is never
    taken to an older version (NRV-E1135). Versions are compared with `sort -V`; a candidate is exempt.
-10. A dispatch for a release that is already published skips `mac` and `mac-verify`; `publish` then
-    makes the formula from the template and the zip's published checksum, because no signing run
+10. A dispatch for a release that is already published skips `mac` only; `mac-verify` still checks
+    the published zip (steps 1 to 4; its new `brew` input is `no`, as the tap has no formula yet) and
+    `publish` needs it to succeed. `publish` then makes the formula from the template and the zip's published checksum, because no signing run
     produced one.
+13. Before the draft is published, a tag `v<X>.<Y>.<Z>` that already exists at another commit than the
+    draft's target is refused (NRV-E1138). Every `gh` failure in the script and the workflow ends in
+    a coded refusal of its step's code (E1134 formula, E1137 guard, E1138 publication, E1136 site).
 11. Only `v<X>.<Y>.<Z>` and `v<X>.<Y>.<Z>-rc.<N>` pass the guard (P361).
 12. No step writes a command substitution inside `echo >> $GITHUB_OUTPUT` (it hides the failure), and
     `release-finish.yml` runs every step with `bash -eo pipefail`; a test refuses both. `release.yml`,

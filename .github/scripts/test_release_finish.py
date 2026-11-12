@@ -61,7 +61,7 @@ case "$*" in
     case "$*" in *state=open*) j=$PULLS_OPEN ;; *) j=$PULLS_CLOSED ;; esac
     [ -n "$j" ] && printf '%s' "$j" | jq -r "$f"
     exit 0 ;;
-  *git/ref/tags*) [ -n "$TAG_AT" ] && echo "$TAG_AT" || exit 1 ;;
+  *git/ref/tags*) [ -n "$TAG_AT" ] && echo "$TAG_AT" || { echo "gh: Not Found (HTTP 404)" >&2; exit 1; } ;;
   *releases/assets/*) printf '%s' "$ASSET_SHA" ;;
   *releases*"prerelease == false"*) [ -n "$PUBLISHED" ] && printf '%s\n' "$PUBLISHED" ;;
   *releases*"select(.tag_name"*"assets[]"*) [ -n "$ASSET_ID" ] && echo "$ASSET_ID" ;;
@@ -276,7 +276,7 @@ class Finish(unittest.TestCase):
         self.assertEqual(self.run_script("state", "v0.7.1", DRAFT="false").stdout, "published\n")
         self.assertEqual(self.run_script("state", "v0.7.1", DRAFT="true").stdout, "draft\n")
         self.assertEqual(self.run_script("state", "v0.7.1", DRAFT="").stdout, "draft\n")
-        self.assertEqual(self.run_script("state", "v0.7.1", API_FAILS="1").returncode, 2)
+        self.refused(self.run_script("state", "v0.7.1", API_FAILS="1"), "NRV-E1137", "cannot list the releases")
 
     def test_an_older_release_is_not_made_latest(self):
         self.assertEqual(self.run_script("latest-check", "v0.7.1", PUBLISHED="v0.7.0\nv0.7.1").returncode, 0)
@@ -307,8 +307,22 @@ class Finish(unittest.TestCase):
         self.assertNotIn("release edit", self.calls())
 
     def test_a_tag_on_another_commit_or_none_is_refused(self):
-        self.refused(self.run_script("publish", "v0.7.1", COMMIT, TAG_AT="f" * 40), "NRV-E1138", "not at 0123456")
+        self.refused(self.run_script("publish", "v0.7.1", COMMIT, DRAFT="false", TAG_AT="f" * 40), "NRV-E1138", "not at 0123456")
         self.refused(self.run_script("publish", "v0.7.1", COMMIT), "NRV-E1138", "is at 'nothing'")
+
+    def test_a_tag_that_already_exists_elsewhere_is_refused_before_the_draft_is_published(self):
+        result = self.run_script("publish", "v0.7.1", COMMIT, DRAFT="true", TAG_AT="f" * 40)
+        self.refused(result, "NRV-E1138", "already exists at " + "f" * 40)
+        self.assertNotIn("release edit", self.calls())
+        # a tag already at the draft's target is fine; a lookup that fails for another reason is not
+        self.assertEqual(self.run_script("publish", "v0.7.1", COMMIT, TAG_AT=COMMIT).returncode, 0)
+        self.log.write_text("")
+        self.refused(self.run_script("publish", "v0.7.1", COMMIT, API_FAILS="1"), "NRV-E1138", "cannot list")
+        self.assertNotIn("release edit", self.calls())
+
+    def test_fetching_the_checksum_fails_with_a_code(self):
+        self.refused(self.run_script("fetch-sha", "v0.7.1", str(self.dir / "o"), API_FAILS="1"), "NRV-E1134", "cannot list")
+        self.refused(self.run_script("fetch-sha", "v0.7.1", str(self.dir / "o")), "NRV-E1134", "has no")
 
     def test_a_failed_edit_is_refused(self):
         self.refused(self.run_script("publish", "v0.7.1", COMMIT, EDIT_FAILS="1"), "NRV-E1138",
@@ -354,7 +368,8 @@ class Finish(unittest.TestCase):
 
     def test_a_fork_pull_request_of_the_same_branch_name_is_never_ours(self):
         url, _ = self.bare("site", {"index.html": PAGE})
-        fork = self.pull(99, "f" * 40, login="mallory", repo="fork/site")
+        # The author is the App's, so only the head repository tells a fork's pull request apart.
+        fork = self.pull(99, "f" * 40, login=self.BOT, repo="fork/site")
         # a fork's open pull request, and a fork's merged one, are both passed over
         result = self.run_script("site", "v0.7.1", "2026-11-13", "A line.", SITE_URL=url,
                                  PULLS_OPEN=json.dumps([fork]), PULLS_CLOSED=json.dumps([dict(fork, merged_at="2026-11-01T00:00:00Z")]))
@@ -363,6 +378,13 @@ class Finish(unittest.TestCase):
         self.assertIn("pr create --repo o/site", self.calls())
         self.assertIn("pr merge 7 --repo o/site --auto --squash", self.calls())
         self.assertNotIn("pr merge 99", self.calls())
+
+    def test_a_closed_pull_request_that_was_not_merged_is_not_a_merged_one(self):
+        url, _ = self.bare("site", {"index.html": PAGE})
+        closed = dict(self.pull(4, "a" * 40), merged_at=None)
+        result = self.run_script("site", "v0.7.1", "2026-11-13", "A line.", SITE_URL=url, PULLS_CLOSED=json.dumps([closed]))
+        self.assertEqual(result.stdout.strip(), "7", result.stderr)
+        self.assertIn("pr create", self.calls())
 
     def test_a_pull_request_by_another_author_or_at_another_commit_is_not_ours(self):
         url, bare = self.bare("site", {"index.html": PAGE})
@@ -390,12 +412,30 @@ class Finish(unittest.TestCase):
         self.assertIn("auto merge is not allowed", result.stderr)
         self.assertNotIn("pr merge 7 --repo o/site --squash", self.calls())
 
-    def test_a_pull_request_that_is_already_clean_is_merged_when_auto_merge_cannot_be_asked(self):
+    def test_without_auto_merge_a_passed_site_check_allows_a_merge_at_that_commit(self):
+        url, bare = self.bare("site", {"index.html": PAGE})
+        result = self.run_script("site", "v0.7.1", "2026-11-13", "A line.", SITE_URL=url,
+                                 AUTO_FAILS="1", MSTATE="clean", CHECK="success")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        tip = git("rev-parse", "release/v0.7.1", cwd=bare).strip()
+        self.assertIn(f"pr merge 7 --repo o/site --squash --match-head-commit {tip}", self.calls())
+
+    def test_a_failed_or_missing_site_check_is_never_merged_even_when_the_state_is_clean(self):
+        for check in ("failure", ""):
+            url, _ = self.bare("site" + check, {"index.html": PAGE})
+            self.log.write_text("")
+            result = self.run_script("site", "v0.7.1", "2026-11-13", "A line.", SITE_URL=url,
+                                     AUTO_FAILS="1", MSTATE="clean", CHECK=check)
+            self.refused(result, "NRV-E1136", "cannot ask for the merge of the site's pull request #7")
+            self.assertIn(f"is '{check or 'missing'}'", result.stderr)
+            self.assertNotIn("--squash --match-head-commit", self.calls())
+            self.assertNotIn("pr merge 7 --repo o/site --squash", self.calls())
+
+    def test_a_merge_that_gh_refuses_after_a_passed_check_is_coded(self):
         url, _ = self.bare("site", {"index.html": PAGE})
         result = self.run_script("site", "v0.7.1", "2026-11-13", "A line.", SITE_URL=url,
-                                 AUTO_FAILS="1", MSTATE="clean")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("pr merge 7 --repo o/site --squash", self.calls())
+                                 AUTO_FAILS="1", MERGE_FAILS="1", CHECK="success")
+        self.refused(result, "NRV-E1136", "cannot merge the site's pull request #7")
 
     def test_site_check_edits_a_scratch_clone_and_writes_nothing(self):
         url, bare = self.bare("site", {"index.html": PAGE})
@@ -419,7 +459,11 @@ class Finish(unittest.TestCase):
                      "NRV-E1136", "cannot clone the site")
 
     def test_wait_passes_when_merged(self):
-        self.assertEqual(self.run_script("site-wait", "7", "release", MERGED="true").returncode, 0)
+        self.assertEqual(self.run_script("site-wait", "7", "release", MERGED="true", CHECK="success").returncode, 0)
+
+    def test_a_merged_pull_request_whose_check_failed_or_is_missing_is_refused(self):
+        self.refused(self.run_script("site-wait", "7", "release", MERGED="true", CHECK="failure"), "NRV-E1136", "ended failure")
+        self.refused(self.run_script("site-wait", "7", "release", MERGED="true"), "NRV-E1136", "has no result on its head")
 
     def test_wait_gives_up_and_says_so(self):
         self.refused(self.run_script("site-wait", "7", "release"), "NRV-E1136",
@@ -498,11 +542,15 @@ class Workflow(unittest.TestCase):
 
     def test_a_published_release_skips_the_signing_and_publish_still_runs(self):
         self.assertIn("published: ${{ steps.refs.outputs.published }}", self.text)
-        for job in ("mac", "mac-verify"):
-            body = self.text.split(f"\n  {job}:\n")[1].split("\n\n")[0]
-            self.assertIn("if: needs.guard.outputs.published != 'true'", body, job)
+        # only the signing is skipped: the published zip is still checked (steps 1 to 4, no brew yet)
+        mac = self.text.split("\n  mac:\n")[1].split("\n\n")[0]
+        self.assertIn("if: needs.guard.outputs.published != 'true'", mac)
+        verify = self.text.split("\n  mac-verify:\n")[1].split("\n\n")[0]
+        self.assertNotIn("published != 'true'", verify.split("with:")[0])
+        self.assertIn("brew: ${{ needs.guard.outputs.published == 'true' && 'no' || 'yes' }}", verify)
         publish = self.text.split("\n  publish:\n")[1].split("\n  verify:\n")[0]
         self.assertIn("'[\"success\", \"skipped\"]'", publish)
+        self.assertIn("needs.mac-verify.result == 'success'", publish)
         self.assertIn("make-formula", publish)
 
     def test_release_yml_calls_finish_after_its_draft_and_refuses_a_missing_site_line_early(self):

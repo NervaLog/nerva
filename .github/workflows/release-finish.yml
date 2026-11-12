@@ -4,9 +4,10 @@
 # environment release-publish: main only, no reviewers), then installs from the tap (`verify`).
 # Called by release.yml on main after its draft, or dispatched from main with a draft's tag: that
 # is how a prerelease drafted from a branch is rehearsed, and how a run that stopped is finished.
-# A dispatch for a release that is already published skips the signing (`mac`, `mac-verify`: the
-# zip is public and is never signed again) and carries on with the tap, the site and `verify`; the
-# formula is then made from the template and the zip's published checksum.
+# A dispatch for a release that is already published skips the signing (`mac`: the zip is public and
+# is never signed again), still checks the published zip (`mac-verify`, steps 1 to 4, no brew yet),
+# and carries on with the tap, the site and `verify`; the formula is then made from the template and
+# the zip's published checksum.
 #
 # Only main may run it (`guard`, NRV-E1137); each environment's main-only deployment rule is the
 # second guard. The scripts come from the workflow's own ref, never from the draft's target. If a
@@ -89,13 +90,14 @@ jobs:
   # The zip on the draft, on both architectures. brew waits for the published release (`verify`).
   mac-verify:
     needs: [guard, mac]
-    if: needs.guard.outputs.published != 'true'
+    if: ${{ !cancelled() && needs.guard.result == 'success' && contains(fromJSON('["success", "skipped"]'), needs.mac.result) }}
     uses: ./.github/workflows/mac-verify.yml
     permissions:
       contents: write
     with:
       tag: ${{ inputs.tag }}
       tap-ref: ${{ needs.guard.outputs.tap-ref }}
+      brew: ${{ needs.guard.outputs.published == 'true' && 'no' || 'yes' }}
 
   # Runs when the Mac checks passed, or were skipped because the release is already published.
   publish:
@@ -103,7 +105,7 @@ jobs:
     if: >-
       ${{ !cancelled() && needs.guard.result == 'success'
       && contains(fromJSON('["success", "skipped"]'), needs.mac.result)
-      && contains(fromJSON('["success", "skipped"]'), needs.mac-verify.result) }}
+      && needs.mac-verify.result == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     environment: release-publish
@@ -184,7 +186,10 @@ jobs:
           SLUG: ${{ steps.app.outputs.app-slug }}
         run: |
           set -euo pipefail
-          id=$(gh api "users/${SLUG}[bot]" --jq .id)
+          if ! id=$(gh api "users/${SLUG}[bot]" --jq .id); then
+            echo "::error::NRV-E1136 cannot read the App's user id; the draft is not published; run the failed job again"
+            exit 1
+          fi
           echo "name=${SLUG}[bot]" >> "$GITHUB_OUTPUT"
           echo "email=${id}+${SLUG}[bot]@users.noreply.github.com" >> "$GITHUB_OUTPUT"
 
@@ -206,9 +211,11 @@ jobs:
         run: |
           set -euo pipefail
           .github/scripts/release_finish.sh publish "$TAG" "$COMMIT"
-          date=$(gh api "repos/$GITHUB_REPOSITORY/releases" --paginate \
-            --jq ".[] | select(.tag_name == \"$TAG\") | .published_at[:10]" | head -n1)
-          test -n "$date" || { echo "::error::cannot read when $TAG was published"; exit 1; }
+          if ! date=$(gh api "repos/$GITHUB_REPOSITORY/releases" --paginate \
+            --jq ".[] | select(.tag_name == \"$TAG\") | .published_at[:10]" | head -n1) || [ -z "$date" ]; then
+            echo "::error::NRV-E1138 cannot read when $TAG was published; the release is public; run the failed job again"
+            exit 1
+          fi
           echo "date=$date" >> "$GITHUB_OUTPUT"
 
       - name: Commit the formula to the tap

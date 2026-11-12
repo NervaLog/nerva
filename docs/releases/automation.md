@@ -468,11 +468,12 @@ with `branch_policy` only. Then tell the supervisor, and the rehearsal follows.
 
 If a job fails, "Re-run failed jobs" resumes it. If the run itself is gone, dispatch
 `release-finish.yml` from `main` with the tag. Each job is idempotent. For a release that is
-already published the dispatch skips `mac` and `mac-verify` (nothing is signed twice) and carries
+already published the dispatch skips `mac` (nothing is signed twice), still runs `mac-verify`
+on the published zip (steps 1 to 4, `brew: 'no'`, since the tap has no formula yet) and carries
 on with `publish`, which publishes nothing again but checks the tag, then the tap, the site and
 `verify`; the formula is then made from the template and the zip's published checksum. Everything
 that can refuse without writing (the App's token, the site's sentence, the tap's diff, the site's
-edit, and a release older than the latest one) runs before the draft is published, so a setup
+edit, a release older than the latest one, and a tag that already exists at another commit) runs before the draft is published, so a setup
 mistake leaves a draft and not a half-finished release. A draft that cannot be
 signed in CI falls back to the owner's Mac, as P311 and P343 describe. After uploading the zip, the
 owner dispatches `release-finish.yml` again; its `mac` job approval is then the only click, and it

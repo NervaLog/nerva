@@ -26,6 +26,10 @@
 # the formula, the brew step's error says where it comes from: mac-sign.yml's run uploads it as the
 # `homebrew-formula` artifact (`gh run download <run> -n homebrew-formula`).
 #
+# `brew: 'no'` (release-finish.yml, for a release that was already published when it started) skips
+# step 5 too, since the tap has not been written yet: steps 1 to 4 then check the published zip
+# before the formula reaches the tap's main.
+#
 # The token is given to the download step only (GH_TOKEN), never to the brew, formula or binary
 # steps. `contents: write` is needed only to list a draft release in a dispatch.
 name: Mac verify
@@ -41,6 +45,11 @@ on:
         description: 'The branch of nervalog/tap that holds the formula: main, or rc/v<VERSION> for a prerelease'
         required: false
         default: main
+        type: string
+      brew:
+        description: "'no' skips step 5 (brew install): the tap has not taken the formula yet"
+        required: false
+        default: 'yes'
         type: string
   workflow_dispatch:
     inputs:
@@ -187,7 +196,7 @@ jobs:
           echo "::notice::$TAG is a draft, and nervalog/tap is not updated until it is published; brew install is checked by the run on the published event"
 
       - name: brew install nervalog/tap/nerva, brew test
-        if: steps.release.outputs.draft != 'true'
+        if: steps.release.outputs.draft != 'true' && inputs.brew != 'no'
         env:
           EVENT: ${{ github.event_name }}
           HOMEBREW_NO_AUTO_UPDATE: '1'
