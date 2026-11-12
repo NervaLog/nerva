@@ -245,10 +245,11 @@ for a re-run, and `verify` then also waits for it. Its design is v0.7.2's. This 
 - **No secret on argv, none echoed.** Secrets enter steps only through `env:`, and only the steps
   that use them. The App's key goes only to `create-github-app-token`, and its token only to the
   tap and site steps. Git authenticates through a credential helper that reads the environment,
-  never a token in a URL or a `-c` argument. `mac_keychain.sh` is unchanged: as P343 recorded,
-  `security import -P` takes the `.p12` password on argv for a moment, on a hosted runner whose
-  other processes are this job's own. Re-wrapping the `.p12` with `openssl pkcs12 -passin env:`
-  first (as Zigbox does) is a possible follow-up, not part of this change.
+  never a token in a URL or a `-c` argument. **The `.p12` is re-wrapped first** (owner,
+  2026-11-12; slice A): `mac_keychain.sh` runs `openssl pkcs12 -passin env:<real> -passout
+  env:<throwaway>` with a random throwaway password made in the step, and `security import -P`
+  sees only that throwaway. The real export password then reaches only `openssl`, through `env:`,
+  and never argv (P343 had accepted it on argv for a moment).
 - **Actions pinned to a full SHA:** `actions/create-github-app-token` and
   `actions/download-artifact` are added, each pinned, with the tag in a comment.
 - **The App's reach.** "Nerva Release" has these repository permissions: Contents read and write,
@@ -479,7 +480,8 @@ the owner deletes afterwards. It now covers the whole graph.
    and `rehearsal/v0.7.1-rc.2`. The run link goes in the worklog note of the PR that records the
    result.
 
-**What the rehearsal does not exercise:** the push-triggered path (`release.yml` calling `finish`
+**What the rehearsal does not exercise** (the owner accepted this on 2026-11-12, with the by-hand
+fallback below): the push-triggered path (`release.yml` calling `finish`
 on `main`), a commit to the tap's `main`, and an auto-merge on the site. These are the same steps
 with a different branch and one flag. The first real release is their first run. If any of them
 fails, the release is already published, and the fallback is today's manual step for that one
@@ -499,9 +501,9 @@ mechanical tier for work fully specified by a pattern.
 
 | Slice | What | Files | Model (tier) |
 |---|---|---|---|
-| A | `release_check.sh publish-ready`; `release_notes.sh site` and dropping the site line; `site_release.py`; their tests in `ci.yml`'s scripts step; the new codes in `docs/ERRORS.md` | `.github/scripts/*`, `docs/ERRORS.md`, `ci.yml` (one step) | implementation tier; review tier |
+| A | `mac_keychain.sh` re-wraps the `.p12` (see "Security notes") with a test; `release_check.sh publish-ready`; `release_notes.sh site` and dropping the site line; `site_release.py`; their tests in `ci.yml`'s scripts step; the new codes in `docs/ERRORS.md` | `.github/scripts/*`, `docs/ERRORS.md`, `ci.yml` (one step) | implementation tier; review tier |
 | D | The site's `check.yml` (`site-check`), as a PR on `NervaLog/nervalog.github.io` (runs in parallel with A) | that repository only | implementation tier; review tier |
 | B | `release-finish.yml`; `release.yml`'s `finish` and site-line refusal; `mac-verify.yml`'s `tap-ref`. Tried on a dispatch with a prerelease before review where it can be (no secrets are needed up to `mac`). After A. | `.github/workflows/{release,release-finish,mac-verify}.yml` | implementation tier; review tier (security focus: environments, tokens, argv) |
-| C | Header comments of `mac-sign.yml`, `release.yml` and `mac-verify.yml`; `docs/INSTALL.md`'s tap wording; the CLAUDE.md release line. Mechanical, from this spec. After B. | those files | mechanical tier; the supervisor checks the diff |
+| C | Header comments of `mac-sign.yml`, `release.yml` and `mac-verify.yml`; `docs/INSTALL.md`'s tap wording; the CLAUDE.md release line, and a CLAUDE.md rule that a session never approves a deployment (P360 2 relies on it). Mechanical, from this spec. After B. | those files | mechanical tier; the supervisor checks the diff |
 | E | The setup guide above | GitHub settings | owner (in parallel with A and D) |
 | F | The rehearsal, the cleanup, and the run link recorded | worklog | supervisor |

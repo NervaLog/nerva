@@ -24,7 +24,7 @@ amends: P343
    `apple-signing` now, before the machine account exists. Sessions act as the owner's account
    `topwombat`, the environment's reviewer, so a session could in principle approve a deployment,
    and now that approval publishes. The owner accepts this risk. What keeps it in check: sessions
-   have no tool that approves a deployment; CLAUDE.md says a session never does; workflow changes
+   have no tool that approves a deployment; CLAUDE.md will say a session never does (slice C); workflow changes
    are reviewed before they merge. The machine account, with "Prevent self-review" on
    `apple-signing`, stays the later fix. Everything else in P343 holds: secrets only in the
    keychain step, `mac-draft` before any secret, `main`'s code with the keychain unlocked, the
@@ -57,7 +57,11 @@ amends: P343
    Otherwise v0.7.1 ships the way it does today, and this lands first thing after the tag. The
    change touches no `src/` or `build.zig`, so the release freeze does not cover it, but it
    changes how v0.7.1 ships, so the rehearsal is the gate.
-9. **apt and dnf repositories (v0.7.2)** join later as one more job after `publish`, in an
+9. **The owner's answers to the spec's questions (2026-11-12):** the `<!-- site: ... -->` line
+   is the convention; v0.7.1 may be the first run of the steps the rehearsal cannot reach, with
+   the manual steps as the fallback; the `.p12` is re-wrapped so its password never reaches
+   argv (slice A).
+10. **apt and dnf repositories (v0.7.2)** join later as one more job after `publish`, in an
    environment of their own. Only that hook is reserved here, not the job's design.
 
 **Reason.** The owner should decide once whether a release ships, and not then be needed four
