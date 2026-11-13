@@ -73,8 +73,24 @@ pub fn run(gpa: std.mem.Allocator, options: Options) void {
             "recover: the cluster did not commit recover's requests within {} seconds",
             .{@divFloor(recover_timeout.ns, std.time.ns_per_s)},
             "bring back enough of the other replicas, then run nerva recover again; " ++
-                "with fewer, restore from a backup",
+                "with fewer, restore from a backup; if they are all running, check that " ++
+                "--cluster is the id of the running cluster, because a wrong one is " ++
+                "ignored by every replica and looks the same",
             .{},
+        ),
+        error.PathAlreadyExists,
+        error.NotSameFileSystem,
+        error.DiskQuota,
+        error.LinkQuotaExceeded,
+        error.SymLinkLoop,
+        error.FileSystem,
+        error.SystemResources,
+        => diag.fail(
+            "NRV-E0724",
+            "recover: cannot move {s}.recovering to {s}: {s}",
+            .{ options.path, options.path, link_reason(err) },
+            "check the directory of {s}, then run nerva recover again; nothing was left behind",
+            .{options.path},
         ),
         error.Evicted => diag.fail(
             "NRV-E0716",
@@ -95,6 +111,20 @@ pub fn run(gpa: std.mem.Allocator, options: Options) void {
     });
     log.warn("recover: the old data file of replica {} must never start again: two replicas " ++
         "with one index void the cluster's guarantees", .{options.replica});
+}
+
+/// What the operator reads for a `linkat` failure that moves the finished data file into place.
+fn link_reason(err: anyerror) []const u8 {
+    return switch (err) {
+        error.PathAlreadyExists => "the path now exists",
+        error.NotSameFileSystem => "the two names are on different file systems",
+        error.DiskQuota => "the disk quota is exhausted",
+        error.LinkQuotaExceeded => "the file system allows no more links to the file",
+        error.SymLinkLoop => "the path has too many symbolic links",
+        error.FileSystem => "the file system reported an error",
+        error.SystemResources => "the kernel is out of memory",
+        else => unreachable,
+    };
 }
 
 fn attempt(gpa: std.mem.Allocator, options: Options) !Summary {
@@ -372,6 +402,26 @@ test origin_parse {
     }) |text| {
         try std.testing.expectError(error.Invalid, origin_parse(text));
     }
+}
+
+test "link_reason names what a refused linkat says" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "a", .data = "" });
+    try tmp.dir.writeFile(.{ .sub_path = "b", .data = "" });
+
+    // The one a real operator meets: the path appeared while recover ran.
+    const err = std.posix.linkat(tmp.dir.fd, "a", tmp.dir.fd, "b", 0);
+    try std.testing.expectError(error.PathAlreadyExists, err);
+    try std.testing.expectEqualStrings("the path now exists", link_reason(error.PathAlreadyExists));
+    for ([_]anyerror{
+        error.NotSameFileSystem,
+        error.DiskQuota,
+        error.LinkQuotaExceeded,
+        error.SymLinkLoop,
+        error.FileSystem,
+        error.SystemResources,
+    }) |e| try std.testing.expect(link_reason(e).len > 0);
 }
 
 fn flags_test(replica: u8, replica_count: u8, address_count: u8, origin: []const u8) Flags {
