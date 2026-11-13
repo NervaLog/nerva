@@ -50,6 +50,7 @@ BINDING_KEYS = {
     "secrets_store_secrets", "pipelines", "tail_consumers", "version_metadata", "containers",
     "triggers", "unsafe", "worker_loaders", "assets_binding", "rules", "build", "env",
 }
+WRANGLER = "4.153.0"
 COMMIT = "c886c9f3e5a1b2d4f6a8c0e2b4d6f8a0c2e4b6d8"
 SHA256 = "0f" * 32
 
@@ -103,7 +104,8 @@ class Gate(unittest.TestCase):
         self.assertNotIn("main", config)
         self.assertFalse(BINDING_KEYS & set(config), "the config gives the Worker code or a binding")
         self.assertFalse(BINDING_KEYS & set(config["previews"]), "a Preview gets a binding")
-        self.assertEqual(sorted(p.name for p in out.iterdir()), ["dist", "wrangler.json"])
+        self.assertEqual(sorted(p.name for p in out.iterdir()),
+                         ["dist", "package-lock.json", "package.json", "wrangler.json"])
 
     def test_all_present_without_wkd(self):
         out = self.passes(run_gate(self.tree))
@@ -128,11 +130,12 @@ class Gate(unittest.TestCase):
                 (self.tree / name).write_text(f"{name}\n")
 
     def test_each_required_symlink_or_directory(self):
-        (self.tree / "elsewhere.html").write_text("x\n")
+        elsewhere = Path(self.tmp.name) / "elsewhere.html"
+        elsewhere.write_text("x\n")
         for name in REQUIRED:
             with self.subTest(name=name, kind="symlink"):
                 (self.tree / name).unlink()
-                (self.tree / name).symlink_to("elsewhere.html")
+                (self.tree / name).symlink_to(elsewhere)
                 self.refused(run_gate(self.tree), f"{name} is missing, not a regular file, or a symlink")
                 (self.tree / name).unlink()
             with self.subTest(name=name, kind="directory"):
@@ -162,6 +165,77 @@ class Gate(unittest.TestCase):
                 (self.tree / name).symlink_to("does-not-exist")
                 self.refused(run_gate(self.tree), f"{name} is not allowed in the site repository")
                 (self.tree / name).unlink()
+
+    def test_unknown_names_are_refused(self):
+        for name in ["notes.txt", ".hidden", ".gitignore", "sitemap.xml", "robots.txt",
+                     ".mise.toml", "mise.toml", "..odd", "a b"]:
+            with self.subTest(name=name, kind="file"):
+                (self.tree / name).write_text("x\n")
+                self.refused(run_gate(self.tree), f"{name} is not allowed in the site repository")
+                (self.tree / name).unlink()
+        for name in ["assets", ".config"]:
+            with self.subTest(name=name, kind="directory"):
+                (self.tree / name / "x").mkdir(parents=True)
+                self.refused(run_gate(self.tree), f"{name} is not allowed in the site repository")
+                shutil.rmtree(self.tree / name)
+
+    def test_unknown_symlink_is_refused(self):
+        for name in ["notes.txt", ".hidden", "sitemap.xml"]:
+            with self.subTest(name=name):
+                (self.tree / name).symlink_to("index.html")
+                self.refused(run_gate(self.tree), f"{name} is not allowed in the site repository")
+                (self.tree / name).unlink()
+
+    def test_allowed_metadata_passes_and_is_not_copied(self):
+        (self.tree / ".git").mkdir()
+        (self.tree / "LICENSE").write_text("licence\n")
+        out = self.passes(run_gate(self.tree))
+        self.assertEqual(self.served(out), sorted(REQUIRED))
+
+    def test_metadata_symlinks_are_refused(self):
+        (Path(self.tmp.name) / "target").mkdir()
+        for name in [".git", ".github", ".nojekyll", "README.md", "LICENSE", "CLAUDE.md"]:
+            with self.subTest(name=name):
+                backup = Path(self.tmp.name) / (name + ".bak")
+                if (self.tree / name).exists():
+                    (self.tree / name).rename(backup)
+                (self.tree / name).symlink_to(Path(self.tmp.name) / "target")
+                self.refused(run_gate(self.tree), f"{name} is a symlink")
+                (self.tree / name).unlink()
+                if backup.exists():
+                    backup.rename(self.tree / name)
+
+    def test_wkd_other_files_are_refused(self):
+        for extra in [".well-known/other", ".well-known/openpgpkey/other",
+                      ".well-known/openpgpkey/hu/other", ".well-known/security.txt"]:
+            with self.subTest(extra=extra):
+                self.add_wkd()
+                (self.tree / extra).write_text("x\n")
+                self.refused(run_gate(self.tree), f"{extra} is not allowed in the site repository")
+                shutil.rmtree(self.tree / ".well-known")
+
+    def test_well_known_not_a_directory(self):
+        (self.tree / ".well-known").write_text("x\n")
+        self.refused(run_gate(self.tree), ".well-known is not a directory")
+
+    def test_lock_file(self):
+        out = self.passes(run_gate(self.tree))
+        package = json.loads((out / "package.json").read_text())
+        lock = json.loads((out / "package-lock.json").read_text())
+        self.assertEqual(package["dependencies"], {"wrangler": WRANGLER})
+        self.assertEqual(lock["packages"][""]["dependencies"], {"wrangler": WRANGLER})
+        self.assertEqual(lock["lockfileVersion"], 3)
+        self.assertEqual(lock["packages"]["node_modules/wrangler"]["version"], WRANGLER)
+        packages = {k: v for k, v in lock["packages"].items() if k}
+        self.assertGreater(len(packages), 50)
+        for name, entry in packages.items():
+            with self.subTest(name=name):
+                self.assertTrue(name.startswith("node_modules/"), name)
+                self.assertRegex(entry["resolved"], r"^https://registry\.npmjs\.org/")
+                self.assertRegex(entry["integrity"], r"^sha512-[A-Za-z0-9+/]+=*$")
+                self.assertNotIn("link", entry)
+        # the platform binaries are packages of their own, so no install script has to fetch them
+        self.assertIn("node_modules/@cloudflare/workerd-linux-64", packages)
 
     def test_skip_dependency_install(self):
         for value in [None, "", "0", "true"]:
@@ -218,8 +292,8 @@ def spec_commands():
     text = SPEC.read_text()
     blocks = re.findall(r"^```\n(.*?)\n```$", text, flags=re.S | re.M)
     build = [b for b in blocks if b.startswith("f=/tmp/gate.sh; ") and "site_build.sh" in b]
-    deploy = [b for b in blocks if b.startswith("cd .nerva-site && npx ") and " deploy " in b]
-    preview = [b for b in blocks if b.startswith("cd .nerva-site && npx ") and " preview " in b]
+    deploy = [b for b in blocks if b.startswith("cd .nerva-site && npm ci ") and " deploy " in b]
+    preview = [b for b in blocks if b.startswith("cd .nerva-site && npm ci ") and " preview " in b]
     return build, deploy, preview
 
 
@@ -239,7 +313,7 @@ class SpecCommands(unittest.TestCase):
                 filled = self.fill(command)
                 self.assertNotIn("<", filled.replace("<<", ""))
                 self.assertLessEqual(len(filled), 400, filled)
-                self.assertLess(len(filled), 512)
+                self.assertLess(len(filled), 512)  # the dashboard's limit
 
     def test_pins(self):
         self.assertIn("raw.githubusercontent.com/NervaLog/nerva/<commit>/.github/scripts/site_build.sh",
@@ -247,13 +321,14 @@ class SpecCommands(unittest.TestCase):
         self.assertIn('echo "<sha256>  $f" | sha256sum -c --status', self.build)
         self.assertTrue(self.build.endswith("; sh $f"))
         for command in [self.deploy, self.preview]:
-            self.assertRegex(command, r"npx --yes wrangler@\d+\.\d+\.\d+ (deploy|preview) "
+            self.assertRegex(command, r"^cd \.nerva-site && npm ci --ignore-scripts && "
+                                      r"npx --no-install wrangler (deploy|preview) "
                                       r"--config wrangler\.json$")
-        self.assertEqual(re.findall(r"wrangler@[\d.]+", self.deploy),
-                         re.findall(r"wrangler@[\d.]+", self.preview))
+            self.assertNotIn("wrangler@", command)  # the version is the lock file's, not npx's
 
-    def run_build_command(self, sha256):
-        """Runs the spec's build command against a fake curl that serves this site_build.sh."""
+    def run_build_command(self, sha256, commit=COMMIT):
+        """Runs the spec's build command against a fake curl that serves this site_build.sh at
+        COMMIT and fails (as curl -f does for a 404) for any other URL."""
         tmp = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, tmp)
         bin_dir = tmp / "bin"
@@ -270,7 +345,9 @@ class SpecCommands(unittest.TestCase):
             (tree / name).write_text(name)
         env = {"PATH": f"{bin_dir}:{os.environ.get('PATH', '/usr/bin:/bin')}",
                "SKIP_DEPENDENCY_INSTALL": "1"}
-        command = self.fill(self.build, sha256=sha256)
+        command = self.fill(self.build, commit=commit, sha256=sha256)
+        self.assertIn("f=/tmp/gate.sh;", command)
+        command = command.replace("f=/tmp/gate.sh;", f"f={tmp}/gate.sh;", 1)  # not a shared path
         return tree, subprocess.run(["sh", "-c", command], cwd=tree, env=env, capture_output=True, text=True)
 
     def test_build_command_runs_the_pinned_script(self):
@@ -283,6 +360,14 @@ class SpecCommands(unittest.TestCase):
         tree, result = self.run_build_command("00" * 32)
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn("error[NRV-E1164]: site build: ", result.stderr)
+        self.assertFalse((tree / ".nerva-site").exists())
+
+    def test_build_command_refuses_a_failed_fetch(self):
+        digest = hashlib.sha256(SCRIPT.read_bytes()).hexdigest()
+        tree, result = self.run_build_command(digest, commit="1" * 40)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("error[NRV-E1164]: site build: ", result.stderr)
+        self.assertNotIn("site build: copied", result.stdout)
         self.assertFalse((tree / ".nerva-site").exists())
 
 

@@ -80,29 +80,45 @@ changes what runs; changing the gate means a pull request here **and** the owner
 in the dashboard (setup step 2). `site_build.sh`:
 
 - refuses to run unless `SKIP_DEPENDENCY_INSTALL` is `1` (see below);
-- refuses a tree that holds any name that would make Cloudflare run code, install dependencies,
-  bind resources, or configure Wrangler or npm: the Wrangler files, `functions`, `_worker.js`,
-  `_routes.json`, `.wrangler`, `.dev.vars*`, `.env*` (Wrangler loads `.env` from its working
-  directory into its own environment), `.npmrc`, `.yarnrc`, `.yarnrc.yml` (they pick the registry
-  `npx` fetches Wrangler from), every package manifest, lock file and version file the build image
-  acts on, `node_modules`, and `.nerva-site`, its own output. A dangling symlink is refused too;
+- accepts only named files (an allow-list, not a list of bad names, so a name it does not know
+  fails closed): the repository's root may hold only `index.html`, `404.html`, `_headers`,
+  `.well-known` (the WKD pair, below, and nothing else under it) and the repository's metadata,
+  `.git`, `.github`, `.nojekyll`, `README.md`, `LICENSE` and `CLAUDE.md`, which are never copied.
+  Any other path is refused and named, a dotfile or a symlink (dangling or not) included:
+  `wrangler.*`, `functions`, `_worker.js`, `.env*` (Wrangler loads `.env` from its working
+  directory into its own environment), `.npmrc`, `package.json`, a lock file, a version file or a
+  tool's configuration the build image might act on, `node_modules`, and `.nerva-site`, its own
+  output. A metadata name that is a symlink is refused too;
 - copies `index.html`, `404.html` and `_headers` into `.nerva-site/dist/`, and refuses any of the
   three that is missing, is not a regular file, or is a symlink. The two WKD files (see "The key
   by WKD") are a pair (P398): both present, as regular files, and both are copied; or both
   absent, and the build goes on without them, as it must while the reference key file does not
   exist yet (v0.7.0). One without the other, a WKD file that is not a regular file, or a symlink
-  at either file or at `.well-known`, `.well-known/openpgpkey` or its `hu` is refused. It copies
-  nothing else;
+  at either file or at `.well-known`, `.well-known/openpgpkey` or its `hu`, or any other path
+  under `.well-known`, is refused. It copies nothing else;
 - writes `.nerva-site/wrangler.json`, the only Wrangler configuration: name `nerva-site`, a pinned
   `compatibility_date`, `assets` with `directory` `dist`, `not_found_handling` `404-page` and
   `html_handling` `auto-trailing-slash`, `workers_dev` and `preview_urls` on (P410c), and an empty
-  `previews` block. No `main`, no binding, no `vars`, no route.
+  `previews` block. No `main`, no binding, no `vars`, no route;
+- writes `.nerva-site/package.json` (one dependency, `wrangler` at exactly 4.153.0) and
+  `.nerva-site/package-lock.json` (every package of Wrangler's tree, each with its `resolved`
+  address and its `integrity` hash, the platform binaries among them as packages of their own).
+  Both are in the script, so the script's SHA-256, which the dashboard pins, covers them. The
+  lock file is what `npm install --package-lock-only --ignore-scripts` writes for that
+  `package.json`; moving Wrangler means regenerating it in a pull request here and the owner
+  moving the pin.
 
 Every refusal is NRV-E1152, and nothing is deployed. The deploy and preview commands run inside
 `.nerva-site/`, so Wrangler never sees the repository's root (no `.env`, no `.npmrc`, no
 `package.json` above it), and pass `--config`, which also turns off the configuration Workers
-Builds would otherwise generate. Wrangler's version is pinned. The three commands, set in the
-dashboard (setup step 2), each one line:
+Builds would otherwise generate. They install with `npm ci --ignore-scripts` from the gate's lock
+file, so Wrangler and every package under it are the ones the lock names, checked against their
+hashes, and no install script runs while the build token is present; `npx --no-install` then runs
+the installed Wrangler and fetches nothing. (An assets-only deploy needs no install script:
+`workerd` and `esbuild` are fetched as platform packages, and neither runs. `npm ci --ignore-scripts`
+and `wrangler deploy --dry-run` were run on Wrangler 4.153.0, 2026-11-13, and the dry run read
+the three files and found no binding.) The
+three commands, set in the dashboard (setup step 2), each one line:
 
 Build command:
 
@@ -113,18 +129,19 @@ f=/tmp/gate.sh; { curl -fsSo $f https://raw.githubusercontent.com/NervaLog/nerva
 Deploy command:
 
 ```
-cd .nerva-site && npx --yes wrangler@4.153.0 deploy --config wrangler.json
+cd .nerva-site && npm ci --ignore-scripts && npx --no-install wrangler deploy --config wrangler.json
 ```
 
 Preview command (Non-production branch deploy command):
 
 ```
-cd .nerva-site && npx --yes wrangler@4.153.0 preview --config wrangler.json
+cd .nerva-site && npm ci --ignore-scripts && npx --no-install wrangler preview --config wrangler.json
 ```
 
 `<commit>` is the full SHA of a commit on this repository's `main` that holds the script, and
 `<sha256>` its SHA-256; setup step 2 says how to read both. Filled in, the build command is 392
-characters and each of the others under 80 (`test_site_build.py` checks every one is at most 400).
+characters and each of the others 100 and 101 (`test_site_build.py` checks every one is at most
+400, and so under the dashboard's 512).
 A fetch that fails, or a script whose hash differs, is NRV-E1164, and nothing is deployed.
 
 What the static assets do, from Cloudflare's Workers static assets docs: `_headers` and
@@ -141,7 +158,9 @@ does: its asset manifest walks the directory recursively and leaves out only `.a
 `npm install` (or the Python, Ruby or other tool) when it finds a `package.json`, a lock file or a
 version file, and a `postinstall` script would run before the gate ("Build image"). So the Worker
 sets the build variable `SKIP_DEPENDENCY_INSTALL` to `1` (setup step 2), the gate refuses to run
-without it, and it refuses those files too.
+without it, and it refuses those files too. The gate runs after the image has handled the
+checkout, so it only **detects** what the image did first; what **prevents** it is that variable
+and that the allow-list leaves the image nothing it acts on.
 
 The gate does not check what the WKD file holds, nor whether it should be there. The site's own
 check does both (NRV-E1162), and the release checks it again (`site-live`). If the WKD file is
@@ -151,8 +170,8 @@ A failed build deploys nothing, so the last good version keeps serving. A pull r
 site repository cannot change the build, deploy or preview command, nor the pin: only a member of
 the Cloudflare account can. The site's `site_check.mjs` refuses the same names too (slice 5), so a
 pull request fails before it merges, but that check is the pull request's own code. The gate is
-what holds. If the site gains another file, the gate's list gains it, in a pull request here, and
-the owner moves the pin.
+what holds. If the site gains another file, the gate's allow-list gains it, in a pull request
+here, and the owner moves the pin.
 
 **The build token.** Workers Builds deploys with a user API token. The one it offers to create
 ("Create new token") has, per its docs, Account Settings read, Workers Scripts edit, **Workers KV
@@ -169,8 +188,10 @@ another name, and a Worker with an R2 binding to `nerva-packages` could write th
 that upload needs an R2 permission too is not documented, and is not assumed. Such a Worker could
 put or delete objects the bucket's locks do not hold, but could not remove a lock, sign anything,
 or change the key; "The R2 token leaks" below bounds the rest, and the next write run reports any
-tampering. The token never leaves Cloudflare: only the pinned Wrangler, run after the pinned gate
-from a directory the gate wrote, sees it, and no file of the site repository reaches that step.
+tampering. The token never leaves Cloudflare: only the commands the build runs after the pinned
+gate see it, from a directory the gate wrote, and no file of the site repository reaches that
+step. Those commands are `npm ci --ignore-scripts` and the Wrangler it installs, whose version
+and whole tree (hashes included) the pinned gate fixes; no package's install script runs.
 The owner accepted this residual reach on 2026-11-13 (P410e): the site stays in the same account.
 
 **Preview deployments: on, for non-production branches (recommended).** With **Enable Preview
@@ -1668,7 +1689,7 @@ the other release codes.
 | NRV-E1149 | A bucket lock rule is missing: R2 accepted an overwrite under a locked prefix | `package_repos.sh publish`, `refresh` | the Cloudflare account's admin |
 | NRV-E1150 | The repositories' signatures expire within 10 days, or this repository has had no commit for 45 days and GitHub will disable the refresh at 60 | `package_repos.sh refresh`, `ci.yml`'s `repos-fresh` | release maintainer |
 | NRV-E1151 | `nerva.pro` does not show the release 15 minutes after the site's pull request merged | `release_finish.sh site-live` (`site-verify`) | release maintainer / Cloudflare |
-| NRV-E1152 | The site's build refused: a file that would run code, bind resources or configure Wrangler or npm on Cloudflare (`functions/`, `_worker.js`, `_routes.json`, `wrangler.*`, `.wrangler`, `.env*`, `.dev.vars*`, `.npmrc`, `.yarnrc*`, `node_modules`, `.nerva-site`), a package manifest, lock file or version file that would make Cloudflare install dependencies, `SKIP_DEPENDENCY_INSTALL` not set to `1`, `index.html`, `404.html` or `_headers` missing, not a regular file, or a symlink, one of the two WKD files (the policy and the key) without the other, a WKD file that is not a regular file, or a symlink at a WKD file or at `.well-known`, `.well-known/openpgpkey` or `.well-known/openpgpkey/hu` | `site_build.sh`, run by the `nerva-site` Worker's build command (Cloudflare), and the site's `site_check.mjs` | whoever added the file to the site repository, or changed the Worker's build variables |
+| NRV-E1152 | The site's build refused: a path that is not on the allow-list (`index.html`, `404.html`, `_headers`, `.well-known`, `.git`, `.github`, `.nojekyll`, `README.md`, `LICENSE`, `CLAUDE.md`): any other file, directory, dotfile or symlink (so every file that would run code, bind resources, configure Wrangler or npm or make Cloudflare install dependencies), a symlink at an allowed metadata name, `SKIP_DEPENDENCY_INSTALL` not set to `1`, `index.html`, `404.html` or `_headers` missing, not a regular file, or a symlink, one of the two WKD files (the policy and the key) without the other, a WKD file that is not a regular file, or a symlink at a WKD file or at `.well-known`, `.well-known/openpgpkey` or `.well-known/openpgpkey/hu` | `site_build.sh`, run by the `nerva-site` Worker's build command (Cloudflare), and the site's `site_check.mjs` | whoever added the file to the site repository, or changed the Worker's build variables |
 | NRV-E1153 | `repos-ready`, binding a draft, ran in another run attempt than the `mac` job the owner approved (a dispatch for a published release is not checked) | `package_repos.sh ready` | whoever re-ran the job; use "Re-run all jobs" |
 | NRV-E1154 | **Retired, unused.** It was the `abandoned` state, cut in the fourth rework: a pending entry of a release that is not public is now skipped, never marked | none | none |
 | NRV-E1155 | A GitHub API call or a download from GitHub failed (the network, an outage, a rate limit), not a hash mismatch or a release that reads draft or 404; also the refresh's read of the last commit's date. The affected entries stay `pending` | `package_repos.sh ready`, `publish`, `refresh` | GitHub |
@@ -1701,9 +1722,9 @@ zone says **Active**. Then, in the zone:
 the ones Cloudflare's Workers Builds docs use, and where a docs page does not confirm a field, the
 step says "if shown".
 
-- **Wait for slice 5a's site pull request** to merge: the gate requires `index.html`,
-  `404.html` and `_headers`, and fails (NRV-E1152, nothing deployed) until the site repository
-  holds them. The two WKD files are not needed: they come later, as a pair, with v0.7.1's site
+- **Wait for slice 5a's site pull request and for pull request #410 (slice W) to merge:** the
+  gate requires `index.html`, `404.html` and `_headers`, and fails (NRV-E1152, nothing deployed)
+  until the site repository holds them, and there is no gate to pin until #410 is on `main`. The two WKD files are not needed: they come later, as a pair, with v0.7.1's site
   pull request (P398).
 - **P410d's residual risk is accepted** (owner, 2026-11-13, P410e): the narrower token below can
   still deploy any Worker of the account, and the site stays in this account.
@@ -2150,8 +2171,8 @@ fails with NRV-E1143 and is re-run.
   `main` publishes through Cloudflare; that the page carries no key, fingerprint or repository
   line (it links to INSTALL.md), and that the key is only at its WKD path, a copy of Nerva's
   `packaging/keys/nerva-release.asc` that changes only with it (P376, NRV-E1162); and that
-  `functions/`, `_worker.js`, `_routes.json` and `wrangler.*` are refused, with package
-  manifests, lock files and version files (NRV-E1152).
+  `functions/`, `_worker.js`, `_routes.json` and `wrangler.*` are refused, with every other
+  name off the allow-list (NRV-E1152).
 - **P365** is amended by P376: point 3 (the site now carries the key, by WKD), point 6 (the
   check is pinned to the primary and the subkey's role), point 10 (`Date`, and `repos-fresh` at
   10 days) and point 12 (the key model, once slice K passes). **P368**'s `verify_manifest` is
@@ -2302,7 +2323,7 @@ CLAUDE.md (P148b).
 | 3 | `packaging/keys/nerva-release.asc` and `packaging/keys/fingerprints` (`primary <fpr>` and `current <subkey fpr>`; in the fallback, `current <fpr>`), from setup step 4 | `packaging/keys/*` | mechanical; supervisor checks both fingerprints against the owner's and against `gpg --show-keys` | after K and setup step 4; parallel with 2b |
 | 4 | `release-finish.yml`: jobs `repos-ready` and `repos` (gated on `public`), both in the concurrency group `nerva-packages-bucket` with `cancel-in-progress: false`, `repos-verify`, `site-verify`; `publish`'s `needs`, `if`, last step and output `public`; `mac-sign.yml`'s new output `attempt` (`github.run_attempt` of its signing job), which `repos-ready` compares; the header comment (which still says "the site's auto-merge"; P364 merges directly); images pinned by digest. `release_finish.sh site-live` and its test, and `release_finish.sh site` writing both WKD files into the site pull request it opens (P398): `.well-known/openpgpkey/policy`, empty, created if absent, and `.well-known/openpgpkey/hu/ndqm47zydhyqyzabecddtdk1q3bponab`, the dearmored key file at the tag it publishes, a release's or a candidate's, only when that tag's commit is an ancestor of `main` (for a branch candidate it leaves them as the site's `main` has them, #400). `package-repos-refresh.yml`: the weekly schedule and dispatch, its job in the same group. `ci.yml`'s `repos-fresh` job, behind `REPOS_LIVE`, failing at under 10 days and on NRV-E1160, and `package-repos-watch.yml` (daily, the same check through `package_repos.sh fresh`, and the 45-day check). The `alarm` job in all four workflows (P376: `issues: write` only, `continue-on-error`), the refresh's `missed` output and its `alarm_test` and `rpm_key` inputs; the alarm's `if` as "Alarms" gives it for each workflow, `cancelled` only for `repos-ready` and `repos`. `site-live` also compares the served WKD file with the reference key file of "The key by WKD" (NRV-E1162); when the reference's tag has no key file (v0.7.0), it passes with a notice and requires the WKD path to answer 404, as `site_check.mjs` does (P398). Tried with a dispatch on a published candidate before review where possible: `repos-ready` then refuses NRV-E1139 cleanly while the environment is not set up | `.github/workflows/release-finish.yml`, `.github/workflows/mac-sign.yml` (one output), `.github/workflows/package-repos-refresh.yml`, `.github/workflows/package-repos-watch.yml`, `.github/workflows/ci.yml` (one job), `.github/scripts/release_finish.sh` (`site-live`, `site`), `.github/scripts/test_release_finish.py` | implementation; review (security focus: environments, `needs`/`if`, outputs, `!cancelled()`, the shared concurrency group on every job that writes the bucket and on no other) | after 2 |
 | 5a | In the site repository only, one pull request: `404.html`, a plain not-found page (no script, no outside resource, a link to `/`), so the site answers an unknown path, another WKD hash included, with 404 rather than `index.html`; `_headers`, holding exactly the rule `/.well-known/openpgpkey/*` with the two headers `Content-Type: application/octet-stream` and `Access-Control-Allow-Origin: *`, each on its own line indented by two spaces; and `site_check.mjs` requiring `index.html`, `404.html` and `_headers` as regular files, not symlinks (NRV-E1152), with its test (each missing, each a symlink). No WKD file (P398) | the site's `404.html`, `_headers`, `.github/scripts/site_check.mjs` and its test | mechanical, except the `site_check.mjs` change (implementation); supervisor checks | now, after nothing; before setup step 2 |
-| W | P410, this spec's Worker rework (pull request #410): the gate as `.github/scripts/site_build.sh`, which writes the only Wrangler configuration; `test_site_build.py` (fixture trees, the configuration it writes, the dashboard commands' lengths and pins, the build command against a served and a tampered script) in `ci.yml`'s release-scripts step; NRV-E1164 registered and the texts of NRV-E1152 and NRV-E1162 say Worker; P410 to P410d | `.github/scripts/site_build.sh`, `.github/scripts/test_site_build.py`, `.github/workflows/ci.yml`, `docs/ERRORS.md`, this spec | design (Opus); supervisor checks | done in #410; before setup step 2 |
+| W | P410, this spec's Worker rework (pull request #410): the gate as `.github/scripts/site_build.sh`, which writes the only Wrangler configuration; `test_site_build.py` (fixture trees, the allow-list, the configuration and the lock file it writes, the dashboard commands' lengths and pins, the build command against a served, a tampered and an unfetchable script) in `ci.yml`'s release-scripts step; NRV-E1164 registered and the texts of NRV-E1152 and NRV-E1162 say Worker; P410 to P410d | `.github/scripts/site_build.sh`, `.github/scripts/test_site_build.py`, `.github/workflows/ci.yml`, `docs/ERRORS.md`, this spec | design (Opus); supervisor checks | done in #410; before setup step 2 |
 | 5 | The fingerprint in INSTALL.md's new section (the `primary` line; the dnf 5 notes, pinning by Origin, the signing sentence, the two-channel WKD check, and the yearly key-file fetch), CLAUDE.md (the site line, the release line, the environment fact), automation.md's hook section as a pointer here, the source of slice 2's install-block test switched from this spec to INSTALL.md (one line), and the worklog. In the site repository, one pull request: CLAUDE.md and README (a Cloudflare Worker of static assets, P410, "no key on the page", the refused names), `.github/CODEOWNERS` deleted, the WKD files (`.well-known/openpgpkey/policy`, empty, and `hu/ndqm47zydhyqyzabecddtdk1q3bponab`, the `gpg --dearmor` of the key file; the hash rechecked with `gpg-wks-client --print-wkd-hash nerva@nerva.pro`): none here (P398); the first pair comes with v0.7.1's site pull request, from slice 4's `site`, and `site_check.mjs` refusing every name the gate (`site_build.sh`) refuses and one WKD file without the other (NRV-E1152), dangling symlinks included, and comparing the WKD file with the key file at the newest published `v*` tag whose commit is an ancestor of `main` (`git merge-base --is-ancestor <tag> origin/main`), prereleases included, never at a reference the site pull request names (NRV-E1162), with its test, which covers a candidate's pull request with its entry first in `RELEASES`, a candidate cut during a rotation followed by an unrelated site pull request that must carry the candidate's key file, and a prerelease tagged on a branch (newer than the last release, with an older or no key file), which is skipped, so the reference stays the key file of the newest tag on `main` | `docs/INSTALL.md`, `CLAUDE.md`, `docs/releases/automation.md`, `tests/packaging/repos.py` (one line); the site's `CLAUDE.md`, `README.md`, `.github/CODEOWNERS`, `.well-known/openpgpkey/*`, `site_check.mjs` and its test | mechanical, except the `site_check.mjs` change (implementation); supervisor checks | after 2 and 3, and after setup steps 2 and 8 |
 | E | Setup steps 1 to 10 | Cloudflare, GitHub | owner | in order; step 2 after slices 5a and W; step 4 after K and before slice 3; step 7 only after step 3's check |
 | F | The rehearsal, its run link recorded, and `REPOS_LIVE` set | worklog, a repository variable | supervisor | after 0 to 5, 5a, 0b, 2b, K and E |
