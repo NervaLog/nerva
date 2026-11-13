@@ -247,7 +247,8 @@ def failing_tool(tmp, name, stage, *args):
     os.chmod(stub, 0o755)
     result = sh(["unshare", "-m", "sh", "-c",
                  f"mount --bind {stub} {program} && exec sh {stage}/install.sh " + " ".join(args)])
-    assert os.access(program, os.X_OK) and sh([program, "--version"]).returncode == 0, "the stub leaked"
+    assert os.access(program, os.X_OK) and sh(["cmp", "-s", stub, program]).returncode != 0, \
+        "the stub leaked"
     return result
 
 
