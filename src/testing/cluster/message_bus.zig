@@ -23,6 +23,9 @@ pub const MessageBus = struct {
     buffer: ?MessageBuffer,
     suspended: bool = false,
     resume_scheduled: bool = false,
+    /// Nerva (#358): the simulated network does not say which replica sent the messages in the
+    /// buffer, which may hold several, so the sender is always unknown here.
+    recv_from: ?u8 = null,
     /// The callback to be called when a message is received.
     on_messages_callback: *const fn (message_bus: *MessageBus, buffer: *MessageBuffer) void,
 
