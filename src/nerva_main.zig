@@ -248,7 +248,9 @@ fn run() !void {
                     "give a new path, or remove the old file if it is really unwanted",
                     .{},
                 ),
-                else => return err,
+                // A path the user may not use, or whose directory is missing, is the operator's
+                // (NRV-E0810), never a listen failure or a bug (#372).
+                else => diagnostic.fail_file(args.path, err),
             };
             defer storage.deinit();
 

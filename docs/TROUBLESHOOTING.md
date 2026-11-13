@@ -43,6 +43,7 @@ with the cases. If the block shows `NRV-B…`, report it with the command and it
 | `--listen must be <ipv4>:<port> or [<ipv6>]:<port>` | NRV-E0003 | Give `host:port` |
 | `<path> exists` on `format`, `export`, `import` | NRV-E0004, NRV-E0005 | Give a new path; Nerva never overwrites a file |
 | `start: <path> does not exist` | NRV-E0006 | `nerva format` first, or fix the path |
+| `format: cannot use <path>: no such file or directory` or `permission denied` | NRV-E0810 | The directory is missing (a typo) or you may not write it: fix the path, or run as the user that owns the directory |
 
 Section: [00xx · Commands and flags](ERRORS.md#00xx--commands-and-flags).
 
