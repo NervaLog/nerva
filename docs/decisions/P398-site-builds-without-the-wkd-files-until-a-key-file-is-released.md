@@ -21,9 +21,9 @@ before setup step 2. No slice adds the WKD files by hand.
 - "The build command copies exactly those two files" becomes the pair rule above.
 - `release-finish.yml`'s `site` job writes **both** WKD files into the site pull request it opens:
   `policy`, empty, created if absent, and the `hu/` key file, the dearmored key file at the tag it
-  publishes. It writes them only when that tag's commit is an ancestor of `main`, so a candidate
-  tagged on a branch (the rehearsal's) gets neither and its pull request passes `site-check`
-  against the older reference (#400). The first WKD pair on the site comes with v0.7.1's site
+  publishes. It writes them only when that tag's commit is an ancestor of `main`; for a candidate
+  tagged on a branch (the rehearsal's) it leaves them as the site's `main` has them (none before
+  v0.7.1), so its pull request passes `site-check` against the older reference (#400). The first WKD pair on the site comes with v0.7.1's site
   pull request.
 - `release_finish.sh site-live`, like `site_check.mjs`, passes with a notice when the reference's
   tag has no key file (v0.7.0), and then requires the WKD path to answer 404.
