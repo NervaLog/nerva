@@ -6,6 +6,7 @@ const SourceLocation = std.builtin.SourceLocation;
 
 const constants = @import("../constants.zig");
 const nerva = @import("../nerva.zig");
+const manifest_admission = @import("../nerva/manifest_admission.zig");
 const release_peers = @import("../nerva/release_peers.zig");
 const peer_auth = @import("../nerva/peer_auth.zig");
 const internal_operations = @import("../nerva/internal_operations.zig");
@@ -2058,6 +2059,13 @@ pub fn ReplicaType(
                     return;
                 };
 
+            if (!self.manifest_admits()) {
+                log.warn("{}: on_request: dropping (NRV-W0703: the LSM manifest is nearly full)", .{
+                    self.log_prefix(),
+                });
+                return;
+            }
+
             const request: Request = .{
                 .message = message.ref(),
                 .realtime = realtime,
@@ -2068,6 +2076,24 @@ pub fn ReplicaType(
             } else {
                 self.primary_pipeline_prepare(request);
             }
+        }
+
+        /// Nerva (#334): whether the manifest has room for everything already admitted plus one
+        /// more request (`manifest_admission.zig`). Reads the pool and table count; changes nothing.
+        fn manifest_admits(self: *const Replica) bool {
+            const reserve_tables = comptime manifest_admission.tables_reserve(
+                Forest.tree_infos.len,
+                @import("../lsm/compaction.zig").compaction_tables_input_max + 1,
+                constants.pipeline_prepare_queue_max + constants.pipeline_request_queue_max,
+                constants.lsm_compaction_ops,
+            );
+            const forest = &self.state_machine.forest;
+            const usage: manifest_admission.Usage = .{
+                .nodes_free = @intCast(forest.node_pool.free.count()),
+                .tables = forest.manifest_log.table_extents.count(),
+                .tables_max = forest.manifest_log.forest_table_count_max,
+            };
+            return manifest_admission.admits(usage, reserve_tables);
         }
 
         /// Replication is simple, with a single code path for the primary and backups.
