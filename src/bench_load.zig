@@ -17,6 +17,9 @@ const vsr = @import("vsr.zig");
 const nerva = @import("nerva.zig");
 const Client = @import("nerva/client.zig").Client;
 const LatencyHistogram = @import("nerva/latency_histogram.zig").LatencyHistogram;
+const bench_timeline = @import("nerva/bench_timeline.zig");
+const Timeline = bench_timeline.Timeline;
+const Counts = bench_timeline.Counts;
 
 const Entry = nerva.Entry;
 const EntryResult = nerva.EntryResult;
@@ -38,6 +41,8 @@ const table: u32 = 1;
 const local_clients_max = 6;
 const batch_max = 1024;
 const history_limit = 64;
+/// `--warmup` + `--seconds` at most: one timeline line a second (bench_timeline.zig).
+const timeline_seconds_max = bench_timeline.seconds_max;
 const timeout = stdx.Duration.seconds(30);
 
 const Workload = enum {
@@ -70,28 +75,48 @@ const CLIArgs = struct {
     keys: u64 = 10_000,
     hot: u32 = 4,
     seconds: u32 = 10,
+    /// The first `--warmup` seconds run as usual but are left out of the summary.
+    warmup: u32 = 0,
     rate: u32 = 0,
     seed: ?u64 = null,
     output: ?[]const u8 = null,
+    /// One JSON line a second (`bench_timeline.zig`), warm-up included and flagged.
+    timeline: ?[]const u8 = null,
     /// The `nerva` binary the `botpike` workload starts its gateway from (default: the one built
     /// with this generator).
     nerva: ?[]const u8 = null,
+    /// botpike only: the gateway's `nerva api --statsd`.
+    @"gateway-statsd": ?[]const u8 = null,
+    /// botpike only: where the gateway's PID is written, right after it spawns.
+    @"gateway-pid-file": ?[]const u8 = null,
+    /// botpike only: `inherit` passes the gateway's stderr to this process's.
+    @"gateway-stderr": GatewayStderr = .ignore,
 
     pub const help =
         \\Usage:
         \\
         \\  bench-load (--local | --addresses=<addresses> [--cluster=<id>]) --workload=<workload>
         \\             [--clients=<n>] [--batch=<n>] [--keys=<n>] [--hot=<n>] [--seconds=<n>]
-        \\             [--rate=<requests per second>] [--seed=<n>] [--output=<file>]
-        \\             [--nerva=<path>]
+        \\             [--warmup=<seconds>] [--rate=<requests per second>] [--seed=<n>]
+        \\             [--output=<file>] [--timeline=<file>] [--nerva=<path>]
+        \\             [--gateway-statsd=<host:port>] [--gateway-pid-file=<file>]
+        \\             [--gateway-stderr=inherit|ignore]
         \\
         \\Workloads: c1 puts, c2 read-modify-write, c3 hot rows with retries, c3_adds hot rows
         \\with add entries, c4 lookups, c5 change feed, c7 mixed, botpike submits through one
         \\`nerva api` gateway (--clients callers, --keys accounts, --nerva the binary to start it
         \\from). See src/bench_load.zig.
         \\
+        \\--warmup runs the first <seconds> as usual and leaves them out of the summary;
+        \\--warmup + --seconds is at most 3600. --timeline writes one JSON line per second
+        \\(t_us, count, p50_us, p99_us, max_us, errors, the second's non-zero histogram
+        \\buckets, and "warmup":true for the warm-up's). The --gateway-* flags are for botpike:
+        \\the gateway's statsd address, a file for its PID, and whether its stderr is passed on.
+        \\
     ;
 };
+
+const GatewayStderr = enum { inherit, ignore };
 
 const Config = struct {
     workload: Workload,
@@ -99,7 +124,9 @@ const Config = struct {
     batch: u32,
     keys: u64,
     hot: u32,
+    /// The measured seconds, after the warm-up.
     seconds: u32,
+    warmup: u32,
     rate: u32,
     seed: u64,
 };
@@ -141,7 +168,15 @@ pub fn main() !void {
     if (args.hot == 0 or args.hot > args.keys) {
         stdx.Flags.fatal("--hot must be from 1 to --keys", .{});
     }
-    if (args.seconds == 0) stdx.Flags.fatal("--seconds must be at least 1", .{});
+    if (bench_timeline.seconds_refusal(args.warmup, args.seconds)) |reason| {
+        stdx.Flags.fatal("{s}", .{reason});
+    }
+    if (bench_timeline.gateway_flags_refusal(
+        gateway_workload,
+        args.@"gateway-statsd" != null,
+        args.@"gateway-pid-file" != null,
+        args.@"gateway-stderr" == .inherit,
+    )) |reason| stdx.Flags.fatal("{s}", .{reason});
 
     const config: Config = .{
         .workload = args.workload,
@@ -150,6 +185,7 @@ pub fn main() !void {
         .keys = args.keys,
         .hot = args.hot,
         .seconds = args.seconds,
+        .warmup = args.warmup,
         .rate = args.rate,
         .seed = args.seed orelse std.crypto.random.int(u64),
     };
@@ -163,11 +199,17 @@ pub fn main() !void {
     } else try vsr.parse_addresses(args.addresses.?, &addresses_buffer);
 
     const addresses_text = if (args.local) local.?.addresses_flag else args.addresses.?;
+    var timeline = try Timeline.init(gpa, config.warmup, config.seconds);
+    defer timeline.deinit(gpa);
     const result = if (gateway_workload)
-        try run_botpike(gpa, args.cluster, addresses_text, args.nerva orelse nerva_exe_built, &config)
+        try run_botpike(gpa, args.cluster, addresses_text, args.nerva orelse nerva_exe_built, &config, &timeline, .{
+            .statsd = args.@"gateway-statsd",
+            .pid_file = args.@"gateway-pid-file",
+            .inherit_stderr = args.@"gateway-stderr" == .inherit,
+        })
     else result: {
         try preload(gpa, args.cluster, addresses, &config);
-        break :result try run(gpa, args.cluster, addresses, &config);
+        break :result try run(gpa, args.cluster, addresses, &config, &timeline);
     };
     var json = std.ArrayList(u8).init(gpa);
     defer json.deinit();
@@ -177,6 +219,12 @@ pub fn main() !void {
         try std.fs.cwd().writeFile(.{ .sub_path = path, .data = json.items });
     } else {
         try std.io.getStdOut().writeAll(json.items);
+    }
+    if (args.timeline) |path| {
+        var lines = std.ArrayList(u8).init(gpa);
+        defer lines.deinit();
+        try timeline.write(lines.writer());
+        try std.fs.cwd().writeFile(.{ .sub_path = path, .data = lines.items });
     }
     if (result.failures > 0) std.process.exit(1);
 }
@@ -210,6 +258,8 @@ fn preload(
     }
 }
 
+/// The workers count into these as they go; the summary is the timeline's seconds after the
+/// warm-up (`Timeline.summary`), with the failures of every worker.
 const Result = struct {
     histogram: LatencyHistogram = .{},
     /// Latency samples: one per request, or per transaction for c2 and c3.
@@ -224,15 +274,30 @@ const Result = struct {
     failures: u64 = 0,
     duration: stdx.Duration = .{ .ns = 0 },
 
-    fn merge(result: *Result, other: *const Result) void {
-        result.histogram.merge(&other.histogram);
-        result.operations += other.operations;
-        result.requests += other.requests;
-        result.entries += other.entries;
-        result.conflicts += other.conflicts;
-        result.retries += other.retries;
-        result.errors += other.errors;
-        result.failures += other.failures;
+    fn counts(result: *const Result) Counts {
+        return .{
+            .requests = result.requests,
+            .entries = result.entries,
+            .conflicts = result.conflicts,
+            .retries = result.retries,
+            .errors = result.errors,
+        };
+    }
+
+    /// The measured seconds' histogram and counters, and `failures` of the whole run.
+    fn from_timeline(timeline: *Timeline, failures: u64, config: *const Config) Result {
+        const summary = timeline.summary();
+        return .{
+            .histogram = summary.histogram,
+            .operations = summary.histogram.count,
+            .requests = summary.counts.requests,
+            .entries = summary.counts.entries,
+            .conflicts = summary.counts.conflicts,
+            .retries = summary.counts.retries,
+            .errors = summary.counts.errors,
+            .failures = failures,
+            .duration = .{ .ns = @as(u64, config.seconds) * std.time.ns_per_s },
+        };
     }
 };
 
@@ -241,6 +306,7 @@ const Shared = struct {
     cluster: u128,
     addresses: []const stdx.SocketAddress,
     gpa: std.mem.Allocator,
+    timeline: *Timeline,
     ready: std.atomic.Value(u32) = .init(0),
     /// Monotonic ns at which every worker starts; zero until all are ready.
     start_ns: std.atomic.Value(u64) = .init(0),
@@ -251,8 +317,15 @@ fn run(
     cluster: u128,
     addresses: []const stdx.SocketAddress,
     config: *const Config,
+    timeline: *Timeline,
 ) !Result {
-    var shared: Shared = .{ .config = config, .cluster = cluster, .addresses = addresses, .gpa = gpa };
+    var shared: Shared = .{
+        .config = config,
+        .cluster = cluster,
+        .addresses = addresses,
+        .gpa = gpa,
+        .timeline = timeline,
+    };
     const workers = try gpa.alloc(Worker, config.clients);
     defer gpa.free(workers);
     const threads = try gpa.alloc(std.Thread, config.clients);
@@ -263,6 +336,7 @@ fn run(
             .shared = &shared,
             .index = @intCast(index),
             .prng = stdx.PRNG.from_seed(config.seed +% index),
+            .recorder = timeline.recorder(),
         };
         thread.* = try std.Thread.spawn(.{}, Worker.main, .{worker});
     }
@@ -272,15 +346,22 @@ fn run(
     while (shared.ready.load(.acquire) < config.clients) std.time.sleep(std.time.ns_per_ms);
     // Workers whose client failed to connect are ready too; they report a failure.
     const start = time.monotonic().add(.ms(100));
+    // The timeline is fixed before the workers are released: they read `start_ns` with acquire.
+    timeline.begin(start.ns, wall_us() + 100 * std.time.us_per_ms);
     shared.start_ns.store(start.ns, .release);
 
-    var total: Result = .{};
+    var failures: u64 = 0;
     for (workers, threads) |*worker, thread| {
         thread.join();
-        total.merge(&worker.result);
+        failures += worker.result.failures;
     }
-    total.duration = .{ .ns = @as(u64, config.seconds) * std.time.ns_per_s };
-    return total;
+    return Result.from_timeline(timeline, failures, config);
+}
+
+/// `CLOCK_REALTIME` in µs: what `node.py` stamps log lines with, so the timeline can be placed
+/// beside them. Latencies are timed with the monotonic clock.
+fn wall_us() u64 {
+    return @intCast(std.time.microTimestamp());
 }
 
 /// The `botpike` workload: a gateway in front of the cluster, and callers of the gateway.
@@ -290,27 +371,21 @@ fn run_botpike(
     addresses: []const u8,
     nerva_exe: []const u8,
     config: *const Config,
+    timeline: *Timeline,
+    gateway_options: botpike.GatewayOptions,
 ) !Result {
-    var gateway = try botpike.Gateway.start(gpa, nerva_exe, cluster, addresses);
+    var gateway = try botpike.Gateway.start(gpa, nerva_exe, cluster, addresses, gateway_options);
     defer gateway.stop();
-    const outcome = try botpike.run(gpa, &.{
+    const failures = try botpike.run(gpa, &.{
         .address = gateway.address,
         .callers = config.clients,
         .accounts = config.keys,
-        .seconds = config.seconds,
+        .seconds = config.warmup + config.seconds,
         .seed = config.seed,
         .cluster = cluster,
+        .timeline = timeline,
     });
-    return .{
-        .histogram = outcome.histogram,
-        .operations = outcome.submits,
-        .requests = outcome.requests,
-        .entries = outcome.entries,
-        .conflicts = outcome.conflicts,
-        .errors = outcome.errors,
-        .failures = outcome.failures,
-        .duration = .{ .ns = @as(u64, config.seconds) * std.time.ns_per_s },
-    };
+    return Result.from_timeline(timeline, failures, config);
 }
 
 const Worker = struct {
@@ -318,6 +393,7 @@ const Worker = struct {
     index: u32,
     prng: stdx.PRNG,
     result: Result = .{},
+    recorder: bench_timeline.Recorder,
     sequence: u64 = 0,
     feed_cursor: u64 = 0,
 
@@ -351,13 +427,14 @@ const Worker = struct {
             return err;
         };
         defer client.deinit();
+        defer worker.recorder.flush();
         _ = shared.ready.fetchAdd(1, .release);
 
         var time_os: stdx.TimeOS = .{};
         const time = time_os.interface();
         while (shared.start_ns.load(.acquire) == 0) std.time.sleep(std.time.ns_per_ms / 10);
         const start: stdx.Instant = .{ .ns = shared.start_ns.load(.acquire) };
-        const end = start.add(.{ .ns = @as(u64, config.seconds) * std.time.ns_per_s });
+        const end = start.add(.{ .ns = @as(u64, config.warmup + config.seconds) * std.time.ns_per_s });
 
         // Open loop: this client's share of the rate, staggered so clients do not send at once.
         const interval_ns: u64 = if (config.rate == 0)
@@ -378,9 +455,14 @@ const Worker = struct {
             } else {
                 due = now;
             }
+            const counts_before = worker.result.counts();
             try worker.operation(client);
-            worker.result.histogram.record(due.elapsed(time.monotonic()).ns);
-            worker.result.operations += 1;
+            const ended = time.monotonic();
+            worker.recorder.record(
+                ended.ns,
+                due.elapsed(ended).ns,
+                worker.result.counts().sub(counts_before),
+            );
             due = due.add(.{ .ns = interval_ns });
         }
     }
@@ -538,10 +620,10 @@ fn result_write(writer: anytype, config: *const Config, result: *const Result) !
     const histogram = &result.histogram;
     try writer.print(
         "{{\"workload\":\"{s}\",\"clients\":{},\"batch\":{},\"keys\":{},\"hot\":{}," ++
-            "\"seconds\":{},\"rate\":{},\"seed\":{},",
+            "\"seconds\":{},\"warmup\":{},\"rate\":{},\"seed\":{},",
         .{
             @tagName(config.workload), config.clients, config.batch, config.keys, config.hot,
-            config.seconds,            config.rate,    config.seed,
+            config.seconds,            config.warmup,  config.rate,  config.seed,
         },
     );
     try writer.print(

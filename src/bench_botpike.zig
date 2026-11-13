@@ -23,7 +23,9 @@ const assert = std.debug.assert;
 const posix = std.posix;
 
 const stdx = @import("stdx");
-const LatencyHistogram = @import("nerva/latency_histogram.zig").LatencyHistogram;
+const bench_timeline = @import("nerva/bench_timeline.zig");
+const Timeline = bench_timeline.Timeline;
+const Counts = bench_timeline.Counts;
 
 const accounts_table: u32 = 7;
 const sources_table: u32 = 8;
@@ -49,15 +51,17 @@ pub const Params = struct {
     callers: u32,
     /// Accounts, funded in setup.
     accounts: u64,
+    /// How long the callers run, warm-up included, from the end of setup.
     seconds: u32,
     seed: u64,
     cluster: u128,
+    /// Every submit's latency and counters go here, by the second it ended in (the caller of
+    /// `run` summarizes it); `run` fixes its start when setup is done.
+    timeline: *Timeline,
 };
 
-pub const Outcome = struct {
-    /// Latency of a submit: its lookup and its commit.
-    histogram: LatencyHistogram = .{},
-    submits: u64 = 0,
+/// What a caller counted, as the timeline's `Counts` take them per submit.
+const Outcome = struct {
     requests: u64 = 0,
     /// Entries committed (the key's entry not counted).
     entries: u64 = 0,
@@ -67,15 +71,23 @@ pub const Outcome = struct {
     /// Callers that stopped with an error.
     failures: u64 = 0,
 
-    fn merge(outcome: *Outcome, other: *const Outcome) void {
-        outcome.histogram.merge(&other.histogram);
-        outcome.submits += other.submits;
-        outcome.requests += other.requests;
-        outcome.entries += other.entries;
-        outcome.conflicts += other.conflicts;
-        outcome.errors += other.errors;
-        outcome.failures += other.failures;
+    fn counts(outcome: *const Outcome) Counts {
+        return .{
+            .requests = outcome.requests,
+            .entries = outcome.entries,
+            .conflicts = outcome.conflicts,
+            .errors = outcome.errors,
+        };
     }
+};
+
+pub const GatewayOptions = struct {
+    /// `nerva api --statsd`.
+    statsd: ?[]const u8 = null,
+    /// Where the gateway's PID is written, right after it spawns.
+    pid_file: ?[]const u8 = null,
+    /// Pass the gateway's stderr on to this process's instead of dropping it.
+    inherit_stderr: bool = false,
 };
 
 /// A `nerva api` process on a free local port, in front of a cluster.
@@ -88,30 +100,48 @@ pub const Gateway = struct {
         nerva_exe: []const u8,
         cluster: u128,
         addresses: []const u8,
+        options: GatewayOptions,
     ) !Gateway {
         const port = try port_free();
+        var statsd_buffer: [128]u8 = undefined;
         var cluster_buffer: [48]u8 = undefined;
         var addresses_buffer: [512]u8 = undefined;
         var listen_buffer: [32]u8 = undefined;
         var environment = try std.process.getEnvMap(gpa);
         defer environment.deinit();
         try environment.put("NERVA_KEY", key_header);
+        var argv: [7][]const u8 = undefined;
+        var argc: usize = 0;
+        for ([_][]const u8{
+            nerva_exe,
+            "api",
+            try std.fmt.bufPrint(&cluster_buffer, "--cluster={}", .{cluster}),
+            try std.fmt.bufPrint(&addresses_buffer, "--addresses={s}", .{addresses}),
+            try std.fmt.bufPrint(&listen_buffer, "--listen=127.0.0.1:{}", .{port}),
+        }) |argument| {
+            argv[argc] = argument;
+            argc += 1;
+        }
+        if (options.statsd) |statsd| {
+            argv[argc] = try std.fmt.bufPrint(&statsd_buffer, "--statsd={s}", .{statsd});
+            argc += 1;
+        }
         var gateway: Gateway = .{
-            .process = std.process.Child.init(&.{
-                nerva_exe,
-                "api",
-                try std.fmt.bufPrint(&cluster_buffer, "--cluster={}", .{cluster}),
-                try std.fmt.bufPrint(&addresses_buffer, "--addresses={s}", .{addresses}),
-                try std.fmt.bufPrint(&listen_buffer, "--listen=127.0.0.1:{}", .{port}),
-            }, gpa),
+            .process = std.process.Child.init(argv[0..argc], gpa),
             .address = try std.net.Address.parseIp4("127.0.0.1", port),
         };
         gateway.process.env_map = &environment;
         gateway.process.stdin_behavior = .Ignore;
         gateway.process.stdout_behavior = .Ignore;
-        gateway.process.stderr_behavior = .Ignore;
+        gateway.process.stderr_behavior = if (options.inherit_stderr) .Inherit else .Ignore;
         try gateway.process.spawn();
         errdefer _ = gateway.process.kill() catch {};
+
+        if (options.pid_file) |path| {
+            var pid_buffer: [32]u8 = undefined;
+            const pid = try std.fmt.bufPrint(&pid_buffer, "{}\n", .{gateway.process.id});
+            try std.fs.cwd().writeFile(.{ .sub_path = path, .data = pid });
+        }
 
         // The replicas may still be starting: wait until the gateway has a session.
         var reply: [reply_size_max]u8 = undefined;
@@ -252,7 +282,8 @@ const Shared = struct {
     end_ns: u64,
 };
 
-pub fn run(gpa: std.mem.Allocator, params: *const Params) !Outcome {
+/// Runs the callers for `params.seconds` after setup, and returns how many of them failed.
+pub fn run(gpa: std.mem.Allocator, params: *const Params) !u64 {
     assert(params.callers >= 1 and params.callers <= callers_max);
     assert(params.accounts >= 2 and params.accounts <= accounts_max);
     assert(params.seconds >= 1);
@@ -261,10 +292,12 @@ pub fn run(gpa: std.mem.Allocator, params: *const Params) !Outcome {
 
     var time_os: stdx.TimeOS = .{};
     const time = time_os.interface();
+    const start = time.monotonic();
+    params.timeline.begin(start.ns, @intCast(std.time.microTimestamp()));
     var shared: Shared = .{
         .params = params,
         .nonce = std.crypto.random.int(u64),
-        .end_ns = time.monotonic().add(.{ .ns = @as(u64, params.seconds) * std.time.ns_per_s }).ns,
+        .end_ns = start.add(.{ .ns = @as(u64, params.seconds) * std.time.ns_per_s }).ns,
     };
 
     const callers = try gpa.alloc(Caller, params.callers);
@@ -277,16 +310,17 @@ pub fn run(gpa: std.mem.Allocator, params: *const Params) !Outcome {
             .index = @intCast(index),
             .prng = stdx.PRNG.from_seed(params.seed ^ (shared.nonce +% index)),
             .arena = std.heap.ArenaAllocator.init(gpa),
+            .recorder = params.timeline.recorder(),
         };
         thread.* = try std.Thread.spawn(.{}, Caller.main, .{caller});
     }
-    var total: Outcome = .{};
+    var failures: u64 = 0;
     for (callers, threads) |*caller, thread| {
         thread.join();
         caller.arena.deinit();
-        total.merge(&caller.outcome);
+        failures += caller.outcome.failures;
     }
-    return total;
+    return failures;
 }
 
 const Pending = struct {
@@ -300,6 +334,7 @@ const Caller = struct {
     prng: stdx.PRNG,
     arena: std.heap.ArenaAllocator,
     outcome: Outcome = .{},
+    recorder: bench_timeline.Recorder,
     sequence: u64 = 0,
     /// The reserve this caller settles next, if its last submit was a reserve that committed.
     pending: ?Pending = null,
@@ -309,6 +344,7 @@ const Caller = struct {
     last_body: []const u8 = "",
 
     fn main(caller: *Caller) void {
+        defer caller.recorder.flush();
         caller.loop() catch |err| {
             std.log.err("caller {}: {}", .{ caller.index, err });
             caller.outcome.failures += 1;
@@ -323,15 +359,19 @@ const Caller = struct {
             if (start.ns >= caller.shared.end_ns) break;
             const pending = caller.pending;
             caller.pending = null;
+            const counts_before = caller.outcome.counts();
             const done = if (pending) |reserved|
                 try caller.settle(reserved)
             else
                 try caller.reserve();
-            // A submit that failed on the wire is not a latency sample of the cluster.
-            if (done) {
-                caller.outcome.histogram.record(start.elapsed(time.monotonic()).ns);
-                caller.outcome.submits += 1;
-            }
+            // A submit that failed on the wire is not a latency sample of the cluster, but its
+            // requests and errors still count in the second it ended in.
+            const ended = time.monotonic();
+            caller.recorder.record(
+                ended.ns,
+                if (done) start.elapsed(ended).ns else null,
+                caller.outcome.counts().sub(counts_before),
+            );
         }
     }
 
