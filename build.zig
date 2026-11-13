@@ -171,6 +171,13 @@ pub fn build(b: *std.Build) !void {
             "Path to the previous release's `nerva`: install a `nerva` that carries it, so that " ++
                 "a cluster can roll from it to this release (R6, P259)",
         ),
+        .strip = b.option(
+            bool,
+            "strip",
+            "Install `nerva` stripped, and the build with its debug info beside it as " ++
+                "`nerva.debug` (ELF targets): a ReleaseSafe pair with debug info is over " ++
+                "`multiversion_binary_platform_size_max` (P417)",
+        ) orelse false,
         .print_exe = b.option(
             bool,
             "print-exe",
@@ -228,7 +235,7 @@ pub fn build(b: *std.Build) !void {
     steps.check.dependOn(&check.step);
 
     // zig build, zig build run
-    const nerva = nerva_executable(b, .{
+    const nerva_full = nerva_executable(b, .{
         .stdx_module = stdx_module,
         .vsr_options = vsr_options,
         .target = target,
@@ -236,6 +243,23 @@ pub fn build(b: *std.Build) !void {
         .version = options.version,
         .commit_keys_deduplicate = options.test_commit_keys == .on,
     });
+    // `-Dstrip` (P417): the installed `nerva` has its debug info and symbols removed after
+    // linking, and the linked build is installed beside it as `nerva.debug`. Stripping at compile
+    // time instead (`root_module.strip`) changes the code, so its debug file would not match.
+    // `zig objcopy` strips ELF only: other targets are refused.
+    const nerva_stripped = if (options.strip) strip: {
+        if (target.result.ofmt != .elf) {
+            const refuse = b.addFail("-Dstrip: the pinned Zig strips ELF only; " ++
+                "this target's binaries are shipped with their debug info (P417)");
+            b.getInstallStep().dependOn(&refuse.step);
+        }
+        const objcopy = b.addObjCopy(nerva_full.getEmittedBin(), .{ .strip = .debug_and_symbols });
+        b.getInstallStep().dependOn(
+            &b.addInstallBinFile(nerva_full.getEmittedBin(), "nerva.debug").step,
+        );
+        break :strip objcopy.getOutput();
+    } else null;
+    const nerva = nerva_full;
     // The packer runs on the build host: it runs both binaries to read their facts.
     const nerva_pack = b.addExecutable(.{
         .name = "nerva_pack",
@@ -254,13 +278,15 @@ pub fn build(b: *std.Build) !void {
     if (options.bundle) |bundle_path| {
         const pack_run = b.addRunArtifact(nerva_pack);
         pack_run.addArg("--input");
-        pack_run.addFileArg(nerva.getEmittedBin());
+        pack_run.addFileArg(nerva_stripped orelse nerva.getEmittedBin());
         pack_run.addArg("--past");
         pack_run.addFileArg(.{ .cwd_relative = bundle_path });
         pack_run.addArg("--output");
         const nerva_packed = pack_run.addOutputFileArg("nerva");
         if (mode == .Debug) pack_run.addArg("--debug");
         b.getInstallStep().dependOn(&b.addInstallBinFile(nerva_packed, "nerva").step);
+    } else if (nerva_stripped) |stripped| {
+        b.getInstallStep().dependOn(&b.addInstallBinFile(stripped, "nerva").step);
     } else {
         b.installArtifact(nerva);
     }

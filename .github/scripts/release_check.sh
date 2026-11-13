@@ -31,7 +31,7 @@
 # `-Dtest-commit-keys=off` is never shipped). `assets` refuses a draft whose asset names are not
 # exactly the files of <dist-dir>: GitHub renames a file whose name has a character it does not keep.
 # `publish-ready` (the publish job of release-finish.yml) refuses a release that is missing or does
-# not hold exactly the twelve assets it is published with, the ten of `release` and the Mac zip with
+# not hold exactly the fourteen assets it is published with, the twelve of `release` and the Mac zip with
 # its checksum (NRV-E1131), and applies mac-draft's checks of the target commit (NRV-E1120, E1122,
 # E1124); a release that is already published passes, so a re-run carries on.
 set -euo pipefail
@@ -303,8 +303,9 @@ case "${1:-}" in
         "the 'Set as a pre-release' box was changed by hand, or release.yml did not set it from the version" \
         "set it (gh release edit $tag --prerelease=$want) and run the failed job again"
     fi
-    # The ten files `release` builds (release.yml's dist/: four tarballs, four packages, the bill
-    # of materials and SHA256SUMS, which lists nine of them) and the two of the Mac zip.
+    # The twelve files `release` builds (release.yml's dist/: four tarballs, four packages, the two
+    # Linux debug files, the bill of materials and SHA256SUMS, which lists eleven of them, P417) and
+    # the two of the Mac zip.
     ver=${tag#v}
     filever=${ver//-/.}
     expected=$(printf '%s\n' \
@@ -312,6 +313,7 @@ case "${1:-}" in
       "nerva-$tag-x86_64-macos.tar.gz" "nerva-$tag-aarch64-macos.tar.gz" \
       "nerva_$filever-1_amd64.deb" "nerva_$filever-1_arm64.deb" \
       "nerva-$filever-1.x86_64.rpm" "nerva-$filever-1.aarch64.rpm" \
+      "nerva-$tag-x86_64-linux.debug" "nerva-$tag-aarch64-linux.debug" \
       "nerva-$tag.cdx.json" SHA256SUMS \
       "nerva-$tag-universal-macos.zip" "nerva-$tag-universal-macos.zip.sha256" | LC_ALL=C sort)
     uploaded=$(tr ',' '\n' <<< "$names" | LC_ALL=C sort)

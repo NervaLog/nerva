@@ -248,11 +248,12 @@ class MacDraft(unittest.TestCase):
 
 
 def release_assets(tag, extra=(), without=()):
-    """The twelve names a release is published with, as the comma-joined list `gh` prints."""
+    """The fourteen names a release is published with, as the comma-joined list `gh` prints."""
     filever = tag[1:].replace("-", ".")
     names = [f"nerva-{tag}-{t}.tar.gz" for t in ("x86_64-linux", "aarch64-linux", "x86_64-macos", "aarch64-macos")]
     names += [f"nerva_{filever}-1_amd64.deb", f"nerva_{filever}-1_arm64.deb",
               f"nerva-{filever}-1.x86_64.rpm", f"nerva-{filever}-1.aarch64.rpm",
+              f"nerva-{tag}-x86_64-linux.debug", f"nerva-{tag}-aarch64-linux.debug",
               f"nerva-{tag}.cdx.json", "SHA256SUMS",
               f"nerva-{tag}-universal-macos.zip", f"nerva-{tag}-universal-macos.zip.sha256"]
     return ",".join([n for n in names if n not in without] + list(extra))

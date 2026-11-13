@@ -23,7 +23,7 @@ The release gates (P147b) do not change. The fleet soak, Jepsen and the two adve
 still come before the `VERSION` commit, and the release PR still quotes them. What changes is what
 the approval means. Today it means "sign this draft", and the owner publishes later. From now on
 it means **"ship this release"**: once the Mac jobs are green, the draft is published without
-another look. The draft, with its notes and its ten assets (the zip and its checksum join them in `mac`), already exists when the approval
+another look. The draft, with its notes and its twelve assets (the zip and its checksum join them in `mac`), already exists when the approval
 prompt appears, so the owner can read it before they click.
 
 Today the owner does four things after the draft exists: approve `mac`, read the green
@@ -126,7 +126,7 @@ full commit SHA, as today.
      `github.token`. It refuses unless all of these hold: the release is a draft (or already
      published, which a re-run continues past), its target resolves to the commit `mac-draft`
      accepts (main for a release; main plus `VERSION` and `CHANGELOG.md` for a prerelease), and
-     its `prerelease` flag is true exactly when the tag has a `-` (NRV-E1133), its assets are exactly the ten `release` built (P361; `SHA256SUMS` lists nine of them) plus `nerva-<tag>-universal-macos.zip` and
+     its `prerelease` flag is true exactly when the tag has a `-` (NRV-E1133), its assets are exactly the twelve `release` built (P361, P417; `SHA256SUMS` lists eleven of them) plus `nerva-<tag>-universal-macos.zip` and
      its `.zip.sha256`. It prints the commit.
   3. Download the `homebrew-formula` artifact (`actions/download-artifact`, pinned). Refuse,
      with a new code, unless its `url` is
@@ -481,7 +481,7 @@ with `branch_policy` only. Then tell the supervisor, and the rehearsal follows.
    ancestor of the release commit, a release commit that changes `release/candidate`, or a push that changed it together with the bump (a rebase merge; a release dispatched with no push is refused), and any
    pinned path that differs from the candidate (it prints the paths). A prerelease with no
    `release/candidate` passes; with one it is checked, so a rehearsal exercises the check.
-2. `release.yml` runs `version`, `ci` and `release`. The draft appears with ten assets, and
+2. `release.yml` runs `version`, `ci` and `release`. The draft appears with twelve assets, and
    `mac` waits.
 3. **The owner reads the draft and approves `mac` once.** That approval ships the release.
 4. `mac`, `mac-verify`, `publish` and `verify` run. The tag, the tap's `main` and the site's
@@ -511,7 +511,7 @@ the owner deletes afterwards. It now covers the whole graph.
 2. The supervisor makes branch `rehearsal/v0.7.1-rc.2` from `main`. It changes only `VERSION`
    (`0.7.1-rc.2`) and `CHANGELOG.md` (a `## v0.7.1-rc.2 — <date>` section with a site line).
 3. The supervisor dispatches `release.yml` from that branch. Expect `version`, `ci` and `release`
-   green, a prerelease draft with ten assets, and `finish` skipped (not main).
+   green, a prerelease draft with twelve assets, and `finish` skipped (not main).
 4. The supervisor dispatches `release-finish.yml` from `main` with `tag=v0.7.1-rc.2`. The owner
    approves `mac` once.
 5. **Pass:**
