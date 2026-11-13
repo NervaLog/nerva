@@ -800,6 +800,13 @@ const StartArgs = struct {
 /// passes the value explicitly, so the shipped default is visible here (P136).
 const commit_stall_probability_default = stdx.PRNG.ratio(2, 5);
 
+/// A `--development` replica queues no requests beyond its prepare pipeline, but it still takes
+/// this many extra client connections. Each gateway is a client on every replica, so with 0 a
+/// cluster of ten gateways (Jepsen's `--gateways 2` on 5 nodes) had its last connections closed
+/// (#231). It stays far below the production limit, and within the build's request queue (the
+/// test configuration's is smaller).
+const development_pipeline_requests_limit: u32 = @min(8, constants.pipeline_request_queue_max);
+
 const cache_rows_multiple = StateMachine.cache_entries_rows_multiple;
 const cache_rows_size_multiple = cache_rows_multiple * @sizeOf(nerva.Row);
 
@@ -862,7 +869,7 @@ fn start_resolve(start: StartArgs) Error!Command.Start {
         .cache_rows_count = cache_rows_count,
         .storage_size_limit = constants.storage_size_limit_default,
         .pipeline_requests_limit = if (start.development)
-            0
+            development_pipeline_requests_limit
         else
             stdx.div_ceil(constants.clients_max, 2) - constants.pipeline_prepare_queue_max,
         .request_size_limit = constants.message_size_max,
@@ -980,7 +987,14 @@ test start_resolve {
         @divExact(cache_grid_size_min, constants.block_size),
         development.cache_grid_blocks,
     );
-    try std.testing.expectEqual(@as(u32, 0), development.pipeline_requests_limit);
+    // #231: a development replica takes client slots beyond its prepare pipeline. With the
+    // production configuration that is room for ten gateways (two on each of five nodes).
+    try std.testing.expectEqual(development_pipeline_requests_limit, development.pipeline_requests_limit);
+    try std.testing.expect(development.pipeline_requests_limit > 0);
+    if (constants.clients_max >= 64) {
+        try std.testing.expect(constants.pipeline_prepare_queue_max +
+            development.pipeline_requests_limit >= 10);
+    }
     try std.testing.expectEqual(constants.message_size_max, development.request_size_limit);
     try std.testing.expect(development.statsd == null);
     try std.testing.expect(development.trace == null);
