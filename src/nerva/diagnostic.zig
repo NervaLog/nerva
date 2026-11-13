@@ -65,6 +65,7 @@ pub const table = [_]Entry{
     .{ .code = "NRV-E0718", .summary = "The data file's cluster has upgraded to a release this binary does not run: a rollback after the switch", .exit = exit_operator },
     .{ .code = "NRV-E0719", .summary = "The binary's bundled release is damaged, or the bundle cannot be read", .exit = exit_operator },
     .{ .code = "NRV-E0720", .summary = "The kernel refuses to execute from memory (`vm.memfd_noexec = 2`): this replica could not switch release", .exit = exit_operator },
+    .{ .code = "NRV-E0721", .summary = "The binary could not be read to look for its bundle of releases", .exit = exit_operator },
     .{ .code = "NRV-E0801", .summary = "The cluster did not answer the export", .exit = exit_operator },
     .{ .code = "NRV-E0802", .summary = "`--as-of` is past the latest op", .exit = exit_operator },
     .{ .code = "NRV-E0803", .summary = "The export would be refused by `nerva import`", .exit = exit_operator },

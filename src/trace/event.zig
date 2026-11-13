@@ -598,8 +598,6 @@ pub const EventMetric = union(enum) {
     lsm_manifest_block_count,
     metrics_statsd_packets,
     release,
-    replica_release,
-    replica_releases_offered,
     release_seen_client_min,
     release_seen_client_max,
     clock_delta_ns,
@@ -609,6 +607,8 @@ pub const EventMetric = union(enum) {
     compaction_values_logical: struct { tree: TreeEnum },
 
     loop_syscalls,
+    replica_release,
+    replica_releases_offered,
 
     pub const slot_limits = std.enums.EnumArray(Tag, u32).init(.{
         .table_count_visible = enum_count(TreeEnum),
@@ -641,8 +641,6 @@ pub const EventMetric = union(enum) {
         .lsm_manifest_block_count = 1,
         .metrics_statsd_packets = 1,
         .release = 1,
-        .replica_release = 1,
-        .replica_releases_offered = 1,
         .release_seen_client_min = 1,
         .release_seen_client_max = 1,
         .clock_delta_ns = 1,
@@ -651,6 +649,8 @@ pub const EventMetric = union(enum) {
         .compaction_values_physical = enum_count(TreeEnum),
         .compaction_values_logical = enum_count(TreeEnum),
         .loop_syscalls = 1,
+        .replica_release = 1,
+        .replica_releases_offered = 1,
     });
 
     pub const slot_bases = array: {

@@ -50,8 +50,9 @@ pub fn runs(releases_run: []const vsr.Release, release: vsr.Release) bool {
 /// never). A ping or pong is checked after its own announcement has been recorded.
 ///
 /// `releases_run` is every release this process can run, `release` included, in increasing order
-/// (a single-release binary: just `release`). A peer, a prepare's maker and a block count when the
-/// release they announce or carry is one of them (R6, P259; amends N61).
+/// (a single-release binary: just `release`). A peer and a prepare's maker count when the release
+/// they announce is one of them, and a block when the release that wrote it is at or below the
+/// newest (R6, P259; amends N61).
 pub fn admits(
     release: vsr.Release,
     releases_run: []const vsr.Release,
@@ -96,7 +97,12 @@ pub fn admits(
             }
             return true;
         },
-        .block => |block| return runs(releases_run, block.release),
+        // A block names the release that wrote it, and stays in the grid for as long as
+        // compaction leaves it: after two rolling upgrades a peer's live blocks come from a
+        // release this binary no longer bundles. The format digest (P259c) makes every release
+        // at or below the newest one this process runs readable; only a newer one is not (P415b).
+        .block => |block| return block.release.value != 0 and
+            block.release.value <= releases_run[releases_run.len - 1].value,
         else => {},
     }
     switch (header.peer_type()) {
@@ -328,7 +334,9 @@ test "release_peers: a prepare is refused for its client's release, or its maker
     var block: Header.Block = std.mem.zeroInit(Header.Block, .{ .command = .block });
     block.release = release_this;
     try testing.expect(peers.admits(block.frame_const()));
-    block.release = release_other;
+    block.release = release_other; // Written by an older release: still in the grid.
+    try testing.expect(peers.admits(block.frame_const()));
+    block.release = release_newer; // Written by a release this process does not run.
     try testing.expect(!peers.admits(block.frame_const()));
 }
 
@@ -437,10 +445,17 @@ test "release_peers: a bundle of two releases admits peers, prepares and blocks 
         block.release = release_block;
         try testing.expect(peers.admits(block.frame_const()));
     }
-    for ([_]vsr.Release{ release_other, release_third }) |release_block| {
-        block.release = release_block;
-        try testing.expect(!peers.admits(block.frame_const()));
-    }
+    // Two rolling upgrades on: a block written at `release_other`, below the bundle, is admitted
+    // (a lagging replica must finish grid repair), and so is one of a release before it.
+    block.release = release_other;
+    try testing.expect(peers.admits(block.frame_const()));
+    block.release = vsr.Release.from(.{ .major = 0, .minor = 0, .patch = 1 });
+    try testing.expect(peers.admits(block.frame_const()));
+    // A block of a release newer than any this process runs is refused, and release 0 is none.
+    block.release = release_third;
+    try testing.expect(!peers.admits(block.frame_const()));
+    block.release = vsr.Release.zero;
+    try testing.expect(!peers.admits(block.frame_const()));
     block.release = release_newer;
     try testing.expect(!peers_single.admits(block.frame_const()));
 }

@@ -862,14 +862,14 @@ fn command_start(
         @panic("This is a test binary, but the cluster id is non-zero.");
     }
 
-    const releases_offered = multiversion.releases_bundled().count;
     var gauge_ticks: u64 = 0;
     while (true) {
         replica.tick();
         // The release this replica runs and how many it bundles, once a second.
         if (gauge_ticks % (std.time.ms_per_s / constants.tick_ms) == 0) {
             tracer.gauge(.replica_release, replica.release.value);
-            tracer.gauge(.replica_releases_offered, releases_offered);
+            // Read each time: replacing the binary on disk changes what this replica offers.
+            tracer.gauge(.replica_releases_offered, multiversion.releases_bundled().count);
         }
         gauge_ticks +%= 1;
         try io.run_for_ns(constants.tick_ms * std.time.ns_per_ms);
@@ -878,40 +878,71 @@ fn command_start(
 
 /// Opens the release bundle of this binary into `multiversion_os`: true when it has one. An
 /// unbundled binary (a build, or the first release) runs only itself. A bundle that cannot be
-/// read is refused (NRV-E0719): running as one release would strand a cluster that upgrades.
+/// read is refused (NRV-E0719), and so is a binary that cannot be read at all (NRV-E0721):
+/// running as one release would strand a cluster that upgrades (P415).
 fn bundle_open(gpa: std.mem.Allocator, io: *IO, multiversion_os: *MultiversionOS) bool {
-    const exe_path = mv.self_exe_path(gpa) catch |err| bundle_fail(err);
+    const exe_path = mv.self_exe_path(gpa) catch bundle_unreadable("its path is unknown");
     defer gpa.free(exe_path);
 
-    if (!bundle_present(gpa, exe_path)) return false;
+    const present = bundle_present(gpa, exe_path) catch |err| switch (err) {
+        error.BinaryTooLarge => bundle_fail("the binary is larger than any bundle can be"),
+        error.BinaryUnreadable => bundle_unreadable("the file could not be opened or read"),
+    };
+    if (!present) return false;
 
-    multiversion_os.* = MultiversionOS.init(gpa, io, exe_path, .native) catch |err| bundle_fail(err);
-    multiversion_os.open_sync() catch |err| bundle_fail(err);
+    multiversion_os.* = MultiversionOS.init(gpa, io, exe_path, .native) catch |err|
+        bundle_fail(bundle_cause(err));
+    multiversion_os.open_sync() catch |err| bundle_fail(bundle_cause(err));
     return true;
 }
 
-fn bundle_fail(err: anyerror) noreturn {
-    log.err("reading the bundle of releases failed: {s}", .{@errorName(err)});
+/// The words for why a bundle that exists could not be opened; never a Zig error name.
+fn bundle_cause(err: anyerror) []const u8 {
+    return switch (err) {
+        error.OutOfMemory => "out of memory",
+        error.RunningVersionNotIncluded => "it does not include the release it is running",
+        else => "its sections are damaged or inconsistent",
+    };
+}
+
+fn bundle_fail(cause: []const u8) noreturn {
     diagnostic.fail(
         "NRV-E0719",
-        "start: this binary's bundle of releases cannot be read",
-        .{},
+        "start: this binary's bundle of releases cannot be read: {s}",
+        .{cause},
         "download the release again; nothing was changed",
         .{},
     );
 }
 
-/// Whether the executable at `exe_path` carries the multiversion sections.
-fn bundle_present(gpa: std.mem.Allocator, exe_path: [:0]const u8) bool {
+fn bundle_unreadable(cause: []const u8) noreturn {
+    diagnostic.fail(
+        "NRV-E0721",
+        "start: this binary cannot be read to look for its bundle of releases: {s}",
+        .{cause},
+        "check that the process may read its own executable and has file descriptors to spare, " ++
+            "then start it again; nothing was changed",
+        .{},
+    );
+}
+
+const BundleReadError = error{ BinaryTooLarge, BinaryUnreadable };
+
+/// Whether the executable at `exe_path` carries the multiversion sections. Only a binary without
+/// them is unbundled; a failure to read it says nothing, and is an error (P415). Bounded by
+/// `multiversion_binary_size_max`.
+fn bundle_present(gpa: std.mem.Allocator, exe_path: [:0]const u8) BundleReadError!bool {
     // Only Linux switches release (P259); a Mach-O binary has no ELF sections to read.
     if (builtin.target.os.tag != .linux) return false;
-    const file = std.fs.openFileAbsolute(exe_path, .{}) catch return false;
+    const file = std.fs.openFileAbsolute(exe_path, .{}) catch return error.BinaryUnreadable;
     defer file.close();
-    const size = file.getEndPos() catch return false;
-    const buffer = gpa.alignedAlloc(u8, @alignOf(std.elf.Elf64_Ehdr), size) catch return false;
+    const size = file.getEndPos() catch return error.BinaryUnreadable;
+    if (size > constants.multiversion_binary_size_max) return error.BinaryTooLarge;
+    const buffer = gpa.alignedAlloc(u8, @alignOf(std.elf.Elf64_Ehdr), size) catch
+        return error.BinaryUnreadable;
     defer gpa.free(buffer);
-    const read = file.readAll(buffer) catch return false;
-    if (read != size) return false;
+    const read = file.readAll(buffer) catch return error.BinaryUnreadable;
+    if (read != size) return error.BinaryUnreadable;
     _ = mv.parse_elf(buffer) catch |err| switch (err) {
         error.MultiversionHeaderOrBodyNotFound => return false,
         // Present but unreadable: open_sync reports it.

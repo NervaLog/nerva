@@ -82,7 +82,7 @@ originals should be checked for relevance.
 | `src/stdx/benchmark/bench.zig` | Added `Bench.metric(name, value, unit)`: in benchmark mode, one `bench-json:` line per result for the nightly job (N55). |
 | `src/stdx/flags.zig` | Added `fatal_hook`: when set, `fatal` passes its formatted message to the hook instead of printing `error: …`; `cli.parse_args` sets it to print the message as NRV-E0001 (exit status 1 as before). Every flag-parser failure is now coded. Unset (other binaries, the parser's own tests), `fatal` is unchanged. Owner-approved 2026-11-05. |
 | `src/vsr/replica.zig` | `on_message` passes `self.multiversion.releases_bundled()` (the releases this binary runs) to `release_peers.admits`. `on_release_announced` ignores a peer only when its release is not one this binary runs (`release_peers.runs`), where it ignored any release other than its own (N61). Its log line is now a warning carrying code NRV-W0702: `replica N runs release X, this replica runs Y (up to Z): ignoring it` (R6 slice 2, P259, amending N61, PR #415). |
-| `src/trace/event.zig` | Two gauges, `replica_release` and `replica_releases_offered`, added to `EventMetric` and to `slot_limits` (1 each). `command_start` sets them once a second: the release this replica runs and how many releases its binary bundles (R6 slice 2, P259). |
+| `src/trace/event.zig` | Two gauges, `replica_release` and `replica_releases_offered`, appended at the end of `EventMetric` and of `slot_limits` (1 each). `command_start` sets them once a second: the release this replica runs and how many releases its binary bundles (R6 slice 2, P259). |
 
 ## Known differences in behaviour
 

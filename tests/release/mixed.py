@@ -160,7 +160,9 @@ def refuses_other_release(nerva, nerva_other, cluster):
     # Written by 0.0.200, started by this binary: the cluster is past it.
     refused(nerva, cluster.data_file(2), "E0718", "0.0.200")
     # Written by this binary, started by 0.0.200: another release, below it.
-    refused(nerva_other, cluster.data_file(0), "E0701", "")
+    first = subprocess.run([nerva, "version"], capture_output=True, text=True).stdout
+    release_this = first.split("Nerva version ")[1].split()[0].split("+")[0]
+    refused(nerva_other, cluster.data_file(0), "E0701", release_this)
 
 
 def main():

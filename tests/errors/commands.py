@@ -238,6 +238,22 @@ def main():
             check("start locked file", start + [data], "NRV-E0703", 1, "another process holds")
         assert sha(data) == before
 
+        # A binary with multiversion sections that hold no bundle: NRV-E0719, not a replica
+        # that runs as one release (P415). Needs objcopy; E0720 and E0721 are unit-tested.
+        objcopy = shutil.which("objcopy")
+        if objcopy:
+            junk = os.path.join(tmp, "junk-section")
+            with open(junk, "wb") as f:
+                f.write(b"not a bundle" * 100)
+            damaged_bundle = os.path.join(tmp, "nerva-damaged-bundle")
+            subprocess.run([objcopy, "--add-section", f".tb_mvb={junk}",
+                            "--add-section", f".tb_mvh={junk}", nerva, damaged_bundle],
+                           check=True)
+            os.chmod(damaged_bundle, 0o755)
+            check("start with a damaged bundle", start + [data], "NRV-E0719", 1,
+                  "bundle of releases cannot be read", nerva=damaged_bundle)
+            assert sha(data) == before
+
         # The test build with commit-key deduplication off (R1): E0717 without --development,
         # W0701 before the data file is opened with it, `+keys-off` in `version`; a release
         # build has none of the three.

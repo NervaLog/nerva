@@ -438,7 +438,7 @@ test "preflight: a lock released within the wait is not refused" {
 
 test "preflight: every refusal has a registered code and a message" {
     // Rendering must not trip an assertion; `refuse` exits, so render through the table.
-    inline for (.{ "NRV-E0006", "NRV-E0701", "NRV-E0702", "NRV-E0703", "NRV-E0704", "NRV-E0705", "NRV-E0718", "NRV-E0719", "NRV-E0720" }) |code| {
+    inline for (.{ "NRV-E0006", "NRV-E0701", "NRV-E0702", "NRV-E0703", "NRV-E0704", "NRV-E0705", "NRV-E0718", "NRV-E0719", "NRV-E0720", "NRV-E0721" }) |code| {
         var found = false;
         for (diagnostic.table) |candidate| {
             if (std.mem.eql(u8, candidate.code, code)) found = true;
