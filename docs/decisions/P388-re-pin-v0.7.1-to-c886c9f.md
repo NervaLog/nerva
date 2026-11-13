@@ -15,6 +15,13 @@ reviews of the candidate still read the code that ships.
 
 Jepsen is not run again: the owner accepts `5d7d806`'s Jepsen run for `c886c9f`, whose pinned
 code is the same (in session, 2026-11-13), and the release PR quotes that run and this acceptance.
+This loosens P374's rule that a re-pin restarts both clauses of the gate on the new SHA: the soak
+restarts, Jepsen does not. The harness is not the same: `c886c9f` carries #337 (57fed64), after
+which `healthy?` no longer hides harness errors (#248), so `5d7d806`'s run was checked by the
+older harness. The release PR says so beside the run.
+
+This replaces `5d7d806` as the candidate wherever P359 and P369 name it. On the host, both
+`SIM_FLEET_BRANCH` and `JEPSEN_BRANCH` name `c886c9f0e5e4cffd12597cc29f46a4535fe6b254`.
 
 What it costs: the 24-hour soak starts over on `c886c9f`. The Jepsen result the release PR
-quotes is of `5d7d806`, not of the candidate commit itself.
+quotes is of `5d7d806`, not of the candidate commit itself, and was judged by the older harness.
