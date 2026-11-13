@@ -13,7 +13,8 @@
 //! the client whose request it holds (`replica.zig` copies the request's), any from
 //! `release_client_min` up, and names the primary that made it (`replica`), though any replica
 //! may relay or repair it: it is admitted with a client release this replica accepts, unless its
-//! maker last announced another release.
+//! maker last announced another release. A prepare received directly from its maker needs that
+//! connection's announcement, as any other message of a peer does (#358, P412).
 //!
 //! The same gate keeps apart replicas imported from different exports (P90, #81): a ping or pong
 //! also announces its sender's origin (`VSRState.origin`, the export's SHA-256, or zero for a
