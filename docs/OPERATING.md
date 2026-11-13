@@ -115,12 +115,12 @@ README ("Backups") and the v0.7.0 notes in [CHANGELOG.md](../CHANGELOG.md). What
   item 6; it takes one of the cluster's 64 client sessions, below). Neither file is overwritten,
   so give each a new name, for example by date. `--as-of=<op>` backs up an earlier op while
   writers go on.
-- **Make them private.** Until [#302](https://github.com/NervaLog/nerva/issues/302) is fixed, `nerva backup` (and `nerva export`) creates the backup and its manifest
-  **world-readable** (mode 0644, though the data file is 0600; [SECURITY.md](../SECURITY.md)): run it under `umask 077` (in the
-  unit or the cron job) and write into a directory of mode 0700. Under `umask 077` both files
-  were 0600 in the run recorded here. A backup holds every row and its history unencrypted
-  (there is no encryption at rest), so protect every copy you keep elsewhere as you would the
-  data.
+- **Make them private.** `nerva backup` (and `nerva export`) creates the backup and its manifest
+  with mode 0600, as the data file is (releases up to v0.7.1 made them 0644: `chmod 600` the ones
+  you have, or run those releases under `umask 077`). A job that copies them elsewhere must run
+  as the same user, or be given access explicitly. A backup holds every row and its history
+  unencrypted (there is no encryption at rest), so protect every copy you keep elsewhere as you
+  would the data.
 - **Alert on the job.** Check the job's exit status, and the age of the newest backup that
   passed (a refusal is a failed job: `backup` refuses, among other things, a full destination,
   NRV-E0706, and a cluster where a view was declared without a catalog document). A job that

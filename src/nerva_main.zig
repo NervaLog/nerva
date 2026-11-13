@@ -500,7 +500,10 @@ fn command_backup(gpa: std.mem.Allocator, args: *const cli.Command.Backup) void 
     var buffer: [backup.manifest_size_max]u8 = undefined;
     const bytes = backup.render(&manifest, &buffer);
 
-    const file = std.fs.cwd().createFile(manifest_path, .{ .exclusive = true }) catch |err| {
+    const file = std.fs.cwd().createFile(manifest_path, .{
+        .exclusive = true,
+        .mode = 0o600,
+    }) catch |err| {
         std.fs.cwd().deleteFile(args.output) catch {};
         if (err == error.PathAlreadyExists) manifest_exists(manifest_path);
         diagnostic.fail_file(manifest_path, err);
@@ -678,8 +681,12 @@ fn command_export(
     gpa: std.mem.Allocator,
     args: *const cli.Command.Export,
 ) !void {
-    // Never an existing file: a path given by mistake would be truncated.
-    const file = std.fs.cwd().createFile(args.output, .{ .exclusive = true }) catch |err|
+    // Never an existing file: a path given by mistake would be truncated. Owner-only (0600, #302):
+    // an export holds the whole ledger, as the data file does.
+    const file = std.fs.cwd().createFile(args.output, .{
+        .exclusive = true,
+        .mode = 0o600,
+    }) catch |err|
         switch (err) {
             error.PathAlreadyExists => diagnostic.fail(
                 "NRV-E0004",
