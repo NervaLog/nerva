@@ -36,7 +36,10 @@ brew install nervalog/tap/nerva
 nerva version
 ```
 
-The tap is `NervaLog/homebrew-tap`. It is not published yet; its formula is generated from
+The tap is `NervaLog/homebrew-tap`, which exists once the first release is out; from then on
+`brew install nervalog/tap/nerva` installs the latest release from its `main`. A release candidate's
+formula is on the tap's `rc/v<V>` branch, never on `main`, so `brew install` never installs one.
+The formula is generated from
 [`packaging/homebrew/nerva.rb`](../packaging/homebrew/nerva.rb) by `zig build -Drelease mac-release`, which the
 release's Mac signing job runs (`mac-sign.yml`), and installs the prebuilt universal binary (arm64 and x86_64) pinned by its SHA-256. It builds nothing
 and needs no `sudo`. The formula's own test is that `nerva version` ends in `version <the

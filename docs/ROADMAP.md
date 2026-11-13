@@ -1,7 +1,8 @@
 # Roadmap
 
-*A proposal, written 2026-11-11 from `main`. It maps the work already planned to releases. The
-milestones themselves are defined elsewhere, and this page does not change them:*
+*Written 2026-11-11 from `main`; the owner accepted the release split on 2026-11-12. It maps the
+work already planned to releases. The milestones themselves are defined elsewhere, and this page
+does not change them:*
 
 - *[docs/PRODUCTION.md](./PRODUCTION.md): R1 to R8, what stands between the engine and
   strangers' money;*
@@ -35,12 +36,13 @@ No engine change: `src/` has been frozen since the soak candidate.
 - **apt and dnf repositories**, served from a Cloudflare Worker, with signed packages (#296).
 - **Fixes held during the freeze:** #300, #302, #304 and #306 (pull requests #332, #333 and
   #338), and the pre-flight lock wait (#294).
-- **Security fixes:** #303 (client port), #335 and #336 (keys), #222 (mixing keys-off and release
-  binaries).
+- **Security fixes:** #335 and #336 (keys), #222 (mixing keys-off and release binaries). For
+  #303 (client port), only documentation: replica client ports must be reachable only by
+  replicas and their gateways.
 - **Process:** a machine account for sessions, CODEOWNERS, and "prevent self-review" on
   `apple-signing`.
 
-## v0.8 · Proven and upgradable (proposed)
+## v0.8 · Proven and upgradable (decided)
 
 The first release that can upgrade without closing the cluster. This is also the release the
 production gate (R1 to R5) is meant to close.
@@ -52,10 +54,12 @@ production gate (R1 to R5) is meant to close.
   ([brief](./briefs/r6.md); its owner questions are answered, P259b to P259g). Upgrading from
   v0.7.x to v0.8 is still an export and import (P259g). Rolling upgrades apply from v0.8 on.
 - **R3 · Measured:** sizing and latency on three machines, and the Fly p99 explained.
+- **Client authentication at the replica (#303):** a client key checked in a connection
+  handshake, a wire change, designed in #353.
 - **Toolshed tutorial:** a complete small application on Nerva, from its brief (written after
   v0.7.1).
 
-## v0.9 · Bounded (proposed)
+## v0.9 · Bounded (planned)
 
 Disk, export and import stop growing with all of history.
 
@@ -65,7 +69,7 @@ Disk, export and import stop growing with all of history.
   fields.
 - **View snapshots** (README roadmap item 5).
 
-## v0.10 · Native and effects (proposed)
+## v0.10 · Native and effects (planned)
 
 - **R8 · Native client:** a C ABI and a JVM binding, with batched ops and no gateway in the
   client's path.

@@ -37,6 +37,13 @@ refuse() { # <headline> <fix>
     exit 1
 }
 
+setup_failed() { # <what> <fix>: the tool's own message is already on stderr, above this block
+    echo "error[NRV-E1163]: nerva package: could not $1" >&2
+    echo "  cause  A tool that creates the service user or a directory the package needs refused; its own message is printed just above" >&2
+    echo "  fix    $2" >&2
+    exit 1
+}
+
 # A file install.sh would make, or one that overrides the package's, shadows the package's:
 # /usr/local/bin comes before /usr/bin on the PATH and /etc/systemd/system overrides
 # /usr/lib/systemd/system. It is a tarball install's, a source build's or a full unit override.
@@ -74,8 +81,13 @@ elif getent group "$user" > /dev/null 2>&1; then
         "remove the group (groupdel $user), or create the user $user with it as primary group (useradd -g $user ...)"
 else
     useradd --system --user-group --home-dir "$data_dir" --no-create-home \
-        --shell /usr/sbin/nologin "$user"
+        --shell /usr/sbin/nologin "$user" ||
+        setup_failed "create the system user $user" \
+            "find why useradd refused (its message is above: /etc/passwd read-only or managed by LDAP, no free system uid, SELinux), or create the user yourself (useradd --system --user-group --home-dir $data_dir --no-create-home --shell /usr/sbin/nologin $user), then install the package again"
 fi
 
-install -d -m 750 -o root -g "$user" "$etc_dir"
-install -d -m 750 -o "$user" -g "$user" "$data_dir"
+dir_fix="find why install -d refused (its message is above: a read-only file system, no space, a path that is a file), fix that, then install the package again"
+install -d -m 750 -o root -g "$user" "$etc_dir" ||
+    setup_failed "make the directory $etc_dir" "$dir_fix"
+install -d -m 750 -o "$user" -g "$user" "$data_dir" ||
+    setup_failed "make the directory $data_dir" "$dir_fix"

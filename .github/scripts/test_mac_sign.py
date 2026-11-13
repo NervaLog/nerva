@@ -22,11 +22,25 @@ SECURITY = """#!/bin/sh
 # FAIL_ON: a subcommand that exits 1. IDENTITIES: what find-identity prints.
 [ "$1" = "$FAIL_ON" ] && { echo "security: $1 failed (stand-in)" >&2; exit 1; }
 case "$1" in
+  import) printf '%s\\n' "$*" >> "$SECURITY_LOG"; cp "$2" "$IMPORTED" ;;
   find-identity) printf '%s\\n' "$IDENTITIES" ;;
   list-keychains|default-keychain) case " $* " in *" -s "*) ;; *) echo '    "/Users/runner/Library/Keychains/login.keychain-db"' ;; esac ;;
 esac
 exit 0
 """
+REAL_PASSWORD = "real-export-password-0123"
+
+
+def make_p12(directory):
+    """A real .p12 (a self-signed certificate and its key) under REAL_PASSWORD, as bytes."""
+    key, crt, out = (Path(directory) / n for n in ("k.pem", "c.pem", "t.p12"))
+    subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1", "-subj",
+                    "/CN=Nerva test", "-keyout", key, "-out", crt], check=True, capture_output=True)
+    subprocess.run(["openssl", "pkcs12", "-export", "-inkey", key, "-in", crt, "-passout",
+                    f"pass:{REAL_PASSWORD}", "-out", out], check=True, capture_output=True)
+    return out.read_bytes()
+
+
 XCRUN = '#!/bin/sh\n[ "$FAIL_ON" = notarytool ] && { echo "notarytool: refused (stand-in)" >&2; exit 1; }\nexit 0\n'
 
 
@@ -48,6 +62,11 @@ class Keychain(unittest.TestCase):
         self.bin.mkdir()
         self.runner = Path(self.tmp.name) / "runner"
         self.runner.mkdir()
+        self.log = Path(self.tmp.name) / "security.log"
+        self.imported = Path(self.tmp.name) / "imported.p12"
+        if not hasattr(Keychain, "p12"):
+            with tempfile.TemporaryDirectory() as d:
+                Keychain.p12 = base64.b64encode(make_p12(d)).decode()
         stub(self.bin, "security", SECURITY)
         stub(self.bin, "xcrun", XCRUN)
 
@@ -56,7 +75,8 @@ class Keychain(unittest.TestCase):
 
     def script(self, sub, *args, **extra):
         env = dict(os.environ, PATH=f"{self.bin}:{os.environ['PATH']}", RUNNER_TEMP=str(self.runner),
-                   APPLE_DEVELOPER_ID_P12=b64("p12"), APPLE_DEVELOPER_ID_P12_PASSWORD="pw",
+                   APPLE_DEVELOPER_ID_P12=self.p12, APPLE_DEVELOPER_ID_P12_PASSWORD=REAL_PASSWORD,
+                   SECURITY_LOG=str(self.log), IMPORTED=str(self.imported),
                    APPLE_NOTARY_KEY_P8=b64("p8"), APPLE_NOTARY_KEY_ID="ABC123DEFG",
                    APPLE_NOTARY_ISSUER_ID="00000000-0000-0000-0000-000000000000",
                    IDENTITIES="     1) ABCDEF \"Developer ID Application: X\"\n     1 valid identities found")
@@ -74,11 +94,36 @@ class Keychain(unittest.TestCase):
         self.assertIn("\n  cause  ", result.stderr)
         self.assertIn("\n  fix    ", result.stderr)
         self.assertIn(f"::error::{code}", result.stderr)
-        self.assertEqual(list(self.runner.glob("nerva-id.p12")) + list(self.runner.glob("nerva-notary.p8")), [])
+        self.assertEqual(list(self.runner.glob("nerva-id*")) + list(self.runner.glob("nerva-notary.p8")), [])
 
     def test_a_good_run_passes(self):
         result = self.create()
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_the_real_p12_password_never_reaches_security_and_the_rewrapped_file_is_gone(self):
+        result = self.create()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        argv = self.log.read_text()
+        self.assertNotIn(REAL_PASSWORD, argv)
+        self.assertNotIn(REAL_PASSWORD, result.stdout + result.stderr)
+        throwaway = argv.split(" -P ")[1].split(" -T ")[0]
+        self.assertNotEqual(throwaway, REAL_PASSWORD)
+        # The file security imported opens with the throwaway, not with the real password.
+        def opens(password):
+            return subprocess.run(["openssl", "pkcs12", "-in", self.imported, "-noout", "-passin", f"pass:{password}"],
+                                  capture_output=True).returncode == 0
+        self.assertTrue(opens(throwaway))
+        self.assertFalse(opens(REAL_PASSWORD))
+        self.assertEqual(list(self.runner.glob("nerva-id*")), [])
+
+    def test_a_wrong_p12_password_is_refused_before_security_sees_the_file(self):
+        self.refused(self.create(APPLE_DEVELOPER_ID_P12_PASSWORD="wrong"), "NRV-E1121",
+                     "the keychain could not import APPLE_DEVELOPER_ID_P12")
+        self.assertFalse(self.log.exists())
+
+    def test_a_secret_that_is_not_a_p12_is_refused(self):
+        self.refused(self.create(APPLE_DEVELOPER_ID_P12=b64("not a p12")), "NRV-E1121",
+                     "the keychain could not import APPLE_DEVELOPER_ID_P12")
 
     def test_a_partition_list_that_fails_is_refused(self):
         self.refused(self.create(FAIL_ON="set-key-partition-list"), "NRV-E1121",

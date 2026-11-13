@@ -14,9 +14,12 @@
 # keychain first in the user search list and makes it the default (`mac-release` passes no
 # `--keychain` to security, codesign or notarytool), and stores a notary profile `nerva-notary`.
 # It prints the identities (exactly one valid one is required) and no secret. `security import -P`
-# has no stdin form, so the .p12 password (and the random keychain password) are in `security`'s
-# argv for a moment, where other processes of the runner's VM can read them: on a hosted runner
-# those are this job's own.
+# has no stdin form, so the .p12 is first re-wrapped (`openssl pkcs12`, the real password through
+# `-passin env:`) under a random throwaway password made in the step, and `security import -P` sees
+# only that throwaway; the real export password never reaches an argv (docs/releases/automation.md,
+# "Security notes"). The random keychain password is in `security`'s argv for a moment, where other
+# processes of the runner's VM can read it: on a hosted runner those are this job's own. The
+# re-wrapped file is deleted as soon as it is imported.
 # Every failure has a code, a headline, a cause and a fix (docs/ERRORS.md): NRV-E1121 for the
 # secrets and the identity (`refuse`), NRV-E1125 for the runner and the `security` commands that make
 # and arrange the keychain (`fail`). Nothing ends in a raw command error.
@@ -30,6 +33,8 @@ kc="$RUNNER_TEMP/nerva-signing.keychain-db"
 saved_default="$RUNNER_TEMP/nerva-signing.default-keychain"
 saved_list="$RUNNER_TEMP/nerva-signing.keychain-list"
 p12="$RUNNER_TEMP/nerva-id.p12"
+p12w="$RUNNER_TEMP/nerva-id-rewrapped.p12"
+p12pem="$RUNNER_TEMP/nerva-id-rewrapped.pem"
 p8="$RUNNER_TEMP/nerva-notary.p8"
 
 # fail <code> <headline> <cause> <fix>
@@ -68,6 +73,24 @@ make_keychain() {
   security create-keychain -p "$1" "$kc" || return 1
   security set-keychain-settings "$kc" || return 1
   security unlock-keychain -p "$1" "$kc" || return 1
+}
+
+# rewrap <in.p12> <out.p12> <throwaway password>: reads <in> with APPLE_DEVELOPER_ID_P12_PASSWORD
+# and writes <out> under the throwaway, in two `openssl pkcs12` runs through a PEM file whose key is
+# itself encrypted under the throwaway (`-passin env:real -passout env:throwaway`, then the
+# throwaway for both). Every password goes through the environment, never argv; no unencrypted key
+# is written. OpenSSL 3 needs -legacy to read an old RC2 .p12 and the 3DES settings below to write
+# one macOS reads; LibreSSL (macOS's own) needs neither. Called inside `if`, where `set -e` is off.
+rewrap() {
+  rm -f "$p12pem"
+  NERVA_P12_THROWAWAY="$3" openssl pkcs12 -in "$1" -passin env:APPLE_DEVELOPER_ID_P12_PASSWORD \
+    -passout env:NERVA_P12_THROWAWAY -out "$p12pem" 2> /dev/null ||
+    NERVA_P12_THROWAWAY="$3" openssl pkcs12 -legacy -in "$1" -passin env:APPLE_DEVELOPER_ID_P12_PASSWORD \
+      -passout env:NERVA_P12_THROWAWAY -out "$p12pem" 2> /dev/null || return 1
+  NERVA_P12_THROWAWAY="$3" openssl pkcs12 -export -in "$p12pem" -passin env:NERVA_P12_THROWAWAY \
+    -passout env:NERVA_P12_THROWAWAY -out "$2" \
+    -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES -macalg sha1 2> /dev/null || return 1
+  rm -f "$p12pem"
 }
 
 # arrange_keychains <keychain> <search list...>
@@ -111,7 +134,7 @@ create() {
   umask 077
   # The secret files go on every path, refusals and errors included (they are globals: the trap
   # fires after create has returned).
-  trap 'rm -f "$p12" "$p8"' EXIT
+  trap 'rm -f "$p12" "$p12w" "$p12pem" "$p8"' EXIT
 
   local pw
   if ! pw=$(openssl rand -base64 32 2> /dev/null) || [[ -z "$pw" ]]; then
@@ -134,13 +157,27 @@ create() {
       "it holds something other than the base64 of the .p12 file" \
       "set it from 'base64 < developer-id.p12' (one line, no quotes) in the environment apple-signing"
   fi
-  if ! security import "$p12" -k "$kc" -f pkcs12 -P "$APPLE_DEVELOPER_ID_P12_PASSWORD" \
-    -T /usr/bin/codesign > /dev/null; then
+  local throwaway
+  if ! throwaway=$(openssl rand -base64 32 2> /dev/null) || [[ -z "$throwaway" ]]; then
+    fail NRV-E1125 "a random password for the re-wrapped .p12 could not be made" \
+      "'openssl rand' failed or printed nothing" \
+      "run again; if it repeats, the runner image is broken"
+  fi
+  echo "::add-mask::$throwaway"
+  if ! rewrap "$p12" "$p12w" "$throwaway"; then
+    rm -f "$p12pem"
     refuse "the keychain could not import APPLE_DEVELOPER_ID_P12" \
-      "the secret is not the base64 of a .p12, its password is wrong, or OpenSSL 3 wrote it with an encryption macOS cannot read (MAC verification failed)" \
-      "export it again with 'openssl pkcs12 -export -legacy', and check APPLE_DEVELOPER_ID_P12_PASSWORD"
+      "the secret is not the base64 of a .p12, or APPLE_DEVELOPER_ID_P12_PASSWORD is wrong (OpenSSL could not open it)" \
+      "export it again from Keychain Access and check APPLE_DEVELOPER_ID_P12_PASSWORD (the owner's setup checklist)"
   fi
   rm -f "$p12"
+  if ! security import "$p12w" -k "$kc" -f pkcs12 -P "$throwaway" \
+    -T /usr/bin/codesign > /dev/null; then
+    refuse "the keychain could not import APPLE_DEVELOPER_ID_P12" \
+      "macOS refused the .p12 after it was re-wrapped (a bad certificate or key inside it)" \
+      "export it again from Keychain Access, with its private key, and set APPLE_DEVELOPER_ID_P12 again"
+  fi
+  rm -f "$p12w"
   # Without this, codesign fails with errSecInternalComponent: there is no UI to allow it.
   if ! security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$pw" "$kc" > /dev/null 2>&1; then
     refuse "the keychain's signing key could not be opened for codesign" \
@@ -206,7 +243,7 @@ destroy() {
       "run it as a step of a workflow job on a hosted runner"
   fi
   set +e
-  rm -f "$RUNNER_TEMP/nerva-id.p12" "$RUNNER_TEMP/nerva-notary.p8"
+  rm -f "$RUNNER_TEMP/nerva-id.p12" "$RUNNER_TEMP/nerva-id-rewrapped.p12" "$RUNNER_TEMP/nerva-id-rewrapped.pem" "$RUNNER_TEMP/nerva-notary.p8"
   if [[ -s "$saved_list" ]]; then
     local list=() line
     while IFS= read -r line; do
