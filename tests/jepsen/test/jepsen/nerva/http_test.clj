@@ -104,3 +104,10 @@
   (is (false? (healthz-says 200 "this is not json"))
       "a body that cannot be read is a gateway that is not healthy, not a harness throw")
   (is (false? (http/healthy? "127.0.0.1" 1)) "no reply"))
+
+(deftest healthy-does-not-hide-a-bug-of-the-harness
+  (with-redefs [http/request! (fn [& _] (throw (NullPointerException. "harness bug")))]
+    (is (thrown? NullPointerException (http/healthy? "n1"))
+        "a bug is not an unhealthy gateway (NRV-E0604)"))
+  (with-redefs [http/request! (fn [& _] (throw (java.net.http.HttpTimeoutException. "slow")))]
+    (is (false? (http/healthy? "n1")) "a timeout is no reply")))

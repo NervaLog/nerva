@@ -1,0 +1,128 @@
+# Signs, notarizes and uploads the universal macOS zip to a DRAFT release (v0.7.1; amends P284, P311
+# and P325). Called by release-finish.yml's `mac` job after release.yml's draft exists, or dispatched
+# from main with a draft's tag (a re-run, a rehearsal). It is inert until the environment `apple-signing` exists: a job
+# that names a missing environment creates it empty, so create it first, with the owner as required
+# reviewer and `main` as its only deployment branch.
+#
+# The owner approves every run; the environment's secrets reach only the "Create the signing
+# keychain" step, which hands them to mac_keychain.sh (slice A1) and nothing else. That script,
+# mac_zip_check.sh and release_check.sh are fetched from the workflow's own ref ($GITHUB_SHA, main for an approved run),
+# never from the draft's target. The target's `zig build` still runs with the keychain unlocked, so
+# release_check.sh mac-draft refuses a target that is not main, or main plus a change to VERSION and
+# CHANGELOG.md only (P343): the code that runs there is main's.
+# mac-release then reads the keychain, never a secret. The signed commit is the one the draft
+# targets, never the workflow's ref; the draft is checked before any secret is unlocked
+# (release_check.sh mac-draft: NRV-E1119, NRV-E1120, NRV-E1122, NRV-E1123, NRV-E1124) and again before the upload. A
+# re-run replaces an unpublished zip and nothing else. No cache; every action is pinned by SHA.
+name: Mac sign
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'A draft release, v<VERSION>'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mac-sign-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  sign:
+    runs-on: macos-15
+    # Notarization usually takes minutes; Apple sometimes takes longer.
+    timeout-minutes: 75
+    environment: apple-signing
+    permissions:
+      contents: write # gh release upload to the draft; GH_TOKEN goes only to the steps that need it
+    env:
+      TAG: ${{ inputs.tag }}
+    steps:
+      - name: Refuse a draft that cannot be signed
+        id: draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          # The code that sees the secrets or judges the draft comes from the workflow's own ref
+          # (main: the environment's deployment rule), never from the draft's target, which for a
+          # prerelease could be any commit. Fetch both scripts from $GITHUB_SHA into $RUNNER_TEMP/wf;
+          # the target is checked out after, and its copies of them are never run.
+          mkdir "$RUNNER_TEMP/wf"
+          for f in release_check.sh mac_keychain.sh mac_zip_check.sh; do
+            gh api -H "Accept: application/vnd.github.raw" \
+              "repos/$GITHUB_REPOSITORY/contents/.github/scripts/$f?ref=$GITHUB_SHA" \
+              > "$RUNNER_TEMP/wf/$f"
+            chmod +x "$RUNNER_TEMP/wf/$f"
+          done
+          commit=$("$RUNNER_TEMP/wf/release_check.sh" mac-draft "$TAG")
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          echo "$TAG is a draft targeting $commit"
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ steps.draft.outputs.commit }}
+          persist-credentials: false
+
+      - name: Install the pinned Zig (no cache)
+        run: ./zig/download.sh
+
+      - name: Create the signing keychain
+        id: keychain
+        env:
+          APPLE_DEVELOPER_ID_P12: ${{ secrets.APPLE_DEVELOPER_ID_P12 }}
+          APPLE_DEVELOPER_ID_P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_P12_PASSWORD }}
+          APPLE_NOTARY_KEY_P8: ${{ secrets.APPLE_NOTARY_KEY_P8 }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+        run: |
+          "$RUNNER_TEMP/wf/mac_keychain.sh" create
+
+      - name: mac-release, Developer ID and notarized
+        env:
+          IDENTITY: ${{ vars.NERVA_SIGN_IDENTITY }}
+        run: |
+          set -eu
+          # Local only, never pushed: build.zig names the version after it (as ci.yml, P325).
+          git tag "$TAG"
+          args=(-Drelease mac-release -Dnotarize=true)
+          if [ -n "$IDENTITY" ]; then args+=("-Dsign-identity=$IDENTITY"); fi
+          ./zig/zig build "${args[@]}"
+
+      - name: Check the zip from outside
+        run: |
+          set -eu
+          "$RUNNER_TEMP/wf/mac_zip_check.sh" zig-out/mac-release "$TAG"
+
+      - name: Upload the zip and its checksum to the draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMIT: ${{ steps.draft.outputs.commit }}
+        run: |
+          set -eu
+          # Still a draft, still the same commit: --clobber replaces only an unpublished zip. A
+          # publish in the seconds between this check and the upload is the owner's act, made only
+          # after a green run, so it is not guarded.
+          again=$("$RUNNER_TEMP/wf/release_check.sh" mac-draft "$TAG")
+          "$RUNNER_TEMP/wf/release_check.sh" mac-same "$TAG" "$COMMIT" "$again"
+          "$RUNNER_TEMP/wf/release_check.sh" mac-upload "$TAG" zig-out/mac-release
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: homebrew-formula
+          path: zig-out/mac-release/nerva.rb
+          retention-days: 90
+
+      - name: Destroy the keychain
+        if: always() && steps.keychain.outcome != 'skipped'
+        run: |
+          "$RUNNER_TEMP/wf/mac_keychain.sh" destroy

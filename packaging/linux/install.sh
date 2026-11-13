@@ -9,11 +9,16 @@
 # /etc/systemd/system and runs `systemctl daemon-reload`. It never formats, enables or starts
 # anything, and prints the next three commands. A second run changes nothing. A `nerva` of
 # another release is replaced only with --upgrade. --uninstall removes the binary and the units
-# and leaves /var/lib/nerva, /etc/nerva and the user. --dry-run prints what would change, and
-# changes nothing; it runs the same checks as a real run.
+# and leaves /var/lib/nerva, /etc/nerva and the user; like --upgrade it is refused (NRV-E1118)
+# while replicas or the gateway run, and it keeps the enabled instances a package's units serve.
+# --dry-run prints what would change, and changes nothing; it runs the same checks as a real run.
 #
 # Every refusal is one coded diagnostic, as `nerva`'s are (docs/ERRORS.md, 11xx).
 set -eu
+# Root trusts nothing of the caller's environment: a fixed PATH, and no CDPATH (`cd` would print).
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+unset CDPATH
 
 bin_dir=/usr/local/bin
 unit_dir=/etc/systemd/system
@@ -30,6 +35,14 @@ refuse() {
     exit "$1"
 }
 
+# setup_failed <what> <fix>: NRV-E1163, when the tool that makes the user, a directory or a file
+# fails. Its own message is already on stderr, above this block.
+setup_failed() {
+    refuse 1 NRV-E1163 "could not $1" \
+        "A tool that creates the service user, a directory or a file the installer makes refused; its own message is printed just above" \
+        "$2"
+}
+
 dry=0
 upgrade=0
 uninstall=0
@@ -39,7 +52,7 @@ for arg in "$@"; do
         --upgrade) upgrade=1 ;;
         --uninstall) uninstall=1 ;;
         -h | --help)
-            sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'
+            sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
             exit 0
             ;;
         *)
@@ -101,7 +114,15 @@ if [ "$uninstall" = 0 ]; then
                 "unpack the release tarball whole, and run install.sh from its directory"
         fi
     done
-    chmod 0755 "$here/nerva" 2> /dev/null || true
+    # A dry run changes nothing, the permissions of the tarball's files included: it cannot run a
+    # nerva that is not executable, so it skips that check and says so.
+    runnable=1
+    if [ "$dry" = 1 ] && [ ! -x "$here/nerva" ]; then
+        echo "would make $here/nerva executable (0755); a dry run does not run it to check it"
+        runnable=0
+    elif [ "$dry" = 0 ]; then
+        chmod 0755 "$here/nerva" 2> /dev/null || true
+    fi
     host=$(uname -m)
     [ "$host" != arm64 ] || host=aarch64
     built=$(elf_machine "$here/nerva")
@@ -111,7 +132,7 @@ if [ "$uninstall" = 0 ]; then
             "download the tarball for this machine: x86_64-linux or aarch64-linux"
     fi
     status=0
-    "$here/nerva" version > /dev/null 2>&1 || status=$?
+    [ "$runnable" = 0 ] || "$here/nerva" version > /dev/null 2>&1 || status=$?
     if [ "$status" != 0 ]; then
         refuse 2 NRV-E1107 "the nerva in $here cannot run (exit status $status)" \
             "This machine cannot run the tarball's nerva, though it is for this architecture" \
@@ -144,13 +165,49 @@ for unit in $units; do
     fi
 done
 sum_of() { sha256sum "$1" | cut -d' ' -f1; }
-if [ "$uninstall" = 0 ] && [ -e "$bin_dir/nerva" ] && [ "$upgrade" = 0 ]; then
-    if [ "$(sum_of "$bin_dir/nerva")" != "$(sum_of "$here/nerva")" ]; then
-        installed=$("$bin_dir/nerva" version 2> /dev/null | head -n1 || true)
-        refuse 1 NRV-E1103 "$bin_dir/nerva is a different build (${installed:-unknown})" \
-            "A different nerva is already installed" \
-            "pass --upgrade to replace it with this one (stop the replicas first, then restart them)"
+if [ "$uninstall" = 0 ] && [ -e "$bin_dir/nerva" ] &&
+    [ "$(sum_of "$bin_dir/nerva")" != "$(sum_of "$here/nerva")" ] && [ "$upgrade" = 0 ]; then
+    installed=$("$bin_dir/nerva" version 2> /dev/null | head -n1 || true)
+    refuse 1 NRV-E1103 "$bin_dir/nerva is a different build (${installed:-unknown})" \
+        "A different nerva is already installed" \
+        "pass --upgrade to replace it with this one (stop the replicas first, then restart them)"
+fi
+# The nerva the units run now: $bin_dir's, else a package's (the units find $bin_dir first). Putting
+# a different one first means a replica that restarts runs the new binary: a cluster of two
+# releases, or NRV-E0701 across a protocol release. Units still starting or stopping count as
+# running. A unit started after this check and before the install is not seen.
+current=
+if [ -e "$bin_dir/nerva" ]; then
+    current=$bin_dir/nerva
+elif [ -e /usr/bin/nerva ]; then
+    current=/usr/bin/nerva
+fi
+# refuse_if_running <what>: NRV-E1118 when a replica or gateway unit runs now, and NRV-E1102 when
+# systemctl cannot say (fail closed).
+refuse_if_running() {
+    list=$(systemctl list-units --plain --no-legend --state=active,activating,deactivating,reloading \
+        'nerva@*.service' 'nerva-api@*.service' 2> /dev/null) || refuse 2 NRV-E1102 \
+        "systemctl could not list the nerva units, so a running replica would not be seen" \
+        "The installer found no running systemd" \
+        "run systemctl list-units 'nerva@*' to see why it fails (no bus, or a chroot), then run install.sh again"
+    running=$(printf '%s\n' "$list" | cut -d' ' -f1 | tr '\n' ' ')
+    if [ -n "${running% }" ]; then
+        refuse 1 NRV-E1118 "$1 while units are running: ${running% }" \
+            "install.sh found a replica or gateway unit running, and would replace the nerva it executes" \
+            "stop them (systemctl stop 'nerva@*' 'nerva-api@*'), run install.sh again (--upgrade over a tarball install; --uninstall to remove it), then start them; across a protocol release upgrade by export and import (README, Upgrading a cluster)"
     fi
+}
+if [ "$uninstall" = 0 ] && [ -n "$current" ] && [ "$(sum_of "$current")" != "$(sum_of "$here/nerva")" ]; then
+    refuse_if_running "an install over $current"
+fi
+# --uninstall removes $bin_dir/nerva: a replica that restarts then runs a package's /usr/bin/nerva
+# (another release, #292's hazard) or finds none.
+if [ "$uninstall" = 1 ] && [ -e "$bin_dir/nerva" ]; then
+    refuse_if_running "an uninstall of $bin_dir/nerva"
+fi
+if [ "$uninstall" = 0 ] && [ -e /usr/bin/nerva ]; then
+    printf 'warning[NRV-W1102]: install.sh: /usr/bin/nerva exists and %s/nerva shadows it\n  cause  install.sh found a package'"'"'s /usr/bin/nerva, which the tarball'"'"'s %s/nerva shadows\n  fix    leave the package installed (removing it disables the enabled nerva@N and nerva-api@N instances, so none starts at the next boot; enable each again after; install.sh --uninstall keeps them while the package'"'"'s units are installed)\n' \
+        "$bin_dir" "$bin_dir" >&2
 fi
 
 # 2. Uninstall.
@@ -162,10 +219,19 @@ if [ "$uninstall" = 1 ]; then
     fi
     # The enable links of instances the operator enabled (nerva@0, nerva-api@0): left behind they
     # dangle, and a later install would make them live again.
+    # A package's unit file for the same template serves the instance too: its link stays (P342,
+    # #340), and is made again below, once the tarball's unit is gone, so it points at the package's.
+    kept=""
     for link in "$unit_dir"/*.wants/nerva@*.service "$unit_dir"/*.wants/nerva-api@*.service; do
         [ -L "$link" ] || continue
-        do_ "disable $(basename "$link") (remove the link $link)" \
-            systemctl disable "$(basename "$link")"
+        name=$(basename "$link")
+        template=$(echo "$name" | sed 's/@[^.]*\.service$/@.service/')
+        if [ -e "/usr/lib/systemd/system/$template" ]; then
+            echo "keep $name: the package's /usr/lib/systemd/system/$template serves it"
+            case " $kept " in *" $name "*) ;; *) kept="$kept $name" ;; esac
+            continue
+        fi
+        do_ "disable $name (remove the link $link)" systemctl disable "$name"
         changed=1
     done
     for unit in $units; do
@@ -176,7 +242,10 @@ if [ "$uninstall" = 1 ]; then
     done
     if [ "$changed" = 1 ]; then
         do_ "run systemctl daemon-reload" systemctl daemon-reload
-        echo "Replicas that are running keep running: stop them (systemctl stop 'nerva@*')."
+        for name in $kept; do
+            do_ "enable $name again, with the package's unit" systemctl reenable "$name"
+        done
+        echo "Units that are running keep running; the next start of a replica runs the nerva that is left (a package's /usr/bin/nerva, if any)."
     else
         echo "nothing to remove"
     fi
@@ -188,21 +257,26 @@ fi
 if ! getent passwd "$user" > /dev/null 2>&1; then
     do_ "create the system user $user (home $data_dir, no login)" \
         useradd --system --user-group --home-dir "$data_dir" --no-create-home \
-        --shell /usr/sbin/nologin "$user"
+        --shell /usr/sbin/nologin "$user" ||
+        setup_failed "create the system user $user" \
+            "find why useradd refused (its message is above: /etc/passwd read-only or managed by LDAP, no free system uid, SELinux), or create the user yourself (useradd --system --user-group --home-dir $data_dir --no-create-home --shell /usr/sbin/nologin $user), then run install.sh again"
 fi
 if [ "$dry" = 1 ] && ! getent passwd "$user" > /dev/null 2>&1; then
     owner=root
 else
     owner=$user
 fi
+dir_fix="find why install -d refused (its message is above: a read-only file system, no space, a path that is a file), fix that, then run install.sh again"
 ensure_dir() { # <path> <mode> <group>
-    if [ ! -d "$1" ] || [ "$(stat -c '%a %U %G' "$1")" != "$2 root $3" ]; then
-        do_ "make $1 ($2, root:$3)" install -d -m "$2" -o root -g "$3" "$1"
+    if [ ! -d "$1" ] || [ "$(stat -L -c '%a %U %G' "$1")" != "$2 root $3" ]; then
+        do_ "make $1 ($2, root:$3)" install -d -m "$2" -o root -g "$3" "$1" ||
+            setup_failed "make the directory $1" "$dir_fix"
     fi
 }
 ensure_dir "$etc_dir" 750 "$owner"
-if [ ! -d "$data_dir" ] || [ "$(stat -c '%a %U %G' "$data_dir")" != "750 $owner $owner" ]; then
-    do_ "make $data_dir (750, $owner:$owner)" install -d -m 750 -o "$owner" -g "$owner" "$data_dir"
+if [ ! -d "$data_dir" ] || [ "$(stat -L -c '%a %U %G' "$data_dir")" != "750 $owner $owner" ]; then
+    do_ "make $data_dir (750, $owner:$owner)" install -d -m 750 -o "$owner" -g "$owner" "$data_dir" ||
+        setup_failed "make the directory $data_dir" "$dir_fix"
 fi
 
 # put <source> <destination> <mode>: copies when the destination is missing or different, and
@@ -216,8 +290,11 @@ put() {
         echo "would install $2"
     else
         echo "install $2"
-        install -m "$3" -o root -g root "$1" "$base/.install.$$"
-        mv -f "$base/.install.$$" "$2"
+        if ! { install -m "$3" -o root -g root "$1" "$base/.install.$$" && mv -f "$base/.install.$$" "$2"; }; then
+            rm -f "$base/.install.$$"
+            setup_failed "install $2" \
+                "find why install refused (its message is above: a read-only file system, no space), fix that, then run install.sh again"
+        fi
     fi
     changed=1
 }

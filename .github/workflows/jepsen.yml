@@ -124,8 +124,22 @@ jobs:
           [[ -n "${JAVA_HOME_21_X64:-}" ]] || { echo "::error::no JDK 21 on this runner"; exit 1; }
           echo "JAVA_HOME=$JAVA_HOME_21_X64" >> "$GITHUB_ENV"
           echo "$JAVA_HOME_21_X64/bin" >> "$GITHUB_PATH"
-          sudo -n apt-get update -q
-          sudo -n apt-get install -y -q --no-install-recommends gnuplot-nox
+          # The runner sometimes cannot resolve the Ubuntu mirror (a network fault, not Nerva's):
+          # up to 5 attempts, sleeping 15, 30, 60 and 120 s between them.
+          apt_ok=
+          delays=(15 30 60 120)
+          for attempt in 1 2 3 4 5; do
+            if sudo -n apt-get -o Acquire::Retries=3 update -q &&
+               sudo -n apt-get -o Acquire::Retries=3 install -y -q --no-install-recommends gnuplot-nox; then
+              apt_ok=1
+              break
+            fi
+            if (( attempt < 5 )); then
+              echo "apt-get failed (attempt $attempt of 5); retrying in ${delays[attempt-1]} s"
+              sleep "${delays[attempt-1]}"
+            fi
+          done
+          [[ -n "$apt_ok" ]] || { echo "::error::apt-get could not reach the Ubuntu mirror after 5 attempts (a runner network fault, not Nerva)"; exit 1; }
           docker info --format 'Docker {{.ServerVersion}}, {{.NCPU}} CPUs, {{.MemTotal}} bytes'
           free -m
 
