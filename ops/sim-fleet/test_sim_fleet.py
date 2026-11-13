@@ -9,6 +9,7 @@ import os
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -686,6 +687,13 @@ class Soak(unittest.TestCase):
         self.assertEqual(self.ingest_main(path, self.too_many_failures())[0],
                          fleet.EXIT_UNRECORDED)
 
+    def test_a_save_that_fails_after_counting_is_exit_4_not_counted(self):
+        path = self.state_path()
+        with mock.patch.object(fleet, "save_state", side_effect=OSError("disk full")):
+            code = self.ingest_main(path, self.clean_round())[0]
+        self.assertEqual(code, fleet.EXIT_UNRECORDED)
+        self.assertNotEqual(code, fleet.EXIT_COUNTED)
+
     def test_a_state_written_before_the_counter_loads_and_reads_clean(self):
         github, state = Recorder(), fleet.new_state()
         rnd = Round(self)
@@ -955,11 +963,14 @@ class RunShRefuse(unittest.TestCase):
         self.stub = os.path.join(self.dir, "python")
         with open(self.stub, "w") as f:
             f.write("#!/bin/sh\nshift 2\nif [ \"$1\" = ingest ]; then exit \"$STUB_CODE\"; fi\n"
+                    "if [ \"$1\" = refuse ] && [ -n \"$STUB_REFUSE_FAILS\" ]; then exit 2; fi\n"
                     f"exec python3 -I \"{HERE}/sim_fleet.py\" \"$@\"\n")
         os.chmod(self.stub, 0o755)
 
-    def sh(self, script, code=0):
+    def sh(self, script, code=0, refuse_fails=False):
         env = {"PATH": os.environ["PATH"], "STUB_CODE": str(code)}
+        if refuse_fails:
+            env["STUB_REFUSE_FAILS"] = "1"
         return subprocess.run(
             ["bash", "-c", f'source "{HERE}/run.sh"; STATE="{self.state}"; bin="{HERE}"; '
              f'built={SHA_A}; round="$STATE/round"; SIM_FLEET_PYTHON="{self.stub}"; '
@@ -995,7 +1006,50 @@ class RunShRefuse(unittest.TestCase):
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertEqual(self.refused(), 1)
         self.assertIn("never reported", out.stderr)
-        self.assertEqual(Path(rnd, "commit").read_text().strip(), SHA_A)
+
+    def soak_code(self):
+        return fleet.main(["soak", "--commit", SHA_A, "--state",
+                           os.path.join(self.state, "state.json")], now=DAY_ONE)
+
+    def test_two_clean_rounds_in_a_row_are_not_refused_and_soak_is_clean(self):
+        state = fleet.new_state()
+        rnd = Round(self)
+        rnd.seed(0, "vopr-nerva", 1, 0, seconds=3600)
+        ingest(self, Recorder(), state, rnd, SHA_A, DAY_ONE)
+        fleet.save_state(os.path.join(self.state, "state.json"), state)
+        for _ in range(2):
+            out = self.sh("run_round", 0)  # runs ingest itself
+            self.assertEqual(out.returncode, 0, out.stderr)
+            self.assertFalse(os.path.exists(os.path.join(self.state, "round")))
+        self.assertEqual(self.refused(), 0)
+        self.assertNotIn("never reported", out.stderr)
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(self.soak_code(), 0)
+
+    def test_a_round_killed_midway_is_counted_refused_by_the_next_round(self):
+        rnd = os.path.join(self.state, "round")  # begun, then killed before any outcome
+        os.makedirs(os.path.join(rnd, "w0"))
+        Path(rnd, "commit").write_text(SHA_A + "\n")
+        out = self.sh("run_round", 0)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(self.refused(), 1)
+
+    def test_a_round_nothing_could_record_leaves_a_marker_soak_reads_not_clean(self):
+        state = fleet.new_state()
+        rnd = Round(self)
+        rnd.seed(0, "vopr-nerva", 1, 0, seconds=3600)
+        ingest(self, Recorder(), state, rnd, SHA_A, DAY_ONE)
+        fleet.save_state(os.path.join(self.state, "state.json"), state)
+        os.makedirs(os.path.join(self.state, "round"))
+        out = self.sh("ingest", 4, refuse_fails=True)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertTrue(os.path.exists(os.path.join(self.state, "unrecorded-" + SHA_A)))
+        self.assertEqual(self.refused(), 0)
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(self.soak_code(), 1)
+        os.unlink(os.path.join(self.state, "unrecorded-" + SHA_A))
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(self.soak_code(), 0)
 
     def test_a_round_left_with_no_commit_is_deleted_and_says_so(self):
         os.makedirs(os.path.join(self.state, "round", "w0"))

@@ -405,7 +405,12 @@ ingest() {
     if [[ -n "$SIM_FLEET_TRACKER" ]]; then set -- "$@" --tracker "$SIM_FLEET_TRACKER"; fi
     timeout "$SIM_FLEET_REPORT_TIMEOUT" "$SIM_FLEET_PYTHON" -I "$bin/sim_fleet.py" "$@" ||
         code=$?
-    if (( code == 0 )); then return 0; fi
+    if (( code == 0 )); then
+        # Recorded: the round is done. A leftover `round/commit` would be counted as a round a
+        # killed run left, so the next round would count this clean one as refused.
+        rm -rf "$round"
+        return 0
+    fi
     rm -rf "$STATE/last-failed-round"
     mv "$round" "$STATE/last-failed-round"
     log "sim_fleet.py ingest exited $code; the round is in $STATE/last-failed-round"
@@ -423,7 +428,14 @@ refuse_round() {
     local commit=${1:-$built}
     timeout "$SIM_FLEET_REPORT_TIMEOUT" "$SIM_FLEET_PYTHON" -I "$bin/sim_fleet.py" refuse \
         --commit "$commit" --state "$STATE/state.json" ||
-        log "sim_fleet.py refuse failed; the round of $commit is not counted"
+        {
+            log "sim_fleet.py refuse failed; the round of $commit is not counted"
+            # Nothing recorded the round: leave a marker `soak` reads as not clean for this
+            # commit. An empty file named for the commit needs an inode, not a data block.
+            : >"$STATE/unrecorded-$commit" ||
+                log "cannot write $STATE/unrecorded-$commit; stopping"
+            [[ -e "$STATE/unrecorded-$commit" ]] || exit 75
+        }
 }
 
 # Sourced by the tests, which call the functions above.

@@ -37,9 +37,14 @@ malformed `results` line) is counted against its commit as `refused`, since its 
 unknown; `run.sh` runs `refuse` for a round the reporter never finished (killed by its timeout, a
 crash, exit 70), which counts one the same way.
 
-Exit codes: 0 done, 1 usage or bad input (a refused round is counted as above), 2 environment
-(state file, token, GitHub), 70 a bug in the reporter. The state is saved whenever it was read,
-whatever GitHub answered. Standard library only.
+A round nothing could record (`refuse` failed too: an unwritable state) leaves the empty file
+`unrecorded-<commit>` beside the state; `soak` reads that commit as not clean while it exists.
+
+`ingest` exit codes: 0 done; 2 the round is counted and saved, GitHub stopped the reports; 3 the
+round is refused and recorded as refused; 4 nothing could be recorded (state unreadable or
+unwritable); 64 usage; 70 a bug in the reporter. `refuse` and `soak`: 0 done, 1 not clean or bad
+input, 2 environment. The state is saved whenever it was read, whatever GitHub answered. Standard
+library only.
 """
 
 import argparse
@@ -886,6 +891,16 @@ def read_token(path):
     return token
 
 
+def unrecorded_rounds(state_path, commit):
+    """The `unrecorded-<commit>` markers run.sh leaves for a round nothing could record."""
+    folder = os.path.dirname(os.path.abspath(state_path))
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return []
+    return [n for n in names if n.startswith("unrecorded-") and n[len("unrecorded-"):].startswith(commit)]
+
+
 def soak_main(args, log):
     if not re.fullmatch(r"[0-9a-f]{7,64}", args.commit):
         log("--commit must be a hex commit of at least 7 digits")
@@ -899,13 +914,17 @@ def soak_main(args, log):
         log(f"no state file at {args.state}")
         return 2
     line, ran, clean = soak_line(state, args.commit)
+    unrecorded = unrecorded_rounds(args.state, args.commit)
+    if unrecorded:
+        line += "; a round was never recorded (unrecorded- marker beside the state)"
+        clean = False
     print(line, flush=True)
     if not ran:
         log(f"no rounds of {args.commit[:7]} in the state (or its prefix names two commits)")
     elif not clean:
         log(f"{args.commit[:7]} is not clean: a seed failed, hung or was killed, a failure "
             f"was hit, or a round was refused or lost")
-    return 0 if ran and clean else 1
+    return 0 if ran and clean and not unrecorded else 1
 
 
 def record_refused(args, log):

@@ -95,7 +95,7 @@ one.
   redirect, so the token never goes to another host.
 - Filed fingerprints are in `/var/lib/sim-fleet/state/state.json`. If that file is missing, the
   issue markers rebuild it (the latest 500 issues labelled `sim-fleet`). A state file that exists
-  but cannot be read is an error (exit 2); it is never taken for empty.
+  but cannot be read is an error (`ingest` exit 4, `soak` exit 2); it is never taken for empty.
 - Exit codes of `sim_fleet.py ingest`: 0 done; 2 the round is counted and saved but GitHub
   stopped the reports (a rate limit, an outage); 3 the round is refused whole (no seed is counted,
   but the round is counted against its commit as `refused`, and `soak` reads that commit as not
@@ -106,7 +106,9 @@ one.
   itself, which counts the round against its commit as refused. A round left in `state/round/` by
   a killed run (the file `commit` names its commit) is counted the same way before the next round
   deletes it. The state is saved whatever GitHub answered; a round the reporter did not finish is
-  kept in `state/last-failed-round/`.
+  kept in `state/last-failed-round/`. A round that `refuse` could not record either leaves the
+  empty file `state/unrecorded-<commit>`, which `soak` reads as not clean until it is removed.
+  The round directory is deleted once its outcome is recorded.
 - Every collection is bounded (`sim_fleet.py`, the constants at the top): seeds and failing seeds
   per round, bytes read of a log, lines in an issue, fingerprints remembered (2048), days kept
   (31), pages scanned on a rebuild (5).

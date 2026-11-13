@@ -16,7 +16,13 @@ each end its own code (4 nothing recorded, 64 usage, 70 a bug), so `run.sh` neve
 or import error (exit 1) for a recorded round. A missing token file, or GitHub unreachable while
 the state is rebuilt, counts the round as refused before returning. A round a killed `run.sh`
 left in `state/round` is counted as refused, against the commit written in its `commit` file,
-before the next round deletes it. The reporter's messages stay plain text, not `NRV-` codes, as
+before the next round deletes it. `run.sh` deletes the round once its outcome is recorded (exit 0, 2, 3, or `refuse` succeeded), so
+the next round does not count it as a leftover. When `refuse` fails too (an unwritable state, a
+full disk), `run.sh` leaves the empty file `unrecorded-<commit>` in the state directory (it needs
+an inode, not a data block) and `soak` reads that commit as not clean while it exists; if the
+marker cannot be written either, `run.sh` exits 75 so systemd restarts it and the leftover-round
+path counts the round. The marker was chosen over a non-zero exit alone because it survives and
+is visible to `soak`. The reporter's messages stay plain text, not `NRV-` codes, as
 P215c (resting on P147i) set.
 
 The reason: P287b's soak clause says the commit has no failing seed, but the record `soak` reads
