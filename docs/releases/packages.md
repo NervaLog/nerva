@@ -2003,8 +2003,14 @@ gh variable set R2_BUCKET --env package-repos --repo NervaLog/nerva --body nerva
 ```
 
 ```bash
-gh variable set PACKAGES_BASE_URL --env package-repos --repo NervaLog/nerva --body 'https://packages.nerva.pro'
+gh variable set PACKAGES_BASE_URL --repo NervaLog/nerva --body 'https://packages.nerva.pro'
 ```
+
+`PACKAGES_BASE_URL` is a repository variable, not the environment's (P404): `ci.yml`'s
+`repos-fresh`, the daily watch and `repos-verify` read it and have no environment. Do not set it on
+`package-repos` as well; if an earlier setup did, remove it there
+(`gh variable delete PACKAGES_BASE_URL --env package-repos --repo NervaLog/nerva`), so that the two
+cannot disagree.
 
 Then, in step 4's terminal. **4A:**
 
@@ -2105,7 +2111,7 @@ curl -sI 'https://packages.nerva.pro/nothing' | head -n1
 ```
 
 ```bash
-gh secret list --env package-repos --repo NervaLog/nerva && gh variable list --env package-repos --repo NervaLog/nerva
+gh secret list --env package-repos --repo NervaLog/nerva && gh variable list --env package-repos --repo NervaLog/nerva && gh variable list --repo NervaLog/nerva
 ```
 
 ```bash
@@ -2126,8 +2132,8 @@ gh label list --repo NervaLog/nerva --search package-repos
 
 Expect: a 200 from `nerva.pro`; a 404 from `nervalog.github.io`; a 404 from `packages.nerva.pro`
 (served by R2: the bucket is empty); four secrets (`R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`,
-`REPO_SIGNING_KEY`, `REPO_SIGNING_PASSPHRASE`) and four variables (`R2_ENDPOINT`, `R2_BUCKET`,
-`PACKAGES_BASE_URL`, `PACKAGE_REPOS_OWNER`); `false`, `true` and `branch_policy`; `false`; `pages exit 1` (Pages is
+`REPO_SIGNING_KEY`, `REPO_SIGNING_PASSPHRASE`) and two variables (`R2_ENDPOINT`, `R2_BUCKET`) on the
+environment, and among the repository's variables `PACKAGES_BASE_URL` and `PACKAGE_REPOS_OWNER`; `false`, `true` and `branch_policy`; `false`; `pages exit 1` (Pages is
 off); and the label `package-repos`. Then tell the supervisor.
 
 **Rotating the R2 token** (yearly, or if it may have leaked): create a new token as in step 5, set
