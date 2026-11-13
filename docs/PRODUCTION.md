@@ -36,7 +36,7 @@ green in CI, with a link to the run.
 | R5 · Recover | Replace a lost replica, and restore from a backup, with the cluster open | Delivered 2026-11-05 ([demo](https://github.com/NervaLog/nerva/actions/runs/41997293568/job/127143488126), [docs/demos/r5.md](./demos/r5.md)) |
 | R6 · Upgrade | Rolling upgrades between releases with the same data format | Brief written ([docs/briefs/r6.md](./briefs/r6.md)) |
 | R7 · Retention | Commit keys, history and view versions trimmed below a horizon: bounded growth | Not started |
-| R8 · Native client | The client library over a C ABI, called from the JVM: no gateway, no JSON, batching as TigerBeetle's clients do | Not started |
+| R8 · Native client | The client library over a C ABI, called from the JVM: no gateway, no JSON, batching as TigerBeetle's clients do | Brief written ([docs/briefs/r8.md](./briefs/r8.md)) |
 
 **The gate for strangers' money** (Botpike's invite-only launch on Nerva, Botpike/app P121b) is
 R1 to R5. R6, R7 and R8 follow. Until R6, an upgrade is an export and import with the cluster closed,
