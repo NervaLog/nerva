@@ -13,5 +13,8 @@ the commit it soaks, so a soak of `5d7d806` would run the loop that loses failin
 `build.zig.zon`, `zig/`, `.gitmodules`, `.gitattributes`) are identical in both, so the release
 reviews of the candidate still read the code that ships.
 
-What it costs: the 24-hour soak starts over on `c886c9f`. Jepsen either runs again on
-`c886c9f` or the owner accepts `5d7d806`'s run, of the same code, in writing in the release PR.
+Jepsen is not run again: the owner accepts `5d7d806`'s Jepsen run for `c886c9f`, whose pinned
+code is the same (in session, 2026-11-13), and the release PR quotes that run and this acceptance.
+
+What it costs: the 24-hour soak starts over on `c886c9f`. The Jepsen result the release PR
+quotes is of `5d7d806`, not of the candidate commit itself.
