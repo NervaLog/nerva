@@ -90,7 +90,7 @@ need_env() {
 tool_is() { # <tool> <the first line its --version starts with>
   local got
   got=$("$1" --version 2>&1 | head -n1)
-  case $got in "$2" | "$2"[!0-9]*) ;; *) e1139 "$1 reads '$got', not '$2'" "the pinned tools were not installed on this runner" ;; esac
+  case $got in "$2" | "$2"[!0-9.]*) ;; *) e1139 "$1 reads '$got', not '$2'" "the pinned tools were not installed on this runner" ;; esac
 }
 
 need_tools() {
