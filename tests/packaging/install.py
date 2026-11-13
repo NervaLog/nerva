@@ -11,7 +11,7 @@ tarball's contents, then checks, against the real units:
   3. every refusal, NRV-E1101 to NRV-E1109, with its code, exit status and three-line block; a
      fixed PATH; a dry run that does not chmod; NRV-W1102 (a package's /usr/bin/nerva); a symlinked
      /var/lib/nerva left alone;
-  3b. a `useradd` and an `install -d` that fail (stubs, in a mount namespace) are refused with
+  3b. a `useradd`, an `install -d` and a copy that fail (stubs, in a mount namespace) are refused with
      NRV-E1163 after the tool's own message, exit 1, and the failed run is rerun clean;
   4. the gateway nerva-api@0 started while the cluster is down fails with NRV-E0604 and is restarted,
      and serves once three replicas, formatted as `nerva` and run as nerva@0..2, are up; a commit and a
@@ -237,16 +237,20 @@ def test_early_refusals(stage):
     assert sh(["getent", "passwd", "nerva"]).returncode != 0
 
 
-def failing_tool(tmp, name, stage, *args):
-    """Runs install.sh with `name` (found on the script's fixed PATH) replaced by a stub that prints
-    its own message and exits 1, in a mount namespace of its own, so nothing leaks to the host."""
+def failing_tool(tmp, name, stage, when="*"):
+    """Runs install.sh with `name` (found on the script's fixed PATH) replaced by a stub, in a mount
+    namespace of its own, so nothing leaks to the host. The stub prints its own message and exits 1
+    when its arguments match the shell pattern `when`, and runs the real tool otherwise."""
     program = os.path.realpath(shutil.which(name, path="/usr/sbin:/usr/bin:/sbin:/bin"))
+    real = os.path.join(tmp, f"{name}-real")
+    shutil.copy2(program, real)
     stub = os.path.join(tmp, f"{name}-stub")
     with open(stub, "w") as f:
-        f.write(f"#!/bin/sh\necho '{name}: stub failure' >&2\nexit 1\n")
+        f.write(f"#!/bin/sh\ncase \"$*\" in {when}) echo '{name}: stub failure' >&2; exit 1;; esac\n"
+                f"exec {real} \"$@\"\n")
     os.chmod(stub, 0o755)
     result = sh(["unshare", "-m", "sh", "-c",
-                 f"mount --bind {stub} {program} && exec sh {stage}/install.sh " + " ".join(args)])
+                 f"mount --bind {stub} {program} && exec sh {stage}/install.sh"])
     assert os.access(program, os.X_OK) and sh(["cmp", "-s", stub, program]).returncode != 0, \
         "the stub leaked"
     return result
@@ -264,22 +268,39 @@ def refused_after_tool(result, name, headline, summary):
 
 
 def test_setup_failures(tmp, stage):
-    """`useradd` and `install -d` fail: one NRV-E1163 block after the tool's message, exit 1 (#378)."""
+    """`useradd`, `install -d` and the copy of a file fail: one NRV-E1163 block after the tool's
+    message, exit 1 (#378). Each failed run leaves what it made; the host is cleaned at the end."""
     summary = ("A tool that creates the service user, a directory or a file the installer makes "
                "refused; its own message is printed just above")
     assert sh(["getent", "passwd", "nerva"]).returncode != 0
     before = snapshot()
-    result = failing_tool(tmp, "useradd", stage)
-    refused_after_tool(result, "useradd", "could not create the system user nerva", summary)
-    assert snapshot() == before, "a refused useradd changed something"
-    # A dry run does not run the tool, so it cannot fail.
-    assert "nothing was changed" in installer(stage, "--dry-run").stdout
-    # The user is made, then the first directory fails; the rerun finds the user and goes on.
-    result = failing_tool(tmp, "install", stage)
-    refused_after_tool(result, "install", f"could not make the directory {ETC}", summary)
-    assert sh(["getent", "passwd", "nerva"]).returncode == 0
-    assert not os.path.exists(ETC) and not os.path.exists(BIN), "a refused install -d went on"
-    assert sh(["userdel", "nerva"]).returncode == 0
+    try:
+        result = failing_tool(tmp, "useradd", stage)
+        refused_after_tool(result, "useradd", "could not create the system user nerva", summary)
+        assert snapshot() == before, "a refused useradd changed something"
+        # A dry run does not run the tool, so it cannot fail.
+        assert "nothing was changed" in installer(stage, "--dry-run").stdout
+        # The user is made, then the first directory fails.
+        result = failing_tool(tmp, "install", stage, "-d*")
+        refused_after_tool(result, "install", f"could not make the directory {ETC}", summary)
+        assert sh(["getent", "passwd", "nerva"]).returncode == 0
+        assert not os.path.exists(ETC) and not os.path.exists(BIN), "a refused install -d went on"
+        # The user and /etc/nerva exist, then only the data directory fails.
+        result = failing_tool(tmp, "install", stage, f"-d*{DATA}")
+        refused_after_tool(result, "install", f"could not make the directory {DATA}", summary)
+        assert os.path.isdir(ETC) and not os.path.exists(DATA) and not os.path.exists(BIN)
+        # The directories exist, then the first file is copied and its rename fails: the temporary
+        # file is removed.
+        result = failing_tool(tmp, "mv", stage, "*.install.*")
+        refused_after_tool(result, "mv", f"could not install {BIN}", summary)
+        for directory in (os.path.dirname(BIN), UNIT_DIR):
+            leftover = [n for n in os.listdir(directory) if n.startswith(".install.")]
+            assert not leftover, (directory, leftover)
+        assert not os.path.exists(BIN), "a refused rename installed the file"
+    finally:
+        sh(["userdel", "nerva"])
+        shutil.rmtree(ETC, ignore_errors=True)
+        shutil.rmtree(DATA, ignore_errors=True)
     assert sh(["getent", "group", "nerva"]).returncode != 0
     assert snapshot() == before, "the failed runs left something behind"
 

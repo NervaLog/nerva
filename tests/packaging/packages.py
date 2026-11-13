@@ -182,17 +182,21 @@ def check_setup_modes(repo, tmp):
         result = run(["sh", f"{root}/setup.sh", *args], check=False, env=env)
         assert result.returncode == 0, (args, result.stderr)
         assert "NRV-W1101" not in result.stderr, (args, result.stderr)
-    # useradd, then install -d, that fail: NRV-E1163 after the tool's own line, exit 1 (#378).
-    for tool, what in (("useradd", "create the system user nerva"),
-                       ("install", "make the directory /etc/nerva")):
-        os.makedirs(f"{root}/failing-{tool}")
-        with open(f"{root}/failing-{tool}/{tool}", "w") as out:
-            out.write(f"#!/bin/sh\necho '{tool}: stub failure' >&2\nexit 1\n")
-        os.chmod(f"{root}/failing-{tool}/{tool}", 0o755)
-        failing = {**env, "PATH": f"{root}/failing-{tool}:{env['PATH']}"}
+    # useradd, then each install -d, that fail: NRV-E1163 after the tool's own line, exit 1 (#378).
+    # The stub fails only for its pattern, so the earlier steps pass.
+    for tool, when, what in (("useradd", "*", "create the system user nerva"),
+                             ("install", "*/etc/nerva", "make the directory /etc/nerva"),
+                             ("install", "*/var/lib/nerva", "make the directory /var/lib/nerva")):
+        stubs = f"{root}/failing-{tool}-{len(os.listdir(root))}"
+        os.makedirs(stubs)
+        with open(f"{stubs}/{tool}", "w") as out:
+            out.write(f"#!/bin/sh\ncase \"$*\" in {when}) echo '{tool}: stub failure' >&2; exit 1;; esac\n"
+                      "exit 0\n")
+        os.chmod(f"{stubs}/{tool}", 0o755)
+        failing = {**env, "PATH": f"{stubs}:{env['PATH']}"}
         result = run(["sh", f"{root}/setup.sh", "install"], check=False, env=failing)
         lines = result.stderr.strip().split("\n")
-        assert result.returncode == 1 and len(lines) == 4, (tool, result.returncode, result.stderr)
+        assert result.returncode == 1 and len(lines) == 4, (what, result.returncode, result.stderr)
         assert lines[0] == f"{tool}: stub failure", lines
         assert lines[1] == f"error[NRV-E1163]: nerva package: could not {what}", lines
         assert lines[2].startswith("  cause  ") and lines[3].startswith("  fix    "), lines
