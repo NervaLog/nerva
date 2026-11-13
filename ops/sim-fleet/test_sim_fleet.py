@@ -2,12 +2,15 @@
 """Tests for sim_fleet.py (P147h), without network. Run from the repository root:
 python3 ops/sim-fleet/test_sim_fleet.py"""
 import contextlib
+import http.client
 import importlib.util
 import io
 import json
 import os
+import stat
 import subprocess
 import tempfile
+import time
 import unittest
 from unittest import mock
 from pathlib import Path
@@ -371,8 +374,8 @@ class StateFile(unittest.TestCase):
         rnd.seed(1, "vopr-nerva", 2, 0)
         out = io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
-            code = fleet.main(["ingest", "--round", rnd.path, "--commit", "abcdef1",
-                               "--state", self.path, "--dry-run"], now=DAY_ONE)
+            code = fleet.main(["ingest", "--round", rnd.path, "--round-id", ID_A, "--commit",
+                               "abcdef1", "--state", self.path, "--dry-run"], now=DAY_ONE)
         self.assertEqual(code, 0)
         self.assertIn("would open issue [sim-fleet] 'VOPR nerva liveness: no state convergence: "
                       "pending replica convergence'", out.getvalue())
@@ -380,14 +383,14 @@ class StateFile(unittest.TestCase):
         self.assertEqual(json.loads(Path(self.path).read_text())["days"]["2026-11-02"]["rounds"],
                          1)
 
-    def test_main_refuses_a_bad_round_with_the_refused_exit(self):
+    def test_main_refuses_a_bad_round(self):
         rnd = Round(self)
         os.makedirs(os.path.join(rnd.path, "w0"))
         Path(rnd.path, "w0", "results").write_text("garbage\n")
         with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
-            code = fleet.main(["ingest", "--round", rnd.path, "--commit", "abcdef1",
-                               "--state", self.path, "--dry-run"], now=DAY_ONE)
-        self.assertEqual(code, fleet.EXIT_REFUSED)
+            code = fleet.main(["ingest", "--round", rnd.path, "--round-id", ID_A, "--commit",
+                               "abcdef1", "--state", self.path, "--dry-run"], now=DAY_ONE)
+        self.assertEqual(code, 1)
         # No seed is counted, but the round is: against its commit, as refused (#370).
         state = fleet.load_state(self.path)
         self.assertEqual(state["days"], {})
@@ -397,6 +400,14 @@ class StateFile(unittest.TestCase):
 
 SHA_A = "1a2b3c4" + "0" * 33
 SHA_B = "9f8e7d6" + "0" * 33
+ID_A = "1793581200-0123456789abcdef"
+ID_B = "1793581260-fedcba9876543210"
+_ids = iter(range(1, 1 << 30))
+
+
+def new_id():
+    """A fresh round id, as run.sh makes them."""
+    return f"{DAY_ONE}-{next(_ids):016x}"
 
 
 def soak_round(test, seconds=1800):
@@ -530,13 +541,20 @@ class Soak(unittest.TestCase):
         return code, out.getvalue().strip(), err.getvalue()
 
     def state_path(self):
-        path = os.path.join(tempfile.mkdtemp(), "state.json")
-        self.addCleanup(lambda: [os.path.exists(f) and os.unlink(f) for f in (path, path + ".new")])
-        return path
+        folder = tempfile.mkdtemp()
+        self.addCleanup(subprocess.run, ["rm", "-rf", folder])
+        return os.path.join(folder, "state.json")
 
-    def ingest_main(self, path, rnd, commit=SHA_A):
-        return self.run_main("ingest", "--round", rnd.path, "--commit", commit, "--state", path,
-                             "--dry-run")
+    def ingest_main(self, path, rnd, commit=SHA_A, round_id=None):
+        return self.run_main("ingest", "--round", rnd.path, "--round-id", round_id or new_id(),
+                             "--commit", commit, "--state", path, "--dry-run")
+
+    def refuse_main(self, path, round_id=None, commit=SHA_A):
+        return self.run_main("refuse", "--round-id", round_id or new_id(), "--commit", commit,
+                             "--state", path)
+
+    def soak_code(self, path, commit=SHA_A):
+        return self.run_main("soak", "--commit", commit, "--state", path)[0]
 
     def too_many_failures(self):
         rnd = Round(self)
@@ -556,7 +574,7 @@ class Soak(unittest.TestCase):
     def test_a_refused_round_then_a_clean_one_is_not_a_clean_soak(self):
         path = self.state_path()
         code, _, err = self.ingest_main(path, self.too_many_failures())
-        self.assertEqual(code, fleet.EXIT_REFUSED)
+        self.assertEqual(code, 1)
         self.assertIn("refused", err)
         self.assertEqual(self.ingest_main(path, self.clean_round())[0], 0)
         code, line, err = self.run_main("soak", "--commit", SHA_A, "--state", path)
@@ -566,22 +584,27 @@ class Soak(unittest.TestCase):
                                       "their seeds unknown"), line)
         self.assertIn("not clean", err)
 
+    def test_a_refused_round_is_recorded_with_its_id(self):
+        path = self.state_path()
+        self.ingest_main(path, self.too_many_failures(), round_id=ID_A)
+        self.assertEqual(fleet.load_state(path)["last_round"],
+                         {"id": ID_A, "commit": SHA_A, "outcome": "refused"})
+
     def test_a_malformed_results_line_is_a_refused_round_too(self):
         path = self.state_path()
         rnd = self.clean_round()
         with open(os.path.join(rnd.path, "w0", "results"), "a") as file:
             file.write("vopr-nerva not-a-seed\n")
-        self.assertEqual(self.ingest_main(path, rnd)[0], fleet.EXIT_REFUSED)
+        self.assertEqual(self.ingest_main(path, rnd)[0], 1)
         self.assertEqual(self.ingest_main(path, self.clean_round())[0], 0)
-        self.assertEqual(self.run_main("soak", "--commit", SHA_A, "--state", path)[0], 1)
+        self.assertEqual(self.soak_code(path), 1)
 
     def test_a_refused_round_counts_against_its_own_commit_only(self):
         path = self.state_path()
         self.assertEqual(self.ingest_main(path, self.clean_round(), SHA_B)[0], 0)
-        self.assertEqual(self.ingest_main(path, self.too_many_failures(), SHA_A)[0],
-                         fleet.EXIT_REFUSED)
-        self.assertEqual(self.run_main("soak", "--commit", SHA_B, "--state", path)[0], 0)
-        self.assertEqual(self.run_main("soak", "--commit", SHA_A, "--state", path)[0], 1)
+        self.assertEqual(self.ingest_main(path, self.too_many_failures(), SHA_A)[0], 1)
+        self.assertEqual(self.soak_code(path, SHA_B), 0)
+        self.assertEqual(self.soak_code(path, SHA_A), 1)
 
     def test_a_commit_with_only_a_refused_round_is_exit_1_and_says_why(self):
         path = self.state_path()
@@ -592,20 +615,39 @@ class Soak(unittest.TestCase):
         self.assertIn("1 rounds refused", line)
         self.assertNotIn("no rounds of", err)
 
-    def test_refuse_counts_a_round_the_reporter_lost(self):
+    def test_refuse_counts_each_round_once(self):
         path = self.state_path()
         self.assertEqual(self.ingest_main(path, self.clean_round())[0], 0)
-        self.assertEqual(self.run_main("soak", "--commit", SHA_A, "--state", path)[0], 0)
-        for _ in range(2):
-            self.assertEqual(self.run_main("refuse", "--commit", SHA_A, "--state", path)[0], 0)
+        self.assertEqual(self.soak_code(path), 0)
+        for round_id in (ID_A, ID_A, ID_B):
+            self.assertEqual(self.refuse_main(path, round_id)[0], 0)
         code, line, _ = self.run_main("soak", "--commit", SHA_A, "--state", path)
         self.assertEqual(code, 1)
         self.assertIn("; 2 rounds refused or lost", line)
-        self.assertEqual(self.run_main("refuse", "--commit", "xyz", "--state", path)[0], 1)
+        self.assertEqual(self.refuse_main(path, "not-an-id")[0], 1)
+        self.assertEqual(fleet.load_state(path)["commits"][SHA_A]["refused"], 2)
 
-    def live_main(self, path, rnd, token_file, commit=SHA_A):
-        return self.run_main("ingest", "--round", rnd.path, "--commit", commit, "--state", path,
-                             "--repo", "NervaLog/nerva", "--token-file", token_file)
+    def test_ingest_counts_each_round_once_and_refuse_leaves_a_counted_round_alone(self):
+        path = self.state_path()
+        rnd = self.clean_round()
+        for _ in range(2):
+            self.assertEqual(self.ingest_main(path, rnd, round_id=ID_A)[0], 0)
+        self.assertEqual(self.refuse_main(path, ID_A)[0], 0)
+        state = fleet.load_state(path)
+        self.assertEqual(state["commits"][SHA_A]["rounds"], 1)
+        self.assertEqual(state["commits"][SHA_A]["refused"], 0)
+        self.assertEqual(state["last_round"]["outcome"], "counted")
+        # A refused round is not counted by a later ingest of the same id either.
+        self.ingest_main(path, self.too_many_failures(), round_id=ID_B)
+        self.assertEqual(self.ingest_main(path, rnd, round_id=ID_B)[0], 0)
+        state = fleet.load_state(path)
+        self.assertEqual((state["commits"][SHA_A]["rounds"], state["commits"][SHA_A]["refused"]),
+                         (1, 1))
+
+    def live_main(self, path, rnd, token_file, commit=SHA_A, round_id=None):
+        return self.run_main("ingest", "--round", rnd.path, "--round-id", round_id or new_id(),
+                             "--commit", commit, "--state", path, "--repo", "NervaLog/nerva",
+                             "--token-file", token_file)
 
     def failing_round(self):
         rnd = Round(self)
@@ -613,62 +655,98 @@ class Soak(unittest.TestCase):
             rnd.seed(0, "vopr-nerva", seed, 134, tail="boom")
         return rnd
 
-    def test_a_missing_token_file_counts_the_round_as_refused(self):
-        # Was exit 2 with nothing counted: a later clean round read the commit clean (#370).
+    def test_a_missing_token_file_still_counts_the_round(self):
+        # A token is needed only to report: the round is counted, and recorded, without it.
         path = self.state_path()
-        self.assertEqual(self.ingest_main(path, self.clean_round())[0], 0)
-        code, _, err = self.live_main(path, self.failing_round(), "/nonexistent/token")
-        self.assertEqual(code, fleet.EXIT_REFUSED)
+        code, out, err = self.live_main(path, self.clean_round(), "/nonexistent/token",
+                                        round_id=ID_A)
+        self.assertEqual(code, 0)
         self.assertIn("cannot read the token file", err)
-        self.assertEqual(self.ingest_main(path, self.clean_round())[0], 0)
-        self.assertEqual(self.run_main("soak", "--commit", SHA_A, "--state", path)[0], 1)
-        self.assertEqual(fleet.load_state(path)["commits"][SHA_A]["refused"], 1)
+        self.assertIn("(writes stopped: token)", out)
+        state = fleet.load_state(path)
+        self.assertEqual(state["last_round"]["id"], ID_A)
+        self.assertEqual(state["commits"][SHA_A]["refused"], 0)
+        self.assertEqual(self.soak_code(path), 0)
+        # The failures of a round counted without a token still make its commit not clean.
+        self.live_main(path, self.failing_round(), "/nonexistent/token")
+        self.assertEqual(self.soak_code(path), 1)
 
-    def test_github_unreachable_while_rebuilding_counts_the_round_as_refused(self):
-        class Down:
+    def test_the_issues_unreadable_while_rebuilding_count_the_round_and_file_nothing(self):
+        failing = self.failing_round()
+        _, failures = fleet.read_round(failing.path)
+        fingerprint = failures[0]["fingerprint"]
+
+        class Flaky(Recorder):
+            down = True
+
             def __init__(self, *args):
-                pass
+                super().__init__(markers={fingerprint: 7})
+                calls.append(self)
 
             def markers(self):
-                raise fleet.GitHubError("unreachable", "no answer")
+                if Flaky.down:
+                    raise fleet.GitHubError("unreachable", "no answer")
+                return super().markers()
 
+        calls = []
         path = self.state_path()
         token = os.path.join(os.path.dirname(path), "token")
         Path(token).write_text("t0ken\n")
-        original = fleet.GitHub
-        fleet.GitHub = Down
-        self.addCleanup(setattr, fleet, "GitHub", original)
-        code, _, err = self.live_main(path, self.failing_round(), token)
-        self.assertEqual(code, fleet.EXIT_REFUSED)
-        self.assertIn("could not be read", err)
-        # The state exists now, and says `rebuild`; the next round still counts.
-        state = fleet.load_state(path)
-        self.assertEqual(state["commits"][SHA_A]["refused"], 1)
-        self.assertEqual(self.ingest_main(path, self.clean_round())[0], 0)
-        self.assertEqual(self.run_main("soak", "--commit", SHA_A, "--state", path)[0], 1)
+        with mock.patch.object(fleet, "GitHub", Flaky):
+            code, out, err = self.live_main(path, failing, token)
+            self.assertEqual(code, 0)
+            self.assertIn("could not be read", err)
+            self.assertEqual(calls[0].opened, [])
+            state = fleet.load_state(path)
+            self.assertTrue(state["rebuild"])
+            self.assertEqual(state["filed"], {})
+            self.assertEqual(state["commits"][SHA_A]["refused"], 0)
+            self.assertEqual(state["commits"][SHA_A]["rounds"], 1)
+            Flaky.down = False
+            self.assertEqual(self.live_main(path, self.failing_round(), token)[0], 0)
+        # The marker was read before anything was filed: a comment on #7, no second issue.
+        self.assertEqual(calls[1].opened, [])
+        self.assertEqual([number for number, _ in calls[1].comments], [7])
+        self.assertNotIn("rebuild", fleet.load_state(path))
 
-    def test_a_usage_error_is_not_the_refused_exit(self):
-        code, _, _ = self.run_main("ingest", "--round", "r", "--commit", "xyz", "--state",
-                                   self.state_path(), "--dry-run")
-        self.assertEqual(code, fleet.EXIT_USAGE)
-        code, _, _ = self.run_main("ingest", "--round", "r", "--commit", SHA_A, "--state",
-                                   self.state_path())
-        self.assertEqual(code, fleet.EXIT_USAGE)
+    def test_a_bad_commit_is_a_usage_error_and_records_nothing(self):
+        path = self.state_path()
+        for command in (["ingest", "--round", "r", "--round-id", ID_A], ["refuse",
+                                                                         "--round-id", ID_A]):
+            with self.assertRaises(SystemExit) as caught, \
+                    contextlib.redirect_stderr(io.StringIO()):
+                fleet.main(command + ["--commit", "xyz", "--state", path])
+            self.assertEqual(caught.exception.code, 2)
+        self.assertFalse(os.path.exists(path))
 
-    def test_an_uncaught_exception_in_the_reporter_exits_70(self):
+    def test_a_missing_repo_or_a_bad_round_id_or_tracker_records_nothing(self):
+        path = self.state_path()
+        rnd = self.clean_round()
+        self.assertEqual(self.run_main("ingest", "--round", rnd.path, "--round-id", ID_A,
+                                       "--commit", SHA_A, "--state", path)[0], 1)
+        self.assertEqual(self.run_main("ingest", "--round", rnd.path, "--round-id", "1-abc",
+                                       "--commit", SHA_A, "--state", path, "--dry-run")[0], 1)
+        self.assertEqual(self.run_main("ingest", "--round", rnd.path, "--round-id", ID_A,
+                                       "--commit", SHA_A, "--state", path, "--dry-run",
+                                       "--tracker", "0")[0], 1)
+        self.assertFalse(os.path.exists(path))
+
+    def test_an_uncaught_exception_in_the_reporter_records_nothing(self):
         rnd = Round(self)
         os.makedirs(os.path.join(rnd.path, "w0", "results"))  # A directory: open() raises.
+        path = self.state_path()
         out = subprocess.run(
             ["python3", "-I", str(HERE / "sim_fleet.py"), "ingest", "--round", rnd.path,
-             "--commit", SHA_A, "--state", self.state_path(), "--dry-run"],
+             "--round-id", ID_A, "--commit", SHA_A, "--state", path, "--dry-run"],
             capture_output=True, text=True)
-        self.assertEqual(out.returncode, 70)
+        self.assertEqual(out.returncode, 1)
         self.assertIn("Traceback", out.stderr)
+        self.assertFalse(os.path.exists(path))
 
     def test_a_refusal_with_no_state_starts_one_the_next_ingest_rebuilds(self):
         path = self.state_path()
-        self.assertEqual(self.run_main("refuse", "--commit", SHA_A, "--state", path)[0], 0)
-        self.assertEqual(self.run_main("soak", "--commit", SHA_A, "--state", path)[0], 1)
+        self.assertEqual(self.refuse_main(path)[0], 0)
+        self.assertEqual(self.soak_code(path), 1)
         code, _, err = self.ingest_main(path, self.clean_round())
         self.assertEqual(code, 0)
         self.assertIn("the state file was missing: rebuilt", err)
@@ -677,22 +755,36 @@ class Soak(unittest.TestCase):
         self.assertEqual(state["commits"][SHA_A]["refused"], 1)
         self.assertNotIn("the state file was missing", self.ingest_main(path, self.clean_round())[2])
 
-    def test_an_unreadable_state_is_not_overwritten_by_a_refusal(self):
+    def test_an_unreadable_state_is_not_overwritten(self):
         path = self.state_path()
         with open(path, "w") as file:
             file.write("not json")
-        self.assertEqual(self.run_main("refuse", "--commit", SHA_A, "--state", path)[0], 2)
+        self.assertEqual(self.refuse_main(path)[0], 1)
+        self.assertEqual(self.ingest_main(path, self.too_many_failures())[0], 1)
+        self.assertEqual(self.ingest_main(path, self.clean_round())[0], 1)
         with open(path) as file:
             self.assertEqual(file.read(), "not json")
-        self.assertEqual(self.ingest_main(path, self.too_many_failures())[0],
-                         fleet.EXIT_UNRECORDED)
 
-    def test_a_save_that_fails_after_counting_is_exit_4_not_counted(self):
+    def test_a_save_that_fails_records_nothing(self):
         path = self.state_path()
         with mock.patch.object(fleet, "save_state", side_effect=OSError("disk full")):
-            code = self.ingest_main(path, self.clean_round())[0]
-        self.assertEqual(code, fleet.EXIT_UNRECORDED)
-        self.assertNotEqual(code, fleet.EXIT_COUNTED)
+            self.assertEqual(self.ingest_main(path, self.clean_round())[0], 1)
+            self.assertEqual(self.ingest_main(path, self.too_many_failures())[0], 1)
+            self.assertEqual(self.refuse_main(path)[0], 1)
+        self.assertFalse(os.path.exists(path))
+
+    def test_a_save_fsyncs_the_file_and_then_its_directory(self):
+        path = self.state_path()
+        synced = []
+        real = os.fsync
+
+        def fsync(fd):
+            synced.append(stat.S_ISDIR(os.fstat(fd).st_mode))
+            real(fd)
+
+        with mock.patch.object(fleet.os, "fsync", side_effect=fsync):
+            fleet.save_state(path, fleet.new_state())
+        self.assertEqual(synced, [False, True])
 
     def test_a_state_written_before_the_counter_loads_and_reads_clean(self):
         github, state = Recorder(), fleet.new_state()
@@ -750,8 +842,9 @@ class Soak(unittest.TestCase):
             rnd = soak_round(self, 3600)
             with contextlib.redirect_stdout(io.StringIO()), \
                     contextlib.redirect_stderr(io.StringIO()):
-                self.assertEqual(fleet.main(["ingest", "--round", rnd.path, "--commit", SHA_A,
-                                             "--state", state_path, "--dry-run"],
+                self.assertEqual(fleet.main(["ingest", "--round", rnd.path, "--round-id", new_id(),
+                                             "--commit", SHA_A, "--state", state_path,
+                                             "--dry-run"],
                                             now=DAY_ONE + 900 * i), 0)
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
@@ -951,112 +1044,293 @@ class MemoryLimit(unittest.TestCase):
             check=True).stdout.strip()
 
 
-class RunShRefuse(unittest.TestCase):
-    """run.sh's `ingest` and `run_round` count a round the reporter did not (#370), with a stub
-    in place of the interpreter that ends `ingest` with $STUB_CODE and runs the real `refuse`."""
+class GitHubRequest(unittest.TestCase):
+    """Every way an answer can go wrong is a GitHubError, never an exception that escapes."""
+
+    def github(self, opened):
+        class Opener:
+            def open(self, request, timeout):
+                return opened()
+
+        github = fleet.GitHub("NervaLog/nerva", "t0ken", lambda message: None)
+        github.opener = Opener()
+        return github
+
+    def test_a_dropped_connection_is_unreachable(self):
+        def opened():
+            raise http.client.RemoteDisconnected("closed")  # An OSError too.
+
+        with self.assertRaises(fleet.GitHubError) as caught:
+            self.github(opened).markers()
+        self.assertEqual(caught.exception.kind, "unreachable")
+
+    def test_an_answer_cut_short_is_unreachable(self):
+        class Response:
+            status, headers = 200, {}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self, limit):
+                raise http.client.IncompleteRead(b"[")  # Not an OSError.
+
+        def opened():
+            return Response()
+
+        with self.assertRaises(fleet.GitHubError) as caught:
+            self.github(opened).markers()
+        self.assertEqual(caught.exception.kind, "unreachable")
+
+    def test_an_answer_that_is_not_json_is_refused(self):
+        class Response:
+            status, headers = 200, {}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self, limit):
+                return b"<html>not json"
+
+        with self.assertRaises(fleet.GitHubError) as caught:
+            self.github(Response).markers()
+        self.assertEqual(caught.exception.kind, "refused")
+
+
+class RunShSettle(unittest.TestCase):
+    """run.sh settles every round by the record in the state file, never by an exit code (#370,
+    P382). The interpreter is a stub that runs the real sim_fleet.py unless told to fail:
+    STUB_INGEST or STUB_REFUSE `fail:N` exits N without running it, `after:N` runs it, then
+    exits N."""
 
     def setUp(self):
         self.dir = tempfile.mkdtemp()
-        self.addCleanup(lambda: subprocess.run(["rm", "-rf", self.dir]))
+        self.addCleanup(subprocess.run, ["rm", "-rf", self.dir])
         self.state = os.path.join(self.dir, "state")
+        self.round = os.path.join(self.state, "round")
+        self.bin = os.path.join(self.dir, "bin")
         os.makedirs(self.state)
+        os.makedirs(self.bin)
+        os.symlink(HERE / "sim_fleet.py", os.path.join(self.bin, "sim_fleet.py"))
+        # A seed of a second that passes.
+        self.script(os.path.join(self.bin, "vopr-nerva"), "sleep 1\n")
         self.stub = os.path.join(self.dir, "python")
-        with open(self.stub, "w") as f:
-            f.write("#!/bin/sh\nshift 2\nif [ \"$1\" = ingest ]; then exit \"$STUB_CODE\"; fi\n"
-                    "if [ \"$1\" = refuse ] && [ -n \"$STUB_REFUSE_FAILS\" ]; then exit 2; fi\n"
-                    f"exec python3 -I \"{HERE}/sim_fleet.py\" \"$@\"\n")
-        os.chmod(self.stub, 0o755)
+        self.script(self.stub, 'case "$3" in ingest) mode=$STUB_INGEST;; '
+                               'refuse) mode=$STUB_REFUSE;; *) mode=;; esac\n'
+                               'case "$mode" in fail:*) exit "${mode#fail:}";;\n'
+                               'after:*) python3 "$@"; exit "${mode#after:}";; esac\n'
+                               'exec python3 "$@"\n')
 
-    def sh(self, script, code=0, refuse_fails=False):
-        env = {"PATH": os.environ["PATH"], "STUB_CODE": str(code)}
-        if refuse_fails:
-            env["STUB_REFUSE_FAILS"] = "1"
+    def script(self, path, body):
+        Path(path).write_text("#!/bin/sh\n" + body)
+        os.chmod(path, 0o755)
+
+    def sh(self, script, ingest="", refuse="", workers=0, tracker=""):
+        env = {"PATH": os.environ["PATH"], "STUB_INGEST": ingest, "STUB_REFUSE": refuse}
         return subprocess.run(
-            ["bash", "-c", f'source "{HERE}/run.sh"; STATE="{self.state}"; bin="{HERE}"; '
-             f'built={SHA_A}; round="$STATE/round"; SIM_FLEET_PYTHON="{self.stub}"; '
-             'SIM_FLEET_REPORT_TIMEOUT=30; SIM_FLEET_REPO_DIR=/x; SIM_FLEET_DRY_RUN=1; '
-             f'SIM_FLEET_ROUND_SECONDS=0; SIM_FLEET_TRACKER=; token_file=/x; SIM_FLEET_WORKERS_VOPR_NERVA=0; SIM_FLEET_WORKERS_VOPR_TESTING=0; SIM_FLEET_WORKERS_FUZZ=0; SIM_FLEET_WORKERS_MIXED=0; log() {{ echo "$*" >&2; }}; {script}'],
-            env=env, capture_output=True, text=True)
+            ["bash", "-c", f'set -euo pipefail; source "{HERE}/run.sh"; STATE="{self.state}"; '
+             f'built={SHA_A}; SIM_FLEET_PYTHON="{self.stub}"; SIM_FLEET_REPORT_TIMEOUT=30; '
+             f'SIM_FLEET_REPO_DIR=/x; SIM_FLEET_DRY_RUN=1; SIM_FLEET_ROUND_SECONDS=1; '
+             f'SIM_FLEET_TRACKER="{tracker}"; token_file=/x; SIM_FLEET_VOPR_SEED_TIMEOUT=30; '
+             f'SIM_FLEET_TAIL_BYTES=100; SIM_FLEET_WORKERS_VOPR_NERVA={workers}; '
+             'SIM_FLEET_WORKERS_VOPR_TESTING=0; SIM_FLEET_WORKERS_FUZZ=0; '
+             'SIM_FLEET_WORKERS_MIXED=0; log() { echo "$*" >&2; }; '
+             f'{script}'],
+            env=env, capture_output=True, text=True, timeout=120)
 
-    def refused(self):
-        path = os.path.join(self.state, "state.json")
-        return fleet.load_state(path)["commits"].get(SHA_A, {}).get("refused", 0) \
-            if os.path.exists(path) else 0
+    def run_round(self, **kwargs):
+        # run_round sets `bin` from `built`; the binaries of SHA_A are the stub's.
+        os.makedirs(os.path.join(self.state, "bin"), exist_ok=True)
+        link = os.path.join(self.state, "bin", SHA_A)
+        if not os.path.exists(link):
+            os.symlink(self.bin, link)
+        return self.sh("run_round", **kwargs)
 
-    def ingest(self, code):
-        os.makedirs(os.path.join(self.state, "round"), exist_ok=True)
-        out = self.sh("ingest", code)
-        self.assertEqual(out.returncode, 0, out.stderr)
-        return self.refused()
+    def leftover(self, lines, round_id=ID_A, commit=SHA_A):
+        os.makedirs(os.path.join(self.round, "w0"))
+        Path(self.round, "id").write_text(round_id + "\n")
+        Path(self.round, "commit").write_text(commit + "\n")
+        Path(self.round, "w0", "results").write_text("".join(f"{line}\n" for line in lines))
+        for line in lines:
+            target, seed, code, _ = line.split()
+            if code != "0":
+                fail = os.path.join(self.round, "w0", f"fail-{target}-{seed}")
+                os.makedirs(fail)
+                Path(fail, "tail.log").write_text("panic: boom\n")
 
-    def test_the_exits_that_recorded_the_round_are_not_counted_again(self):
-        for code in (0, 2, 3):
-            self.assertEqual(self.ingest(code), 0, code)
+    def state_json(self):
+        return fleet.load_state(os.path.join(self.state, "state.json"))
 
-    def test_every_other_exit_counts_the_round_as_refused(self):
-        # 1 is a usage error or an import error of the reporter; it records nothing.
-        for n, code in enumerate((1, 4, 64, 70, 124, 137), 1):
-            self.assertEqual(self.ingest(code), n, code)
+    def entry(self):
+        state = self.state_json()
+        return state["commits"].get(SHA_A, {}) if state else {}
 
-    def test_a_round_left_by_a_killed_run_is_counted_before_it_is_deleted(self):
-        rnd = os.path.join(self.state, "round")
-        os.makedirs(os.path.join(rnd, "w0"))
-        Path(rnd, "commit").write_text(SHA_A + "\n")
-        out = self.sh("run_round")
-        self.assertEqual(out.returncode, 0, out.stderr)
-        self.assertEqual(self.refused(), 1)
-        self.assertIn("never reported", out.stderr)
+    def seeds(self):
+        return fleet.seeds_of(self.entry()) if self.entry() else 0
 
     def soak_code(self):
-        return fleet.main(["soak", "--commit", SHA_A, "--state",
-                           os.path.join(self.state, "state.json")], now=DAY_ONE)
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            return fleet.main(["soak", "--commit", SHA_A, "--state",
+                               os.path.join(self.state, "state.json")])
 
-    def test_two_clean_rounds_in_a_row_are_not_refused_and_soak_is_clean(self):
-        state = fleet.new_state()
-        rnd = Round(self)
-        rnd.seed(0, "vopr-nerva", 1, 0, seconds=3600)
-        ingest(self, Recorder(), state, rnd, SHA_A, DAY_ONE)
-        fleet.save_state(os.path.join(self.state, "state.json"), state)
+    def kept(self):
+        return os.path.exists(os.path.join(self.state, "last-failed-round"))
+
+    def test_two_clean_rounds_then_soak_is_clean(self):
         for _ in range(2):
-            out = self.sh("run_round", 0)  # runs ingest itself
+            out = self.run_round(workers=1)
             self.assertEqual(out.returncode, 0, out.stderr)
-            self.assertFalse(os.path.exists(os.path.join(self.state, "round")))
-        self.assertEqual(self.refused(), 0)
-        self.assertNotIn("never reported", out.stderr)
-        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-            self.assertEqual(self.soak_code(), 0)
+            self.assertFalse(os.path.exists(self.round))
+        self.assertEqual(self.entry()["rounds"], 2)
+        self.assertEqual(self.entry()["refused"], 0)
+        self.assertGreater(self.seeds(), 0)
+        self.assertFalse(self.kept())
+        self.assertEqual(self.soak_code(), 0)
 
-    def test_a_round_killed_midway_is_counted_refused_by_the_next_round(self):
-        rnd = os.path.join(self.state, "round")  # begun, then killed before any outcome
-        os.makedirs(os.path.join(rnd, "w0"))
-        Path(rnd, "commit").write_text(SHA_A + "\n")
-        out = self.sh("run_round", 0)
-        self.assertEqual(out.returncode, 0, out.stderr)
-        self.assertEqual(self.refused(), 1)
+    def test_a_round_is_made_with_its_id_and_commit(self):
+        # Nothing can record it, so it stays in place: what run.sh wrote is still there.
+        out = self.run_round(ingest="fail:1", refuse="fail:1")
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("recorded nowhere", out.stderr)
+        self.assertRegex(Path(self.round, "id").read_text(), r"^[0-9]{1,20}-[0-9a-f]{16}\n$")
+        self.assertEqual(Path(self.round, "commit").read_text(), SHA_A + "\n")
+        self.assertFalse(os.path.exists(self.round + ".new"))
 
-    def test_a_round_nothing_could_record_leaves_a_marker_soak_reads_not_clean(self):
-        state = fleet.new_state()
-        rnd = Round(self)
-        rnd.seed(0, "vopr-nerva", 1, 0, seconds=3600)
-        ingest(self, Recorder(), state, rnd, SHA_A, DAY_ONE)
-        fleet.save_state(os.path.join(self.state, "state.json"), state)
-        os.makedirs(os.path.join(self.state, "round"))
-        out = self.sh("ingest", 4, refuse_fails=True)
+    def test_a_restart_mid_round_with_passing_results_stays_clean(self):
+        self.leftover(["vopr-nerva 5 0 3600", "vopr-nerva 6 0 600"])
+        out = self.run_round()
         self.assertEqual(out.returncode, 0, out.stderr)
-        self.assertTrue(os.path.exists(os.path.join(self.state, "unrecorded-" + SHA_A)))
-        self.assertEqual(self.refused(), 0)
-        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-            self.assertEqual(self.soak_code(), 1)
-        os.unlink(os.path.join(self.state, "unrecorded-" + SHA_A))
-        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-            self.assertEqual(self.soak_code(), 0)
+        self.assertIn(f"settling round {ID_A}", out.stderr)
+        self.assertEqual(self.seeds(), 2)
+        self.assertEqual(self.entry()["refused"], 0)
+        self.assertEqual(self.soak_code(), 0)
 
-    def test_a_round_left_with_no_commit_is_deleted_and_says_so(self):
-        os.makedirs(os.path.join(self.state, "round", "w0"))
-        out = self.sh("run_round")
+    def test_a_restart_mid_round_with_a_failing_result_is_not_clean(self):
+        self.leftover(["vopr-nerva 5 0 3600", "vopr-nerva 6 134 600"])
+        out = self.run_round()
         self.assertEqual(out.returncode, 0, out.stderr)
-        self.assertEqual(self.refused(), 0)
-        self.assertIn("cannot be counted", out.stderr)
+        self.assertEqual(self.entry()["kinds"]["vopr-nerva"]["failed"], 1)
+        self.assertEqual(self.soak_code(), 1)
+
+    def test_a_restart_before_any_seed_ended_counts_an_empty_round(self):
+        self.leftover([])
+        out = self.run_round()
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(self.entry()["refused"], 0)
+        self.assertEqual(self.entry()["rounds"], 2)
+
+    def test_a_round_recorded_before_a_crash_is_not_counted_twice(self):
+        # Killed after `ingest` saved, before the round was deleted.
+        self.leftover(["vopr-nerva 5 0 3600"])
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(fleet.main(["ingest", "--round", self.round, "--round-id", ID_A,
+                                         "--commit", SHA_A, "--state",
+                                         os.path.join(self.state, "state.json"), "--dry-run"]),
+                             0)
+        out = self.run_round()
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("already recorded", out.stderr)
+        self.assertEqual(self.seeds(), 1)
+        self.assertEqual(self.entry()["rounds"], 2)  # It and the new, empty round.
+        self.assertFalse(os.path.exists(self.round))
+
+    def test_a_usage_error_from_ingest_is_refused(self):
+        for n, tracker in enumerate(("abc", "0"), 1):  # argparse's exit 2, then ingest's 1.
+            self.leftover(["vopr-nerva 5 0 3600"], round_id=f"{n}-{n:016x}")
+            out = self.sh(f'round="{self.round}"; bin="{self.bin}"; settle {n}-{n:016x} {SHA_A}',
+                          tracker=tracker)
+            self.assertEqual(out.returncode, 0, out.stderr)
+            self.assertIn("refusing it", out.stderr)
+            self.assertEqual(self.entry()["refused"], n)
+            self.assertEqual(self.seeds(), 0)
+            self.assertFalse(os.path.exists(self.round))
+            self.assertTrue(self.kept())
+        self.assertEqual(self.soak_code(), 1)
+
+    def test_a_crash_in_ingest_is_refused(self):
+        self.leftover(["vopr-nerva 5 0 3600"])
+        os.unlink(os.path.join(self.round, "w0", "results"))
+        os.makedirs(os.path.join(self.round, "w0", "results"))  # The real reporter raises.
+        out = self.run_round()
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("Traceback", out.stderr)
+        self.assertEqual(self.entry()["refused"], 1)
+        self.assertEqual(self.soak_code(), 1)
+
+    def test_ingest_killed_or_exiting_0_without_a_record_is_refused(self):
+        for n, mode in enumerate(("fail:137", "fail:124", "fail:0", "fail:2"), 1):
+            self.leftover(["vopr-nerva 5 0 3600"], round_id=f"{n}-{n:016x}")
+            out = self.sh(f'round="{self.round}"; bin="{self.bin}"; settle {n}-{n:016x} {SHA_A}',
+                          ingest=mode)
+            self.assertEqual(out.returncode, 0, out.stderr)
+            self.assertEqual(self.entry()["refused"], n, mode)
+            self.assertTrue(self.kept())
+
+    def test_an_exit_after_the_record_is_saved_is_not_refused(self):
+        for n, mode in enumerate(("after:124", "after:2", "after:75"), 1):
+            self.leftover(["vopr-nerva 5 0 3600"], round_id=f"{n}-{n:016x}")
+            out = self.sh(f'round="{self.round}"; bin="{self.bin}"; settle {n}-{n:016x} {SHA_A}',
+                          ingest=mode)
+            self.assertEqual(out.returncode, 0, out.stderr)
+            self.assertNotIn("refusing", out.stderr)
+            self.assertEqual(self.entry()["refused"], 0, mode)
+            self.assertEqual(self.seeds(), n)
+            self.assertTrue(self.kept())  # A copy to look at; it is counted.
+        self.assertEqual(self.soak_code(), 0)
+
+    def test_a_round_nothing_could_record_stays_and_the_next_start_settles_it(self):
+        self.leftover(["vopr-nerva 5 0 3600"])
+        out = self.sh(f'round="{self.round}"; bin="{self.bin}"; settle {ID_A} {SHA_A}',
+                      ingest="fail:1", refuse="fail:1")
+        self.assertEqual(out.returncode, 1)
+        self.assertTrue(os.path.exists(os.path.join(self.round, "w0", "results")))
+        self.assertIsNone(self.state_json())
+        out = self.run_round()  # systemd's restart.
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(self.seeds(), 1)
+        self.assertEqual(self.entry()["refused"], 0)
+        self.assertEqual(self.soak_code(), 0)
+
+    def test_an_unreadable_state_stops_the_loop_and_is_kept(self):
+        Path(self.state, "state.json").write_text("not json")
+        self.leftover(["vopr-nerva 5 0 3600"])
+        out = self.run_round()
+        self.assertEqual(out.returncode, 1)
+        self.assertIn("recorded nowhere", out.stderr)
+        self.assertTrue(os.path.isdir(self.round))
+        self.assertEqual(Path(self.state, "state.json").read_text(), "not json")
+
+    def test_a_half_made_round_or_one_with_no_id_is_deleted_uncounted(self):
+        os.makedirs(self.round + ".new")
+        os.makedirs(os.path.join(self.round, "w0"))
+        Path(self.round, "commit").write_text(SHA_A + "\n")
+        out = self.run_round()
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("deleting a round with no id or commit", out.stderr)
+        self.assertEqual(self.entry()["rounds"], 1)  # Only the new round.
+        self.assertFalse(os.path.exists(self.round + ".new"))
+
+    def test_an_id_that_is_not_one_is_never_found_recorded(self):
+        Path(self.state, "state.json").write_text('{"x": ""}')
+        for bad in ("", "x", '1-abc'):
+            self.assertNotEqual(self.sh(f"recorded '{bad}'").returncode, 0)
+        self.assertNotEqual(self.sh(f"recorded {ID_A}").returncode, 0)
+        Path(self.state, "state.json").write_text(f'{{"id": "{ID_A}"}}')
+        self.assertEqual(self.sh(f"recorded {ID_A}").returncode, 0)
+
+    def test_a_seed_ended_by_sigterm_is_not_recorded_and_the_worker_stops(self):
+        self.script(os.path.join(self.bin, "vopr-nerva"), "kill -TERM $$\n")
+        started = time.monotonic()
+        out = self.sh(f'round="{self.round}"; bin="{self.bin}"; mkdir -p "$STATE/rotation"; '
+                      'worker 0 vopr-nerva $(( $(date +%s) + 60 ))')
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertLess(time.monotonic() - started, 30)
+        self.assertFalse(os.path.exists(os.path.join(self.round, "w0", "results")))
 
 
 class Rotation(unittest.TestCase):

@@ -94,21 +94,25 @@ one.
   A tracking issue that refuses the totals is retried each round. A request never follows a
   redirect, so the token never goes to another host.
 - Filed fingerprints are in `/var/lib/sim-fleet/state/state.json`. If that file is missing, the
-  issue markers rebuild it (the latest 500 issues labelled `sim-fleet`). A state file that exists
-  but cannot be read is an error (`ingest` exit 4, `soak` exit 2); it is never taken for empty.
-- Exit codes of `sim_fleet.py ingest`: 0 done; 2 the round is counted and saved but GitHub
-  stopped the reports (a rate limit, an outage); 3 the round is refused whole (no seed is counted,
-  but the round is counted against its commit as `refused`, and `soak` reads that commit as not
-  clean, #370); 4 nothing could be recorded (the state file is unreadable or unwritable); 64 usage;
-  70 a bug in the reporter. A missing token file, or GitHub unreachable while the state is
-  rebuilt, counts the round as refused too (exit 3). `run.sh` trusts only 0, 2 and 3: after any
-  other end (4, 64, 70, a timeout's 124, a kill, an import error) it runs `sim_fleet.py refuse`
-  itself, which counts the round against its commit as refused. A round left in `state/round/` by
-  a killed run (the file `commit` names its commit) is counted the same way before the next round
-  deletes it. The state is saved whatever GitHub answered; a round the reporter did not finish is
-  kept in `state/last-failed-round/`. A round that `refuse` could not record either leaves the
-  empty file `state/unrecorded-<commit>`, which `soak` reads as not clean until it is removed.
-  The round directory is deleted once its outcome is recorded.
+  issue markers rebuild it (the latest 500 issues labelled `sim-fleet`) before anything is filed;
+  until they can be read, rounds are still counted and nothing is filed. A state file that exists
+  but cannot be read is an error (`soak` exit 2); it is never taken for empty or overwritten.
+- **Every round is settled by a record, never by an exit code** (#370, P382). `run.sh` gives each
+  round a random id (`state/round/id`, beside `commit`). `sim_fleet.py ingest` counts the round
+  (or refuses it whole: past 4096 failing seeds, or a malformed `results` line) and saves that,
+  with the id in `last_round`, in one atomic write of the state file, before it reads the token
+  or asks GitHub anything; a missing token or GitHub down then stops only the reports. After
+  `ingest` ends, however it ends, `run.sh` looks for the id in the state file. Not there (a usage
+  error, a crash, a timeout, a kill): `sim_fleet.py refuse` records the round as refused. Still
+  not there (the state cannot be written): the round stays in `state/round/`, `run.sh` exits 1,
+  and systemd starts it again 30 s later. A recorded round is deleted; one `ingest` did not exit
+  0 on is kept in `state/last-failed-round/` for a look. `ingest` and `refuse` do nothing for a
+  round already recorded, so no round is counted twice. A refused round makes its commit not
+  clean for `soak`.
+- **A restart is safe.** A round that a stop, a reboot or a crash left in `state/round/` is
+  settled from the results its workers wrote, as any round is, before the next one starts: its
+  finished seeds count, a failing one makes the commit not clean, and a seed the stop cut short
+  is not recorded.
 - Every collection is bounded (`sim_fleet.py`, the constants at the top): seeds and failing seeds
   per round, bytes read of a log, lines in an issue, fingerprints remembered (2048), days kept
   (31), pages scanned on a rebuild (5).
@@ -142,8 +146,9 @@ is (P147i). Its tests need no network: `python3 ops/sim-fleet/test_sim_fleet.py`
    - Repository permissions: **Issues: Read and write**. Nothing else (Metadata: read is added by
      GitHub itself).
    - Expiry: the longest the organisation allows; put the date in the calendar. An expired token
-     makes `sim_fleet.py` exit 2 with `HTTP 401` in the journal, files nothing, and the daily
-     totals stop appearing on the tracker.
+     leaves `HTTP 401` in the journal and `(writes stopped: refused)` on the round's line; the
+     rounds are still counted, nothing is filed, and the daily totals stop appearing on the
+     tracker.
 3. **No deploy key.** The repository is public, and the fleet fetches it over HTTPS
    (`SIM_FLEET_REMOTE=https://github.com/NervaLog/nerva.git`, the default). Should it ever go
    private: `ssh-keygen -t ed25519 -N '' -f nerva-fleet`, add `nerva-fleet.pub` under the
@@ -255,6 +260,12 @@ rounds' own records and so independent of throttling, a hold or a rate limit (`n
 is a failure whose report was not posted); the state does not see a closed issue, so confirm each
 listed issue on GitHub (`label:sim-fleet is:open`) before quoting it. The gate wants 24 hours and no open
 issue; the line does not decide that, the reader does.
+
+**A refused round cannot be cleared.** A refused round now means bad input or a reporter bug (a
+token, GitHub, a restart or a slow disk no longer refuses a round), so the state has no way to
+undo one and `run.sh` writes no marker to remove. Read the round in `state/last-failed-round/`
+and the journal; if it was the host and not the candidate, the owner waives it in writing in the
+release PR, or the fleet soaks a new candidate.
 
 **Pointing the fleet at the candidate.** Set `SIM_FLEET_BRANCH` in `/etc/sim-fleet/fleet.env` to
 the candidate's **full 40-character SHA** and `systemctl restart sim-fleet`. `run.sh` runs

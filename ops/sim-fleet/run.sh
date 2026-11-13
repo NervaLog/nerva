@@ -295,25 +295,34 @@ prune_cache() {
 }
 
 # One round: every worker runs seeds of its kind until the round's time is up, then the
-# reporter reads what they wrote.
+# reporter reads what they wrote. A round is made whole under a temporary name, with its id and
+# commit, so `round` always has both.
 run_round() {
     bin="$STATE/bin/$built"
     round="$STATE/round"
-    # A round left here was killed (the unit stopped, the host rebooted) before the reporter saw
-    # it: count it against the commit it ran, written in `commit` when it began, before deleting.
+    rm -rf "$round.new"
+    # A round a stop, a reboot or a crash left is settled from the results it holds, as any
+    # other round: its finished seeds are counted (#370, P382). A round with no valid id is not
+    # this run.sh's (or it was half deleted after its record was saved): deleted, as before.
     if [[ -d "$round" ]]; then
-        local left
-        left=$(cat "$round/commit" 2>/dev/null || true)
-        if [[ "$left" =~ ^[0-9a-f]{7,64}$ ]]; then
-            log "a round of $left was never reported; counting it as refused"
-            refuse_round "$left"
+        local left_id left_commit
+        left_id=$(cat "$round/id" 2>/dev/null || true)
+        left_commit=$(cat "$round/commit" 2>/dev/null || true)
+        if [[ "$left_id" =~ ^[0-9]{1,20}-[0-9a-f]{16}$ && "$left_commit" =~ ^[0-9a-f]{7,64}$ ]]
+        then
+            log "settling round $left_id of $left_commit, left by a stop or a crash"
+            settle "$left_id" "$left_commit"
         else
-            log "a round with no commit was never reported; it cannot be counted"
+            log "deleting a round with no id or commit"
+            rm -rf "$round"
         fi
     fi
-    rm -rf "$round"
-    mkdir -p "$round"
-    echo "$built" >"$round/commit"
+    local id
+    id="$(date +%s)-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
+    mkdir "$round.new"
+    echo "$id" >"$round.new/id"
+    echo "$built" >"$round.new/commit"
+    mv "$round.new" "$round"
     local deadline=$(( $(date +%s) + SIM_FLEET_ROUND_SECONDS )) w=0 i
     for (( i = 0; i < SIM_FLEET_WORKERS_VOPR_NERVA; i++ )); do
         worker "$w" vopr-nerva "$deadline" & w=$(( w + 1 ))
@@ -330,7 +339,7 @@ run_round() {
         worker "$w" mixed "$deadline" "$i" & w=$(( w + 1 ))
     done
     wait
-    ingest
+    settle "$id" "$built"
 }
 
 # Worker $1 of kind $2 runs seeds until time $3; a fuzz worker starts its rotation at $4. Each
@@ -370,6 +379,9 @@ worker() {
         # The whole output goes to a file of this worker's, overwritten by the next seed (a VOPR
         # seed writes about 100 KB in the short log mode).
         "$@" >"$dir/seed.log" 2>&1 </dev/null 9>&- || code=$?
+        # SIGTERM: the fleet itself is stopping (`systemctl stop` or `restart`), not the seed
+        # failing. The seed is not recorded; the round's other seeds are, when it is settled.
+        if (( code == 143 )); then break; fi
         if (( code != 0 && code != 124 && code != 137 )); then
             out="$dir/fail-${target/:/-}-$seed"
             mkdir -p "$out"
@@ -390,13 +402,16 @@ worker() {
     rm -f "$dir/seed.log"
 }
 
-# Hands the round to the reporter of the commit the round ran. A round it refused or could not
-# report is kept for a look; its failures recur in later rounds if they are real. A round lost
-# or refused counts against its commit (`refused` in the state), so `soak` reads it not clean.
-ingest() {
-    local code=0
-    set -- ingest --round "$round" --commit "$built" --state "$STATE/state.json" \
-        --source-root "$SIM_FLEET_REPO_DIR"
+# Settles round $1 of commit $2: `ingest` counts it (or refuses it) and saves that with the
+# round's id in the state file, in one atomic write. The decision is that record, never an exit
+# code (P382): with no record, `refuse` records the round as refused; with none still (the state
+# cannot be written), the round stays where it is and the loop stops, so systemd's restart
+# settles it again. A round that is recorded is deleted, or, when `ingest` did not exit 0 (it
+# refused the round, or failed after recording it), kept in `last-failed-round` for a look.
+settle() {
+    local id=$1 commit=$2 code=0
+    set -- ingest --round "$round" --round-id "$id" --commit "$commit" \
+        --state "$STATE/state.json" --source-root "$SIM_FLEET_REPO_DIR"
     if [[ -n "$SIM_FLEET_DRY_RUN" ]]; then
         set -- "$@" --dry-run
     else
@@ -405,37 +420,31 @@ ingest() {
     if [[ -n "$SIM_FLEET_TRACKER" ]]; then set -- "$@" --tracker "$SIM_FLEET_TRACKER"; fi
     timeout "$SIM_FLEET_REPORT_TIMEOUT" "$SIM_FLEET_PYTHON" -I "$bin/sim_fleet.py" "$@" ||
         code=$?
-    if (( code == 0 )); then
-        # Recorded: the round is done. A leftover `round/commit` would be counted as a round a
-        # killed run left, so the next round would count this clean one as refused.
-        rm -rf "$round"
-        return 0
+    if ! recorded "$id"; then
+        log "sim_fleet.py ingest exited $code and did not record round $id; refusing it"
+        if (( code == 0 )); then code=1; fi
+        timeout "$SIM_FLEET_REPORT_TIMEOUT" "$SIM_FLEET_PYTHON" -I "$bin/sim_fleet.py" refuse \
+            --round-id "$id" --commit "$commit" --state "$STATE/state.json" || true
     fi
-    rm -rf "$STATE/last-failed-round"
-    mv "$round" "$STATE/last-failed-round"
-    log "sim_fleet.py ingest exited $code; the round is in $STATE/last-failed-round"
-    # Only 2 (counted, GitHub stopped the reports) and 3 (recorded as refused) say the reporter
-    # counted the round. Any other end (an unreadable state, a usage error, the timeout's 124, a
-    # kill, 70 for a crash, an import error) recorded nothing: count it against its commit as
-    # refused, so `soak` cannot read the commit clean (#370).
-    if (( code != 2 && code != 3 )); then
-        refuse_round
+    if ! recorded "$id"; then
+        log "round $id of $commit is recorded nowhere (can $STATE/state.json be written?);" \
+            "it stays in $round, and the loop stops"
+        exit 1
+    fi
+    if (( code == 0 )); then
+        rm -rf "$round"
+    else
+        rm -rf "$STATE/last-failed-round"
+        mv "$round" "$STATE/last-failed-round"
+        log "sim_fleet.py ingest exited $code on round $id, which is recorded; the round is" \
+            "kept in $STATE/last-failed-round for a look"
     fi
 }
 
-# Counts a round of $1 (default: $built) the reporter did not count, as refused.
-refuse_round() {
-    local commit=${1:-$built}
-    timeout "$SIM_FLEET_REPORT_TIMEOUT" "$SIM_FLEET_PYTHON" -I "$bin/sim_fleet.py" refuse \
-        --commit "$commit" --state "$STATE/state.json" ||
-        {
-            log "sim_fleet.py refuse failed; the round of $commit is not counted"
-            # Nothing recorded the round: leave a marker `soak` reads as not clean for this
-            # commit. An empty file named for the commit needs an inode, not a data block.
-            : >"$STATE/unrecorded-$commit" ||
-                log "cannot write $STATE/unrecorded-$commit; stopping"
-            [[ -e "$STATE/unrecorded-$commit" ]] || exit 75
-        }
+# Whether the state file holds the record of round $1: the id is a random token that only
+# `last_round` holds, and it is written in the same atomic save as the round's count.
+recorded() {
+    [[ "$1" =~ ^[0-9]{1,20}-[0-9a-f]{16}$ ]] && grep -qsF -- "\"$1\"" "$STATE/state.json"
 }
 
 # Sourced by the tests, which call the functions above.
