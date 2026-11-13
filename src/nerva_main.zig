@@ -9,6 +9,9 @@ const log = std.log.scoped(.main);
 
 const stdx = @import("stdx");
 const vsr = @import("vsr.zig");
+const mv = vsr.multiversion;
+const Multiversion = mv.Multiversion;
+const MultiversionOS = mv.MultiversionOS;
 const constants = @import("constants.zig");
 const config = constants.config;
 const cli = @import("nerva/cli.zig");
@@ -161,16 +164,31 @@ fn run() !void {
                 log.warn("NRV-W0701 start: commit-key deduplication is off: " ++
                     "a resent key commits again", .{});
             }
-            if (tag == .start) preflight.start(gpa, args.path, if (!constants.direct_io)
-                .disabled
-            else if (args.development)
-                .optional
-            else
-                .required);
-
             // Initialise IO before creating any file, so a failure leaves nothing behind.
             var io = try IO.init(if (tag == .format) 2048 else 128, 0);
             defer io.deinit();
+
+            // `start` runs every release its binary bundles (R6, P259): found before the data
+            // file is checked, since the file's release is judged against them.
+            var multiversion_os: MultiversionOS = undefined;
+            var multiversion_bundled = false;
+            var multiversion: Multiversion = Multiversion.single_release(config.process.release);
+            if (tag == .start) {
+                multiversion_bundled = bundle_open(gpa, &io, &multiversion_os);
+                if (multiversion_bundled) multiversion = multiversion_os.multiversion();
+                const releases_run = multiversion.releases_bundled();
+                preflight.start(gpa, args.path, if (!constants.direct_io)
+                    .disabled
+                else if (args.development)
+                    .optional
+                else
+                    .required, releases_run.slice(), if (multiversion_bundled)
+                    (std.posix.getenv("NERVA_MEMFD_NOEXEC_PATH") orelse
+                        preflight.memfd_noexec_path)
+                else
+                    null);
+            }
+            defer if (multiversion_bundled) multiversion_os.deinit(gpa);
 
             var time_os: stdx.TimeOS = .{};
             const time = time_os.interface();
@@ -254,7 +272,16 @@ fn run() !void {
 
             switch (tag) {
                 .format => try command_format(gpa, &storage, args),
-                .start => try command_start(gpa, &io, time, &tracer, &storage, args),
+                .start => try command_start(
+                    gpa,
+                    &io,
+                    time,
+                    &tracer,
+                    &storage,
+                    args,
+                    multiversion,
+                    if (multiversion_bundled) &multiversion_os else null,
+                ),
                 .version, .view, .api, .@"export", .backup, .import, .restore, .recover => comptime unreachable,
             }
         },
@@ -729,6 +756,8 @@ fn command_start(
     tracer: *Tracer,
     storage: *Storage,
     args: *const cli.Command.Start,
+    multiversion: Multiversion,
+    multiversion_os: ?*MultiversionOS,
 ) !void {
     const peer_keys = cluster_keys(args);
 
@@ -747,8 +776,8 @@ fn command_start(
         .node_count = args.addresses.members_count(),
         .release = config.process.release,
         .release_client_min = config.process.release_client_min,
-        .multiversion = .single_release(config.process.release),
-        // Nerva bundles only its own release: peers of another release are ignored (N61, #34).
+        .multiversion = multiversion,
+        // Peers of a release this binary cannot run are ignored (N61, P259).
         .release_peers_strict = true,
         // Replicas prove to each other that they hold the cluster key (P102).
         .peer_keys = peer_keys,
@@ -790,6 +819,9 @@ fn command_start(
         else => |e| return e,
     };
 
+    // Poll the binary on disk for a newer bundle, as upstream does after opening.
+    if (multiversion_os) |os| os.timeout_start(replica.replica);
+
     // Startup succeeded: the trace file is the operator's now, whatever happens later.
     diagnostic.cleanup_clear();
 
@@ -827,10 +859,59 @@ fn command_start(
         @panic("This is a test binary, but the cluster id is non-zero.");
     }
 
+    const releases_offered = multiversion.releases_bundled().count;
+    var gauge_ticks: u64 = 0;
     while (true) {
         replica.tick();
+        // The release this replica runs and how many it bundles, once a second.
+        if (gauge_ticks % (std.time.ms_per_s / constants.tick_ms) == 0) {
+            tracer.gauge(.replica_release, replica.release.value);
+            tracer.gauge(.replica_releases_offered, releases_offered);
+        }
+        gauge_ticks +%= 1;
         try io.run_for_ns(constants.tick_ms * std.time.ns_per_ms);
     }
+}
+
+/// Opens the release bundle of this binary into `multiversion_os`: true when it has one. An
+/// unbundled binary (a build, or the first release) runs only itself. A bundle that cannot be
+/// read is refused (NRV-E0719): running as one release would strand a cluster that upgrades.
+fn bundle_open(gpa: std.mem.Allocator, io: *IO, multiversion_os: *MultiversionOS) bool {
+    const exe_path = mv.self_exe_path(gpa) catch |err| bundle_fail(err);
+    defer gpa.free(exe_path);
+
+    if (!bundle_present(gpa, exe_path)) return false;
+
+    multiversion_os.* = MultiversionOS.init(gpa, io, exe_path, .native) catch |err| bundle_fail(err);
+    multiversion_os.open_sync() catch |err| bundle_fail(err);
+    return true;
+}
+
+fn bundle_fail(err: anyerror) noreturn {
+    diagnostic.fail(
+        "NRV-E0719",
+        "start: this binary's bundle of releases cannot be read ({s})",
+        .{@errorName(err)},
+        "download the release again; nothing was changed",
+        .{},
+    );
+}
+
+/// Whether the executable at `exe_path` carries the multiversion sections.
+fn bundle_present(gpa: std.mem.Allocator, exe_path: [:0]const u8) bool {
+    const file = std.fs.openFileAbsolute(exe_path, .{}) catch return false;
+    defer file.close();
+    const size = file.getEndPos() catch return false;
+    const buffer = gpa.alignedAlloc(u8, @alignOf(std.elf.Elf64_Ehdr), size) catch return false;
+    defer gpa.free(buffer);
+    const read = file.readAll(buffer) catch return false;
+    if (read != size) return false;
+    _ = mv.parse_elf(buffer) catch |err| switch (err) {
+        error.MultiversionHeaderOrBodyNotFound => return false,
+        // Present but unreadable: open_sync reports it.
+        else => return true,
+    };
+    return true;
 }
 
 /// The cluster keys replicas authenticate each other with (P102), from `NERVA_CLUSTER_KEY` and
