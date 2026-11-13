@@ -100,21 +100,30 @@ one.
   Deleting a corrupt `state.json` to get past that erases the candidate's refused count (and its
   fingerprints): never do it for a commit you mean to release.
 - **Every round is settled by a record, never by an exit code** (#370, P382). `run.sh` gives each
-  round a random id (`state/round/id`, beside `commit`). `sim_fleet.py ingest` counts the round
-  (or refuses it whole: past 4096 failing seeds, or a malformed `results` line) and saves that,
-  with the id in `last_round`, in one atomic write of the state file, before it reads the token
-  or asks GitHub anything; a missing token or GitHub down then stops only the reports. After
-  `ingest` ends, however it ends, `run.sh` looks for the id in the state file. Not there (a usage
-  error, a crash, a timeout, a kill): `sim_fleet.py refuse` records the round as refused. Still
-  not there (the state cannot be written): the round stays in `state/round/`, `run.sh` exits 1,
-  and systemd starts it again 30 s later. A recorded round is deleted; one `ingest` did not exit
-  0 on is kept in `state/last-failed-round/` for a look. `ingest` and `refuse` do nothing for a
-  round already recorded, so no round is counted twice. A refused round makes its commit not
-  clean for `soak`.
+  round a random id (`state/round/id`, beside `commit`) and waits for each worker. If any worker
+  died before the round's end (any failed command, such as a full disk), the round is refused
+  without being read: that worker may have lost a failing seed. Otherwise `sim_fleet.py ingest`
+  counts the round, or refuses it whole (past 4096 failing seeds, or a malformed `results`
+  line), and saves that, with the id in `last_round`, in one atomic write of the state file,
+  before it reads the token or asks GitHub anything; a missing token or GitHub down then stops
+  only the reports. An unterminated last line, which only a power cut or a full disk leaves, is
+  a failure when it has a code that is not 0, and is dropped otherwise. After `ingest` ends,
+  however it ends, `run.sh` looks for the id in the state file. Not there (a usage error, a
+  crash, a timeout, a kill): `sim_fleet.py refuse` records the round as refused. Still not there
+  (the state cannot be written): the round stays in `state/round/`, `run.sh` exits 1, and
+  systemd starts it again 30 s later. A counted round is deleted; a refused one, or one `ingest`
+  did not exit 0 on, is kept in `state/last-failed-round/` for a look. `ingest` and `refuse` do
+  nothing for a round already recorded, so no round is counted twice. A refused round makes its
+  commit not clean for `soak`, and the tracker's daily totals say how many rounds were refused.
 - **A restart is safe.** A round that a stop, a reboot or a crash left in `state/round/` is
-  settled from the results its workers wrote, as any round is, before the next one starts: its
-  finished seeds count, a failing one makes the commit not clean (its `results` line is fsynced
-  before its full-log replay), and a seed the stop killed is recorded as a failure (exit 143).
+  settled from the results its workers wrote, before the next one starts, under the round's own
+  commit: its finished seeds count, and a failing one makes that commit not clean (a seed's
+  `results` line is its only record: written first, and fsynced when the seed did not pass,
+  before its log and its full-log replay). A stop kills the seeds that were running with their
+  workers, and they are not recorded: a seed that had not finished had not failed yet, so this
+  loses seed-hours, not failures. Two rare cases do lose one failing seed: a worker that died
+  in a round that a stop then cut before the round's end, and a power cut that tears a failing
+  seed's line before its code (P382).
 - Every collection is bounded (`sim_fleet.py`, the constants at the top): seeds and failing seeds
   per round, bytes read of a log, lines in an issue, fingerprints remembered (2048), days kept
   (31), pages scanned on a rebuild (5).
@@ -253,19 +262,20 @@ soak 1a2b3c4: 24.6 h, vopr-nerva 182,311 seeds, vopr-testing 15,020, fuzz 9,874;
 is the full SHA or a prefix of at least 7 hex digits.) Exit 0 if the commit ran and is clean; 1 if the state
 has no round of it (the line then says `0.0 h`), the prefix names two commits, or the commit is not
 clean: any failing seed, any seed past its deadline or killed by the host (a candidate that hangs
-its seeds is not clean, however many hours they fill), any failure fingerprint hit, or any round refused or lost (a round the reporter refused,
-e.g. past 4096 failing seeds, or never finished; the line then ends `; N rounds refused or lost
-by the reporter, their seeds unknown`); 2 if the
-state file is missing or unreadable. "Failures" counts failing seeds, not distinct bugs. "Issues
+its seeds is not clean, however many hours they fill), any failure fingerprint hit, or any
+refused round (a worker died, past 4096 failing seeds, a malformed line, or a reporter that left
+no record; the line then ends `; N rounds refused or lost by the reporter, their seeds
+unknown`); 2 if the state file is missing or unreadable. "Failures" counts failing seeds, not distinct bugs. "Issues
 its rounds hit" lists the issue of every failure fingerprint the commit's rounds hit, from the
 rounds' own records and so independent of throttling, a hold or a rate limit (`not filed (...)`
 is a failure whose report was not posted); the state does not see a closed issue, so confirm each
 listed issue on GitHub (`label:sim-fleet is:open`) before quoting it. The gate wants 24 hours and no open
 issue; the line does not decide that, the reader does.
 
-**A refused round cannot be cleared.** A refused round now means bad input or a reporter bug (a
-token, GitHub, a restart or a slow disk no longer refuses a round), so the state has no way to
-undo one and `run.sh` writes no marker to remove. Read the round in `state/last-failed-round/`
+**A refused round cannot be cleared.** A refused round now means a worker that died (a full
+disk, a failing command), bad input or a reporter bug (a token, GitHub, a restart or a slow disk
+no longer refuses a round), so the state has no way to undo one and `run.sh` writes no marker to
+remove. Read the round in `state/last-failed-round/`
 and the journal; if it was the host and not the candidate, the owner waives it in writing in the
 release PR, or the fleet soaks a new candidate.
 

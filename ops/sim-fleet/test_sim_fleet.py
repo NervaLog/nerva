@@ -192,6 +192,22 @@ class Fingerprints(unittest.TestCase):
             with self.assertRaises(fleet.BadInput, msg=line):
                 fleet.read_round(rnd.path)
 
+    def test_every_collection_of_a_round_is_bounded(self):
+        # Each bound is checked as the collection grows, not after: lowered here to 2.
+        rnd = Round(self)
+        for worker in range(3):
+            rnd.seed(worker, "vopr-nerva", worker, 134)
+        for name, value in (("WORKERS_MAX", 2), ("ROUND_FAILURES_MAX", 2),
+                            ("RESULTS_LINES_MAX", 2), ("RESULTS_BYTES_MAX", 40)):
+            saved = getattr(fleet, name)
+            setattr(fleet, name, value)
+            try:
+                with self.assertRaisesRegex(fleet.BadInput, f"more than {value} ", msg=name):
+                    fleet.read_round(rnd.path)
+            finally:
+                setattr(fleet, name, saved)
+        self.assertEqual(len(fleet.read_round(rnd.path)[1]), 3)
+
     def test_the_issue_body_carries_seed_commit_replay_tail_and_marker(self):
         failure = self.failure("vopr-nerva", 128, LIVENESS_LOG, seed=42)
         body = fleet.report_text([failure], "abc1234", first=True)
@@ -392,11 +408,17 @@ class StateFile(unittest.TestCase):
             code = fleet.main(["ingest", "--round", rnd.path, "--round-id", ID_A, "--commit",
                                "abcdef1", "--state", self.path, "--dry-run"], now=DAY_ONE)
         self.assertEqual(code, 1)
-        # No seed is counted, but the round is: against its commit, as refused (#370).
+        # No seed is counted, but the round is: against its commit and its day, as refused
+        # (#370), and the day's totals on the tracker say so.
         state = fleet.load_state(self.path)
-        self.assertEqual(state["days"], {})
+        day = state["days"][fleet.ymd(DAY_ONE)]
+        self.assertEqual((day["rounds"], day["refused"], day["targets"]), (0, 1, {}))
         self.assertEqual(state["commits"]["abcdef1"]["refused"], 1)
         self.assertEqual(state["commits"]["abcdef1"]["rounds"], 0)
+        text = fleet.totals_text(state, fleet.ymd(DAY_ONE), day)
+        self.assertIn("in 0 rounds, and 1 rounds refused (their seeds unknown;", text)
+        state["days"][fleet.ymd(DAY_ONE)]["refused"] = 0
+        self.assertNotIn("refused", fleet.totals_text(state, fleet.ymd(DAY_ONE), day))
 
 
 SHA_A = "1a2b3c4" + "0" * 33
@@ -638,9 +660,10 @@ class Soak(unittest.TestCase):
         self.assertEqual(state["commits"][SHA_A]["rounds"], 1)
         self.assertEqual(state["commits"][SHA_A]["refused"], 0)
         self.assertEqual(state["last_round"]["outcome"], "counted")
-        # A refused round is not counted by a later ingest of the same id either.
+        # A refused round is not counted by a later ingest of the same id either, and that
+        # ingest exits 1, so run.sh keeps the round for a look.
         self.ingest_main(path, self.too_many_failures(), round_id=ID_B)
-        self.assertEqual(self.ingest_main(path, rnd, round_id=ID_B)[0], 0)
+        self.assertEqual(self.ingest_main(path, rnd, round_id=ID_B)[0], 1)
         state = fleet.load_state(path)
         self.assertEqual((state["commits"][SHA_A]["rounds"], state["commits"][SHA_A]["refused"]),
                          (1, 1))
@@ -1144,13 +1167,13 @@ class RunShSettle(unittest.TestCase):
              f'{script}'],
             env=env, capture_output=True, text=True, timeout=120)
 
-    def run_round(self, **kwargs):
+    def run_round(self, prefix="", **kwargs):
         # run_round sets `bin` from `built`; the binaries of SHA_A are the stub's.
         os.makedirs(os.path.join(self.state, "bin"), exist_ok=True)
         link = os.path.join(self.state, "bin", SHA_A)
         if not os.path.exists(link):
             os.symlink(self.bin, link)
-        return self.sh("run_round", **kwargs)
+        return self.sh(prefix + "run_round", **kwargs)
 
     def leftover(self, lines, round_id=ID_A, commit=SHA_A):
         os.makedirs(os.path.join(self.round, "w0"))
@@ -1369,36 +1392,92 @@ class RunShSettle(unittest.TestCase):
         self.assertEqual(self.failed(), 1)
         self.assertEqual(self.soak_code(), 1)
 
-    def test_a_failure_directory_with_no_results_line_is_counted(self):
-        self.leftover(["vopr-nerva 5 0 3600"])
-        fail = os.path.join(self.round, "w0", "fail-vopr-nerva-77")
-        os.makedirs(fail)
-        Path(fail, "tail.log").write_text("panic: boom\n")
-        Path(fail, "code").write_text("134\n")
-        fuzz = os.path.join(self.round, "w0", "fail-fuzz-lsm_tree-78")
-        os.makedirs(fuzz)  # No code file: counted as a failure with code 1.
-        out = self.sh(f'round="{self.round}"; bin="{self.bin}"; settle {ID_A} {SHA_A}')
-        self.assertEqual(out.returncode, 0, out.stderr)
-        self.assertEqual(self.failed(), 2)
-        self.assertEqual(self.entry()["refused"], 0)
-        self.assertEqual(self.soak_code(), 1)
+    def test_a_torn_last_results_line_is_a_failure_when_it_names_one(self):
+        for n, torn in enumerate(("vopr-nerva 66 12", "vopr-nerva 66 134 1"), 1):
+            subprocess.run(["rm", "-rf", self.round, os.path.join(self.state, "state.json")])
+            self.leftover(["vopr-nerva 5 0 3600"], round_id=f"{n}-{n:016x}")
+            with open(os.path.join(self.round, "w0", "results"), "a") as f:
+                f.write(torn)  # No newline: cut short.
+            out = self.sh(f'round="{self.round}"; bin="{self.bin}"; settle {n}-{n:016x} {SHA_A}')
+            self.assertEqual(out.returncode, 0, out.stderr)
+            self.assertEqual((self.seeds(), self.failed()), (2, 1), torn)
+            self.assertEqual(self.entry()["refused"], 0)
 
-    def test_a_torn_last_results_line_is_a_failure_when_its_seed_is_known(self):
+    def test_a_torn_last_results_line_that_names_no_failure_is_dropped(self):
+        # A power cut tears an unsynced (passing) line, or leaves a NUL tail: the round still
+        # counts, without that seed. A cut seed number ("vopr-nerva 12") is never a failure.
+        for n, torn in enumerate(("vopr-ne", "vopr-nerva 12", "vopr-nerva 66 0 3",
+                                  "\0\0\0\0", "vopr-nerva 66 x"), 1):
+            subprocess.run(["rm", "-rf", self.round, os.path.join(self.state, "state.json")])
+            self.leftover(["vopr-nerva 5 0 3600"], round_id=f"{n}-{n:016x}")
+            with open(os.path.join(self.round, "w0", "results"), "a") as f:
+                f.write(torn)
+            out = self.sh(f'round="{self.round}"; bin="{self.bin}"; settle {n}-{n:016x} {SHA_A}')
+            self.assertEqual(out.returncode, 0, out.stderr)
+            self.assertEqual((self.seeds(), self.failed()), (1, 0), repr(torn))
+            self.assertEqual(self.entry()["refused"], 0)
+            self.assertFalse(self.kept())
+
+    def test_a_malformed_terminated_line_still_refuses_the_round(self):
         self.leftover(["vopr-nerva 5 0 3600"])
         with open(os.path.join(self.round, "w0", "results"), "a") as f:
-            f.write("vopr-nerva 66 12")  # No newline, no seconds: cut short.
-        out = self.sh(f'round="{self.round}"; bin="{self.bin}"; settle {ID_A} {SHA_A}')
-        self.assertEqual(out.returncode, 0, out.stderr)
-        self.assertEqual(self.failed(), 1)
-        self.assertEqual(self.entry()["refused"], 0)
-
-    def test_a_torn_last_results_line_without_a_seed_refuses_the_round(self):
-        self.leftover(["vopr-nerva 5 0 3600"])
-        with open(os.path.join(self.round, "w0", "results"), "a") as f:
-            f.write("vopr-ne")
+            f.write("vopr-ne\n")
         out = self.sh(f'round="{self.round}"; bin="{self.bin}"; settle {ID_A} {SHA_A}')
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertEqual(self.entry()["refused"], 1)
+        self.assertTrue(self.kept())
+
+    def test_a_leftover_round_is_settled_under_its_own_commit(self):
+        # `systemctl restart` to move the pin: the new pin is built before the old candidate's
+        # round is settled, and that round's failure is the old candidate's.
+        self.leftover(["vopr-nerva 6 134 600"], commit=SHA_B)
+        out = self.run_round()
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(self.failed(), 0)  # The new pin, SHA_A: one empty round.
+        self.assertEqual(self.entry()["rounds"], 1)
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(fleet.main(["soak", "--commit", SHA_B, "--state",
+                                         os.path.join(self.state, "state.json")]), 1)
+        self.assertEqual(self.state_json()["commits"][SHA_B]["kinds"]["vopr-nerva"]["failed"], 1)
+
+    def test_a_worker_that_dies_refuses_the_round(self):
+        # A failing seed, then a full disk: `mkdir` of its directory fails and the worker dies
+        # under `set -e` (#370, the review's reproduction). The round is refused, not clean.
+        self.script(os.path.join(self.bin, "vopr-nerva"), "exit 134\n")
+        mkdir = 'mkdir() { case "$*" in *fail-*) return 1;; esac; command mkdir "$@"; }; '
+        out = self.run_round(mkdir, workers=2)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("2 of 2 workers of round", out.stderr)
+        self.assertEqual(self.entry()["refused"], 1)
+        self.assertEqual(self.entry()["rounds"], 0)
+        self.assertTrue(self.kept())
+        self.assertEqual(self.soak_code(), 1)
+
+    def test_one_dead_worker_of_two_refuses_the_round(self):
+        # The other worker's seeds pass; the round is refused all the same.
+        self.script(os.path.join(self.bin, "vopr-nerva"), "exit 0\n")
+        die = ('worker() { if [[ $1 == 1 ]]; then return 3; fi; '
+               'mkdir -p "$round/w$1"; echo "vopr-nerva 9 0 3600" >>"$round/w$1/results"; }; ')
+        out = self.run_round(die, workers=2)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("1 of 2 workers of round", out.stderr)
+        self.assertEqual(self.entry()["refused"], 1)
+        self.assertEqual(self.soak_code(), 1)
+
+    def test_a_failing_seed_line_and_the_round_id_are_synced(self):
+        # Power-cut durability cannot be tested here; this checks that the syncs are made, and
+        # in order: the round's id before any seed, a failing seed's line before its log.
+        self.script(os.path.join(self.bin, "vopr-nerva"), "exit 134\n")
+        log = os.path.join(self.dir, "sync.log")
+        spy = (f'sync() {{ echo "sync $*" >>"{log}"; }}; '
+               f'tail() {{ echo "tail" >>"{log}"; command tail "$@"; }}; ')
+        out = self.run_round(spy, workers=1)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        calls = Path(log).read_text().splitlines()
+        self.assertRegex(calls[0], r"^sync .*/round\.new/id .*/round\.new/commit")
+        self.assertRegex(calls[1], r"^sync .*/round .*/state$")
+        self.assertRegex(calls[2], r"^sync .*/round/w0/results$")
+        self.assertEqual(calls[3], "tail")
 
 
 class Rotation(unittest.TestCase):

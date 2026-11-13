@@ -326,23 +326,32 @@ run_round() {
     mv "$round.new" "$round"
     # The id must survive a power cut before any worker writes a result under it.
     sync "$round" "$(dirname "$round")"
-    local deadline=$(( $(date +%s) + SIM_FLEET_ROUND_SECONDS )) w=0 i
+    local deadline=$(( $(date +%s) + SIM_FLEET_ROUND_SECONDS )) w=0 i pid died=0 pids=()
     for (( i = 0; i < SIM_FLEET_WORKERS_VOPR_NERVA; i++ )); do
-        worker "$w" vopr-nerva "$deadline" & w=$(( w + 1 ))
+        worker "$w" vopr-nerva "$deadline" & pids+=("$!") w=$(( w + 1 ))
     done
     for (( i = 0; i < SIM_FLEET_WORKERS_VOPR_TESTING; i++ )); do
-        worker "$w" vopr-testing "$deadline" & w=$(( w + 1 ))
+        worker "$w" vopr-testing "$deadline" & pids+=("$!") w=$(( w + 1 ))
     done
     for (( i = 0; i < SIM_FLEET_WORKERS_FUZZ; i++ )); do
         # Each fuzz worker starts at a different fuzzer and moves to the next after every seed.
-        worker "$w" fuzz "$deadline" "$i" & w=$(( w + 1 ))
+        worker "$w" fuzz "$deadline" "$i" & pids+=("$!") w=$(( w + 1 ))
     done
     for (( i = 0; i < SIM_FLEET_WORKERS_MIXED; i++ )); do
         # Each mixed worker starts at a different place in the rotation.
-        worker "$w" mixed "$deadline" "$i" & w=$(( w + 1 ))
+        worker "$w" mixed "$deadline" "$i" & pids+=("$!") w=$(( w + 1 ))
     done
-    wait
-    settle "$id" "$built"
+    # A worker that exits non-zero died before the round's end (any failed command, under the
+    # inherited `set -e`): it may have lost a failing seed, so the round is refused (#370).
+    for pid in "${pids[@]}"; do
+        wait "$pid" || died=$(( died + 1 ))
+    done
+    if (( died > 0 )); then
+        log "$died of ${#pids[@]} workers of round $id died before its end; refusing it"
+        settle "$id" "$built" refuse
+    else
+        settle "$id" "$built"
+    fi
 }
 
 # Worker $1 of kind $2 runs seeds until time $3; a fuzz worker starts its rotation at $4. Each
@@ -382,18 +391,18 @@ worker() {
         # The whole output goes to a file of this worker's, overwritten by the next seed (a VOPR
         # seed writes about 100 KB in the short log mode).
         "$@" >"$dir/seed.log" 2>&1 </dev/null 9>&- || code=$?
-        # A failing seed is made known before anything slow: its directory and its `results`
-        # line (synced) come first, the full-log replay (up to SIM_FLEET_REPLAY_TIMEOUT) after,
-        # so a stop in the replay cannot lose it (#370). A stop kills this bash too, so a 143
-        # is a seed signalled by something else, and a failure like any other.
+        # The seed's `results` line is its only record, so it comes first, synced when the seed
+        # did not pass; its log and its full-log replay (up to SIM_FLEET_REPLAY_TIMEOUT) come
+        # after, and a stop or a full disk there cannot lose it (#370). If anything here fails,
+        # this worker dies and run_round refuses the round. A stop kills this bash with its
+        # seed: that seed had not finished, so it had not failed, and it is not recorded.
+        echo "$target $seed $code $(( $(date +%s) - started ))" >>"$dir/results"
+        if (( code != 0 )); then sync "$dir/results"; fi
         if (( code != 0 && code != 124 && code != 137 )); then
             out="$dir/fail-${target/:/-}-$seed"
             mkdir -p "$out"
-            echo "$code" >"$out/code"
             tail -c "$SIM_FLEET_TAIL_BYTES" "$dir/seed.log" >"$out/tail.log"
         fi
-        echo "$target $seed $code $(( $(date +%s) - started ))" >>"$dir/results"
-        if (( code != 0 )); then sync "$dir/results" 2>/dev/null || true; fi
         if [[ "$cur" == vopr-* && $code -eq 129 ]]; then
             # The last 20: a passing run logs `[err] (client): ... session evicted` too, and
             # the checker's message is the last line before the exit.
@@ -409,26 +418,23 @@ worker() {
 }
 
 # Settles round $1 of commit $2: `ingest` counts it (or refuses it) and saves that with the
-# round's id in the state file, in one atomic write. The decision is that record, never an exit
-# code (P382): with no record, `refuse` records the round as refused; with none still (the state
-# cannot be written), the round stays where it is and the loop stops, so systemd's restart
-# settles it again. A round that is recorded is deleted, or, when `ingest` did not exit 0 (it
-# refused the round, or failed after recording it), kept in `last-failed-round` for a look.
+# round's id in the state file, in one atomic write; with $3 = `refuse` (a worker died), the
+# round is refused without reading it. The decision is that record, never an exit code (P382):
+# with no record, `refuse` records the round as refused; with none still (the state cannot be
+# written), the round stays where it is and the loop stops, so systemd's restart settles it
+# again. A round that is recorded is deleted, or, when it was refused or `ingest` did not exit 0,
+# kept in `last-failed-round` for a look.
 settle() {
-    local id=$1 commit=$2 code=0
-    set -- ingest --round "$round" --round-id "$id" --commit "$commit" \
-        --state "$STATE/state.json" --source-root "$SIM_FLEET_REPO_DIR"
-    if [[ -n "$SIM_FLEET_DRY_RUN" ]]; then
-        set -- "$@" --dry-run
-    else
-        set -- "$@" --repo "$SIM_FLEET_GH_REPO" --token-file "$token_file"
+    local id=$1 commit=$2 code=1
+    if [[ "${3:-}" != refuse ]]; then
+        code=0
+        ingest_round "$id" "$commit" || code=$?
+        if ! recorded "$id"; then
+            log "sim_fleet.py ingest exited $code and did not record round $id; refusing it"
+            if (( code == 0 )); then code=1; fi
+        fi
     fi
-    if [[ -n "$SIM_FLEET_TRACKER" ]]; then set -- "$@" --tracker "$SIM_FLEET_TRACKER"; fi
-    timeout "$SIM_FLEET_REPORT_TIMEOUT" "$SIM_FLEET_PYTHON" -I "$bin/sim_fleet.py" "$@" ||
-        code=$?
     if ! recorded "$id"; then
-        log "sim_fleet.py ingest exited $code and did not record round $id; refusing it"
-        if (( code == 0 )); then code=1; fi
         timeout "$SIM_FLEET_REPORT_TIMEOUT" "$SIM_FLEET_PYTHON" -I "$bin/sim_fleet.py" refuse \
             --round-id "$id" --commit "$commit" --state "$STATE/state.json" || true
     fi
@@ -442,9 +448,23 @@ settle() {
     else
         rm -rf "$STATE/last-failed-round"
         mv "$round" "$STATE/last-failed-round"
-        log "sim_fleet.py ingest exited $code on round $id, which is recorded; the round is" \
-            "kept in $STATE/last-failed-round for a look"
+        log "round $id is recorded, refused or with sim_fleet.py exit $code; the round is kept" \
+            "in $STATE/last-failed-round for a look"
     fi
+}
+
+# `sim_fleet.py ingest` of round $1 of commit $2 (its exit code).
+ingest_round() {
+    local id=$1 commit=$2
+    set -- ingest --round "$round" --round-id "$id" --commit "$commit" \
+        --state "$STATE/state.json" --source-root "$SIM_FLEET_REPO_DIR"
+    if [[ -n "$SIM_FLEET_DRY_RUN" ]]; then
+        set -- "$@" --dry-run
+    else
+        set -- "$@" --repo "$SIM_FLEET_GH_REPO" --token-file "$token_file"
+    fi
+    if [[ -n "$SIM_FLEET_TRACKER" ]]; then set -- "$@" --tracker "$SIM_FLEET_TRACKER"; fi
+    timeout "$SIM_FLEET_REPORT_TIMEOUT" "$SIM_FLEET_PYTHON" -I "$bin/sim_fleet.py" "$@"
 }
 
 # Whether the state file holds the record of round $1: the id is a random token that only

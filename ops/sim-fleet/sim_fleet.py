@@ -36,14 +36,14 @@ deadline or was killed by the host, or a failure fingerprint was hit, or a round
 
 The round's record (P382). `ingest` counts the round, or refuses it whole (more than
 ROUND_FAILURES_MAX failing seeds, a malformed `results` line: its seeds are unknown, so it counts
-against its commit as `refused`), and saves that in one atomic write of the state file together
-with `last_round`, the round's id (`--round-id`, which run.sh makes), before it needs the token or
-GitHub. `refuse` records a round `ingest` left unrecorded as refused, and does nothing if it is
-recorded. run.sh decides by that record alone, never by an exit code: after `ingest` it looks for
-the id in the state file, runs `refuse` if it is not there, and stops with the round kept if it is
-still not there. Both commands are idempotent for one id, so a round a stop or a crash left is
-ingested again safely. Exit codes are for people: `ingest` 0 counted (or already recorded), 1
-not; `refuse` 0 recorded, 1 not; argparse's own 2 for a bad command line. The state is saved
+against its commit and its day as `refused`), and saves that in one atomic write of the state
+file together with `last_round`, the round's id (`--round-id`, which run.sh makes), before it
+needs the token or GitHub. `refuse` records a round as refused (one `ingest` left unrecorded,
+or one a worker of which died), and does nothing if it is recorded. run.sh decides by that
+record alone, never by an exit code: after `ingest` it looks for the id in the state file, runs
+`refuse` if it is not there, and stops with the round kept if it is still not there. Both commands are idempotent for one id, so a round a stop or a crash left is
+ingested again safely. Exit codes are for people: `ingest` 0 counted (now or before), 1 not;
+`refuse` 0 recorded, 1 not; argparse's own 2 for a bad command line. The state is saved
 whatever GitHub answered. Standard library only.
 """
 
@@ -65,7 +65,9 @@ STATE_VERSION = 1
 
 # Bounds. Every collection this reads or keeps has one.
 RESULTS_LINES_MAX = 500_000  # Seeds per round (a 15-minute round on 64 cores at 1 s a seed: 58k).
+RESULTS_BYTES_MAX = RESULTS_LINES_MAX * 128  # Bytes of `results` read per round (a line is < 100).
 ROUND_FAILURES_MAX = 4096  # Failing seeds read per round; past it the round is refused.
+WORKERS_MAX = 1024  # Worker directories in a round (run.sh refuses more workers).
 LOG_READ_BYTES_MAX = 256 * 1024  # Read of one tail.log or errors.log.
 ISSUE_LOG_LINES_MAX = 60  # Lines of log in an issue body.
 ISSUE_LOG_BYTES_MAX = 8 * 1024  # Bytes of log in an issue body.
@@ -279,70 +281,55 @@ class Counts(dict):
 
 def read_round(round_dir, source_root=None):
     """Every seed of the round: counts per target (with each worker's busy seconds), and the
-    failures to report."""
+    failures to report. Each worker's `results` line is a seed's only record (run.sh writes it
+    first, and syncs it when the seed failed); a malformed line refuses the round."""
     if not os.path.isdir(round_dir):
         raise BadInput(f"{round_dir} is not a directory")
+    workers = []
+    with os.scandir(round_dir) as entries:
+        for entry in entries:
+            if re.fullmatch(r"w\d{1,4}", entry.name):
+                workers.append(entry.name)
+                if len(workers) > WORKERS_MAX:
+                    raise BadInput(f"more than {WORKERS_MAX} workers in one round")
     counts = Counts()
     failures = []
     lines_read = 0
-    workers = sorted(name for name in os.listdir(round_dir) if re.fullmatch(r"w\d{1,4}", name))
-    for worker in workers:
-        seen = set()
-        results = os.path.join(round_dir, worker, "results")
-        if os.path.exists(results):
-            with open(results, encoding="utf-8", errors="replace") as file:
-                lines = file.readlines()
-            for index, line in enumerate(lines):
-                lines_read += 1
-                if lines_read > RESULTS_LINES_MAX:
-                    raise BadInput(f"more than {RESULTS_LINES_MAX} seeds in one round")
-                if index == len(lines) - 1 and not line.endswith("\n"):
-                    line = torn_line(line)  # A write cut short by a crash or a full disk.
-                seen.add(tuple(line.split()[:2]))
-                failure = read_result(round_dir, worker, line, counts, source_root)
-                if failure is not None:
-                    failures.append(failure)
-        # A failing seed has its directory before its `results` line: one without a line is a
-        # failure the worker was stopped on, and is counted (#370).
-        for line in unrecorded_failures(round_dir, worker, seen):
+    bytes_left = RESULTS_BYTES_MAX
+    for worker in sorted(workers):
+        try:
+            with open(os.path.join(round_dir, worker, "results"), "rb") as file:
+                data = file.read(bytes_left + 1)
+        except FileNotFoundError:
+            continue
+        if len(data) > bytes_left:
+            raise BadInput(f"more than {RESULTS_BYTES_MAX} bytes of results in one round")
+        bytes_left -= len(data)
+        lines = data.decode("utf-8", "replace").split("\n")
+        torn = torn_line(lines.pop())  # "" (dropped) when the file ends in a newline.
+        for line in lines + ([torn] if torn else []):
             lines_read += 1
+            if lines_read > RESULTS_LINES_MAX:
+                raise BadInput(f"more than {RESULTS_LINES_MAX} seeds in one round")
             failure = read_result(round_dir, worker, line, counts, source_root)
             if failure is not None:
+                if len(failures) == ROUND_FAILURES_MAX:
+                    raise BadInput(f"more than {ROUND_FAILURES_MAX} failing seeds in one round")
                 failures.append(failure)
-        if len(failures) > ROUND_FAILURES_MAX:
-            raise BadInput(f"more than {ROUND_FAILURES_MAX} failing seeds in one round")
+    assert lines_read <= RESULTS_LINES_MAX and len(failures) <= ROUND_FAILURES_MAX
     return counts, failures
 
 
-def torn_line(line):
-    """An unterminated last line of `results` that does not parse is a seed whose line was cut
-    short: a failure of that seed, when its target and seed can be read. Otherwise the round
-    is refused, as for any other bad line."""
-    fields = line.split()
-    if len(fields) == 4 and all(f.isdigit() for f in fields[1:]):
-        return line
-    if len(fields) >= 2 and TARGET.match(fields[0]) and fields[1].isdigit():
-        return f"{fields[0]} {fields[1]} 1 0"
-    return line
-
-
-def unrecorded_failures(round_dir, worker, seen):
-    """`results` lines for the `fail-*` directories of a worker with no line of their own: the
-    exit code is the one in the directory's `code` file, else 1."""
-    lines = []
-    names = sorted(os.listdir(os.path.join(round_dir, worker)))
-    for name in names:
-        match = re.fullmatch(r"fail-(vopr-nerva|vopr-testing|fuzz-[a-z0-9_]{1,64})-(\d{1,20})",
-                             name)
-        if match is None:
-            continue
-        target = match.group(1).replace("fuzz-", "fuzz:", 1)
-        if (target, match.group(2)) in seen:
-            continue
-        code = (read_bounded(os.path.join(round_dir, worker, name, "code")) or [""])[0].strip()
-        code = code if code.isdigit() and code != "0" else "1"
-        lines.append(f"{target} {match.group(2)} {code} 0")
-    return lines
+def torn_line(text):
+    """The unterminated end of `results`: a line a power cut or a full disk cut short. It is
+    kept only when it names a failure (a third field, the code, that is not 0; a cut code is
+    still not 0), as a failure of that seed, read as any line is. Anything else is dropped:
+    that seed is lost, as a seed a stop killed is, and a passing seed's lost line hides no
+    failure. A cut seed number has no third field, so it is never counted."""
+    fields = text.split()
+    if len(fields) >= 3 and fields[2].isdigit() and int(fields[2]) != 0:
+        return f"{fields[0]} {fields[1]} {fields[2]} 0"
+    return None
 
 
 def read_result(round_dir, worker, line, counts, source_root):
@@ -568,14 +555,16 @@ def add_round(entry, counts):
     assert len(entry["kinds"]) <= len(KINDS)
 
 
-def refuse_round(state, commit):
+def refuse_round(state, commit, now):
     """Counts a round the reporter could not read against `commit`: its seeds are unknown, so it
-    makes the commit not clean for `soak` instead of vanishing (#370). A counter, so it is
-    bounded by the rounds the fleet runs."""
+    makes the commit not clean for `soak` instead of vanishing (#370), and the day's totals on
+    the tracker say so. Counters, so they are bounded by the rounds the fleet runs."""
     state["sequence"] += 1
     entry = commit_entry(state["commits"], commit, state["sequence"])
     entry["refused"] = entry.get("refused", 0) + 1
-    assert entry["refused"] > 0
+    day = day_of(state, ymd(now))
+    day["refused"] = day.get("refused", 0) + 1
+    assert entry["refused"] > 0 and day["refused"] > 0
 
 
 def count_round(day, counts, commit, state=None):
@@ -671,9 +660,11 @@ def totals_text(state, ymd_day, day):
     targets = day["targets"]
     seeds = sum(t["seeds"] for t in targets.values())
     failed = sum(t["failed"] for t in targets.values())
-    out = [f"{ymd_day} (UTC): {seeds} seeds run, {failed} failed, in {day['rounds']} rounds; the "
-           f"last ran at commit `{day['commit']}`. A day with no comment here means the fleet "
-           f"did not run.", "", "Seeds by run:"]
+    refused = (f", and {day['refused']} rounds refused (their seeds unknown; the commit is not "
+               f"clean)") if day.get("refused") else ""
+    out = [f"{ymd_day} (UTC): {seeds} seeds run, {failed} failed, in {day['rounds']} rounds"
+           f"{refused}; the last ran at commit `{day['commit'] or 'none'}`. A day with no comment "
+           f"here means the fleet did not run.", "", "Seeds by run:"]
     for target in sorted(targets):
         total = targets[target]
         out.append(f"- {target}: {total['seeds']} seeds, {total['failed']} failed, "
@@ -1031,7 +1022,8 @@ def rebuild(github, state, log, dry_run):
 def ingest_main(args, now, log):
     """Counts the round, or refuses it, and saves that with the round's record before it needs
     the token or GitHub, which can then stop only the reports. Exit 0 if this run counted the
-    round, else 1; run.sh reads the record, never the exit code."""
+    round (now or before), else 1 (run.sh then keeps the round for a look); whether the round
+    is settled is the record, never the exit code."""
     if not ROUND_ID.fullmatch(args.round_id):
         log("--round-id must be <seconds>-<16 hex digits>")
         return 1
@@ -1045,13 +1037,14 @@ def ingest_main(args, now, log):
     if state is None:
         return 1
     if recorded(state, args.round_id):
-        log(f"round {args.round_id} is already recorded")
-        return 0
+        outcome = state["last_round"]["outcome"]
+        log(f"round {args.round_id} is already recorded ({outcome})")
+        return 0 if outcome == "counted" else 1
     try:
         counts, failures = read_round(args.round, args.source_root)
     except BadInput as err:
         log(f"round refused, counted against {args.commit[:7]} as refused: {err}")
-        refuse_round(state, args.commit)
+        refuse_round(state, args.commit, now)
         save_record(args.state, state, args.round_id, args.commit, "refused", log)
         return 1
     groups, seen = count(state, counts, failures, args.commit, now)
@@ -1079,7 +1072,7 @@ def ingest_main(args, now, log):
     return 0
 
 
-def refuse_main(args, log):
+def refuse_main(args, now, log):
     """Records the round as refused unless it is already recorded: run.sh's fallback when
     `ingest` left no record. Exit 0 if the round is recorded, now or before; else 1."""
     if not ROUND_ID.fullmatch(args.round_id):
@@ -1091,7 +1084,7 @@ def refuse_main(args, log):
     if recorded(state, args.round_id):
         log(f"round {args.round_id} is already recorded")
         return 0
-    refuse_round(state, args.commit)
+    refuse_round(state, args.commit, now)
     return 0 if save_record(args.state, state, args.round_id, args.commit, "refused", log) else 1
 
 
@@ -1124,7 +1117,7 @@ def main(argv, now=None):
     if args.command == "soak":
         return soak_main(args, log)
     if args.command == "refuse":
-        return refuse_main(args, log)
+        return refuse_main(args, now, log)
     return ingest_main(args, now, log)
 
 
