@@ -151,7 +151,7 @@ commit lands within 10%.
 
 - [ ] The README's numbers come from this run.
 - [ ] The p99 cause is named in a decision.
-- [ ] Botpike's Machine size follows from the table.
+- [ ] Botpike's VM size follows from the table.
 
 ## R4 · Gateway: beside its client, honest and observable
 
@@ -339,7 +339,7 @@ gateway. Submits per second and p99 are compared with the sidecar gateway's on t
 
 ```text
 R2 Fleet ──▶ R1 Proven (shares its host) ──▶ R4 Gateway ──▶ Botpike's gate (R1-R5)
-R3 Measured ──────────────────────────────▶ Machine size
+R3 Measured ──────────────────────────────▶ VM size
 R5 Recover ───────────────────────────────▶
                                             R6 Upgrade ──▶ R7 Retention ──▶ R8 Native client
 ```
