@@ -134,16 +134,31 @@ The README's first line no longer says "toy / research": it gives the label and 
 
 ### What was tested
 
-The release candidate is `main` at `TO FILL: candidate SHA`. The figures below are filled in
+The release candidate is `main` at `c886c9f0e5e4cffd12597cc29f46a4535fe6b254` (P388; it replaced `5d7d806`, whose `src/`,
+`build.zig`, `build.zig.zon` and `zig/` are identical). The figures below are filled in
 after the soak and the reviews, and are quoted here from their records. **TO FILL** marks what
 is not in yet.
 
 - **Simulation:** **TO FILL** (the `sim_fleet.py soak --commit <candidate>` line: at least
   24.0 hours of fleet rounds on the candidate, and no open `sim-fleet` issue against it).
-- **Jepsen:** **TO FILL** (the night's `jepsen/nightly` status on the candidate: `retry` and
-  `bank` valid, kill and partition nemeses, with its link).
-- **Two adversarial reviews** (P147b): **TO FILL** (each reviewer's verdict, and its
-  `release-review` issues).
+- **Jepsen:** `retry` and `bank` both passed on `5d7d806`, the candidate's ancestor with the same
+  pinned code: runs [43075322433](https://github.com/NervaLog/nerva/actions/runs/43075322433)
+  (`retry`) and [43075317959](https://github.com/NervaLog/nerva/actions/runs/43075317959)
+  (`bank`), both `success`, 2026-11-11. The owner accepted this run for `c886c9f` instead of a
+  new one (P388). The run was judged by the older harness: `c886c9f` carries #337, after which
+  `healthy?` no longer hides harness errors (#248).
+- **Two adversarial reviews** (P147b), of `5d7d806` against `v0.7.0` (P369), whose findings are
+  `release-review` issues: [#370](https://github.com/NervaLog/nerva/issues/370),
+  [#371](https://github.com/NervaLog/nerva/issues/371),
+  [#372](https://github.com/NervaLog/nerva/issues/372),
+  [#373](https://github.com/NervaLog/nerva/issues/373),
+  [#378](https://github.com/NervaLog/nerva/issues/378),
+  [#379](https://github.com/NervaLog/nerva/issues/379),
+  [#380](https://github.com/NervaLog/nerva/issues/380) and
+  [#384](https://github.com/NervaLog/nerva/issues/384). **TO FILL:** each reviewer's verdict
+  (none is recorded in the issues or the repository) and the owner's written waiver, if any, of
+  the findings still open: #372 (SHOULD), #379 and #380 (NITs). Earlier rounds on older commits:
+  #315 to #321 and #328.
 - **macOS:** the release workflow's Mac job (`mac-sign.yml`) signs and notarizes the zip after the
   owner approves the `apple-signing` environment, and uploads it to the draft release; the owner's
   Mac is the fallback. The `mac-verify` workflow then checks it on Apple silicon and on Intel: the zip against
