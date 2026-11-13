@@ -930,11 +930,25 @@ def record_refused(args, log):
     return True
 
 
+def refused_exit(args, log):
+    return EXIT_REFUSED if record_refused(args, log) else EXIT_UNRECORDED
+
+
 def refuse_main(args, log):
     if not re.fullmatch(r"[0-9a-f]{7,64}", args.commit):
         log("--commit must be a hex commit")
         return 1
     return 0 if record_refused(args, log) else 2
+
+
+# `ingest`'s exit codes. 0 done; EXIT_COUNTED: the round is counted and saved, GitHub stopped the
+# reports (a rate limit, an outage); EXIT_REFUSED: the round is recorded as refused. Anything else
+# (EXIT_UNRECORDED, EXIT_USAGE, 70 for a crash, a timeout's 124, a kill, an interpreter that
+# could not even import this file) recorded nothing: run.sh then runs `refuse` itself.
+EXIT_COUNTED = 2
+EXIT_REFUSED = 3
+EXIT_UNRECORDED = 4
+EXIT_USAGE = 64
 
 
 def main(argv, now=None):
@@ -967,18 +981,18 @@ def main(argv, now=None):
         return refuse_main(args, log)
     if not re.fullmatch(r"[0-9a-f]{7,64}", args.commit):
         log("--commit must be a hex commit")
-        return 1
+        return EXIT_USAGE
     if args.tracker is not None and args.tracker <= 0:
         log("--tracker must be an issue number")
-        return 1
+        return EXIT_USAGE
     if not args.dry_run and not (args.repo and args.token_file):
         log("--repo and --token-file are required unless --dry-run")
-        return 1
+        return EXIT_USAGE
     try:
         counts, failures = read_round(args.round, args.source_root)
     except BadInput as err:
         log(f"round refused, counted against {args.commit[:7]} as refused: {err}")
-        return 1 if record_refused(args, log) else 2
+        return refused_exit(args, log)
     try:
         if args.dry_run:
             github = DryRun(print)
@@ -986,8 +1000,9 @@ def main(argv, now=None):
             github = GitHub(args.repo, read_token(args.token_file), log)
         state = load_state(args.state)
     except Environment as err:
-        log(str(err))
-        return 2
+        # Nothing was counted yet: count the round as refused, so it cannot vanish (#370).
+        log(f"{err}; the round is counted against {args.commit[:7]} as refused")
+        return refused_exit(args, log)
     if state is not None and state.pop("rebuild", False):
         state["filed"] = {}
         state_missing = True
@@ -1001,8 +1016,8 @@ def main(argv, now=None):
                     remember(state, fingerprint, number, "", "")
         except GitHubError as err:
             log(f"the state file is missing and the issues could not be read ({err}); "
-                "nothing is filed this round")
-            return 2
+                f"the round is counted against {args.commit[:7]} as refused")
+            return refused_exit(args, log)
         source = "a dry run reads no issues" if args.dry_run else "issue markers"
         log(f"the state file was missing: rebuilt from {len(state['filed'])} ({source})")
     summary = ingest(github, state, counts, failures, args.commit, args.tracker, now, log)
@@ -1010,9 +1025,9 @@ def main(argv, now=None):
         save_state(args.state, state)
     except OSError as err:
         log(f"cannot save the state file: {err}")
-        return 2
+        return EXIT_UNRECORDED
     print(summary_line(counts, failures, summary), flush=True)
-    return 2 if summary["stopped"] else 0
+    return EXIT_COUNTED if summary["stopped"] else 0
 
 
 if __name__ == "__main__":

@@ -299,8 +299,21 @@ prune_cache() {
 run_round() {
     bin="$STATE/bin/$built"
     round="$STATE/round"
+    # A round left here was killed (the unit stopped, the host rebooted) before the reporter saw
+    # it: count it against the commit it ran, written in `commit` when it began, before deleting.
+    if [[ -d "$round" ]]; then
+        local left
+        left=$(cat "$round/commit" 2>/dev/null || true)
+        if [[ "$left" =~ ^[0-9a-f]{7,64}$ ]]; then
+            log "a round of $left was never reported; counting it as refused"
+            refuse_round "$left"
+        else
+            log "a round with no commit was never reported; it cannot be counted"
+        fi
+    fi
     rm -rf "$round"
     mkdir -p "$round"
+    echo "$built" >"$round/commit"
     local deadline=$(( $(date +%s) + SIM_FLEET_ROUND_SECONDS )) w=0 i
     for (( i = 0; i < SIM_FLEET_WORKERS_VOPR_NERVA; i++ )); do
         worker "$w" vopr-nerva "$deadline" & w=$(( w + 1 ))
@@ -396,15 +409,21 @@ ingest() {
     rm -rf "$STATE/last-failed-round"
     mv "$round" "$STATE/last-failed-round"
     log "sim_fleet.py ingest exited $code; the round is in $STATE/last-failed-round"
-    # Exit 1 (the round was refused) and 2 (state, token or GitHub) are recorded or counted by the
-    # reporter itself. Any other end (the timeout's 124, a kill, 70 for a crash) lost the round
-    # before it was counted: count it against its commit as refused, so `soak` cannot read the
-    # commit clean (#370).
-    if (( code != 1 && code != 2 )); then
-        timeout "$SIM_FLEET_REPORT_TIMEOUT" "$SIM_FLEET_PYTHON" -I "$bin/sim_fleet.py" refuse \
-            --commit "$built" --state "$STATE/state.json" ||
-            log "sim_fleet.py refuse failed; the round of $built is not counted"
+    # Only 2 (counted, GitHub stopped the reports) and 3 (recorded as refused) say the reporter
+    # counted the round. Any other end (an unreadable state, a usage error, the timeout's 124, a
+    # kill, 70 for a crash, an import error) recorded nothing: count it against its commit as
+    # refused, so `soak` cannot read the commit clean (#370).
+    if (( code != 2 && code != 3 )); then
+        refuse_round
     fi
+}
+
+# Counts a round of $1 (default: $built) the reporter did not count, as refused.
+refuse_round() {
+    local commit=${1:-$built}
+    timeout "$SIM_FLEET_REPORT_TIMEOUT" "$SIM_FLEET_PYTHON" -I "$bin/sim_fleet.py" refuse \
+        --commit "$commit" --state "$STATE/state.json" ||
+        log "sim_fleet.py refuse failed; the round of $commit is not counted"
 }
 
 # Sourced by the tests, which call the functions above.

@@ -379,14 +379,14 @@ class StateFile(unittest.TestCase):
         self.assertEqual(json.loads(Path(self.path).read_text())["days"]["2026-11-02"]["rounds"],
                          1)
 
-    def test_main_refuses_a_bad_round_with_exit_1(self):
+    def test_main_refuses_a_bad_round_with_the_refused_exit(self):
         rnd = Round(self)
         os.makedirs(os.path.join(rnd.path, "w0"))
         Path(rnd.path, "w0", "results").write_text("garbage\n")
         with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
             code = fleet.main(["ingest", "--round", rnd.path, "--commit", "abcdef1",
                                "--state", self.path, "--dry-run"], now=DAY_ONE)
-        self.assertEqual(code, 1)
+        self.assertEqual(code, fleet.EXIT_REFUSED)
         # No seed is counted, but the round is: against its commit, as refused (#370).
         state = fleet.load_state(self.path)
         self.assertEqual(state["days"], {})
@@ -555,7 +555,7 @@ class Soak(unittest.TestCase):
     def test_a_refused_round_then_a_clean_one_is_not_a_clean_soak(self):
         path = self.state_path()
         code, _, err = self.ingest_main(path, self.too_many_failures())
-        self.assertEqual(code, 1)
+        self.assertEqual(code, fleet.EXIT_REFUSED)
         self.assertIn("refused", err)
         self.assertEqual(self.ingest_main(path, self.clean_round())[0], 0)
         code, line, err = self.run_main("soak", "--commit", SHA_A, "--state", path)
@@ -570,14 +570,15 @@ class Soak(unittest.TestCase):
         rnd = self.clean_round()
         with open(os.path.join(rnd.path, "w0", "results"), "a") as file:
             file.write("vopr-nerva not-a-seed\n")
-        self.assertEqual(self.ingest_main(path, rnd)[0], 1)
+        self.assertEqual(self.ingest_main(path, rnd)[0], fleet.EXIT_REFUSED)
         self.assertEqual(self.ingest_main(path, self.clean_round())[0], 0)
         self.assertEqual(self.run_main("soak", "--commit", SHA_A, "--state", path)[0], 1)
 
     def test_a_refused_round_counts_against_its_own_commit_only(self):
         path = self.state_path()
         self.assertEqual(self.ingest_main(path, self.clean_round(), SHA_B)[0], 0)
-        self.assertEqual(self.ingest_main(path, self.too_many_failures(), SHA_A)[0], 1)
+        self.assertEqual(self.ingest_main(path, self.too_many_failures(), SHA_A)[0],
+                         fleet.EXIT_REFUSED)
         self.assertEqual(self.run_main("soak", "--commit", SHA_B, "--state", path)[0], 0)
         self.assertEqual(self.run_main("soak", "--commit", SHA_A, "--state", path)[0], 1)
 
@@ -601,6 +602,68 @@ class Soak(unittest.TestCase):
         self.assertIn("; 2 rounds refused or lost", line)
         self.assertEqual(self.run_main("refuse", "--commit", "xyz", "--state", path)[0], 1)
 
+    def live_main(self, path, rnd, token_file, commit=SHA_A):
+        return self.run_main("ingest", "--round", rnd.path, "--commit", commit, "--state", path,
+                             "--repo", "NervaLog/nerva", "--token-file", token_file)
+
+    def failing_round(self):
+        rnd = Round(self)
+        for seed in range(3):
+            rnd.seed(0, "vopr-nerva", seed, 134, tail="boom")
+        return rnd
+
+    def test_a_missing_token_file_counts_the_round_as_refused(self):
+        # Was exit 2 with nothing counted: a later clean round read the commit clean (#370).
+        path = self.state_path()
+        self.assertEqual(self.ingest_main(path, self.clean_round())[0], 0)
+        code, _, err = self.live_main(path, self.failing_round(), "/nonexistent/token")
+        self.assertEqual(code, fleet.EXIT_REFUSED)
+        self.assertIn("cannot read the token file", err)
+        self.assertEqual(self.ingest_main(path, self.clean_round())[0], 0)
+        self.assertEqual(self.run_main("soak", "--commit", SHA_A, "--state", path)[0], 1)
+        self.assertEqual(fleet.load_state(path)["commits"][SHA_A]["refused"], 1)
+
+    def test_github_unreachable_while_rebuilding_counts_the_round_as_refused(self):
+        class Down:
+            def __init__(self, *args):
+                pass
+
+            def markers(self):
+                raise fleet.GitHubError("unreachable", "no answer")
+
+        path = self.state_path()
+        token = os.path.join(os.path.dirname(path), "token")
+        Path(token).write_text("t0ken\n")
+        original = fleet.GitHub
+        fleet.GitHub = Down
+        self.addCleanup(setattr, fleet, "GitHub", original)
+        code, _, err = self.live_main(path, self.failing_round(), token)
+        self.assertEqual(code, fleet.EXIT_REFUSED)
+        self.assertIn("could not be read", err)
+        # The state exists now, and says `rebuild`; the next round still counts.
+        state = fleet.load_state(path)
+        self.assertEqual(state["commits"][SHA_A]["refused"], 1)
+        self.assertEqual(self.ingest_main(path, self.clean_round())[0], 0)
+        self.assertEqual(self.run_main("soak", "--commit", SHA_A, "--state", path)[0], 1)
+
+    def test_a_usage_error_is_not_the_refused_exit(self):
+        code, _, _ = self.run_main("ingest", "--round", "r", "--commit", "xyz", "--state",
+                                   self.state_path(), "--dry-run")
+        self.assertEqual(code, fleet.EXIT_USAGE)
+        code, _, _ = self.run_main("ingest", "--round", "r", "--commit", SHA_A, "--state",
+                                   self.state_path())
+        self.assertEqual(code, fleet.EXIT_USAGE)
+
+    def test_an_uncaught_exception_in_the_reporter_exits_70(self):
+        rnd = Round(self)
+        os.makedirs(os.path.join(rnd.path, "w0", "results"))  # A directory: open() raises.
+        out = subprocess.run(
+            ["python3", "-I", str(HERE / "sim_fleet.py"), "ingest", "--round", rnd.path,
+             "--commit", SHA_A, "--state", self.state_path(), "--dry-run"],
+            capture_output=True, text=True)
+        self.assertEqual(out.returncode, 70)
+        self.assertIn("Traceback", out.stderr)
+
     def test_a_refusal_with_no_state_starts_one_the_next_ingest_rebuilds(self):
         path = self.state_path()
         self.assertEqual(self.run_main("refuse", "--commit", SHA_A, "--state", path)[0], 0)
@@ -620,7 +683,8 @@ class Soak(unittest.TestCase):
         self.assertEqual(self.run_main("refuse", "--commit", SHA_A, "--state", path)[0], 2)
         with open(path) as file:
             self.assertEqual(file.read(), "not json")
-        self.assertEqual(self.ingest_main(path, self.too_many_failures())[0], 2)
+        self.assertEqual(self.ingest_main(path, self.too_many_failures())[0],
+                         fleet.EXIT_UNRECORDED)
 
     def test_a_state_written_before_the_counter_loads_and_reads_clean(self):
         github, state = Recorder(), fleet.new_state()
@@ -877,6 +941,68 @@ class MemoryLimit(unittest.TestCase):
             ["bash", "-c", f'set -euo pipefail; source "{HERE}/run.sh"; memory_mb'],
             env={"PATH": os.environ["PATH"]}, capture_output=True, text=True,
             check=True).stdout.strip()
+
+
+class RunShRefuse(unittest.TestCase):
+    """run.sh's `ingest` and `run_round` count a round the reporter did not (#370), with a stub
+    in place of the interpreter that ends `ingest` with $STUB_CODE and runs the real `refuse`."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(lambda: subprocess.run(["rm", "-rf", self.dir]))
+        self.state = os.path.join(self.dir, "state")
+        os.makedirs(self.state)
+        self.stub = os.path.join(self.dir, "python")
+        with open(self.stub, "w") as f:
+            f.write("#!/bin/sh\nshift 2\nif [ \"$1\" = ingest ]; then exit \"$STUB_CODE\"; fi\n"
+                    f"exec python3 -I \"{HERE}/sim_fleet.py\" \"$@\"\n")
+        os.chmod(self.stub, 0o755)
+
+    def sh(self, script, code=0):
+        env = {"PATH": os.environ["PATH"], "STUB_CODE": str(code)}
+        return subprocess.run(
+            ["bash", "-c", f'source "{HERE}/run.sh"; STATE="{self.state}"; bin="{HERE}"; '
+             f'built={SHA_A}; round="$STATE/round"; SIM_FLEET_PYTHON="{self.stub}"; '
+             'SIM_FLEET_REPORT_TIMEOUT=30; SIM_FLEET_REPO_DIR=/x; SIM_FLEET_DRY_RUN=1; '
+             f'SIM_FLEET_ROUND_SECONDS=0; SIM_FLEET_TRACKER=; token_file=/x; SIM_FLEET_WORKERS_VOPR_NERVA=0; SIM_FLEET_WORKERS_VOPR_TESTING=0; SIM_FLEET_WORKERS_FUZZ=0; SIM_FLEET_WORKERS_MIXED=0; log() {{ echo "$*" >&2; }}; {script}'],
+            env=env, capture_output=True, text=True)
+
+    def refused(self):
+        path = os.path.join(self.state, "state.json")
+        return fleet.load_state(path)["commits"].get(SHA_A, {}).get("refused", 0) \
+            if os.path.exists(path) else 0
+
+    def ingest(self, code):
+        os.makedirs(os.path.join(self.state, "round"), exist_ok=True)
+        out = self.sh("ingest", code)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        return self.refused()
+
+    def test_the_exits_that_recorded_the_round_are_not_counted_again(self):
+        for code in (0, 2, 3):
+            self.assertEqual(self.ingest(code), 0, code)
+
+    def test_every_other_exit_counts_the_round_as_refused(self):
+        # 1 is a usage error or an import error of the reporter; it records nothing.
+        for n, code in enumerate((1, 4, 64, 70, 124, 137), 1):
+            self.assertEqual(self.ingest(code), n, code)
+
+    def test_a_round_left_by_a_killed_run_is_counted_before_it_is_deleted(self):
+        rnd = os.path.join(self.state, "round")
+        os.makedirs(os.path.join(rnd, "w0"))
+        Path(rnd, "commit").write_text(SHA_A + "\n")
+        out = self.sh("run_round")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(self.refused(), 1)
+        self.assertIn("never reported", out.stderr)
+        self.assertEqual(Path(rnd, "commit").read_text().strip(), SHA_A)
+
+    def test_a_round_left_with_no_commit_is_deleted_and_says_so(self):
+        os.makedirs(os.path.join(self.state, "round", "w0"))
+        out = self.sh("run_round")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(self.refused(), 0)
+        self.assertIn("cannot be counted", out.stderr)
 
 
 class Rotation(unittest.TestCase):
