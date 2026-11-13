@@ -23,10 +23,11 @@ release publishes the debug info as a separate file.
 - "Signed like the other release files" is read as: covered by `SHA256SUMS`, which is how every
   release file except the Mac zip is protected today (P284b). The bill of materials is unchanged.
 
-**Not covered: macOS.** The pinned Zig's `objcopy` cannot strip a Mach-O file, and Apple's `strip`
-and `dsymutil` need the macOS runner that `mac-sign.yml` uses. The Mac binaries keep their debug
-info, so the first release that bundles a past release needs a macOS stripping step (open question
-on #417).
+**Not covered: macOS (owner, 2026-11-13).** The pinned Zig's `objcopy` cannot strip a Mach-O file,
+and Apple's `strip` and `dsymutil` need the macOS runner that `mac-sign.yml` uses. v0.7.1 ships the
+Mac binaries unstripped, with their debug info and no `.debug` file. A macOS stripping step is its
+own later slice, and the first release that bundles a past release on macOS needs it
+(https://github.com/NervaLog/nerva/pull/417#issuecomment-6867906442).
 
 **Reason.** The smallest change that keeps the platform bound and upstream's code. **Cost.** A
 second 34 MiB file per Linux target in every release.
