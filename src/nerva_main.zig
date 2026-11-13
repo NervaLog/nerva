@@ -747,7 +747,7 @@ fn command_start(
         ),
     };
     const budget_bytes = start_memory.budget(visible.bytes) orelse memory_refuse(args, &visible, 0);
-    var memory_budget = MemoryBudget.init(base_allocator, @intCast(budget_bytes));
+    var memory_budget = MemoryBudget.init(base_allocator, @intCast(@min(budget_bytes, std.math.maxInt(usize))));
     var counting_allocator = vsr.CountingAllocator.init(memory_budget.allocator());
     const gpa = counting_allocator.allocator();
 

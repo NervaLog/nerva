@@ -23,6 +23,7 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
+const builtin = @import("builtin");
 const stdx = @import("stdx");
 const MemoryBudget = @import("api/memory_budget.zig");
 
@@ -87,8 +88,13 @@ pub fn budget(visible: u64) ?u64 {
     return visible - memory_reserve;
 }
 
+/// What a host without `/proc` and cgroups (macOS) is taken to see: no limit. P416b: only Linux
+/// has the OOM killer this refusal answers, and the release targets include Macs.
+pub const unlimited: u64 = 1 << 62;
+
 /// Reads what this process can see from the real `/proc` and `/sys/fs/cgroup`.
 pub fn read() Result {
+    if (builtin.os.tag != .linux) return .{ .visible = .{ .bytes = unlimited, .source = .meminfo } };
     var root = std.fs.openDirAbsolute("/", .{}) catch return refuse(.unparsable, "/");
     defer root.close();
     return read_from(root);
@@ -459,4 +465,9 @@ test "start_memory: the real machine can be read" {
         .visible => |visible| try std.testing.expect(visible.bytes > 0),
         .refused => {},
     }
+}
+
+test "start_memory: a host without /proc is unlimited, with room for the reserve" {
+    try std.testing.expect(budget(unlimited) != null);
+    try std.testing.expect(budget(unlimited).? > 1 << 61);
 }
