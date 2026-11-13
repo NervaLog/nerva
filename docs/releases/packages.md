@@ -159,8 +159,15 @@ does: its asset manifest walks the directory recursively and leaves out only `.a
 version file, and a `postinstall` script would run before the gate ("Build image"). So the Worker
 sets the build variable `SKIP_DEPENDENCY_INSTALL` to `1` (setup step 2), the gate refuses to run
 without it, and it refuses those files too. The gate runs after the image has handled the
-checkout, so it only **detects** what the image did first; what **prevents** it is that variable
-and that the allow-list leaves the image nothing it acts on.
+checkout, so it only **detects** and refuses such a tree, and nothing is deployed. It prevents
+nothing the image does first. Cloudflare's "Build image" page lists version files the image acts
+on (`.nvmrc`, `.node-version`, `.python-version`, `runtime.txt`, `.ruby-version`, and the
+`packageManager` field of `package.json`) and describes `SKIP_DEPENDENCY_INSTALL` only as
+disabling automatic dependency installation, not version selection. So before the gate refuses
+such a tree, a merged site change could make the image install a toolchain, with the build token
+in its environment. That is **residual reach**, kept small because a site change goes through a
+reviewed pull request (the owner, and branch protection on the site repository). The rehearsal
+checks what the image does (below).
 
 The gate does not check what the WKD file holds, nor whether it should be there. The site's own
 check does both (NRV-E1162), and the release checks it again (`site-live`). If the WKD file is
@@ -226,8 +233,8 @@ as `topwombat`, or the release App, whose token can open and merge site pull req
   release's `site-live`.
 - **Cannot:** run code on Cloudflare, give the Worker a script or a binding, or change the gate
   (the gate refuses every such file, writes the only configuration itself, and is pinned in the
-  dashboard). Cannot reach the build token (Wrangler runs after the gate, from the gate's
-  directory). Cannot read or write the bucket (no credential). Cannot change the key, the
+  dashboard). Cannot reach the build token through Wrangler, which runs after the gate, from the gate's
+  directory (the image's own handling of version files before the gate is the residual reach above). Cannot read or write the bucket (no credential). Cannot change the key, the
   fingerprints or the scripts (all in this repository). Cannot get anything signed, or change
   what `packages.nerva.pro` serves (R2 serves it, not the Worker).
 - **If the gate ever failed** (for example, Wrangler starts reading a file under a new name), a
@@ -2228,6 +2235,13 @@ packages (a dispatch for a published release would stop with NRV-E1148):
   **Bindings** stay empty. A build whose pin is wrong is not rehearsed on Cloudflare; the test
   covers NRV-E1164. The pull request is closed unmerged. (With previews
   off, this needs a merge; skip it and record it as not verified.)
+- **The image and version files:** the same site pull request, run again with
+  `SKIP_DEPENDENCY_INSTALL=1` set and a `.nvmrc` naming an odd Node version, shows from the build
+  log whether the image acts on `.nvmrc` anyway (downloads or installs a toolchain) before the
+  gate refuses it with NRV-E1152. The result, for `.nvmrc` and for `.node-version`,
+  `.python-version`, `runtime.txt`, `.ruby-version` and a `packageManager` field, goes in the
+  worklog; if the image runs repository content (not only fetches an upstream release), that is a
+  finding.
 - `https://nerva.pro/` answers 200, `https://www.nerva.pro/` answers 301 to it, and
   `https://nervalog.github.io/` answers 404.
 - **Signed and served** (P376): step 5b (NRV-E1161) and step 8's fetch-back are green in both

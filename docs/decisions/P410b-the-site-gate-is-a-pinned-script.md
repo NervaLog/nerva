@@ -27,7 +27,13 @@ commands in the spec, filled in, are at most 400 characters.
 2,600. A script in a site repository could be changed by a site merge, so it lives here, under
 this repository's guard, and the dashboard pins it by commit and hash, so a later merge here
 changes nothing until the owner moves the pin. The gate runs after the build image has handled
-the checkout, so it detects; `SKIP_DEPENDENCY_INSTALL=1` and the allow-list prevent. A list of
+the checkout, so it only detects and refuses a tree with such files, and nothing is deployed.
+`SKIP_DEPENDENCY_INSTALL=1` stops the dependency install, but Cloudflare does not document that it
+stops version selection from `.nvmrc`, `.node-version`, `.python-version`, `runtime.txt`,
+`.ruby-version` or `packageManager`, so before the gate refuses it a merged site change could make
+the image install a toolchain with the build token in its environment. That residual reach is kept
+small because site changes go through reviewed pull requests (owner and branch protection); the
+rehearsal checks what the image does. A list of
 bad names fails open for any name it does not know, so the gate lists the good ones. Wrangler reads `.env` from its working directory
 and npm reads `.npmrc`, so Wrangler runs in a directory the gate wrote, and the repository's root
 never reaches it. `--config` also stops Workers Builds from generating a configuration. Wrangler

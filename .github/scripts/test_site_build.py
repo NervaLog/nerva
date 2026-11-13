@@ -214,6 +214,14 @@ class Gate(unittest.TestCase):
                 self.refused(run_gate(self.tree), f"{extra} is not allowed in the site repository")
                 shutil.rmtree(self.tree / ".well-known")
 
+    def test_wkd_name_ending_in_newline_is_refused(self):
+        for extra in [".well-known/openpgpkey/hu\n", ".well-known/openpgpkey/policy\n"]:
+            with self.subTest(extra=extra):
+                self.add_wkd()
+                (self.tree / extra).write_text("x\n")
+                self.refused(run_gate(self.tree), "with a newline in its name is not allowed")
+                shutil.rmtree(self.tree / ".well-known")
+
     def test_well_known_not_a_directory(self):
         (self.tree / ".well-known").write_text("x\n")
         self.refused(run_gate(self.tree), ".well-known is not a directory")

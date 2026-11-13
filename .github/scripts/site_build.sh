@@ -71,6 +71,12 @@ if [ -e .well-known ] && [ ! -d .well-known ]; then
     fail ".well-known is not a directory"
 fi
 if [ -d .well-known ]; then
+    # $(...) strips trailing newlines, so the walk below cannot see a name that ends in one.
+    nl=$(printf '\n_')
+    nl=${nl%_}
+    if [ -n "$(find .well-known -name "*$nl*" -print -quit)" ]; then
+        fail "a path under .well-known with a newline in its name is not allowed in the site repository"
+    fi
     extra=$(find .well-known -mindepth 1 | while IFS= read -r f; do
         case "$f" in
         .well-known/openpgpkey | .well-known/openpgpkey/hu | "$wkd_policy" | "$wkd_key") ;;
