@@ -117,7 +117,7 @@ pub const Facts = struct {
     }
 };
 
-/// Why a past release cannot be bundled (NRV-E0721).
+/// Why a past release cannot be bundled (NRV-E0725).
 pub const Refusal = enum {
     /// Its release is not lower: a cluster only moves up (`execute_op_upgrade`).
     release_not_lower,

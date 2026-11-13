@@ -8,7 +8,7 @@ release). Checks, without a cluster:
 - `nerva_next version` lists the bundled release, `nerva version` bundles none, and the format
   digests are equal;
 - one changed byte anywhere in the bundle is refused with NRV-E0719, never run;
-- the packer refuses, with NRV-E0721 and no output, a past release that is not lower, of another
+- the packer refuses, with NRV-E0725 and no output, a past release that is not lower, of another
   format digest, or whose clients the next release would refuse;
 - the packer refuses a result over its size limit with NRV-E0719, and writes it at the limit;
 - the packed binary is under `multiversion_binary_platform_size_max` (64 MiB); the margin is
@@ -108,7 +108,7 @@ def check(nerva, nerva_next, nerva_pack, work):
         stub(past_stub, text)
         result = run([nerva_pack, "--input", nerva_next, "--past", past_stub, "--output", output])
         assert result.returncode == 1, (name, result.returncode, result.stderr)
-        assert "NRV-E0721" in result.stderr, (name, result.stderr)
+        assert "NRV-E0725" in result.stderr, (name, result.stderr)
         assert not os.path.exists(output), name
 
     # The size limit: written at exactly the size it takes, refused one byte under it.

@@ -7,7 +7,7 @@
 //! Writes `--output`: `--input` (this release's executable, unpacked) with `--past` (an earlier
 //! release's executable, packed or not) bundled, in the layout `bundle.zig` describes. The facts
 //! of both come from `<exe> version --verbose`, so each must run here: a pack is native. It refuses
-//! (NRV-E0721, nothing written) a past release that is not lower, of another format digest, or
+//! (NRV-E0725, nothing written) a past release that is not lower, of another format digest, or
 //! whose clients this release would refuse, and a result over the size limit (NRV-E0719).
 //! It is a build tool: `zig build` runs it, and `tests/release/bundle.py` runs it on stubs.
 
@@ -61,7 +61,7 @@ pub fn main() !void {
     const past_facts = try facts_read(allocator, past_path.?);
     if (bundle.refusal(current_facts, past_facts)) |refusal| {
         diagnostic.fail(
-            "NRV-E0721",
+            "NRV-E0725",
             "pack: {s} cannot be bundled: {s}",
             .{ past_path.?, refusal.text() },
             "build with the previous release's `nerva` of the same format (README, \"Upgrading a cluster\")",
@@ -145,14 +145,14 @@ fn facts_read(allocator: mem.Allocator, exe: []const u8) !bundle.Facts {
         .argv = &.{ exe, "version", "--verbose" },
         .max_output_bytes = facts_size_max,
     }) catch diagnostic.fail(
-        "NRV-E0721",
+        "NRV-E0725",
         "pack: {s} does not run here (`version --verbose`)",
         .{exe},
         "pack on the platform both binaries are for",
         .{},
     );
     const facts = bundle.Facts.parse(result.stdout) catch diagnostic.fail(
-        "NRV-E0721",
+        "NRV-E0725",
         "pack: {s} does not say its release, format and commit (`version --verbose`)",
         .{exe},
         "build it from a git checkout of the release, with its commit",
