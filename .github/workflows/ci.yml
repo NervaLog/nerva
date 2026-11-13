@@ -173,7 +173,7 @@ jobs:
           tool_is rpmsign "RPM version 4.18.2"
           gpg --version | head -n1 | grep -q 'gpg (GnuPG) 2\.4\.' || { echo "error[NRV-E1139]: ci.yml: gpg is not 2.4" >&2; exit 1; }
 
-      - name: Release scripts (the bill of materials, N63; the refusals, NRV-E1112 to E1117, E1130 to E1138)
+      - name: Release scripts (the bill of materials, N63; the refusals, NRV-E1112 to E1117, E1130 to E1138, E1152, E1164)
         if: needs.changes.outputs.code != 'false'
         run: |
           python3 .github/scripts/test_sbom.py
@@ -183,6 +183,7 @@ jobs:
           python3 -I .github/scripts/test_release_finish.py
           python3 -I .github/scripts/test_r2.py
           python3 -I .github/scripts/test_package_repos.py
+          python3 -I .github/scripts/test_site_build.py
 
       - name: Nightly perf scripts (the comparison, its issues)
         if: needs.changes.outputs.code != 'false'
