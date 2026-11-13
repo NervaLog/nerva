@@ -334,10 +334,21 @@ def make_4b(k, w, www):
 
 
 class Handler(http.server.SimpleHTTPRequestHandler):
-    """The static tree, and /swap/<name>, which makes /keys/current.asc the key file <name>: what
-    the owner's key change at the URL INSTALL.md's gpgkey= names does, with no change on the host."""
+    """The static tree, /swap/<name>, which makes /keys/current.asc the key file <name>, and
+    /swaprepo/<name>, which makes /rpm/live the repository <name>: what the owner's change at the
+    URLs INSTALL.md's gpgkey= and baseurl= name does, with no change on the host."""
 
     def do_GET(self):
+        if self.path.startswith("/swaprepo/"):
+            name = os.path.basename(self.path[len("/swaprepo/"):])
+            rpm = Path(self.directory) / "rpm"
+            if not (rpm / name).is_dir():
+                return self.send_error(404)
+            shutil.rmtree(rpm / "live", ignore_errors=True)
+            shutil.copytree(rpm / name, rpm / "live")
+            self.send_response(204)
+            self.end_headers()
+            return None
         if self.path.startswith("/swap/"):
             name = os.path.basename(self.path[len("/swap/"):])
             keys = Path(self.directory) / "keys"
@@ -666,17 +677,29 @@ apt_group() {
 # gpgkey= is a URL the test server serves, as INSTALL.md's is; /swap/<name> changes what it serves
 # (the owner changing the key file), and nothing is done on the host.
 swap_key() { curl -fsS "$base/swap/$1" > /dev/null; }
+# the repository is at one fixed path, as a host's baseurl= is; /swaprepo/<name> changes what it serves
+swap_repo() { curl -fsS "$base/swaprepo/$1" > /dev/null; }
+# the repo file we ship (INSTALL.md): no metadata_expire, so dnf's default applies. The host's dnf
+# cache (metadata and the repository keyring) is kept from one stage to the next, never cleaned.
 dnf_repo() {
   cat > /etc/yum.repos.d/nerva.repo <<EOF
 [nerva]
 name=Nerva (key-model test)
-baseurl=$base/rpm/$1
+baseurl=$base/rpm/live
 enabled=1
 gpgcheck=1
 repo_gpgcheck=1
 gpgkey=$base/keys/current.asc
 EOF
-  dnf clean all > /dev/null 2>&1
+}
+# What a user runs when a new version is out: `dnf upgrade`, as INSTALL.md says. Within the default
+# metadata expiry dnf answers from its cache and sees nothing, so the plain run is recorded (INFO) and
+# the judged run is `dnf upgrade --refresh`, which is what a host does once its metadata has expired.
+# Same cache, same keyring: only the metadata is fetched again.
+host_upgrade() {   # NAME VERSION
+  upg "$1/plain-dnf-upgrade" info "$2" dnf upgrade -y nervak
+  if installed "$2"; then say "$1" PASS "installed by the plain dnf upgrade"
+  else silent=fail upg "$1" ok "$2" dnf upgrade -y --refresh nervak; fi
 }
 installed() { [ "$(rpm -q --qf '%{VERSION}' nervak)" = "$1" ]; }
 dnf_prepare() {
@@ -691,48 +714,48 @@ dnf_group() {
   case $group in
   rotation)
     # what a host does at a 4A rotation: nothing but the key file changing at its URL, then upgrade
-    swap_key keyA.asc; dnf_repo s1
+    swap_key keyA.asc; swap_repo s1; dnf_repo
     cell rotation/dnf-install-from-S1 ok bash -c 'dnf install -y nervak-1.0-1 && installed 1.0'
     say rotation/dnf-keys-after-install INFO "$(dnf_keys | tr '\n' ';')"
-    swap_key keyAB.asc; dnf_repo s2
-    silent=fail upg rotation/dnf-upgrade-with-the-new-key-file ok 2.0 dnf upgrade -y nervak
+    swap_key keyAB.asc; swap_repo s2
+    host_upgrade rotation/dnf-upgrade-with-the-new-key-file 2.0
     say rotation/dnf-keys-after-upgrade INFO "$(dnf_keys | tr '\n' ';')"
     if ! installed 2.0; then
       # diagnosis only: what would it take?
       curl -fsS "$base/keys/current.asc" -o /tmp/key.asc
       rpm --import /tmp/key.asc > "$log" 2>&1; say rotation/diagnosis-rpm-import INFO "rc=$? $(tail -n 2 "$log" | tr '\n' ' ')"
-      upg rotation/diagnosis-upgrade-after-rpm-import info 2.0 bash -c 'dnf clean all; dnf upgrade -y nervak'
+      upg rotation/diagnosis-upgrade-after-rpm-import info 2.0 dnf upgrade -y --refresh nervak
       for id in $(rpm -qa 'gpg-pubkey*'); do rpm -e "$id" > /dev/null 2>&1; done
-      upg rotation/diagnosis-upgrade-after-rpm-e-and-import info 2.0 bash -c 'dnf clean all; dnf upgrade -y nervak'
+      upg rotation/diagnosis-upgrade-after-rpm-e-and-import info 2.0 dnf upgrade -y --refresh nervak
     fi ;;
   stale)
-    swap_key keyA.asc; dnf_repo s1
+    swap_key keyA.asc; swap_repo s1; dnf_repo
     cell rotation/dnf-install-from-S1 ok bash -c 'dnf install -y nervak-1.0-1 && installed 1.0'
-    dnf_repo s2   # the key file is still {P, S1}: the owner did not change it
-    silent=fail upg rotation/dnf-S2-with-the-old-key-file refuse 2.0 dnf upgrade -y nervak
+    swap_repo s2   # the key file is still {P, S1}: the owner did not change it
+    silent=fail upg rotation/dnf-S2-with-the-old-key-file refuse 2.0 dnf upgrade -y --refresh nervak
     ;;
   rotation4b)
     # setup step 4B: K1 and K2 are whole keys; the key file becomes {K1, K2}; the new rpm is signed by K2
-    swap_key k1.asc; dnf_repo b1
+    swap_key k1.asc; swap_repo b1; dnf_repo
     cell rotation4b/dnf-install-signed-by-K1 ok bash -c 'dnf install -y nervak-1.0-1 && installed 1.0'
     say rotation4b/dnf-keys-after-install INFO "$(dnf_keys | tr '\n' ';')"
-    swap_key k1k2.asc; dnf_repo b2
-    silent=fail upg rotation4b/dnf-upgrade-signed-by-K2-after-the-key-file-swap ok 2.0 dnf upgrade -y nervak
+    swap_key k1k2.asc; swap_repo b2
+    host_upgrade rotation4b/dnf-upgrade-signed-by-K2-after-the-key-file-swap 2.0
     say rotation4b/dnf-keys-after-upgrade INFO "$(dnf_keys | tr '\n' ';')"
     ;;
   expiry)
-    swap_key keyExp.asc; dnf_repo s3
+    swap_key keyExp.asc; swap_repo s3; dnf_repo
     cell expiry/dnf-install-rpm-signed-by-an-expired-subkey ok bash -c 'dnf install -y nervak-3.0-1 && installed 3.0'
     ;;
   revocation)
-    swap_key keyRev.asc; dnf_repo s1
+    swap_key keyRev.asc; swap_repo s1; dnf_repo
     cell revocation/dnf-key-file-with-a-revocation-still-installs-S1 ok bash -c 'dnf install -y nervak-1.0-1 && installed 1.0'
     # the positive control: a refusal of S4 below means something only if S1 verified here first
     if installed 1.0; then
-      dnf_repo s4
-      upg revocation/dnf-rpm-signed-by-a-revoked-subkey refuse 4.0 dnf install -y nervak-4.0-1
-      dnf_repo s4m
-      upg revocation/dnf-repomd-signed-by-a-revoked-subkey refuse 5.0 dnf install -y nervak-5.0-1
+      swap_repo s4
+      upg revocation/dnf-rpm-signed-by-a-revoked-subkey refuse 4.0 dnf install -y --refresh nervak-4.0-1
+      swap_repo s4m
+      upg revocation/dnf-repomd-signed-by-a-revoked-subkey refuse 5.0 dnf install -y --refresh nervak-5.0-1
     else
       say revocation/dnf-rpm-signed-by-a-revoked-subkey FAIL "not tested: the key file did not import, so S1 does not verify either: $(excerpt)"
       say revocation/dnf-repomd-signed-by-a-revoked-subkey FAIL "not tested: the key file did not import, so S1 does not verify either"
@@ -740,7 +763,7 @@ dnf_group() {
     ;;
   esac
 }
-export -f apt_n apt_update_clean apt_has dnf_keys installed excerpt swap_key
+export -f apt_n apt_update_clean apt_has dnf_keys installed excerpt swap_key swap_repo
 export base log
 
 case $mgr in
@@ -806,6 +829,10 @@ def main():
         for name, tag in (("keyExp", "e"), ("keyRev", "r")):
             out = sh(["gpg", "--show-keys", "--with-colons", str(www / f"keys/{name}.asc")]).stdout
             assert re.search(rf"^sub:{tag}:", out, re.M), f"{name}.asc carries no {tag} subkey"
+        out = sh(["gpg", "--show-keys", "--with-colons", "--with-subkey-fingerprints",
+                  str(www / "keys/keyRev.asc")]).stdout
+        assert re.search(rf"^sub:r:.*\nfpr:+{keys['s4']}:", out, re.M), \
+            "the revoked subkey of keyRev.asc is not S4"
         if a.host:
             primary_cells(k, keys, signer, www)
             host_cells(w, www, keys)
@@ -835,13 +862,17 @@ def judge(image):
     red, found = [], []
     for n, v, t in CELLS:
         want = FINDINGS.get((image, n))
-        if v == "FAIL" and want is not None and want in t:
+        if v == "FAIL" and want is not None and all(x in t for x in ((want,) if isinstance(want, str) else want)):
             found.append(n)
         elif v == "FAIL":
             red.append(f"FAIL: {n}" + (f" (expected a finding containing {want!r})" if want else ""))
     seen = {n: v for n, v, _ in CELLS}
     for (img, n), want in FINDINGS.items():
-        if img == image and seen.get(n) in ("PASS", "INFO"):
+        if img != image:
+            continue
+        if n not in seen:
+            red.append(f"MISSING: {n} was not reported; P392 rests on it, so the test no longer checks it")
+        elif seen[n] in ("PASS", "INFO"):
             red.append(f"XPASS: {n} now {seen[n]}; P392 rests on it failing: revisit the decision")
     print(f"\nkey-model {image}: {sum(v == 'PASS' for _, v, _ in CELLS)} PASS, "
           f"{sum(v == 'FAIL' for _, v, _ in CELLS)} FAIL, {sum(v == 'INFO' for _, v, _ in CELLS)} INFO")
@@ -859,7 +890,7 @@ def judge(image):
 FINDINGS = {
     # rpm 4.18 keeps the first certificate it was given for a primary, and refuses a revoked subkey's
     # key file outright (so the S4 refusal is not tested there)
-    ("host", "rotation/rpm4.18-S2-after-keyAB-import"): "SIGNATURES NOT OK",
+    ("host", "rotation/rpm4.18-S2-after-keyAB-import"): ("import rc=0;", "SIGNATURES NOT OK"),
     ("host", "revocation/rpm4.18-key-file-with-a-revocation-still-verifies-S1"): "key 1 import failed",
     ("host", "revocation/rpm4.18-S4-revoked"): "not tested",
     # dnf4 (rpm 4.16): the same; the key file with a revocation does not import

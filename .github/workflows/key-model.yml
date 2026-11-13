@@ -15,8 +15,10 @@ on:
       - 'tests/packaging/subkeys.py'
       - '.github/workflows/key-model.yml'
   workflow_dispatch:
-  # Weekly: the images and dnf5 move, and a finding that stops being true is red (XPASS), not stale.
-  # Read-only, 16 jobs of at most 30 minutes, no secrets.
+  # Weekly. The images are pinned by digest, so what moves is dnf5 (upgraded live in the Fedora cells)
+  # and the runner image's rpm, gpg and sqv (versions are printed in each log). A finding that stops
+  # being true is red (XPASS), a cell that is no longer reported is red (MISSING), and a red scheduled
+  # run opens or comments on one issue (job `alarm`, below). 16 jobs of at most 30 minutes, no secrets.
   schedule:
     - cron: '17 5 * * 1'
 
@@ -64,3 +66,27 @@ jobs:
           else
             python3 -I tests/packaging/subkeys.py --image "${{ matrix.image }}"
           fi
+
+  # A red scheduled run reaches nobody on its own (GitHub notifies only whoever last edited the cron
+  # line). This job opens one issue, or comments on it if it is already open. It has `issues: write`
+  # and the workflow's GITHUB_TOKEN only; it checks out nothing and runs no repository code.
+  alarm:
+    name: Alarm
+    needs: cells
+    if: failure() && github.event_name == 'schedule'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Open or update the key-model issue
+        run: |
+          set -eu
+          title='key-model: the weekly run is red'
+          body="The weekly key-model run failed: $RUN_URL. A finding recorded in P392 stopped being true (XPASS), a cell is no longer reported (MISSING), or an unexpected FAIL appeared. Read the cells job logs, then revisit docs/decisions/P392-rpm-does-not-follow-a-subkey-rotation.md."
+          n=$(gh issue list --state open --search "\"$title\" in:title" --json number --jq '.[0].number // empty')
+          if [ -n "$n" ]; then gh issue comment "$n" --body "$body"; else gh issue create --title "$title" --body "$body"; fi
