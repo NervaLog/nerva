@@ -107,7 +107,7 @@ pub fn main() !void {
     const directory = std.fs.cwd();
     var atomic = try directory.atomicFile(output.?, .{ .mode = 0o755 });
     defer atomic.deinit();
-    try atomic.file_writer.interface.writeAll(packed_bytes);
+    try atomic.file.writeAll(packed_bytes);
     try atomic.finish();
 }
 
