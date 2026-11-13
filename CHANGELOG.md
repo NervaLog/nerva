@@ -5,7 +5,7 @@ publishes a version's section as its GitHub release notes, and refuses to releas
 without one. Design reasons are in [docs/DECISIONS.md](./docs/DECISIONS.md); the full log of
 work is [WORKLOG.md](./WORKLOG.md).
 
-## v0.7.1 — 2026-11-11
+## v0.7.1 — TO FILL (the release date; not before 2026-11-14, the end of the soak)
 
 The first Nerva release for people outside the project. It changes no data file, protocol or
 state machine: what is new is how you install it, what it tells you about itself, and the pages
@@ -137,12 +137,13 @@ The README's first line no longer says "toy / research": it gives the label and 
 The release candidate is `main` at `c886c9f0e5e4cffd12597cc29f46a4535fe6b254` (P388; it replaced `5d7d806`, whose `src/`,
 `build.zig`, `build.zig.zon` and `zig/` are identical). The figures below are filled in
 after the soak and the reviews, and are quoted here from their records. **TO FILL** marks what
-is not in yet.
+is not in yet. **TO FILL:** the heading's date, set in the `VERSION` commit; the heading's own
+placeholder is not scanned by the release check, so this line makes the release refuse a stale one.
 
 - **Simulation:** **TO FILL** (the `sim_fleet.py soak --commit <candidate>` line: at least
   24.0 hours of fleet rounds on the candidate, and no open `sim-fleet` issue against it).
 - **Jepsen:** `retry` and `bank` both passed on `5d7d806`, the candidate's ancestor with the same
-  pinned code: runs [43075322433](https://github.com/NervaLog/nerva/actions/runs/43075322433)
+  pinned code, with nemeses `kill,partition` and `--time-limit 1200`: runs [43075322433](https://github.com/NervaLog/nerva/actions/runs/43075322433)
   (`retry`) and [43075317959](https://github.com/NervaLog/nerva/actions/runs/43075317959)
   (`bank`), both `success`, 2026-11-11. The owner accepted this run for `c886c9f` instead of a
   new one (P388). The run was judged by the older harness: `c886c9f` carries #337, after which
@@ -155,10 +156,13 @@ is not in yet.
   [#378](https://github.com/NervaLog/nerva/issues/378),
   [#379](https://github.com/NervaLog/nerva/issues/379),
   [#380](https://github.com/NervaLog/nerva/issues/380) and
-  [#384](https://github.com/NervaLog/nerva/issues/384). **TO FILL:** each reviewer's verdict
-  (none is recorded in the issues or the repository) and the owner's written waiver, if any, of
-  the findings still open: #372 (SHOULD), #379 and #380 (NITs). Earlier rounds on older commits:
-  #315 to #321 and #328.
+  [#384](https://github.com/NervaLog/nerva/issues/384). #379 and #380 closed on 2026-11-13
+  (#405); the only finding still open is #372 (SHOULD), whose fix is deferred to after v0.7.1
+  (#395). **TO FILL:** each reviewer's verdict (none is recorded in the issues or the repository)
+  and the owner's written waiver of #372. **TO FILL:** P369's short review of what ships after
+  `5d7d806` (release automation, packages, the installer, the env examples), with its findings
+  (#384 came from the review of this part). Earlier rounds on older commits: #315 to #321 and
+  #328.
 - **macOS:** the release workflow's Mac job (`mac-sign.yml`) signs and notarizes the zip after the
   owner approves the `apple-signing` environment, and uploads it to the draft release; the owner's
   Mac is the fallback. The `mac-verify` workflow then checks it on Apple silicon and on Intel: the zip against
