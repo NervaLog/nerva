@@ -171,7 +171,7 @@ put or delete objects the bucket's locks do not hold, but could not remove a loc
 or change the key; "The R2 token leaks" below bounds the rest, and the next write run reports any
 tampering. The token never leaves Cloudflare: only the pinned Wrangler, run after the pinned gate
 from a directory the gate wrote, sees it, and no file of the site repository reaches that step.
-The owner accepts this residual reach in writing (P410d) before setup step 2.
+The owner accepted this residual reach on 2026-11-13 (P410e): the site stays in the same account.
 
 **Preview deployments: on, for non-production branches (recommended).** With **Enable Preview
 Builds** on (Branch control), Workers Builds builds every non-production branch of the site
@@ -1705,8 +1705,8 @@ step says "if shown".
   `404.html` and `_headers`, and fails (NRV-E1152, nothing deployed) until the site repository
   holds them. The two WKD files are not needed: they come later, as a pair, with v0.7.1's site
   pull request (P398).
-- **Accept P410d's residual risk in writing** (the narrower token below can still deploy any
-  Worker of the account), or stop here.
+- **P410d's residual risk is accepted** (owner, 2026-11-13, P410e): the narrower token below can
+  still deploy any Worker of the account, and the site stays in this account.
 - **The pin.** In a checkout of this repository, on an up-to-date `main`, read the commit that
   last changed the gate and the gate's SHA-256 at that commit. The first is `<commit>`, the
   second `<sha256>`:

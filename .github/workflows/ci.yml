@@ -184,6 +184,7 @@ jobs:
           python3 -I .github/scripts/test_r2.py
           python3 -I .github/scripts/test_package_repos.py
           python3 -I .github/scripts/test_site_build.py
+          python3 -I .github/scripts/test_repos_alarm.py
 
       - name: Nightly perf scripts (the comparison, its issues)
         if: needs.changes.outputs.code != 'false'
