@@ -2,10 +2,9 @@
 id: P390
 date: 2026-11-13
 area: Releases
-amends: P339
 ---
 
-# The unit restarts exit 1; QUICKSTART was wrong
+# QUICKSTART was wrong about exit 1; the unit restarts it (P339 item 4)
 
 **Decision.** `nerva@.service` keeps `RestartPreventExitStatus=2 3 4 5 6 7 8 70`. Exit 1 restarts,
 bounded by `StartLimitBurst=20` in 300 s, as P339 item 4 decided. QUICKSTART is corrected to say so (#385).

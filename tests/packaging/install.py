@@ -143,13 +143,13 @@ def show(unit, *properties):
     return dict(line.split("=", 1) for line in out.strip().split("\n"))
 
 
-def wait(what, condition, seconds=60, evidence=None):
+def wait(what, condition, seconds=60):
     deadline = time.monotonic() + seconds
     while True:
         value = condition()
         if value:
             return value
-        assert time.monotonic() < deadline, f"timed out: {what}" + (f"\n{evidence()}" if evidence else "")
+        assert time.monotonic() < deadline, f"timed out: {what}"
         time.sleep(0.2)
 
 
@@ -595,32 +595,26 @@ def test_restart_policy(tmp):
         # start-limit-hit), so the outcome is read from the states, the counts and the journal.
         state = show(unit, "ActiveState", "SubState", "ExecMainStatus", "NRestarts")
         assert state["SubState"] == "failed" and state["ExecMainStatus"] == "1", state
-        # The journal is read after `journalctl --sync`. "Started" is not counted: #375 failed with
-        # the refusal already in the log and 19 "Started" lines, so systemd can start the unit
-        # without logging it (Type=exec, a process that exits at once). The counted facts are
-        # "Starting" and "Main process exited", which every start has, and NRestarts. A failure
-        # prints the whole journal and the counts.
-        def journal():
-            sh(["journalctl", "--sync"])
-            return sh(["journalctl", "-u", unit, "--since", since, "--no-pager", "-o", "cat"]).stdout
-
-        # systemd's own lines can reach the journal after the unit shows `failed`: wait, bounded,
-        # for the refusal and the 20 exits, then count. A timeout prints the whole journal.
-        wait("the journal records the 20 exits and the refused start",
-             lambda: "Start request repeated too quickly" in (log := journal())
-             and log.count("Main process exited, code=exited, status=1/FAILURE") >= 20,
-             evidence=journal)
-        log = journal()
+        # systemd's own state is the exact assertion: NRestarts is the counter the journal prints
+        # ("restart counter is at 20") and cannot lose a line. The journal is read after
+        # `journalctl --sync` and counted loosely, because a line PID 1 could not send to journald
+        # goes to kmsg without UNIT= and `-u` never matches it. "Started" is not counted: #375
+        # failed with the refusal in the log and one "Started" short, since with Type=exec a
+        # process that exits at once can be reaped before systemd logs it. A failure prints the
+        # counts, including "Failed to start", and the whole journal.
+        sh(["journalctl", "--sync"])
+        log = sh(["journalctl", "-u", unit, "--since", since, "--no-pager", "-o", "cat"]).stdout
         counts = {"Starting": log.count("Starting nerva@9.service"),
                   "Started": log.count("Started nerva@9.service"),
                   "exited": log.count("Main process exited, code=exited, status=1/FAILURE"),
+                  "Failed to start": log.count("Failed to start nerva@9.service"),
                   "refused": log.count("Start request repeated too quickly"),
                   "NRestarts": state["NRestarts"]}
         report = f"{counts}\n{log}"
-        # StartLimitBurst=20 allows 20 starts (the first and 19 restarts); the 20th restart job's
-        # start is refused.
-        assert counts["Starting"] == 20 and counts["exited"] == 20, report
-        assert counts["refused"] == 1 and int(counts["NRestarts"]) >= 19, report
+        # StartLimitBurst=20 allows 20 starts (the first and 19 restarts), each of which exits 1;
+        # the restart job after the 20th is the refused one, so the counter reads 20.
+        assert state["NRestarts"] == "20", report
+        assert counts["refused"] >= 1 and counts["Starting"] >= 19 and counts["exited"] >= 19, report
         time.sleep(2)  # with RestartSec=100ms, a unit still restarting would have moved by now
         again = show(unit, "ActiveState", "NRestarts")
         assert again["ActiveState"] == "failed" and again["NRestarts"] == state["NRestarts"], (state, again)
