@@ -22,7 +22,12 @@ If it is not there, `sim_fleet.py refuse` records the round as refused. If it is
 and systemd starts it again. `ingest` and `refuse` do nothing for an id already recorded, so a
 round is never counted twice. At start, a round left in `state/round` with a valid id and commit
 (a stop, a reboot, a crash, or the exit above) is settled the same way, from the results its
-workers wrote; a seed ended by the stop's SIGTERM (exit 143) is not recorded. A leftover
+workers wrote; a failing seed's directory and its `results` line (fsynced) are written before its full-log
+replay, so a stop in the replay loses nothing, and a `fail-*` directory with no line is counted as
+a failure when the round is settled (code from its `code` file, else 1). A torn last `results`
+line whose target and seed can be read is a failure of that seed; one that cannot is bad input and
+refuses the round. A stop kills the worker with its seed, so an exit 143 is recorded like any other
+failure. A leftover
 `round.new`, or a round without an id, is deleted uncounted. A leftover round with no results yet
 is counted as an empty round, not refused.
 

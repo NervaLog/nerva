@@ -97,6 +97,8 @@ one.
   issue markers rebuild it (the latest 500 issues labelled `sim-fleet`) before anything is filed;
   until they can be read, rounds are still counted and nothing is filed. A state file that exists
   but cannot be read is an error (`soak` exit 2); it is never taken for empty or overwritten.
+  Deleting a corrupt `state.json` to get past that erases the candidate's refused count (and its
+  fingerprints): never do it for a commit you mean to release.
 - **Every round is settled by a record, never by an exit code** (#370, P382). `run.sh` gives each
   round a random id (`state/round/id`, beside `commit`). `sim_fleet.py ingest` counts the round
   (or refuses it whole: past 4096 failing seeds, or a malformed `results` line) and saves that,

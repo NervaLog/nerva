@@ -7,6 +7,7 @@ import importlib.util
 import io
 import json
 import os
+import signal
 import stat
 import subprocess
 import tempfile
@@ -1173,6 +1174,9 @@ class RunShSettle(unittest.TestCase):
     def seeds(self):
         return fleet.seeds_of(self.entry()) if self.entry() else 0
 
+    def failed(self):
+        return sum(kind["failed"] for kind in self.entry()["kinds"].values())
+
     def soak_code(self):
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             return fleet.main(["soak", "--commit", SHA_A, "--state",
@@ -1264,6 +1268,7 @@ class RunShSettle(unittest.TestCase):
 
     def test_ingest_killed_or_exiting_0_without_a_record_is_refused(self):
         for n, mode in enumerate(("fail:137", "fail:124", "fail:0", "fail:2"), 1):
+            subprocess.run(["rm", "-rf", os.path.join(self.state, "last-failed-round")])
             self.leftover(["vopr-nerva 5 0 3600"], round_id=f"{n}-{n:016x}")
             out = self.sh(f'round="{self.round}"; bin="{self.bin}"; settle {n}-{n:016x} {SHA_A}',
                           ingest=mode)
@@ -1323,14 +1328,77 @@ class RunShSettle(unittest.TestCase):
         Path(self.state, "state.json").write_text(f'{{"id": "{ID_A}"}}')
         self.assertEqual(self.sh(f"recorded {ID_A}").returncode, 0)
 
-    def test_a_seed_ended_by_sigterm_is_not_recorded_and_the_worker_stops(self):
-        self.script(os.path.join(self.bin, "vopr-nerva"), "kill -TERM $$\n")
-        started = time.monotonic()
+    def test_a_seed_that_exits_143_is_recorded_as_a_failure(self):
+        # A stop kills the worker's bash with the seed, so a 143 here was a signal from
+        # something else: a failure, as before.
+        self.script(os.path.join(self.bin, "vopr-nerva"), "exit 143\n")
         out = self.sh(f'round="{self.round}"; bin="{self.bin}"; mkdir -p "$STATE/rotation"; '
-                      'worker 0 vopr-nerva $(( $(date +%s) + 60 ))')
+                      'worker 0 vopr-nerva $(( $(date +%s) + 1 ))')
         self.assertEqual(out.returncode, 0, out.stderr)
-        self.assertLess(time.monotonic() - started, 30)
-        self.assertFalse(os.path.exists(os.path.join(self.round, "w0", "results")))
+        line = Path(self.round, "w0", "results").read_text().split()
+        self.assertEqual(line[0], "vopr-nerva")
+        self.assertEqual(line[2], "143")
+        self.assertTrue(any(n.startswith("fail-") for n in os.listdir(self.round + "/w0")))
+
+    def test_a_stop_during_the_replay_of_a_failure_does_not_lose_it(self):
+        self.script(os.path.join(self.bin, "vopr-nerva"), "exit 129\n")
+        self.script(os.path.join(self.bin, "vopr-nerva-full"), "sleep 60\n")
+        os.makedirs(os.path.join(self.state, "bin"), exist_ok=True)
+        os.symlink(self.bin, os.path.join(self.state, "bin", SHA_A))
+        proc = subprocess.Popen(
+            ["bash", "-c", f'set -euo pipefail; source "{HERE}/run.sh"; STATE="{self.state}"; '
+             f'built={SHA_A}; SIM_FLEET_PYTHON="{self.stub}"; SIM_FLEET_REPORT_TIMEOUT=30; '
+             'SIM_FLEET_REPO_DIR=/x; SIM_FLEET_DRY_RUN=1; SIM_FLEET_ROUND_SECONDS=30; '
+             'SIM_FLEET_TRACKER=; token_file=/x; SIM_FLEET_VOPR_SEED_TIMEOUT=30; '
+             'SIM_FLEET_REPLAY_TIMEOUT=60; SIM_FLEET_TAIL_BYTES=100; '
+             'SIM_FLEET_WORKERS_VOPR_NERVA=1; SIM_FLEET_WORKERS_VOPR_TESTING=0; '
+             'SIM_FLEET_WORKERS_FUZZ=0; SIM_FLEET_WORKERS_MIXED=0; '
+             'log() { echo "$*" >&2; }; run_round'],
+            env={"PATH": os.environ["PATH"]}, start_new_session=True,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline and not os.path.exists(
+                os.path.join(self.round, "w0", "results")):
+            time.sleep(0.1)
+        self.assertTrue(os.path.exists(os.path.join(self.round, "w0", "results")))
+        os.killpg(proc.pid, signal.SIGKILL)  # No trap runs, as when systemd stops the group.
+        proc.wait()
+        subprocess.run(["pkill", "-9", "-f", "vopr-nerva-full"])
+        out = self.run_round()  # Settles the leftover round, then runs an empty one.
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(self.failed(), 1)
+        self.assertEqual(self.soak_code(), 1)
+
+    def test_a_failure_directory_with_no_results_line_is_counted(self):
+        self.leftover(["vopr-nerva 5 0 3600"])
+        fail = os.path.join(self.round, "w0", "fail-vopr-nerva-77")
+        os.makedirs(fail)
+        Path(fail, "tail.log").write_text("panic: boom\n")
+        Path(fail, "code").write_text("134\n")
+        fuzz = os.path.join(self.round, "w0", "fail-fuzz-lsm_tree-78")
+        os.makedirs(fuzz)  # No code file: counted as a failure with code 1.
+        out = self.sh(f'round="{self.round}"; bin="{self.bin}"; settle {ID_A} {SHA_A}')
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(self.failed(), 2)
+        self.assertEqual(self.entry()["refused"], 0)
+        self.assertEqual(self.soak_code(), 1)
+
+    def test_a_torn_last_results_line_is_a_failure_when_its_seed_is_known(self):
+        self.leftover(["vopr-nerva 5 0 3600"])
+        with open(os.path.join(self.round, "w0", "results"), "a") as f:
+            f.write("vopr-nerva 66 12")  # No newline, no seconds: cut short.
+        out = self.sh(f'round="{self.round}"; bin="{self.bin}"; settle {ID_A} {SHA_A}')
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(self.failed(), 1)
+        self.assertEqual(self.entry()["refused"], 0)
+
+    def test_a_torn_last_results_line_without_a_seed_refuses_the_round(self):
+        self.leftover(["vopr-nerva 5 0 3600"])
+        with open(os.path.join(self.round, "w0", "results"), "a") as f:
+            f.write("vopr-ne")
+        out = self.sh(f'round="{self.round}"; bin="{self.bin}"; settle {ID_A} {SHA_A}')
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(self.entry()["refused"], 1)
 
 
 class Rotation(unittest.TestCase):

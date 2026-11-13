@@ -379,21 +379,24 @@ worker() {
         # The whole output goes to a file of this worker's, overwritten by the next seed (a VOPR
         # seed writes about 100 KB in the short log mode).
         "$@" >"$dir/seed.log" 2>&1 </dev/null 9>&- || code=$?
-        # SIGTERM: the fleet itself is stopping (`systemctl stop` or `restart`), not the seed
-        # failing. The seed is not recorded; the round's other seeds are, when it is settled.
-        if (( code == 143 )); then break; fi
+        # A failing seed is made known before anything slow: its directory and its `results`
+        # line (synced) come first, the full-log replay (up to SIM_FLEET_REPLAY_TIMEOUT) after,
+        # so a stop in the replay cannot lose it (#370). A stop kills this bash too, so a 143
+        # is a seed signalled by something else, and a failure like any other.
         if (( code != 0 && code != 124 && code != 137 )); then
             out="$dir/fail-${target/:/-}-$seed"
             mkdir -p "$out"
+            echo "$code" >"$out/code"
             tail -c "$SIM_FLEET_TAIL_BYTES" "$dir/seed.log" >"$out/tail.log"
-            if [[ "$cur" == vopr-* && $code -eq 129 ]]; then
-                # The last 20: a passing run logs `[err] (client): ... session evicted` too, and
-                # the checker's message is the last line before the exit.
-                timeout "$SIM_FLEET_REPLAY_TIMEOUT" "$bin/$cur-full" "$seed" 2>&1 </dev/null 9>&- |
-                    grep -a -E '^\[err\] ' | tail -n 20 >"$out/errors.log" || true
-            fi
         fi
         echo "$target $seed $code $(( $(date +%s) - started ))" >>"$dir/results"
+        if (( code != 0 )); then sync "$dir/results" 2>/dev/null || true; fi
+        if [[ "$cur" == vopr-* && $code -eq 129 ]]; then
+            # The last 20: a passing run logs `[err] (client): ... session evicted` too, and
+            # the checker's message is the last line before the exit.
+            timeout "$SIM_FLEET_REPLAY_TIMEOUT" "$bin/$cur-full" "$seed" 2>&1 </dev/null 9>&- |
+                grep -a -E '^\[err\] ' | tail -n 20 >"$out/errors.log" || true
+        fi
         if [[ "$kind" == mixed || "$kind" == fuzz ]]; then
             echo "$(( turn % ${#MIXED[@]} )) $(( next % ${#FUZZERS[@]} ))" >"$rot.new" &&
                 mv "$rot.new" "$rot"

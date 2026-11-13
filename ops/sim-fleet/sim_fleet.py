@@ -287,21 +287,62 @@ def read_round(round_dir, source_root=None):
     lines_read = 0
     workers = sorted(name for name in os.listdir(round_dir) if re.fullmatch(r"w\d{1,4}", name))
     for worker in workers:
+        seen = set()
         results = os.path.join(round_dir, worker, "results")
-        if not os.path.exists(results):
-            continue
-        with open(results, encoding="utf-8", errors="replace") as file:
-            for line in file:
+        if os.path.exists(results):
+            with open(results, encoding="utf-8", errors="replace") as file:
+                lines = file.readlines()
+            for index, line in enumerate(lines):
                 lines_read += 1
                 if lines_read > RESULTS_LINES_MAX:
                     raise BadInput(f"more than {RESULTS_LINES_MAX} seeds in one round")
+                if index == len(lines) - 1 and not line.endswith("\n"):
+                    line = torn_line(line)  # A write cut short by a crash or a full disk.
+                seen.add(tuple(line.split()[:2]))
                 failure = read_result(round_dir, worker, line, counts, source_root)
-                if failure is None:
-                    continue
-                if len(failures) == ROUND_FAILURES_MAX:
-                    raise BadInput(f"more than {ROUND_FAILURES_MAX} failing seeds in one round")
+                if failure is not None:
+                    failures.append(failure)
+        # A failing seed has its directory before its `results` line: one without a line is a
+        # failure the worker was stopped on, and is counted (#370).
+        for line in unrecorded_failures(round_dir, worker, seen):
+            lines_read += 1
+            failure = read_result(round_dir, worker, line, counts, source_root)
+            if failure is not None:
                 failures.append(failure)
+        if len(failures) > ROUND_FAILURES_MAX:
+            raise BadInput(f"more than {ROUND_FAILURES_MAX} failing seeds in one round")
     return counts, failures
+
+
+def torn_line(line):
+    """An unterminated last line of `results` that does not parse is a seed whose line was cut
+    short: a failure of that seed, when its target and seed can be read. Otherwise the round
+    is refused, as for any other bad line."""
+    fields = line.split()
+    if len(fields) == 4 and all(f.isdigit() for f in fields[1:]):
+        return line
+    if len(fields) >= 2 and TARGET.match(fields[0]) and fields[1].isdigit():
+        return f"{fields[0]} {fields[1]} 1 0"
+    return line
+
+
+def unrecorded_failures(round_dir, worker, seen):
+    """`results` lines for the `fail-*` directories of a worker with no line of their own: the
+    exit code is the one in the directory's `code` file, else 1."""
+    lines = []
+    names = sorted(os.listdir(os.path.join(round_dir, worker)))
+    for name in names:
+        match = re.fullmatch(r"fail-(vopr-nerva|vopr-testing|fuzz-[a-z0-9_]{1,64})-(\d{1,20})",
+                             name)
+        if match is None:
+            continue
+        target = match.group(1).replace("fuzz-", "fuzz:", 1)
+        if (target, match.group(2)) in seen:
+            continue
+        code = (read_bounded(os.path.join(round_dir, worker, name, "code")) or [""])[0].strip()
+        code = code if code.isdigit() and code != "0" else "1"
+        lines.append(f"{target} {match.group(2)} {code} 0")
+    return lines
 
 
 def read_result(round_dir, worker, line, counts, source_root):
