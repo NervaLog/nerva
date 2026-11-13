@@ -2,30 +2,41 @@
 id: P394
 date: 2026-11-13
 area: Releases
-amends: N27, N62, P123
 ---
 
-# R7's brief: retention is declared in the log and trimmed by pulses under a keep-last rule
+# R7's brief is a proposal: retention declared in the log, trimmed by pulses, keep-last by predecessor
 
-The R7 brief (`docs/briefs/r7.md`) proposes how Nerva stops keeping the past forever. A horizon
-per kind (commit keys, row and record history, view and group versions) is declared in the log;
-the default is forever. The primary's pulses trim a bounded number of objects per pulse: reads in
-`prefetch`, tombstones written in `commit`, reclaimed by ordinary compaction. Trimming is not
-done at compaction time. A change or version is trimmed only if a newer one of the same row,
-group or view is itself below the horizon (keep-last), so as-of reads at or above `horizon_op`
-stay exact and reads below it answer `before_horizon`. A commit key is trimmed with its row;
-once a key horizon is declared keys must be UUIDv7, and a key older than the horizon less
-`skew_max`, or than what was trimmed plus `skew_max`, is refused as `key_expired`, never applied.
+This pull request decides only that `docs/briefs/r7.md` is R7's proposed design, to be
+implemented once the owner answers its eight questions. It amends no decision. Until the
+answers, N27 and N62 (history and view versions kept forever) and P123 (commit keys kept
+forever; clients choose keys) stand as written.
+
+The proposal, in short: a horizon per kind (commit keys, row and record history, view and group
+versions) is declared in the log, and the default is forever. The primary's pulses trim, a
+bounded number of objects per pulse: reads happen in `prefetch`, tombstones are written in
+`commit`, and ordinary compaction reclaims them. A forward cursor removes each change's
+predecessor once the change is below the horizon (keep-last). So as-of reads at or above
+`horizon_op` stay exact, and reads below it answer `before_horizon`. A key's resend with no row
+is refused as `key_expired` unless its time is strictly above everything trimmed, plus
+`skew_max` and the op's timestamp span. That check holds for as long as any key has been
+trimmed.
 
 **Why:** pulses are how Nerva already does bounded, deterministic background work in the log
 (N52's backfill). Compaction-time filters cannot work, because append-only, timestamp-keyed
-tables at the last level are never rewritten. The keep-last rule keeps every current answer and
-every as-of answer above the horizon exact. The key check needs only prepare timestamps, so it is
-deterministic, and it proves a passing resend finds its row.
+tables at the last level are never rewritten. Recording the brief as a proposal, not as
+amendments, keeps merged decisions from saying more than the owner has agreed to.
 
-**Cost:** a vendored patch to `groove.zig` (removal from cacheless grooves) and a fuzzer for it.
-Formats move (new trees, operations, statuses, flags, export v3, `format_epoch` 2), so the
-release that ships R7 is reached by export and import (P259c). Clients must send UUIDv7 keys
-once a key horizon is declared. This amends N27, N62 and P123 ("kept forever") only for clusters
-that declare a horizon; the owner's answers to the brief's questions will be filed as P394b and
-onward.
+**Cost:** nothing yet; the brief names its own costs (formats, a vendored patch, export and
+import into R7's release).
+
+**Open, for the owner** (the brief's questions; the pull request that records the answers files
+its own decisions under its own number):
+- whether to amend N27, N62 and P123 ("kept forever") for clusters that declare a horizon
+  (question 5);
+- how a key's age is known: UUIDv7 or `sent_at`. Either amends P123's "clients choose keys" in
+  substance, and the first client's derived keys are not v7 (question 2);
+- whether pulses replace PRODUCTION.md's "Compaction drops what is older" (question 7);
+- whether "bounded" means bounded by the live set, since a load that creates records still grows
+  (question 8);
+- the feed below the horizon, the demo's time scale, the bounds, and when R7 starts (questions 3,
+  4, 6 and 1).
