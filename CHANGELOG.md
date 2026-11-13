@@ -107,6 +107,10 @@ The README's first line no longer says "toy / research": it gives the label and 
 
 ### Fixed
 
+- **#373, #306:** the settings examples (`replica.env.example`, `api.env.example`) shipped placeholder
+  keys that passed the length check, so an unedited copy ran on a key published in this repository.
+  They now ship `NERVA_CLUSTER_KEY=` and `NERVA_KEY=` empty, and `nerva start` and `nerva api`
+  refuse them (NRV-E0901, NRV-E0008) until you set your own.
 - **#308:** v0.7.0's "Upgrading from v0.6.1" step 2 told operators to wait for a log line saying
   a replica is committing; no replica writes one. The step now names the real signal (the
   `tb.replica_commit_min` gauge, or `sync: done`), here and in the v0.7.0 section below.
@@ -208,9 +212,6 @@ Open issues an operator should know about before relying on this release:
   sessions, which evicts every gateway, or declare a view that blocks a later `nerva import`.
   Let only the replicas, the gateways and the hosts that run backup, export or recover reach it
   (SECURITY.md).
-- **#306:** the settings examples' placeholder keys pass the length check. Replace both
-  `NERVA_CLUSTER_KEY` and `NERVA_KEY` before you start anything, or the cluster runs on a key
-  published in this repository.
 - **#304:** a replica's exit statuses 3 and 6 print vendored text with no NRV code; exit 3 names a
   flag Nerva does not have (TROUBLESHOOTING.md, "A replica exits").
 - **#300:** every flag refusal says to run `nerva <command> --help`, which is itself refused.
