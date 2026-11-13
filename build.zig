@@ -18,6 +18,9 @@ const release = "0.0.6";
 const release_client_min = "0.0.4";
 // Only `zig build test:release` builds this release, to run a cluster of two releases (N61).
 const release_test_other = "0.0.200";
+// The next release `test:release` builds, to roll a cluster from `release` to it (R6, P259): this
+// release with its patch plus 200, which no real release uses. It bundles this build's `nerva`.
+const release_test_next = release_plus_200(release);
 // The one past release a binary bundles, so that a cluster can move from it to `release` one
 // replica at a time (R6, P259). None until the packer exists (R6 slice 3). A release that rolls
 // keeps `release_client_min` at or below the bundled release, so that the past release's clients
@@ -34,6 +37,12 @@ comptime {
         assert(bundled.order(current) == .lt);
         assert(client_min.order(bundled) != .gt);
     }
+}
+
+fn release_plus_200(comptime text: []const u8) []const u8 {
+    const version = std.SemanticVersion.parse(text) catch unreachable;
+    assert(version.patch + 200 <= std.math.maxInt(u8));
+    return std.fmt.comptimePrint("{}.{}.{}", .{ version.major, version.minor, version.patch + 200 });
 }
 
 const zig_version = std.SemanticVersion{
@@ -156,6 +165,12 @@ pub fn build(b: *std.Build) !void {
             "version",
             "The release `nerva version` names (default: VERSION's contents).",
         ) orelse version_file(b),
+        .bundle = b.option(
+            []const u8,
+            "bundle",
+            "Path to the previous release's `nerva`: install a `nerva` that carries it, so that " ++
+                "a cluster can roll from it to this release (R6, P259)",
+        ),
         .print_exe = b.option(
             bool,
             "print-exe",
@@ -221,7 +236,34 @@ pub fn build(b: *std.Build) !void {
         .version = options.version,
         .commit_keys_deduplicate = options.test_commit_keys == .on,
     });
-    b.installArtifact(nerva);
+    // The packer runs on the build host: it runs both binaries to read their facts.
+    const nerva_pack = b.addExecutable(.{
+        .name = "nerva_pack",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/nerva/pack_main.zig"),
+            .target = target,
+            .optimize = .ReleaseSafe,
+        }),
+    });
+    nerva_pack.root_module.addImport("stdx", stdx_module);
+    nerva_pack.root_module.addImport(
+        "abi",
+        b.createModule(.{ .root_source_file = b.path("src/abi.zig") }),
+    );
+    nerva_pack.root_module.addOptions("vsr_options", vsr_options);
+    if (options.bundle) |bundle_path| {
+        const pack_run = b.addRunArtifact(nerva_pack);
+        pack_run.addArg("--input");
+        pack_run.addFileArg(nerva.getEmittedBin());
+        pack_run.addArg("--past");
+        pack_run.addFileArg(.{ .cwd_relative = bundle_path });
+        pack_run.addArg("--output");
+        const nerva_packed = pack_run.addOutputFileArg("nerva");
+        if (mode == .Debug) pack_run.addArg("--debug");
+        b.getInstallStep().dependOn(&b.addInstallBinFile(nerva_packed, "nerva").step);
+    } else {
+        b.installArtifact(nerva);
+    }
     // The same build with deduplication off, for `tests/errors/commands.py` (R1). Never
     // installed; when `-Dtest-commit-keys=off`, `nerva` itself is that build.
     const nerva_keys_off = nerva_executable(b, .{
@@ -473,6 +515,39 @@ pub fn build(b: *std.Build) !void {
         .mode = mode,
         .version = options.version,
     });
+    // `bundle.py` and the rolling tests: this code as the next release, bundling `nerva` (R6 slice
+    // 3). Never installed.
+    const vsr_options_next = b.addOptions();
+    vsr_options_next.addOption(?[40]u8, "git_commit", options.git_commit[0..40].*);
+    vsr_options_next.addOption(bool, "config_verify", options.config_verify);
+    vsr_options_next.addOption([]const u8, "release", release_test_next);
+    vsr_options_next.addOption([]const u8, "release_client_min", release_client_min);
+    const nerva_next_unpacked = nerva_executable(b, .{
+        .stdx_module = stdx_module,
+        .vsr_options = vsr_options_next,
+        .target = target,
+        .mode = mode,
+        .version = options.version,
+        .strip = true,
+    });
+    // The past release, from this commit too, stripped like its pair.
+    const nerva_past_stripped = nerva_executable(b, .{
+        .stdx_module = stdx_module,
+        .vsr_options = vsr_options,
+        .target = target,
+        .mode = mode,
+        .version = options.version,
+        .strip = true,
+    });
+    const pack_next = b.addRunArtifact(nerva_pack);
+    pack_next.addArg("--input");
+    pack_next.addFileArg(nerva_next_unpacked.getEmittedBin());
+    pack_next.addArg("--past");
+    pack_next.addFileArg(nerva_past_stripped.getEmittedBin());
+    pack_next.addArg("--output");
+    const nerva_next = pack_next.addOutputFileArg("nerva_next");
+    if (mode == .Debug) pack_next.addArg("--debug");
+
     // Then an upgrade: an export from `nerva`, imported by the other release (N80), without
     // records (export version 1) and with them (version 2, P123b); then replicas imported from
     // different exports (P90); then a backup, a restore drill and a restore (R5). One after the other: each runs a cluster.
@@ -484,6 +559,7 @@ pub fn build(b: *std.Build) !void {
         .{ "origins.py", "" },
         .{ "recover.py", "" },
         .{ "restore.py", "" },
+        .{ "bundle.py", "" },
     }) |release_test| {
         const script = release_test[0];
         const run_release_test = b.addSystemCommand(&.{
@@ -491,11 +567,17 @@ pub fn build(b: *std.Build) !void {
             b.fmt("tests/release/{s}", .{script}),
         });
         run_release_test.addFileArg(nerva.getEmittedBin());
-        const nerva_second = if (std.mem.eql(u8, script, "origins.py"))
-            nerva_client_min
-        else
-            nerva_other;
-        run_release_test.addFileArg(nerva_second.getEmittedBin());
+        if (std.mem.eql(u8, script, "bundle.py")) {
+            // The packed next release, then the packer, to try its refusals.
+            run_release_test.addFileArg(nerva_next);
+            run_release_test.addFileArg(nerva_pack.getEmittedBin());
+        } else {
+            const nerva_second = if (std.mem.eql(u8, script, "origins.py"))
+                nerva_client_min
+            else
+                nerva_other;
+            run_release_test.addFileArg(nerva_second.getEmittedBin());
+        }
         if (release_test[1].len > 0) run_release_test.addArg(release_test[1]);
         if (b.args) |args| run_release_test.addArgs(args);
         run_release_test.setCwd(b.path("."));
@@ -599,6 +681,9 @@ fn nerva_executable(b: *std.Build, options: struct {
     mode: std.builtin.OptimizeMode,
     version: []const u8,
     commit_keys_deduplicate: bool = true,
+    /// No debug info: a ReleaseSafe pair is over `multiversion_binary_platform_size_max` with it
+    /// (P417), so the test pair `nerva_next` bundles is stripped.
+    strip: bool = false,
 }) *std.Build.Step.Compile {
     const nerva = b.addExecutable(.{
         .name = "nerva",
@@ -621,6 +706,7 @@ fn nerva_executable(b: *std.Build, options: struct {
     nerva.root_module.addOptions("nerva_options", nerva_options);
     // Keep stack traces in release builds.
     nerva.root_module.omit_frame_pointer = false;
+    if (options.strip) nerva.root_module.strip = true;
     return nerva;
 }
 
