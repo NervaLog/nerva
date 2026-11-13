@@ -796,7 +796,7 @@ class Workflow(unittest.TestCase):
 
     def test_publish_waits_for_the_mac_checks_and_names_its_environment(self):
         publish = self.text.split("\n  publish:\n")[1].split("\n  verify:\n")[0]
-        self.assertIn("needs: [guard, mac, mac-verify]", publish)
+        self.assertIn("needs: [guard, mac, mac-verify, repos-ready]", publish)
         self.assertIn("environment: release-publish", publish)
         # the tap and the site come after the draft is public
         self.assertLess(publish.index('release_finish.sh publish "$TAG"'), publish.index('release_finish.sh tap "$TAG"'))
@@ -851,6 +851,157 @@ class Workflow(unittest.TestCase):
         self.assertIn("needs: [version, ci, packages]", draft)
         self.assertNotIn("\n    if:", draft)
         self.assertIn("workflow_call:", (ROOT / ".github/workflows/packages.yml").read_text())
+
+
+def job(text, name):
+    """The text of one job of a workflow file."""
+    body = "\n" + text.split("\njobs:\n")[1]
+    return re.split(r"\n  [a-z-]+:\n", body.split(f"\n  {name}:\n")[1])[0]
+
+
+class PackageRepos(unittest.TestCase):
+    """The package repositories' jobs (docs/releases/packages.md, slice 4), kept as tests."""
+
+    flows = ROOT / ".github/workflows"
+    finish = WORKFLOW.read_text()
+    refresh = (flows / "package-repos-refresh.yml").read_text()
+    watch = (flows / "package-repos-watch.yml").read_text()
+    ci = (flows / "ci.yml").read_text()
+
+    def test_the_bucket_group_is_on_exactly_three_jobs_and_queues_without_cancelling(self):
+        group = "concurrency:\n      group: nerva-packages-bucket\n      cancel-in-progress: false\n      queue: max\n"
+        found = []
+        for path in sorted(self.flows.glob("*.yml")):
+            text = path.read_text()
+            self.assertEqual(text.count("group: nerva-packages-bucket"), text.count(group), path.name)
+            for name in re.findall(r"(?m)^  ([a-z-]+):$", text.split("\njobs:\n")[1]) if "\njobs:\n" in text else []:
+                if group in job(text, name):
+                    found.append((path.name, name))
+        self.assertEqual(sorted(found), [("package-repos-refresh.yml", "refresh"), ("release-finish.yml", "repos"),
+                                 ("release-finish.yml", "repos-ready")])
+
+    def test_publish_waits_for_the_binding_and_reports_whether_it_is_public(self):
+        publish = job(self.finish, "publish")
+        self.assertIn("needs: [guard, mac, mac-verify, repos-ready]", publish)
+        self.assertIn("needs.repos-ready.result == 'success'", publish)
+        self.assertIn("public: ${{ steps.public.outputs.public }}", publish)
+        last = publish.split("\n      - name: ")[-1]
+        self.assertTrue(last.startswith("Is the release public"), last[:40])
+        self.assertIn("if: ${{ always() && steps.ready.conclusion == 'success' }}", last)
+        self.assertIn("releases/tags/$TAG", last)
+        self.assertNotIn("exit 1", last)
+
+    def test_repos_is_gated_on_the_publication_and_not_on_the_jobs_success(self):
+        repos = job(self.finish, "repos")
+        self.assertIn("needs: [guard, repos-ready, publish]", repos)
+        self.assertIn("if: ${{ !cancelled() && needs.repos-ready.result == 'success' && needs.publish.outputs.public == 'true' }}", repos)
+        self.assertIn("environment: package-repos", repos)
+        self.assertIn("package_repos.sh publish", repos)
+        self.assertEqual(job(self.finish, "verify").count("repos"), 0)  # brew waits for neither
+
+    def test_repos_ready_binds_the_approved_attempt_before_publish(self):
+        ready = job(self.finish, "repos-ready")
+        self.assertIn("MAC_ATTEMPT: ${{ needs.mac.outputs.attempt }}", ready)
+        self.assertIn("environment: package-repos", ready)
+        self.assertIn("package_repos.sh ready", ready)
+        self.assertIn("GITHUB_SHA: ${{ steps.ready.outputs.commit }}", ready)
+        mac = (self.flows / "mac-sign.yml").read_text()
+        self.assertIn("attempt: ${{ github.run_attempt }}", mac)
+        self.assertIn("value: ${{ jobs.sign.outputs.attempt }}", mac)
+        # no secret reaches any step but the one that binds
+        for step in ready.split("\n      - ")[1:]:
+            self.assertEqual("secrets." in step, "package_repos.sh ready" in step, step[:50])
+
+    def test_the_signing_secrets_reach_only_the_steps_that_write_the_bucket(self):
+        for text, names in ((self.finish, ("repos-ready", "repos")), (self.refresh, ("refresh",))):
+            for name in names:
+                for step in job(text, name).split("\n      - ")[1:]:
+                    self.assertEqual("secrets." in step, "package_repos.sh" in step and "cleanup" not in step, step[:50])
+        for other in ("publish", "site-verify", "repos-verify", "alarm", "guard"):
+            self.assertNotIn("secrets.R2_", job(self.finish, other))
+            self.assertNotIn("secrets.REPO_SIGNING", job(self.finish, other))
+        for text in (self.watch, self.ci):
+            self.assertNotIn("secrets.R2_", text)
+            self.assertNotIn("secrets.REPO_SIGNING", text)
+
+    def test_repos_verify_is_fourteen_cells_with_every_image_pinned_by_digest(self):
+        verify = job(self.finish, "repos-verify")
+        self.assertIn("runner: [ubuntu-24.04, ubuntu-24.04-arm]", verify)
+        distros = re.search(r"distro: \[(.*?)\]", verify).group(1).split(", ")
+        self.assertEqual(len(distros), 7)
+        images = re.findall(r"\{ distro: (\S+), image: (\S+), mgr: (apt|dnf) \}", verify)
+        self.assertEqual([d for d, _, _ in images], distros)
+        for _, image, _ in images:
+            self.assertRegex(image, r"^docker\.io/library/[a-z]+@sha256:[0-9a-f]{64}$")
+        self.assertIn("needs: [guard, repos]", verify)
+        self.assertNotIn("environment:", verify)
+        self.assertNotIn("secrets.", verify)
+
+    def test_site_verify_is_a_release_only_job_with_no_permissions(self):
+        site = job(self.finish, "site-verify")
+        self.assertIn("permissions: {}", site)
+        self.assertNotIn("environment:", site)
+        self.assertNotIn("secrets.", site)
+        self.assertIn("!contains(inputs.tag, '-')", site)
+        self.assertIn("needs.publish.result == 'success'", site)
+        self.assertIn("release_finish.sh site-live", site)
+
+    def test_every_alarm_holds_issues_write_only_and_never_fails_the_run(self):
+        alarms = {"release-finish.yml": self.finish, "package-repos-refresh.yml": self.refresh,
+                  "package-repos-watch.yml": self.watch, "ci.yml": self.ci}
+        for name, text in alarms.items():
+            alarm = job(text, "alarm")
+            self.assertIn("permissions:\n      issues: write\n", alarm, name)
+            self.assertIn("continue-on-error: true", alarm, name)
+            self.assertNotIn("environment:", alarm, name)
+            self.assertNotIn("secrets.", alarm, name)
+            self.assertIn("persist-credentials: false", alarm, name)
+            self.assertIn("if: ${{ always() && ", alarm.replace("if: >-\n      ${{ always() && ", "if: ${{ always() && "), name)
+            self.assertIn("repos_alarm.sh", alarm, name)
+            # cancelled alarms for repos-ready and repos, in release-finish.yml, and nowhere else
+            self.assertEqual("cancelled" in alarm.split("repos_alarm.sh")[0].split("steps:")[0], name == "release-finish.yml", name)
+        alarm = job(self.finish, "alarm")
+        self.assertIn("needs.repos-ready.result == 'cancelled' || needs.repos.result == 'cancelled'", alarm.replace("\n      ", " "))
+        self.assertIn("needs: [repos-ready, repos, repos-verify]", alarm)
+        self.assertIn("needs.refresh.outputs.missed == 'true'", job(self.refresh, "alarm"))
+
+    def test_the_refresh_runs_weekly_from_main_and_takes_its_two_inputs(self):
+        self.assertIn("cron: '17 5 * * 1'", self.refresh)
+        self.assertIn("alarm_test:", self.refresh)
+        self.assertIn("rpm_key:", self.refresh)
+        refresh = job(self.refresh, "refresh")
+        self.assertIn("if: github.ref == 'refs/heads/main'", refresh)
+        self.assertIn("environment: package-repos", refresh)
+        self.assertIn("timeout-minutes: 90", refresh)
+        self.assertIn("missed: ${{ steps.missed.outputs.missed }}", refresh)
+        self.assertLess(refresh.index("alarm-test"), refresh.index("secrets."))
+        self.assertLess(refresh.index("alarm-test"), refresh.index("package_repos.sh refresh"))
+        self.assertIn("TRIGGERING_ACTOR: ${{ github.triggering_actor }}", refresh)
+
+    def test_the_freshness_watches_run_only_when_the_repositories_are_live_and_write_nothing(self):
+        fresh = job(self.ci, "repos-fresh")
+        self.assertIn("github.event_name == 'push'", fresh)
+        self.assertIn("vars.REPOS_LIVE == 'true'", fresh)
+        self.assertIn("github.workflow == 'CI'", fresh)  # not in release.yml's call
+        self.assertIn("package_repos.sh fresh", fresh)
+        self.assertNotIn("pull_request", fresh)
+        self.assertNotIn("environment:", fresh)
+        self.assertNotIn("repos-fresh", job(self.ci, "unit"))  # no job needs it
+        self.assertEqual(self.ci.count("needs: repos-fresh"), 1)
+        watch = job(self.watch, "watch")
+        self.assertIn("vars.REPOS_LIVE == 'true'", watch)
+        self.assertIn("package_repos.sh fresh", watch)
+        self.assertIn("-gt 45", watch)
+        self.assertIn("cron: '41 6 * * *'", self.watch)
+        self.assertNotIn("environment:", watch)
+
+    def test_release_finish_describes_the_direct_merge_not_an_auto_merge(self):
+        self.assertNotIn("auto-merge", self.finish.split("\njobs:\n")[0])
+
+    def test_release_workflow_lets_the_called_ci_hold_the_alarm_permission(self):
+        release = (self.flows / "release.yml").read_text()
+        call = release.split("\n  ci:\n")[1].split("\n\n")[0]
+        self.assertIn("issues: write", call)
 
 
 if __name__ == "__main__":

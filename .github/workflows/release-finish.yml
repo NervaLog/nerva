@@ -12,11 +12,21 @@
 # Only main may run it (`guard`, NRV-E1137); each environment's main-only deployment rule is the
 # second guard. The scripts come from the workflow's own ref, never from the draft's target. If a
 # Mac check fails, nothing is published. Everything that can refuse without writing (the token, the
-# site's sentence, the tap's diff, the site's edit, an older version) runs before the draft is
-# published. Every step of `publish` is idempotent, so "Re-run failed jobs", or a dispatch, finishes
-# a half-done publish. A release goes to the tap's main and the site's auto-merge;
-# a prerelease to the tap's branch rc/<tag> and an unmerged site pull request, so it never reaches
-# users. The App's token (NervaLog/homebrew-tap and NervaLog/nervalog.github.io only, contents and
+# site's sentence, the tap's diff, the site's edit, an older version, the package repositories'
+# binding, `repos-ready`) runs before the draft is published. Every step of `publish` is
+# idempotent, so "Re-run failed jobs", or a dispatch, finishes a half-done publish. A release goes
+# to the tap's main and is merged into the site's main directly once site-check passes (P364); a
+# prerelease to the tap's branch rc/<tag> and an unmerged site pull request, so it never reaches
+# users.
+#
+# The package repositories (docs/releases/packages.md, P376): `repos-ready` binds the draft's
+# packages in a signed manifest in the same run attempt as the approved `mac` (NRV-E1153), before
+# `publish`; `repos` finishes them once the release is public (output `public`, so a tap or site
+# failure after the publication does not stop it); `repos-verify` installs from the signed
+# repositories on 14 cells; `site-verify` checks that nerva.pro shows the release and its WKD key.
+# `repos-ready` and `repos` are the only jobs here that write the bucket, in the one concurrency
+# group `nerva-packages-bucket` (with the refresh of package-repos-refresh.yml); `alarm` files an
+# issue when one of them fails. The App's token (NervaLog/homebrew-tap and NervaLog/nervalog.github.io only, contents and
 # pull requests) is given only to the steps that write there; writes to this repository use
 # GITHUB_TOKEN. Secrets are never on a command line.
 name: Release finish
@@ -99,18 +109,99 @@ jobs:
       tap-ref: ${{ needs.guard.outputs.tap-ref }}
       brew: ${{ needs.guard.outputs.published == 'true' && 'no' || 'yes' }}
 
-  # Runs when the Mac checks passed, or were skipped because the release is already published.
-  publish:
+  # Binds the draft's four packages in a signed manifest in the bucket, in the run attempt of the
+  # `mac` job the owner approved and before `publish` (docs/releases/packages.md, "`repos-ready`").
+  # It refuses on a bucket fault, on purpose: a release is never published while its packages
+  # cannot follow. A dispatch for a published release binds nothing and writes nothing.
+  repos-ready:
     needs: [guard, mac, mac-verify]
     if: >-
       ${{ !cancelled() && needs.guard.result == 'success'
       && contains(fromJSON('["success", "skipped"]'), needs.mac.result)
       && needs.mac-verify.result == 'success' }}
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: package-repos
+    permissions:
+      contents: write # reading a draft's assets needs it (P311)
+    concurrency:
+      group: nerva-packages-bucket
+      cancel-in-progress: false
+      queue: max
+    outputs:
+      code: ${{ steps.bind.outputs.code }}
+    env:
+      TAG: ${{ inputs.tag }}
+      PUBLISHED: ${{ needs.guard.outputs.published }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+          fetch-depth: 0 # `candidate` of publish-ready reads the history of the commit
+
+      - name: The release is ready to publish
+        id: ready
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          commit=$(.github/scripts/release_check.sh publish-ready "$TAG")
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+
+      # Pinned to what ubuntu-24.04 offers and asserted (packages.md, "Tools on the runner, pinned").
+      - name: Install the package repositories' tools, pinned
+        run: |
+          set -euo pipefail
+          sudo apt-get -o Acquire::Retries=5 update -qq
+          sudo apt-get -o Acquire::Retries=5 install -y -qq apt-utils=2.8.4ubuntu0.1 \
+            createrepo-c=0.17.3-2ubuntu3 rpm=4.18.2+dfsg-2.1build2 sqv=1.1.0-1build2 gnupg jq
+          tool_is() { # <tool> <expected first line>
+            got=$("$1" --version 2>&1 | head -n1)
+            case $got in "$2" | "$2"[!0-9.]*) ;; *) echo "error[NRV-E1139]: release-finish.yml: $1 reads '$got', not '$2'" >&2; exit 1 ;; esac
+          }
+          tool_is apt-ftparchive "apt 2.8.4"
+          tool_is createrepo_c "Version: 0.17.3"
+          tool_is rpmsign "RPM version 4.18.2"
+          gpg --version | head -n1 | grep -q 'gpg (GnuPG) 2\.4\.' || { echo "error[NRV-E1139]: release-finish.yml: gpg is not 2.4" >&2; exit 1; }
+
+      - name: Bind the packages
+        id: bind
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_SHA: ${{ steps.ready.outputs.commit }}
+          MAC_ATTEMPT: ${{ needs.mac.outputs.attempt }}
+          R2_ENDPOINT: ${{ vars.R2_ENDPOINT }}
+          R2_BUCKET: ${{ vars.R2_BUCKET }}
+          PACKAGES_BASE_URL: ${{ vars.PACKAGES_BASE_URL }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          REPO_SIGNING_KEY: ${{ secrets.REPO_SIGNING_KEY }}
+          REPO_SIGNING_PASSPHRASE: ${{ secrets.REPO_SIGNING_PASSPHRASE }}
+          REPO_SIGNING_KEY_NEXT: ${{ secrets.REPO_SIGNING_KEY_NEXT }}
+          REPO_SIGNING_PASSPHRASE_NEXT: ${{ secrets.REPO_SIGNING_PASSPHRASE_NEXT }}
+        run: |
+          set -euo pipefail
+          .github/scripts/package_repos.sh ready "$TAG" "$PUBLISHED"
+
+      - name: Remove the temporary keys
+        if: always()
+        run: .github/scripts/package_repos.sh cleanup
+
+  # Runs when the Mac checks passed, or were skipped because the release is already published.
+  publish:
+    needs: [guard, mac, mac-verify, repos-ready]
+    if: >-
+      ${{ !cancelled() && needs.guard.result == 'success'
+      && contains(fromJSON('["success", "skipped"]'), needs.mac.result)
+      && needs.mac-verify.result == 'success'
+      && needs.repos-ready.result == 'success' }}
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     environment: release-publish
     permissions:
       contents: write # publishes the draft in this repository; the other repositories use the App's token
+    outputs:
+      public: ${{ steps.public.outputs.public }}
     env:
       TAG: ${{ inputs.tag }}
       TAP_REF: ${{ needs.guard.outputs.tap-ref }}
@@ -267,6 +358,21 @@ jobs:
           case "$TAG" in *-*) mode=prerelease ;; esac
           .github/scripts/release_finish.sh site-wait "$PR" "$mode"
 
+      # Whatever failed after the publication (the date, the tap, the site), the packages still
+      # follow: `repos` is gated on this, not on the job's result. It never fails the job.
+      - name: Is the release public
+        id: public
+        if: ${{ always() && steps.ready.conclusion == 'success' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          public=false
+          if draft=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --jq .draft 2> /dev/null) && [ "$draft" = false ]; then
+            public=true
+          fi
+          echo "public=$public" >> "$GITHUB_OUTPUT"
+
   # The release is public and the tap has the formula: brew install on both architectures. No
   # environment and no secret.
   verify:
@@ -277,3 +383,176 @@ jobs:
     with:
       tag: ${{ inputs.tag }}
       tap-ref: ${{ needs.guard.outputs.tap-ref }}
+
+  # nerva.pro shows the release, and serves its WKD key. A release only: a candidate's site pull
+  # request is never merged (P364). No environment, no secret, no token.
+  site-verify:
+    needs: [guard, publish]
+    if: ${{ !cancelled() && needs.publish.result == 'success' && !contains(inputs.tag, '-') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions: {}
+    env:
+      TAG: ${{ inputs.tag }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+
+      - name: nerva.pro shows the release and its key
+        env:
+          SITE_LIVE_WAIT_SECONDS: '900'
+          SITE_POLL_SECONDS: '20'
+        run: |
+          set -euo pipefail
+          .github/scripts/release_finish.sh site-live "$TAG"
+
+  # Finishes the pending packages of every public release and re-signs both channels. Gated on the
+  # publication, not on `publish`'s success: a tap or site failure after the release is public no
+  # longer stops the packages. A queued writer waits in GitHub's queue (`queue: max`).
+  repos:
+    needs: [guard, repos-ready, publish]
+    if: ${{ !cancelled() && needs.repos-ready.result == 'success' && needs.publish.outputs.public == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    environment: package-repos
+    permissions:
+      contents: read # the release is public now
+    concurrency:
+      group: nerva-packages-bucket
+      cancel-in-progress: false
+      queue: max
+    outputs:
+      code: ${{ steps.write.outputs.code }}
+    env:
+      TAG: ${{ inputs.tag }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+
+      # Pinned to what ubuntu-24.04 offers and asserted (packages.md, "Tools on the runner, pinned").
+      - name: Install the package repositories' tools, pinned
+        run: |
+          set -euo pipefail
+          sudo apt-get -o Acquire::Retries=5 update -qq
+          sudo apt-get -o Acquire::Retries=5 install -y -qq apt-utils=2.8.4ubuntu0.1 \
+            createrepo-c=0.17.3-2ubuntu3 rpm=4.18.2+dfsg-2.1build2 sqv=1.1.0-1build2 gnupg jq
+          tool_is() { # <tool> <expected first line>
+            got=$("$1" --version 2>&1 | head -n1)
+            case $got in "$2" | "$2"[!0-9.]*) ;; *) echo "error[NRV-E1139]: release-finish.yml: $1 reads '$got', not '$2'" >&2; exit 1 ;; esac
+          }
+          tool_is apt-ftparchive "apt 2.8.4"
+          tool_is createrepo_c "Version: 0.17.3"
+          tool_is rpmsign "RPM version 4.18.2"
+          gpg --version | head -n1 | grep -q 'gpg (GnuPG) 2\.4\.' || { echo "error[NRV-E1139]: release-finish.yml: gpg is not 2.4" >&2; exit 1; }
+
+      - name: Put the packages, sign and upload both channels
+        id: write
+        env:
+          GH_TOKEN: ${{ github.token }}
+          R2_ENDPOINT: ${{ vars.R2_ENDPOINT }}
+          R2_BUCKET: ${{ vars.R2_BUCKET }}
+          PACKAGES_BASE_URL: ${{ vars.PACKAGES_BASE_URL }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          REPO_SIGNING_KEY: ${{ secrets.REPO_SIGNING_KEY }}
+          REPO_SIGNING_PASSPHRASE: ${{ secrets.REPO_SIGNING_PASSPHRASE }}
+          REPO_SIGNING_KEY_NEXT: ${{ secrets.REPO_SIGNING_KEY_NEXT }}
+          REPO_SIGNING_PASSPHRASE_NEXT: ${{ secrets.REPO_SIGNING_PASSPHRASE_NEXT }}
+        run: |
+          set -euo pipefail
+          .github/scripts/package_repos.sh publish "$TAG"
+
+      - name: Remove the temporary keys
+        if: always()
+        run: .github/scripts/package_repos.sh cleanup
+
+  # Installs from the signed repositories, as INSTALL.md tells a user to, on every distribution
+  # its text names: 7 images on each architecture, 14 cells. The release is already public here.
+  # Images are pinned by digest (the manifest lists' digests, as `docker.io/library/<name>:<tag>`
+  # resolved them on 2026-11-13). No environment, no secret.
+  repos-verify:
+    needs: [guard, repos]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+        distro: [debian-12, debian-13, ubuntu-22.04, ubuntu-24.04, rockylinux-9, fedora-43, fedora-44]
+        include:
+          - { distro: debian-12, image: docker.io/library/debian@sha256:268fb24c39bca92d326dd83ea3abebe4a3f7751c804ffef23bb6d857dd343ff8, mgr: apt }
+          - { distro: debian-13, image: docker.io/library/debian@sha256:9c6e381421d0f48d1b8133e573f33c185ee16cbf505eda9c4a8a4791b25ea8a6, mgr: apt }
+          - { distro: ubuntu-22.04, image: docker.io/library/ubuntu@sha256:74b12b11ffa550fba1929ad4d8d16533c34f6612728469671afba1b03b66881c, mgr: apt }
+          - { distro: ubuntu-24.04, image: docker.io/library/ubuntu@sha256:2198e4c65076e9cb0b3d695219df667c0e3b0072da64ca3c2648aca17dcecaf5, mgr: apt }
+          - { distro: rockylinux-9, image: docker.io/library/rockylinux@sha256:d7be1c094cc5845ee815d4632fe377514ee6ebcf8efaed6892889657e5ddaaa6, mgr: dnf }
+          - { distro: fedora-43, image: docker.io/library/fedora@sha256:f01112b9a1f1d0504ad962d9adfa401425033f8ab067e0a821904ebdde5b8ca5, mgr: dnf }
+          - { distro: fedora-44, image: docker.io/library/fedora@sha256:15da97ed9aa94dd3d92c3925eb89520f6c80e07ea7ee24cba848d1f8b6912b3e, mgr: dnf }
+    env:
+      TAG: ${{ inputs.tag }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+
+      - name: Install nerva from the repository in ${{ matrix.distro }}
+        env:
+          IMAGE: ${{ matrix.image }}
+          MGR: ${{ matrix.mgr }}
+          BASE_URL: ${{ vars.PACKAGES_BASE_URL }}
+        run: |
+          set -euo pipefail
+          channel=stable
+          case "$TAG" in *-*) channel=rc ;; esac
+          version=${TAG#v}
+          # `primary` when the key file has one; in the fallback, `current`
+          fpr=$(awk '$1 == "primary" { p = $2 } $1 == "current" { c = $2 } END { print p ? p : c }' packaging/keys/fingerprints)
+          docker run --rm -v "$PWD/.github/scripts:/scripts:ro" "$IMAGE" \
+            bash /scripts/repo_install_check.sh "$MGR" "$channel" "${BASE_URL:-https://packages.nerva.pro}" "$fpr" "$version"
+
+  # Files or comments on the one open `package-repos` issue when a job above failed, and for
+  # `repos-ready` and `repos` also when one was cancelled (nothing supersedes them, so a person did,
+  # and a cancelled `repos-ready` may be a release that never gets its packages). `issues: write`
+  # and nothing else; no environment, no secret; it never changes the run's verdict.
+  alarm:
+    needs: [repos-ready, repos, repos-verify]
+    if: >-
+      ${{ always() && (contains(needs.*.result, 'failure')
+      || needs.repos-ready.result == 'cancelled' || needs.repos.result == 'cancelled') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    continue-on-error: true
+    permissions:
+      issues: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+
+      - name: File the alarm
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PACKAGE_REPOS_OWNER: ${{ vars.PACKAGE_REPOS_OWNER }}
+          READY: ${{ needs.repos-ready.result }}
+          READY_CODE: ${{ needs.repos-ready.outputs.code }}
+          REPOS: ${{ needs.repos.result }}
+          REPOS_CODE: ${{ needs.repos.outputs.code }}
+          VERIFY: ${{ needs.repos-verify.result }}
+        run: |
+          set -euo pipefail
+          url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          alarm() { # <job> <result> <code>
+            case "$2" in failure | cancelled) ;; *) return 0 ;; esac
+            code=${3:-unknown}
+            [ "$2" = cancelled ] && code=cancelled
+            .github/scripts/repos_alarm.sh release-finish.yml "$1" "${code:-unknown}" "$url"
+          }
+          alarm repos-ready "$READY" "$READY_CODE"
+          alarm repos "$REPOS" "$REPOS_CODE"
+          # `repos-verify` is a matrix; its cells say NRV-E1146 or NRV-E1157 in their own logs
+          if [ "$VERIFY" = failure ]; then
+            .github/scripts/repos_alarm.sh release-finish.yml repos-verify unknown "$url"
+          fi

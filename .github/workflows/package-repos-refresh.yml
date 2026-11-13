@@ -1,0 +1,158 @@
+# Re-signs the package repositories every Monday, so apt's `Valid-Until` (21 days after `Date`)
+# never lapses when no release happens (docs/releases/packages.md, "`Valid-Until`, and the weekly
+# refresh"). `package_repos.sh refresh` is `publish` without a tag: it finishes the pending entries
+# of public releases, promotes, re-signs both channels and ends with the 45-day commit-age check.
+# Its job is the third writer of the bucket and is in the same concurrency group as `repos-ready`
+# and `repos` of release-finish.yml: one writer at a time, nothing cancelled (`queue: max`).
+#
+# Dispatch inputs: `alarm_test` fails the job at once with the code `alarm-test`, before a secret is
+# read, so the rehearsal can test the alarm; `rpm_key` is `exclude <Key ID>` or `restore <Key ID>`
+# ("Excluding the rpms of one key"), owner-only: `package_repos.sh` refuses it (NRV-E1139) unless
+# the triggering actor is PACKAGE_REPOS_OWNER. A session never dispatches it.
+#
+# `missed` is true when the served `stable` InRelease is over 8 days old, which means the refresh
+# before this one did not run; the `alarm` job then comments on the issue and the refresh carries on.
+name: Package repositories refresh
+
+on:
+  schedule:
+    - cron: '17 5 * * 1'
+  workflow_dispatch:
+    inputs:
+      alarm_test:
+        description: 'Fail at once, with the code alarm-test, to test the alarm'
+        type: boolean
+        default: false
+      rpm_key:
+        description: 'Owner only: "exclude <Key ID>" or "restore <Key ID>" (16 hex)'
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+# `bash` here is `bash -eo pipefail`: a failing command in a pipeline fails the step.
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  refresh:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    environment: package-repos
+    permissions:
+      contents: read
+    concurrency:
+      group: nerva-packages-bucket
+      cancel-in-progress: false
+      queue: max
+    outputs:
+      code: ${{ steps.refresh.outputs.code || steps.alarm_test.outputs.code }}
+      missed: ${{ steps.missed.outputs.missed }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+
+      - name: The alarm test
+        id: alarm_test
+        if: ${{ inputs.alarm_test }}
+        run: |
+          set -euo pipefail
+          echo "code=alarm-test" >> "$GITHUB_OUTPUT"
+          echo "::error::alarm-test: this run fails on purpose, to test the alarm"
+          exit 1
+
+      # More than 8 days since the served stable `Date`: the refresh before this one did not run.
+      - name: The previous refresh ran
+        id: missed
+        env:
+          BASE_URL: ${{ vars.PACKAGES_BASE_URL }}
+        run: |
+          set -euo pipefail
+          missed=false
+          if release=$(curl -fsS --max-time 30 "${BASE_URL%/}/apt/dists/stable/InRelease") \
+            && date=$(printf '%s\n' "$release" | sed -n 's/^Date: //p' | head -n1) && [ -n "$date" ] \
+            && then=$(date -u -d "$date" +%s 2> /dev/null); then
+            age=$((($(date -u +%s) - then) / 86400))
+            if [ "$age" -gt 8 ]; then
+              missed=true
+              echo "::warning::the served stable InRelease is $age days old: the refresh before this one did not run"
+            fi
+          else
+            echo "::notice::no stable InRelease to read the age of (the first run, or the site is unreachable)"
+          fi
+          echo "missed=$missed" >> "$GITHUB_OUTPUT"
+
+      # Pinned to what ubuntu-24.04 offers and asserted (packages.md, "Tools on the runner, pinned").
+      - name: Install the package repositories' tools, pinned
+        run: |
+          set -euo pipefail
+          sudo apt-get -o Acquire::Retries=5 update -qq
+          sudo apt-get -o Acquire::Retries=5 install -y -qq apt-utils=2.8.4ubuntu0.1 \
+            createrepo-c=0.17.3-2ubuntu3 rpm=4.18.2+dfsg-2.1build2 sqv=1.1.0-1build2 gnupg jq
+          tool_is() { # <tool> <expected first line>
+            got=$("$1" --version 2>&1 | head -n1)
+            case $got in "$2" | "$2"[!0-9.]*) ;; *) echo "error[NRV-E1139]: package-repos-refresh.yml: $1 reads '$got', not '$2'" >&2; exit 1 ;; esac
+          }
+          tool_is apt-ftparchive "apt 2.8.4"
+          tool_is createrepo_c "Version: 0.17.3"
+          tool_is rpmsign "RPM version 4.18.2"
+          gpg --version | head -n1 | grep -q 'gpg (GnuPG) 2\.4\.' || { echo "error[NRV-E1139]: package-repos-refresh.yml: gpg is not 2.4" >&2; exit 1; }
+
+      - name: Refresh both channels
+        id: refresh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RPM_KEY: ${{ inputs.rpm_key }}
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+          PACKAGE_REPOS_OWNER: ${{ vars.PACKAGE_REPOS_OWNER }}
+          R2_ENDPOINT: ${{ vars.R2_ENDPOINT }}
+          R2_BUCKET: ${{ vars.R2_BUCKET }}
+          PACKAGES_BASE_URL: ${{ vars.PACKAGES_BASE_URL }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          REPO_SIGNING_KEY: ${{ secrets.REPO_SIGNING_KEY }}
+          REPO_SIGNING_PASSPHRASE: ${{ secrets.REPO_SIGNING_PASSPHRASE }}
+          REPO_SIGNING_KEY_NEXT: ${{ secrets.REPO_SIGNING_KEY_NEXT }}
+          REPO_SIGNING_PASSPHRASE_NEXT: ${{ secrets.REPO_SIGNING_PASSPHRASE_NEXT }}
+        run: |
+          set -euo pipefail
+          .github/scripts/package_repos.sh refresh
+
+      - name: Remove the temporary keys
+        if: always()
+        run: .github/scripts/package_repos.sh cleanup
+
+  # `issues: write` and nothing else; no environment, no secret; it never changes the run's verdict.
+  alarm:
+    needs: refresh
+    if: ${{ always() && (contains(needs.*.result, 'failure') || needs.refresh.outputs.missed == 'true') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    continue-on-error: true
+    permissions:
+      issues: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+
+      - name: File the alarm
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PACKAGE_REPOS_OWNER: ${{ vars.PACKAGE_REPOS_OWNER }}
+          RESULT: ${{ needs.refresh.result }}
+          CODE: ${{ needs.refresh.outputs.code }}
+          MISSED: ${{ needs.refresh.outputs.missed }}
+        run: |
+          set -euo pipefail
+          url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          if [ "$MISSED" = true ]; then
+            .github/scripts/repos_alarm.sh package-repos-refresh.yml refresh missed "$url"
+          fi
+          if [ "$RESULT" = failure ]; then
+            .github/scripts/repos_alarm.sh package-repos-refresh.yml refresh "${CODE:-unknown}" "$url"
+          fi
