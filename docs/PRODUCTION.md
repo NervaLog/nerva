@@ -31,7 +31,7 @@ green in CI, with a link to the run.
 | --- | --- | --- |
 | R1 · Proven | Jepsen nightly on a dedicated host: commit keys under unknown outcomes, the gateway killed and cut off | In progress (the retry, bank-keys and gateway workloads and the nightly workflow are merged and run on GitHub-hosted runners; the dedicated host is not provisioned) |
 | R2 · Fleet | An always-on VOPR and fuzzer fleet on Hetzner that files every new failure | In progress (scripts and reporter written; host not provisioned) |
-| R3 · Measured | Sizing and latency on the real topology: three machines, the Fly p99 explained | Not started |
+| R3 · Measured | Sizing and latency on the real topology: three machines, the p99 tail explained | Not started |
 | R4 · Gateway | Beside its client, never ambiguous, observable: a gateway per client process, no ambiguous 503, metrics | Delivered 2026-11-06 ([demo](https://github.com/NervaLog/nerva/actions/runs/42136037296/job/127624296815), [docs/demos/r4.md](./demos/r4.md)) |
 | R5 · Recover | Replace a lost replica, and restore from a backup, with the cluster open | Delivered 2026-11-05 ([demo](https://github.com/NervaLog/nerva/actions/runs/41997293568/job/127143488126), [docs/demos/r5.md](./demos/r5.md)) |
 | R6 · Upgrade | Rolling upgrades between releases with the same data format | Brief written ([docs/briefs/r6.md](./briefs/r6.md)) |
@@ -136,15 +136,15 @@ one sandbox.
 
 **Scope:**
 
-- **`perf/fly/`** runs three replicas on three Machines, with the benchmark and gateways on
-  others, and records p50, p99 and p99.9 with checkpoints marked.
+- **`perf/topology/`** runs three replicas on three generic VMs over SSH (P406, P406e), with the
+  benchmark and gateways on a fourth, and records p50, p99 and p99.9 with checkpoints marked.
 - **The p99 tail** is explained: checkpoints, compaction or IO, with a trace (N50).
 - **A sizing table** goes in the README, by working set: the memory each cache takes, and what
   `--cache-grid` and the row cache cost and save. This closes #127's open half.
 - **A replica refuses to start** when its configured caches exceed the memory it can see, with a
   message naming the flag. Today it starts and is killed later.
 
-**Demo script:** `perf/fly/run.sh --topology 3+1` prints the table. A second run on the same
+**Demo script:** `perf/topology/run.py --topology 3+1` prints the table. A second run on the same
 commit lands within 10%.
 
 **Acceptance:**
