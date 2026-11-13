@@ -122,6 +122,12 @@ vsr_superblock_quorums vsr_multi_batch nerva_adds nerva_http_head nerva_document
         "$SIM_FLEET_WORKERS_VOPR_TESTING, fuzz $SIM_FLEET_WORKERS_FUZZ, mixed" \
         "$SIM_FLEET_WORKERS_MIXED ($SIM_FLEET_WORKERS $workers_from; $SIM_FLEET_SEED_MEMORY_MB MB" \
         "a seed, $SIM_FLEET_RESERVE_MB MB reserved)"
+    # A round the last run left is settled first, by the reporter already built: not after
+    # `follow_main`, which may take an hour to build or die. With none built, `run_round` does it.
+    if [[ -n "$built" && -r "$STATE/bin/$built/sim_fleet.py" ]]; then
+        bin="$STATE/bin/$built" round="$STATE/round"
+        settle_leftover
+    fi
     local rounds=0
     while (( SIM_FLEET_ROUNDS == 0 || rounds < SIM_FLEET_ROUNDS )); do
         rounds=$(( rounds + 1 ))
@@ -294,6 +300,30 @@ prune_cache() {
     fi
 }
 
+# A round a stop, a reboot or a crash left is settled from the results it holds, as any other
+# round: its finished seeds are counted (#370, P382). A round whose `id.refuse` exists had a
+# worker die: that verdict was made durable (by a rename, which needs no disk space) before it
+# was recorded, so it is refused, never counted. A round with no valid id is not this run.sh's
+# (or it was half deleted after its record was saved): deleted, as before. Needs `bin`, `round`.
+settle_leftover() {
+    [[ -d "$round" ]] || return 0
+    local left_id left_commit mode=""
+    left_id=$(cat "$round/id" 2>/dev/null || true)
+    if [[ -e "$round/id.refuse" ]]; then
+        left_id=$(cat "$round/id.refuse" 2>/dev/null || true)
+        mode=refuse
+    fi
+    left_commit=$(cat "$round/commit" 2>/dev/null || true)
+    if [[ "$left_id" =~ ^[0-9]{1,20}-[0-9a-f]{16}$ && "$left_commit" =~ ^[0-9a-f]{7,64}$ ]]
+    then
+        log "settling round $left_id of $left_commit, left by a stop or a crash${mode:+ ($mode)}"
+        settle "$left_id" "$left_commit" $mode
+    else
+        log "deleting a round with no id or commit"
+        rm -rf "$round"
+    fi
+}
+
 # One round: every worker runs seeds of its kind until the round's time is up, then the
 # reporter reads what they wrote. A round is made whole under a temporary name, with its id and
 # commit, so `round` always has both.
@@ -301,22 +331,7 @@ run_round() {
     bin="$STATE/bin/$built"
     round="$STATE/round"
     rm -rf "$round.new"
-    # A round a stop, a reboot or a crash left is settled from the results it holds, as any
-    # other round: its finished seeds are counted (#370, P382). A round with no valid id is not
-    # this run.sh's (or it was half deleted after its record was saved): deleted, as before.
-    if [[ -d "$round" ]]; then
-        local left_id left_commit
-        left_id=$(cat "$round/id" 2>/dev/null || true)
-        left_commit=$(cat "$round/commit" 2>/dev/null || true)
-        if [[ "$left_id" =~ ^[0-9]{1,20}-[0-9a-f]{16}$ && "$left_commit" =~ ^[0-9a-f]{7,64}$ ]]
-        then
-            log "settling round $left_id of $left_commit, left by a stop or a crash"
-            settle "$left_id" "$left_commit"
-        else
-            log "deleting a round with no id or commit"
-            rm -rf "$round"
-        fi
-    fi
+    settle_leftover
     local id
     id="$(date +%s)-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
     mkdir "$round.new"
@@ -348,6 +363,10 @@ run_round() {
     done
     if (( died > 0 )); then
         log "$died of ${#pids[@]} workers of round $id died before its end; refusing it"
+        # The verdict first, durably: `refuse` may be unable to write the state (a full disk),
+        # and a restart must not count this round.
+        mv "$round/id" "$round/id.refuse"
+        sync "$round/id.refuse" "$round"
         settle "$id" "$built" refuse
     else
         settle "$id" "$built"

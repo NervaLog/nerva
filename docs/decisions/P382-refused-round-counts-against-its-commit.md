@@ -30,7 +30,11 @@ again. `ingest` and `refuse` do nothing for an id already recorded, so a round i
 twice; `ingest` exits 1 for one recorded as refused, so `run.sh` keeps it in
 `last-failed-round` as it keeps every refused round. At start, a round left in `state/round` with
 a valid id and commit (a stop, a reboot, a crash, or the exit above) is settled the same way,
-under its own commit, from the lines its workers wrote. A leftover `round.new`, or a round
+under its own commit, from the lines its workers wrote, before `follow_main` (which may build
+for an hour or die), by the reporter already built; with none built, `run_round` does it. When a
+worker died, `run.sh` first renames the round's `id` to `id.refuse` (a rename needs no disk
+space) and then calls `refuse`; a leftover round with `id.refuse` is settled with `refuse`, never
+counted, so a full disk that stops `refuse` cannot turn the refusal into a count after a restart. A leftover `round.new`, or a round
 without an id, is deleted uncounted. A refused round is counted on its UTC day too, and the
 tracker's daily totals say how many.
 

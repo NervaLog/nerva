@@ -1440,6 +1440,42 @@ class RunShSettle(unittest.TestCase):
                                          os.path.join(self.state, "state.json")]), 1)
         self.assertEqual(self.state_json()["commits"][SHA_B]["kinds"]["vopr-nerva"]["failed"], 1)
 
+    DIE = ('worker() { if [[ $1 == 1 ]]; then return 3; fi; mkdir -p "$round/w$1"; '
+           'echo "vopr-nerva 9 0 3600" >>"$round/w$1/results"; }; ')
+
+    def test_a_round_a_worker_died_in_is_refused_even_if_refuse_cannot_write(self):
+        # A full disk: the worker dies, `refuse` cannot save the state, run.sh stops with the
+        # round kept. The restart must refuse it, not count its surviving lines.
+        out = self.run_round(self.DIE, workers=2, refuse="fail:1")
+        self.assertEqual(out.returncode, 1, out.stderr)
+        self.assertIn("recorded nowhere", out.stderr)
+        out = self.run_round()  # systemd's restart.
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("(refuse)", out.stderr)
+        self.assertEqual(self.entry()["refused"], 1)
+        self.assertEqual(self.soak_code(), 1)
+
+    def test_a_leftover_is_settled_before_the_build_and_even_if_it_dies(self):
+        # `systemctl restart`: the old round is settled with the built reporter before
+        # follow_main, which can take an hour or die on a full disk.
+        self.leftover(["vopr-nerva 6 134 600"])
+        os.makedirs(os.path.join(self.state, "bin"))
+        os.symlink(self.bin, os.path.join(self.state, "bin", SHA_A))
+        Path(self.state, "built").write_text(SHA_A + "\n")
+        self.script(os.path.join(self.bin, "fuzz"), "exit 0\n")
+        os.makedirs(os.path.join(self.dir, ".git"))
+        out = subprocess.run(
+            ["bash", "-c", f'source "{HERE}/run.sh"; follow_main() {{ echo FOLLOW >&2; exit 7; }}; '
+             'log() { echo "$*" >&2; }; main'],
+            env={"PATH": os.environ["PATH"], "SIM_FLEET_DRY_RUN": "1",
+                 "SIM_FLEET_HOME": self.dir, "SIM_FLEET_STATE_DIR": self.state,
+                 "SIM_FLEET_REPO_DIR": self.dir, "SIM_FLEET_WORKERS_VOPR_NERVA": "1"},
+            capture_output=True, text=True, timeout=60)
+        self.assertEqual(out.returncode, 7, out.stderr)
+        self.assertLess(out.stderr.index("settling round"), out.stderr.index("FOLLOW"))
+        self.assertEqual(self.failed(), 1)
+        self.assertEqual(self.soak_code(), 1)
+
     def test_a_worker_that_dies_refuses_the_round(self):
         # A failing seed, then a full disk: `mkdir` of its directory fails and the worker dies
         # under `set -e` (#370, the review's reproduction). The round is refused, not clean.

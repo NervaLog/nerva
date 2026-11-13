@@ -289,7 +289,11 @@ fetch (`couldn't find remote ref`; the loop logs `git fetch failed` and keeps wh
 typo soaks the old commit silently: check `journalctl -u sim-fleet` for `building <SHA>`). The
 fleet then stops following `main`; the soak restarts at a new commit when the owner moves the
 pin (a fix merged to `main` first), and when the soak ends the owner removes the line and
-restarts the service.
+restarts the service. A restart kills the round in flight; the next start settles it from the
+lines it holds, before it builds anything when a reporter is already built (otherwise right
+after the first build; the log says `settling round ... left by a stop or a
+crash`). Read `soak` for the old candidate only after that line, and for the new one only after
+its first round ends.
 
 **Before the soak counts** (the owner's host steps, in order; none is done by this repository):
 
