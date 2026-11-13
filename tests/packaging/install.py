@@ -143,13 +143,13 @@ def show(unit, *properties):
     return dict(line.split("=", 1) for line in out.strip().split("\n"))
 
 
-def wait(what, condition, seconds=60):
+def wait(what, condition, seconds=60, evidence=None):
     deadline = time.monotonic() + seconds
     while True:
         value = condition()
         if value:
             return value
-        assert time.monotonic() < deadline, f"timed out: {what}"
+        assert time.monotonic() < deadline, f"timed out: {what}" + (f"\n{evidence()}" if evidence else "")
         time.sleep(0.2)
 
 
@@ -600,8 +600,17 @@ def test_restart_policy(tmp):
         # without logging it (Type=exec, a process that exits at once). The counted facts are
         # "Starting" and "Main process exited", which every start has, and NRestarts. A failure
         # prints the whole journal and the counts.
-        sh(["journalctl", "--sync"])
-        log = sh(["journalctl", "-u", unit, "--since", since, "--no-pager", "-o", "cat"]).stdout
+        def journal():
+            sh(["journalctl", "--sync"])
+            return sh(["journalctl", "-u", unit, "--since", since, "--no-pager", "-o", "cat"]).stdout
+
+        # systemd's own lines can reach the journal after the unit shows `failed`: wait, bounded,
+        # for the refusal and the 20 exits, then count. A timeout prints the whole journal.
+        wait("the journal records the 20 exits and the refused start",
+             lambda: "Start request repeated too quickly" in (log := journal())
+             and log.count("Main process exited, code=exited, status=1/FAILURE") >= 20,
+             evidence=journal)
+        log = journal()
         counts = {"Starting": log.count("Starting nerva@9.service"),
                   "Started": log.count("Started nerva@9.service"),
                   "exited": log.count("Main process exited, code=exited, status=1/FAILURE"),
