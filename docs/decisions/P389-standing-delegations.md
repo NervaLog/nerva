@@ -2,6 +2,7 @@
 id: P389
 date: 2026-11-13
 area: Releases
+amends: P374
 ---
 
 # Standing delegations from the owner
@@ -51,20 +52,25 @@ by itself. Later releases need a decision of their own.
 A question that stops a pull request is settled by its recommended option, unless the owner
 answers first, when all of these hold:
 
-- every path in the pull request's diff is in `docs/`, `tests/` or `ops/`, and none is in
-  `docs/decisions/`, `docs/briefs/`, `docs/releases/`, `docs/retros/`, `docs/ERRORS.md`,
-  `docs/GOALS-1.0.md`, `docs/PRODUCTION.md`, `tests/jepsen/`, `tests/packaging/`,
-  `ops/sim-fleet/` or `ops/jepsen/`, or names a release, a key or signing. No file outside these
-  three directories qualifies: not `README.md`, `UPSTREAM.md`, `CHANGELOG.md`, `CLAUDE.md`,
-  `REVIEW.md`, `VERSION`, `release/` or any workflow;
+- the pull request only adds new test files under `tests/`, or changes explanatory documents
+  under `docs/`, and touches nothing else. It removes, skips or relaxes no existing test, check or
+  gate;
+- no path is in `docs/decisions/`, `docs/briefs/`, `docs/releases/`, `docs/retros/`,
+  `docs/ERRORS.md`, `docs/GOALS-1.0.md`, `docs/PRODUCTION.md`, `docs/INSTALL.md`,
+  `docs/QUICKSTART.md`, `tests/release/`, `tests/macos/`, `tests/demo/`, `tests/jepsen/` or
+  `tests/packaging/`. No path or content concerns a release, an upgrade, a key, signing or
+  checksums;
 - the question is not about anything a Stop item names: a format, a vendored file, a golden value,
   an invariant, the toolchain or a new dependency, or a contradiction of `README.md`,
   `docs/GOALS-1.0.md` or a decision;
-- 24 hours have passed since the daily digest that carried it.
+- 24 hours have passed since the daily digest that carried it. The digest names the pull
+  request's head SHA and the recommended option.
 
-The supervisor checks the paths again at the head that merges. A push that adds a path outside
-them ends the default, and the question goes back to the owner. The record that counts is the
-digest in the supervisor's session, where the owner did not answer. The supervisor's comment on
+If the supervisor cannot place a pull request inside these limits with certainty, it is outside
+them. The supervisor checks them again at the head that merges. Any push after the digest, or a
+change to the recommendation, starts the 24 hours again from the next digest. A push that leaves
+the limits ends the default, and the question goes back to the owner. The record that counts is
+the digest in the supervisor's session, where the owner did not answer. The supervisor's comment on
 the pull request only reports it. The pull request then proceeds under the usual rules: an Opus
 review with no open MUST, and green CI.
 
