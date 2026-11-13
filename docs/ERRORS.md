@@ -219,7 +219,7 @@ These are the replies to `POST /v1/commit`. The identifier is the state machine'
 | NRV-E0807 | The imported data failed its checks | `error[NRV-E0807]: import: the export was refused: <first reason>` (and N more in the log above), exit 1 | operator | Read the log lines above the error |
 | NRV-E0808 | A backup's manifest is missing, malformed, too large or of an unknown version | `error[NRV-E0808]: restore: <manifest>: <what is wrong>`, exit 1 (`nerva restore`, R5 slice 6) | operator | Give the `.manifest.json` that `nerva backup` wrote beside the backup |
 | NRV-E0809 | A backup does not match its manifest: size, SHA-256, op, version, a view hash or a ledger total | `error[NRV-E0809]: restore: <backup> does not match <manifest>: <first difference>`, exit 1 (`nerva restore`, R5 slice 6) | operator | Use the backup the manifest names, or another backup with its own manifest |
-| NRV-E0810 | A file `export` or `import` was given cannot be opened, read or written | `error[NRV-E0810]: import: cannot use <path>: no such file or directory` and the like, exit 1 (R5 slice 1) | operator | Check the path and its permissions |
+| NRV-E0810 | A file `format`, `start`, `export` or `import` was given cannot be opened, read or written, or its directory is missing or not writable | `error[NRV-E0810]: format: cannot use <path>: no such file or directory` and the like, exit 1 (R5 slice 1; `format` since #372) | operator | Check the path and its permissions |
 
 ## 09xx · Keys between replicas
 

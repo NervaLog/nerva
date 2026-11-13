@@ -89,6 +89,16 @@ def main():
         fmt = ["format", "--cluster=0", "--replica=0", "--replica-count=3", "--development"]
         assert run(nerva, fmt + [data]).returncode == 0
         check("format twice", fmt + [data], "NRV-E0005", 1, "exists")
+        # The data file's directory: the operator's to fix, never a listen failure or a bug (#372).
+        check("format missing directory", fmt + [os.path.join(tmp, "missing", "x.nerva")],
+              "NRV-E0810", 1, "no such file or directory")
+        check("format parent is a file", fmt + [os.path.join(data, "x.nerva")],
+              "NRV-E0810", 1, "not a directory")
+        if os.geteuid() != 0:  # root may write anywhere
+            locked = os.path.join(tmp, "locked")
+            os.mkdir(locked, 0o500)
+            check("format unwritable directory", fmt + [os.path.join(locked, "x.nerva")],
+                  "NRV-E0810", 1, "permission denied")
         check("replica out of range",
               ["format", "--cluster=0", "--replica=3", "--replica-count=3", "--development",
                os.path.join(tmp, "b.nerva")], "NRV-E0002", 1, "--replica must be less")
