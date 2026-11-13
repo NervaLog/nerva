@@ -727,6 +727,7 @@ dnf_group() {
       upg rotation/diagnosis-upgrade-after-rpm-import info 2.0 dnf upgrade -y --refresh nervak
       for id in $(rpm -qa 'gpg-pubkey*'); do rpm -e "$id" > /dev/null 2>&1; done
       upg rotation/diagnosis-upgrade-after-rpm-e-and-import info 2.0 dnf upgrade -y --refresh nervak
+      upg rotation/diagnosis-upgrade-after-dnf-clean-all info 2.0 bash -c 'dnf clean all; dnf upgrade -y nervak'
     fi ;;
   stale)
     swap_key keyA.asc; swap_repo s1; dnf_repo
@@ -900,8 +901,11 @@ FINDINGS = {
         "Key import failed (code 2)",
     ("rockylinux:9", "revocation:revocation/dnf-rpm-signed-by-a-revoked-subkey"): "not tested",
     ("rockylinux:9", "revocation:revocation/dnf-repomd-signed-by-a-revoked-subkey"): "not tested",
-    # dnf5 (rpm 6) follows a rotation, but skips a repository it cannot verify and exits 0, and does
-    # not enforce a revoked subkey on repomd.xml
+    # dnf5 (rpm 6) with its cache kept does not pick up a new subkey of a primary it already holds
+    # (repomd.xml: "Signing key not found"; it skips the repository and exits 0), and does not enforce
+    # a revoked subkey on repomd.xml
+    **{(img, "rotation:rotation/dnf-upgrade-with-the-new-key-file"): "Signing key not found"
+       for img in ("fedora:43", "fedora:44")},
     **{(img, "stale:rotation/dnf-S2-with-the-old-key-file/exit-status"): "Signing key not found"
        for img in ("fedora:43", "fedora:44")},
     **{(img, "revocation:revocation/dnf-repomd-signed-by-a-revoked-subkey"): "ACCEPTED"
