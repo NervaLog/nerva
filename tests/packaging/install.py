@@ -595,7 +595,14 @@ def test_restart_policy(tmp):
         # start-limit-hit), so the outcome is read from the states, the counts and the journal.
         state = show(unit, "ActiveState", "SubState", "ExecMainStatus", "NRestarts")
         assert state["SubState"] == "failed" and state["ExecMainStatus"] == "1", state
-        log = sh(["journalctl", "-u", unit, "--since", since, "--no-pager", "-o", "cat"]).stdout
+        # systemd's own lines reach the journal after the unit shows `failed`: wait, bounded, for
+        # the refusal, the last line of the run, so the count below is of a complete log (#375).
+        def journal():
+            sh(["journalctl", "--sync"])
+            return sh(["journalctl", "-u", unit, "--since", since, "--no-pager", "-o", "cat"]).stdout
+
+        wait("the journal records the refused start", lambda: "Start request repeated too quickly" in journal())
+        log = journal()
         # StartLimitBurst=20 allows 20 starts (the first and 19 restarts); the 20th restart job's
         # start is refused.
         assert log.count("Started nerva@9.service") == 20, log[-2000:]

@@ -273,7 +273,9 @@ systemctl status nerva@0
 ```
 
 Once two of the three are up, the cluster has a quorum and commits. A replica that stops with an
-exit status the unit lists (`1` to `8`) is not restarted, because a restart cannot fix it:
+exit status the unit lists (`2` to `8`, and `70`) is not restarted, because a restart cannot fix it.
+Exit `1` (a flag, the data file, a lock the dead process still held) is restarted, up to 20
+starts in 300 s, then the unit stays `failed`. In both cases
 `journalctl -u nerva@0` shows its `error[NRV-E…]` block, and
 [docs/ERRORS.md](./ERRORS.md) says what to do.
 
