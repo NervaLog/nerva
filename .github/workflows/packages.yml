@@ -29,7 +29,7 @@ on:
       - 'src/nerva/diagnostic.zig'
       - 'VERSION'
   workflow_dispatch:
-  # release.yml calls it on the release commit and does not publish until it is green (#384, PPR).
+  # release.yml calls it on the release commit and does not publish until it is green (#384, P386).
   workflow_call:
 
 permissions:
