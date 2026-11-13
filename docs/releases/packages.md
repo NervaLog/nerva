@@ -81,7 +81,7 @@ version file, and a `postinstall` script would run before the gate. So the proje
 it refuses those files too. A name that is a dangling symlink is refused as well. The command:
 
 ```
-set -eu; if [ "${SKIP_DEPENDENCY_INSTALL:-}" != 1 ]; then echo "error[NRV-E1152]: site build: SKIP_DEPENDENCY_INSTALL is not 1; nothing is deployed" >&2; exit 1; fi; for p in wrangler.toml wrangler.json wrangler.jsonc functions _worker.js _routes.json package.json package-lock.json npm-shrinkwrap.json yarn.lock pnpm-lock.yaml bun.lock bun.lockb requirements.txt Pipfile Pipfile.lock pyproject.toml poetry.lock Gemfile Gemfile.lock .tool-versions .nvmrc .node-version .python-version .ruby-version runtime.txt; do if [ -e "$p" ] || [ -L "$p" ]; then echo "error[NRV-E1152]: site build: $p is not allowed in the site repository; nothing is deployed" >&2; exit 1; fi; done; rm -rf dist; mkdir -p dist/.well-known/openpgpkey/hu; for f in index.html .well-known/openpgpkey/policy .well-known/openpgpkey/hu/ndqm47zydhyqyzabecddtdk1q3bponab; do if [ -L "$f" ] || [ ! -f "$f" ]; then echo "error[NRV-E1152]: site build: $f is missing or is a symlink; nothing is deployed" >&2; exit 1; fi; cp "$f" "dist/$f"; done
+set -eu; if [ "${SKIP_DEPENDENCY_INSTALL:-}" != 1 ]; then echo "error[NRV-E1152]: site build: SKIP_DEPENDENCY_INSTALL is not 1; nothing is deployed" >&2; exit 1; fi; for p in wrangler.toml wrangler.json wrangler.jsonc functions _worker.js _routes.json package.json package-lock.json npm-shrinkwrap.json yarn.lock pnpm-lock.yaml bun.lock bun.lockb requirements.txt Pipfile Pipfile.lock pyproject.toml poetry.lock Gemfile Gemfile.lock .tool-versions .nvmrc .node-version .python-version .ruby-version runtime.txt; do if [ -e "$p" ] || [ -L "$p" ]; then echo "error[NRV-E1152]: site build: $p is not allowed in the site repository; nothing is deployed" >&2; exit 1; fi; done; rm -rf dist; mkdir -p dist/.well-known/openpgpkey/hu; for f in index.html 404.html _headers .well-known/openpgpkey/policy .well-known/openpgpkey/hu/ndqm47zydhyqyzabecddtdk1q3bponab; do if [ -L "$f" ] || [ ! -f "$f" ]; then echo "error[NRV-E1152]: site build: $f is missing or is a symlink; nothing is deployed" >&2; exit 1; fi; cp "$f" "dist/$f"; done
 ```
 
 The command does not check what the WKD file holds. The site's own check does that (NRV-E1162),
@@ -1607,6 +1607,7 @@ zone says **Active**. Then, in the zone:
 
 **2. The Pages project.** **Workers & Pages**, **Create**, **Pages**, **Connect to Git**.
 
+- **Wait for slice 5's site pull request** to merge: the build copies `404.html`, `_headers` and the two WKD files, and fails (NRV-E1152, nothing deployed) until the site repository holds them.
 - **GitHub:** Cloudflare asks to install its GitHub App. Install it on the **NervaLog**
   organisation with **Only select repositories**, `nervalog.github.io`, and nothing else.
 - Select `NervaLog/nervalog.github.io`, then **Begin setup**:
