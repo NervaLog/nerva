@@ -5,11 +5,13 @@ repository root: python3 -I .github/scripts/test_release_finish.py
 A stand-in `gh` (a script that logs its arguments and answers from environment variables) stands for
 the real one; the tap and the site are bare git repositories in a temporary directory, so the real
 `git` clones, commits and pushes to them."""
+import http.server
 import json
 import os
 import re
 import subprocess
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -85,11 +87,70 @@ exit 0
 """
 
 
+WKD_HASH = "ndqm47zydhyqyzabecddtdk1q3bponab"
+WKD = ".well-known/openpgpkey"
+
+
+def make_key():
+    """A throwaway armored key, made once: the release key file of these tests."""
+    with tempfile.TemporaryDirectory() as home:
+        os.chmod(home, 0o700)
+        env = dict(os.environ, GNUPGHOME=home)
+        subprocess.run(["gpg", "--batch", "--quiet", "--passphrase", "", "--quick-generate-key",
+                        "Nerva Test <nerva@nerva.pro>", "ed25519", "sign", "never"],
+                       env=env, check=True, capture_output=True)
+        out = subprocess.run(["gpg", "--batch", "--armor", "--export"], env=env, check=True,
+                             capture_output=True, text=True).stdout
+        subprocess.run(["gpgconf", "--kill", "all"], env=env, capture_output=True)
+        return out
+
+
+def dearmor(armored):
+    with tempfile.TemporaryDirectory() as home:
+        os.chmod(home, 0o700)
+        return subprocess.run(["gpg", "--batch", "--quiet", "--dearmor"], input=armored.encode(),
+                              env=dict(os.environ, GNUPGHOME=home), check=True,
+                              capture_output=True).stdout
+
+
 def git(*args, cwd=None):
     return subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *args], cwd=cwd, capture_output=True, text=True, check=True).stdout
 
 
 class Finish(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.key = make_key()
+        cls.key_bin = dearmor(cls.key)
+
+    def make_source(self):
+        """This repository as the workflow's checkout sees it: `self.src` is a clone of `origin`
+        taken before any tag exists (the release's tag is made after the checkout), main holds the
+        key file from v0.7.1 on, v0.7.0 has none, and v0.7.2-rc.1 is tagged on a branch off main."""
+        work = self.dir / "srcwork"
+        self.origin = self.dir / "origin.git"
+        git("init", "-q", "-b", "main", str(work))
+        (work / "README.md").write_text("one\n")
+        git("add", ".", cwd=work)
+        git("commit", "-q", "-m", "before the key", cwd=work)
+        git("tag", "v0.7.0", cwd=work)
+        (work / "packaging/keys").mkdir(parents=True)
+        (work / "packaging/keys/nerva-release.asc").write_text(self.key)
+        git("add", ".", cwd=work)
+        git("commit", "-q", "-m", "the key", cwd=work)
+        git("tag", "v0.7.1", cwd=work)
+        git("tag", "v0.7.1-rc.2", cwd=work)
+        git("checkout", "-q", "-b", "cand", cwd=work)
+        (work / "packaging/keys/nerva-release.asc").write_text("not a key\n")
+        git("commit", "-q", "-am", "a broken key on a branch", cwd=work)
+        git("tag", "v0.7.2-rc.1", cwd=work)
+        git("tag", "v0.7.3", cwd=work)
+        git("checkout", "-q", "main", cwd=work)
+        git("clone", "-q", "--bare", str(work), str(self.origin))
+        self.src = self.dir / "src"
+        # the checkout is taken before the release's tag exists: it holds main and none of the tags
+        git("clone", "-q", "--no-tags", f"file://{self.origin}", str(self.src))
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -100,6 +161,7 @@ class Finish(unittest.TestCase):
         (self.bin / "gh").chmod(0o755)
         self.log = self.dir / "gh.log"
         self.log.write_text("")
+        self.make_source()
         self.env = dict(
             os.environ, GITHUB_REPOSITORY="o/r", GH_TOKEN="s3cret-token", GH_LOG=str(self.log),
             PATH=f"{self.bin}:{os.environ['PATH']}", BOT_NAME="nerva-release[bot]",
@@ -111,7 +173,7 @@ class Finish(unittest.TestCase):
 
     def run_script(self, *args, **env):
         result = subprocess.run([str(SCRIPT), *args], capture_output=True, text=True,
-                                env=dict(self.env, **env))
+                                cwd=self.src, env=dict(self.env, **env))
         self.assertNotIn("s3cret-token", result.stdout + result.stderr)
         return result
 
@@ -546,6 +608,161 @@ class Finish(unittest.TestCase):
         self.assertEqual(self.run_script("site-wait", "7", "prerelease", CHECK="success").returncode, 0)
         self.refused(self.run_script("site-wait", "7", "prerelease", CHECK="failure"), "NRV-E1136", "ended failure")
         self.refused(self.run_script("site-wait", "7", "prerelease"), "NRV-E1136", "did not pass site-check")
+
+
+    # the WKD pair, written into the site's pull request (P398)
+    def site_files(self, bare, ref):
+        return git("ls-tree", "-r", "--name-only", ref, cwd=bare).split()
+
+    def test_a_release_writes_both_wkd_files_into_the_site_pull_request(self):
+        url, bare = self.bare("site", {"index.html": PAGE})
+        result = self.run_script("site", "v0.7.1", "2026-11-13", "A line.", SITE_URL=url, CHECK="success")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(git("show", f"release/v0.7.1:{WKD}/policy", cwd=bare), "")
+        key = subprocess.run(["git", "show", f"release/v0.7.1:{WKD}/hu/{WKD_HASH}"], cwd=bare,
+                             capture_output=True, check=True).stdout
+        self.assertEqual(key, self.key_bin)
+        # only the page and the two files; the site's main is untouched until the merge
+        diff = git("diff", "--name-only", "main", "release/v0.7.1", cwd=bare).split()
+        self.assertEqual(sorted(diff), sorted(["index.html", f"{WKD}/policy", f"{WKD}/hu/{WKD_HASH}"]))
+        self.assertEqual(self.site_files(bare, "main"), ["index.html"])
+
+    def test_a_candidate_on_main_writes_the_files_too(self):
+        url, bare = self.bare("site", {"index.html": PAGE})
+        self.assertEqual(self.run_script("site", "v0.7.1-rc.2", "2026-11-13", "Release candidate v0.7.1-rc.2.", SITE_URL=url).returncode, 0)
+        self.assertIn(f"{WKD}/hu/{WKD_HASH}", self.site_files(bare, "release/v0.7.1-rc.2"))
+
+    def test_a_candidate_tagged_on_a_branch_leaves_the_wkd_files_as_the_site_has_them(self):
+        # the tag's key file is not even a key: it is never read as one, because the tag is not on main
+        url, bare = self.bare("site", {"index.html": PAGE})
+        result = self.run_script("site", "v0.7.2-rc.1", "2026-11-13", "Release candidate v0.7.2-rc.1.", SITE_URL=url)
+        self.assertEqual(result.returncode, 1, result.stderr)  # a broken key file refuses first, see below
+        # a branch candidate with a good key file: on the branch, off main
+        work = self.dir / "srcwork"
+        git("checkout", "-q", "cand", cwd=work)
+        (work / "packaging/keys/nerva-release.asc").write_text(self.key + "\n")
+        git("commit", "-q", "-am", "a key", cwd=work)
+        git("tag", "v0.7.2-rc.2", cwd=work)
+        git("push", "-q", str(self.origin), "cand", "v0.7.2-rc.2", cwd=work)
+        # the site already holds a WKD pair from an earlier release: it stays as it is
+        url, bare = self.bare("site2", {"index.html": PAGE, f"{WKD}/policy": "", f"{WKD}/hu/{WKD_HASH}": "old"})
+        result = self.run_script("site", "v0.7.2-rc.2", "2026-11-13", "Release candidate v0.7.2-rc.2.", SITE_URL=url)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("is not on main", result.stderr)
+        self.assertEqual(git("show", f"release/v0.7.2-rc.2:{WKD}/hu/{WKD_HASH}", cwd=bare), "old")
+        self.assertEqual(git("diff", "--name-only", "main", "release/v0.7.2-rc.2", cwd=bare).split(), ["index.html"])
+
+    def test_a_tag_without_a_key_file_writes_no_wkd_file(self):
+        older = PAGE.replace("0.7.0", "0.6.9")
+        url, bare = self.bare("site", {"index.html": older})
+        # v0.7.0 has no key file: the site's pull request is the page alone
+        result = self.run_script("site", "v0.7.0", "2026-11-10", "A line.", SITE_URL=url, CHECK="success")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("has no packaging/keys/nerva-release.asc", result.stderr)
+        self.assertEqual(self.site_files(bare, "release/v0.7.0"), ["index.html"])
+
+    def test_an_existing_policy_file_is_kept_and_a_rerun_adds_nothing(self):
+        url, bare = self.bare("site", {"index.html": PAGE, f"{WKD}/policy": "# kept\n"})
+        self.run_script("site", "v0.7.1", "2026-11-13", "A line.", SITE_URL=url, CHECK="success")
+        tip = git("rev-parse", "release/v0.7.1", cwd=bare).strip()
+        self.assertEqual(git("show", f"release/v0.7.1:{WKD}/policy", cwd=bare), "# kept\n")
+        self.run_script("site", "v0.7.1", "2026-11-13", "A line.", SITE_URL=url, CHECK="success")
+        self.assertEqual(git("rev-parse", "release/v0.7.1", cwd=bare).strip(), tip)
+
+    def test_a_key_file_that_is_not_a_key_is_refused_before_anything_is_pushed(self):
+        url, bare = self.bare("site", {"index.html": PAGE})
+        result = self.run_script("site", "v0.7.3", "2026-11-13", "A line.", SITE_URL=url)
+        self.refused(result, "NRV-E1136", "is not an armored key")
+        self.assertNotIn("release/v0.7.3", git("branch", "-a", cwd=bare))
+        self.assertNotIn("pr create", self.calls())
+
+    def test_a_tag_this_repository_does_not_have_is_refused(self):
+        url, _ = self.bare("site", {"index.html": PAGE})
+        self.refused(self.run_script("site", "v0.9.9", "2026-11-13", "A line.", SITE_URL=url),
+                     "NRV-E1136", "cannot read the tag v0.9.9")
+
+    # site-live (NRV-E1151, E1162)
+    def serve(self, routes):
+        """A local stand-in for nerva.pro. routes: {path: (status, body)}; a callable body is
+        called with the request count of the path. Returns the base URL; self.seen lists
+        (path, Cache-Control) of the requests."""
+        seen, counts = [], {}
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(handler):
+                path = handler.path.split("?")[0]
+                seen.append((handler.path, handler.headers.get("Cache-Control")))
+                counts[path] = counts.get(path, 0) + 1
+                status, body = routes.get(path, (404, b"not found"))
+                if callable(body):
+                    body = body(counts[path])
+                handler.send_response(status)
+                handler.send_header("Content-Length", str(len(body)))
+                handler.end_headers()
+                handler.wfile.write(body)
+            def log_message(handler, *args):
+                pass
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.seen = seen
+        return f"http://127.0.0.1:{server.server_address[1]}"
+
+    LIVE = dict(SITE_LIVE_WAIT_SECONDS="3", SITE_POLL_SECONDS="1")
+
+    def test_site_live_passes_when_the_page_and_the_wkd_key_are_the_releases(self):
+        page = PAGE.replace('{v:"0.7.0"', '{v:"0.7.1", date:"2026-11-13", d:"A."},\n  {v:"0.7.0"').encode()
+        base = self.serve({"/": (200, page), f"/{WKD}/hu/{WKD_HASH}": (200, self.key_bin)})
+        result = self.run_script("site-live", "v0.7.1", SITE_LIVE_URL=base, **self.LIVE)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("shows 0.7.1", result.stdout)
+        # the page is asked for uncached; the WKD file as users ask for it, with its l= parameter
+        self.assertEqual(self.seen[0], ("/", "no-cache"))
+        self.assertEqual(self.seen[-1][0], f"/{WKD}/hu/{WKD_HASH}?l=nerva")
+        self.assertIsNone(self.seen[-1][1])
+
+    def test_site_live_waits_for_the_page_and_then_passes(self):
+        entry = '{v:"0.7.1", date:"2026-11-13", d:"A."}'
+        base = self.serve({"/": (200, lambda n: (entry if n >= 3 else "{v:\"0.7.0\"").encode()),
+                           f"/{WKD}/hu/{WKD_HASH}": (200, self.key_bin)})
+        result = self.run_script("site-live", "v0.7.1", SITE_LIVE_URL=base, SITE_LIVE_WAIT_SECONDS="10", SITE_POLL_SECONDS="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([p for p, _ in self.seen].count("/"), 3)
+
+    def test_site_live_refuses_a_page_that_never_shows_the_release(self):
+        base = self.serve({"/": (200, b'{v:"0.7.0"'), f"/{WKD}/hu/{WKD_HASH}": (200, self.key_bin)})
+        result = self.run_script("site-live", "v0.7.1", SITE_LIVE_URL=base, SITE_LIVE_WAIT_SECONDS="2", SITE_POLL_SECONDS="1")
+        self.refused(result, "NRV-E1151", "nerva.pro does not show 0.7.1")
+        self.assertIn("packages are unaffected", result.stderr)
+        self.assertIn("Retry deployment", result.stderr)
+        # an unreachable site is the same: "not yet" until the deadline
+        result = self.run_script("site-live", "v0.7.1", SITE_LIVE_URL="http://127.0.0.1:9", SITE_LIVE_WAIT_SECONDS="1", SITE_POLL_SECONDS="1")
+        self.refused(result, "NRV-E1151", "does not show 0.7.1")
+
+    def test_site_live_refuses_a_wkd_key_that_differs(self):
+        page = b'{v:"0.7.1", date:"2026-11-13", d:"A."}'
+        for served in ((200, b"another key"), (200, b""), (404, b"not found"), (500, b"oops")):
+            base = self.serve({"/": (200, page), f"/{WKD}/hu/{WKD_HASH}": served})
+            result = self.run_script("site-live", "v0.7.1", SITE_LIVE_URL=base, **self.LIVE)
+            self.refused(result, "NRV-E1162", "WKD key differs from packaging/keys at v0.7.1")
+            self.assertIn(f"served status {served[0]}", result.stderr)
+
+    def test_site_live_without_a_reference_key_file_requires_a_404(self):
+        page = b'{v:"0.7.0", date:"2026-11-10", d:"A."}'
+        base = self.serve({"/": (200, page)})
+        result = self.run_script("site-live", "v0.7.0", SITE_LIVE_URL=base, **self.LIVE)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("has no packaging/keys/nerva-release.asc", result.stdout)
+        # the SPA-style answer, the page with 200, is not a 404
+        base = self.serve({"/": (200, page), f"/{WKD}/hu/{WKD_HASH}": (200, page)})
+        self.refused(self.run_script("site-live", "v0.7.0", SITE_LIVE_URL=base, **self.LIVE), "NRV-E1162",
+                     "serves a WKD file (status 200) although v0.7.0 has no")
+
+    def test_site_live_is_for_releases_only(self):
+        for tag in ("v0.7.1-rc.2", "0.7.1", "v0.7.1; true"):
+            result = self.run_script("site-live", tag)
+            self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(self.run_script("site-live", "v0.7.1", SITE_POLL_SECONDS="0").returncode, 1)
 
 
 class Workflow(unittest.TestCase):
