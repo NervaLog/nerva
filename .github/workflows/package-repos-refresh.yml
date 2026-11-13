@@ -65,9 +65,25 @@ jobs:
           echo "::error::alarm-test: this run fails on purpose, to test the alarm"
           exit 1
 
+      # Setup (docs/releases/packages.md, setup E) is done when the environment has its variables;
+      # the refresh script refuses without them (NRV-E1139). Until then the run passes, with a notice.
+      - name: Setup is done
+        id: setup
+        env:
+          R2_BUCKET: ${{ vars.R2_BUCKET }}
+        run: |
+          set -euo pipefail
+          complete=true
+          if [ -z "$R2_BUCKET" ]; then
+            complete=false
+            echo "::notice::the package repositories' setup is not done (R2_BUCKET is not set in the package-repos environment): nothing to refresh"
+          fi
+          echo "complete=$complete" >> "$GITHUB_OUTPUT"
+
       # More than 8 days since the served stable `Date`: the refresh before this one did not run.
       - name: The previous refresh ran
         id: missed
+        if: ${{ steps.setup.outputs.complete == 'true' }}
         env:
           BASE_URL: ${{ vars.PACKAGES_BASE_URL }}
         run: |
@@ -88,6 +104,7 @@ jobs:
 
       # Pinned to what ubuntu-24.04 offers and asserted (packages.md, "Tools on the runner, pinned").
       - name: Install the package repositories' tools, pinned
+        if: ${{ steps.setup.outputs.complete == 'true' }}
         run: |
           set -euo pipefail
           sudo apt-get -o Acquire::Retries=5 update -qq
@@ -104,6 +121,7 @@ jobs:
 
       - name: Refresh both channels
         id: refresh
+        if: ${{ steps.setup.outputs.complete == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
           RPM_KEY: ${{ inputs.rpm_key }}

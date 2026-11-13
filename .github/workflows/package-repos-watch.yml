@@ -37,7 +37,7 @@ jobs:
       - name: Valid-Until and the signing key's expiry
         id: fresh
         env:
-          PACKAGES_BASE_URL: https://packages.nerva.pro
+          PACKAGES_BASE_URL: ${{ vars.PACKAGES_BASE_URL }}
         run: |
           set -euo pipefail
           .github/scripts/package_repos.sh fresh

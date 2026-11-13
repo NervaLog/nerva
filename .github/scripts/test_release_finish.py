@@ -904,7 +904,9 @@ class PackageRepos(unittest.TestCase):
         self.assertIn("MAC_ATTEMPT: ${{ needs.mac.outputs.attempt }}", ready)
         self.assertIn("environment: package-repos", ready)
         self.assertIn("package_repos.sh ready", ready)
-        self.assertIn("GITHUB_SHA: ${{ steps.ready.outputs.commit }}", ready)
+        self.assertIn("COMMIT: ${{ steps.ready.outputs.commit }}", ready)
+        self.assertIn('GITHUB_SHA="$COMMIT" .github/scripts/package_repos.sh ready', ready)
+        self.assertNotIn("GITHUB_SHA: ", ready)  # GitHub ignores an override of GITHUB_* in env:
         mac = (self.flows / "mac-sign.yml").read_text()
         self.assertIn("attempt: ${{ github.run_attempt }}", mac)
         self.assertIn("value: ${{ jobs.sign.outputs.attempt }}", mac)
@@ -924,11 +926,11 @@ class PackageRepos(unittest.TestCase):
             self.assertNotIn("secrets.R2_", text)
             self.assertNotIn("secrets.REPO_SIGNING", text)
 
-    def test_repos_verify_is_fourteen_cells_with_every_image_pinned_by_digest(self):
+    def test_repos_verify_is_sixteen_cells_with_every_image_pinned_by_digest(self):
         verify = job(self.finish, "repos-verify")
         self.assertIn("runner: [ubuntu-24.04, ubuntu-24.04-arm]", verify)
         distros = re.search(r"distro: \[(.*?)\]", verify).group(1).split(", ")
-        self.assertEqual(len(distros), 7)
+        self.assertEqual(len(distros), 8)
         images = re.findall(r"\{ distro: (\S+), image: (\S+), mgr: (apt|dnf) \}", verify)
         self.assertEqual([d for d, _, _ in images], distros)
         for _, image, _ in images:
@@ -1002,6 +1004,21 @@ class PackageRepos(unittest.TestCase):
         release = (self.flows / "release.yml").read_text()
         call = release.split("\n  ci:\n")[1].split("\n\n")[0]
         self.assertIn("issues: write", call)
+
+    def test_release_workflow_lets_the_finish_call_hold_the_alarm_permission(self):
+        release = (self.flows / "release.yml").read_text()
+        call = release.split("\n  finish:\n")[1].split("\n    with:")[0]
+        self.assertIn("contents: write\n      issues: write", call)
+
+    def test_all_package_workflows_read_the_base_url_from_the_variable(self):
+        for name in ("ci.yml", "package-repos-watch.yml", "package-repos-refresh.yml", "release-finish.yml"):
+            text = (self.flows / name).read_text()
+            self.assertNotIn("https://packages.nerva.pro", text.replace("${BASE_URL:-https://packages.nerva.pro}", ""), name)
+
+    def test_refresh_passes_with_a_notice_until_setup_is_done(self):
+        refresh = (self.flows / "package-repos-refresh.yml").read_text()
+        self.assertIn("::notice::the package repositories' setup is not done", refresh)
+        self.assertEqual(refresh.count("if: ${{ steps.setup.outputs.complete == 'true' }}"), 3)
 
 
 if __name__ == "__main__":

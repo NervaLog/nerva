@@ -23,7 +23,7 @@
 # packages in a signed manifest in the same run attempt as the approved `mac` (NRV-E1153), before
 # `publish`; `repos` finishes them once the release is public (output `public`, so a tap or site
 # failure after the publication does not stop it); `repos-verify` installs from the signed
-# repositories on 14 cells; `site-verify` checks that nerva.pro shows the release and its WKD key.
+# repositories on 16 cells; `site-verify` checks that nerva.pro shows the release and its WKD key.
 # `repos-ready` and `repos` are the only jobs here that write the bucket, in the one concurrency
 # group `nerva-packages-bucket` (with the refresh of package-repos-refresh.yml); `alarm` files an
 # issue when one of them fails. The App's token (NervaLog/homebrew-tap and NervaLog/nervalog.github.io only, contents and
@@ -168,7 +168,7 @@ jobs:
         id: bind
         env:
           GH_TOKEN: ${{ github.token }}
-          GITHUB_SHA: ${{ steps.ready.outputs.commit }}
+          COMMIT: ${{ steps.ready.outputs.commit }}
           MAC_ATTEMPT: ${{ needs.mac.outputs.attempt }}
           R2_ENDPOINT: ${{ vars.R2_ENDPOINT }}
           R2_BUCKET: ${{ vars.R2_BUCKET }}
@@ -181,7 +181,8 @@ jobs:
           REPO_SIGNING_PASSPHRASE_NEXT: ${{ secrets.REPO_SIGNING_PASSPHRASE_NEXT }}
         run: |
           set -euo pipefail
-          .github/scripts/package_repos.sh ready "$TAG" "$PUBLISHED"
+          # GITHUB_* cannot be set in `env:` (GitHub ignores it), so the command line sets it.
+          GITHUB_SHA="$COMMIT" .github/scripts/package_repos.sh ready "$TAG" "$PUBLISHED"
 
       - name: Remove the temporary keys
         if: always()
@@ -469,7 +470,7 @@ jobs:
         run: .github/scripts/package_repos.sh cleanup
 
   # Installs from the signed repositories, as INSTALL.md tells a user to, on every distribution
-  # its text names: 7 images on each architecture, 14 cells. The release is already public here.
+  # its text names: 8 images on each architecture, 16 cells. The release is already public here.
   # Images are pinned by digest (the manifest lists' digests, as `docker.io/library/<name>:<tag>`
   # resolved them on 2026-11-13). No environment, no secret.
   repos-verify:
@@ -482,7 +483,7 @@ jobs:
       fail-fast: false
       matrix:
         runner: [ubuntu-24.04, ubuntu-24.04-arm]
-        distro: [debian-12, debian-13, ubuntu-22.04, ubuntu-24.04, rockylinux-9, fedora-43, fedora-44]
+        distro: [debian-12, debian-13, ubuntu-22.04, ubuntu-24.04, rockylinux-9, fedora-43, fedora-44, fedora-45]
         include:
           - { distro: debian-12, image: docker.io/library/debian@sha256:268fb24c39bca92d326dd83ea3abebe4a3f7751c804ffef23bb6d857dd343ff8, mgr: apt }
           - { distro: debian-13, image: docker.io/library/debian@sha256:9c6e381421d0f48d1b8133e573f33c185ee16cbf505eda9c4a8a4791b25ea8a6, mgr: apt }
@@ -491,6 +492,7 @@ jobs:
           - { distro: rockylinux-9, image: docker.io/library/rockylinux@sha256:d7be1c094cc5845ee815d4632fe377514ee6ebcf8efaed6892889657e5ddaaa6, mgr: dnf }
           - { distro: fedora-43, image: docker.io/library/fedora@sha256:f01112b9a1f1d0504ad962d9adfa401425033f8ab067e0a821904ebdde5b8ca5, mgr: dnf }
           - { distro: fedora-44, image: docker.io/library/fedora@sha256:15da97ed9aa94dd3d92c3925eb89520f6c80e07ea7ee24cba848d1f8b6912b3e, mgr: dnf }
+          - { distro: fedora-45, image: docker.io/library/fedora@sha256:a7d72ba2745b100a3351087472e5ee7b2450af7cf331e7673007e3817612839c, mgr: dnf }
     env:
       TAG: ${{ inputs.tag }}
     steps:
@@ -510,6 +512,7 @@ jobs:
           version=${TAG#v}
           # `primary` when the key file has one; in the fallback, `current`
           fpr=$(awk '$1 == "primary" { p = $2 } $1 == "current" { c = $2 } END { print p ? p : c }' packaging/keys/fingerprints)
+          docker pull --quiet "$IMAGE" > /dev/null || { echo "error[NRV-E1157]: release-finish.yml: cannot pull $IMAGE" >&2; exit 1; }
           docker run --rm -v "$PWD/.github/scripts:/scripts:ro" "$IMAGE" \
             bash /scripts/repo_install_check.sh "$MGR" "$channel" "${BASE_URL:-https://packages.nerva.pro}" "$fpr" "$version"
 
