@@ -1021,7 +1021,7 @@ class Publish(Base):
 
     def test_a_tool_of_another_version_is_e1139(self):
         self.bound("v0.7.2")
-        for ver in ("RPM version 4.19.1", "RPM version 4.18.20"):
+        for ver in ("RPM version 4.19.1", "RPM version 4.18.20", "RPM version 4.18.2.1"):
             (self.tmp / "bin/rpmsign").write_text(f'#!/bin/sh\n[ "$1" = --version ] && echo "{ver}"\nexit 0\n')
             (self.tmp / "bin/rpmsign").chmod(0o755)
             rc, _, err = self.publish("v0.7.2")

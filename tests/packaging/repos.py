@@ -180,7 +180,7 @@ def copied_channel(image, g, base, fpr):
         for f in ("InRelease", "Release", "Release.gpg"):
             g.web.override[f"apt/dists/stable/{f}"] = g.s3.objects[f"apt/dists/rc/{f}"][0]
         p = exec_in(cid, "apt-get update")
-        if p.returncode == 0 or not re.search(r"Codename|Label|Conflicting distribution", p.stdout + p.stderr):
+        if p.returncode == 0 or not re.search(r"changed its '(Label|Codename|Suite|Origin)' value", p.stdout + p.stderr):
             fail(f"{image}: apt accepted rc's files as stable:\n{p.stdout[-600:]}{p.stderr[-600:]}")
         else:
             ok(f"{image} apt refuses a copied channel")
