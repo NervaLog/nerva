@@ -63,6 +63,10 @@ the graph with a required reviewer. `release-publish` has none, so `publish` sta
 `mac-verify` is green. If any Mac check fails, nothing is published, and the draft stays as it
 was.
 
+A release published by hand (the fallback when `release-finish.yml` is not used) has no such gate:
+`mac-verify.yml` then runs only on `release: published`, after the zip is public. Before publishing a
+draft by hand, dispatch `mac-verify.yml` with the draft's tag and publish only when it is green.
+
 ## Workflows and jobs
 
 Existing files keep their names. `mac_keychain.sh`, `mac_zip_check.sh`, `release_check.sh` and
