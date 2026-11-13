@@ -30,6 +30,8 @@ refuses the round. A stop kills the worker with its seed, so an exit 143 is reco
 failure. A leftover
 `round.new`, or a round without an id, is deleted uncounted. A leftover round with no results yet
 is counted as an empty round, not refused.
+The round's `id` and `commit`, `round.new`, the renamed round and its parent directory are fsynced
+before the first worker starts, so a power cut cannot leave results under a round with no id.
 
 A refused round cannot be cleared: there is no marker and no state edit for it. With this design a
 round is refused only for bad input or a reporter bug, which is what the gate must not miss. When

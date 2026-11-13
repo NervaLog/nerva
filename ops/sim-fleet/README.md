@@ -113,8 +113,8 @@ one.
   clean for `soak`.
 - **A restart is safe.** A round that a stop, a reboot or a crash left in `state/round/` is
   settled from the results its workers wrote, as any round is, before the next one starts: its
-  finished seeds count, a failing one makes the commit not clean, and a seed the stop cut short
-  is not recorded.
+  finished seeds count, a failing one makes the commit not clean (its `results` line is fsynced
+  before its full-log replay), and a seed the stop killed is recorded as a failure (exit 143).
 - Every collection is bounded (`sim_fleet.py`, the constants at the top): seeds and failing seeds
   per round, bytes read of a log, lines in an issue, fingerprints remembered (2048), days kept
   (31), pages scanned on a rebuild (5).

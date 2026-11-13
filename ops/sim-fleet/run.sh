@@ -322,7 +322,10 @@ run_round() {
     mkdir "$round.new"
     echo "$id" >"$round.new/id"
     echo "$built" >"$round.new/commit"
+    sync "$round.new/id" "$round.new/commit" "$round.new"
     mv "$round.new" "$round"
+    # The id must survive a power cut before any worker writes a result under it.
+    sync "$round" "$(dirname "$round")"
     local deadline=$(( $(date +%s) + SIM_FLEET_ROUND_SECONDS )) w=0 i
     for (( i = 0; i < SIM_FLEET_WORKERS_VOPR_NERVA; i++ )); do
         worker "$w" vopr-nerva "$deadline" & w=$(( w + 1 ))
