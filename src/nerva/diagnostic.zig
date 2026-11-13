@@ -62,6 +62,7 @@ pub const table = [_]Entry{
     .{ .code = "NRV-E0715", .summary = "An earlier `nerva recover` did not finish", .exit = exit_operator },
     .{ .code = "NRV-E0716", .summary = "`nerva recover`'s session was evicted before it finished", .exit = exit_operator },
     .{ .code = "NRV-E0717", .summary = "A test build with commit-key deduplication off was started without `--development`", .exit = exit_operator },
+    .{ .code = "NRV-E0723", .summary = "The replica's caches do not fit the memory it may use (the machine's, or the tightest cgroup limit above it, less 256 MiB)", .exit = exit_operator },
     .{ .code = "NRV-E0801", .summary = "The cluster did not answer the export", .exit = exit_operator },
     .{ .code = "NRV-E0802", .summary = "`--as-of` is past the latest op", .exit = exit_operator },
     .{ .code = "NRV-E0803", .summary = "The export would be refused by `nerva import`", .exit = exit_operator },
