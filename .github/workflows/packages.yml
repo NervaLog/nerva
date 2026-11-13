@@ -35,12 +35,9 @@ on:
 permissions:
   contents: read
 
-# Only a pull request's run is replaced by its next push. On main every commit's run is a record,
-# and the release's call (github.workflow is then `Release`, in a group of its own) must never be
-# cancelled by a later push to main (#384).
 concurrency:
   group: packages-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: true
 
 env:
   # Installs the Zig pinned by zig/download.sh. Checkout removes ./zig's toolchain, so it is kept

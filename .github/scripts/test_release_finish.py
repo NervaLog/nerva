@@ -625,6 +625,16 @@ class Workflow(unittest.TestCase):
         version = release.split("\n  ci:\n")[0]
         self.assertIn('release_notes.sh site "$TAG"', version)
 
+    def test_release_yml_drafts_only_after_ci_and_the_packaging_tests_on_the_release_commit(self):
+        # #384: the draft must wait for packages.yml, called (not observed) on this very commit
+        release = (ROOT / ".github/workflows/release.yml").read_text()
+        packages = release.split("\n  packages:\n")[1].split("\n\n")[0]
+        self.assertIn("uses: ./.github/workflows/packages.yml", packages)
+        draft = release.split("\n  release:\n")[1].split("\n  finish:\n")[0]
+        self.assertIn("needs: [version, ci, packages]", draft)
+        self.assertNotIn("\n    if:", draft)
+        self.assertIn("workflow_call:", (ROOT / ".github/workflows/packages.yml").read_text())
+
 
 if __name__ == "__main__":
     unittest.main()
