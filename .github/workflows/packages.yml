@@ -1,7 +1,8 @@
 # Linux packaging (v0.7.1, slice 4; docs/briefs/v0.7.1.md): the release tarball's install.sh and
 # the two systemd units, proved on a real systemd; and slice 5's .deb and .rpm packages.
 #
-# It runs on every push to main (so on the release commit), and on a pull request that changes
+# It runs on every push to main (so on the release commit), is called by release.yml, whose draft
+# waits for it on the release commit itself (#384), and runs on a pull request that changes
 # packaging, the code whose output or exit statuses the installer and units rely on
 # (src/nerva_main.zig, src/nerva/diagnostic.zig) or VERSION (a draft's run waits until the pull
 # request is marked ready). Every job runs on GitHub's hosted runners, as ci.yml's do (P147e): a
@@ -28,6 +29,8 @@ on:
       - 'src/nerva/diagnostic.zig'
       - 'VERSION'
   workflow_dispatch:
+  # release.yml calls it on the release commit and does not publish until it is green (#384, P386).
+  workflow_call:
 
 permissions:
   contents: read
