@@ -903,6 +903,8 @@ fn bundle_fail(err: anyerror) noreturn {
 
 /// Whether the executable at `exe_path` carries the multiversion sections.
 fn bundle_present(gpa: std.mem.Allocator, exe_path: [:0]const u8) bool {
+    // Only Linux switches release (P259); a Mach-O binary has no ELF sections to read.
+    if (builtin.target.os.tag != .linux) return false;
     const file = std.fs.openFileAbsolute(exe_path, .{}) catch return false;
     defer file.close();
     const size = file.getEndPos() catch return false;
