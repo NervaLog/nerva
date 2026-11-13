@@ -154,11 +154,35 @@ jobs:
         if: needs.changes.outputs.code != 'false'
         run: .github/scripts/docs_only_test.sh
 
-      - name: Release scripts (the bill of materials, N63; the refusals, NRV-E1112 to E1117)
+      # The package repositories' tools, pinned to what ubuntu-24.04 offers and asserted, so a
+      # runner-image change fails here (NRV-E1139) and does not silently change the bytes
+      # (docs/releases/packages.md, "Tools on the runner, pinned"). gpg is the image's 2.4.
+      - name: Install the package repositories' tools, pinned
+        if: needs.changes.outputs.code != 'false'
+        run: |
+          set -eu
+          sudo apt-get -o Acquire::Retries=5 update -qq
+          sudo apt-get -o Acquire::Retries=5 install -y -qq apt-utils=2.8.4ubuntu0.1 \
+            createrepo-c=0.17.3-2ubuntu3 rpm=4.18.2+dfsg-2.1build2 sqv=1.1.0-1build2 gnupg jq
+          tool_is() { # <tool> <expected first line>
+            got=$("$1" --version 2>&1 | head -n1)
+            case $got in "$2" | "$2"[!0-9.]*) ;; *) echo "error[NRV-E1139]: ci.yml: $1 reads '$got', not '$2'" >&2; exit 1 ;; esac
+          }
+          tool_is apt-ftparchive "apt 2.8.4"
+          tool_is createrepo_c "Version: 0.17.3"
+          tool_is rpmsign "RPM version 4.18.2"
+          gpg --version | head -n1 | grep -q 'gpg (GnuPG) 2\.4\.' || { echo "error[NRV-E1139]: ci.yml: gpg is not 2.4" >&2; exit 1; }
+
+      - name: Release scripts (the bill of materials, N63; the refusals, NRV-E1112 to E1117, E1130 to E1138)
         if: needs.changes.outputs.code != 'false'
         run: |
           python3 .github/scripts/test_sbom.py
           python3 .github/scripts/test_release_check.py
+          python3 .github/scripts/test_mac_sign.py
+          python3 -I .github/scripts/test_site_release.py
+          python3 -I .github/scripts/test_release_finish.py
+          python3 -I .github/scripts/test_r2.py
+          python3 -I .github/scripts/test_package_repos.py
 
       - name: Placeholder keys (the refused values equal the env examples', #306)
         if: needs.changes.outputs.code != 'false'
@@ -364,7 +388,8 @@ jobs:
           done
 
   # Nerva on a Mac (#278, v0.7.1 slice 2). GitHub's hosted macOS runners are free for a public
-  # repository, and the jobs run ad hoc: they hold no Apple secret. `macos-arm64` (the faster
+  # repository, and the jobs run ad hoc: they hold no Apple secret (mac-sign.yml's does, in its own approved
+  # environment: P343). `macos-arm64` (the faster
   # runner) cross-compiles both macOS targets once, ReleaseSafe as release.yml builds them, and
   # joins them with `lipo` into a universal binary; it signs only that one ad hoc, as
   # `mac-release` will, since lipo invalidates the arm64 slice's signature. The thin binaries are
@@ -382,8 +407,8 @@ jobs:
   # step's zip is then checked from outside: its checksum, its architectures, its signature, the
   # version line and the smoke test. The formula is checked only to exist: `brew install` and
   # `brew test` run in `mac-verify.yml` on the published release, not here. What it cannot run
-  # here is the Developer ID signature and notarization (`-Dnotarize=true`): CI holds no Apple
-  # secret.
+  # here is the Developer ID signature and notarization (`-Dnotarize=true`): this workflow holds
+  # no Apple secret, and `mac-sign.yml` does that behind the environment `apple-signing` (P343).
   macos-arm64:
     needs: changes
     if: ${{ !cancelled() }}
@@ -520,12 +545,187 @@ jobs:
         if: needs.changes.outputs.code != 'false'
         run: python3 tests/macos/smoke.py "$RUNNER_TEMP/macos-out/universal/nerva" --arch x86_64 --expect-signature adhoc
 
+  # The signing keychain of mac-sign.yml (P343), tried on every pull request without Apple: a
+  # self-signed certificate made here stands for the Developer ID one, and no secret is used. The
+  # job runs `mac_keychain.sh create --skip-notary` (no notary profile: that needs Apple), signs a
+  # copy of /usr/bin/true from the temporary keychain through the search list alone, runs
+  # `destroy`, and asserts the keychain is gone and the user's default and search list are as they
+  # were. It also asserts that an empty secret is refused with NRV-E1121 before anything is made.
+  # Not tried here: the Developer ID chain and notarization, which only the rehearsal (the design's
+  # A.6) can show. The certificate is made by /usr/bin/openssl (LibreSSL), whose .p12 macOS reads.
+  mac-keychain:
+    needs: changes
+    if: ${{ !cancelled() }}
+    name: macOS (signing keychain)
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        if: needs.changes.outputs.code != 'false'
+        with:
+          persist-credentials: false
+
+      - name: An empty secret is refused, and nothing is made
+        if: needs.changes.outputs.code != 'false'
+        run: |
+          set -u
+          kc="$RUNNER_TEMP/nerva-signing.keychain-db"
+          if APPLE_DEVELOPER_ID_P12='' APPLE_DEVELOPER_ID_P12_PASSWORD=x \
+            .github/scripts/mac_keychain.sh create --skip-notary 2> "$RUNNER_TEMP/refused.txt"; then
+            echo "::error::an empty APPLE_DEVELOPER_ID_P12 was accepted"; exit 1
+          fi
+          cat "$RUNNER_TEMP/refused.txt"
+          grep -q '^error\[NRV-E1121\]: mac_keychain.sh: the signing secret APPLE_DEVELOPER_ID_P12 is empty' "$RUNNER_TEMP/refused.txt"
+          grep -q '^  cause  ' "$RUNNER_TEMP/refused.txt"
+          grep -q '^  fix    ' "$RUNNER_TEMP/refused.txt"
+          test ! -e "$kc"
+
+      - name: Keychain, self-signed identity, codesign, destroy
+        if: needs.changes.outputs.code != 'false'
+        run: |
+          set -euo pipefail
+          kc="$RUNNER_TEMP/nerva-signing.keychain-db"
+          security default-keychain -d user > "$RUNNER_TEMP/before-default.txt"
+          security list-keychains -d user > "$RUNNER_TEMP/before-list.txt"
+
+          cat > "$RUNNER_TEMP/cert.cnf" <<'CNF'
+          [req]
+          distinguished_name = dn
+          x509_extensions = ext
+          prompt = no
+          [dn]
+          CN = Nerva CI Test Signing
+          [ext]
+          basicConstraints = critical,CA:false
+          keyUsage = critical,digitalSignature
+          extendedKeyUsage = critical,codeSigning
+          CNF
+          /usr/bin/openssl req -x509 -newkey rsa:2048 -nodes -days 1 -config "$RUNNER_TEMP/cert.cnf" \
+            -keyout "$RUNNER_TEMP/test.key" -out "$RUNNER_TEMP/test.crt"
+          p12pw=$(/usr/bin/openssl rand -hex 16)
+          /usr/bin/openssl pkcs12 -export -inkey "$RUNNER_TEMP/test.key" -in "$RUNNER_TEMP/test.crt" \
+            -name "Nerva CI Test Signing" -passout "pass:$p12pw" -out "$RUNNER_TEMP/test.p12"
+
+          # Every NRV-E1121 headline that needs no Apple secret. Each refusal leaves the keychain to
+          # destroy, as mac-sign.yml's `if: always()` step does; no secret file is left behind.
+          # Not triggered here: "could not be opened for codesign" (a .p12 that imports with no key)
+          # and "not exactly one valid identity" (needs a notary profile Apple accepted); both are
+          # triggered with a stand-in `security` in .github/scripts/test_mac_sign.py.
+          good=$(base64 < "$RUNNER_TEMP/test.p12")
+          expect() {  # expect <headline regex>; the rest of the command runs create
+            local re=$1; shift
+            if "$@" 2> "$RUNNER_TEMP/refused.txt"; then echo "::error::accepted: $re"; exit 1; fi
+            cat "$RUNNER_TEMP/refused.txt"
+            grep -Eq "^error\[NRV-E1121\]: mac_keychain.sh: ($re)" "$RUNNER_TEMP/refused.txt"
+            grep -q '^  cause  ' "$RUNNER_TEMP/refused.txt"
+            grep -q '^  fix    ' "$RUNNER_TEMP/refused.txt"
+            test ! -e "$RUNNER_TEMP/nerva-id.p12" && test ! -e "$RUNNER_TEMP/nerva-notary.p8"
+            .github/scripts/mac_keychain.sh destroy
+          }
+          # Not base64 at all (a lenient decoder that accepts it lands on the import refusal).
+          APPLE_DEVELOPER_ID_P12='!!! not base64 !!!' APPLE_DEVELOPER_ID_P12_PASSWORD=x \
+            expect 'the signing secret APPLE_DEVELOPER_ID_P12 is not base64|the keychain could not import' \
+            .github/scripts/mac_keychain.sh create --skip-notary
+          APPLE_DEVELOPER_ID_P12=$(echo not-a-p12 | base64) APPLE_DEVELOPER_ID_P12_PASSWORD=x \
+            expect 'the keychain could not import APPLE_DEVELOPER_ID_P12' \
+            .github/scripts/mac_keychain.sh create --skip-notary
+          APPLE_DEVELOPER_ID_P12=$good APPLE_DEVELOPER_ID_P12_PASSWORD=wrong \
+            expect 'the keychain could not import APPLE_DEVELOPER_ID_P12' \
+            .github/scripts/mac_keychain.sh create --skip-notary
+          # The notary secrets are made up: Apple refuses them (or is unreachable), a refusal either way.
+          APPLE_DEVELOPER_ID_P12=$good APPLE_DEVELOPER_ID_P12_PASSWORD=$p12pw \
+          APPLE_NOTARY_KEY_P8='!!! not base64 !!!' APPLE_NOTARY_KEY_ID=ABC123DEFG \
+          APPLE_NOTARY_ISSUER_ID=00000000-0000-0000-0000-000000000000 \
+            expect 'the signing secret APPLE_NOTARY_KEY_P8 is not base64|the notary profile could not be stored' \
+            .github/scripts/mac_keychain.sh create
+          APPLE_DEVELOPER_ID_P12=$good APPLE_DEVELOPER_ID_P12_PASSWORD=$p12pw \
+          APPLE_NOTARY_KEY_P8=$(echo not-a-p8 | base64) APPLE_NOTARY_KEY_ID=ABC123DEFG \
+          APPLE_NOTARY_ISSUER_ID=00000000-0000-0000-0000-000000000000 \
+            expect 'the notary profile could not be stored' \
+            .github/scripts/mac_keychain.sh create
+          test ! -e "$kc"
+
+          APPLE_DEVELOPER_ID_P12=$good \
+          APPLE_DEVELOPER_ID_P12_PASSWORD=$p12pw \
+            .github/scripts/mac_keychain.sh create --skip-notary
+          rm -f "$RUNNER_TEMP/test.key" "$RUNNER_TEMP/test.crt" "$RUNNER_TEMP/test.p12"
+
+          # The keychain exists, is the default and heads the search list.
+          test -f "$kc"
+          security default-keychain -d user | grep -q 'nerva-signing.keychain-db'
+          security list-keychains -d user | head -n1 | grep -q 'nerva-signing.keychain-db'
+
+          # codesign finds the identity through the search list and default, as mac-release does.
+          hash=$(security find-identity -p codesigning "$kc" | sed -n 's/^ *1) \([0-9A-F]*\) .*/\1/p')
+          test -n "$hash"
+          cp /usr/bin/true "$RUNNER_TEMP/signed-true"
+          codesign --force --sign "$hash" "$RUNNER_TEMP/signed-true"
+          codesign --verify --verbose "$RUNNER_TEMP/signed-true"
+          # -dvv: the Authority lines are printed only from verbosity 2.
+          info=$(codesign -dvv "$RUNNER_TEMP/signed-true" 2>&1)
+          printf '%s\n' "$info"
+          grep -q 'Authority=Nerva CI Test Signing' <<< "$info"
+
+      - name: The keychain is destroyed and the user's keychains are as they were
+        if: always() && needs.changes.outputs.code != 'false'
+        run: |
+          set -euo pipefail
+          kc="$RUNNER_TEMP/nerva-signing.keychain-db"
+          .github/scripts/mac_keychain.sh destroy
+          test ! -e "$kc"
+          security default-keychain -d user | diff - "$RUNNER_TEMP/before-default.txt"
+          security list-keychains -d user | diff - "$RUNNER_TEMP/before-list.txt"
+          .github/scripts/mac_keychain.sh destroy   # a second destroy is harmless
+
+      # The failures that need no keychain and no Apple secret: NRV-E1125 (an unusable RUNNER_TEMP, a
+      # keychain left by an earlier run) and mac_zip_check.sh's NRV-E1126 and NRV-E1127 from the real
+      # codesign (an ad hoc signature has no Developer ID authority). The `security` commands that
+      # fail only on a broken runner, and the runtime and timestamp checks (they need a Developer ID
+      # signature), are triggered with stand-ins in `.github/scripts/test_mac_sign.py`.
+      - name: The other refusals, from the real tools
+        if: needs.changes.outputs.code != 'false'
+        run: |
+          set -uo pipefail
+          expect() {  # expect <code> <headline fragment> <command...>
+            local code=$1 frag=$2; shift 2
+            if "$@" 2> "$RUNNER_TEMP/refused.txt"; then echo "::error::accepted: $frag"; exit 1; fi
+            cat "$RUNNER_TEMP/refused.txt"
+            grep -Fq "error[$code]: " "$RUNNER_TEMP/refused.txt"
+            grep -Fq "$frag" "$RUNNER_TEMP/refused.txt"
+            grep -q '^  cause  ' "$RUNNER_TEMP/refused.txt"
+            grep -q '^  fix    ' "$RUNNER_TEMP/refused.txt"
+          }
+          export APPLE_DEVELOPER_ID_P12=eA== APPLE_DEVELOPER_ID_P12_PASSWORD=x
+          # `env` sets the bogus RUNNER_TEMP for the script only: a `VAR=x expect ...` prefix on a shell
+          # function would stay in force inside `expect` and break its own redirect.
+          expect NRV-E1125 'is not a writable directory' \
+            env RUNNER_TEMP="$RUNNER_TEMP/missing" .github/scripts/mac_keychain.sh create --skip-notary
+          kc="$RUNNER_TEMP/nerva-signing.keychain-db"
+          touch "$kc"
+          expect NRV-E1125 'a signing keychain already exists at' \
+            .github/scripts/mac_keychain.sh create --skip-notary
+          rm -f "$kc"
+
+          tag=v0.0.0-ci
+          name="nerva-$tag-universal-macos"
+          dist="$RUNNER_TEMP/dist"
+          mkdir -p "$dist/$name"
+          cp /usr/bin/true "$dist/$name/nerva"
+          codesign --force --sign - "$dist/$name/nerva"
+          (cd "$dist" && zip -qr "$name.zip" "$name" && shasum -a 256 "$name.zip" > "$name.zip.sha256")
+          expect NRV-E1127 "not signed with a Developer ID Application certificate" \
+            .github/scripts/mac_zip_check.sh "$dist" "$tag"
+          echo "0000000000000000000000000000000000000000000000000000000000000000  $name.zip" > "$dist/$name.zip.sha256"
+          expect NRV-E1126 'does not match its checksum file' .github/scripts/mac_zip_check.sh "$dist" "$tag"
+          rm "$dist/$name.zip.sha256"
+          expect NRV-E1126 'or one of the two is missing' .github/scripts/mac_zip_check.sh "$dist" "$tag"
+
   # The required check's name (the ruleset cannot change here). It passes only if every split job
   # above succeeded: `always()` so that a failed, cancelled or skipped one still runs this job and
   # fails it, instead of leaving it skipped (which a ruleset may count as passing). A docs-only
   # pull request: each split job runs and skips its steps, so each is `success`, and so is this.
   system:
-    needs: [checks, integration, api, releases, targets, macos-arm64, macos-x86_64]
+    needs: [checks, integration, api, releases, targets, macos-arm64, macos-x86_64, mac-keychain]
     if: ${{ always() }}
     name: check, integration, API, views
     runs-on: ubuntu-24.04

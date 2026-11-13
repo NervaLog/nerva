@@ -1,7 +1,8 @@
 # Linux packaging (v0.7.1, slice 4; docs/briefs/v0.7.1.md): the release tarball's install.sh and
 # the two systemd units, proved on a real systemd; and slice 5's .deb and .rpm packages.
 #
-# It runs on every push to main (so on the release commit), and on a pull request that changes
+# It runs on every push to main (so on the release commit), is called by release.yml, whose draft
+# waits for it on the release commit itself (#384), and runs on a pull request that changes
 # packaging, the code whose output or exit statuses the installer and units rely on
 # (src/nerva_main.zig, src/nerva/diagnostic.zig) or VERSION (a draft's run waits until the pull
 # request is marked ready). Every job runs on GitHub's hosted runners, as ci.yml's do (P147e): a
@@ -21,10 +22,15 @@ on:
       - 'packaging/**'
       - 'tests/packaging/**'
       - '.github/workflows/packages.yml'
+      - '.github/scripts/package_repos.sh'
+      - '.github/scripts/repo_install_check.sh'
+      - '.github/scripts/test_package_repos.py'
       - 'src/nerva_main.zig'
       - 'src/nerva/diagnostic.zig'
       - 'VERSION'
   workflow_dispatch:
+  # release.yml calls it on the release commit and does not publish until it is green (#384, P386).
+  workflow_call:
 
 permissions:
   contents: read
@@ -134,11 +140,31 @@ jobs:
       - name: Install rpmbuild, pinned
         run: |
           set -eu
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq rpm=4.18.2+dfsg-2.1build2
+          sudo apt-get -o Acquire::Retries=5 update -qq
+          sudo apt-get -o Acquire::Retries=5 install -y -qq rpm=4.18.2+dfsg-2.1build2
           rpmbuild --version
           test "$(rpmbuild --version)" = "RPM version 4.18.2"
           dpkg-deb --version | head -n1
 
       - name: Build, inspect and install the packages (tests/packaging/packages.py)
         run: python3 -I tests/packaging/packages.py zig-out/bin/nerva . --aarch64 zig-out-aarch64/bin/nerva --require-version-line
+
+      # The signed repositories (slice 2): three trees built by package_repos.sh with throwaway
+      # keys, served over local HTTP, and installed from by repo_install_check.sh in a container
+      # per distribution (apt, dnf 4 and dnf 5), with the refusals and the dual-signed InRelease.
+      # The tools are pinned as ci.yml pins them. The images are tags here; slice 4 pins them by
+      # digest in release-finish.yml's `repos-verify`.
+      - name: Install from the signed repositories on seven distributions (tests/packaging/repos.py)
+        run: |
+          set -eu
+          sudo apt-get -o Acquire::Retries=5 install -y -qq apt-utils=2.8.4ubuntu0.1 \
+            createrepo-c=0.17.3-2ubuntu3 rpm=4.18.2+dfsg-2.1build2 sqv=1.1.0-1build2 gnupg jq
+          tool_is() { # <tool> <expected first line>
+            got=$("$1" --version 2>&1 | head -n1)
+            case $got in "$2" | "$2"[!0-9.]*) ;; *) echo "error[NRV-E1139]: packages.yml: $1 reads '$got', not '$2'" >&2; exit 1 ;; esac
+          }
+          tool_is apt-ftparchive "apt 2.8.4"
+          tool_is createrepo_c "Version: 0.17.3"
+          tool_is rpmsign "RPM version 4.18.2"
+          gpg --version | head -n1 | grep -q 'gpg (GnuPG) 2\.4\.' || { echo "error[NRV-E1139]: packages.yml: gpg is not 2.4" >&2; exit 1; }
+          python3 -I tests/packaging/repos.py

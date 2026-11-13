@@ -50,17 +50,28 @@ environmental, see UPSTREAM.md. Every other test must pass.
 
 CI (`.github/workflows/ci.yml`) runs the same steps on every push and pull request to `main`
 that changes more than Markdown (N68). A
-commit that changes `VERSION` publishes release `v<VERSION>` (`release.yml`) after CI passes: to
-release, add the version's "what's new" section to `CHANGELOG.md` (`## v<VERSION> — <date>`,
+commit that changes `VERSION` starts `release.yml`, which publishes release `v<VERSION>` after CI
+passes. To release, add the version's "what's new" section to `CHANGELOG.md` (`## v<VERSION> — <date>`,
 written for people running Nerva: new capabilities with examples, fixes with their issues, and
-upgrade steps), then bump `VERSION` (and add a worklog note, `worklog/<number>.md`) in its own commit. The section
-becomes the GitHub release notes; a version without one is refused.
+upgrade steps), then bump `VERSION` (and add a worklog note, `worklog/<number>.md`) in its own commit.
+The section becomes the GitHub release notes; a version without one is refused. The `VERSION` commit
+then runs the rest unattended: the draft, then `release-finish.yml`, which signs the Mac zip and
+checks it, publishes the draft, commits the Homebrew formula to the tap and opens the site's pull
+request. The owner's single approval of the `apple-signing` environment ships all of it. If a run
+stops, `release-finish.yml` can be started by hand from `main` with the tag, to recover it.
+A session never approves a deployment (an environment's required review); only the owner does (P360).
 
 **Before every release, the release gate** (P147b, amending P105). A release is cut only from a
 `main` commit that is sim-clean (once R2's fleet runs: 24 hours of the fleet on that commit and no
 open `sim-fleet` issue against it), Jepsen-clean (once R1's nightly runs: the suite passes on that
 commit), and reviewed adversarially by **two** independent reviewers, as below. The release PR
-quotes the fleet's tracker line, the Jepsen result and both verdicts. Within a day of the release,
+quotes the fleet's tracker line, the Jepsen result and both verdicts. **Code pinned** (owner,
+2026-11-12; P374): choosing a candidate means writing its full SHA to `release/candidate` on `main`
+(one line). The release check (`release_check.sh candidate`, NRV-E1158, in `release.yml`'s
+`version` job and `release-finish.yml`'s `publish` job) refuses a `VERSION` commit that is not that
+candidate's descendant, that changes `src/`, `build.zig`, `build.zig.zon`, `zig/`, `.gitmodules` or
+a `.gitattributes` since it, or that changes `release/candidate` itself (it is read at the commit's
+first parent, and must be unchanged since main's head before the push); packaging, docs and workflow changes may follow the candidate. Within a day of the release,
 a short retro goes in `docs/retros/<version>.md`: which assumptions were wrong, what each cost,
 and what changes; a rule it changes lands here or in `docs/decisions/` in the same PR.
 

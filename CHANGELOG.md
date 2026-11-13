@@ -120,12 +120,21 @@ The README's first line no longer says "toy / research": it gives the label and 
 
 ### Fixed
 
+- **#373, #306:** the settings examples (`replica.env.example`, `api.env.example`) shipped placeholder
+  keys that passed the length check, so an unedited copy ran on a key published in this repository.
+  They now ship `NERVA_CLUSTER_KEY=` and `NERVA_KEY=` empty, and `nerva start` and `nerva api`
+  refuse them (NRV-E0901, NRV-E0008) until you set your own.
+- **#308:** v0.7.0's "Upgrading from v0.6.1" step 2 told operators to wait for a log line saying
+  a replica is committing; no replica writes one. The step now names the real signal (the
+  `tb.replica_commit_min` gauge, or `sync: done`), here and in the v0.7.0 section below.
+- **#307:** the `.deb`'s `Maintainer` field had no email address, which Debian policy requires. It
+  is now `The Nerva authors <nerva@nerva.pro>`.
 - **#278:** CI had never run Nerva on macOS. CI now builds the universal binary on a Mac, runs a
   smoke test on Apple silicon and on Intel (three replicas, a gateway with `--statsd`, a commit, a
   lookup, the change feed) and the unit tests on Apple silicon (#293). `zig build -Drelease
   mac-release` builds, signs, zips and notarizes the universal binary and writes the Homebrew
   formula (#291). CI runs it on a Mac, ad hoc and not notarized (`-Dsign-identity=-`), and checks
-  its zip (#315); the Developer ID signature and the notarization run only on the owner's Mac.
+  its zip (#315); the Developer ID signature and the notarization run in the release workflow, behind an environment the owner approves (`mac-sign.yml`).
 - **#271:** the release workflow did not check that the binary it publishes deduplicates commit
   keys. It now refuses a binary built with `-Dtest-commit-keys=off`, and checks that the
   `version` line matches the release (#311).
@@ -148,8 +157,9 @@ is not in yet.
   `bank` valid, kill and partition nemeses, with its link).
 - **Two adversarial reviews** (P147b): **TO FILL** (each reviewer's verdict, and its
   `release-review` issues).
-- **macOS:** the owner builds, signs and notarizes the zip on a Mac and uploads it to the draft
-  release. The `mac-verify` workflow then checks it on Apple silicon and on Intel: the zip against
+- **macOS:** the release workflow's Mac job (`mac-sign.yml`) signs and notarizes the zip after the
+  owner approves the `apple-signing` environment, and uploads it to the draft release; the owner's
+  Mac is the fallback. The `mac-verify` workflow then checks it on Apple silicon and on Intel: the zip against
   its checksum, the binary's version and commit, its Developer ID signature, hardened runtime and
   secure timestamp, and the smoke test; it is run on the draft before publishing, and once the
   release is published its run also does `brew install nervalog/tap/nerva && brew test nerva`.
@@ -215,9 +225,6 @@ Open issues an operator should know about before relying on this release:
   sessions, which evicts every gateway, or declare a view that blocks a later `nerva import`.
   Let only the replicas, the gateways and the hosts that run backup, export or recover reach it
   (SECURITY.md).
-- **#306:** the settings examples' placeholder keys pass the length check. Replace both
-  `NERVA_CLUSTER_KEY` and `NERVA_KEY` before you start anything, or the cluster runs on a key
-  published in this repository.
 - **#304:** a replica's exit statuses 3 and 6 print vendored text with no NRV code; exit 3 names a
   flag Nerva does not have (TROUBLESHOOTING.md, "A replica exits").
 - **#300:** every flag refusal says to run `nerva <command> --help`, which is itself refused.
@@ -438,7 +445,8 @@ combine requests into such ops. Do it in this order:
 2. Upgrade the replicas one at a time. Data files, the superblock, the replica protocol,
    `tree_ids`, `Operation` values and the export format are the same, so v0.7.0 replicas open
    v0.6.1 data files: no export or import. For each replica: stop it, start it with the v0.7.0
-   binary, and wait for it to rejoin (its log says it is committing) before the next one.
+   binary, and wait for it to catch up before the next one: its `tb.replica_commit_min` gauge
+   (`--statsd`) reaches the others', or `sync: done` appears in its log when it state-synced.
 3. Only when every replica runs v0.7.0 (`nerva version | head -n1` on each), upgrade the gateways and start
    any multi-batch client.
 

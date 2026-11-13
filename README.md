@@ -895,7 +895,8 @@ Nerva holds its first client's money on the R milestones' terms, in
 
 ## Roadmap
 
-The 1.0 target is in [docs/GOALS-1.0.md](./docs/GOALS-1.0.md).
+The 1.0 target is in [docs/GOALS-1.0.md](./docs/GOALS-1.0.md). Which release ships what, from
+v0.7.1 to 1.0, is in [docs/ROADMAP.md](./docs/ROADMAP.md).
 
 1. **Foundation** — vendored consensus + storage + simulator, placeholder state machine. ✅
 2. **Commit core** — row model, optimistic read-set validation, versioned base rows; VOPR

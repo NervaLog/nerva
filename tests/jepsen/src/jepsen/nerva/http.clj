@@ -46,6 +46,17 @@
              (.connectTimeout (Duration/ofSeconds 5))
              (.build))))
 
+(defn- parse-body
+  "The JSON in text. A body that is not JSON throws an ex-info whose data has
+  `::unreadable-reply` (data.json throws a bare Exception, which `healthy?` cannot tell from a
+  bug of the harness's own)."
+  [text]
+  (try (json/read-str text)
+       (catch InterruptedException e (throw e))
+       (catch Exception e
+         (throw (ex-info (str "the reply is not JSON: " (.getMessage e))
+                         {::unreadable-reply true} e)))))
+
 (defn request!
   "Sends one request to node's gateway. Returns {:status int, :body parsed JSON or nil}.
   Throws an IOException when no reply arrives. With a port, sends it to that gateway; with a
@@ -67,7 +78,7 @@
          response  (.send ^HttpClient @client request (HttpResponse$BodyHandlers/ofString))
          text      (.body response)]
      {:status (.statusCode response)
-      :body   (when-not (str/blank? text) (json/read-str text))})))
+      :body   (when-not (str/blank? text) (parse-body text))})))
 
 (defn ok!
   "Like request!, for setup: returns the body of a `200`, and throws on anything else."
@@ -167,13 +178,15 @@
 (defn healthy?
   "Whether the gateway at node (and port, `api-port` when omitted) has a cluster session
   (`/healthz` answers 200). No reply, or a reply that cannot be read (a body that is not JSON: a
-  gateway bug), is not healthy; only an interrupt propagates (P244e)."
+  gateway bug), is not healthy. Any other throw is a bug of the harness's own, and propagates,
+  so it is NRV-E0607 and not a gateway found down (NRV-E0604; #248)."
   ([node]
    (healthy? node api-port))
   ([node port]
    (try (= 200 (:status (request! node port "GET" "/healthz" nil probe-timeout-ms)))
-        (catch InterruptedException e (throw e))
-        (catch Exception _ false))))
+        (catch IOException _ false)
+        (catch clojure.lang.ExceptionInfo e
+          (if (::unreadable-reply (ex-data e)) false (throw e))))))
 
 (defn await-healthy!
   "Waits until the gateway at node (and port, `api-port` when omitted) is healthy, at most
