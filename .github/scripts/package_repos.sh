@@ -8,20 +8,28 @@
 #                                              <published> true it writes nothing
 #   package_repos.sh publish <tag>             put pending packages, regenerate and sign both
 #                                              channels, upload, check what is served
-#   package_repos.sh refresh                   publish without a tag, then the 45-day check
+#   package_repos.sh refresh                   publish without a tag, then the 45-day check; with
+#                                              RPM_KEY (`exclude <Key ID>` or `restore <Key ID>`, the
+#                                              owner only) it first marks that key's rpms
+#   package_repos.sh fresh                     stable's served InRelease has 10 days of Valid-Until
+#                                              left (writes nothing, reads no secret)
 #   package_repos.sh served [<tag>]            what packages.nerva.pro serves equals the bucket
 #   package_repos.sh verify-manifest <file> <generation>   verify one manifest object exactly as a
 #                                              reader would and print the signed text (no bucket)
 #   package_repos.sh cleanup                   kill gpg-agent, remove the temporary directories
 #
-# Environment: R2_ENDPOINT, R2_BUCKET, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY (read by r2.py only),
-# PACKAGES_BASE_URL, REPO_SIGNING_KEY, REPO_SIGNING_PASSPHRASE, optionally REPO_SIGNING_KEY_NEXT and
+# Environment: R2_ENDPOINT, R2_BUCKET (empty: NRV-E1139), R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY (read by
+# r2.py only), PACKAGES_BASE_URL, RPM_KEY, TRIGGERING_ACTOR, PACKAGE_REPOS_OWNER (the refresh's rpm_key), REPO_SIGNING_KEY, REPO_SIGNING_PASSPHRASE, optionally REPO_SIGNING_KEY_NEXT and
 # REPO_SIGNING_PASSPHRASE_NEXT (a rotation), GH_TOKEN, GITHUB_REPOSITORY, GITHUB_SHA (the commit
 # `publish-ready` checked), and for `ready` MAC_ATTEMPT and GITHUB_RUN_ATTEMPT. No secret is ever in
-# an argument: key and passphrase travel through stdin, a 0600 file and gpg-agent.
+# an argument: key and passphrase travel through stdin, a 0600 file and gpg-agent. SOURCE_DATE_EPOCH
+# is refused: `Release` carries the run's own clock (P376).
+#
+# GITHUB_OUTPUT: a failing run writes `code=<NRV code>` to it, for the workflow's alarm job.
 #
 # Testing overrides, refused (NRV-E1139) when GITHUB_ACTIONS is set: PACKAGE_KEYS_DIR (packaging/keys), R2_PY (r2.py),
-# PACKAGE_REPOS_FREE_KIB (the free disk, instead of df), PACKAGE_REPOS_KILL_AT=<point>[:<n>] (kill -9
+# PACKAGE_REPOS_FREE_KIB (the free disk, instead of df), PACKAGE_REPOS_SERVED_WAIT=<interval>:<total>
+# (seconds, instead of 10:120, for the served retries), PACKAGE_REPOS_KILL_AT=<point>[:<n>] (kill -9
 # at the nth pass through a named point, for the idempotence table).
 set -euo pipefail
 { set +x; } 2>/dev/null
@@ -44,9 +52,16 @@ arches=(amd64 arm64)
 # ---- diagnostics ---------------------------------------------------------------------------
 
 block() { printf 'error[%s]: %s: %s\n  cause  %s\n  fix    %s\n' "$1" "$where" "$2" "$3" "$4"; }
-refuse() { block "$@" >&2; echo "::error::$1 $2" >&2; exit 1; }
+# The step's `code` output (the first one wins): the alarm job names the failure with it.
+CODE_SET=0
+set_code() {
+  [ "$CODE_SET" = 0 ] || return 0
+  CODE_SET=1
+  if [ -n "${GITHUB_OUTPUT:-}" ]; then echo "code=$1" >>"$GITHUB_OUTPUT"; fi
+}
+refuse() { set_code "$1"; block "$@" >&2; echo "::error::$1 $2" >&2; exit 1; }
 # A fault the run reports at its end, after it has finished everything else.
-defer() { block "$@" >>"$W/deferred"; }
+defer() { block "$@" >>"$W/deferred"; echo "$1" >>"$W/deferred.codes"; }
 # An assertion of the script's own bounds: a bug in it, never the operator's input.
 bug() {
   printf 'bug[NRV-B0006]: %s: %s\n  cause  a loop of the script ran past its own bound\n  fix    Report it; the script'"'"'s bound or its input is wrong\n' "$where" "$1" >&2
@@ -56,8 +71,9 @@ notice() { echo "::notice::$*" >&2; }
 junk() { echo "$1" >>"$W/junk"; notice "noted: $1"; }
 
 if [ -n "${GITHUB_ACTIONS:-}" ]; then
-  for v in PACKAGE_KEYS_DIR R2_PY PACKAGE_REPOS_FREE_KIB PACKAGE_REPOS_KILL_AT; do
+  for v in PACKAGE_KEYS_DIR R2_PY PACKAGE_REPOS_FREE_KIB PACKAGE_REPOS_SERVED_WAIT PACKAGE_REPOS_KILL_AT; do
     if [ -n "${!v:-}" ]; then
+      set_code NRV-E1139
       block NRV-E1139 "$v is set on a runner" "$v exists for the tests only" \
         "Remove $v from the workflow's environment" >&2
       echo "::error::NRV-E1139 $v is set on a runner" >&2
@@ -65,6 +81,15 @@ if [ -n "${GITHUB_ACTIONS:-}" ]; then
     fi
   done
 fi
+
+# A failure r2.py reported itself (it prints its own coded block) still names its code.
+exit_code() {
+  local rc=$?
+  if [ "$rc" != 0 ] && [ "$CODE_SET" = 0 ] && [ -s "${W:-/nonexistent}/r2.codes" ]; then
+    set_code "$(tail -n1 "$W/r2.codes")"
+  fi
+}
+trap exit_code EXIT
 
 kill_point() {
   local want=${PACKAGE_REPOS_KILL_AT:-} name n=1
@@ -98,8 +123,10 @@ need_tools() {
   for t in "$@"; do
     command -v "$t" >/dev/null || e1139 "$t is not installed" "the pinned tools were not installed on this runner"
   done
-  python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)' ||
-    e1139 "python3 is older than 3.12" "r2.py is pinned to the runner's Python 3.12"
+  if [[ " $* " == *" python3 "* ]]; then
+    python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)' ||
+      e1139 "python3 is older than 3.12" "r2.py is pinned to the runner's Python 3.12"
+  fi
   for t in "$@"; do
     case $t in
       apt-ftparchive) tool_is apt-ftparchive "apt 2.8.4" ;;
@@ -107,8 +134,10 @@ need_tools() {
       rpmsign) tool_is rpmsign "RPM version 4.18.2" ;;
     esac
   done
-  gpg --version | head -n1 | grep -q ' 2\.4\.' ||
-    e1139 "gpg is not 2.4.x" "the signing commands are pinned to gpg 2.4"
+  if [[ " $* " == *" gpg "* ]]; then
+    gpg --version | head -n1 | grep -q ' 2\.4\.' ||
+      e1139 "gpg is not 2.4.x" "the signing commands are pinned to gpg 2.4"
+  fi
 }
 
 FP_CURRENT=; FP_NEXT=; FP_PREVIOUS=
@@ -144,6 +173,13 @@ build_keyring() {
   [ "$want" = "$have" ] || e1139 "$keys_dir/nerva-release.asc does not hold exactly the keys fingerprints lists" \
     "listed: $want; in the file: $have"
   gpg --batch --dearmor <"$keys_dir/nerva-release.asc" >"$W/ring.gpg"
+  # `current` or `next` shown revoked or expired is not a key to sign with (no expiry is the model). A
+  # revoked `previous` stays: its rpms are handled by "Excluding the rpms of one key".
+  have=$(gpg --batch --show-keys --with-colons "$keys_dir/nerva-release.asc" 2>/dev/null |
+    awk -F: -v keep="$FP_CURRENT $FP_NEXT" '$1=="pub" {st=$2; next} $1=="fpr" && st != "" {
+      if (index(keep, $10) && (st=="r" || st=="e")) print $10 " " st; st=""}' | tr '\n' ';')
+  [ -z "$have" ] || e1139 "$keys_dir/nerva-release.asc holds the current or next key revoked or expired ($have)" \
+    "the one key has no expiry, so a revocation or an expiry is a finding"
 }
 
 secret_primaries() { gpg --batch --list-secret-keys --with-colons 2>/dev/null | awk -F: '$1=="sec"{p=1;next} $1=="fpr"&&p{print $10;p=0}'; }
@@ -189,7 +225,14 @@ sign_failed() {
 
 # ---- the bucket ------------------------------------------------------------------------------
 
-r2() { python3 -I "$r2_py" "$@"; }
+r2() {
+  local rc=0
+  python3 -I "$r2_py" "$@" 2>"$W/r2.last" || rc=$?
+  cat "$W/r2.last" >&2
+  # only the last call's code: a status the script handled itself must not name a later failure
+  grep -o 'NRV-[EWB][0-9]\{4\}' "$W/r2.last" | head -n1 >"$W/r2.codes" || true
+  return "$rc"
+}
 # A call whose every status but the listed ones ends the run (r2.py has printed its coded message).
 r2need() { local rc=0; r2 "$@" || rc=$?; [ "$rc" = 0 ] || exit 1; }
 
@@ -199,12 +242,42 @@ mkey() { printf 'manifest/%010d.asc' "$1"; }
 
 # ---- the manifest ------------------------------------------------------------------------------
 
+SIG_FPRS=; sig_why=
+# check_sigs <status-file> <min> <max>: every VALIDSIG of a gpgv status file passes the pinned check
+# of "The manifest" (12 fields; $3, the signing key, is the primary and listed; RSA; SHA-512; class 00
+# or 01), there are no bad statuses, and between <min> and <max> of them. The fingerprints go to
+# SIG_FPRS, and the reason of a refusal to sig_why.
+check_sigs() {
+  local out n line
+  sig_why=; SIG_FPRS=
+  if grep -q -E '^\[GNUPG:\] (BADSIG|ERRSIG|EXPSIG|EXPKEYSIG|REVKEYSIG)' "$1"; then sig_why="bad signature status"; return 1; fi
+  out=$(awk -v listed=" $(listed_fprs | tr '\n' ' ') " '
+    $2 == "VALIDSIG" {
+      if (NF != 12) { print "ERR a VALIDSIG line is not 12 fields"; exit }
+      if ($3 != $12) { print "ERR signed by a subkey, but this key model has none"; exit }
+      if (index(listed, " " $3 " ") == 0) { print "ERR signed by a key fingerprints does not list"; exit }
+      if ($9 != 1) { print "ERR the signature is not RSA"; exit }
+      if ($10 != 10) { print "ERR the signature digest is not SHA-512"; exit }
+      if ($11 != "00" && $11 != "01") { print "ERR the signature class is not 00 or 01"; exit }
+      print "OK " $3
+    }' "$1")
+  n=0
+  while read -r line; do
+    [ -n "$line" ] || continue
+    case $line in
+      "OK "*) n=$((n + 1)); SIG_FPRS+="${line#OK } " ;;
+      *) sig_why=${line#ERR }; return 1 ;;
+    esac
+  done <<<"$out"
+  if [ "$n" -lt "$2" ] || [ "$n" -gt "$3" ]; then sig_why="$n valid signatures, not $2 to $3"; return 1; fi
+}
+
 vm_why=
 # verify_manifest <file> <generation>: 0 and the signed text in $W/body when it verifies; 1 and
 # $vm_why when it does not. Strict, as the spec says: one signed block and nothing else, one VALIDSIG by
 # a listed primary key, and only what gpgv printed is parsed.
 verify_manifest() {
-  local f=$1 gen=$2 fpr
+  local f=$1 gen=$2
   vm_why=
   if [ ! -s "$f" ]; then vm_why=empty; return 1; fi
   if [ "$(head -n1 "$f")" != "-----BEGIN PGP SIGNED MESSAGE-----" ]; then vm_why="text before the signed block"; return 1; fi
@@ -220,10 +293,7 @@ verify_manifest() {
   if ! gpgv --keyring "$W/ring.gpg" --status-fd 3 --output "$W/body.raw" "$f" 3>"$W/status" 2>/dev/null; then
     vm_why="signature does not verify"; return 1
   fi
-  if grep -q -E '^\[GNUPG:\] (BADSIG|ERRSIG|EXPSIG|EXPKEYSIG|REVKEYSIG)' "$W/status"; then vm_why="bad signature status"; return 1; fi
-  if [ "$(grep -c '^\[GNUPG:\] VALIDSIG ' "$W/status" || true)" != 1 ]; then vm_why="not exactly one valid signature"; return 1; fi
-  fpr=$(awk '$2=="VALIDSIG"{print $NF}' "$W/status")
-  if ! listed_fprs | grep -qx "$fpr"; then vm_why="signed by a key fingerprints does not list"; return 1; fi
+  check_sigs "$W/status" 1 1 || { vm_why=$sig_why; return 1; }
   rm -rf "$W/p"; mkdir "$W/p"
   if ! awk -v gen="$gen" -v dir="$W/p" '
     function bad(m) { print m > "/dev/stderr"; exit 1 }
@@ -236,7 +306,7 @@ verify_manifest() {
     NR > 10000 { bad("too long") }
     $1 == "package" && phase == 0 {
       if (NF != 8 || !pkey($5) || ($5 <= prev && prev != "")) bad("package line " NR)
-      if ($2 != "pending" && $2 != "published") bad("package state " NR)
+      if ($2 != "pending" && $2 != "published" && $2 != "excluded") bad("package state " NR)
       if (!(hex($3, 64) && $4 ~ /^[0-9]+$/) && !($2 == "pending" && $3 == "-" && $4 == "-" && $5 ~ /^rpm\//)) bad("package hash " NR)
       if (!hex($6, 64) || $7 !~ /^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$/ || !hex($8, 40)) bad("package fields " NR)
       prev = $5; printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", $2, $3, $4, $5, $6, $7, $8 > (dir "/pk"); next
@@ -323,7 +393,7 @@ write_manifest() {
       "Check the signing key and the package's NEVRA and payload against the release's file, then run again"
     rc=0; r2 put-new "$(mkey "$g")" "$W/mnew.asc" || rc=$?
     case $rc in
-      0) CUR_GEN=$g; echo "$st" >"$W/state"; return 0 ;;
+      0) CUR_GEN=$g; echo "$st" >"$W/state"; note_written "$(mkey "$g")" "$(sha_of "$W/mnew.asc")"; return 0 ;;
       3) rc=0; r2 get "$(mkey "$g")" "$W/m.asc" || rc=$?
          [ "$rc" -le 2 ] || exit 1
          if [ "$rc" = 0 ] && verify_manifest "$W/m.asc" "$g"; then
@@ -480,15 +550,41 @@ disk_check() {
 
 e1145() { refuse NRV-E1145 "$1" "packages.nerva.pro does not serve what the bucket holds" "Check what serves packages.nerva.pro in Cloudflare, then run served again"; }
 
-fetch_served() { # <path> <file>
-  curl -fsS --max-time 60 --retry 2 -o "$2" "${PACKAGES_BASE_URL%/}/$1" 2>/dev/null || e1145 "$1 is not served"
+# served_same <path> <want-sha256> <what a difference says>: what packages.nerva.pro serves at <path>
+# hashes to <want>. No query string and no cache-busting header: users get what the edge gives. A
+# difference is retried every 10 seconds for up to 2 minutes (P376), then refused (NRV-E1145).
+served_same() {
+  local wait=${PACKAGE_REPOS_SERVED_WAIT:-10:120} iv total n i=0 why
+  iv=${wait%%:*}; total=${wait##*:}
+  n=1; [ "$iv" = 0 ] || n=$((total / iv + 1))
+  while :; do
+    i=$((i + 1))
+    if curl -fsS --max-time 60 -o "$W/sv.served" "${PACKAGES_BASE_URL%/}/$1" 2>/dev/null; then
+      [ "$(sha_of "$W/sv.served")" != "$2" ] || return 0
+      why=$3
+    else
+      why="is not served"
+    fi
+    [ "$i" -lt "$n" ] || e1145 "$1 $why"
+    sleep "$iv"
+  done
+}
+
+# Everything this run put or replaced, `<key> <sha256>`, checked over HTTPS by served_written.
+note_written() { printf '%s %s\n' "$1" "$2" >>"$W/written"; }
+served_written() {
+  local key want
+  [ -s "$W/written" ] || return 0
+  while read -r key want; do
+    served_same "$key" "$want" "is served with other bytes than this run uploaded"
+  done <"$W/written"
+  : >"$W/written"
 }
 
 served_manifest() {
   [ "$CUR_GEN" -gt 0 ] || return 0
   r2need get "$(mkey "$CUR_GEN")" "$W/sv.bucket"
-  fetch_served "$(mkey "$CUR_GEN")" "$W/sv.served"
-  cmp -s "$W/sv.bucket" "$W/sv.served" || e1145 "$(mkey "$CUR_GEN") is served with other bytes than the bucket's"
+  served_same "$(mkey "$CUR_GEN")" "$(sha_of "$W/sv.bucket")" "is served with other bytes than the bucket's"
 }
 
 served_all() { # <tag or empty>
@@ -497,15 +593,13 @@ served_all() { # <tag or empty>
   for c in "${channels[@]}"; do
     for name in "apt/dists/$c/InRelease" "rpm/$c/repodata/repomd.xml"; do
       r2need get "$name" "$W/sv.bucket"
-      fetch_served "$name" "$W/sv.served"
-      cmp -s "$W/sv.bucket" "$W/sv.served" || e1145 "$name is served with other bytes than the bucket's"
+      served_same "$name" "$(sha_of "$W/sv.bucket")" "is served with other bytes than the bucket's"
     done
   done
   [ -n "$1" ] || return 0
   while IFS=$'\t' read -r st sha size key src tag _; do
     [ "$tag" = "$1" ] && [ "$st" = published ] || continue
-    fetch_served "$key" "$W/sv.served"
-    [ "$(sha_of "$W/sv.served")" = "$sha" ] || e1145 "$key is served with another SHA-256 than the manifest's"
+    served_same "$key" "$sha" "is served with another SHA-256 than the manifest's"
   done <"$W/pk"
 }
 
@@ -528,7 +622,7 @@ cmd_ready() {
   local tag=$1 published=$2 names n draft_ids ids2 name want got key src entry changed=0 exist
   [[ $tag =~ $tag_re ]] || e1139 "the tag $tag is not a version tag" "ready takes vX.Y.Z or vX.Y.Z-rc.N"
   case $published in true|false) ;; *) e1139 "published must be true or false" "ready takes the guard's finding" ;; esac
-  need_env PACKAGES_BASE_URL GH_TOKEN GITHUB_REPOSITORY GITHUB_SHA
+  need_env PACKAGES_BASE_URL GH_TOKEN GITHUB_REPOSITORY GITHUB_SHA R2_ENDPOINT R2_BUCKET
   [[ $GITHUB_SHA =~ ^[0-9a-f]{40}$ ]] || e1139 "GITHUB_SHA is not a commit" "ready records the commit publish-ready checked"
   need_tools gpg gpgv python3 gh curl jq sha256sum
   mkdir -p "$W"; setup_keys
@@ -606,6 +700,7 @@ cmd_ready() {
   done <"$W/want"
   if [ "$added" = 1 ]; then
     write_manifest "$(cat "$W/state")"
+    served_written
     kill_point ready_manifest
   else
     notice "the tag already has its entries"
@@ -623,7 +718,7 @@ finish() {
       "$(tr '\n' ';' <"$W/junk" | cut -c1-1500)" "$e1142_fix"
   fi
   if [ -s "$W/deferred" ]; then cat "$W/deferred" >&2; rc=1; fi
-  [ "$rc" = 0 ] || exit 1
+  [ "$rc" = 0 ] || { set_code "$(head -n1 "$W/deferred.codes")"; exit 1; }
 }
 
 # ---- publish -----------------------------------------------------------------------------------
@@ -661,7 +756,7 @@ put_object() { # <key> <file> <sha>: put-new; a taken name is adopted only with 
   local rc=0 cur
   r2 put-new "$1" "$2" || rc=$?
   case $rc in
-    0) echo "$1" >>"$W/ok"; return 0 ;;
+    0) echo "$1" >>"$W/ok"; note_written "$1" "$3"; return 0 ;;
     3) cur=$(obj_state "$1")
        if [ "$cur" = "$3" ]; then
          rc=0; verify_obj "$1" "$3" "$W/adopt.bin" || rc=$?
@@ -670,6 +765,48 @@ put_object() { # <key> <file> <sha>: put-new; a taken name is adopted only with 
        junk "object $1 exists with other content than its entry"; return 1 ;;
     *) exit 1 ;;
   esac
+}
+
+e1161() { refuse NRV-E1161 "$1" "$2" "Fix it, then re-run. It is a finding until explained"; }
+
+key_id_of() { printf '%s' "${1: -16}" | tr 'A-F' 'a-f'; }
+
+RPMDB=
+# A scratch rpm database holding the pinned key file's keys, and nothing else.
+rpm_scratch() {
+  local want have
+  [ -z "$RPMDB" ] || return 0
+  RPMDB=$W/rpmdb
+  rm -rf "$RPMDB"; mkdir -p "$RPMDB"
+  rpmdb --initdb --dbpath "$RPMDB" >/dev/null 2>&1 </dev/null || e1161 "the scratch rpm database could not be made" "rpmdb --initdb failed"
+  rpmkeys --dbpath "$RPMDB" --import "$keys_dir/nerva-release.asc" >/dev/null 2>&1 </dev/null ||
+    e1161 "the pinned key file did not import into the scratch rpm database" "rpmkeys --import refused packaging/keys/nerva-release.asc"
+  want=$(listed_fprs | wc -l)
+  have=$(rpm --dbpath "$RPMDB" -qa 'gpg-pubkey*' 2>/dev/null | wc -l)
+  [ "$have" = "$want" ] || e1161 "the scratch rpm database holds $have keys, not the $want listed" \
+    "the key file and fingerprints disagree"
+}
+
+# verify_rpm <file>: step 4's check of the exact bytes about to be recorded or put (and 5b's again).
+verify_rpm() {
+  local f=$1 name out sig kid by
+  name=${f##*/}
+  rpm_scratch
+  sig=$(rpm -qp --qf '%{RSAHEADER:pgpsig}\n' "$f" 2>/dev/null </dev/null) || sig=
+  by=; [[ $sig =~ Key\ ID\ ([0-9a-f]{16})$ ]] && by=" (signed by the Key ID ${BASH_REMATCH[1]})"
+  out=$(rpmkeys --dbpath "$RPMDB" -K "$f" 2>&1 </dev/null) ||
+    e1161 "$name does not verify under rpmkeys$by: $(printf '%s' "$out" | head -c 200 | tr '\n' ' ')" \
+      "its signature, digests or key are not what packaging/keys/ pins"
+  case $out in *"digests signatures OK"*) ;; *)
+    e1161 "$name does not verify under rpmkeys$by: $(printf '%s' "$out" | head -c 200 | tr '\n' ' ')" \
+      "rpmkeys did not report digests signatures OK" ;;
+  esac
+  [[ $sig =~ ^RSA/SHA512,\ .*,\ Key\ ID\ ([0-9a-f]{16})$ ]] ||
+    e1161 "$name carries the signature '$sig', not RSA/SHA512 with a Key ID" "rpm reads its header signature otherwise than the pin"
+  kid=${BASH_REMATCH[1]}
+  [ "$kid" = "$(key_id_of "$FP_CURRENT")" ] || { [ -n "$FP_PREVIOUS" ] && [ "$kid" = "$(key_id_of "$FP_PREVIOUS")" ]; } ||
+    e1161 "$name is signed by the Key ID $kid, which is not current's or previous's" \
+      "its key left fingerprints, or a run signed it with another key"
 }
 
 sign_rpm() { # <file>: rpmsign in place, then the NEVRA and payload digest check
@@ -754,6 +891,7 @@ put_rpm() { # <key> <tag> <base> <source-sha>
       junk "object $k exists with other content than its entry"
     done
     if [ -n "$have" ]; then
+      verify_rpm "$W/dl/copy.rpm"
       for k in "${keys[@]}"; do
         [ "$k" != "$have" ] || continue
         [ "$(obj_state "$k")" = absent ] || continue
@@ -765,6 +903,7 @@ put_rpm() { # <key> <tag> <base> <source-sha>
   fi
   fetch_source "$tag" "$base" "$srcsha" "$W/dl/$base" || return 1
   sign_rpm "$W/dl/$base"
+  verify_rpm "$W/dl/$base"
   sha=$(sha_of "$W/dl/$base"); size=$(size_of "$W/dl/$base")
   for k in "${keys[@]}"; do set_entry "$k" pending "$sha" "$size"; done
   write_manifest "$(cat "$W/state")"
@@ -781,11 +920,12 @@ channel_has() { # <channel> <key> <tag>
 }
 
 make_indexes() {
-  local c a key st sha size src tag f now stage rc
+  local c a key st sha size src tag f now stage rc d dts drift
   rm -rf "$W/stage" "$W/pk.files"; mkdir -p "$W/stage" "$W/pk.files"
   now=$(date -u +%s)
   # every package on disk (published entries and the pending ones about to be)
   while IFS=$'\t' read -r st sha size key src tag _; do
+    [ "$st" != excluded ] || continue
     [ "$st" = published ] || [ "$(obj_state "$key")" = "$sha" ] || continue
     [ "$sha" != - ] || continue
     mkdir -p "$W/pk.files/$(dirname "$key")"
@@ -816,6 +956,13 @@ make_indexes() {
         -o APT::FTPArchive::Release::Acquire-By-Hash=yes -o APT::FTPArchive::Release::ValidTime=1814400 \
         release "dists/$c" >"dists/$c/Release" 2>/dev/null
     ) || refuse NRV-E1156 "apt-ftparchive failed for $c" "the index tool refused its input" "Install the index tools or free disk on the runner, then run again"
+    # `Date` is the run's own clock (P376): a Release dated elsewhere is a run that must not sign
+    d=$(sed -n 's/^Date: //p' "$stage/dists/$c/Release" | head -n1)
+    dts=$(date -u -d "$d" +%s 2>/dev/null) || dts=0
+    drift=$(( $(date -u +%s) - dts )); [ "$drift" -ge 0 ] || drift=$((-drift))
+    [ "$drift" -le 600 ] || refuse NRV-E1156 "Release of $c is dated '$d', $drift seconds from the run's clock" \
+      "apt-ftparchive was given a clock of its own (SOURCE_DATE_EPOCH or a wrapper)" \
+      "Install the index tools or free disk on the runner, then run again"
     for a in "${arches[@]}"; do
       local d=$stage/dists/$c/main/binary-$a
       mkdir -p "$d/by-hash/SHA256"
@@ -859,11 +1006,12 @@ upload_indexes() {
   local key file rc name n=0
   while IFS=$'\t' read -r key file; do
     rc=0; r2 put-new "$key" "$file" || rc=$?
-    case $rc in 0) ;; 3)
+    case $rc in 0) note_written "$key" "$(sha_of "$file")" ;; 3)
         rc=0; verify_obj "$key" "$(sha_of "$file")" "$W/idx.bin" || rc=$?
         if [ "$rc" != 0 ]; then
           junk "content-named object $key holds other bytes than its name says"
           r2need put "$key" "$file"
+          note_written "$key" "$(sha_of "$file")"
         fi ;;
       *) exit 1 ;;
     esac
@@ -879,15 +1027,119 @@ upload_indexes() {
   for c in "${channels[@]}"; do order+=("rpm/$c/repodata/repomd.xml.asc" "rpm/$c/repodata/repomd.xml"); done
   for name in "${order[@]}"; do
     r2need put "$name" "$(stage_file "$name")"
+    note_written "$name" "$(sha_of "$(stage_file "$name")")"
     kill_point index_put
   done
 }
 
+# ---- verify before upload (step 5b) ------------------------------------------------------------
+
+# The run's own indexes, against the public key file alone: a GNUPGHOME with no secret and no agent.
+verify_before_upload() {
+  local vh=$tmp_root/package-repos.verify c d f want
+  rm -rf "$vh"; mkdir -m 700 "$vh"
+  want=$(( ${#SIGN_U_BOTH[@]} / 2 ))
+  for c in "${channels[@]}"; do
+    d=$W/stage/apt/$c/dists/$c
+    GNUPGHOME=$vh gpgv --keyring "$W/ring.gpg" --status-fd 3 --output "$W/v.out" "$d/InRelease" 3>"$W/v.st" 2>/dev/null ||
+      e1161 "InRelease of $c does not verify under packaging/keys/ alone" "the signing key and the pinned key file disagree"
+    check_sigs "$W/v.st" "$want" "$want" || e1161 "InRelease of $c fails the pinned check: $sig_why" "the signing key and the pinned key file disagree"
+    cmp -s "$W/v.out" "$d/Release" || e1161 "the text of InRelease of $c differs from its Release" "the signature covers other text than Release"
+    GNUPGHOME=$vh gpgv --keyring "$W/ring.gpg" --status-fd 3 "$d/Release.gpg" "$d/Release" 3>"$W/v.st" 2>/dev/null ||
+      e1161 "Release.gpg of $c does not verify under packaging/keys/ alone" "the signing key and the pinned key file disagree"
+    check_sigs "$W/v.st" "$want" "$want" || e1161 "Release.gpg of $c fails the pinned check: $sig_why" "the signing key and the pinned key file disagree"
+    f=$W/stage/rpm/$c/repodata
+    GNUPGHOME=$vh gpgv --keyring "$W/ring.gpg" --status-fd 3 "$f/repomd.xml.asc" "$f/repomd.xml" 3>"$W/v.st" 2>/dev/null ||
+      e1161 "repomd.xml.asc of $c does not verify under packaging/keys/ alone" "the signing key and the pinned key file disagree"
+    check_sigs "$W/v.st" 1 1 || e1161 "repomd.xml.asc of $c fails the pinned check: $sig_why" "the signing key and the pinned key file disagree"
+  done
+  rm -rf "$vh"
+  for f in "$W"/stage/rpm/*/packages/*.rpm; do
+    [ -f "$f" ] || continue
+    verify_rpm "$f"
+  done
+}
+
+# ---- excluding the rpms of one key (slice 2b) ---------------------------------------------------
+
+RPM_ACT=; RPM_KEYID=
+# The refresh's rpm_key input: owner only, and one of `exclude <Key ID>`, `restore <Key ID>`. Before any write.
+rpm_key_input() {
+  [ -n "${RPM_KEY:-}" ] || return 0
+  [ -n "${PACKAGE_REPOS_OWNER:-}" ] && [ "${TRIGGERING_ACTOR:-}" = "$PACKAGE_REPOS_OWNER" ] ||
+    e1139 "rpm_key is for the owner (PACKAGE_REPOS_OWNER); ${TRIGGERING_ACTOR:-nobody} is not" \
+      "it removes packages from the indexes, and only the owner decides that" \
+      "Ask the owner to dispatch it, or leave rpm_key empty"
+  [[ $RPM_KEY =~ ^(exclude|restore)\ ([0-9a-fA-F]{16})$ ]] ||
+    e1139 "rpm_key is not 'exclude <Key ID>' or 'restore <Key ID>' with a 16-hex Key ID" "the input is that and nothing else" \
+      "Dispatch it with exclude or restore and a 16-hex Key ID"
+  RPM_ACT=${BASH_REMATCH[1]}
+  RPM_KEYID=$(printf '%s' "${BASH_REMATCH[2]}" | tr 'A-F' 'a-f')
+}
+
+# The Key ID that signed an entry's rpm, read from the bucket's bytes (cached by hash).
+entry_kid() { # <key> <sha> -> $KID
+  local f=$W/kid.$2 sig rc=0
+  KID=
+  if [ -f "$f" ]; then KID=$(cat "$f"); return 0; fi
+  mkdir -p "$W/kx"
+  verify_obj "$1" "$2" "$W/kx/rpm" || rc=$?
+  [ "$rc" = 0 ] || e1142_now "the listed object $1 cannot be read with its hash" "the locks make that impossible, so the locks have failed"
+  sig=$(rpm -qp --qf '%{RSAHEADER:pgpsig}\n' "$W/kx/rpm" 2>/dev/null </dev/null) || sig=
+  KID=$(printf '%s' "$sig" | sed -n 's/.*Key ID \([0-9a-f]\{16\}\)$/\1/p')
+  echo "$KID" >"$f"
+}
+
+# The refusals that need the entries (NRV-E1139), before any write.
+rpm_key_scan() {
+  local st sha size key n=0 want rev
+  [ -n "$RPM_ACT" ] || return 0
+  if [ "$RPM_ACT" = exclude ]; then
+    if [ "$RPM_KEYID" = "$(key_id_of "$FP_CURRENT")" ] || { [ -n "$FP_NEXT" ] && [ "$RPM_KEYID" = "$(key_id_of "$FP_NEXT")" ]; }; then
+      e1139 "rpm_key excludes the Key ID $RPM_KEYID of the current or next key" "that would drop every rpm the job signs" \
+        "Exclude only the Key ID of a key that left fingerprints or was revoked"
+    fi
+    want=published
+  else
+    want=excluded
+    rev=$(gpg --batch --show-keys --with-colons "$keys_dir/nerva-release.asc" 2>/dev/null |
+      awk -F: '$1=="pub" {st=$2; next} $1=="fpr" && st=="r" {print tolower(substr($10, 25))} $1=="fpr" {st=""}' | grep -cx "$RPM_KEYID" || true)
+    [ "$rev" = 0 ] || e1139 "rpm_key restores the Key ID $RPM_KEYID of a revoked key" \
+      "rpm 6 refuses its signatures once a host has the revocation, so a published revocation is final" \
+      "Restore undoes a mistaken exclusion only; release a patch version instead"
+  fi
+  while IFS=$'\t' read -r st sha size key _; do
+    [ "$st" = "$want" ] && [[ $key == rpm/* ]] || continue
+    entry_kid "$key" "$sha"
+    if [ "$KID" = "$RPM_KEYID" ]; then n=$((n + 1)); fi
+  done <"$W/pk"
+  [ "$n" -gt 0 ] || e1139 "rpm_key $RPM_ACT $RPM_KEYID: no $want rpm is signed by that Key ID" \
+    "an exclusion names published rpms and a restoration excluded ones" \
+    "Read the Key ID from the NRV-E1161 message, or from rpm -qp"
+}
+
+# Mark (or unmark) the rpms of the key, in one manifest generation, after step 4.
+rpm_key_apply() {
+  local st sha size key changed=0 from to
+  [ -n "$RPM_ACT" ] || return 0
+  if [ "$RPM_ACT" = exclude ]; then from=published to=excluded; else from=excluded to=published; fi
+  while IFS=$'\t' read -r st sha size key _; do
+    [ "$st" = "$from" ] && [[ $key == rpm/* ]] || continue
+    entry_kid "$key" "$sha"
+    [ "$KID" = "$RPM_KEYID" ] || continue
+    notice "$RPM_ACT: $key (Key ID $KID)"
+    set_entry "$key" "$to" "$sha" "$size"
+    changed=1
+  done < <(cat "$W/pk")
+  if [ "$changed" = 1 ]; then write_manifest "$(cat "$W/state")"; fi
+}
+
 cmd_publish() { # <tag or empty> <refresh: 0|1>
   local tag=$1 refresh=$2 st sha size key name h was age
-  need_env PACKAGES_BASE_URL GH_TOKEN GITHUB_REPOSITORY
+  need_env PACKAGES_BASE_URL GH_TOKEN GITHUB_REPOSITORY R2_ENDPOINT R2_BUCKET
   [ -z "$tag" ] || [[ $tag =~ $tag_re ]] || e1139 "the tag $tag is not a version tag" "publish takes vX.Y.Z or vX.Y.Z-rc.N"
-  need_tools gpg gpgv python3 gh curl jq sha256sum rpm rpmsign apt-ftparchive createrepo_c gzip
+  if [ "$refresh" = 1 ]; then rpm_key_input; fi
+  need_tools gpg gpgv python3 gh curl jq sha256sum rpm rpmsign rpmkeys rpmdb apt-ftparchive createrepo_c gzip
   mkdir -p "$W/dl"; setup_keys
   find_current
   bucket_check 1
@@ -896,6 +1148,7 @@ cmd_publish() { # <tag or empty> <refresh: 0|1>
     refuse NRV-E1148 "the manifest has no entry for $tag" "nothing was bound by an approved run" \
       "Restore the asset the approved run bound, or release a new version, then run again"
   fi
+  rpm_key_scan
   kill_point checked
   put_pending
   # promote what is complete: a pending entry whose object exists with its hash
@@ -906,7 +1159,9 @@ cmd_publish() { # <tag or empty> <refresh: 0|1>
     grep -qxF "$key" "$W/ok" || verify_obj "$key" "$sha" "$W/adopt.bin" || continue
     set_entry "$key" published "$sha" "$size"
   done < <(cat "$W/pk")
+  rpm_key_apply
   make_indexes
+  verify_before_upload
   # index lines: the new hashes; index-was: what was found and accepted, else the previous index hash
   : >"$W/ix.new"; : >"$W/iw.new"
   replaceable_names
@@ -923,8 +1178,10 @@ cmd_publish() { # <tag or empty> <refresh: 0|1>
   upload_indexes
   kill_point indexes_uploaded
   served_all "$tag"
+  served_written
   kill_point served
   write_manifest complete
+  served_written
   if [ "$refresh" = 1 ]; then
     age=$(refresh_age) || e1155_now "reading the date of main's newest commit failed"
     if [ "$age" -gt 45 ]; then
@@ -958,6 +1215,36 @@ cmd_served() {
   finish
 }
 
+# `fresh`: stable's served InRelease verifies under the pinned keys and has at least 10 days of
+# Valid-Until left (P376; it was 7). The same check the daily watch and ci.yml's repos-fresh make. Under
+# the one-key model there is no key expiry to check (NRV-E1160 is retired). Writes nothing.
+cmd_fresh() {
+  local until ts days
+  need_env PACKAGES_BASE_URL
+  need_tools gpg gpgv curl
+  mkdir -p "$W"; read_fingerprints; rm -rf "$GNUPGHOME"; mkdir -m 700 "$GNUPGHOME"; build_keyring
+  curl -fsS --max-time 60 --retry 2 -o "$W/fresh.InRelease" "${PACKAGES_BASE_URL%/}/apt/dists/stable/InRelease" 2>/dev/null ||
+    refuse NRV-E1150 "stable's InRelease is not served" "packages.nerva.pro does not answer for apt/dists/stable/InRelease" \
+      "Run package_repos.sh refresh to re-sign; make a commit to this repository if it has been idle for 45 days"
+  # shellcheck disable=SC2015
+  gpgv --keyring "$W/ring.gpg" --status-fd 3 --output "$W/fresh.Release" "$W/fresh.InRelease" 3>"$W/fresh.st" 2>/dev/null &&
+    check_sigs "$W/fresh.st" 1 2 ||
+    refuse NRV-E1150 "stable's served InRelease does not verify under packaging/keys/ (${sig_why:-gpgv refused it})" \
+      "its signature is bad, or it was signed by a key the pin does not list" \
+      "Run package_repos.sh refresh to re-sign; make a commit to this repository if it has been idle for 45 days"
+  until=$(sed -n 's/^Valid-Until: //p' "$W/fresh.Release" | head -n1)
+  ts=$(date -u -d "$until" +%s 2>/dev/null) ||
+    refuse NRV-E1150 "stable's InRelease has no readable Valid-Until ('$until')" "Release is generated with Valid-Until" \
+      "Run package_repos.sh refresh to re-sign; make a commit to this repository if it has been idle for 45 days"
+  days=$(( (ts - $(date -u +%s)) / 86400 ))
+  if [ "$((ts - $(date -u +%s)))" -lt $((10 * 86400)) ]; then
+    refuse NRV-E1150 "stable's InRelease is valid for $days more days, not the 10 the weekly refresh keeps" \
+      "the signatures expire 21 days after the last refresh, and a refresh is missing" \
+      "Run package_repos.sh refresh to re-sign; make a commit to this repository if it has been idle for 45 days"
+  fi
+  notice "stable's InRelease is valid for $days more days"
+}
+
 cmd_verify_manifest() {
   need_tools gpg gpgv
   mkdir -p "$W"; read_fingerprints; rm -rf "$GNUPGHOME"; mkdir -m 700 "$GNUPGHOME"
@@ -976,16 +1263,20 @@ main() {
   case $cmd in
     cleanup) cmd_cleanup; return ;;
   esac
-  rm -rf "$W"; mkdir -p "$W"; : >"$W/junk"; : >"$W/deferred"; : >"$W/ok"
+  rm -rf "$W"; mkdir -p "$W"; : >"$W/junk"; : >"$W/deferred"; : >"$W/deferred.codes"; : >"$W/ok"; : >"$W/written"
+  if [ -n "${SOURCE_DATE_EPOCH:-}" ]; then
+    e1139 "SOURCE_DATE_EPOCH is set" "Release carries the run's own clock, and a fixed date would make the signatures look fresh"
+  fi
   case $cmd in
     ready) [ $# = 3 ] || usage; cmd_ready "$2" "$3" ;;
     publish) [ $# = 2 ] || usage; cmd_publish "$2" 0 ;;
     refresh) [ $# = 1 ] || usage; cmd_publish "" 1 ;;
+    fresh) [ $# = 1 ] || usage; cmd_fresh ;;
     served) cmd_served "${2:-}" ;;
     verify-manifest) [ $# = 3 ] || usage; cmd_verify_manifest "$2" "$3" ;;
     *) usage ;;
   esac
 }
-usage() { echo "usage: package_repos.sh ready <tag> <published> | publish <tag> | refresh | served [<tag>] | verify-manifest <file> <generation> | cleanup" >&2; exit 64; }
+usage() { echo "usage: package_repos.sh ready <tag> <published> | publish <tag> | refresh | fresh | served [<tag>] | verify-manifest <file> <generation> | cleanup" >&2; exit 64; }
 
 main "$@"
