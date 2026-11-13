@@ -595,18 +595,23 @@ def test_restart_policy(tmp):
         # start-limit-hit), so the outcome is read from the states, the counts and the journal.
         state = show(unit, "ActiveState", "SubState", "ExecMainStatus", "NRestarts")
         assert state["SubState"] == "failed" and state["ExecMainStatus"] == "1", state
-        # systemd's own lines reach the journal after the unit shows `failed`: wait, bounded, for
-        # the refusal, the last line of the run, so the count below is of a complete log (#375).
-        def journal():
-            sh(["journalctl", "--sync"])
-            return sh(["journalctl", "-u", unit, "--since", since, "--no-pager", "-o", "cat"]).stdout
-
-        wait("the journal records the refused start", lambda: "Start request repeated too quickly" in journal())
-        log = journal()
+        # The journal is read after `journalctl --sync`. "Started" is not counted: #375 failed with
+        # the refusal already in the log and 19 "Started" lines, so systemd can start the unit
+        # without logging it (Type=exec, a process that exits at once). The counted facts are
+        # "Starting" and "Main process exited", which every start has, and NRestarts. A failure
+        # prints the whole journal and the counts.
+        sh(["journalctl", "--sync"])
+        log = sh(["journalctl", "-u", unit, "--since", since, "--no-pager", "-o", "cat"]).stdout
+        counts = {"Starting": log.count("Starting nerva@9.service"),
+                  "Started": log.count("Started nerva@9.service"),
+                  "exited": log.count("Main process exited, code=exited, status=1/FAILURE"),
+                  "refused": log.count("Start request repeated too quickly"),
+                  "NRestarts": state["NRestarts"]}
+        report = f"{counts}\n{log}"
         # StartLimitBurst=20 allows 20 starts (the first and 19 restarts); the 20th restart job's
         # start is refused.
-        assert log.count("Started nerva@9.service") == 20, log[-2000:]
-        assert "Start request repeated too quickly" in log, log[-2000:]
+        assert counts["Starting"] == 20 and counts["exited"] == 20, report
+        assert counts["refused"] == 1 and int(counts["NRestarts"]) >= 19, report
         time.sleep(2)  # with RestartSec=100ms, a unit still restarting would have moved by now
         again = show(unit, "ActiveState", "NRestarts")
         assert again["ActiveState"] == "failed" and again["NRestarts"] == state["NRestarts"], (state, again)
