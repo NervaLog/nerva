@@ -295,6 +295,14 @@ after the first build; the log says `settling round ... left by a stop or a
 crash`). Read `soak` for the old candidate only after that line, and for the new one only after
 its first round ends.
 
+**The candidate must contain this loop.** `run.sh` runs from the checkout it builds, and the
+reporter is copied from the commit it built, so pinning the fleet to a commit runs that commit's
+`run.sh` and `sim_fleet.py`. The guarantees above (#370, #387, P382) hold only for a candidate
+that contains #382. An older candidate runs the old loop: its reporter refuses `ingest
+--round-id` and `refuse`, the new `run.sh` exits 1, systemd restarts the checkout's old `run.sh`,
+and that deletes the round in flight uncounted. Pin a candidate that contains #382; one whose
+`src/`, `build.zig`, `build.zig.zon` and `zig/` match an older candidate soaks the same code.
+
 **Before the soak counts** (the owner's host steps, in order; none is done by this repository):
 
 1. Provision the host (docs/briefs/r1.md, "The host").

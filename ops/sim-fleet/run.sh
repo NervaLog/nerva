@@ -416,7 +416,7 @@ worker() {
         # this worker dies and run_round refuses the round. A stop kills this bash with its
         # seed: that seed had not finished, so it had not failed, and it is not recorded.
         echo "$target $seed $code $(( $(date +%s) - started ))" >>"$dir/results"
-        if (( code != 0 )); then sync "$dir/results"; fi
+        if (( code != 0 )); then sync "$dir/results" "$dir" "$round"; fi
         if (( code != 0 && code != 124 && code != 137 )); then
             out="$dir/fail-${target/:/-}-$seed"
             mkdir -p "$out"

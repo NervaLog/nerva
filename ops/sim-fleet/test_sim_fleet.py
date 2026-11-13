@@ -1512,7 +1512,7 @@ class RunShSettle(unittest.TestCase):
         calls = Path(log).read_text().splitlines()
         self.assertRegex(calls[0], r"^sync .*/round\.new/id .*/round\.new/commit")
         self.assertRegex(calls[1], r"^sync .*/round .*/state$")
-        self.assertRegex(calls[2], r"^sync .*/round/w0/results$")
+        self.assertRegex(calls[2], r"^sync \S*/round/w0/results \S*/round/w0 \S*/round$")
         self.assertEqual(calls[3], "tail")
 
 

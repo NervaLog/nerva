@@ -76,3 +76,6 @@ accepted rather than given more machinery: a worker that died in a round a stop 
 loop that would have seen its exit is gone), and a power cut that tears a failing seed's line
 before its code (its fsync had not returned). `run.sh` finds the record with `grep` for the id,
 which is safe because the id is random and appears in the state only in `last_round`.
+The fleet runs the loop and the reporter of the commit it soaks, so these guarantees hold only
+for a candidate that contains this pull request; an older candidate soaks with the old loop and
+its losses (#370, #387).
