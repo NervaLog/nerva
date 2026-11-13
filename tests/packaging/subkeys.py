@@ -857,6 +857,24 @@ def judge(image):
 # The FAILs that are the answer to the question (docs/decisions/P392*), by image and cell, each with
 # the text its failure must contain. Any other FAIL, or a finding with another symptom, is red.
 FINDINGS = {
+    # rpm 4.18 keeps the first certificate it was given for a primary, and refuses a revoked subkey's
+    # key file outright (so the S4 refusal is not tested there)
+    ("host", "rotation/rpm4.18-S2-after-keyAB-import"): "SIGNATURES NOT OK",
+    ("host", "revocation/rpm4.18-key-file-with-a-revocation-still-verifies-S1"): "key 1 import failed",
+    ("host", "revocation/rpm4.18-S4-revoked"): "not tested",
+    # dnf4 (rpm 4.16): the same; the key file with a revocation does not import
+    ("rockylinux:9", "rotation:rotation/dnf-upgrade-with-the-new-key-file"):
+        "Public key for nervak-2.0-1.noarch.rpm is not installed",
+    ("rockylinux:9", "revocation:revocation/dnf-key-file-with-a-revocation-still-installs-S1"):
+        "Key import failed (code 2)",
+    ("rockylinux:9", "revocation:revocation/dnf-rpm-signed-by-a-revoked-subkey"): "not tested",
+    ("rockylinux:9", "revocation:revocation/dnf-repomd-signed-by-a-revoked-subkey"): "not tested",
+    # dnf5 (rpm 6) follows a rotation, but skips a repository it cannot verify and exits 0, and does
+    # not enforce a revoked subkey on repomd.xml
+    **{(img, "stale:rotation/dnf-S2-with-the-old-key-file/exit-status"): "Signing key not found"
+       for img in ("fedora:43", "fedora:44")},
+    **{(img, "revocation:revocation/dnf-repomd-signed-by-a-revoked-subkey"): "ACCEPTED"
+       for img in ("fedora:43", "fedora:44")},
 }
 
 
