@@ -37,6 +37,13 @@ refuse() { # <headline> <fix>
     exit 1
 }
 
+setup_failed() { # <what> <fix>: the tool's own message is already on stderr, above this block
+    echo "error[NRV-E1163]: nerva package: could not $1" >&2
+    echo "  cause  A tool that creates the service user or a directory the package needs refused; its own message is printed just above" >&2
+    echo "  fix    $2" >&2
+    exit 1
+}
+
 # A file install.sh would make, or one that overrides the package's, shadows the package's:
 # /usr/local/bin comes before /usr/bin on the PATH and /etc/systemd/system overrides
 # /usr/lib/systemd/system. It is a tarball install's, a source build's or a full unit override.
@@ -46,7 +53,7 @@ if [ "$first_install" = yes ]; then
         if [ -e "$left" ]; then
             echo "error[NRV-E1111]: nerva package: $left exists and is not this package's" >&2
             echo "  cause  A file that is not this package's (a tarball install, a source build or a full unit override) would shadow the package's binary or units" >&2
-            echo "  fix    if it is a tarball install, run install.sh --uninstall from the tarball (it keeps /var/lib/nerva, /etc/nerva and the user); otherwise move or remove the file (change a unit with a drop-in); then install the package" >&2
+            echo "  fix    if it is a tarball install, stop its replicas with systemd, run install.sh --uninstall from the tarball (it keeps /var/lib/nerva, /etc/nerva and the user; its enabled nerva@N and nerva-api@N instances are removed, as no package is installed yet, so enable them again after installing the package); otherwise move or remove the file (change a unit with a drop-in); then install the package" >&2
             exit 1
         fi
     done
@@ -55,7 +62,7 @@ elif [ -e /usr/local/bin/nerva ]; then
     # run a bare nerva, so the replicas would keep running it instead of the package's new binary.
     echo "warning[NRV-W1101]: nerva package: /usr/local/bin/nerva exists and shadows this package's /usr/bin/nerva" >&2
     echo "  cause  /usr/local/bin comes before /usr/bin on the path, and the units run nerva by name, so the replicas run that file and not the package's new nerva" >&2
-    echo "  fix    if it is a tarball install, run install.sh --uninstall from the tarball (it keeps /var/lib/nerva, /etc/nerva and the user); otherwise move or remove the file; then restart the replicas" >&2
+    echo "  fix    keep one install: if it is a tarball install, stop the nerva@N and nerva-api@N replicas with systemd, run install.sh --uninstall from the tarball (it keeps /var/lib/nerva, /etc/nerva, the user and the enabled nerva@N and nerva-api@N instances), then start the replicas; otherwise move or remove the file. Enable any instance that is not enabled" >&2
 fi
 
 if getent passwd "$user" > /dev/null 2>&1; then
@@ -74,8 +81,13 @@ elif getent group "$user" > /dev/null 2>&1; then
         "remove the group (groupdel $user), or create the user $user with it as primary group (useradd -g $user ...)"
 else
     useradd --system --user-group --home-dir "$data_dir" --no-create-home \
-        --shell /usr/sbin/nologin "$user"
+        --shell /usr/sbin/nologin "$user" ||
+        setup_failed "create the system user $user" \
+            "find why useradd refused (its message is above: /etc/passwd read-only or managed by LDAP, no free system uid, SELinux), or create the user yourself (useradd --system --user-group --home-dir $data_dir --no-create-home --shell /usr/sbin/nologin $user), then install the package again"
 fi
 
-install -d -m 750 -o root -g "$user" "$etc_dir"
-install -d -m 750 -o "$user" -g "$user" "$data_dir"
+dir_fix="find why install -d refused (its message is above: a read-only file system, no space, a path that is a file), fix that, then install the package again"
+install -d -m 750 -o root -g "$user" "$etc_dir" ||
+    setup_failed "make the directory $etc_dir" "$dir_fix"
+install -d -m 750 -o "$user" -g "$user" "$data_dir" ||
+    setup_failed "make the directory $data_dir" "$dir_fix"

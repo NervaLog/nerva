@@ -94,11 +94,36 @@ one.
   A tracking issue that refuses the totals is retried each round. A request never follows a
   redirect, so the token never goes to another host.
 - Filed fingerprints are in `/var/lib/sim-fleet/state/state.json`. If that file is missing, the
-  issue markers rebuild it (the latest 500 issues labelled `sim-fleet`). A state file that exists
-  but cannot be read is an error (exit 2); it is never taken for empty.
-- Exit codes of `sim_fleet.py`: 0 done, 1 bad input (the round is refused whole, nothing
-  counted), 2 environment (state file, token, GitHub). The state is saved whatever GitHub
-  answered; a round it did not finish is kept in `state/last-failed-round/`.
+  issue markers rebuild it (the latest 500 issues labelled `sim-fleet`) before anything is filed;
+  until they can be read, rounds are still counted and nothing is filed. A state file that exists
+  but cannot be read is an error (`soak` exit 2); it is never taken for empty or overwritten.
+  Deleting a corrupt `state.json` to get past that erases the candidate's refused count (and its
+  fingerprints): never do it for a commit you mean to release.
+- **Every round is settled by a record, never by an exit code** (#370, P382). `run.sh` gives each
+  round a random id (`state/round/id`, beside `commit`) and waits for each worker. If any worker
+  died before the round's end (any failed command, such as a full disk), the round is refused
+  without being read: that worker may have lost a failing seed. Otherwise `sim_fleet.py ingest`
+  counts the round, or refuses it whole (past 4096 failing seeds, or a malformed `results`
+  line), and saves that, with the id in `last_round`, in one atomic write of the state file,
+  before it reads the token or asks GitHub anything; a missing token or GitHub down then stops
+  only the reports. An unterminated last line, which only a power cut or a full disk leaves, is
+  a failure when it has a code that is not 0, and is dropped otherwise. After `ingest` ends,
+  however it ends, `run.sh` looks for the id in the state file. Not there (a usage error, a
+  crash, a timeout, a kill): `sim_fleet.py refuse` records the round as refused. Still not there
+  (the state cannot be written): the round stays in `state/round/`, `run.sh` exits 1, and
+  systemd starts it again 30 s later. A counted round is deleted; a refused one, or one `ingest`
+  did not exit 0 on, is kept in `state/last-failed-round/` for a look. `ingest` and `refuse` do
+  nothing for a round already recorded, so no round is counted twice. A refused round makes its
+  commit not clean for `soak`, and the tracker's daily totals say how many rounds were refused.
+- **A restart is safe.** A round that a stop, a reboot or a crash left in `state/round/` is
+  settled from the results its workers wrote, before the next one starts, under the round's own
+  commit: its finished seeds count, and a failing one makes that commit not clean (a seed's
+  `results` line is its only record: written first, and fsynced when the seed did not pass,
+  before its log and its full-log replay). A stop kills the seeds that were running with their
+  workers, and they are not recorded: a seed that had not finished had not failed yet, so this
+  loses seed-hours, not failures. Two rare cases do lose one failing seed: a worker that died
+  in a round that a stop then cut before the round's end, and a power cut that tears a failing
+  seed's line before its code (P382).
 - Every collection is bounded (`sim_fleet.py`, the constants at the top): seeds and failing seeds
   per round, bytes read of a log, lines in an issue, fingerprints remembered (2048), days kept
   (31), pages scanned on a rebuild (5).
@@ -132,8 +157,9 @@ is (P147i). Its tests need no network: `python3 ops/sim-fleet/test_sim_fleet.py`
    - Repository permissions: **Issues: Read and write**. Nothing else (Metadata: read is added by
      GitHub itself).
    - Expiry: the longest the organisation allows; put the date in the calendar. An expired token
-     makes `sim_fleet.py` exit 2 with `HTTP 401` in the journal, files nothing, and the daily
-     totals stop appearing on the tracker.
+     leaves `HTTP 401` in the journal and `(writes stopped: refused)` on the round's line; the
+     rounds are still counted, nothing is filed, and the daily totals stop appearing on the
+     tracker.
 3. **No deploy key.** The repository is public, and the fleet fetches it over HTTPS
    (`SIM_FLEET_REMOTE=https://github.com/NervaLog/nerva.git`, the default). Should it ever go
    private: `ssh-keygen -t ed25519 -N '' -f nerva-fleet`, add `nerva-fleet.pub` under the
@@ -236,13 +262,22 @@ soak 1a2b3c4: 24.6 h, vopr-nerva 182,311 seeds, vopr-testing 15,020, fuzz 9,874;
 is the full SHA or a prefix of at least 7 hex digits.) Exit 0 if the commit ran and is clean; 1 if the state
 has no round of it (the line then says `0.0 h`), the prefix names two commits, or the commit is not
 clean: any failing seed, any seed past its deadline or killed by the host (a candidate that hangs
-its seeds is not clean, however many hours they fill), or any failure fingerprint hit; 2 if the
-state file is missing or unreadable. "Failures" counts failing seeds, not distinct bugs. "Issues
+its seeds is not clean, however many hours they fill), any failure fingerprint hit, or any
+refused round (a worker died, past 4096 failing seeds, a malformed line, or a reporter that left
+no record; the line then ends `; N rounds refused or lost by the reporter, their seeds
+unknown`); 2 if the state file is missing or unreadable. "Failures" counts failing seeds, not distinct bugs. "Issues
 its rounds hit" lists the issue of every failure fingerprint the commit's rounds hit, from the
 rounds' own records and so independent of throttling, a hold or a rate limit (`not filed (...)`
 is a failure whose report was not posted); the state does not see a closed issue, so confirm each
 listed issue on GitHub (`label:sim-fleet is:open`) before quoting it. The gate wants 24 hours and no open
 issue; the line does not decide that, the reader does.
+
+**A refused round cannot be cleared.** A refused round now means a worker that died (a full
+disk, a failing command), bad input or a reporter bug (a token, GitHub, a restart or a slow disk
+no longer refuses a round), so the state has no way to undo one and `run.sh` writes no marker to
+remove. Read the round in `state/last-failed-round/`
+and the journal; if it was the host and not the candidate, the owner waives it in writing in the
+release PR, or the fleet soaks a new candidate.
 
 **Pointing the fleet at the candidate.** Set `SIM_FLEET_BRANCH` in `/etc/sim-fleet/fleet.env` to
 the candidate's **full 40-character SHA** and `systemctl restart sim-fleet`. `run.sh` runs
@@ -254,7 +289,19 @@ fetch (`couldn't find remote ref`; the loop logs `git fetch failed` and keeps wh
 typo soaks the old commit silently: check `journalctl -u sim-fleet` for `building <SHA>`). The
 fleet then stops following `main`; the soak restarts at a new commit when the owner moves the
 pin (a fix merged to `main` first), and when the soak ends the owner removes the line and
-restarts the service.
+restarts the service. A restart kills the round in flight; the next start settles it from the
+lines it holds, before it builds anything when a reporter is already built (otherwise right
+after the first build; the log says `settling round ... left by a stop or a
+crash`). Read `soak` for the old candidate only after that line, and for the new one only after
+its first round ends.
+
+**The candidate must contain this loop.** `run.sh` runs from the checkout it builds, and the
+reporter is copied from the commit it built, so pinning the fleet to a commit runs that commit's
+`run.sh` and `sim_fleet.py`. The guarantees above (#370, #387, P382) hold only for a candidate
+that contains #382. An older candidate runs the old loop: its reporter refuses `ingest
+--round-id` and `refuse`, the new `run.sh` exits 1, systemd restarts the checkout's old `run.sh`,
+and that deletes the round in flight uncounted. Pin a candidate that contains #382; one whose
+`src/`, `build.zig`, `build.zig.zon` and `zig/` match an older candidate soaks the same code.
 
 **Before the soak counts** (the owner's host steps, in order; none is done by this repository):
 
@@ -274,6 +321,7 @@ restarts the service.
 5. Run R2's canary (a scratch-branch fault, filed once, then commented on and not filed again).
 6. Run R1's teeth night (`--expect-invalid` on the keys-off build files one `jepsen` issue). A
    fleet that has never filed anything passes the gate silently; steps 5 and 6 prove it would not.
+   For v0.7.1 the owner skipped step 4 and ran steps 5 and 6 during the soak (P359).
 
 The Jepsen clause of the same soak is in [ops/jepsen](../jepsen/README.md#release-soak). Jepsen
 stops the fleet for about 2.5 h a night, so 24 hours of rounds take about 27 of wall time.

@@ -1,5 +1,8 @@
-# A commit to main that changes VERSION publishes release v<VERSION> (docs/DECISIONS.md N40):
-# CI on that commit, then binaries for four targets, then the tag and the GitHub release.
+# A commit to main that changes VERSION publishes release v<VERSION> (docs/DECISIONS.md N40). The
+# jobs run in order: version, then ci and packages (packages.yml, the packaging tests; both on that
+# commit, and the release waits for both, #384), then release (binaries for four targets, and
+# a draft release), then finish (release-finish.yml, on main), which publishes it once the owner has
+# approved `apple-signing` (P360).
 # A version with a suffix (0.2.0-rc.1) is a prerelease. Releasing a version twice fails.
 # The release notes are the version's section of CHANGELOG.md (`## v<VERSION> — <date>`); a
 # version without one is refused before CI runs. Each release carries its software bill of
@@ -9,9 +12,16 @@
 # units and the settings examples (packaging/linux); the four Linux packages (nerva_<v>-1_<arch>.deb
 # and nerva-<v>-1.<arch>.rpm; a prerelease's `-` is `~` inside the package and `.` in the file name,
 # because GitHub renames an asset whose name has a `~`, P311) are built from the same binaries and
-# are in SHA256SUMS; and the release is a DRAFT. The owner builds, signs and notarizes the Mac zip
-# on their own Mac, uploads it and its `.zip.sha256` to the draft and publishes it
-# (SHA256SUMS does not cover the zip, which does not exist yet); mac-verify.yml then checks it.
+# are in SHA256SUMS; and the release is a DRAFT. `finish` then runs on main: its `mac` job signs and
+# notarizes the Mac zip (mac-sign.yml; environment `apple-signing`, so the owner's one approval of
+# that run ships the release) and uploads it, with its `.zip.sha256`, to the draft; `mac-verify`
+# (mac-verify.yml) checks it on both architectures. Only then `publish` publishes the draft, commits
+# the Homebrew formula to the tap and opens the site's pull request, and `verify` installs from the
+# tap. A prerelease dispatched from a branch stops at its draft, since `finish` runs only on main;
+# release-finish.yml dispatched from main with the draft's tag rehearses it, or finishes a run that
+# stopped. The owner's own Mac (`zig build -Drelease mac-release -Dnotarize=true`) remains the
+# fallback if the runner or Apple's notary service fails. (SHA256SUMS does not cover the zip, which
+# is made after it.)
 # Publishing creates the tag on the commit the draft names. The run refuses a second release of a
 # version while a draft of it exists (a draft has no tag; checked again just before the draft is
 # created, because "Re-run failed jobs" does not run the `version` job again), a binary whose
@@ -43,9 +53,11 @@ jobs:
     outputs:
       tag: ${{ steps.version.outputs.tag }}
     steps:
+      # The full history: `candidate` asks whether the candidate is an ancestor of this commit.
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           persist-credentials: false
+          fetch-depth: 0
 
       - name: Read VERSION
         id: version
@@ -64,6 +76,13 @@ jobs:
           .github/scripts/release_notes.sh "$TAG" > notes.md
           cat notes.md
 
+      # The site's RELEASES sentence (NRV-E1130): the publish job needs it after the release is
+      # public, so a missing one is refused here, before anything is built.
+      - name: Refuse a version without a site line
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: .github/scripts/release_notes.sh site "$TAG"
+
       - name: Refuse a version whose bill of materials cannot be written
         env:
           TAG: ${{ steps.version.outputs.tag }}
@@ -75,6 +94,16 @@ jobs:
         env:
           TAG: ${{ steps.version.outputs.tag }}
         run: .github/scripts/release_check.sh ref "$TAG" "$GITHUB_REF"
+
+      # The code freeze (NRV-E1158): the commit may differ from the soaked candidate named by
+      # release/candidate only outside src/, build.zig, build.zig.zon and zig/. A prerelease with no
+      # such file passes, and one with it is checked, so the rehearsal exercises this.
+      - name: Refuse a commit whose code is not the candidate's
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          # The main head before this push; empty on a dispatch, which a release then refuses.
+          BEFORE: ${{ github.event.before }}
+        run: .github/scripts/release_check.sh candidate "$TAG" "$GITHUB_SHA" "$BEFORE"
 
       - name: Refuse a version already released, or already a draft
         env:
@@ -91,8 +120,18 @@ jobs:
       contents: read
       pull-requests: read
 
+  # The packaging tests on this very commit (docs/briefs/v0.7.1.md, demo row 6; #384): called, not
+  # observed, so a later push to main cannot cancel it, a red run stops the draft, and its result is
+  # on this run. It runs beside `ci`; each job is on a hosted runner of its own (the tests need about
+  # 2 GiB of disk, which only a fresh runner has).
+  packages:
+    needs: version
+    uses: ./.github/workflows/packages.yml
+    permissions:
+      contents: read
+
   release:
-    needs: [version, ci]
+    needs: [version, ci, packages]
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     permissions:
@@ -148,15 +187,16 @@ jobs:
           .github/scripts/release_check.sh binary "./nerva-$TAG-x86_64-linux/nerva" "${TAG#v}"
           # Only the first line: `nerva version` goes on to print release, format and bundles lines,
           # which an env-file refuses.
-          echo "BINARY_VERSION=$(head -n1 version.txt | sed 's/^Nerva version //')" >> "$GITHUB_ENV"
+          binary_version=$(head -n1 version.txt | sed 's/^Nerva version //')
+          echo "BINARY_VERSION=$binary_version" >> "$GITHUB_ENV"
 
       # dpkg-deb is on the image. rpmbuild is the `rpm` package, pinned to the version
       # packages.yml's tests ran against (P284b, P295) and asserted: a runner image change fails here.
       - name: Install rpmbuild, pinned
         run: |
           set -eu
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq rpm=4.18.2+dfsg-2.1build2
+          sudo apt-get -o Acquire::Retries=5 update -qq
+          sudo apt-get -o Acquire::Retries=5 install -y -qq rpm=4.18.2+dfsg-2.1build2
           test "$(rpmbuild --version)" = "RPM version 4.18.2"
           dpkg-deb --version | head -n1
 
@@ -220,3 +260,21 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: .github/scripts/release_check.sh assets "$TAG" dist
+
+  # Everything after the draft is release-finish.yml (P360): `mac` signs and notarizes the zip and
+  # waits for the owner's one approval (environment apple-signing), `mac-verify` checks it on both
+  # architectures, `publish` publishes the draft, commits the formula to the tap and opens the
+  # site's pull request (environment release-publish), and `verify` installs from the tap. The `if`
+  # skips it on a dispatch from any ref but main, so a prerelease dispatched from a branch makes its
+  # draft and stops there (it is finished by dispatching release-finish.yml from main with its tag);
+  # the workflow's own `guard` and each environment's main-only deployment rule are the other guards.
+  # A prerelease draft may target only main plus VERSION and CHANGELOG.md (release_check.sh
+  # mac-draft, P343). The workflow takes no inherited secrets.
+  finish:
+    needs: [version, release]
+    if: github.ref == 'refs/heads/main'
+    uses: ./.github/workflows/release-finish.yml
+    permissions:
+      contents: write
+    with:
+      tag: ${{ needs.version.outputs.tag }}

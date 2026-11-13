@@ -630,6 +630,18 @@ class Run:
         return f"{what}: {self.kind}{' (' + found + ')' if found else ''}{took}"
 
 
+TEST_NAME = re.compile(r"^nerva ([a-z][a-z0-9-]*)( no-keys)?(?: |$)")
+
+
+def workload_from_name(name):
+    """The workload a test directory's name gives (`nerva <workload>[ no-keys][ <nemeses>]`, as
+    core.clj names a test), as findings name it; None when the name is not that shape."""
+    found = TEST_NAME.match(name)
+    if not found:
+        return None
+    return "bank-no-keys" if found.group(1) == "bank" and found.group(2) else found.group(1)
+
+
 def read_test(run, directory):
     """Fills `run` from a test directory (`results.edn`, `jepsen.log`)."""
     run.dir = directory
@@ -643,9 +655,10 @@ def read_test(run, directory):
         run.nemesis = option(words, "nemesis") or ""
         run.seed = option(words, "seed")
         run.reproduce = " ".join(shlex.quote(w) for w in reproduce_words(words))
-    if run.workload == "bank" and os.path.basename(os.path.dirname(directory)).startswith(
-            "nerva bank no-keys"):
-        run.workload = "bank-no-keys"  # `test-all` has no --workload; the test's name says it
+    if not run.workload_read:  # `test-all` has no --workload; the test's name says it
+        named = workload_from_name(os.path.basename(os.path.dirname(directory)))
+        if named:
+            run.workload, run.workload_read = named, True
     path = os.path.join(directory, "results.edn")
     try:
         with open(path, "rb") as file:

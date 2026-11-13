@@ -36,9 +36,12 @@ brew install nervalog/tap/nerva
 nerva version
 ```
 
-The tap is `NervaLog/homebrew-tap`. It is not published yet; its formula is generated from
-[`packaging/homebrew/nerva.rb`](../packaging/homebrew/nerva.rb) by `zig build -Drelease mac-release`, and
-installs the prebuilt universal binary (arm64 and x86_64) pinned by its SHA-256. It builds nothing
+The tap is `NervaLog/homebrew-tap`, which exists once the first release is out; from then on
+`brew install nervalog/tap/nerva` installs the latest release from its `main`. A release candidate's
+formula is on the tap's `rc/v<V>` branch, never on `main`, so `brew install` never installs one.
+The formula is generated from
+[`packaging/homebrew/nerva.rb`](../packaging/homebrew/nerva.rb) by `zig build -Drelease mac-release`, which the
+release's Mac signing job runs (`mac-sign.yml`), and installs the prebuilt universal binary (arm64 and x86_64) pinned by its SHA-256. It builds nothing
 and needs no `sudo`. The formula's own test is that `nerva version` ends in `version <the
 release>`.
 
@@ -57,10 +60,11 @@ The release page also lists `nerva-v0.7.1-x86_64-macos.tar.gz` and
 `nerva-v0.7.1-aarch64-macos.tar.gz`. They are for scripts that pin them: they are not signed with
 a Developer ID or notarized, so Gatekeeper may block them. On a Mac, take Homebrew or the zip.
 
-The zip's binary is meant to be signed with the owner's Developer ID and notarized before the release is
-published; neither has been done for a candidate, and this page does not say it has. A bare
-executable cannot carry Apple's notarization ticket, so Gatekeeper looks the notarization up
-online when the file is first opened.
+The zip's binary is signed with a Developer ID Application certificate and notarized by Apple in the
+release's Mac signing job (`mac-sign.yml`), which runs once the owner approves it. If that job
+cannot run, the owner signs and notarizes on a Mac instead, and the release notes say which. A bare
+executable cannot carry Apple's notarization ticket, so Gatekeeper looks the notarization up online
+when the file is first opened: the first launch needs a network connection.
 
 **A browser download.** A browser marks what it downloads with a quarantine attribute, and
 Gatekeeper then checks the file when it first runs. A notarized binary passes that check. If macOS
@@ -106,7 +110,7 @@ Flags: `--dry-run` (the same checks as a real run, no change), `--upgrade` (repl
 another release: stop the replicas first and start them after; the only upgrade this release states as in place is v0.7.0 to v0.7.1, see
 [OPERATING.md](./OPERATING.md#upgrading), and read
 [Upgrading a cluster](../README.md#upgrading-a-cluster) when the protocol release changes), and
-`--uninstall` (removes the binary and the units; leaves `/var/lib/nerva`, `/etc/nerva` and the
+`--uninstall` (removes the binary and the units, and is refused with NRV-E1118 while replicas or the gateway run: stop them first; leaves `/var/lib/nerva`, `/etc/nerva` and the
 user, so your data stays).
 
 When `install.sh` refuses, it prints one coded block and changes nothing
@@ -123,6 +127,10 @@ When `install.sh` refuses, it prints one coded block and changes nothing
 | NRV-E1107 | 2 | this machine cannot run the tarball's `nerva` (a `noexec` mount such as `/tmp` on a hardened host) | unpack where programs may run |
 | NRV-E1108 | 1 | the tarball is incomplete, or `install.sh` ran outside it | unpack it whole, run from its directory |
 | NRV-E1109 | 2 | no `sha256sum` | install coreutils |
+| NRV-E1118 | 1 | an install over a different `nerva` (the tarball's in `/usr/local/bin`, else a package's in `/usr/bin`), or an `--uninstall` of `/usr/local/bin/nerva`, while `nerva@*` or `nerva-api@*` units are running | stop them, install (`--upgrade` over a tarball install), start them |
+
+When a package's `/usr/bin/nerva` is installed too, `install.sh` goes on and warns (NRV-W1102): the tarball's
+`/usr/local/bin/nerva` comes first on the path, so it is the one the units run. Leave the package installed: removing it disables the enabled `nerva@N` and `nerva-api@N` instances, so enable them again afterwards. `install.sh --uninstall` keeps those instances while the package's `/usr/bin/nerva` exists.
 
 Recorded: `./install.sh --dry-run`, as root, in a container that is not running systemd:
 
@@ -144,7 +152,7 @@ user, `/var/lib/nerva` and `/etc/nerva`, but **do not put the examples in `/etc/
 them there yourself ([QUICKSTART.md](./QUICKSTART.md#three-hosts)). They format, enable and start
 nothing, and removing them leaves your data, your settings and the user.
 
-**They are not signed in v0.7.1**, and there is no apt or dnf repository: you download the file,
+**They are not signed in v0.7.1**, and there is no apt or dnf repository yet (they are planned for v0.7.2): you download the file,
 [check it against `SHA256SUMS`](#checking-a-download), and install it from disk.
 
 ```bash
