@@ -18,17 +18,22 @@ from the environment and nothing is committed. The run:
      `--network host`, apt on Debian and Ubuntu, dnf on Rocky and Fedora) or, with `--host`, with
      the runner's own rpm 4.18 and gpgv/sqv.
 
-The cells (printed `CELL <group>/<name> PASS|FAIL|INFO`; the run exits 1 if any FAIL is not one of FINDINGS, below):
+The cells (printed `CELL <group>/<name> PASS|FAIL|INFO`; the run exits 1 if a FAIL is not a finding in FINDINGS, below, by image and cell, with its symptom, or if a finding now passes):
 
   install     a fresh host installs from a repository signed by S1, with the key file {P, S1}
   rotation    a host that has {P, S1} meets InRelease signed by S1 and S2 (before and after it has
               the new key file), then signed by S2 alone (before: NO_PUBKEY, expected; after the
               INSTALL.md `curl` line alone: must work); on dnf `dnf upgrade nerva` across the swap
-              with the key file now {P, S1, S2} and nothing else done (a cell that needs `rpm -e
-              gpg-pubkey` or a second import is a FAIL: the diagnosis after it is INFO)
+              the key file served at the gpgkey= URL becoming {P, S1, S2} and nothing else done (judged
+              by the installed version, never by the exit status: dnf5 skips a repository it cannot
+              verify and exits 0; a cell that needs `rpm -e gpg-pubkey` or a second import is a FAIL:
+              the diagnosis after it is INFO)
+  rotation4b  setup step 4B: two whole keys K1 and K2 (the primary signs, no expiry); a host that holds
+              {K1} meets the key file {K1, K2} and an rpm signed by K2 (rpm 4.18 and dnf)
   expiry      an rpm signed by S3 before it expired still installs after (a FAIL means subkeys
               without expiry); apt's answer on an InRelease of an expired subkey is INFO
-  revocation  a key file that carries S4's revocation: apt and dnf refuse what S4 signed
+  revocation  a key file that carries S4's revocation: apt and dnf refuse what S4 signed (a refusal
+              counts only when S1 verified first in the same database: else it is a FAIL, "not tested")
   primary     the certify-only primary cannot sign, and every signature names a subkey, never
               the primary (the P376 check of package_repos.sh reads exactly that field)
 
@@ -53,6 +58,18 @@ PRIMARY_PW = "primary-passphrase-throwaway"
 CI_PW = "ci-passphrase-throwaway"
 APT_IMAGES = ["debian:12", "debian:13", "ubuntu:22.04", "ubuntu:24.04"]
 DNF_IMAGES = ["rockylinux:9", "fedora:43", "fedora:44"]
+# The images, by the digest of their multi-arch index, resolved from Docker Hub on 2026-11-13. The
+# tag only names what was meant. A new digest is a change to this file, so a cell cannot flip by the
+# image moving under it (dnf_prepare still upgrades dnf5 from the distribution, and prints its version).
+PINS = {
+    "debian:12": "sha256:268fb24c39bca92d326dd83ea3abebe4a3f7751c804ffef23bb6d857dd343ff8",
+    "debian:13": "sha256:9c6e381421d0f48d1b8133e573f33c185ee16cbf505eda9c4a8a4791b25ea8a6",
+    "ubuntu:22.04": "sha256:74b12b11ffa550fba1929ad4d8d16533c34f6612728469671afba1b03b66881c",
+    "ubuntu:24.04": "sha256:2198e4c65076e9cb0b3d695219df667c0e3b0072da64ca3c2648aca17dcecaf5",
+    "rockylinux:9": "sha256:d7be1c094cc5845ee815d4632fe377514ee6ebcf8efaed6892889657e5ddaaa6",
+    "fedora:43": "sha256:f01112b9a1f1d0504ad962d9adfa401425033f8ab067e0a821904ebdde5b8ca5",
+    "fedora:44": "sha256:15da97ed9aa94dd3d92c3925eb89520f6c80e07ea7ee24cba848d1f8b6912b3e",
+}
 CELLS = []  # (name, verdict, text)
 
 
@@ -203,14 +220,14 @@ def sign_args(subs):
 
 
 class Signer:
-    def __init__(self, k, ci, www):
-        self.k, self.ci, self.www = k, ci, www
-        (ci / "passphrase").write_text(CI_PW + "\n")
+    def __init__(self, k, ci, www, pw=CI_PW):
+        self.k, self.ci, self.www, self.pw = k, ci, www, pw
+        (ci / "passphrase").write_text(pw + "\n")
 
     def gpg(self, subs, *args):
         self.k.gpg(self.ci, "--pinentry-mode", "loopback", "--passphrase-file",
                    str(self.ci / "passphrase"), "--digest-algo", "SHA512", *sign_args(subs), *args,
-                   default=CI_PW)
+                   default=self.pw)
 
     def rpm(self, subs, path):
         assert len(subs) == 1
@@ -295,9 +312,49 @@ def build_all(w, www, keys, signer):
     make_rpm_repo(w, www, signer, "s4m", "5.0", [s1], [s4])  # the repomd signed by S4
 
 
+def make_4b(k, w, www):
+    """Setup step 4B's world: K1 and K2 are two whole keys (the primary signs, no expiry), the
+    rotation is a new key. keys/k1.asc is {K1}, keys/k1k2.asc is {K1, K2}; repository b1 is signed by
+    K1 and b2 by K2. The keys carry no passphrase here: the test is of the verifiers, not of gpg."""
+    fprs, exports = [], []
+    for n in (1, 2):
+        h = k.home()
+        k.gpg(h, "--pinentry-mode", "loopback", "--passphrase", "", "--cert-digest-algo", "SHA512",
+              "--quick-generate-key", f"Nerva 4B test key {n} <nerva-test{n}@example.invalid>", "rsa4096",
+              "sign,cert", "never")
+        out = k.gpg(h, "--with-colons", "--list-secret-keys").stdout
+        fprs.append(next(ln.split(":")[9] for ln in out.splitlines() if ln.startswith("fpr")))
+        exports.append(k.gpg(h, "--armor", "--export", fprs[-1]).stdout)
+        Path(w / f"home{n}").write_text(str(h))
+    (www / "keys/k1.asc").write_text(exports[0])
+    (www / "keys/k1k2.asc").write_text(exports[0] + exports[1])
+    for n, name, version in ((1, "b1", "1.0"), (2, "b2", "2.0")):
+        signer = Signer(k, Path((w / f"home{n}").read_text()), www, pw="")
+        make_rpm_repo(w, www, signer, name, version, [fprs[n - 1]], [fprs[n - 1]])
+
+
+class Handler(http.server.SimpleHTTPRequestHandler):
+    """The static tree, and /swap/<name>, which makes /keys/current.asc the key file <name>: what
+    the owner's key change at the URL INSTALL.md's gpgkey= names does, with no change on the host."""
+
+    def do_GET(self):
+        if self.path.startswith("/swap/"):
+            name = os.path.basename(self.path[len("/swap/"):])
+            keys = Path(self.directory) / "keys"
+            if not (keys / name).is_file():
+                return self.send_error(404)
+            shutil.copy(keys / name, keys / "current.asc")
+            self.send_response(204)
+            self.end_headers()
+            return None
+        return super().do_GET()
+
+    def log_message(self, *a, **kw):
+        pass
+
+
 def serve(www):
-    handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(www))
-    handler.log_message = lambda *a, **kw: None
+    handler = functools.partial(Handler, directory=str(www))
     httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     return httpd
@@ -359,12 +416,29 @@ def host_cells(w, www, keys):
     d = db()
     imp = rpmkeys(d, "--import", str(kd / "keyRev.asc"))
     r = rpmkeys(d, "-K", str(rp("s1")))
+    control = imp.returncode == 0 and verdict(r)
     record("revocation/rpm4.18-key-file-with-a-revocation-still-verifies-S1",
-           "PASS" if imp.returncode == 0 and verdict(r) else "FAIL",
+           "PASS" if control else "FAIL",
            f"import rc={imp.returncode} {imp.stdout.strip()[-100:]}; {r.stdout.strip()}")
     r = rpmkeys(d, "-K", str(rp("s4")))
-    record("revocation/rpm4.18-S4-revoked", "PASS" if not verdict(r) else "FAIL",
-           ("refused: " if not verdict(r) else "ACCEPTED a revoked subkey: ") + r.stdout.strip())
+    if not control:
+        record("revocation/rpm4.18-S4-revoked", "FAIL",
+               "not tested: the key file did not import, so every signature is refused, S1's too: "
+               + r.stdout.strip())
+    else:
+        record("revocation/rpm4.18-S4-revoked", "PASS" if not verdict(r) else "FAIL",
+               ("refused: " if not verdict(r) else "ACCEPTED a revoked subkey: ") + r.stdout.strip())
+
+    # Setup step 4B: a host that holds K1 meets the key file {K1, K2} and an rpm signed by K2.
+    d = db()
+    rpmkeys(d, "--import", str(kd / "k1.asc"))
+    r = rpmkeys(d, "-K", str(rp("b1")))
+    ctl = verdict(r)
+    record("rotation4b/rpm4.18-verify-b1-with-K1", "PASS" if ctl else "FAIL", r.stdout.strip())
+    imp = rpmkeys(d, "--import", str(kd / "k1k2.asc"))
+    r = rpmkeys(d, "-K", str(rp("b2")))
+    record("rotation4b/rpm4.18-K2-after-k1k2-import", "PASS" if imp.returncode == 0 and verdict(r) else "FAIL",
+           f"import rc={imp.returncode}; {r.stdout.strip()}")
 
     gpgv_cells(w, www, keys)
 
@@ -506,7 +580,30 @@ cell() {
     ok:ok) say "$name" PASS "" ;;
     refuse:fail) say "$name" PASS "refused, as expected: $(tail -n 2 "$log" | tr '\n' ' ' | cut -c1-200)" ;;
     info:*) say "$name" INFO "$got: $(tail -n 3 "$log" | tr '\n' ' ' | cut -c1-240)" ;;
-    *) say "$name" FAIL "wanted $want, got $got"; sed 's/^/-- /' "$log" | tail -n 25 ;;
+    *) say "$name" FAIL "wanted $want, got $got: $(excerpt)"; sed 's/^/-- /' "$log" | tail -n 25 ;;
+  esac
+}
+# the lines of the log that say why (verification, keys), on one line
+excerpt() { grep -Ei 'signature|verif|key|NOT OK|error|fail' "$log" | tail -n 3 | tr '\n' ' ' | cut -c1-240; }
+# upg NAME ok|refuse VERSION CMD...: judged by what is installed afterwards, never by the exit status
+# alone: dnf5 skips a repository that fails verification, says "Nothing to do" and exits 0. With
+# `silent=fail` such an exit 0 is its own FAIL cell (NAME/exit-status): the host stops getting updates
+# and nothing is red. Otherwise it is INFO.
+upg() {
+  local name=$1 want=$2 ver=$3; shift 3
+  "$@" > "$log" 2>&1; local rc=$?
+  if installed "$ver"; then got=installed; else got=absent; fi
+  case $want:$got in
+    ok:installed) say "$name" PASS "" ;;
+    ok:absent) say "$name" FAIL "wanted $ver installed, it is not (dnf exit $rc): $(excerpt)"; sed 's/^/-- /' "$log" | tail -n 25 ;;
+    refuse:absent)
+      say "$name" PASS "$ver not installed (dnf exit $rc): $(excerpt)"
+      if [ "$rc" -eq 0 ]; then
+        v=INFO; [ "${silent:-}" = fail ] && v=FAIL
+        say "$name/exit-status" "$v" "dnf exited 0 and skipped the repository without upgrading: $(excerpt)"
+      fi ;;
+    refuse:installed) say "$name" FAIL "ACCEPTED: $ver is installed (dnf exit $rc)" ;;
+    info:*) say "$name" INFO "$got (dnf exit $rc): $(excerpt)" ;;
   esac
 }
 setup_failed() { say "$group/setup" FAIL "$1"; sed 's/^/-- /' "$log" | tail -n 15; exit 0; }
@@ -566,7 +663,9 @@ apt_group() {
 }
 
 # ---- dnf --------------------------------------------------------------------------------------
-dnf_keyfile() { curl -fsS "$base/keys/$1" -o /k/key.asc; }
+# gpgkey= is a URL the test server serves, as INSTALL.md's is; /swap/<name> changes what it serves
+# (the owner changing the key file), and nothing is done on the host.
+swap_key() { curl -fsS "$base/swap/$1" > /dev/null; }
 dnf_repo() {
   cat > /etc/yum.repos.d/nerva.repo <<EOF
 [nerva]
@@ -575,58 +674,73 @@ baseurl=$base/rpm/$1
 enabled=1
 gpgcheck=1
 repo_gpgcheck=1
-gpgkey=file:///k/key.asc
+gpgkey=$base/keys/current.asc
 EOF
   dnf clean all > /dev/null 2>&1
 }
 installed() { [ "$(rpm -q --qf '%{VERSION}' nervak)" = "$1" ]; }
 dnf_prepare() {
-  mkdir -p /k
   command -v curl > /dev/null || dnf install -y curl > "$log" 2>&1 || setup_failed "installing curl"
-  echo "dnf: $(rpm -q dnf5 2>/dev/null || rpm -q dnf) with $(rpm --version)"
   # dnf5 before 5.2.18.0-4 hangs on importing a repository key (RHBZ 2458182)
   if rpm -q dnf5 > /dev/null 2>&1; then dnf upgrade -y dnf5 'libdnf5*' > "$log" 2>&1 || true; fi
+  echo "dnf: $(rpm -q dnf5 2>/dev/null || rpm -q dnf) with $(rpm --version)"
 }
 dnf_keys() { rpm -qa 'gpg-pubkey*' --qf '%{NAME}-%{VERSION}-%{RELEASE}  %{SUMMARY}\n'; }
 dnf_group() {
   dnf_prepare
   case $group in
   rotation)
-    dnf_keyfile keyA.asc; dnf_repo s1
+    # what a host does at a 4A rotation: nothing but the key file changing at its URL, then upgrade
+    swap_key keyA.asc; dnf_repo s1
     cell rotation/dnf-install-from-S1 ok bash -c 'dnf install -y nervak-1.0-1 && installed 1.0'
     say rotation/dnf-keys-after-install INFO "$(dnf_keys | tr '\n' ';')"
-    dnf_repo s2
-    cell rotation/dnf-upgrade-with-the-new-key-file ok bash -c 'dnf upgrade -y nervak && installed 2.0'
+    swap_key keyAB.asc; dnf_repo s2
+    silent=fail upg rotation/dnf-upgrade-with-the-new-key-file ok 2.0 dnf upgrade -y nervak
     say rotation/dnf-keys-after-upgrade INFO "$(dnf_keys | tr '\n' ';')"
     if ! installed 2.0; then
       # diagnosis only: what would it take?
-      rpm --import /k/key.asc > "$log" 2>&1; say rotation/diagnosis-rpm-import INFO "rc=$? $(tail -n 2 "$log" | tr '\n' ' ')"
-      cell rotation/diagnosis-upgrade-after-rpm-import info bash -c 'dnf clean all; dnf upgrade -y nervak && installed 2.0'
+      curl -fsS "$base/keys/current.asc" -o /tmp/key.asc
+      rpm --import /tmp/key.asc > "$log" 2>&1; say rotation/diagnosis-rpm-import INFO "rc=$? $(tail -n 2 "$log" | tr '\n' ' ')"
+      upg rotation/diagnosis-upgrade-after-rpm-import info 2.0 bash -c 'dnf clean all; dnf upgrade -y nervak'
       for id in $(rpm -qa 'gpg-pubkey*'); do rpm -e "$id" > /dev/null 2>&1; done
-      dnf_keyfile keyAB.asc
-      cell rotation/diagnosis-upgrade-after-rpm-e-and-import info bash -c 'dnf clean all; dnf upgrade -y nervak && installed 2.0'
+      upg rotation/diagnosis-upgrade-after-rpm-e-and-import info 2.0 bash -c 'dnf clean all; dnf upgrade -y nervak'
     fi ;;
   stale)
-    dnf_keyfile keyA.asc; dnf_repo s1
+    swap_key keyA.asc; dnf_repo s1
     cell rotation/dnf-install-from-S1 ok bash -c 'dnf install -y nervak-1.0-1 && installed 1.0'
-    dnf_repo s2
-    cell rotation/dnf-S2-with-the-old-key-file refuse bash -c 'dnf upgrade -y nervak'
+    dnf_repo s2   # the key file is still {P, S1}: the owner did not change it
+    silent=fail upg rotation/dnf-S2-with-the-old-key-file refuse 2.0 dnf upgrade -y nervak
+    ;;
+  rotation4b)
+    # setup step 4B: K1 and K2 are whole keys; the key file becomes {K1, K2}; the new rpm is signed by K2
+    swap_key k1.asc; dnf_repo b1
+    cell rotation4b/dnf-install-signed-by-K1 ok bash -c 'dnf install -y nervak-1.0-1 && installed 1.0'
+    say rotation4b/dnf-keys-after-install INFO "$(dnf_keys | tr '\n' ';')"
+    swap_key k1k2.asc; dnf_repo b2
+    silent=fail upg rotation4b/dnf-upgrade-signed-by-K2-after-the-key-file-swap ok 2.0 dnf upgrade -y nervak
+    say rotation4b/dnf-keys-after-upgrade INFO "$(dnf_keys | tr '\n' ';')"
     ;;
   expiry)
-    dnf_keyfile keyExp.asc; dnf_repo s3
+    swap_key keyExp.asc; dnf_repo s3
     cell expiry/dnf-install-rpm-signed-by-an-expired-subkey ok bash -c 'dnf install -y nervak-3.0-1 && installed 3.0'
     ;;
   revocation)
-    dnf_keyfile keyRev.asc; dnf_repo s1
+    swap_key keyRev.asc; dnf_repo s1
     cell revocation/dnf-key-file-with-a-revocation-still-installs-S1 ok bash -c 'dnf install -y nervak-1.0-1 && installed 1.0'
-    dnf_repo s4
-    cell revocation/dnf-rpm-signed-by-a-revoked-subkey refuse dnf install -y nervak-4.0-1
-    dnf_repo s4m
-    cell revocation/dnf-repomd-signed-by-a-revoked-subkey refuse dnf install -y nervak-5.0-1
+    # the positive control: a refusal of S4 below means something only if S1 verified here first
+    if installed 1.0; then
+      dnf_repo s4
+      upg revocation/dnf-rpm-signed-by-a-revoked-subkey refuse 4.0 dnf install -y nervak-4.0-1
+      dnf_repo s4m
+      upg revocation/dnf-repomd-signed-by-a-revoked-subkey refuse 5.0 dnf install -y nervak-5.0-1
+    else
+      say revocation/dnf-rpm-signed-by-a-revoked-subkey FAIL "not tested: the key file did not import, so S1 does not verify either: $(excerpt)"
+      say revocation/dnf-repomd-signed-by-a-revoked-subkey FAIL "not tested: the key file did not import, so S1 does not verify either"
+    fi
     ;;
   esac
 }
-export -f apt_n apt_update_clean apt_has dnf_keys installed
+export -f apt_n apt_update_clean apt_has dnf_keys installed excerpt swap_key
 export base log
 
 case $mgr in
@@ -639,13 +753,19 @@ esac
 def container_cells(image, w, www, port):
     mgr = "apt" if image in APT_IMAGES else "dnf"
     script = w / "cell.sh"
-    # refuse: the revocation cells (a refusal is the pass, and a success is a FAIL, not INFO)
     script.write_text(CELL_SH)
-    groups = ["apt"] if mgr == "apt" else ["rotation", "stale", "expiry", "revocation"]
+    ref = f"{image}@{PINS[image]}"
+    pull = subprocess.run(["docker", "pull", "--quiet", ref], text=True, stdout=subprocess.PIPE,
+                          stderr=subprocess.STDOUT)
+    print(f"image {ref}: {pull.stdout.strip()}", flush=True)
+    if pull.returncode != 0:
+        record("container:pull", "FAIL", f"docker pull {ref} exited {pull.returncode}")
+        return
+    groups = ["apt"] if mgr == "apt" else ["rotation", "stale", "rotation4b", "expiry", "revocation"]
     for g in groups:
         print(f"== {image} {g}", flush=True)
         r = subprocess.run(["docker", "run", "--rm", "--network", "host", "-v", f"{script}:/cell.sh:ro",
-                            image, "bash", "/cell.sh", mgr, g, f"http://127.0.0.1:{port}"],
+                            ref, "bash", "/cell.sh", mgr, g, f"http://127.0.0.1:{port}"],
                            text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         for line in r.stdout.splitlines():
             m = re.match(r"CELL (\S+) (PASS|FAIL|INFO) ?(.*)", line)
@@ -676,6 +796,7 @@ def main():
         keys = make_keys(k, www, a.expiry_seconds)
         signer = Signer(k, keys["ci"], www)
         build_all(w, www, keys, signer)
+        make_4b(k, w, www)
         print(f"keys and repositories made in {int(time.time() - t0)} s", flush=True)
         if time.time() > keys["expires"]:
             sys.exit("error: S3 expired before it signed; raise --expiry-seconds")
@@ -704,29 +825,39 @@ def main():
             f.write(f"### {a.image or 'host'} ({os.uname().machine})\n\n| cell | result | |\n|---|---|---|\n")
             for n, v, t in CELLS:
                 f.write(f"| {n} | {v} | {t.replace('|', '/')[:160]} |\n")
-    bad = [n for n, v, _ in CELLS if v == "FAIL"]
-    print(f"\nkey-model: {sum(v == 'PASS' for _, v, _ in CELLS)} PASS, {len(bad)} FAIL, "
-          f"{sum(v == 'INFO' for _, v, _ in CELLS)} INFO")
-    for n in bad:
-        print("FAIL:", n)
-    surprise = [n for n in bad if not any(k in n for k in FINDINGS)]
-    if bad and not surprise:
-        print("every FAIL is a finding of the key-model decision (P392): the rpm side does not "
-              "follow a subkey rotation; the run is not red for it")
-    return 1 if surprise else 0
+    return judge(a.image or "host")
 
 
-# The cells whose FAIL is the answer to the question (docs/decisions/P392*): rpm and dnf do not
-# merge a new subkey into a key they already hold, and dnf5 does not enforce what dnf4 does. They
-# stay FAIL in the table; they do not turn the run red. Any other FAIL does.
-FINDINGS = (
-    "rotation/rpm4.18-S2-after-keyAB-import",
-    "rotation/dnf-upgrade-with-the-new-key-file",
-    "rotation/dnf-S2-with-the-old-key-file",
-    "revocation/rpm4.18-key-file-with-a-revocation-still-verifies-S1",
-    "revocation/dnf-key-file-with-a-revocation-still-installs-S1",
-    "revocation/dnf-repomd-signed-by-a-revoked-subkey",
-)
+def judge(image):
+    """Exit 1 for a FAIL that is not an expected finding of this image (FINDINGS: the cell exactly,
+    and its text must contain the expected symptom), and for an expected finding that passes (XPASS:
+    the decision rests on it, so it is to be revisited, not left to go stale)."""
+    red, found = [], []
+    for n, v, t in CELLS:
+        want = FINDINGS.get((image, n))
+        if v == "FAIL" and want is not None and want in t:
+            found.append(n)
+        elif v == "FAIL":
+            red.append(f"FAIL: {n}" + (f" (expected a finding containing {want!r})" if want else ""))
+    seen = {n: v for n, v, _ in CELLS}
+    for (img, n), want in FINDINGS.items():
+        if img == image and seen.get(n) in ("PASS", "INFO"):
+            red.append(f"XPASS: {n} now {seen[n]}; P392 rests on it failing: revisit the decision")
+    print(f"\nkey-model {image}: {sum(v == 'PASS' for _, v, _ in CELLS)} PASS, "
+          f"{sum(v == 'FAIL' for _, v, _ in CELLS)} FAIL, {sum(v == 'INFO' for _, v, _ in CELLS)} INFO")
+    for n in found:
+        print("FINDING:", n)
+    for line in red:
+        print(line)
+    if found and not red:
+        print("every FAIL is a finding recorded in P392; the run is not red for it")
+    return 1 if red else 0
+
+
+# The FAILs that are the answer to the question (docs/decisions/P392*), by image and cell, each with
+# the text its failure must contain. Any other FAIL, or a finding with another symptom, is red.
+FINDINGS = {
+}
 
 
 if __name__ == "__main__":

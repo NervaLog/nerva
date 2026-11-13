@@ -4,7 +4,7 @@
 # a revoked subkey and a signature by the primary. The keys are made in the run and thrown away.
 #
 # It is not part of packages.yml and not a required check: it runs on a pull request that changes
-# the test or this file, and by hand (workflow_dispatch). The result decides the key model: the
+# the test or this file, by hand (workflow_dispatch) and weekly. The result decides the key model: the
 # pull request's decision (docs/decisions/) says which branch setup step 4 takes.
 name: Key model
 
@@ -15,6 +15,10 @@ on:
       - 'tests/packaging/subkeys.py'
       - '.github/workflows/key-model.yml'
   workflow_dispatch:
+  # Weekly: the images and dnf5 move, and a finding that stops being true is red (XPASS), not stale.
+  # Read-only, 16 jobs of at most 30 minutes, no secrets.
+  schedule:
+    - cron: '17 5 * * 1'
 
 permissions:
   contents: read
