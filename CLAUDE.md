@@ -189,9 +189,11 @@ When you stop:
 
 If a person is replying in the session, ask them the same question there instead and wait.
 
-The owner's standing delegations are P389: held pull requests merge after the tag on a clean
-Opus review and green CI, a low-risk question takes its recommendation 24 hours after the daily
-digest carries it, and questions are batched into that digest.
+The owner's standing delegations are P389, and only within its exact limits. After the `v0.7.1`
+tag, a pull request held for the freeze merges on a clean Opus review and green CI. The
+exceptions are #353 and any pull request with an unanswered `**Question:**`. A question on a
+pull request whose paths are all in P389's list takes its recommendation 24 hours after the
+daily digest carries it. The owner's questions are batched into that digest.
 
 ### Pull request description
 

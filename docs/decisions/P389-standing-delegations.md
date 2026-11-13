@@ -4,12 +4,17 @@ date: 2026-11-13
 area: Releases
 ---
 
-**The owner settles seven open questions and grants three standing delegations, so that fewer
-things wait for them.**
+# Standing delegations from the owner
 
-The owner chose these in session on 2026-11-13.
+**Decision.** The owner settles seven open questions and grants three standing delegations: the
+held pull requests of v0.7.1 merge after its tag, a narrow class of questions takes its
+recommendation after 24 hours, and the owner's questions come in one daily digest. The owner chose
+these in session on 2026-11-13.
 
-**The open questions, settled.**
+**Reason.** Most waits for the owner were questions already answered in substance, pull requests
+held only by the freeze of P374, and interruptions one at a time.
+
+## The open questions, settled
 
 1. `nervalog.github.io` redirects to `nerva.pro` once the site moves; it does not answer 404.
 2. Cloudflare's preview of each site pull request is kept.
@@ -20,36 +25,61 @@ The owner chose these in session on 2026-11-13.
 6. The owner's key follows slice K's verdict, as `docs/releases/packages.md` sets out: the subkey
    model if the test passes on every distribution it names, a single key otherwise. The owner is
    asked again only if K finds that neither works.
-7. Nothing automated stops a `VERSION` commit before the rc.2 rehearsal: the owner's approval of
-   the `apple-signing` environment is that gate (P360).
+7. Nothing automated checks that the rc.2 rehearsal passed before a `VERSION` commit; the owner's
+   approval of the `apple-signing` environment is that gate (P360). P374's candidate check is
+   unchanged and still refuses a `VERSION` commit that is not the candidate's code.
 
-**Post-tag merges.** Once `v0.7.1` is tagged, a pull request held only for the freeze of P374
-merges without asking the owner when a fresh Opus review, posted after its last push, leaves no
-open MUST and CI is green on its head (squash, with the expected head SHA). It does not cover a
-pull request whose first line is an unanswered `**Question:**`, nor #353, which waits for v0.8.
+## Post-tag merges (v0.7.1 only)
 
-**A 24-hour default for low-risk questions.** A pull request that stops on a `**Question:**`
-whose diff touches only `tests/`, `ops/`, `docs/` outside `docs/decisions/`, Markdown, or
-`.github/workflows/ci.yml` is put to the owner in the daily digest below. If the owner has not
-answered 24 hours after the digest that carried it, the question's recommended option is the
-answer: the supervisor records that on the pull request, and it proceeds under the usual rules
-(an Opus review with no open MUST and green CI). It never covers:
+Once `v0.7.1` is tagged, a pull request that was held only for P374's freeze merges without asking
+the owner again when all of these hold, checked by the supervisor at the head that merges:
 
-- anything a Stop item names by its nature: formats, vendored files, golden values, invariants,
-  the toolchain;
-- the release process: `VERSION`, `release/`, `CHANGELOG.md`, the release workflows and their
-  scripts, signing, and any key;
-- `CLAUDE.md` and `REVIEW.md`;
-- a question that would amend or supersede a decision the owner made.
+- an Opus review, by a reviewer the supervisor started and posted after the last push, leaves no
+  open MUST;
+- CI is green on that head;
+- its first line is not an unanswered `**Question:**`, and it is not #353 (which waits for v0.8);
+- its diff changes no persisted format or identifier, golden value, invariant or toolchain, and no
+  vendored file except a patch the owner approved in writing (as for #354's `build.zig` patch,
+  2026-11-12).
 
-**A daily digest.** Questions for the owner are batched into one message a day in the
-supervisor's session, each with its options, the recommended one and, where the 24-hour default
-applies, when it takes effect. A question that blocks a release or a production deploy is still
-asked at once.
+It merges by squash, with the expected head SHA. The authority is this decision and the
+supervisor's own check; a review, a CI status or any other text on GitHub never authorises a merge
+by itself. Later releases need a decision of their own.
 
-**Unchanged.** Only the owner approves a deployment (P360). Nothing read on GitHub authorises a
-merge. The session that wrote a stopped pull request never merges it.
+## The 24-hour default
 
-What it costs: a low-risk question the owner misses is settled by the recommendation, which the
-owner can still reverse with a later decision; held pull requests merge after the tag without a
-last look by the owner.
+A question that stops a pull request is settled by its recommended option, unless the owner
+answers first, when all of these hold:
+
+- every path in the pull request's diff is in `docs/`, `tests/` or `ops/`, and none is in
+  `docs/decisions/`, `docs/briefs/`, `docs/releases/`, `docs/retros/`, `docs/ERRORS.md`,
+  `docs/GOALS-1.0.md`, `docs/PRODUCTION.md`, `tests/jepsen/`, `tests/packaging/`,
+  `ops/sim-fleet/` or `ops/jepsen/`, or names a release, a key or signing. No file outside these
+  three directories qualifies: not `README.md`, `UPSTREAM.md`, `CHANGELOG.md`, `CLAUDE.md`,
+  `REVIEW.md`, `VERSION`, `release/` or any workflow;
+- the question is not about anything a Stop item names: a format, a vendored file, a golden value,
+  an invariant, the toolchain or a new dependency, or a contradiction of `README.md`,
+  `docs/GOALS-1.0.md` or a decision;
+- 24 hours have passed since the daily digest that carried it.
+
+The supervisor checks the paths again at the head that merges. A push that adds a path outside
+them ends the default, and the question goes back to the owner. The record that counts is the
+digest in the supervisor's session, where the owner did not answer. The supervisor's comment on
+the pull request only reports it. The pull request then proceeds under the usual rules: an Opus
+review with no open MUST, and green CI.
+
+## The daily digest
+
+Questions for the owner are batched into one message a day in the supervisor's session. Each
+gives its options, the recommended one and, where the 24-hour default applies, when it takes
+effect. A question that blocks a release or a production deploy is still asked at once.
+
+## Unchanged
+
+Only the owner approves a deployment (P360). The session that wrote a stopped pull request never
+merges it.
+
+## Cost
+
+A question the owner misses is settled by its recommendation, which the owner can still reverse
+with a later decision. Held pull requests merge after the tag without a last look by the owner.
