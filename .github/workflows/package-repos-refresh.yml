@@ -49,7 +49,7 @@ jobs:
       cancel-in-progress: false
       queue: max
     outputs:
-      code: ${{ steps.refresh.outputs.code || steps.alarm_test.outputs.code }}
+      code: ${{ steps.refresh.outputs.code || steps.setup.outputs.code || steps.alarm_test.outputs.code }}
       missed: ${{ steps.missed.outputs.missed }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
@@ -66,21 +66,28 @@ jobs:
           exit 1
 
       # Setup (docs/releases/packages.md, setup E) is done when the environment has its variables;
-      # the refresh script refuses without them (NRV-E1139). Until then the run passes, with a notice.
+      # the refresh script refuses without them (NRV-E1139). Until the rehearsal sets REPOS_LIVE the
+      # run passes, with a notice; after it, a missing R2_BUCKET is a lapse and refuses (NRV-E1139).
       - name: Setup is done
         id: setup
         env:
           R2_BUCKET: ${{ vars.R2_BUCKET }}
+          REPOS_LIVE: ${{ vars.REPOS_LIVE }}
         run: |
           set -euo pipefail
           complete=true
           if [ -z "$R2_BUCKET" ]; then
+            if [ "$REPOS_LIVE" = true ]; then
+              echo "code=NRV-E1139" >> "$GITHUB_OUTPUT"
+              printf 'error[NRV-E1139]: package-repos-refresh.yml: the package-repos environment lacks R2_BUCKET, and REPOS_LIVE is true\n  cause  the repositories are live, so a refresh that re-signs nothing lets them expire at Valid-Until\n  fix    set R2_BUCKET on the package-repos environment as docs/releases/packages.md, "Setup", step 6 says, then dispatch this workflow\n' >&2
+              exit 1
+            fi
             complete=false
             echo "::notice::the package repositories' setup is not done (R2_BUCKET is not set in the package-repos environment): nothing to refresh"
           fi
           echo "complete=$complete" >> "$GITHUB_OUTPUT"
 
-      # More than 8 days since the served stable `Date`: the refresh before this one did not run.
+      # Over 8 days (counted in seconds) since the served stable `Date`: the last refresh did not run.
       - name: The previous refresh ran
         id: missed
         if: ${{ steps.setup.outputs.complete == 'true' }}
@@ -92,10 +99,10 @@ jobs:
           if release=$(curl -fsS --max-time 30 "${BASE_URL%/}/apt/dists/stable/InRelease") \
             && date=$(printf '%s\n' "$release" | sed -n 's/^Date: //p' | head -n1) && [ -n "$date" ] \
             && then=$(date -u -d "$date" +%s 2> /dev/null); then
-            age=$((($(date -u +%s) - then) / 86400))
-            if [ "$age" -gt 8 ]; then
+            seconds=$(($(date -u +%s) - then))
+            if [ "$seconds" -gt $((8 * 86400)) ]; then
               missed=true
-              echo "::warning::the served stable InRelease is $age days old: the refresh before this one did not run"
+              echo "::warning::the served stable InRelease is $((seconds / 3600)) hours old (over 8 days): the refresh before this one did not run"
             fi
           else
             echo "::notice::no stable InRelease to read the age of (the first run, or the site is unreachable)"

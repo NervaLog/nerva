@@ -734,7 +734,8 @@ class Finish(unittest.TestCase):
         result = self.run_script("site-live", "v0.7.1", SITE_LIVE_URL=base, SITE_LIVE_WAIT_SECONDS="2", SITE_POLL_SECONDS="1")
         self.refused(result, "NRV-E1151", "nerva.pro does not show 0.7.1")
         self.assertIn("packages are unaffected", result.stderr)
-        self.assertIn("Retry deployment", result.stderr)
+        self.assertIn("nerva-site Worker's builds", result.stderr)
+        self.assertNotIn("Pages", result.stderr)
         # an unreachable site is the same: "not yet" until the deadline
         result = self.run_script("site-live", "v0.7.1", SITE_LIVE_URL="http://127.0.0.1:9", SITE_LIVE_WAIT_SECONDS="1", SITE_POLL_SECONDS="1")
         self.refused(result, "NRV-E1151", "does not show 0.7.1")
@@ -1019,6 +1020,76 @@ class PackageRepos(unittest.TestCase):
         refresh = (self.flows / "package-repos-refresh.yml").read_text()
         self.assertIn("::notice::the package repositories' setup is not done", refresh)
         self.assertEqual(refresh.count("if: ${{ steps.setup.outputs.complete == 'true' }}"), 3)
+
+    @staticmethod
+    def step_script(text, name):
+        """The `run: |` block of the step called `name`, dedented."""
+        lines = text.split("\n")
+        start = next(i for i, line in enumerate(lines) if line.strip() == f"- name: {name}")
+        at = next(i for i in range(start, len(lines)) if lines[i].strip() == "run: |")
+        indent = len(lines[at]) - len(lines[at].lstrip()) + 2
+        body = []
+        for line in lines[at + 1:]:
+            if line.strip() and len(line) - len(line.lstrip()) < indent:
+                break
+            body.append(line[indent:])
+        return "\n".join(body)
+
+    def run_step(self, script, env, path_dir=None):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "output"
+            out.touch()
+            full = {"PATH": (f"{path_dir}:" if path_dir else "") + os.environ["PATH"], "GITHUB_OUTPUT": str(out), **env}
+            result = subprocess.run(["bash", "-eo", "pipefail", "-c", script], env=full, cwd=ROOT,
+                                    capture_output=True, text=True, timeout=60)
+            return result, out.read_text()
+
+    def test_the_base_url_is_a_repository_variable_in_the_setup(self):
+        # P404: repos-fresh, the watch and repos-verify have no environment, so only a repository
+        # variable reaches them.
+        spec = (ROOT / "docs/releases/packages.md").read_text()
+        sets = re.findall(r"(?m)^gh variable set PACKAGES_BASE_URL .*$", spec)
+        self.assertEqual(len(sets), 1)
+        self.assertNotIn("--env", sets[0])
+        for text, name in ((self.ci, "repos-fresh"), (self.watch, "watch"), (self.finish, "repos-verify")):
+            body = job(text, name)
+            self.assertIn("vars.PACKAGES_BASE_URL", body, name)
+            self.assertNotIn("environment:", body, name)
+
+    def test_repos_verify_refuses_an_empty_base_url_and_never_falls_back(self):
+        body = job(self.finish, "repos-verify")
+        self.assertNotIn("${BASE_URL:-", body)
+        script = self.step_script(self.finish, "Install nerva from the repository in ${{ matrix.distro }}")
+        result, _ = self.run_step(script, {"TAG": "v0.7.1", "BASE_URL": "", "IMAGE": "x", "MGR": "apt"})
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("error[NRV-E1139]: release-finish.yml: the repository variable PACKAGES_BASE_URL is not set", result.stderr)
+        self.assertIn("  fix    ", result.stderr)
+
+    def test_refresh_refuses_a_missing_bucket_once_the_repositories_are_live(self):
+        script = self.step_script(self.refresh, "Setup is done")
+        result, out = self.run_step(script, {"R2_BUCKET": "", "REPOS_LIVE": "true"})
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("error[NRV-E1139]: package-repos-refresh.yml: the package-repos environment lacks R2_BUCKET", result.stderr)
+        self.assertIn("code=NRV-E1139", out)
+        self.assertIn("steps.setup.outputs.code", self.refresh)
+        result, out = self.run_step(script, {"R2_BUCKET": "", "REPOS_LIVE": ""})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("complete=false", out)
+        result, out = self.run_step(script, {"R2_BUCKET": "nerva-packages", "REPOS_LIVE": "true"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("complete=true", out)
+
+    def test_refresh_counts_missed_from_eight_days_in_seconds(self):
+        script = self.step_script(self.refresh, "The previous refresh ran")
+        for hours, missed in ((8 * 24 + 23, "true"), (8 * 24 + 1, "true"), (7 * 24 + 23, "false")):
+            with tempfile.TemporaryDirectory() as bin_dir:
+                when = time.strftime("%a, %d %b %Y %H:%M:%S UTC", time.gmtime(time.time() - hours * 3600))
+                fake = Path(bin_dir) / "curl"
+                fake.write_text(f"#!/bin/sh\nprintf 'Origin: nerva\\nDate: {when}\\n'\n")
+                fake.chmod(0o755)
+                result, out = self.run_step(script, {"BASE_URL": "https://example.invalid"}, bin_dir)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(f"missed={missed}", out, hours)
 
 
 if __name__ == "__main__":

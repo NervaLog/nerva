@@ -1092,6 +1092,7 @@ jobs:
       - name: Repository freshness (Valid-Until at least 10 days ahead)
         id: fresh
         env:
+          # A repository variable, not the environment's: this job has no environment (P404).
           PACKAGES_BASE_URL: ${{ vars.PACKAGES_BASE_URL }}
         run: |
           set -euo pipefail

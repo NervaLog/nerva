@@ -569,8 +569,8 @@ case "${1:-}" in
       fi
       if (($(date +%s) >= deadline)); then
         refuse NRV-E1151 "nerva.pro does not show $version $((live_wait / 60)) minutes after the site's pull request merged" \
-          "the release is public and its packages are unaffected; the site's deployment on Cloudflare Pages has not finished or failed (NRV-E1152 if its build refused)" \
-          "in the Cloudflare dashboard, open the nerva-site project's deployments, read a failed build's log, choose Retry deployment, then run site-verify again"
+          "the release is public and its packages are unaffected; the nerva-site Worker's build on Cloudflare has not finished or failed (NRV-E1152 if the gate refused, NRV-E1164 if the pin is wrong)" \
+          "in the Cloudflare dashboard, open the nerva-site Worker's builds and read a failed build's log; retry the build of main there, or merge any site pull request to start a new one; then run site-verify again"
       fi
       sleep "$poll_seconds"
     done

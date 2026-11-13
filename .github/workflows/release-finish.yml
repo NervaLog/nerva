@@ -510,11 +510,16 @@ jobs:
           channel=stable
           case "$TAG" in *-*) channel=rc ;; esac
           version=${TAG#v}
+          # A repository variable (P404), so this job, which has no environment, reads it too.
+          if [ -z "$BASE_URL" ]; then
+            printf 'error[NRV-E1139]: release-finish.yml: the repository variable PACKAGES_BASE_URL is not set\n  cause  repos-verify installs from the URL the publish wrote to, and has no other\n  fix    set the repository variable PACKAGES_BASE_URL as docs/releases/packages.md, "Setup", step 6 says (not on the environment), then re-run repos-verify\n' >&2
+            exit 1
+          fi
           # `primary` when the key file has one; in the fallback, `current`
           fpr=$(awk '$1 == "primary" { p = $2 } $1 == "current" { c = $2 } END { print p ? p : c }' packaging/keys/fingerprints)
           docker pull --quiet "$IMAGE" > /dev/null || { echo "error[NRV-E1157]: release-finish.yml: cannot pull $IMAGE" >&2; exit 1; }
           docker run --rm -v "$PWD/.github/scripts:/scripts:ro" "$IMAGE" \
-            bash /scripts/repo_install_check.sh "$MGR" "$channel" "${BASE_URL:-https://packages.nerva.pro}" "$fpr" "$version"
+            bash /scripts/repo_install_check.sh "$MGR" "$channel" "$BASE_URL" "$fpr" "$version"
 
   # Files or comments on the one open `package-repos` issue when a job above failed, and for
   # `repos-ready` and `repos` also when one was cancelled (nothing supersedes them, so a person did,
