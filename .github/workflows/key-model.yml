@@ -1,0 +1,62 @@
+# The key-model test (docs/releases/packages.md, slice K, P376 point 1): a certify-only primary with
+# signing subkeys signs small apt and dnf repositories, and tests/packaging/subkeys.py installs from
+# them on every distribution in scope, on amd64 and arm64, through a rotation, an expired subkey,
+# a revoked subkey and a signature by the primary. The keys are made in the run and thrown away.
+#
+# It is not part of packages.yml and not a required check: it runs on a pull request that changes
+# the test or this file, and by hand (workflow_dispatch). The result decides the key model: the
+# pull request's decision (docs/decisions/) says which branch setup step 4 takes.
+name: Key model
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'tests/packaging/subkeys.py'
+      - '.github/workflows/key-model.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: key-model-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cells:
+    name: ${{ matrix.image }} ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+        image: [host, 'debian:12', 'debian:13', 'ubuntu:22.04', 'ubuntu:24.04', 'rockylinux:9', 'fedora:43', 'fedora:44']
+        include:
+          - runner: ubuntu-24.04
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+
+      # The tools that make the repositories on the runner: apt-ftparchive, dpkg-deb, createrepo_c,
+      # rpmbuild and rpmsign (rpm 4.18 here, the "runner's rpm"), gpg, and gpgv and sqv for the host cells.
+      - name: Install the tools
+        run: |
+          set -eu
+          sudo apt-get -o Acquire::Retries=5 update -qq
+          sudo apt-get -o Acquire::Retries=5 install -y -qq apt-utils createrepo-c rpm sqv gnupg gpgv
+          for t in gpg rpm createrepo_c apt-ftparchive sqv; do echo "$t: $("$t" --version 2>&1 | head -n1)"; done
+
+      - name: Run the cells (tests/packaging/subkeys.py)
+        run: |
+          set -eu
+          if [ "${{ matrix.image }}" = host ]; then
+            python3 -I tests/packaging/subkeys.py --host
+          else
+            python3 -I tests/packaging/subkeys.py --image "${{ matrix.image }}"
+          fi
