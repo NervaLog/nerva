@@ -1823,6 +1823,7 @@ pub fn ReplicaType(
                     &self.peer_releases,
                     &self.peer_releases_last,
                     &self.peer_origins,
+                    self.message_bus.recv_from,
                     message.header,
                 )) {
                     log.debug("{}: on_message: ignoring (peer release or origin unknown or " ++

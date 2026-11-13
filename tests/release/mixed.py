@@ -56,8 +56,9 @@ def commit(port, id, timeout=60):
 
 
 class Cluster:
-    def __init__(self, binaries):
+    def __init__(self, binaries, gateway_binary=None):
         self.binaries = binaries
+        self.gateway_binary = gateway_binary or binaries[0]
         self.tmp = tempfile.mkdtemp(prefix="nerva-release-")
         self.addresses = ",".join(str(port) for port in free_ports(len(binaries)))
         self.replicas = [None] * len(binaries)
@@ -111,7 +112,7 @@ class Cluster:
         """A `nerva api` of the first release; returns its port once it has registered."""
         self.wait_listening()
         process = subprocess.Popen(
-            [self.binaries[0], "api", "--cluster=0", f"--addresses={self.addresses}",
+            [self.gateway_binary, "api", "--cluster=0", f"--addresses={self.addresses}",
              "--listen=127.0.0.1:0"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL, env={**os.environ, "NERVA_KEY": KEY}, text=True)
         self.gateways.append(process)
@@ -154,6 +155,34 @@ def refuses_other_release(nerva, cluster):
     assert digest() == before, "the data file changed"
 
 
+def restarts_beside_other_primary(nerva, nerva_other):
+    """#358: replica 0 (the first view's primary) runs the other release, replicas 1 and 2 run
+    `nerva`. A replica that restarts beside it hears the primary's prepares before its first ping
+    and pong; it must not handle them (a prepare received from its maker counts only once that
+    connection has announced the release). Replicas 1 and 2 form the cluster without the primary;
+    each restart round must leave it committing, with no panic or divergence on any replica."""
+    cluster = Cluster([nerva_other, nerva, nerva], gateway_binary=nerva)
+    try:
+        port = cluster.gateway()
+        assert commit(port, 5000, timeout=90) == 200
+        for round in range(3):
+            victim = 1 + round % 2
+            cluster.stop(victim)
+            cluster.start(victim)
+            cluster.wait_listening()
+            port = cluster.gateway()
+            status = commit(port, 5100 + round, timeout=90)
+            assert status == 200, f"round {round}: commit answered {status}"
+            for index, replica in enumerate(cluster.replicas):
+                assert replica.poll() is None, f"replica {index} exited: " \
+                    f"{cluster.log(index)[-2000:]}"
+                log = cluster.log(index)
+                assert "panic" not in log and "checkpoint diverged" not in log, log[-2000:]
+        print("mixed releases: PASSED (replicas restarting beside an other-release primary)")
+    finally:
+        cluster.close()
+
+
 def main():
     nerva, nerva_other = sys.argv[1], sys.argv[2]
     cluster = Cluster([nerva, nerva, nerva_other])
@@ -191,6 +220,7 @@ def main():
               f"commits past the first checkpoint in {time.monotonic() - started:.0f} s)")
     finally:
         cluster.close()
+    restarts_beside_other_primary(nerva, nerva_other)
 
 
 if __name__ == "__main__":
