@@ -86,7 +86,7 @@ pub fn run(gpa: std.mem.Allocator, options: Options) void {
         error.FileSystem,
         error.SystemResources,
         => diag.fail(
-            "NRV-E0721",
+            "NRV-E0724",
             "recover: cannot move {s}.recovering to {s}: {s}",
             .{ options.path, options.path, link_reason(err) },
             "check the directory of {s}, then run nerva recover again; nothing was left behind",
