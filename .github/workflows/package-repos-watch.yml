@@ -1,10 +1,10 @@
 # The daily watch over the package repositories (docs/releases/packages.md, "The 60-day rule"):
 # two clocks that depend on neither the weekly refresh nor on activity on main. It makes the same
-# freshness and NRV-E1160 check as ci.yml's `repos-fresh` (`package_repos.sh fresh`: stable's
-# InRelease must have at least 10 days of `Valid-Until` left, and the signing key must not be near
-# its expiry), and the 45-day commit-age check (GitHub disables a schedule after 60 days without a
-# commit on main). It runs only when the repository variable REPOS_LIVE is `true`, which the pull
-# request that records the rehearsal sets. No environment, no secret; it never writes the bucket.
+# freshness check as ci.yml's `repos-fresh` (`package_repos.sh fresh`: stable's InRelease must have
+# at least 10 days of `Valid-Until` left), and the 45-day commit-age check (GitHub disables a
+# schedule after 60 days without a commit on main). It runs only when the repository variable
+# REPOS_LIVE is `true`, which the pull request that records the rehearsal sets. No environment, no
+# secret; it never writes the bucket.
 name: Package repositories watch
 
 on:
@@ -34,7 +34,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Valid-Until and the signing key's expiry
+      - name: Repository freshness (Valid-Until at least 10 days ahead)
         id: fresh
         env:
           PACKAGES_BASE_URL: ${{ vars.PACKAGES_BASE_URL }}
