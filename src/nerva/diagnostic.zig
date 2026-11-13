@@ -24,7 +24,7 @@ pub const exit_environment: u8 = 2;
 pub const exit_internal: u8 = 70;
 
 /// The longest block printed; a longer headline is cut.
-const block_size_max = 4096;
+pub const block_size_max = 4096;
 /// The longest reason captured from a log line (`note`).
 const reason_size_max = 512;
 
