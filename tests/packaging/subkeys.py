@@ -18,7 +18,7 @@ from the environment and nothing is committed. The run:
      `--network host`, apt on Debian and Ubuntu, dnf on Rocky and Fedora) or, with `--host`, with
      the runner's own rpm 4.18 and gpgv/sqv.
 
-The cells (printed `CELL <group>/<name> PASS|FAIL|INFO`; the run exits 1 if any is FAIL):
+The cells (printed `CELL <group>/<name> PASS|FAIL|INFO`; the run exits 1 if any FAIL is not one of FINDINGS, below):
 
   install     a fresh host installs from a repository signed by S1, with the key file {P, S1}
   rotation    a host that has {P, S1} meets InRelease signed by S1 and S2 (before and after it has
@@ -343,6 +343,15 @@ def host_cells(w, www, keys):
     n = sh(["rpm", "--dbpath", str(d), "-qa", "gpg-pubkey*"], check=False).stdout.split()
     record("rotation/rpm4.18-S2-after-keyAB-import", "PASS" if imp == 0 and verdict(r) else "FAIL",
            f"import rc={imp}; {r.stdout.strip()}; gpg-pubkey entries: {len(n)}")
+    if not (imp == 0 and verdict(r)):
+        # diagnosis only: the extra command the spec's criterion forbids
+        for key in sh(["rpm", "--dbpath", str(d), "-qa", "gpg-pubkey*"], check=False).stdout.split():
+            sh(["rpm", "--dbpath", str(d), "-e", key], check=False)
+        rpmkeys(d, "--import", str(kd / "keyAB.asc"))
+        r = rpmkeys(d, "-K", str(rp("s2")))
+        record("rotation/rpm4.18-diagnosis-after-rpm-e-and-import", "INFO",
+               ("works after `rpm -e gpg-pubkey-<id>` and a second import" if verdict(r) else
+                "does not work even after `rpm -e` and a second import"))
     d = db()
     rpmkeys(d, "--import", str(kd / "keyExp.asc"))
     r = rpmkeys(d, "-K", str(rp("s3")))
@@ -700,7 +709,24 @@ def main():
           f"{sum(v == 'INFO' for _, v, _ in CELLS)} INFO")
     for n in bad:
         print("FAIL:", n)
-    return 1 if bad else 0
+    surprise = [n for n in bad if not any(k in n for k in FINDINGS)]
+    if bad and not surprise:
+        print("every FAIL is a finding of the key-model decision (P392): the rpm side does not "
+              "follow a subkey rotation; the run is not red for it")
+    return 1 if surprise else 0
+
+
+# The cells whose FAIL is the answer to the question (docs/decisions/P392*): rpm and dnf do not
+# merge a new subkey into a key they already hold, and dnf5 does not enforce what dnf4 does. They
+# stay FAIL in the table; they do not turn the run red. Any other FAIL does.
+FINDINGS = (
+    "rotation/rpm4.18-S2-after-keyAB-import",
+    "rotation/dnf-upgrade-with-the-new-key-file",
+    "rotation/dnf-S2-with-the-old-key-file",
+    "revocation/rpm4.18-key-file-with-a-revocation-still-verifies-S1",
+    "revocation/dnf-key-file-with-a-revocation-still-installs-S1",
+    "revocation/dnf-repomd-signed-by-a-revoked-subkey",
+)
 
 
 if __name__ == "__main__":
