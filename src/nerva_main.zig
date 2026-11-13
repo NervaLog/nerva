@@ -888,10 +888,11 @@ fn bundle_open(gpa: std.mem.Allocator, io: *IO, multiversion_os: *MultiversionOS
 }
 
 fn bundle_fail(err: anyerror) noreturn {
+    log.err("reading the bundle of releases failed: {s}", .{@errorName(err)});
     diagnostic.fail(
         "NRV-E0719",
-        "start: this binary's bundle of releases cannot be read ({s})",
-        .{@errorName(err)},
+        "start: this binary's bundle of releases cannot be read",
+        .{},
         "download the release again; nothing was changed",
         .{},
     );
