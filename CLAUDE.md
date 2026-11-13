@@ -189,6 +189,10 @@ When you stop:
 
 If a person is replying in the session, ask them the same question there instead and wait.
 
+The owner's standing delegations are P389: held pull requests merge after the tag on a clean
+Opus review and green CI, a low-risk question takes its recommendation 24 hours after the daily
+digest carries it, and questions are batched into that digest.
+
 ### Pull request description
 
 Every description states these, and they must be true of the final diff, not of the plan:
