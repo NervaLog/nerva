@@ -1,7 +1,8 @@
 # The domain, and the apt and dnf repositories: spec, setup, slices
 
 Status: spec, 2026-11-12 (P365, which amends P360 point 10, P364 and P148; amended the same day
-after the Zigbox team's review of the pipeline, P376 and P376c). Reworked four times
+after the Zigbox team's review of the pipeline, P376 and P376c; on 2026-11-13 the site moved from
+Cloudflare Pages to a Worker, P410 to P410d). Reworked four times
 the same day after adversarial reviews, and after the owner's decision that Cloudflare deploys the
 site. The fourth rework cut the lock in the bucket: one GitHub concurrency group keeps the writers
 apart instead. Nothing here is built yet. It is the last change before the v0.7.1 tag: the owner moved the
@@ -15,9 +16,9 @@ Cloudflare and GitHub settings. No new dependency enters the Zig build.
 
 1. Nerva's site is served at `https://nerva.pro/`. It is still the one page `index.html` in
    `NervaLog/nervalog.github.io`, and a merge to that repository's `main` is still a deploy. Now
-   **Cloudflare Pages builds and deploys it**, through its Git integration. GitHub Pages is
-   turned off. The release pull request flow (the App, `site-check`, the ruleset, P364's merge)
-   does not change.
+   **Cloudflare builds and deploys it, as a Worker of static assets** (Workers Builds, through its
+   Git integration; P410). GitHub Pages is turned off. The release pull request flow (the App,
+   `site-check`, the ruleset, P364's merge) does not change.
 2. `https://packages.nerva.pro/` serves signed apt and dnf repositories of every release from
    v0.7.1 on. A user installs with `apt install nerva` or `dnf install nerva`, and later upgrades
    with `apt upgrade` or `dnf upgrade`.
@@ -36,7 +37,7 @@ Cloudflare and GitHub settings. No new dependency enters the Zig build.
 ### The hosts
 
 ```
-https://nerva.pro/                 index.html: Cloudflare Pages project nerva-site, built from the site repository's main
+https://nerva.pro/                 index.html: the Cloudflare Worker nerva-site (static assets), built from the site repository's main
 https://www.nerva.pro/             a Cloudflare redirect rule: 301 to https://nerva.pro/<path>
 https://nervalog.github.io/        GitHub Pages is off: GitHub's 404 (accepted, see "The old URL")
 https://packages.nerva.pro/        the R2 bucket nerva-packages, public, read-only (R2 custom domain)
@@ -47,69 +48,178 @@ https://nerva.pro/.well-known/openpgpkey/hu/ndqm47zydhyqyzabecddtdk1q3bponab?l=n
                                    repository: the second channel users compare with
 ```
 
-`nerva.pro` is a Cloudflare zone in the same account as the Pages project and the bucket. Pages
-and R2 both require that: an apex custom domain on Pages, and an R2 custom domain, must be in a
-zone of the project's or bucket's own account. Every record is proxied, and Cloudflare issues every
+`nerva.pro` is a Cloudflare zone in the same account as the Worker and the bucket. Workers and R2
+both require that: a Worker's custom domain, and an R2 custom domain, must be in a zone of the
+Worker's or bucket's own account. Every record is proxied, and Cloudflare issues every
 certificate.
 
-### The site on Cloudflare Pages
+### The site on a Cloudflare Worker
 
-**How it deploys.** The Pages project `nerva-site` is connected to `NervaLog/nervalog.github.io`
-through Cloudflare's GitHub App. The App is installed on that one repository only. Its production
-branch is `main`: a merge to `main` starts a build, and a green build is the deploy. No Cloudflare
-token for the site exists in GitHub. The only Cloudflare credential anywhere in GitHub is the R2
-token in Nerva's `package-repos` environment (below).
+The site is a Worker made of static assets only (P410, which amends P365 point 1 and P398;
+Cloudflare Pages, which P365 chose, is the legacy product and is heading for its end of life).
 
-**The build command is the gate, and it lives in Cloudflare, not in the repository.** A Pages
-project built from a repository runs that repository's `functions/` directory as Functions, runs a
-`_worker.js` in the output directory, and reads bindings from a `wrangler.toml` (or
-`wrangler.json`, `wrangler.jsonc`) in it (Cloudflare's Pages Functions and configuration docs).
-A binding could name any R2 bucket of the account, with `put` and `delete`: there is no read-only
-binding. So the project's build command, set in the dashboard (setup step 2), refuses a tree that
-holds any of those names, then copies five named files into an empty `dist/`, the output
-directory: `index.html`, `404.html`, `_headers`, and the two WKD files (see "The key by WKD").
-It copies nothing else, and refuses any of the five that is missing or is a symlink.
-`404.html` makes Pages answer an unknown path with 404; without one, Pages treats the project
-as a single-page app and answers any path, including another WKD hash, with `index.html` and
-status 200. `_headers` gives `/.well-known/openpgpkey/*` the headers WKD clients expect:
-`Content-Type: application/octet-stream` and `Access-Control-Allow-Origin: *`.
+**How it deploys.** The Worker `nerva-site` is connected to `NervaLog/nervalog.github.io` through
+Cloudflare's GitHub App and built by **Workers Builds**. The App is installed on that one
+repository only. Its production branch is `main`: a merge to `main` starts a build, which runs the
+build command and then the deploy command, and a green build is the deploy. No Cloudflare token
+for the site exists in GitHub. The only Cloudflare credential anywhere in GitHub is the R2 token in
+Nerva's `package-repos` environment (below). The build's own token lives in Cloudflare ("The build
+token", below).
+
+**The gate is a pinned script, and the dashboard holds the pin.** A Worker built from a repository
+takes its code, its bindings and its routes from a Wrangler configuration file (`wrangler.toml`,
+`wrangler.json` or `wrangler.jsonc`): `main` names a script that runs on every request, and a
+binding can name any R2 bucket of the account, with `put` and `delete` (there is no read-only
+binding). When the repository has none, Workers Builds' deploy command configures the project
+itself. So nothing of that may come from the site repository. The dashboard limits a build command
+to 512 characters (owner, 2026-11-13; not in Cloudflare's docs), too short for the gate, so the
+build command only fetches the gate, `.github/scripts/site_build.sh` in **this** repository, from
+`raw.githubusercontent.com` at a full commit SHA, checks its SHA-256, and runs it. A file at a
+commit cannot change, and the hash is checked anyway, so neither GitHub nor a later merge here
+changes what runs; changing the gate means a pull request here **and** the owner changing the pin
+in the dashboard (setup step 2). `site_build.sh`:
+
+- refuses to run unless `SKIP_DEPENDENCY_INSTALL` is `1` (see below);
+- accepts only named files (an allow-list, not a list of bad names, so a name it does not know
+  fails closed): the repository's root may hold only `index.html`, `404.html`, `_headers`,
+  `.well-known` (the WKD pair, below, and nothing else under it) and the repository's metadata,
+  `.git`, `.github`, `.nojekyll`, `README.md`, `LICENSE` and `CLAUDE.md`, which are never copied.
+  Any other path is refused and named, a dotfile or a symlink (dangling or not) included:
+  `wrangler.*`, `functions`, `_worker.js`, `.env*` (Wrangler loads `.env` from its working
+  directory into its own environment), `.npmrc`, `package.json`, a lock file, a version file or a
+  tool's configuration the build image might act on, `node_modules`, and `.nerva-site`, its own
+  output. A metadata name that is a symlink is refused too;
+- copies `index.html`, `404.html` and `_headers` into `.nerva-site/dist/`, and refuses any of the
+  three that is missing, is not a regular file, or is a symlink. The two WKD files (see "The key
+  by WKD") are a pair (P398): both present, as regular files, and both are copied; or both
+  absent, and the build goes on without them, as it must while the reference key file does not
+  exist yet (v0.7.0). One without the other, a WKD file that is not a regular file, or a symlink
+  at either file or at `.well-known`, `.well-known/openpgpkey` or its `hu`, or any other path
+  under `.well-known`, is refused. It copies nothing else;
+- writes `.nerva-site/wrangler.json`, the only Wrangler configuration: name `nerva-site`, a pinned
+  `compatibility_date`, `assets` with `directory` `dist`, `not_found_handling` `404-page` and
+  `html_handling` `auto-trailing-slash`, `workers_dev` and `preview_urls` on (P410c), and an empty
+  `previews` block. No `main`, no binding, no `vars`, no route;
+- writes `.nerva-site/package.json` (one dependency, `wrangler` at exactly 4.153.0) and
+  `.nerva-site/package-lock.json` (every package of Wrangler's tree, each with its `resolved`
+  address and its `integrity` hash, the platform binaries among them as packages of their own).
+  Both are in the script, so the script's SHA-256, which the dashboard pins, covers them. The
+  lock file is what `npm install --package-lock-only --ignore-scripts` writes for that
+  `package.json`; moving Wrangler means regenerating it in a pull request here and the owner
+  moving the pin.
+
+Every refusal is NRV-E1152, and nothing is deployed. The deploy and preview commands run inside
+`.nerva-site/`, so Wrangler never sees the repository's root (no `.env`, no `.npmrc`, no
+`package.json` above it), and pass `--config`, which also turns off the configuration Workers
+Builds would otherwise generate. They install with `npm ci --ignore-scripts` from the gate's lock
+file, so Wrangler and every package under it are the ones the lock names, checked against their
+hashes, and no install script runs while the build token is present; `npx --no-install` then runs
+the installed Wrangler and fetches nothing. (An assets-only deploy needs no install script:
+`workerd` and `esbuild` are fetched as platform packages, and neither runs. `npm ci --ignore-scripts`
+and `wrangler deploy --dry-run` were run on Wrangler 4.153.0, 2026-11-13, and the dry run read
+the three files and found no binding.) The
+three commands, set in the dashboard (setup step 2), each one line:
+
+Build command:
+
+```
+f=/tmp/gate.sh; { curl -fsSo $f https://raw.githubusercontent.com/NervaLog/nerva/<commit>/.github/scripts/site_build.sh && echo "<sha256>  $f" | sha256sum -c --status; } || { echo 'error[NRV-E1164]: site build: site_build.sh not fetched, or its SHA-256 differs; nothing is deployed' >&2; exit 1; }; sh $f
+```
+
+Deploy command:
+
+```
+cd .nerva-site && npm ci --ignore-scripts && npx --no-install wrangler deploy --config wrangler.json
+```
+
+Preview command (Non-production branch deploy command):
+
+```
+cd .nerva-site && npm ci --ignore-scripts && npx --no-install wrangler preview --config wrangler.json
+```
+
+`<commit>` is the full SHA of a commit on this repository's `main` that holds the script, and
+`<sha256>` its SHA-256; setup step 2 says how to read both. Filled in, the build command is 392
+characters and each of the others 100 and 101 (`test_site_build.py` checks every one is at most
+400, and so under the dashboard's 512).
+A fetch that fails, or a script whose hash differs, is NRV-E1164, and nothing is deployed.
+
+What the static assets do, from Cloudflare's Workers static assets docs: `_headers` and
+`_redirects` in the assets directory are read as rules and are not served ("Headers",
+"Redirects"); `_headers` gives `/.well-known/openpgpkey/*` the headers WKD clients expect,
+`Content-Type: application/octet-stream` and `Access-Control-Allow-Origin: *`, and the gate copies
+no `_redirects`. `not_found_handling` `404-page` answers a path with no asset with the nearest
+`404.html` and status 404 ("Routing: static site generation"), so another WKD hash is a 404, never
+`index.html`. The docs do not say whether a dot-directory is uploaded; Wrangler 4.153.0's source
+does: its asset manifest walks the directory recursively and leaves out only `.assetsignore`,
+`_headers`, `_redirects` and symlinks, so `.well-known/` is served. The rehearsal checks it.
 
 **Cloudflare installs dependencies before the build command runs.** Its build image runs
 `npm install` (or the Python, Ruby or other tool) when it finds a `package.json`, a lock file or a
-version file, and a `postinstall` script would run before the gate. So the project sets
-`SKIP_DEPENDENCY_INSTALL` to `1` (setup step 2), the build command refuses to run without it, and
-it refuses those files too. A name that is a dangling symlink is refused as well. The command:
+version file, and a `postinstall` script would run before the gate ("Build image"). So the Worker
+sets the build variable `SKIP_DEPENDENCY_INSTALL` to `1` (setup step 2), the gate refuses to run
+without it, and it refuses those files too. The gate runs after the image has handled the
+checkout, so it only **detects** and refuses such a tree, and nothing is deployed. It prevents
+nothing the image does first. Cloudflare's "Build image" page lists version files the image acts
+on (`.nvmrc`, `.node-version`, `.python-version`, `runtime.txt`, `.ruby-version`, and the
+`packageManager` field of `package.json`) and describes `SKIP_DEPENDENCY_INSTALL` only as
+disabling automatic dependency installation, not version selection. So before the gate refuses
+such a tree, a merged site change could make the image install a toolchain, with the build token
+in its environment. That is **residual reach**, kept small because a site change goes through a
+reviewed pull request (the owner, and branch protection on the site repository). The rehearsal
+checks what the image does (below).
 
-```
-set -eu; if [ "${SKIP_DEPENDENCY_INSTALL:-}" != 1 ]; then echo "error[NRV-E1152]: site build: SKIP_DEPENDENCY_INSTALL is not 1; nothing is deployed" >&2; exit 1; fi; for p in wrangler.toml wrangler.json wrangler.jsonc functions _worker.js _routes.json package.json package-lock.json npm-shrinkwrap.json yarn.lock pnpm-lock.yaml bun.lock bun.lockb requirements.txt Pipfile Pipfile.lock pyproject.toml poetry.lock Gemfile Gemfile.lock .tool-versions .nvmrc .node-version .python-version .ruby-version runtime.txt; do if [ -e "$p" ] || [ -L "$p" ]; then echo "error[NRV-E1152]: site build: $p is not allowed in the site repository; nothing is deployed" >&2; exit 1; fi; done; rm -rf dist; mkdir -p dist/.well-known/openpgpkey/hu; for f in index.html .well-known/openpgpkey/policy .well-known/openpgpkey/hu/ndqm47zydhyqyzabecddtdk1q3bponab; do if [ -L "$f" ] || [ ! -f "$f" ]; then echo "error[NRV-E1152]: site build: $f is missing or is a symlink; nothing is deployed" >&2; exit 1; fi; cp "$f" "dist/$f"; done
-```
+The gate does not check what the WKD file holds, nor whether it should be there. The site's own
+check does both (NRV-E1162), and the release checks it again (`site-live`). If the WKD file is
+wrong, users see a mismatch. The job is not affected (see "The key by WKD").
 
-The command does not check what the WKD file holds. The site's own check does that (NRV-E1162),
-and the release checks it again (`site-live`). If the WKD file is wrong, users see a mismatch.
-The job is not affected (see "The key by WKD").
+A failed build deploys nothing, so the last good version keeps serving. A pull request in the
+site repository cannot change the build, deploy or preview command, nor the pin: only a member of
+the Cloudflare account can. The site's `site_check.mjs` refuses the same names too (slice 5), so a
+pull request fails before it merges, but that check is the pull request's own code. The gate is
+what holds. If the site gains another file, the gate's allow-list gains it, in a pull request
+here, and the owner moves the pin.
 
-A failed build deploys nothing, so the last good deployment keeps serving. A pull request in the
-site repository cannot change the build command: only a member of the Cloudflare account can.
-The site's `site_check.mjs` refuses the same names too (slice 5), so a pull request fails before
-it merges, but that check is the pull request's own code. The build command is what holds.
-If the site gains another file, the owner adds it to the build command's list.
+**The build token.** Workers Builds deploys with a user API token. The one it offers to create
+("Create new token") has, per its docs, Account Settings read, Workers Scripts edit, **Workers KV
+Storage edit and Workers R2 Storage edit** on the account, Workers Routes edit on every zone, and
+User Details read and Memberships read. R2 Storage edit could change or empty `nerva-packages` and
+administer its bucket settings, so that token is not used (P410d). The owner makes a narrower user
+token (setup step 2): **Account, Workers Scripts, Edit** and **Account, Account Settings, Read**
+on the one account, **User, User Details, Read** and **User, Memberships, Read**, nothing on any
+zone, no R2 and no KV. The custom domain is set in the dashboard, and a deploy whose configuration
+names no route leaves it alone, so the token needs no zone permission.
 
-**Preview deployments: on, for pull requests (recommended).** Cloudflare builds every
-non-production branch of the site repository with the same build command and posts its preview
-URL on the pull request. Why on:
+What remains: Workers Scripts edit is account-wide. A leaked token could deploy a Worker under
+another name, and a Worker with an R2 binding to `nerva-packages` could write the bucket. Whether
+that upload needs an R2 permission too is not documented, and is not assumed. Such a Worker could
+put or delete objects the bucket's locks do not hold, but could not remove a lock, sign anything,
+or change the key; "The R2 token leaks" below bounds the rest, and the next write run reports any
+tampering. The token never leaves Cloudflare: only the commands the build runs after the pinned
+gate see it, from a directory the gate wrote, and no file of the site repository reaches that
+step. Those commands are `npm ci --ignore-scripts` and the Wrangler it installs, whose version
+and whole tree (hashes included) the pinned gate fixes; no package's install script runs.
+The owner accepted this residual reach on 2026-11-13 (P410e): the site stays in the same account.
+
+**Preview deployments: on, for non-production branches (recommended).** With **Enable Preview
+Builds** on (Branch control), Workers Builds builds every non-production branch of the site
+repository with the same build command, then runs the preview command, which uploads a Preview of
+the Worker. A Preview takes nothing from production: its configuration is the `previews` block
+the gate wrote, which is empty, so it has no binding either ("Previews"). Why on:
 
 - The gate can be tested without a merge. The rehearsal opens a pull request that adds a
   `wrangler.toml` binding the bucket, a `functions/` file, and a `package.json` whose
-  `postinstall` writes `dist/_worker.js`. Its preview build must fail with NRV-E1152.
+  `postinstall` writes a `_worker.js`. Its preview build must fail with NRV-E1152.
 - A reviewer of a site pull request, a release's included, sees the page before it merges.
-- A preview has no more reach than production: the same gate, no secrets, and a
-  `*.nerva-site.pages.dev` address that nobody links to.
+- A Preview has no more reach than production: the same gate, the same token, no binding, and a
+  `*-nerva-site.<subdomain>.workers.dev` address that nobody links to and that Cloudflare serves
+  with `X-Robots-Tag: noindex`.
 
 Cloudflare's check on a pull request is **not** a required check in the site's ruleset. A
 Cloudflare outage must not block the site's pull requests, the release's included; `site-check`
-stays the only required check. If the owner prefers fewer moving parts, previews off ("None" under
-Preview branches) changes nothing else in this spec except the rehearsal's gate test, which then
-needs a merge.
+stays the only required check. If the owner prefers fewer moving parts, previews off (**Enable
+Preview Builds** off) changes nothing else in this spec except the rehearsal's gate test, which
+then needs a merge.
 
 **What someone who can merge to the site's `main` can do, afterwards.** That is a session acting
 as `topwombat`, or the release App, whose token can open and merge site pull requests.
@@ -121,15 +231,15 @@ as `topwombat`, or the release App, whose token can open and merge site pull req
   fingerprints and stop. The job never reads the site's key, so nothing is signed or trusted
   differently. The next site pull request fails its check (NRV-E1162), and so does the next
   release's `site-live`.
-- **Cannot:** run code on Cloudflare, or bind the bucket (the build command refuses it, and the
-  repository cannot change the build command). Cannot read or write the bucket (no credential).
-  Cannot change the key, the fingerprints or the scripts (all in this repository). Cannot get
-  anything signed, or change what `packages.nerva.pro` serves (R2 serves it, not the Pages
-  project).
-- **If the gate ever failed** (for example, Cloudflare starts reading a config file under a new
-  name), a site merge would gain the bucket token's power and nothing more. "The R2 token leaks"
-  below bounds that: it cannot sign, the bucket locks stop it from deleting or replacing a package
-  or a manifest, and the next write run reports any tampering.
+- **Cannot:** run code on Cloudflare, give the Worker a script or a binding, or change the gate
+  (the gate refuses every such file, writes the only configuration itself, and is pinned in the
+  dashboard). Cannot reach the build token through Wrangler, which runs after the gate, from the gate's
+  directory (the image's own handling of version files before the gate is the residual reach above). Cannot read or write the bucket (no credential). Cannot change the key, the
+  fingerprints or the scripts (all in this repository). Cannot get anything signed, or change
+  what `packages.nerva.pro` serves (R2 serves it, not the Worker).
+- **If the gate ever failed** (for example, Wrangler starts reading a file under a new name), a
+  site merge could gain the build token's reach, which the paragraph above bounds, and nothing
+  more.
 
 ### The key by WKD (P376)
 
@@ -156,10 +266,16 @@ nothing here, and GnuPG falls back to the direct method when that host does not 
   - `site_check.mjs` fetches that file, dearmors it and compares, on every site pull request. A
     difference is **NRV-E1162**. It does not read `RELEASES`, so a candidate's entry may come
     first. If the reference's tag has no key file (v0.7.0), the check passes with a notice, and
-    no WKD file may be present.
+    no WKD file may be present; the build command then deploys the site without them (P398).
+    `site-live` follows the same rule: with no reference key file it passes with a notice, and
+    the served WKD path must answer 404 (P398).
   - **Who opens the site pull request:** `release-finish.yml`'s `site` job, which already opens
-    the site's pull request for a release and for a candidate. It now also replaces the WKD file
-    with the dearmored key file at the tag it publishes, which is then the reference if that tag is on `main`. A
+    the site's pull request for a release and for a candidate. It now also writes both WKD files
+    into it (P398): `.well-known/openpgpkey/policy`, empty, created if absent, and the `hu/` key
+    file, the dearmored key file at the tag it publishes, which is then the reference. It writes
+    them only when that tag's commit is an ancestor of `main`; for a candidate tagged on a branch
+    (the rehearsal's) it leaves them as the site's `main` has them (none before v0.7.1), so its
+    pull request passes the check against the older reference (#400). So the first WKD pair on the site comes with v0.7.1's site pull request. A
     candidate's pull request is never merged (P364), so the served WKD file moves only when a
     later site pull request merges, and that one must carry the same file: the next release's,
     or any other site change, whose check names the file it needs.
@@ -181,7 +297,7 @@ nothing here, and GnuPG falls back to the direct method when that host does not 
 
 | Who | Can | Cannot |
 |---|---|---|
-| The site alone (a merge to the site's `main`, or the Pages project) | Serve another key by WKD. A user who checks both channels sees a mismatch and stops. A user who checks only WKD, against INSTALL.md's advice, could trust the wrong key, but that key's signatures are not in the repositories. | Get anything signed. Change the key the job checks against, the bucket, or the packages. |
+| The site alone (a merge to the site's `main`, or the `nerva-site` Worker) | Serve another key by WKD. A user who checks both channels sees a mismatch and stops. A user who checks only WKD, against INSTALL.md's advice, could trust the wrong key, but that key's signatures are not in the repositories. | Get anything signed. Change the key the job checks against, the bucket, or the packages. |
 | GitHub alone (a merge to Nerva's `main`) | Change the workflows, and with them make the CI subkey sign anything. Replace the key file that users fetch from GitHub. | Change the WKD key. Users who check both channels see that a swapped key file disagrees with WKD. It cannot make a new subkey either, because the primary is offline. So it cannot replace the CI subkey with its own, and a revoked or expired CI subkey ends its reach. In the single-key fallback the whole key is in CI, so that last limit does not exist. |
 | Both together | Everything: a full compromise | |
 
@@ -477,9 +593,9 @@ refused (NRV-E1141).
   unaffected, and the GitHub release still carries every package, so INSTALL.md's
   download-and-install path keeps working. During a release, `repos-ready` cannot read the bucket
   (NRV-E1143), so the draft waits (see "`repos-ready`").
-- **Cloudflare Pages is down, or a build fails:** `nerva.pro` keeps serving the last good
-  deployment, or nothing during an outage. On a release, `site-verify` reports it (NRV-E1151). The
-  packages host is R2, not Pages, and is unaffected.
+- **Workers Builds is down, or a build fails:** `nerva.pro` keeps serving the last good
+  version (or nothing, if Workers itself is down). On a release, `site-verify` reports it
+  (NRV-E1151). The packages host is R2, not the Worker, and is unaffected.
 - **Cloudflare's bot protections challenge apt or dnf:** a challenge page is HTML, so apt says
   "Clearsigned file isn't valid" and dnf says "repomd.xml parser error". The setup turns off Bot
   Fight Mode, and the rehearsal's install checks would show the problem.
@@ -1163,19 +1279,22 @@ Yes, the release checks that `nerva.pro` shows it. It is its own job, not a step
 - `release_finish.sh site-live "$TAG"` fetches `https://nerva.pro/` every 20 seconds, with
   `Cache-Control: no-cache`, until the served page holds the `RELEASES` entry for the version that
   `site_release.py` wrote (`{v:"<V>"`). Its deadline is **15 minutes** from the start of the job.
-  `publish` has already waited for the merge, and a Cloudflare Pages build of one file normally
+  `publish` has already waited for the merge, and a Workers Build of a few files normally
   deploys within two minutes, so 15 minutes leaves room for Cloudflare's build queue and nothing
   more.
 - At the deadline it fails with **NRV-E1151**: "nerva.pro does not show <V> 15 minutes after the
   site's pull request merged; the release is public and its packages are unaffected". The fix: in
-  the Cloudflare dashboard, open the `nerva-site` project's deployments. A failed build shows its
-  log (NRV-E1152 if the gate refused). "Retry deployment" deploys `main` again; then re-run
+  the Cloudflare dashboard, open the `nerva-site` Worker's builds. A failed build shows its log
+  (NRV-E1152 if the gate refused, NRV-E1164 if the pin is wrong). Retry the build of `main` there
+  (if the dashboard offers it) or merge any site pull request to start a new one; then re-run
   `site-verify`.
 - **The WKD key (P376).** Once the page shows the release, `site-live` fetches
   `https://nerva.pro/.well-known/openpgpkey/hu/ndqm47zydhyqyzabecddtdk1q3bponab?l=nerva`, with no
   cache busting. It must equal, byte for byte, `gpg --dearmor` of the reference key file (see
   "The key by WKD"), which is then this release's own. Otherwise it fails with **NRV-E1162**: "nerva.pro's WKD key differs from
-  packaging/keys at <tag>; users who compare the two channels will stop". The fix is a site pull
+  packaging/keys at <tag>; users who compare the two channels will stop". If the reference's tag
+  has no key file (v0.7.0, when `site-live` is run by hand in the rehearsal), it passes with a
+  notice instead, and the WKD path must answer 404; a WKD file served then is NRV-E1162 (P398). The fix is a site pull
   request that replaces the file, then a re-run of `site-verify`. It does not touch the packages.
 - `publish`'s meaning of "published" (P364) changes in one word: the site pull request is merged
   after `site-check` passes, exactly as now, and the page is published when **Cloudflare** has
@@ -1577,7 +1696,7 @@ the other release codes.
 | NRV-E1149 | A bucket lock rule is missing: R2 accepted an overwrite under a locked prefix | `package_repos.sh publish`, `refresh` | the Cloudflare account's admin |
 | NRV-E1150 | The repositories' signatures expire within 10 days, or this repository has had no commit for 45 days and GitHub will disable the refresh at 60 | `package_repos.sh refresh`, `ci.yml`'s `repos-fresh` | release maintainer |
 | NRV-E1151 | `nerva.pro` does not show the release 15 minutes after the site's pull request merged | `release_finish.sh site-live` (`site-verify`) | release maintainer / Cloudflare |
-| NRV-E1152 | The site's build refused: a file that would run code or bind resources on Cloudflare (`functions/`, `_worker.js`, `_routes.json`, `wrangler.*`), a package manifest, lock file or version file that would make Cloudflare install dependencies, `SKIP_DEPENDENCY_INSTALL` not set to `1`, or a file the build copies (`index.html`, the WKD policy and key) missing or a symlink | the `nerva-site` build command (Cloudflare), and the site's `site_check.mjs` | whoever added the file to the site repository, or changed the Pages project's variables |
+| NRV-E1152 | The site's build refused: a path that is not on the allow-list (`index.html`, `404.html`, `_headers`, `.well-known`, `.git`, `.github`, `.nojekyll`, `README.md`, `LICENSE`, `CLAUDE.md`): any other file, directory, dotfile or symlink (so every file that would run code, bind resources, configure Wrangler or npm or make Cloudflare install dependencies), a symlink at an allowed metadata name, `SKIP_DEPENDENCY_INSTALL` not set to `1`, `index.html`, `404.html` or `_headers` missing, not a regular file, or a symlink, one of the two WKD files (the policy and the key) without the other, a WKD file that is not a regular file, or a symlink at a WKD file or at `.well-known`, `.well-known/openpgpkey` or `.well-known/openpgpkey/hu` | `site_build.sh`, run by the `nerva-site` Worker's build command (Cloudflare), and the site's `site_check.mjs` | whoever added the file to the site repository, or changed the Worker's build variables |
 | NRV-E1153 | `repos-ready`, binding a draft, ran in another run attempt than the `mac` job the owner approved (a dispatch for a published release is not checked) | `package_repos.sh ready` | whoever re-ran the job; use "Re-run all jobs" |
 | NRV-E1154 | **Retired, unused.** It was the `abandoned` state, cut in the fourth rework: a pending entry of a release that is not public is now skipped, never marked | none | none |
 | NRV-E1155 | A GitHub API call or a download from GitHub failed (the network, an outage, a rate limit), not a hash mismatch or a release that reads draft or 404; also the refresh's read of the last commit's date. The affected entries stay `pending` | `package_repos.sh ready`, `publish`, `refresh` | GitHub |
@@ -1585,7 +1704,8 @@ the other release codes.
 | NRV-E1157 | `repos-verify` could not set up a distribution's container or its prerequisites (an image pull, a mirror), before any check of the repository ran | `repo_install_check.sh` (`repos-verify`) | the environment (a registry or mirror) |
 | NRV-E1160 | The CI signing subkey expires soon: under 120 days and no `next` listed, or under 30 days and not swapped. Noted; the run finishes its work, then ends red (retired, unused, if slice K takes the fallback) | `package_repos.sh publish`, `refresh`, `ci.yml`'s `repos-fresh` | the key's owner |
 | NRV-E1161 | The run's own output does not verify before upload: `InRelease`, `Release.gpg` or `repomd.xml.asc` under a keyring of `packaging/keys/` only, `InRelease`'s text against `Release`, or an rpm under `rpmkeys -K` in a scratch database, which step 4 checks before the rpm is recorded or put and step 5b checks again for every indexed rpm. Nothing of the indexes is uploaded, and the message names the rpm and its Key ID | `package_repos.sh publish`, `refresh` | release maintainer (a key file and secret that disagree, or a tool change) |
-| NRV-E1162 | The WKD key on `nerva.pro` is not `packaging/keys/nerva-release.asc` | the site's `site_check.mjs`, `release_finish.sh site-live` (`site-verify`) | whoever changed either key file without the other; if nobody did, the site's repository or Pages project |
+| NRV-E1162 | The WKD key on `nerva.pro` is not `packaging/keys/nerva-release.asc` | the site's `site_check.mjs`, `release_finish.sh site-live` (`site-verify`) | whoever changed either key file without the other; if nobody did, the site's repository or the `nerva-site` Worker |
+| NRV-E1164 | The site's build command could not fetch `site_build.sh` at the pinned commit, or its SHA-256 is not the pinned one; nothing is deployed | the `nerva-site` Worker's build command (Cloudflare) | the owner (a wrong pin), or GitHub (unreachable) |
 | NRV-W1103 | The `alarm` job could not open or comment on the `package-repos` issue. A warning: it never changes the run's verdict | `.github/scripts/repos_alarm.sh` | GitHub, or a missing label |
 
 ## Setup (owner, once)
@@ -1605,33 +1725,72 @@ zone says **Active**. Then, in the zone:
   host, and they cannot answer a challenge.
 - **DNS** stays empty for now: steps 3 and 5 make every record.
 
-**2. The Pages project.** **Workers & Pages**, **Create**, **Pages**, **Connect to Git**.
+**2. The `nerva-site` Worker** (P410). Cloudflare's dashboard changes often: the names below are
+the ones Cloudflare's Workers Builds docs use, and where a docs page does not confirm a field, the
+step says "if shown".
 
-- **GitHub:** Cloudflare asks to install its GitHub App. Install it on the **NervaLog**
-  organisation with **Only select repositories**, `nervalog.github.io`, and nothing else.
-- Select `NervaLog/nervalog.github.io`, then **Begin setup**:
-  - **Project name:** `nerva-site`;
-  - **Production branch:** `main`;
-  - **Framework preset:** None;
-  - **Build command:** the one line in "The site on Cloudflare Pages", exactly;
-  - **Build output directory:** `dist`;
-  - **Root directory (advanced):** empty (the repository's root);
-  - **Environment variables:** one, `SKIP_DEPENDENCY_INSTALL` with the value `1`, for both
-    Production and Preview. The build command refuses to run without it.
-- **Save and Deploy.** Wait for a green deployment, then open `https://nerva-site.pages.dev/`:
-  it must show the site.
-- In the project, **Settings**:
-  - **Builds**, **Branch control:** **Enable automatic production branch deployments** on;
-    **Preview branch:** "All non-Production branches" (recommended; "None" turns previews off,
-    see "Preview deployments").
-  - **Bindings:** none. Leave it empty, now and later.
-  - **Functions** and **Variables and Secrets:** none.
+- **Wait for slice 5a's site pull request and for pull request #410 (slice W) to merge:** the
+  gate requires `index.html`, `404.html` and `_headers`, and fails (NRV-E1152, nothing deployed)
+  until the site repository holds them, and there is no gate to pin until #410 is on `main`. The two WKD files are not needed: they come later, as a pair, with v0.7.1's site
+  pull request (P398).
+- **P410d's residual risk is accepted** (owner, 2026-11-13, P410e): the narrower token below can
+  still deploy any Worker of the account, and the site stays in this account.
+- **The pin.** In a checkout of this repository, on an up-to-date `main`, read the commit that
+  last changed the gate and the gate's SHA-256 at that commit. The first is `<commit>`, the
+  second `<sha256>`:
+
+```bash
+git fetch origin main && git log -1 --format=%H origin/main -- .github/scripts/site_build.sh
+```
+
+```bash
+git show "$(git log -1 --format=%H origin/main -- .github/scripts/site_build.sh)":.github/scripts/site_build.sh | shasum -a 256
+```
+
+- **The build token.** **My Profile**, **API Tokens**, **Create Token**, **Create Custom Token**.
+  Name `nerva-site build`. Permissions: **Account**, **Workers Scripts**, **Edit**; **Account**,
+  **Account Settings**, **Read**; **User**, **User Details**, **Read**; **User**,
+  **Memberships**, **Read**. **Account Resources:** Include, the one account. **Zone
+  Resources:** none (if the form insists on one, the `nerva.pro` zone, with no zone permission
+  above). No IP filter, no expiry. **Create Token.** Do not copy the value anywhere: Workers
+  Builds asks you to select it.
+- **Workers & Pages**, **Create**, then **Import a repository** (or **Connect to Git**, whichever
+  is shown). **GitHub:** Cloudflare asks to install its GitHub App. Install it on the **NervaLog**
+  organisation with **Only select repositories**, `nervalog.github.io`, and nothing else. Select
+  `NervaLog/nervalog.github.io`, then:
+  - **Project name:** `nerva-site` (it must equal the `name` the gate writes);
+  - **Build command:** the build command in "The site on a Cloudflare Worker", with `<commit>`
+    and `<sha256>` filled in, exactly, on one line;
+  - **Deploy command:** the deploy command there, exactly;
+  - **Non-production branch deploy command** (or **Preview command**), if shown: the preview
+    command there, exactly;
+  - **Git branch** (or **Production branch**), if shown: `main`; if no field is shown, the
+    default is `main`;
+  - **Root directory**, if shown: empty (the repository's root);
+  - **API token**, if shown: `nerva-site build`, never **Create new token**;
+  - **Build variables**, if shown: one, `SKIP_DEPENDENCY_INSTALL` with the value `1`. The gate
+    refuses to run without it.
+- **Deploy** (or **Save and Deploy**). The first build may fail on a field this form did not
+  show; finish the settings below, then retry it. In the Worker, **Settings**, **Build**:
+  - **Git repository** and **Git branch:** `NervaLog/nervalog.github.io`, `main`;
+  - **Build command**, **Deploy command**, **Non-production branch deploy command**: as above;
+  - **API token:** `nerva-site build`;
+  - **Build variables and secrets:** `SKIP_DEPENDENCY_INSTALL` = `1`, and nothing else;
+  - **Branch control:** production branch `main`; **Enable Preview Builds** on (recommended; off
+    turns previews off, see "Preview deployments").
+- In the Worker, **Settings**: **Bindings** none, **Variables and Secrets** none, now and later.
+- Wait for a green build of `main`. Its log shows `site build: copied 3 files`. Then open the
+  Worker's `workers.dev` address, `https://nerva-site.<your subdomain>.workers.dev/`: it must
+  show the site.
+- **Whenever `site_build.sh` changes on `main`,** read the pin again and replace `<commit>` and
+  `<sha256>` in the build command. Until then the old gate runs, and a site build stays green.
 
 **3. The site's domains.**
 
-- In the `nerva-site` project, **Custom domains**, **Set up a custom domain**, `nerva.pro`,
-  **Continue**, **Activate domain**. Cloudflare adds the record and the certificate. Wait until it
-  says **Active**.
+- In the `nerva-site` Worker, **Settings**, **Domains & Routes**, **Add**, **Custom Domain**,
+  `nerva.pro`, **Add Custom Domain**. Cloudflare adds the record and the certificate. Wait until it
+  says **Active**. (It is refused while the zone holds another record for `nerva.pro`; step 1 left
+  DNS empty.)
 - **www:** in the zone, **DNS**, **Records**, **Add record**: type `AAAA`, name `www`, IPv6
   address `100::`, **Proxied**. (`100::` is a placeholder that goes nowhere; the redirect rule
   answers before it would be used.)
@@ -1651,7 +1810,12 @@ curl -sI 'https://nerva.pro/' | grep -i -e '^HTTP' -e '^server'
 curl -sI 'https://www.nerva.pro/install?x=1' | grep -i -e '^HTTP' -e '^location'
 ```
 
-Expect a 200 with `server: cloudflare`, then a 301 to `https://nerva.pro/install?x=1`.
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' 'https://nerva.pro/no-such-page'
+```
+
+Expect a 200 with `server: cloudflare`, then a 301 to `https://nerva.pro/install?x=1`, then
+`404` (the Worker's `404.html`, never `index.html`).
 
 **4. The signing key** (P376). **Wait for slice K**: its pull request says which branch is
 taken. If the subkey model is adopted, follow 4A. If it fell back to one key, follow 4B. If it
@@ -1839,8 +2003,14 @@ gh variable set R2_BUCKET --env package-repos --repo NervaLog/nerva --body nerva
 ```
 
 ```bash
-gh variable set PACKAGES_BASE_URL --env package-repos --repo NervaLog/nerva --body 'https://packages.nerva.pro'
+gh variable set PACKAGES_BASE_URL --repo NervaLog/nerva --body 'https://packages.nerva.pro'
 ```
+
+`PACKAGES_BASE_URL` is a repository variable, not the environment's (P404): `ci.yml`'s
+`repos-fresh`, the daily watch and `repos-verify` read it and have no environment. Do not set it on
+`package-repos` as well; if an earlier setup did, remove it there
+(`gh variable delete PACKAGES_BASE_URL --env package-repos --repo NervaLog/nerva`), so that the two
+cannot disagree.
 
 Then, in step 4's terminal. **4A:**
 
@@ -1941,7 +2111,7 @@ curl -sI 'https://packages.nerva.pro/nothing' | head -n1
 ```
 
 ```bash
-gh secret list --env package-repos --repo NervaLog/nerva && gh variable list --env package-repos --repo NervaLog/nerva
+gh secret list --env package-repos --repo NervaLog/nerva && gh variable list --env package-repos --repo NervaLog/nerva && gh variable list --repo NervaLog/nerva
 ```
 
 ```bash
@@ -1962,8 +2132,8 @@ gh label list --repo NervaLog/nerva --search package-repos
 
 Expect: a 200 from `nerva.pro`; a 404 from `nervalog.github.io`; a 404 from `packages.nerva.pro`
 (served by R2: the bucket is empty); four secrets (`R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`,
-`REPO_SIGNING_KEY`, `REPO_SIGNING_PASSPHRASE`) and four variables (`R2_ENDPOINT`, `R2_BUCKET`,
-`PACKAGES_BASE_URL`, `PACKAGE_REPOS_OWNER`); `false`, `true` and `branch_policy`; `false`; `pages exit 1` (Pages is
+`REPO_SIGNING_KEY`, `REPO_SIGNING_PASSPHRASE`) and two variables (`R2_ENDPOINT`, `R2_BUCKET`) on the
+environment, and among the repository's variables `PACKAGES_BASE_URL` and `PACKAGE_REPOS_OWNER`; `false`, `true` and `branch_policy`; `false`; `pages exit 1` (Pages is
 off); and the label `package-repos`. Then tell the supervisor.
 
 **Rotating the R2 token** (yearly, or if it may have leaked): create a new token as in step 5, set
@@ -1986,16 +2156,18 @@ fails with NRV-E1143 and is re-run.
 - **The alarm** uses the `GITHUB_TOKEN` with `issues: write` only, outside the environment.
 - **The trust anchor** (the public key and the pinned fingerprints) is in this repository.
 - **The site repository and the release App** hold nothing the packages depend on. Cloudflare's
-  GitHub App reads that one repository. The Pages project has no binding, and its build command,
-  which no pull request can change, refuses the files that would add one.
+  GitHub App reads that one repository. The `nerva-site` Worker has no script and no binding: its
+  only configuration is the one the pinned gate writes, which no pull request can change, and the
+  gate refuses the files that would add one. Its build token is narrower than Cloudflare's default
+  (P410d): no R2, no KV, no zone.
 - `package-repos` has no reviewer, as `release-publish` has none, so the release is still one
   approval. The same accepted risk applies (automation.md, "Security notes"): any workflow merged
   to `main` can name the environment, and merging is the guard.
 
 ## What changes elsewhere
 
-- **P148:** the site is no longer served by GitHub Pages. Cloudflare Pages builds and deploys the
-  site repository's `main`, at `https://nerva.pro/`. The repository, its name, its `main` and its
+- **P148:** the site is no longer served by GitHub Pages. A Cloudflare Worker of static assets,
+  built by Workers Builds, deploys the site repository's `main`, at `https://nerva.pro/` (P410). The repository, its name, its `main` and its
   pull request flow stay. P365 records this; P148 itself is not edited.
 - **P364:** unchanged, except that "published" now means Cloudflare deployed the merge, which
   `site-verify` checks.
@@ -2004,16 +2176,16 @@ fails with NRV-E1143 and is re-run.
   waits for `repos-ready`, and `repos` waits for the publication, not for `publish`'s success.
 - **Nerva's CLAUDE.md:**
   - "README and site status": "served by GitHub Pages from that repository's `main` at
-    <https://nervalog.github.io/>" becomes "built and deployed by Cloudflare Pages from that
-    repository's `main` at <https://nerva.pro/> (P365)".
+    <https://nervalog.github.io/>" becomes "built and deployed as a Cloudflare Worker (static
+    assets, Workers Builds) from that repository's `main` at <https://nerva.pro/> (P365, P410)".
   - The release paragraph adds that the release also publishes the apt and dnf repositories.
   - "Environment facts" notes that the session proxy cannot reach Cloudflare.
 - **The site's CLAUDE.md and README:** the served-by line, as in Nerva's CLAUDE.md; that a push to
   `main` publishes through Cloudflare; that the page carries no key, fingerprint or repository
   line (it links to INSTALL.md), and that the key is only at its WKD path, a copy of Nerva's
   `packaging/keys/nerva-release.asc` that changes only with it (P376, NRV-E1162); and that
-  `functions/`, `_worker.js`, `_routes.json` and `wrangler.*` are refused, with package
-  manifests, lock files and version files (NRV-E1152).
+  `functions/`, `_worker.js`, `_routes.json` and `wrangler.*` are refused, with every other
+  name off the allow-list (NRV-E1152).
 - **P365** is amended by P376: point 3 (the site now carries the key, by WKD), point 6 (the
   check is pinned to the primary and the subkey's role), point 10 (`Date`, and `repos-fresh` at
   10 days) and point 12 (the key model, once slice K passes). **P368**'s `verify_manifest` is
@@ -2031,7 +2203,7 @@ fails with NRV-E1143 and is re-run.
 
 The owner's decision (owner, 2026-11-12): v0.7.1's other gates wait for this rehearsal to pass.
 
-Prerequisites: setup steps 1 to 10 are done, and slices 0 to 5 have merged.
+Prerequisites: setup steps 1 to 10 are done, and slices 0 to 5 and 5a have merged.
 
 The rehearsal is a candidate run **with the approval**, because only an approved run binds new
 packages (a dispatch for a published release would stop with NRV-E1148):
@@ -2061,21 +2233,29 @@ packages (a dispatch for a published release would stop with NRV-E1148):
 - **The refresh:** one `workflow_dispatch` of `package-repos-refresh.yml` is green, and
   `InRelease`'s `Valid-Until` moves.
 - **The site:** `release_finish.sh site-live v0.7.0`, run by hand, passes (the page already lists
-  v0.7.0). A candidate's site pull request is never merged, so `site-verify` itself runs first on
+  v0.7.0; v0.7.0 has no key file, so it passes with a notice and the WKD path answers 404). A candidate's site pull request is never merged, so `site-verify` itself runs first on
   v0.7.1.
 - **The build gate:** a pull request on the site repository that adds a `wrangler.toml` binding
   `nerva-packages`, a `functions/x.js`, and a `package.json` whose `postinstall` writes
-  `dist/_worker.js` gets a failed preview build with NRV-E1152 in its log,
-  and the project's **Bindings** stay empty. The pull request is closed unmerged. (With previews
+  a `_worker.js` gets a failed preview build with NRV-E1152 in its log, and the Worker's
+  **Bindings** stay empty. A build whose pin is wrong is not rehearsed on Cloudflare; the test
+  covers NRV-E1164. The pull request is closed unmerged. (With previews
   off, this needs a merge; skip it and record it as not verified.)
+- **The image and version files:** the same site pull request, run again with
+  `SKIP_DEPENDENCY_INSTALL=1` set and a `.nvmrc` naming an odd Node version, shows from the build
+  log whether the image acts on `.nvmrc` anyway (downloads or installs a toolchain) before the
+  gate refuses it with NRV-E1152. The result, for `.nvmrc` and for `.node-version`,
+  `.python-version`, `runtime.txt`, `.ruby-version` and a `packageManager` field, goes in the
+  worklog; if the image runs repository content (not only fetches an upstream release), that is a
+  finding.
 - `https://nerva.pro/` answers 200, `https://www.nerva.pro/` answers 301 to it, and
   `https://nervalog.github.io/` answers 404.
 - **Signed and served** (P376): step 5b (NRV-E1161) and step 8's fetch-back are green in both
   write runs; every signature's `VALIDSIG` names `primary` as its primary and `current` as its
   key; the rpms' Key ID is `current`'s.
-- **WKD:** `gpg --auto-key-locate clear,wkd --locate-external-keys nerva@nerva.pro`, in a
-  throwaway `GNUPGHOME`, finds the key, and its primary fingerprint is `primary`; INSTALL.md's
-  `curl` line shows the same. Record the `Content-Type` the file is served with.
+- **WKD** is not checked here (P398): the rehearsal's candidate is tagged on a branch, so the
+  reference stays v0.7.0, which has no key file, and nothing serves a WKD file until v0.7.1's
+  site pull request merges. The WKD checks run at v0.7.1 (below).
 - **The alarm:** one dispatch of `package-repos-refresh.yml` with `alarm_test` set fails on
   purpose, opens an issue labelled `package-repos`, and a second such dispatch comments on the
   same issue. The issue is closed by hand afterwards.
@@ -2114,18 +2294,34 @@ containers):
   the runner.
 - That a failed `publish` job's `public` output reaches `repos`.
 - `ubuntu-24.04-arm` running the arm64 cells.
-- Cloudflare Pages: that it reads `wrangler.toml` and `functions/` only for a deployment whose
-  build passed, so the gate holds; and that it builds no pull request from a fork.
-- Cloudflare Pages serving `dist/.well-known/`, a dot-directory, and the `Content-Type` it gives
-  the WKD file, and answering an unknown path under `/.well-known/openpgpkey/hu/` with 404 and
-  `policy` with 200. **WKD is adopted only if all of this passes in the rehearsal.** If not,
-  P376 point 6 is cut by a decision before v0.7.1: the key stays on GitHub only, and INSTALL.md's
-  second channel goes.
+- Workers Builds: that the dashboard takes the three commands as written (the 512-character
+  limit is the owner's reading of the dashboard, not a documented one); that the deploy command
+  runs only after a green build command, so the gate holds; that the preview command is accepted
+  in the form given (Cloudflare says a custom one must invoke `wrangler preview`); that the
+  narrower build token (P410d) is enough to deploy and to upload a Preview; that a deploy leaves
+  the dashboard's custom domain in place; and that it builds no pull request from a fork.
 - The `alarm` job's `if` on a cancelled run, and `issues: write` being enough to add a label
   that exists.
 
 **Not verified until v0.7.1** (the same code with another filter): the first release package in
 `stable`, its rpm under `rpm/stable/`, `repos-verify` installing from `stable`, and `site-verify`.
+
+**WKD's adoption gate is v0.7.1's release** (P398, amending P376 point 6, which had it in the
+rehearsal). Once `site-verify` is green on v0.7.1 (its `site-live` compared the served key file
+with v0.7.1's), the supervisor checks by hand, and records in the worklog:
+
+- The Worker serves `dist/.well-known/`, a dot-directory (Wrangler's source uploads it; the docs
+  do not say): `policy` answers 200 and an
+  unknown path under `/.well-known/openpgpkey/hu/` answers 404;
+- the key file is served with the two headers `_headers` sets, `Content-Type:
+  application/octet-stream` and `Access-Control-Allow-Origin: *`;
+- `gpg --auto-key-locate clear,wkd --locate-external-keys nerva@nerva.pro`, in a throwaway
+  `GNUPGHOME`, finds the key, and its primary fingerprint is `primary`; INSTALL.md's `curl` line
+  shows the same.
+
+**WKD is adopted only if all of this passes.** If not, P376 point 6 is cut by a decision right
+after v0.7.1: a site pull request removes both WKD files, the key stays on GitHub only, and
+INSTALL.md's second channel goes. v0.7.1 itself is already public and is not affected.
 
 The fallback is the same as for the tap and the site in automation.md: the release is already
 public, its files install by hand, and a re-run finishes the repositories.
@@ -2145,21 +2341,24 @@ CLAUDE.md (P148b).
 | 0b | Register NRV-E1160 to NRV-E1162 and NRV-W1103 from the table above, amend the texts of NRV-E1139, E1145, E1150 and E1152, and the 11xx intro (adds `repos_alarm.sh`). If K took the fallback, E1160 is registered "retired, unused" | `docs/ERRORS.md` | mechanical; supervisor checks the diff | after K's branch is known; before 2b |
 | 2b | `package_repos.sh` amended to P376: the pinned check (`VALIDSIG` `$12` is `primary`, `$3` a subkey listed for the file kind, RSA, SHA-512, the class, no `EXPKEYSIG` or `REVKEYSIG`; replaces slice 2's `$NF` check), the roles of `fingerprints` (`primary`, `current`, `next`, `retired`, `revoked`, `anchor`, or the fallback's), the secret's `sec#` check and `_NEXT` pair, dual signing, the rpm Key ID, NRV-E1160, step 4's rpm check and step 5b (NRV-E1161), "Excluding the rpms of one key" (`refresh`'s `rpm_key`: `exclude` and `restore`, owner-only: refused NRV-E1139 unless `github.triggering_actor` equals `vars.PACKAGE_REPOS_OWNER`, the `excluded` state kept by later runs), step 8's fetch-back of everything written, `Date` from the run and `SOURCE_DATE_EPOCH` refused, each step's `code` output, and `.github/scripts/repos_alarm.sh` with its test (a stand-in `gh`: open, assigned to `PACKAGE_REPOS_OWNER`, comment, one comment a day per (workflow, job, code), NRV-W1103). Tests add: a badly signed rpm never recorded or put; any rpm failure in step 5b (a `revoked` Key ID, an unlisted Key ID, a changed `rpmkeys` output, a `fingerprints` edit that drops `retired`) stopping the run with nothing written; `exclude` of a revoked subkey's Key ID indexing without its rpms in both channels, and the next plain run keeping them `excluded`; `restore` of a mistaken exclusion; `exclude` of `current`'s Key ID, `restore` of a revoked one, `restore` of a Key ID no `excluded` entry has, and any `rpm_key` dispatched by an actor other than `PACKAGE_REPOS_OWNER`, refused (NRV-E1139); a primary-signed file refused; a subkey not listed for the kind refused; an expired and a revoked subkey; a secret holding the primary refused; a key file and secret that disagree (NRV-E1161, nothing uploaded); a served object that differs (NRV-E1145); the expiry thresholds | `.github/scripts/package_repos.sh`, `.github/scripts/test_package_repos.py`, `.github/scripts/repos_alarm.sh`, `.github/scripts/test_repos_alarm.py` | implementation; review (security focus: the check, the roles, the anchor) | after 2, K and 0b |
 | 3 | `packaging/keys/nerva-release.asc` and `packaging/keys/fingerprints` (`primary <fpr>` and `current <subkey fpr>`; in the fallback, `current <fpr>`), from setup step 4 | `packaging/keys/*` | mechanical; supervisor checks both fingerprints against the owner's and against `gpg --show-keys` | after K and setup step 4; parallel with 2b |
-| 4 | `release-finish.yml`: jobs `repos-ready` and `repos` (gated on `public`), both in the concurrency group `nerva-packages-bucket` with `cancel-in-progress: false`, `repos-verify`, `site-verify`; `publish`'s `needs`, `if`, last step and output `public`; `mac-sign.yml`'s new output `attempt` (`github.run_attempt` of its signing job), which `repos-ready` compares; the header comment (which still says "the site's auto-merge"; P364 merges directly); images pinned by digest. `release_finish.sh site-live` and its test, and `release_finish.sh site` writing the WKD file (the dearmored key file at the tag it publishes, a release's or a candidate's) into the site pull request. `package-repos-refresh.yml`: the weekly schedule and dispatch, its job in the same group. `ci.yml`'s `repos-fresh` job, behind `REPOS_LIVE`, failing at under 10 days and on NRV-E1160, and `package-repos-watch.yml` (daily, the same check through `package_repos.sh fresh`, and the 45-day check). The `alarm` job in all four workflows (P376: `issues: write` only, `continue-on-error`), the refresh's `missed` output and its `alarm_test` and `rpm_key` inputs; the alarm's `if` as "Alarms" gives it for each workflow, `cancelled` only for `repos-ready` and `repos`. `site-live` also compares the served WKD file with the reference key file of "The key by WKD" (NRV-E1162). Tried with a dispatch on a published candidate before review where possible: `repos-ready` then refuses NRV-E1139 cleanly while the environment is not set up | `.github/workflows/release-finish.yml`, `.github/workflows/mac-sign.yml` (one output), `.github/workflows/package-repos-refresh.yml`, `.github/workflows/package-repos-watch.yml`, `.github/workflows/ci.yml` (one job), `.github/scripts/release_finish.sh` (`site-live`, `site`), `.github/scripts/test_release_finish.py` | implementation; review (security focus: environments, `needs`/`if`, outputs, `!cancelled()`, the shared concurrency group on every job that writes the bucket and on no other) | after 2 |
-| 5 | The fingerprint in INSTALL.md's new section (the `primary` line; the dnf 5 notes, pinning by Origin, the signing sentence, the two-channel WKD check, and the yearly key-file fetch), CLAUDE.md (the site line, the release line, the environment fact), automation.md's hook section as a pointer here, the source of slice 2's install-block test switched from this spec to INSTALL.md (one line), and the worklog. In the site repository, one pull request: CLAUDE.md and README (Cloudflare Pages, "no key on the page", the refused names), `.github/CODEOWNERS` deleted, the WKD files (`.well-known/openpgpkey/policy`, empty, and `hu/ndqm47zydhyqyzabecddtdk1q3bponab`, the `gpg --dearmor` of the key file; the hash rechecked with `gpg-wks-client --print-wkd-hash nerva@nerva.pro`), and `site_check.mjs` refusing every name the build command refuses (NRV-E1152), dangling symlinks included, and comparing the WKD file with the key file at the newest published `v*` tag whose commit is an ancestor of `main` (`git merge-base --is-ancestor <tag> origin/main`), prereleases included, never at a reference the site pull request names (NRV-E1162), with its test, which covers a candidate's pull request with its entry first in `RELEASES`, a candidate cut during a rotation followed by an unrelated site pull request that must carry the candidate's key file, and a prerelease tagged on a branch (newer than the last release, with an older or no key file), which is skipped, so the reference stays the key file of the newest tag on `main` | `docs/INSTALL.md`, `CLAUDE.md`, `docs/releases/automation.md`, `tests/packaging/repos.py` (one line); the site's `CLAUDE.md`, `README.md`, `.github/CODEOWNERS`, `.well-known/openpgpkey/*`, `site_check.mjs` and its test | mechanical, except the `site_check.mjs` change (implementation); supervisor checks | after 2 and 3, and after setup steps 2 and 8 |
-| E | Setup steps 1 to 10 | Cloudflare, GitHub | owner | in order; step 4 after K and before slice 3; step 7 only after step 3's check |
-| F | The rehearsal, its run link recorded, and `REPOS_LIVE` set | worklog, a repository variable | supervisor | after 0 to 5, 0b, 2b, K and E |
+| 4 | `release-finish.yml`: jobs `repos-ready` and `repos` (gated on `public`), both in the concurrency group `nerva-packages-bucket` with `cancel-in-progress: false`, `repos-verify`, `site-verify`; `publish`'s `needs`, `if`, last step and output `public`; `mac-sign.yml`'s new output `attempt` (`github.run_attempt` of its signing job), which `repos-ready` compares; the header comment (which still says "the site's auto-merge"; P364 merges directly); images pinned by digest. `release_finish.sh site-live` and its test, and `release_finish.sh site` writing both WKD files into the site pull request it opens (P398): `.well-known/openpgpkey/policy`, empty, created if absent, and `.well-known/openpgpkey/hu/ndqm47zydhyqyzabecddtdk1q3bponab`, the dearmored key file at the tag it publishes, a release's or a candidate's, only when that tag's commit is an ancestor of `main` (for a branch candidate it leaves them as the site's `main` has them, #400). `package-repos-refresh.yml`: the weekly schedule and dispatch, its job in the same group. `ci.yml`'s `repos-fresh` job, behind `REPOS_LIVE`, failing at under 10 days and on NRV-E1160, and `package-repos-watch.yml` (daily, the same check through `package_repos.sh fresh`, and the 45-day check). The `alarm` job in all four workflows (P376: `issues: write` only, `continue-on-error`), the refresh's `missed` output and its `alarm_test` and `rpm_key` inputs; the alarm's `if` as "Alarms" gives it for each workflow, `cancelled` only for `repos-ready` and `repos`. `site-live` also compares the served WKD file with the reference key file of "The key by WKD" (NRV-E1162); when the reference's tag has no key file (v0.7.0), it passes with a notice and requires the WKD path to answer 404, as `site_check.mjs` does (P398). Tried with a dispatch on a published candidate before review where possible: `repos-ready` then refuses NRV-E1139 cleanly while the environment is not set up | `.github/workflows/release-finish.yml`, `.github/workflows/mac-sign.yml` (one output), `.github/workflows/package-repos-refresh.yml`, `.github/workflows/package-repos-watch.yml`, `.github/workflows/ci.yml` (one job), `.github/scripts/release_finish.sh` (`site-live`, `site`), `.github/scripts/test_release_finish.py` | implementation; review (security focus: environments, `needs`/`if`, outputs, `!cancelled()`, the shared concurrency group on every job that writes the bucket and on no other) | after 2 |
+| 5a | In the site repository only, one pull request: `404.html`, a plain not-found page (no script, no outside resource, a link to `/`), so the site answers an unknown path, another WKD hash included, with 404 rather than `index.html`; `_headers`, holding exactly the rule `/.well-known/openpgpkey/*` with the two headers `Content-Type: application/octet-stream` and `Access-Control-Allow-Origin: *`, each on its own line indented by two spaces; and `site_check.mjs` requiring `index.html`, `404.html` and `_headers` as regular files, not symlinks (NRV-E1152), with its test (each missing, each a symlink). No WKD file (P398) | the site's `404.html`, `_headers`, `.github/scripts/site_check.mjs` and its test | mechanical, except the `site_check.mjs` change (implementation); supervisor checks | now, after nothing; before setup step 2 |
+| W | P410, this spec's Worker rework (pull request #410): the gate as `.github/scripts/site_build.sh`, which writes the only Wrangler configuration; `test_site_build.py` (fixture trees, the allow-list, the configuration and the lock file it writes, the dashboard commands' lengths and pins, the build command against a served, a tampered and an unfetchable script) in `ci.yml`'s release-scripts step; NRV-E1164 registered and the texts of NRV-E1152 and NRV-E1162 say Worker; P410 to P410d | `.github/scripts/site_build.sh`, `.github/scripts/test_site_build.py`, `.github/workflows/ci.yml`, `docs/ERRORS.md`, this spec | design (Opus); supervisor checks | done in #410; before setup step 2 |
+| 5 | The fingerprint in INSTALL.md's new section (the `primary` line; the dnf 5 notes, pinning by Origin, the signing sentence, the two-channel WKD check, and the yearly key-file fetch), CLAUDE.md (the site line, the release line, the environment fact), automation.md's hook section as a pointer here, the source of slice 2's install-block test switched from this spec to INSTALL.md (one line), and the worklog. In the site repository, one pull request: CLAUDE.md and README (a Cloudflare Worker of static assets, P410, "no key on the page", the refused names), `.github/CODEOWNERS` deleted, the WKD files (`.well-known/openpgpkey/policy`, empty, and `hu/ndqm47zydhyqyzabecddtdk1q3bponab`, the `gpg --dearmor` of the key file; the hash rechecked with `gpg-wks-client --print-wkd-hash nerva@nerva.pro`): none here (P398); the first pair comes with v0.7.1's site pull request, from slice 4's `site`, and `site_check.mjs` refusing every name the gate (`site_build.sh`) refuses and one WKD file without the other (NRV-E1152), dangling symlinks included, and comparing the WKD file with the key file at the newest published `v*` tag whose commit is an ancestor of `main` (`git merge-base --is-ancestor <tag> origin/main`), prereleases included, never at a reference the site pull request names (NRV-E1162), with its test, which covers a candidate's pull request with its entry first in `RELEASES`, a candidate cut during a rotation followed by an unrelated site pull request that must carry the candidate's key file, and a prerelease tagged on a branch (newer than the last release, with an older or no key file), which is skipped, so the reference stays the key file of the newest tag on `main` | `docs/INSTALL.md`, `CLAUDE.md`, `docs/releases/automation.md`, `tests/packaging/repos.py` (one line); the site's `CLAUDE.md`, `README.md`, `.github/CODEOWNERS`, `.well-known/openpgpkey/*`, `site_check.mjs` and its test | mechanical, except the `site_check.mjs` change (implementation); supervisor checks | after 2 and 3, and after setup steps 2 and 8 |
+| E | Setup steps 1 to 10 | Cloudflare, GitHub | owner | in order; step 2 after slices 5a and W; step 4 after K and before slice 3; step 7 only after step 3's check |
+| F | The rehearsal, its run link recorded, and `REPOS_LIVE` set | worklog, a repository variable | supervisor | after 0 to 5, 5a, 0b, 2b, K and E |
 | M | P376c: `macos-x86_64` and `mac-verify.yml`'s x86_64 cell moved to `macos-15` under Rosetta; automation.md's wording | `.github/workflows/ci.yml`, `.github/workflows/mac-verify.yml`, `docs/releases/automation.md` | mechanical; supervisor checks | on P376c's trigger |
 
 Slices 0, 1 and 2 have merged (2 is #368). The order from here (P376):
 
 1. **K.** It touches only its own test and workflow.
-2. **0b**, once K's branch is known.
-3. **2b**, after K and 0b. It amends what slice 2 merged.
-4. **Setup step 4**, by the branch K chose, **then 3**.
-5. **4**, after 2b. Slices 1, 2 and 4 each touch `ci.yml` and run in sequence.
-6. **5**, which changes no script in this repository, after 3 and 4.
-7. **E and F**, the rehearsal.
+2. **5a**, now, beside the rest: it touches only the site repository. Setup step 2 waits for it.
+3. **0b**, once K's branch is known.
+4. **2b**, after K and 0b. It amends what slice 2 merged.
+5. **Setup step 4**, by the branch K chose, **then 3**.
+6. **4**, after 2b. Slices 1, 2 and 4 each touch `ci.yml` and run in sequence.
+7. **5**, which changes no script in this repository, after 3 and 4.
+8. **E and F**, the rehearsal.
 
 M waits for its trigger (P376c). Slice G, the check that the release commit records its gates,
 comes after v0.7.1 and proposes its own decision in its own pull request.

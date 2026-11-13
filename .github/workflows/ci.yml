@@ -173,7 +173,7 @@ jobs:
           tool_is rpmsign "RPM version 4.18.2"
           gpg --version | head -n1 | grep -q 'gpg (GnuPG) 2\.4\.' || { echo "error[NRV-E1139]: ci.yml: gpg is not 2.4" >&2; exit 1; }
 
-      - name: Release scripts (the bill of materials, N63; the refusals, NRV-E1112 to E1117, E1130 to E1138)
+      - name: Release scripts (the bill of materials, N63; the refusals, NRV-E1112 to E1117, E1130 to E1138, E1152, E1164)
         if: needs.changes.outputs.code != 'false'
         run: |
           python3 .github/scripts/test_sbom.py
@@ -183,6 +183,8 @@ jobs:
           python3 -I .github/scripts/test_release_finish.py
           python3 -I .github/scripts/test_r2.py
           python3 -I .github/scripts/test_package_repos.py
+          python3 -I .github/scripts/test_site_build.py
+          python3 -I .github/scripts/test_repos_alarm.py
 
       - name: Nightly perf scripts (the comparison, its issues)
         if: needs.changes.outputs.code != 'false'
@@ -1068,3 +1070,55 @@ jobs:
         if: needs.changes.outputs.code != 'false'
         with:
           name: vopr_main
+
+  # The repositories' freshness, on every push to main: stable's InRelease must have at least 10 days
+  # of `Valid-Until` left (NRV-E1150; docs/releases/packages.md, "The 60-day rule"). Never on a pull
+  # request, not a required check, and not in release.yml's call of this file (`github.workflow` is
+  # then `Release`): a Cloudflare outage blocks neither. Until the rehearsal has written the bucket
+  # it does not run (REPOS_LIVE).
+  repos-fresh:
+    if: ${{ github.event_name == 'push' && github.workflow == 'CI' && vars.REPOS_LIVE == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      code: ${{ steps.fresh.outputs.code }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+
+      - name: Repository freshness (Valid-Until at least 10 days ahead)
+        id: fresh
+        env:
+          # A repository variable, not the environment's: this job has no environment (P404).
+          PACKAGES_BASE_URL: ${{ vars.PACKAGES_BASE_URL }}
+        run: |
+          set -euo pipefail
+          .github/scripts/package_repos.sh fresh
+
+  # `issues: write` and nothing else; no environment, no secret; it never changes the run's verdict.
+  # Only for `failure`: a superseded run of this workflow on main is cancelled, never alarmed.
+  alarm:
+    needs: repos-fresh
+    if: ${{ always() && contains(needs.*.result, 'failure') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    continue-on-error: true
+    permissions:
+      issues: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+
+      - name: File the alarm
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PACKAGE_REPOS_OWNER: ${{ vars.PACKAGE_REPOS_OWNER }}
+          CODE: ${{ needs.repos-fresh.outputs.code }}
+        run: |
+          set -euo pipefail
+          url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          .github/scripts/repos_alarm.sh ci.yml repos-fresh "${CODE:-unknown}" "$url"
