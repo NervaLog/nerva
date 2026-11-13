@@ -11,6 +11,8 @@
 # fails a run: when GitHub refuses, it prints NRV-W1103 and exits 0. Environment: GH_TOKEN,
 # GITHUB_REPOSITORY, PACKAGE_REPOS_OWNER. Nothing secret is ever printed.
 #
+# Only comments by github-actions[bot] count for the deduplication: anyone may comment on a public issue.
+#
 # Testing override: REPOS_ALARM_NOW (an epoch second, instead of the clock).
 set -euo pipefail
 { set +x; } 2>/dev/null
@@ -49,14 +51,14 @@ trap 'rm -f "$err"' EXIT
 fail() { warn "$1" "$(head -c 300 "$err" | tr '\n' ' ')"; }
 
 # The open alarm issue, if any (never a pull request: the issues endpoint lists both).
-issue=$(gh api "repos/$GITHUB_REPOSITORY/issues?labels=$label&state=open&per_page=1" \
-  --jq '.[] | select(has("pull_request") | not) | .number' 2>"$err") || fail "reading the open issues failed"
+issue=$(gh api "repos/$GITHUB_REPOSITORY/issues?labels=$label&state=open&sort=created&direction=asc&per_page=100" \
+  --jq '[.[] | select(has("pull_request") | not) | .number][0] // empty' 2>"$err") || fail "reading the open issues failed"
 
 if [ -n "$issue" ]; then
   [[ $issue =~ ^[0-9]+$ ]] || fail "the issue number is not a number"
   prefix="\`$workflow\` / \`$job\` failed with \`$code\`:"
   seen=$(gh api "repos/$GITHUB_REPOSITORY/issues/$issue/comments?since=$since&per_page=100" \
-    --jq ".[] | select(.created_at >= \"$since\") | .body" 2>"$err") || fail "reading the comments of issue #$issue failed"
+    --jq ".[] | select(.created_at >= \"$since\" and .user.login == \"github-actions[bot]\") | .body" 2>"$err") || fail "reading the comments of issue #$issue failed"
   if printf '%s\n' "$seen" | grep -qF -e "$prefix"; then
     echo "::notice::the alarm for $workflow / $job / $code was commented in the last 24 hours; not repeated" >&2
     exit 0

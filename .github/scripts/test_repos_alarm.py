@@ -53,7 +53,10 @@ route, _, query = path.partition("?")
 parts = route.split("/")  # repos OWNER REPO issues [N comments]
 out = None
 if method == "GET" and parts[3:] == ["issues"]:
-    out = [i for i in st["issues"] if i["state"] == "open" and "package-repos" in i["labels"]][:1]
+    q = dict(x.split("=", 1) for x in query.split("&") if "=" in x)
+    out = [i for i in st["issues"] if i["state"] == "open" and "package-repos" in i["labels"]]
+    out.sort(key=lambda i: i["number"], reverse=q.get("direction", "desc") == "desc")
+    out = out[:int(q.get("per_page", 30))]
     out = [{k: v for k, v in i.items() if k in ("number", "pull_request")} for i in out]
 elif method == "GET" and parts[5:] == ["comments"]:
     out = [c for c in st["comments"] if c["issue"] == int(parts[4])]
@@ -63,7 +66,8 @@ elif method == "POST" and parts[3:] == ["issues"]:
                          "labels": fields.get("labels[]", []), "assignees": fields.get("assignees[]", [])})
     out = {"number": n}
 elif method == "POST" and parts[5:] == ["comments"]:
-    st["comments"].append({"issue": int(parts[4]), "body": fields["body"][0], "created_at": iso(now)})
+    st["comments"].append({"issue": int(parts[4]), "body": fields["body"][0], "created_at": iso(now),
+                          "user": {"login": "github-actions[bot]"}})
     out = {}
 else:
     sys.stderr.write("gh: unexpected " + method + " " + path + "\\n")
@@ -162,6 +166,26 @@ class Alarm(unittest.TestCase):
         self.alarm()
         self.assertEqual(len(self.state()["issues"]), 2)
         self.assertEqual(self.state()["comments"], [])
+
+    def test_a_newer_pull_request_with_the_label_does_not_hide_the_open_issue(self):
+        self.alarm()
+        st = self.state()
+        st["issues"].append({"number": 2, "state": "open", "labels": ["package-repos"], "title": "pr",
+                             "body": "", "assignees": [], "pull_request": {}})
+        self.state(st)
+        self.alarm(code="NRV-E1145")
+        st = self.state()
+        self.assertEqual(len(st["issues"]), 2, "no second alarm issue")
+        self.assertEqual([c["issue"] for c in st["comments"]], [1])
+
+    def test_a_comment_by_anyone_else_does_not_suppress_the_alarm(self):
+        self.alarm()
+        st = self.state()
+        st["comments"].append({"issue": 1, "body": f"`release-finish.yml` / `repos` failed with `NRV-E1145`: x",
+                               "created_at": "2027-01-15T08:00:00Z", "user": {"login": "someone"}})
+        self.state(st)
+        self.alarm(code="NRV-E1145")
+        self.assertEqual(len(self.state()["comments"]), 2, "the alarm is commented although a stranger wrote its line")
 
     def test_a_closed_issue_is_not_commented_on(self):
         self.state({"issues": [{"number": 1, "state": "closed", "labels": ["package-repos"], "title": "old",

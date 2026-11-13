@@ -27,14 +27,17 @@ amends: P376
 - Every failing step writes `code=<NRV-...>` to `$GITHUB_OUTPUT` for `repos_alarm.sh`.
 
 **Not implemented, because P392 removed their premise:** the subkey roles (`primary`, `retired`,
-`revoked`, `anchor`), the `sec#` check of the CI secret, NRV-E1160 (retired), and the skipped-run count.
+`revoked`, `anchor`), the `sec#` check of the CI secret and NRV-E1160 (retired). **Not implemented,
+for another reason:** the skipped-run count; P392 did not remove its premise, so the alarm keeps its
+24-hour deduplication per (workflow, job, code) and nothing counts skipped runs.
 
 **Choices the task left open.**
 
-- `restore` refuses the Key ID of a revoked key (a published revocation is final) and nothing else; a
+- `restore` refuses the Key ID of a revoked key (a published revocation is final) and one that is neither
+  current's nor previous's (5b would refuse its rpms), and nothing else; a
   revoked key may still be listed as `previous`, so its rpms can be excluded and the key file kept.
 - The key file may hold a revoked `previous`; `current` and `next` must be neither revoked nor expired.
-- `PACKAGE_REPOS_SERVED_WAIT=<interval>:<total>` is refused on a runner, like the other overrides.
+- `PACKAGE_REPOS_SERVED_WAIT=<interval>:<total>` and `PACKAGE_REPOS_CLOCK` are refused on a runner, like the other overrides.
 
 **Cost.** The rotation to a new key needs `previous` in `fingerprints` for as long as rpms signed by the
 old key stay published, or an exclusion; there is no subkey rotation that needs neither (P392).

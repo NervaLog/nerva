@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -507,13 +508,13 @@ class Parsing(Base):
 
     def test_a_key_in_the_key_file_but_not_in_fingerprints_is_refused(self):
         self.set_keys(current="a", file_extra=("b",))
-        self.assertEqual(self.verify(self.good("b")), 1 if False else self.verify(self.good("b")))
         self.assertNotEqual(self.verify(self.good("b")), 0)
 
-    def test_the_next_and_previous_keys_verify(self):
+    def test_a_manifest_is_signed_by_current_or_previous_and_never_by_next(self):
         self.set_keys(current="a", next="b", previous="c")
-        for n in "abc":
-            self.assertEqual(self.verify(self.good(n)), 0, n)
+        self.assertEqual(self.verify(self.good("a")), 0)
+        self.assertEqual(self.verify(self.good("c")), 0)
+        self.assertNotEqual(self.verify(self.good("b")), 0, "a signature by next is refused on a manifest")
 
     def test_the_wrong_generation_is_refused(self):
         self.assertNotEqual(self.verify(self.good(gen=2), 1), 0)
@@ -594,7 +595,7 @@ class Ready(Base):
 
     def test_a_testing_override_on_a_runner_is_e1139(self):
         self.release("v0.7.1")
-        for v in ("PACKAGE_KEYS_DIR", "R2_PY", "PACKAGE_REPOS_FREE_KIB", "PACKAGE_REPOS_SERVED_WAIT",
+        for v in ("PACKAGE_KEYS_DIR", "R2_PY", "PACKAGE_REPOS_FREE_KIB", "PACKAGE_REPOS_SERVED_WAIT", "PACKAGE_REPOS_CLOCK",
                   "PACKAGE_REPOS_KILL_AT"):
             rc, _, err = self.ready("v0.7.1", GITHUB_ACTIONS="true", **{v: "1"})
             self.assert_diag(rc, err, "NRV-E1139")
@@ -1085,6 +1086,63 @@ class Publish(Base):
         self.assertEqual(p.returncode, 0)  # a package-lines-only generation copies them (spec, "The manifest")
 
 
+class Roles(Base):
+    """Which role may sign which file (docs/releases/packages.md, "The signature check"), through
+    `verify-sig`: a current, b next, c previous."""
+
+    def setUp(self):
+        super().setUp()
+        self.set_keys(current="a", next="b", previous="c")
+        self.data = self.tmp / "data.txt"
+        self.data.write_text("Date: now\n")
+
+    def sign(self, key, detach):
+        home = self.tmp / "sg"
+        home.mkdir(mode=0o700, exist_ok=True)
+        env = {**os.environ, "GNUPGHOME": str(home)}
+        subprocess.run(["gpg", "--batch", "--import"], input=self.k[key][1], text=True, env=env,
+                       capture_output=True, check=True)
+        out = self.tmp / ("sig.asc" if detach else "clear.asc")
+        out.unlink(missing_ok=True)
+        subprocess.run(["gpg", "--batch", "--pinentry-mode", "loopback", "--passphrase", PASS[key],
+                        "--digest-algo", "SHA512", "--detach-sign" if detach else "--clearsign", "--armor",
+                        "-u", self.k[key][0], "-o", str(out), str(self.data)],
+                       check=True, capture_output=True, env=env)
+        return out
+
+    def check(self, kind, sig, data=None):
+        args = ["bash", str(SCRIPT), "verify-sig", kind, str(sig)] + ([str(data)] if data else [])
+        p = subprocess.run(args, env=self.env(), capture_output=True, text=True)
+        return p.returncode
+
+    def test_inrelease_may_be_signed_by_current_or_next_and_not_previous(self):
+        self.assertEqual(self.check("inrelease", self.sign("a", False)), 0)
+        self.assertEqual(self.check("inrelease", self.sign("b", False)), 0)
+        self.assertEqual(self.check("inrelease", self.sign("c", False)), 1, "previous may not sign InRelease")
+
+    def test_release_gpg_may_be_signed_by_current_or_next_and_not_previous(self):
+        self.assertEqual(self.check("releasegpg", self.sign("a", True), self.data), 0)
+        self.assertEqual(self.check("releasegpg", self.sign("b", True), self.data), 0)
+        self.assertEqual(self.check("releasegpg", self.sign("c", True), self.data), 1)
+
+    def test_repomd_asc_is_signed_by_current_only(self):
+        self.assertEqual(self.check("repomd", self.sign("a", True), self.data), 0)
+        self.assertEqual(self.check("repomd", self.sign("b", True), self.data), 1, "next may not sign repomd.xml.asc")
+        self.assertEqual(self.check("repomd", self.sign("c", True), self.data), 1, "previous may not either")
+
+    def test_a_manifest_kind_refuses_next_through_the_same_door(self):
+        self.assertEqual(self.check("manifest", self.sign("c", False)), 0)
+        self.assertEqual(self.check("manifest", self.sign("b", False)), 1)
+
+    def test_the_class_must_match_the_kind_of_file(self):
+        self.assertEqual(self.check("releasegpg", self.sign("a", False)), 1, "a clearsigned file is not a detached signature")
+        self.assertEqual(self.check("inrelease", self.sign("a", True), self.data), 1, "a detached signature is not clearsigned")
+
+    def test_a_signer_without_a_listed_key_is_refused(self):
+        self.set_keys(current="a")
+        self.assertEqual(self.check("inrelease", self.sign("b", False)), 1)
+
+
 def kid(fpr):
     return fpr[-16:].lower()
 
@@ -1193,6 +1251,7 @@ class Slice2b(Base):
             (f"exclude {kb}", self.OWNER),
             ("exclude 0123456789abcdef", self.OWNER),
             (f"restore {ka}", self.OWNER),
+            (f"restore {kb}", self.OWNER),
             (f"drop {ka}", self.OWNER),
             ("exclude abc", self.OWNER),
         ]
@@ -1222,6 +1281,21 @@ class Slice2b(Base):
         rc, _, err = self.refresh(RPM_KEY=f"restore {ka}", **self.OWNER)
         self.assert_diag(rc, err, "NRV-E1139")
 
+    def test_restoring_a_key_that_is_neither_current_nor_previous_is_refused_before_any_write(self):
+        self.rotate_away()
+        ka = kid(self.k["a"][0])
+        self.assertEqual(self.refresh(RPM_KEY=f"exclude {ka}", **self.OWNER)[0], 0)
+        # a is in no role now (rotate_away dropped previous): a restore could never be published
+        self.s3.log.clear()
+        before = set(self.s3.objects)
+        gens = self.manifest_keys()
+        rc, _, err = self.refresh(RPM_KEY=f"restore {ka}", **self.OWNER)
+        self.assert_diag(rc, err, "NRV-E1139")
+        self.assertIn("neither current's nor previous's", err)
+        self.assertEqual(self.new_puts(before), [])
+        self.assertEqual(self.manifest_keys(), gens)
+        self.assertTrue(all(v[0] == "excluded" for k, v in self.entries().items() if k.startswith("rpm/")))
+
     def test_a_secret_that_is_not_the_pinned_current_key_is_refused(self):
         self.baseline()
         self.set_keys(current="a", secret="c")
@@ -1247,6 +1321,79 @@ class Slice2b(Base):
         threading.Timer(1.5, self.web.override.clear).start()
         self.web.override["apt/dists/stable/InRelease"] = b"stale"
         rc, _, err = self.run_script("served", PACKAGE_REPOS_SERVED_WAIT="1:20")
+        self.assertEqual(rc, 0, err)
+
+    def test_a_stalled_edge_ends_in_e1145_inside_the_deadline_not_in_a_timeout(self):
+        self.baseline()
+        log = self.tmp / "curl.log"
+        clock = self.tmp / "clock"
+        clock.write_text("1000")
+        self.shim("clock", f'n=$(cat {clock}); echo $((n + 40)) >{clock}; echo $n\n')
+        # a curl that stalls to its --max-time: it records the cap and takes that long on the fake clock
+        self.shim("curl", f'while [ $# -gt 0 ]; do [ "$1" = --max-time ] && m=$2; shift; done\n'
+                          f'echo $m >>{log}; n=$(cat {clock}); echo $((n + m)) >{clock}; exit 28\n')
+        t0 = time.time()
+        rc, _, err = self.run_script("served", PACKAGE_REPOS_SERVED_WAIT="1:120",
+                                     PACKAGE_REPOS_CLOCK=str(self.tmp / "bin/clock"))
+        self.assert_diag(rc, err, "NRV-E1145")
+        self.assertEqual(self.code(), "NRV-E1145")
+        self.assertLess(time.time() - t0, 60, "the bound is the clock, not the attempts")
+        caps = [int(x) for x in log.read_text().split()]
+        self.assertTrue(caps and all(1 <= c <= 60 for c in caps), caps)
+        self.assertLessEqual(len(caps), 4, caps)  # 120 s of fake clock at 40+ s a call
+
+    def test_fresh_refuses_an_index_without_valid_until(self):
+        self.baseline()
+        old = self.s3.objects["apt/dists/stable/InRelease"][0].decode()
+        body = old.split("-----BEGIN PGP SIGNATURE-----")[0].split("\n\n", 1)[1].rstrip("\n").replace("\n- ", "\n")
+        body = "".join(l + "\n" for l in body.splitlines() if not l.startswith("Valid-Until:"))
+        self.web.override["apt/dists/stable/InRelease"] = self.sign_manifest(body, "a")
+        rc, _, err = self.run_script("fresh")
+        self.assert_diag(rc, err, "NRV-E1150")
+        self.assertIn("no readable Valid-Until", err)
+
+    def test_fresh_refuses_an_index_signed_only_by_previous(self):
+        self.baseline()
+        self.set_keys(current="a", previous="c")
+        old = self.s3.objects["apt/dists/stable/InRelease"][0].decode()
+        body = old.split("-----BEGIN PGP SIGNATURE-----")[0].split("\n\n", 1)[1].rstrip("\n").replace("\n- ", "\n") + "\n"
+        self.web.override["apt/dists/stable/InRelease"] = self.sign_manifest(body, "c")
+        rc, _, err = self.run_script("fresh")
+        self.assert_diag(rc, err, "NRV-E1150")
+        self.web.override["apt/dists/stable/InRelease"] = self.sign_manifest(body, "a")
+        self.assertEqual(self.run_script("fresh")[0], 0)
+
+    def test_a_release_without_a_date_is_refused_not_read_as_midnight(self):
+        self.bound("v0.7.2")
+        real = self.real("apt-ftparchive")
+        self.shim("apt-ftparchive", f'{real} "$@" | case " $* " in *" release "*) grep -v "^Date:";; *) cat;; esac\n')
+        rc, _, err = self.publish("v0.7.2")
+        self.assert_diag(rc, err, "NRV-E1156")
+        self.assertIn("dated ''", err)
+
+    def test_a_refusal_inside_step_5b_leaves_no_verify_home_behind(self):
+        self.bound("v0.7.2")
+        real = self.real("gpgv")
+        self.shim("gpgv", f'case "$GNUPGHOME" in *verify) exit 1;; esac\nexec {real} "$@"\n')
+        (self.tmp / "tmp").mkdir(exist_ok=True)
+        p = subprocess.run(["bash", str(SCRIPT), "publish", "v0.7.2"], env=self.env(), capture_output=True, text=True)
+        self.assertEqual(p.returncode, 1, p.stderr)
+        self.assertRegex(p.stderr, r"error\[NRV-E1161\]")
+        subprocess.run(["bash", str(SCRIPT), "cleanup"], env=self.env(), capture_output=True)
+        self.assertEqual(sorted(x.name for x in (self.tmp / "tmp").iterdir()), [])
+
+    def test_the_owner_gate_reads_the_runners_triggering_actor_first(self):
+        self.rotate_away()
+        ka = kid(self.k["a"][0])
+        before = set(self.s3.objects)
+        # the workflow's variable says owner, the runner's own says someone else: refused
+        rc, _, err = self.refresh(RPM_KEY=f"exclude {ka}", PACKAGE_REPOS_OWNER="topwombat",
+                                  TRIGGERING_ACTOR="topwombat", GITHUB_TRIGGERING_ACTOR="someone")
+        self.assert_diag(rc, err, "NRV-E1139")
+        self.assertEqual(self.new_puts(before), [])
+        # logins are case-insensitive
+        rc, _, err = self.refresh(RPM_KEY=f"exclude {ka}", PACKAGE_REPOS_OWNER="TopWombat",
+                                  GITHUB_TRIGGERING_ACTOR="topwombat")
         self.assertEqual(rc, 0, err)
 
     def test_fresh_passes_on_a_fresh_stable_and_writes_nothing(self):
