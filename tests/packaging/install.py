@@ -23,6 +23,9 @@ tarball's contents, then checks, against the real units:
   5c. the unit restarts exit 1 (NRestarts), and its start limit ends the loop as `failed`;
   5d. `--uninstall` while the units run is refused with NRV-E1118 and NRV-E1102 (#340), and keeps the
       enable links when a package's /usr/bin/nerva exists;
+  5e. each shipped `*.env.example`, sourced as it ships, is refused by the binary (NRV-E0901 for the
+      replica's cluster key, NRV-E0008 for the gateway's key): a forgotten edit cannot start a host
+      on a published secret (#373);
   6. `install.sh --uninstall` removes the binary, the units and the enable links of the instances
      that were enabled, and leaves /var/lib/nerva.
 Not provoked: a `nerva` on a noexec mount (a script that exits 1 stands for it in NRV-E1107).
@@ -262,6 +265,48 @@ def test_dry_run_and_install(stage):
     again = installer(stage)
     assert snapshot() == after, "a second install.sh changed something"
     assert "installed:" in again.stdout and "install /" not in again.stdout, again.stdout
+
+
+def env_file(path):
+    """A systemd EnvironmentFile as the examples are written: NAME=value lines, no quotes."""
+    env = {}
+    for line in open(path).read().splitlines():
+        if line.strip() and not line.lstrip().startswith("#"):
+            name, _, value = line.partition("=")
+            env[name] = value
+    return env
+
+
+def test_env_examples(packaging, nerva, tmp):
+    """The examples' secrets are refused by the binary itself, with a coded block that says what to
+    set (#373). Each example's own values are used unchanged, except the addresses, which are made
+    loopback so that the refusal cannot come from anything but the key."""
+    replica = env_file(os.path.join(packaging, "replica.env.example"))
+    gateway = env_file(os.path.join(packaging, "api.env.example"))
+    assert "NERVA_CLUSTER_KEY" in replica and "NERVA_KEY" in gateway
+    data = os.path.join(tmp, "example.nerva")
+    done = sh([nerva, "format", "--cluster=1", "--replica=0", "--replica-count=1", data])
+    assert done.returncode == 0, done.stderr
+    cases = [
+        ([nerva, "start", "--addresses=127.0.0.1:0", data], replica, "NRV-E0901", "start",
+         "set NERVA_CLUSTER_KEY"),
+        ([nerva, "api", f"--cluster={gateway['NERVA_CLUSTER']}", "--addresses=127.0.0.1:0",
+          "--listen=127.0.0.1:0"], gateway, "NRV-E0008", "api", "set NERVA_KEY"),
+    ]
+    for command, example, code, name, message in cases:
+        env = {"PATH": os.environ["PATH"]}
+        env.update({k: v for k, v in example.items() if k.endswith("KEY")})
+        try:
+            result = sh(command, env=env, timeout=30)
+        except subprocess.TimeoutExpired:
+            raise AssertionError(f"{name} started with the example's own secret: {example}")
+        # `start` logs before it checks the key, so the block is the lines from `error[`.
+        lines = result.stderr[result.stderr.index("error["):].strip().split("\n") \
+            if "error[" in result.stderr else []
+        assert result.returncode == 1 and lines, (name, result.returncode, result.stderr)
+        assert lines[0].startswith(f"error[{code}]: {name}: {message}"), result.stderr
+        assert any(line.startswith("  fix    ") for line in lines), result.stderr
+        assert "error." not in result.stderr and "Traceback" not in result.stderr, result.stderr
 
 
 def test_refusals(packaging, nerva, tmp, stage):
@@ -649,6 +694,8 @@ def main():
     try:
         stage = stage_tarball(packaging, nerva, tmp, "stage")
         test_early_refusals(stage)
+        test_env_examples(packaging, nerva, tmp)
+        print("ok: each env example's secret is refused by the binary (NRV-E0901, NRV-E0008)")
         test_dry_run_and_install(stage)
         print("ok: --dry-run changes nothing; install; a second install changes nothing")
         test_refusals(packaging, nerva, tmp, stage)
