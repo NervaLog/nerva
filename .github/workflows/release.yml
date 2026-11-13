@@ -1,5 +1,6 @@
 # A commit to main that changes VERSION publishes release v<VERSION> (docs/DECISIONS.md N40). The
-# jobs run in order: version, then ci (on that commit), then release (binaries for four targets, and
+# jobs run in order: version, then ci and packages (packages.yml, the packaging tests; both on that
+# commit, and the release waits for both, #384), then release (binaries for four targets, and
 # a draft release), then finish (release-finish.yml, on main), which publishes it once the owner has
 # approved `apple-signing` (P360).
 # A version with a suffix (0.2.0-rc.1) is a prerelease. Releasing a version twice fails.
@@ -119,8 +120,18 @@ jobs:
       contents: read
       pull-requests: read
 
+  # The packaging tests on this very commit (docs/briefs/v0.7.1.md, demo row 6; #384): called, not
+  # observed, so a later push to main cannot cancel it, a red run stops the draft, and its result is
+  # on this run. It runs beside `ci`; each job is on a hosted runner of its own (the tests need about
+  # 2 GiB of disk, which only a fresh runner has).
+  packages:
+    needs: version
+    uses: ./.github/workflows/packages.yml
+    permissions:
+      contents: read
+
   release:
-    needs: [version, ci]
+    needs: [version, ci, packages]
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     permissions:
