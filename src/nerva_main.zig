@@ -8,6 +8,7 @@ const std = @import("std");
 const log = std.log.scoped(.main);
 
 const stdx = @import("stdx");
+const builtin = @import("builtin");
 const vsr = @import("vsr.zig");
 const mv = vsr.multiversion;
 const Multiversion = mv.Multiversion;
@@ -820,7 +821,9 @@ fn command_start(
     };
 
     // Poll the binary on disk for a newer bundle, as upstream does after opening.
-    if (multiversion_os) |os| os.timeout_start(replica.replica);
+    if (builtin.target.os.tag == .linux) {
+        if (multiversion_os) |os| os.timeout_start(replica.replica);
+    }
 
     // Startup succeeded: the trace file is the operator's now, whatever happens later.
     diagnostic.cleanup_clear();
