@@ -862,8 +862,7 @@ gateways can reach.
 To rotate a gateway key without downtime: restart every gateway with the new key as
 `NERVA_KEY_NEXT` (it accepts both); move every caller to the new key; then restart every gateway
 with the new key as `NERVA_KEY` and no `NERVA_KEY_NEXT`. Each set key must be non-empty, and the
-two must differ, and neither may be the placeholder `api.env.example` ships; a gateway refuses to
-start otherwise, without printing either key (P96).
+two must differ; a gateway refuses to start otherwise, without printing either key (P96).
 
 ## Demos
 
@@ -894,7 +893,8 @@ Nerva holds its first client's money on the R milestones' terms, in
 
 ## Roadmap
 
-The 1.0 target is in [docs/GOALS-1.0.md](./docs/GOALS-1.0.md).
+The 1.0 target is in [docs/GOALS-1.0.md](./docs/GOALS-1.0.md). Which release ships what, from
+v0.7.1 to 1.0, is in [docs/ROADMAP.md](./docs/ROADMAP.md).
 
 1. **Foundation** — vendored consensus + storage + simulator, placeholder state machine. ✅
 2. **Commit core** — row model, optimistic read-set validation, versioned base rows; VOPR

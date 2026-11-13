@@ -85,7 +85,7 @@ cat > "$pkg/DEBIAN/control" << CONTROL
 Package: nerva
 Version: $version-1
 Architecture: $arch
-Maintainer: The Nerva authors <https://github.com/NervaLog/nerva>
+Maintainer: The Nerva authors <nerva@nerva.pro>
 Installed-Size: $(((bytes + 1023) / 1024))
 Pre-Depends: passwd
 Recommends: systemd

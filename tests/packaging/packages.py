@@ -182,6 +182,24 @@ def check_setup_modes(repo, tmp):
         result = run(["sh", f"{root}/setup.sh", *args], check=False, env=env)
         assert result.returncode == 0, (args, result.stderr)
         assert "NRV-W1101" not in result.stderr, (args, result.stderr)
+    # useradd, then each install -d, that fail: NRV-E1163 after the tool's own line, exit 1 (#378).
+    # The stub fails only for its pattern, so the earlier steps pass.
+    for tool, when, what in (("useradd", "*", "create the system user nerva"),
+                             ("install", "*/etc/nerva", "make the directory /etc/nerva"),
+                             ("install", "*/var/lib/nerva", "make the directory /var/lib/nerva")):
+        stubs = f"{root}/failing-{tool}-{len(os.listdir(root))}"
+        os.makedirs(stubs)
+        with open(f"{stubs}/{tool}", "w") as out:
+            out.write(f"#!/bin/sh\ncase \"$*\" in {when}) echo '{tool}: stub failure' >&2; exit 1;; esac\n"
+                      "exit 0\n")
+        os.chmod(f"{stubs}/{tool}", 0o755)
+        failing = {**env, "PATH": f"{stubs}:{env['PATH']}"}
+        result = run(["sh", f"{root}/setup.sh", "install"], check=False, env=failing)
+        lines = result.stderr.strip().split("\n")
+        assert result.returncode == 1 and len(lines) == 4, (what, result.returncode, result.stderr)
+        assert lines[0] == f"{tool}: stub failure", lines
+        assert lines[1] == f"error[NRV-E1163]: nerva package: could not {what}", lines
+        assert lines[2].startswith("  cause  ") and lines[3].startswith("  fix    "), lines
     binary = f"{root}/usr/local/bin/nerva"
     os.makedirs(os.path.dirname(binary))
     open(binary, "w").close()
@@ -193,6 +211,11 @@ def check_setup_modes(repo, tmp):
         if not first:
             assert result.stderr.startswith("warning[NRV-W1101]: nerva package: "), result.stderr
             assert "\n  cause  " in result.stderr and "\n  fix    " in result.stderr, result.stderr
+            # The fix is W1102's advice (#340): keep one install, stop the replicas, and the
+            # enabled instances survive (or are enabled again).
+            assert "keep one install" in result.stderr and "stop the nerva@N and nerva-api@N replicas" in result.stderr, result.stderr
+            assert "Enable any instance that is not enabled" in result.stderr, result.stderr
+    print("  a failing useradd or install -d is refused with NRV-E1163")
     print("  NRV-E1111 is checked on a first install (install, rpm 1); an upgrade (upgrade, rpm 2) "
           "warns NRV-W1101 about /usr/local/bin/nerva and goes on")
 
@@ -255,7 +278,7 @@ def check_script(text, repo, name):
     assert verbs <= SCRIPTS[name], f"{name} runs systemctl {verbs - SCRIPTS[name]}"
     assert "%" not in code, f"{name} has a percent sign: the .rpm embeds it in its spec"
     if name == "package-setup.sh":
-        assert "useradd" in code and "NRV-E1105" in code and "NRV-E1111" in code
+        assert "useradd" in code and "NRV-E1105" in code and "NRV-E1111" in code and "NRV-E1163" in code
 
 
 def check_rpm(path, repo, binary, version, arch, epoch, tmp):
@@ -486,9 +509,11 @@ echo "remove left /var/lib/nerva, /etc/nerva and the user, and disabled the enab
 E1105_CAUSE = "A user, group or unit named nerva exists and is not the one Nerva's installer makes"
 E1111_CAUSE = ("A file that is not this package's (a tarball install, a source build or a full unit "
                "override) would shadow the package's binary or units")
-E1111_FIX = ("if it is a tarball install, run install.sh --uninstall from the tarball (it keeps "
-             "/var/lib/nerva, /etc/nerva and the user); otherwise move or remove the file (change a "
-             "unit with a drop-in); then install the package")
+E1111_FIX = ("if it is a tarball install, stop its replicas with systemd, run install.sh --uninstall "
+             "from the tarball (it keeps /var/lib/nerva, /etc/nerva and the user; its enabled nerva@N "
+             "and nerva-api@N instances are removed, as no package is installed yet, so enable them "
+             "again after installing the package); otherwise move or remove the file (change a unit "
+             "with a drop-in); then install the package")
 FOREIGN = [
     ("a foreign user nerva", "useradd --system --home-dir /nonexistent nerva",
      "NRV-E1105", "nerva package: the user nerva exists, with home /nonexistent", E1105_CAUSE,

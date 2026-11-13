@@ -44,7 +44,7 @@ pub const table = [_]Entry{
     .{ .code = "NRV-E0005", .summary = "A data file already exists at `format`'s path", .exit = exit_operator },
     .{ .code = "NRV-E0006", .summary = "A data file is missing at `start`'s path", .exit = exit_operator },
     .{ .code = "NRV-E0007", .summary = "A replica, gateway or view server cannot listen", .exit = exit_operator },
-    .{ .code = "NRV-E0008", .summary = "`NERVA_KEY` is missing, the example's placeholder, or invalid", .exit = exit_operator },
+    .{ .code = "NRV-E0008", .summary = "`NERVA_KEY` is missing or invalid", .exit = exit_operator },
     .{ .code = "NRV-E0009", .summary = "`--listen` is not loopback and `--listen-remote` was not given", .exit = exit_operator },
     .{ .code = "NRV-E0010", .summary = "A replica or gateway cannot send its metrics to `--statsd`", .exit = exit_operator },
     .{ .code = "NRV-E0604", .summary = "A gateway or view server could not reach the cluster", .exit = exit_operator },
@@ -72,7 +72,7 @@ pub const table = [_]Entry{
     .{ .code = "NRV-E0808", .summary = "A backup's manifest is missing, malformed, too large or of an unknown version", .exit = exit_operator },
     .{ .code = "NRV-E0809", .summary = "A backup does not match its manifest: size, SHA-256, op, version, a view hash or a ledger total", .exit = exit_operator },
     .{ .code = "NRV-E0810", .summary = "A file `export` or `import` was given cannot be opened, read or written", .exit = exit_operator },
-    .{ .code = "NRV-E0901", .summary = "`NERVA_CLUSTER_KEY` is missing, short, the example's placeholder, or wrongly paired with `_NEXT`", .exit = exit_operator },
+    .{ .code = "NRV-E0901", .summary = "`NERVA_CLUSTER_KEY` is missing, short, or wrongly paired with `_NEXT`", .exit = exit_operator },
     .{ .code = "NRV-B0004", .summary = "A `nerva` command hit an error it did not expect", .exit = exit_internal },
 };
 
