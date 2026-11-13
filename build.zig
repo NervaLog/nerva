@@ -240,7 +240,7 @@ pub fn build(b: *std.Build) !void {
     const nerva_pack = b.addExecutable(.{
         .name = "nerva_pack",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/nerva/pack_main.zig"),
+            .root_source_file = b.path("src/nerva_pack.zig"),
             .target = target,
             .optimize = .ReleaseSafe,
         }),

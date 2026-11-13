@@ -15,8 +15,8 @@ const std = @import("std");
 const assert = std.debug.assert;
 const mem = std.mem;
 
-const bundle = @import("bundle.zig");
-const diagnostic = @import("diagnostic.zig");
+const bundle = @import("nerva/bundle.zig");
+const diagnostic = @import("nerva/diagnostic.zig");
 
 /// The largest executable read: upstream's overall bound (`multiversion_binary_size_max`) is
 /// 256 MiB; a past release over it was never packable.
@@ -116,7 +116,7 @@ fn usage() noreturn {
         "NRV-E0001",
         "pack: usage: nerva_pack --input <nerva> --past <past nerva> --output <path>",
         .{},
-        "see the header of src/nerva/pack_main.zig",
+        "see the header of src/nerva_pack.zig",
         .{},
     );
 }
