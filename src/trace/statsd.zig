@@ -1,5 +1,6 @@
 const std = @import("std");
 const stdx = @import("stdx");
+const builtin = @import("builtin");
 const assert = std.debug.assert;
 
 const constants = @import("../constants.zig");
@@ -117,6 +118,12 @@ pub const StatsD = struct {
             socket: std.posix.socket_t,
             io: *IO,
             send_callback_error_count: u64 = 0,
+            /// Nerva (P427): the socket is not connected, so a destination with no route does
+            /// not fail `init_udp`; each packet is sent to `address`, and a failure is counted.
+            address: std.net.Address,
+            /// The first failure is warned about once (NRV-W0733); later ones only count.
+            send_failure_warned: bool = false,
+            send_failure_errno: std.posix.E = .SUCCESS,
         },
         log,
     },
@@ -140,10 +147,8 @@ pub const StatsD = struct {
         const send_buffer = try allocator.create([packet_count_max * packet_size_max]u8);
         errdefer allocator.destroy(send_buffer);
 
-        const address_std = address.to_std();
-        // 'Connect' the UDP socket, so we can just send() to it normally.
-        try std.posix.connect(socket, &address_std.any, address_std.getOsSockLen());
-
+        // Nerva (P427): not connected. `connect` fails with NetworkUnreachable when the host has
+        // no route to the collector, which stopped `nerva start`; packets are sent to the address.
         log.info("{}: sending statsd metrics to {}", .{ process_id, address });
 
         return .{
@@ -152,6 +157,7 @@ pub const StatsD = struct {
                 .udp = .{
                     .socket = socket,
                     .io = io,
+                    .address = address.to_std(),
                 },
             },
             .send_buffer = send_buffer,
@@ -231,11 +237,17 @@ pub const StatsD = struct {
         }
 
         if (self.implementation == .udp and self.implementation.udp.send_callback_error_count > 0) {
-            log.warn(
-                "{}: failed to send {} packets",
-                .{ self.process_id, self.implementation.udp.send_callback_error_count },
-            );
-            self.implementation.udp.send_callback_error_count = 0;
+            const udp = &self.implementation.udp;
+            if (!udp.send_failure_warned) {
+                udp.send_failure_warned = true;
+                log.warn("NRV-W0733 {}: cannot send statsd to {}: {s}; the metrics sent " ++
+                    "there are dropped, and the replica keeps running", .{
+                    self.process_id,
+                    udp.address,
+                    @tagName(udp.send_failure_errno),
+                });
+            }
+            udp.send_callback_error_count = 0;
         }
 
         var send_ready: u32 = 0;
@@ -314,15 +326,30 @@ pub const StatsD = struct {
 
     fn emit_buffer(self: *StatsD, send_completion: *IO.Completion, send_buffer: []const u8) void {
         switch (self.implementation) {
-            .udp => |udp| {
-                udp.io.send(
-                    *StatsD,
-                    self,
-                    StatsD.send_callback,
-                    send_completion,
+            .udp => |*udp| {
+                // Nerva (P427): `IO.send` has no destination, and sends on an unconnected socket
+                // fail. A datagram is taken whole or not at all, so the send is immediate and
+                // never blocks; every errno is a dropped packet, counted by `send_callback`.
+                const flags: u32 = switch (builtin.os.tag) {
+                    .linux => std.posix.MSG.DONTWAIT | std.posix.MSG.NOSIGNAL,
+                    .macos, .ios, .tvos, .watchos, .visionos => 0x80, // MSG_DONTWAIT
+                    else => @compileError("statsd send: unsupported OS"),
+                };
+                const result = std.posix.system.sendto(
                     udp.socket,
-                    send_buffer,
+                    send_buffer.ptr,
+                    send_buffer.len,
+                    flags,
+                    &udp.address.any,
+                    udp.address.getOsSockLen(),
                 );
+                const errno = std.posix.errno(result);
+                if (errno == .SUCCESS and result == send_buffer.len) {
+                    StatsD.send_callback(self, send_completion, send_buffer.len);
+                } else {
+                    if (udp.send_failure_errno == .SUCCESS) udp.send_failure_errno = errno;
+                    StatsD.send_callback(self, send_completion, error.ConnectionRefused);
+                }
             },
             .log => {
                 self.log_buffer.?.appendSliceAssumeCapacity(send_buffer);

@@ -216,7 +216,9 @@ fn run() !void {
                     .log,
             } else .{}) catch |err| {
                 // Only the statsd socket can fail here besides memory: the operator's `--statsd`
-                // names an address this host cannot send to (#181, #184).
+                // names an address family this host has no socket for (#181, #184). A route that
+                // is missing, or a broadcast address, no longer fails: the tracer's packets to it
+                // are dropped with NRV-W0733 (#198, P427).
                 switch (err) {
                     error.OutOfMemory => return err,
                     else => if (tag == .start and args.statsd != null) diagnostic.fail(

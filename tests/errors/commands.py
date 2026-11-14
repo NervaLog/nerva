@@ -152,9 +152,10 @@ def main():
         check("trace exists", ["start", "--addresses=127.0.0.1:1,127.0.0.1:2,127.0.0.1:3",
                                "--development", "--trace=" + trace, data],
               "NRV-E0004", 1, "--trace")
-        # A --statsd address this host cannot send to is the operator's: E0010 naming the flag,
-        # never B0004 (a broadcast address) or E0007 "cannot listen" (no IPv6) (#181, #184).
-        statsd_bad = ["255.255.255.255:8125"]
+        # A --statsd address this host has no socket for is the operator's: E0010 naming the flag,
+        # never E0007 "cannot listen" (no IPv6) (#181, #184). One it cannot send to (a broadcast
+        # address; no route, on other hosts) no longer stops `start`: NRV-W0733, once (#198, P427).
+        statsd_bad = []
         try:
             socket.socket(socket.AF_INET6, socket.SOCK_DGRAM).close()
         except OSError:
@@ -165,14 +166,33 @@ def main():
             expect(result, "NRV-E0010", 1, "start: cannot send statsd to", f"start statsd {statsd}")
             assert "cannot listen" not in result.stderr and "NRV-B0004" not in result.stderr
             seen.append("NRV-E0010")
+        # An unroutable address: the replica keeps running, warns once and never exits E0010. A
+        # replica of three that never meets its peers does not commit, so there is no metrics
+        # emit to wait for in a short run; the unit test (src/nerva/statsd_unroutable.zig) holds
+        # the once-only warning, and here the start must simply survive.
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            free_statsd_port = probe.getsockname()[1]
+        process = subprocess.Popen(
+            [nerva, "start", f"--addresses=127.0.0.1:{free_statsd_port},127.0.0.1:1,127.0.0.1:2",
+             "--development", "--statsd=255.255.255.255:8125", data],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            time.sleep(3)
+            assert process.poll() is None, "start did not run on with an unsendable --statsd"
+        finally:
+            process.kill()
+            stderr = process.communicate()[1]
+        assert "NRV-E0010" not in stderr and stderr.count("NRV-W0733") <= 1, stderr[-1000:]
         # A start that failed must not leave its --trace file behind: the operator fixes the flag
         # and starts again with the same path, which must not be refused as E0004 (#197).
         trace_again = os.path.join(tmp, "trace-again")
-        result = run(nerva, ["start", "--addresses=127.0.0.1:1,127.0.0.1:2,127.0.0.1:3",
-                             "--development", "--trace=" + trace_again,
-                             f"--statsd={statsd_bad[0]}", data], {})
-        expect(result, "NRV-E0010", 1, "start: cannot send statsd to", "trace with bad statsd")
-        assert not os.path.exists(trace_again), "the failed start left its trace file"
+        if statsd_bad:  # only a host without IPv6 can fail a start on --statsd now (P427)
+            result = run(nerva, ["start", "--addresses=127.0.0.1:1,127.0.0.1:2,127.0.0.1:3",
+                                 "--development", "--trace=" + trace_again,
+                                 f"--statsd={statsd_bad[0]}", data], {})
+            expect(result, "NRV-E0010", 1, "start: cannot send statsd to", "trace with bad statsd")
+            assert not os.path.exists(trace_again), "the failed start left its trace file"
         # Every other startup failure removes it too: a held port (NRV-E0007), a missing cluster
         # key (NRV-E0901) and a missing address (NRV-E0710).
         with socket.socket() as held:
