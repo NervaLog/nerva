@@ -259,7 +259,7 @@ follow_main() {
         return 0
     fi
     prune_cache
-    git checkout --quiet --detach "$head"
+    checkout_commit "$head" || return 0
     log "building $head"
     rm -rf "$STATE/bin/$head"
     # `9>&-`: a build left behind by a killed loop must not hold the loop's lock.
@@ -296,9 +296,21 @@ restore_built() {
     if [[ -z "$built" ]]; then return 0; fi
     if [[ "$(git rev-parse HEAD)" != "$built" ]]; then
         log "checkout is not on the built commit $built; restoring it"
-        git checkout --quiet --detach "$built"
+        # Stays on the run.sh running: the checkout's is of no known commit.
+        checkout_commit "$built" || return 0
     fi
     reexec_if_changed "$built"
+}
+
+# `git checkout` of $1, which must not end the loop: under set -e a stale .git/index.lock or a
+# commit the checkout does not have would exit 128 at every restart, a systemd loop with no limit.
+# One coded line per call (a round at most), and the caller carries on with what it has.
+checkout_commit() {
+    local err="$STATE/checkout.err"
+    if git checkout --quiet --detach "$1" 2>"$err"; then return 0; fi
+    log "error[NRV-E0731]: cannot check out $1 ($(head -n1 "$err" | cut -c1-200));" \
+        "still testing ${built:-nothing}"
+    return 1
 }
 
 # After a build of $1: if that commit's run.sh is not the one bash loaded, runs that one instead,

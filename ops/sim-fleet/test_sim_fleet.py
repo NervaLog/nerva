@@ -1803,6 +1803,50 @@ class FailedBuild(unittest.TestCase):
         self.assertIn("BUILT-RUN-SH", out.stdout, out.stderr)
         self.assertNotIn("UNBUILT-RUN-SH", out.stdout)
 
+    def _checkout_fails(self, lock, built_known, on_unbuilt):
+        """follow_main under set -e when `git checkout` fails: returns, with one coded line."""
+        d = tempfile.mkdtemp()
+        self.addCleanup(subprocess.run, ["rm", "-rf", d])
+        remote, repo, state = (os.path.join(d, n) for n in ("remote", "repo", "state"))
+        os.makedirs(remote)
+        self.git(remote, "init", "-q", "-b", "main")
+        Path(remote, "f").write_text("v1")
+        self.git(remote, "add", "f")
+        self.git(remote, "commit", "-q", "-m", "v1")
+        v1 = self.git(remote, "rev-parse", "HEAD")
+        subprocess.run(["git", "clone", "-q", remote, repo], check=True)
+        Path(remote, "f").write_text("v2")
+        self.git(remote, "commit", "-q", "-a", "-m", "v2")
+        v2 = self.git(remote, "rev-parse", "HEAD")
+        self.git(repo, "fetch", "-q", "origin", "main")
+        os.makedirs(state)
+        built = v1 if built_known else "0123456789abcdef0123456789abcdef01234567"
+        start = v2 if on_unbuilt else v1
+        script = (f'source "{HERE}/run.sh"; log() {{ echo "$*" >&2; }}; '
+                  f'build_into() {{ return 1; }}; export -f build_into; prune_cache() {{ :; }}; '
+                  f'STATE="{state}"; built={built}; broken={v2 if on_unbuilt else ""}; '
+                  f'cd "{repo}"; SIM_FLEET_BRANCH=main; SIM_FLEET_GIT_TIMEOUT=60; '
+                  f'SIM_FLEET_BUILD_TIMEOUT=60; SIM_FLEET_REPO_DIR="{repo}"; RUN_ARGS=(a); '
+                  f'RUN_SH_SUM=0; ORIG_ENV=(); git checkout -q --detach {start}; ')
+        if lock:
+            script += 'touch .git/index.lock; '
+        out = subprocess.run(["bash", "-c", script + 'follow_main; echo "RETURNED rc=$?"'],
+                             env={"PATH": os.environ["PATH"], "HOME": d}, capture_output=True,
+                             text=True, timeout=60)
+        self.assertIn("RETURNED rc=0", out.stdout, out.stderr)
+        self.assertEqual(out.stderr.count("NRV-E0731"), 1, out.stderr)
+        self.assertIn("error[NRV-E0731]: cannot check out", out.stderr)
+        self.assertNotIn("\nfatal:", out.stderr)
+
+    def test_a_stale_index_lock_does_not_end_the_loop_restoring_the_built_commit(self):
+        self._checkout_fails(lock=True, built_known=True, on_unbuilt=True)
+
+    def test_a_stale_index_lock_does_not_end_the_loop_checking_out_a_new_head(self):
+        self._checkout_fails(lock=True, built_known=True, on_unbuilt=False)
+
+    def test_an_unknown_built_commit_does_not_end_the_loop(self):
+        self._checkout_fails(lock=False, built_known=False, on_unbuilt=True)
+
     def test_a_restart_already_on_the_built_commit_stays_put(self):
         d = tempfile.mkdtemp()
         self.addCleanup(subprocess.run, ["rm", "-rf", d])
