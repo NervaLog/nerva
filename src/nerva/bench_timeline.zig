@@ -1,7 +1,9 @@
 //! The per-second timeline of `bench:load` (R3, docs/briefs/r3.md "`bench-load`: `--timeline`,
 //! `--warmup` and the gateway's flags").
 //!
-//! Every operation belongs to the second in which it **ended**, counted from the run's start. Each
+//! Every operation belongs to the second in which it **ended**, counted from the run's start. An
+//! operation that began before the end of the run but ended after it (up to the client timeout
+//! later) belongs to no second: it is counted apart, as `late` (P414b). Each
 //! second holds a `LatencyHistogram` and the counters of its operations. The run's summary is the
 //! merge of the seconds after the warm-up, so the warm-up's operations are left out of it (and of
 //! its counters), and the lines `--timeline` writes merge back to exactly that histogram.
@@ -56,7 +58,23 @@ const Second = struct {
 pub const Summary = struct {
     histogram: LatencyHistogram = .{},
     counts: Counts = .{},
+    /// Operations that ended after the run's last second: in no histogram and no counter.
+    late: u64 = 0,
 };
+
+/// Why a file `--timeline` or `--gateway-pid-file` names cannot be created, in words (NRV-E0727).
+pub fn path_error_reason(err: anyerror) []const u8 {
+    return switch (err) {
+        error.FileNotFound => "its directory does not exist",
+        error.AccessDenied, error.PermissionDenied => "permission denied",
+        error.IsDir => "it is a directory",
+        error.NotDir => "a part of its path is not a directory",
+        error.NameTooLong => "the path is too long",
+        error.NoSpaceLeft => "no space left on the device",
+        error.ReadOnlyFileSystem => "the file system is read-only",
+        else => "it cannot be created",
+    };
+}
 
 /// Why `--warmup` and `--seconds` are refused, or null if they are accepted.
 pub fn seconds_refusal(warmup: u32, seconds: u32) ?[]const u8 {
@@ -69,17 +87,17 @@ pub fn seconds_refusal(warmup: u32, seconds: u32) ?[]const u8 {
 }
 
 /// Why the gateway's flags are refused for this workload, or null. They only mean something for
-/// the `botpike` workload, which starts a gateway; `inherit` is the one non-default stderr choice.
+/// the `botpike` workload, which starts a gateway; `--gateway-stderr` is refused when given at all.
 pub fn gateway_flags_refusal(
     gateway_workload: bool,
     statsd_set: bool,
     pid_file_set: bool,
-    stderr_inherit: bool,
+    stderr_set: bool,
 ) ?[]const u8 {
     if (gateway_workload) return null;
     if (statsd_set) return "--gateway-statsd is only for the botpike workload";
     if (pid_file_set) return "--gateway-pid-file is only for the botpike workload";
-    if (stderr_inherit) return "--gateway-stderr is only for the botpike workload";
+    if (stderr_set) return "--gateway-stderr is only for the botpike workload";
     return null;
 }
 
@@ -90,6 +108,8 @@ pub const Timeline = struct {
     /// Monotonic ns, and `CLOCK_REALTIME` µs, at the start of second 0; set by `begin`.
     start_ns: u64 = 0,
     start_wall_us: u64 = 0,
+    /// Operations that ended after the last second (`Summary.late`).
+    late: u64 = 0,
     mutex: std.Thread.Mutex = .{},
 
     pub fn init(gpa: std.mem.Allocator, warmup: u32, seconds: u32) !Timeline {
@@ -110,12 +130,14 @@ pub const Timeline = struct {
         timeline.start_wall_us = start_wall_us;
     }
 
-    /// The second an operation that ended at `end_ns` belongs to. An operation that ends past the
-    /// last second (it began before the end) belongs to the last; one before the start, to the first.
-    pub fn second_of(timeline: *const Timeline, end_ns: u64) u32 {
-        const elapsed = end_ns -| timeline.start_ns;
-        const second = elapsed / std.time.ns_per_s;
-        return @intCast(@min(second, timeline.seconds.len - 1));
+    /// The second an operation that ended at `end_ns` belongs to, or null if it ended after the
+    /// last second (it began before the end of the run, and is `late`). No operation ends before
+    /// the start: the workers start at it.
+    pub fn second_of(timeline: *const Timeline, end_ns: u64) ?u32 {
+        assert(end_ns >= timeline.start_ns);
+        const second = (end_ns - timeline.start_ns) / std.time.ns_per_s;
+        if (second >= timeline.seconds.len) return null;
+        return @intCast(second);
     }
 
     pub fn recorder(timeline: *Timeline) Recorder {
@@ -126,7 +148,7 @@ pub const Timeline = struct {
     pub fn summary(timeline: *Timeline) Summary {
         timeline.mutex.lock();
         defer timeline.mutex.unlock();
-        var result: Summary = .{};
+        var result: Summary = .{ .late = timeline.late };
         for (timeline.seconds[timeline.warmup..]) |*second| {
             result.histogram.merge(&second.histogram);
             result.counts.add(second.counts);
@@ -171,11 +193,15 @@ pub const Recorder = struct {
     second: u32 = 0,
     histogram: LatencyHistogram = .{},
     counts: Counts = .{},
+    late: u64 = 0,
 
     /// An operation that ended at `end_ns` (monotonic). `latency_ns` is null for one that is not
     /// a latency sample (a failed submit) but whose counters still count.
     pub fn record(recorder: *Recorder, end_ns: u64, latency_ns: ?u64, counts: Counts) void {
-        const second = recorder.timeline.second_of(end_ns);
+        const second = recorder.timeline.second_of(end_ns) orelse {
+            recorder.late += 1;
+            return;
+        };
         // A worker's operations end in time order, so its seconds never go backwards.
         assert(second >= recorder.second);
         if (second != recorder.second) {
@@ -194,8 +220,10 @@ pub const Recorder = struct {
         const slot = &timeline.seconds[recorder.second];
         slot.histogram.merge(&recorder.histogram);
         slot.counts.add(recorder.counts);
+        timeline.late += recorder.late;
         recorder.histogram = .{};
         recorder.counts = .{};
+        recorder.late = 0;
     }
 };
 
@@ -334,15 +362,21 @@ test "Timeline: --warmup leaves its seconds out of the summary and flags their l
     }
 }
 
-test "Timeline: a line for every second, empty ones too; late and early operations clamp" {
+test "Timeline: a line for every second, empty ones too; an operation ending after the run is late" {
     var timeline = try Timeline.init(testing.allocator, 1, 3);
     defer timeline.deinit(testing.allocator);
     timeline.begin(10 * second_ns, 0);
     var recorder = timeline.recorder();
-    recorder.record(10 * second_ns - 5, 1000, .{}); // before the start: second 0
-    recorder.record(10 * second_ns + 3 * second_ns + 500, 2000, .{}); // past the end: the last
-    recorder.record(10 * second_ns + 90 * second_ns, 3000, .{}); // far past: the last
+    recorder.record(10 * second_ns, 1000, .{}); // at the start: second 0
+    recorder.record(10 * second_ns + 3 * second_ns + 999_999_999, 2000, .{}); // the last second's end
+    recorder.record(10 * second_ns + 4 * second_ns, 2500, .{ .requests = 1 }); // just past the end
+    recorder.record(10 * second_ns + 90 * second_ns, 3000, .{ .requests = 1 }); // far past
     recorder.flush();
+    const summary = timeline.summary();
+    try testing.expectEqual(@as(u64, 2), summary.late);
+    // A late operation is in no histogram and no counter.
+    try testing.expectEqual(@as(u64, 1), summary.histogram.count);
+    try testing.expectEqual(@as(u64, 0), summary.counts.requests);
 
     var text = std.ArrayList(u8).init(testing.allocator);
     defer text.deinit();
@@ -353,7 +387,7 @@ test "Timeline: a line for every second, empty ones too; late and early operatio
     try testing.expectEqual(@as(u64, 1), lines.items[0].value.count);
     try testing.expectEqual(@as(u64, 0), lines.items[1].value.count);
     try testing.expectEqual(@as(u64, 0), lines.items[2].value.count);
-    try testing.expectEqual(@as(u64, 2), lines.items[3].value.count);
+    try testing.expectEqual(@as(u64, 1), lines.items[3].value.count);
     // An empty second reads as zeros with no buckets.
     try testing.expectEqual(@as(u64, 0), lines.items[1].value.p99_us);
     try testing.expectEqual(@as(usize, 0), lines.items[1].value.buckets.len);
@@ -417,5 +451,13 @@ test "gateway flags are refused for a direct workload" {
     try testing.expectEqual(@as(?[]const u8, null), gateway_flags_refusal(false, false, false, false));
     try testing.expect(gateway_flags_refusal(false, true, false, false) != null);
     try testing.expect(gateway_flags_refusal(false, false, true, false) != null);
+    // Any explicit --gateway-stderr is refused, `ignore` too.
     try testing.expect(gateway_flags_refusal(false, false, false, true) != null);
+}
+
+test "path_error_reason names no Zig error" {
+    for ([_]anyerror{ error.FileNotFound, error.AccessDenied, error.IsDir, error.Unexpected }) |err| {
+        try testing.expect(std.mem.indexOf(u8, path_error_reason(err), "error.") == null);
+    }
+    try testing.expectEqualStrings("its directory does not exist", path_error_reason(error.FileNotFound));
 }

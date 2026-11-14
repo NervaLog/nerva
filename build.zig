@@ -386,6 +386,15 @@ pub fn build(b: *std.Build) !void {
     run_errors_test.step.dependOn(&run_integration_tests.step);
     steps.test_integration.dependOn(&run_errors_test.step);
 
+    // `bench-load`'s workloads: warm-up and timeline lines, the botpike gateway's statsd and PID
+    // file, and its path refusals (R3 slice 1, P414); after the tests above, which run clusters.
+    const run_bench_load_test = b.addSystemCommand(&.{ "python3", "tests/bench/bench_load.py" });
+    run_bench_load_test.addFileArg(bench_load.getEmittedBin());
+    run_bench_load_test.setCwd(b.path("."));
+    run_bench_load_test.has_side_effects = true;
+    run_bench_load_test.step.dependOn(&run_errors_test.step);
+    steps.test_integration.dependOn(&run_bench_load_test.step);
+
     // `nerva recover` on three real replicas (R5): after the integration tests, which run a
     // cluster of their own.
     const run_recover_test = b.addSystemCommand(&.{ "python3", "tests/recover/recover.py" });

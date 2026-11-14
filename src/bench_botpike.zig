@@ -94,6 +94,8 @@ pub const GatewayOptions = struct {
 pub const Gateway = struct {
     process: std.process.Child,
     address: std.net.Address,
+    /// The PID file, removed when the gateway stops; borrowed from the caller.
+    pid_file: ?[]const u8 = null,
 
     pub fn start(
         gpa: std.mem.Allocator,
@@ -135,11 +137,13 @@ pub const Gateway = struct {
         gateway.process.stdout_behavior = .Ignore;
         gateway.process.stderr_behavior = if (options.inherit_stderr) .Inherit else .Ignore;
         try gateway.process.spawn();
-        errdefer _ = gateway.process.kill() catch {};
+        errdefer gateway.stop();
 
         if (options.pid_file) |path| {
             var pid_buffer: [32]u8 = undefined;
             const pid = try std.fmt.bufPrint(&pid_buffer, "{}\n", .{gateway.process.id});
+            gateway.pid_file = path;
+            // `bench_load.zig` made the file before the run, so this only fails if it was removed.
             try std.fs.cwd().writeFile(.{ .sub_path = path, .data = pid });
         }
 
@@ -156,6 +160,9 @@ pub const Gateway = struct {
 
     pub fn stop(gateway: *Gateway) void {
         _ = gateway.process.kill() catch {};
+        // The PID names a process that is gone: a reader must not find one (it could be reused).
+        if (gateway.pid_file) |path| std.fs.cwd().deleteFile(path) catch {};
+        gateway.pid_file = null;
     }
 };
 

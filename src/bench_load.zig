@@ -89,8 +89,9 @@ const CLIArgs = struct {
     @"gateway-statsd": ?[]const u8 = null,
     /// botpike only: where the gateway's PID is written, right after it spawns.
     @"gateway-pid-file": ?[]const u8 = null,
-    /// botpike only: `inherit` passes the gateway's stderr to this process's.
-    @"gateway-stderr": GatewayStderr = .ignore,
+    /// botpike only: `inherit` passes the gateway's stderr to this process's (the default is
+    /// `ignore`; any explicit value is refused for the other workloads).
+    @"gateway-stderr": ?GatewayStderr = null,
 
     pub const help =
         \\Usage:
@@ -175,8 +176,16 @@ pub fn main() !void {
         gateway_workload,
         args.@"gateway-statsd" != null,
         args.@"gateway-pid-file" != null,
-        args.@"gateway-stderr" == .inherit,
+        args.@"gateway-stderr" != null,
     )) |reason| stdx.Flags.fatal("{s}", .{reason});
+
+    // The files this run writes are made now, so that a bad path costs no measurement (NRV-E0727).
+    const timeline_file: ?std.fs.File = if (args.timeline) |path|
+        file_create("--timeline", path)
+    else
+        null;
+    defer if (timeline_file) |file| file.close();
+    if (args.@"gateway-pid-file") |path| file_create("--gateway-pid-file", path).close();
 
     const config: Config = .{
         .workload = args.workload,
@@ -205,7 +214,7 @@ pub fn main() !void {
         try run_botpike(gpa, args.cluster, addresses_text, args.nerva orelse nerva_exe_built, &config, &timeline, .{
             .statsd = args.@"gateway-statsd",
             .pid_file = args.@"gateway-pid-file",
-            .inherit_stderr = args.@"gateway-stderr" == .inherit,
+            .inherit_stderr = args.@"gateway-stderr" == @as(?GatewayStderr, .inherit),
         })
     else result: {
         try preload(gpa, args.cluster, addresses, &config);
@@ -220,13 +229,24 @@ pub fn main() !void {
     } else {
         try std.io.getStdOut().writeAll(json.items);
     }
-    if (args.timeline) |path| {
+    if (timeline_file) |file| {
         var lines = std.ArrayList(u8).init(gpa);
         defer lines.deinit();
         try timeline.write(lines.writer());
-        try std.fs.cwd().writeFile(.{ .sub_path = path, .data = lines.items });
+        try file.writeAll(lines.items);
     }
     if (result.failures > 0) std.process.exit(1);
+}
+
+/// Creates (or empties) the file a flag names, or ends the process with NRV-E0727.
+fn file_create(flag: []const u8, path: []const u8) std.fs.File {
+    return std.fs.cwd().createFile(path, .{}) catch |err| {
+        std.io.getStdErr().writer().print(
+            "error[NRV-E0727]: bench-load: {s}: cannot write {s}: {s}\n",
+            .{ flag, path, bench_timeline.path_error_reason(err) },
+        ) catch {};
+        std.process.exit(1);
+    };
 }
 
 /// Writes every key once (in batches), so that reads find rows and versions.
@@ -272,6 +292,8 @@ const Result = struct {
     errors: u64 = 0,
     /// Clients that stopped with an error (timeout, eviction).
     failures: u64 = 0,
+    /// Operations that ended after the run (`Timeline`'s `late`): in no other number.
+    late: u64 = 0,
     duration: stdx.Duration = .{ .ns = 0 },
 
     fn counts(result: *const Result) Counts {
@@ -296,6 +318,7 @@ const Result = struct {
             .retries = summary.counts.retries,
             .errors = summary.counts.errors,
             .failures = failures,
+            .late = summary.late,
             .duration = .{ .ns = @as(u64, config.seconds) * std.time.ns_per_s },
         };
     }
@@ -434,6 +457,9 @@ const Worker = struct {
         const time = time_os.interface();
         while (shared.start_ns.load(.acquire) == 0) std.time.sleep(std.time.ns_per_ms / 10);
         const start: stdx.Instant = .{ .ns = shared.start_ns.load(.acquire) };
+        // Released a little before the start: no operation may end before the timeline begins.
+        const early = time.monotonic();
+        if (early.ns < start.ns) std.time.sleep(start.ns - early.ns);
         const end = start.add(.{ .ns = @as(u64, config.warmup + config.seconds) * std.time.ns_per_s });
 
         // Open loop: this client's share of the rate, staggered so clients do not send at once.
@@ -628,14 +654,15 @@ fn result_write(writer: anytype, config: *const Config, result: *const Result) !
     );
     try writer.print(
         "\"operations\":{},\"requests\":{},\"entries\":{},\"conflicts\":{},\"retries\":{}," ++
-            "\"errors\":{},\"failures\":{},\"operations_per_s\":{d:.1},\"requests_per_s\":{d:.1}," ++
+            "\"errors\":{},\"failures\":{},\"late_operations\":{},\"operations_per_s\":{d:.1},\"requests_per_s\":{d:.1}," ++
             "\"entries_per_s\":{d:.1},",
         .{
-            result.operations,                                  result.requests,
-            result.entries,                                     result.conflicts,
-            result.retries,                                     result.errors,
-            result.failures,                                    @as(f64, @floatFromInt(result.operations)) / seconds,
-            @as(f64, @floatFromInt(result.requests)) / seconds, @as(f64, @floatFromInt(result.entries)) / seconds,
+            result.operations,                                    result.requests,
+            result.entries,                                       result.conflicts,
+            result.retries,                                       result.errors,
+            result.failures,                                      result.late,
+            @as(f64, @floatFromInt(result.operations)) / seconds, @as(f64, @floatFromInt(result.requests)) / seconds,
+            @as(f64, @floatFromInt(result.entries)) / seconds,
         },
     );
     try writer.print(
