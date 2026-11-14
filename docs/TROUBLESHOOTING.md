@@ -257,7 +257,7 @@ Not run, quoted from ERRORS.md:
 
 | You see | Code | Do |
 |---|---|---|
-| `start: <path> was written by release X, and this binary runs Y and bundles Z` | NRV-E0701 | Upgrade by export and import (README, [Upgrading a cluster](../README.md#upgrading-a-cluster)) |
+| `start: <path> was written by release X, and this binary runs Y and bundles Z` | NRV-E0701 | Upgrade by export and import (README, [Upgrading a cluster](../README.md#upgrading-a-cluster)). A binary that bundles a past release, given a file below all of them, says instead that the replica fell behind or the cluster skipped a release: start the binary of the release that follows the file's and step one release at a time, `nerva recover` the replica (README, "Replacing a lost replica"), or export and import the cluster |
 | `start: <path> has no usable superblock (…)` | NRV-E0702 | Check the path. If the file is damaged: a replica of a running cluster is replaced with `nerva recover`; a lone replica or a closed cluster is restored from a backup (every replica, from the same one) |
 | `start: all --addresses must be provided` | NRV-E0710 | Give every replica's address, in replica order |
 | `start: the file system of <path> does not support direct IO`, exit 2 | NRV-E0704 | Put the data file on ext4 or XFS (`--development` allows it) |
