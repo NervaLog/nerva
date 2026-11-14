@@ -247,17 +247,52 @@ fn stat_exiting(text: []const u8) bool {
     return flags & pf_exiting != 0;
 }
 
-/// Whether process `pid` is in `do_exit`. A process killed with SIGKILL keeps its descriptors
-/// until `exit_files`, after in-flight direct IO is cancelled, so it is not yet a live holder.
-/// False where `/proc/<pid>/stat` cannot be read.
-fn process_exiting(pid: posix.pid_t) bool {
-    var path_buffer: [32]u8 = undefined;
-    const path = std.fmt.bufPrint(&path_buffer, "/proc/{}/stat", .{pid}) catch unreachable;
-    const file = std.fs.openFileAbsolute(path, .{}) catch return false;
+/// SIGKILL (signal 9) in the signal masks of `/proc/<pid>/status`: bit 8.
+const sigkill_mask: u64 = 0x100;
+
+/// Whether the text of `/proc/<pid>/status` shows SIGKILL pending in `SigPnd` (the thread's) or
+/// `ShdPnd` (the process's). `kill` sets it at once; `PF_EXITING` only follows when the task runs
+/// `do_exit`, which a task in uninterruptible sleep or not yet scheduled has not reached. False for
+/// text that does not parse.
+fn status_sigkill_pending(text: []const u8) bool {
+    var lines = std.mem.tokenizeScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        const prefix = if (std.mem.startsWith(u8, line, "SigPnd:"))
+            "SigPnd:"
+        else if (std.mem.startsWith(u8, line, "ShdPnd:"))
+            "ShdPnd:"
+        else
+            continue;
+        const mask = std.fmt.parseInt(u64, std.mem.trim(u8, line[prefix.len..], " \t"), 16) catch continue;
+        if (mask & sigkill_mask != 0) return true;
+    }
+    return false;
+}
+
+/// Reads up to `buffer.len` bytes of `/proc/<pid>/<name>`; null where it cannot be read.
+fn proc_read(pid: posix.pid_t, name: []const u8, buffer: []u8) ?[]const u8 {
+    var path_buffer: [48]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buffer, "/proc/{}/{s}", .{ pid, name }) catch unreachable;
+    const file = std.fs.openFileAbsolute(path, .{}) catch return null;
     defer file.close();
-    var buffer: [512]u8 = undefined;
-    const length = file.readAll(&buffer) catch return false;
-    return stat_exiting(buffer[0..length]);
+    const length = file.readAll(buffer) catch return null;
+    return buffer[0..length];
+}
+
+/// Whether process `pid` is exiting: in `do_exit` (`PF_EXITING`) or with SIGKILL pending. A process
+/// killed with SIGKILL keeps its descriptors until `exit_files`, after in-flight direct IO is
+/// cancelled, so it is not yet a live holder. False where `/proc/<pid>/stat` or `status` cannot be
+/// read, or the signal masks lie past the first 4 KiB of `status` (they are well within it).
+fn process_exiting(pid: posix.pid_t) bool {
+    var stat_buffer: [512]u8 = undefined;
+    if (proc_read(pid, "stat", &stat_buffer)) |text| {
+        if (stat_exiting(text)) return true;
+    }
+    var status_buffer: [4096]u8 = undefined;
+    if (proc_read(pid, "status", &status_buffer)) |text| {
+        if (status_sigkill_pending(text)) return true;
+    }
+    return false;
 }
 
 /// Whether process `pid` has the file `stat` describes open (same device and inode) and is not
@@ -478,6 +513,10 @@ test "preflight: a lock held by a live process is refused at once, naming its pi
         std.time.sleep(60 * std.time.ns_per_s);
         posix.exit(0);
     }
+    defer {
+        posix.kill(child, posix.SIG.KILL) catch {};
+        _ = posix.waitpid(child, 0);
+    }
     posix.close(ready[1]);
     defer posix.close(ready[0]);
     var byte: [1]u8 = undefined;
@@ -492,8 +531,8 @@ test "preflight: a lock held by a live process is refused at once, naming its pi
         try testing.expectEqual(child, pid);
         try testing.expect(std.time.milliTimestamp() - started < lock_wait_ms / 2);
     }
-    posix.kill(child, posix.SIG.KILL) catch unreachable;
-    _ = posix.waitpid(child, 0);
+    // The child shares this open file description, so unlocking here frees it; the deferred kill
+    // stops the child.
     try posix.flock(file.handle, posix.LOCK.UN);
     // Free: the next check goes on to the superblock, which an empty file lacks.
     try testing.expect((try open_check(testing.allocator, path, .disabled)).? == .damaged);
@@ -667,6 +706,19 @@ test "preflight: a lock released within the wait is not refused" {
     try testing.expect(refusal == .damaged);
 }
 
+test "preflight: SIGKILL pending is exiting" {
+    try testing.expect(!status_sigkill_pending("Name:\tx\nSigPnd:\t0000000000000000\nShdPnd:\t0000000000000000\n"));
+    try testing.expect(status_sigkill_pending("SigPnd:\t0000000000000100\nShdPnd:\t0000000000000000\n"));
+    try testing.expect(status_sigkill_pending("SigPnd:\t0000000000000000\nShdPnd:\t0000000000000100\n"));
+    // Other signals pending (SIGTERM 0x4000, SIGINT 0x2) are not SIGKILL.
+    try testing.expect(!status_sigkill_pending("SigPnd:\t0000000000004002\nShdPnd:\t0000000000004002\n"));
+    try testing.expect(status_sigkill_pending("SigPnd:\t0000000000000101\n"));
+    // Not parseable: not exiting.
+    try testing.expect(!status_sigkill_pending(""));
+    try testing.expect(!status_sigkill_pending("SigPnd:\tzz\nShdPnd:\n"));
+    try testing.expect(!status_sigkill_pending("XSigPnd:\t0000000000000100\n"));
+}
+
 test "preflight: a process that is exiting is not a holder" {
     // Fields 3 to 8 are "S 1 2 3 4 5"; flags (field 9) 4194304 has PF_EXITING clear, 4194308 set.
     try testing.expect(!stat_exiting("42 (nerva) S 1 2 3 4 5 4194304 0 0"));
@@ -733,9 +785,9 @@ test "preflight: a descriptor scan stops at its bound" {
         while (try again.next()) |entry| : (position += 1) {
             if (std.mem.eql(u8, entry.name, &name)) break;
         }
-        if (position == case.index) {
-            try testing.expectEqual(case.found, dir_holds_file(fds, major, minor, target.ino));
-        }
+        // A file system that moves a recreated name (tmpfs) cannot place the target: say so.
+        if (position != case.index) return error.SkipZigTest;
+        try testing.expectEqual(case.found, dir_holds_file(fds, major, minor, target.ino));
         try fds.deleteFile(&name);
         try fds.symLink(decoy_path, &name, .{});
     }

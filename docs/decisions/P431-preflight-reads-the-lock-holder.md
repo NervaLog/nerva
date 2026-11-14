@@ -16,7 +16,8 @@ amends: P290
   (macOS, unreadable, over the size bound, a block device, a file system whose device `/proc/locks`
   names differently), the 2 s bound of P290 stays, as does the message without a pid. The wait no
   longer sleeps after its last attempt. No new code: E0703's message is extended, and the test
-  `tests/errors/commands.py` still matches "another process holds".
+  `tests/errors/commands.py` asserts `another process holds <data> (pid <its own>)` where `/proc/locks` names the file as
+  `fstat` does, and the message without the pid elsewhere.
 - **Reason:** #294. A killed process's lock lingers for up to a few hundred ms while the kernel
   tears down its ring, and the holder seen in `/proc/locks` was the dead pid in every case the
   review caught. A live holder is a running replica, and waiting 2 s for it helps no one. The
@@ -28,7 +29,9 @@ amends: P290
   would have waited for it; the supervisor restarts as it would for any E0703. A child that
   inherited the descriptor of a dead holder keeps the lock under the dead pid: it waits the 2 s and
   is refused without a pid. A holder that is exiting
-  (`PF_EXITING` in `/proc/<pid>/stat`, still in `do_exit` before `exit_files`) is not named, so
+  (`PF_EXITING` in `/proc/<pid>/stat`, still in `do_exit` before `exit_files`, or SIGKILL pending
+  in `SigPnd` or `ShdPnd` of `/proc/<pid>/status`, which covers a holder in uninterruptible sleep
+  or not yet scheduled) is not named, so
   `kill -9; start` waits as under P290. A holder run by another user is never named (its
   `/proc/<pid>/fd` is unreadable to this process, `hidepid` or not), and this process's own pid is
   never named. Each attempt costs up to 4096 `statx` calls with `AT_STATX_DONT_SYNC`, so a
