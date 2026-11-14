@@ -38,6 +38,9 @@ pub const cgroup_depth_max = 32;
 /// v1 reports "no limit" as a value at or above this.
 const v1_unlimited_min: u64 = 1 << 62;
 const path_size_max = 512;
+/// The longest file name read: a cgroup path of `path_size_max`, the longer base
+/// (`sys/fs/cgroup/memory`), the longer file (`memory.limit_in_bytes`) and two slashes, with room.
+const name_size_max = path_size_max + 64;
 
 pub const Source = enum { meminfo, cgroup_v2, cgroup_v1 };
 
@@ -63,12 +66,14 @@ pub const Visible = struct {
     }
 };
 
-pub const Reason = enum { unparsable, too_large, too_deep };
+/// Why a file could not be used: `absent` (a /proc or a controller directory that is not there),
+/// `unreadable` (it is there and cannot be read), the rest are about what it holds.
+pub const Reason = enum { unparsable, too_large, too_deep, absent, unreadable };
 
 /// A file the walk could not use: named, never guessed around.
 pub const Refusal = struct {
     reason: Reason,
-    file_buffer: [path_size_max]u8 = undefined,
+    file_buffer: [name_size_max]u8 = undefined,
     file_length: usize = 0,
 
     pub fn file(self: *const Refusal) []const u8 {
@@ -95,7 +100,7 @@ pub const unlimited: u64 = 1 << 62;
 /// Reads what this process can see from the real `/proc` and `/sys/fs/cgroup`.
 pub fn read() Result {
     if (builtin.os.tag != .linux) return .{ .visible = .{ .bytes = unlimited, .source = .meminfo } };
-    var root = std.fs.openDirAbsolute("/", .{}) catch return refuse(.unparsable, "/");
+    var root = std.fs.openDirAbsolute("/", .{}) catch return refuse(.unreadable, "/");
     defer root.close();
     return read_from(root);
 }
@@ -107,7 +112,7 @@ pub fn read_from(root: std.fs.Dir) Result {
     // MemTotal: absent or unparsable is a refusal; a machine always has it.
     const meminfo = file_read(root, "proc/meminfo", &buffer) catch |err|
         return refuse(reason_of(err), "/proc/meminfo");
-    const total = meminfo_total(meminfo orelse return refuse(.unparsable, "/proc/meminfo")) orelse
+    const total = meminfo_total(meminfo orelse return refuse(.absent, "/proc/meminfo")) orelse
         return refuse(.unparsable, "/proc/meminfo");
     var result: Visible = .{ .bytes = total, .source = .meminfo };
 
@@ -129,10 +134,15 @@ pub fn read_from(root: std.fs.Dir) Result {
 
     // A path not under the mount (no cgroup namespace): the mount root's limit alone.
     // `membership.path` points into `buffer`, which the reads below reuse: keep a copy.
-    var path_buffer: [path_size_max]u8 = undefined;
+    var path_buffer: [name_size_max]u8 = undefined;
     var cgroup_buffer: [path_size_max]u8 = undefined;
     if (membership.path.len > path_size_max) {
         return refuse(.too_large, "/proc/self/cgroup");
+    }
+    // A v1 `memory` line with no `memory` directory: the controller is mounted somewhere this
+    // walk does not look (`cpu,memory`), and no limit may be guessed.
+    if (membership.source == .cgroup_v1 and !dir_exists(root, base, "/", &path_buffer)) {
+        return refuse(.absent, "/sys/fs/cgroup/memory");
     }
     @memcpy(cgroup_buffer[0..membership.path.len], membership.path);
     const cgroup_path = cgroup_buffer[0..membership.path.len];
@@ -151,7 +161,7 @@ pub fn read_from(root: std.fs.Dir) Result {
 
     var level_path: []const u8 = walk_path;
     while (true) {
-        var file_buffer: [path_size_max]u8 = undefined;
+        var file_buffer: [name_size_max]u8 = undefined;
         const name = join(&file_buffer, base, level_path, limit_file);
         const content = file_read(root, name, &buffer) catch |err|
             return refuse(reason_of(err), name);
@@ -228,7 +238,7 @@ const ReadError = error{ TooLarge, Unreadable };
 fn reason_of(err: ReadError) Reason {
     return switch (err) {
         error.TooLarge => .too_large,
-        error.Unreadable => .unparsable,
+        error.Unreadable => .unreadable,
     };
 }
 
@@ -244,21 +254,23 @@ fn file_read(root: std.fs.Dir, name: []const u8, buffer: *[file_size_max + 1]u8)
     return buffer[0..length];
 }
 
-fn dir_exists(root: std.fs.Dir, base: []const u8, path: []const u8, buffer: *[path_size_max]u8) bool {
+fn dir_exists(root: std.fs.Dir, base: []const u8, path: []const u8, buffer: *[name_size_max]u8) bool {
     const name = join(buffer, base, path, "");
     var dir = root.openDir(name, .{}) catch return false;
     dir.close();
     return true;
 }
 
-/// `<base>/<path>/<file>` without a doubled slash; truncated, never overrun, at `path_size_max`.
-fn join(buffer: *[path_size_max]u8, base: []const u8, path: []const u8, file: []const u8) []const u8 {
+/// `<base>/<path>/<file>` without a doubled slash. It always fits: `path` is at most
+/// `path_size_max` (checked by the caller), and `name_size_max` has room for the rest.
+fn join(buffer: *[name_size_max]u8, base: []const u8, path: []const u8, file: []const u8) []const u8 {
+    assert(path.len <= path_size_max);
     const trimmed = std.mem.trim(u8, path, "/");
     const text = if (trimmed.len == 0)
         std.fmt.bufPrint(buffer, "{s}{s}{s}", .{ base, if (file.len > 0) "/" else "", file })
     else
         std.fmt.bufPrint(buffer, "{s}/{s}{s}{s}", .{ base, trimmed, if (file.len > 0) "/" else "", file });
-    return text catch buffer[0..path_size_max];
+    return text catch unreachable;
 }
 
 fn parent(path: []const u8) []const u8 {
@@ -269,7 +281,7 @@ fn parent(path: []const u8) []const u8 {
 
 fn refuse(reason: Reason, file: []const u8) Result {
     var refusal: Refusal = .{ .reason = reason };
-    const length = @min(file.len, path_size_max);
+    const length = @min(file.len, name_size_max);
     @memcpy(refusal.file_buffer[0..length], file[0..length]);
     refusal.file_length = length;
     return .{ .refused = refusal };
@@ -470,4 +482,50 @@ test "start_memory: the real machine can be read" {
 test "start_memory: a host without /proc is unlimited, with room for the reserve" {
     try std.testing.expect(budget(unlimited) != null);
     try std.testing.expect(budget(unlimited).? > 1 << 61);
+}
+
+test "start_memory: a 500-byte cgroup path is read in full, never truncated into no limit" {
+    var fixture = Fixture.init();
+    defer fixture.deinit();
+    try fixture.meminfo(8 * 1024 * 1024);
+    // 500 bytes: more than 470, where the joined v1 name used to overflow 512.
+    var path: [500]u8 = undefined;
+    @memset(&path, 'c');
+    var at: usize = 0;
+    while (at < path.len) : (at += 100) path[at] = '/';
+    var name: [1200]u8 = undefined;
+    try fixture.write("proc/self/cgroup", try std.fmt.bufPrint(&name, "4:memory:{s}\n", .{path[0..]}));
+    // 5 levels of 100 bytes: the process's own level carries the limit.
+    try fixture.write(try std.fmt.bufPrint(&name, "sys/fs/cgroup/memory{s}/memory.limit_in_bytes", .{path[0..]}), "1073741824\n");
+    const result = read_from(fixture.tmp.dir);
+    try std.testing.expectEqual(@as(u64, 1024 * mib), result.visible.bytes);
+    try std.testing.expectEqual(Source.cgroup_v1, result.visible.source);
+
+    // 513 bytes is a refusal, not a guess.
+    var long: [513]u8 = undefined;
+    @memset(&long, 'c');
+    long[0] = '/';
+    try fixture.write("proc/self/cgroup", try std.fmt.bufPrint(&name, "4:memory:{s}\n", .{long[0..]}));
+    try std.testing.expectEqual(Reason.too_large, read_from(fixture.tmp.dir).refused.reason);
+}
+
+test "start_memory: absent and unreadable files are told apart from unparsable ones" {
+    var fixture = Fixture.init();
+    defer fixture.deinit();
+    // No /proc at all (a chroot): absent.
+    const none = read_from(fixture.tmp.dir);
+    try std.testing.expectEqual(Reason.absent, none.refused.reason);
+    try std.testing.expectEqualStrings("/proc/meminfo", none.refused.file());
+
+    // A directory where a file belongs cannot be read: unreadable.
+    try fixture.tmp.dir.makePath("proc/meminfo");
+    try std.testing.expectEqual(Reason.unreadable, read_from(fixture.tmp.dir).refused.reason);
+    try fixture.tmp.dir.deleteTree("proc/meminfo");
+
+    // A v1 `memory` line with no memory directory: the controller is mounted elsewhere.
+    try fixture.meminfo(8 * 1024 * 1024);
+    try fixture.write("proc/self/cgroup", "4:cpu,memory:/a\n");
+    const elsewhere = read_from(fixture.tmp.dir);
+    try std.testing.expectEqual(Reason.absent, elsewhere.refused.reason);
+    try std.testing.expectEqualStrings("/sys/fs/cgroup/memory", elsewhere.refused.file());
 }

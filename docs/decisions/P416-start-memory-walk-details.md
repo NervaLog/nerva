@@ -15,7 +15,7 @@ limit; `proc/meminfo` absent or without a parsable `MemTotal` is a refusal, as i
 over 512 bytes. (4) A file of exactly 4,096 bytes is read; 4,097 is a refusal. (5) The refusal
 names the flags' values (`--cache-grid` in MiB, `--cache-rows` in rows) and the source of the
 limit, and an unusable file is NRV-E0723 with its own headline (the file and `unparsable`,
-`too_large` or `too_deep`), not a second code.
+`too_large`, `too_deep`, `absent` or `unreadable`), not a second code. (6) The reason names the cause, and the fix line follows it: no `/proc/meminfo`, or a v1 `memory` line whose `/sys/fs/cgroup/memory` is not there (the controller is mounted elsewhere), is `absent`; a file that cannot be read is `unreadable`. (7) File names are built in a buffer sized for the longest path, so a path of 512 bytes is read in full and one of 513 is `too_large`; the walk never truncates a name into "no limit".
 
 **Why.** P406d fixes the budget and the refusal; these are the cases its text left to the code.
 One code keeps the operator's fix the same: make the machine or its files readable, or lower the

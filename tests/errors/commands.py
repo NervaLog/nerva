@@ -248,6 +248,27 @@ def main():
               start + [f"--cache-grid={grid_mib}MiB", data], "NRV-E0723", 1, "--cache-grid")
         assert sha(data) == before, "the refused start wrote to the data file"
 
+        # The other E0723 headline: a /proc/meminfo the replica cannot use, a garbage file bind
+        # mounted over it in a private mount namespace (`unshare -m`, or `-rm` without root).
+        # Skipped, and said so, where the sandbox does not let a process mount.
+        garbage = os.path.join(tmp, "meminfo")
+        with open(garbage, "w") as f:
+            f.write("MemTotal: lots kB\n")
+        script = 'mount --bind "$1" /proc/meminfo && shift && exec "$@"'
+        for flags in (["-m"], ["-r", "-m"]):
+            wrapper = ["unshare"] + flags + ["sh", "-c", script, "sh", garbage]
+            if subprocess.run(wrapper + ["true"], capture_output=True).returncode != 0:
+                continue
+            result = subprocess.run(wrapper + [nerva] + start + [data], capture_output=True,
+                                    text=True, timeout=120)
+            seen.append(expect(result, "NRV-E0723", 1, "cannot tell how much memory",
+                               "start unusable meminfo"))
+            assert "/proc/meminfo cannot be used (unparsable)" in result.stderr, result.stderr
+            assert sha(data) == before, "the refused start wrote to the data file"
+            break
+        else:
+            print("errors: skipped the unusable-meminfo start, this sandbox cannot mount")
+
         # With a damaged superblock copy the refusal may repair that copy (the one write that
         # can precede it, Replica.open) and nothing else: the WAL and grid zones, from the end
         # of the 4 copies of 24,576 bytes, are byte for byte as before, and the file then opens.

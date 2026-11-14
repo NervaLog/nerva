@@ -742,8 +742,12 @@ fn command_start(
             "NRV-E0723",
             "start: cannot tell how much memory this replica may use: {s} cannot be used ({s})",
             .{ refusal.file(), @tagName(refusal.reason) },
-            "fix or remove that file's limit, or run on a machine whose /proc and cgroup files are readable",
-            .{},
+            "{s}",
+            .{switch (refusal.reason) {
+                .absent => "mount /proc (and the cgroup filesystem) where this replica runs, or run it on a machine that has them",
+                .unreadable => "give this process read access to that file, or run it on a machine whose /proc and cgroup files are readable",
+                .unparsable, .too_large, .too_deep => "fix or remove that file's limit, or run on a machine whose /proc and cgroup files are readable",
+            }},
         ),
     };
     const budget_bytes = start_memory.budget(visible.bytes) orelse memory_refuse(args, &visible, 0);
