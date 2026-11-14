@@ -201,9 +201,9 @@ fn run_flags(gpa: std.mem.Allocator, args: CLIArgs, failure: *?bench_timeline.Fi
     }
 
     // The files this run writes are opened now, so that a bad path costs no measurement
-    // (NRV-E0728). A regular file is written as a temporary file beside it and renamed into place
-    // once its content is whole (`OutFile`), so that a failure at any later step leaves every
-    // path with its earlier content, and no temporary file. Two flags may not name one file.
+    // (NRV-E0728). A new file, or a regular file this user owns (one link, writable), is written
+    // beside its path and renamed into place once whole (`OutFile`, P414b), so that a later failure
+    // leaves its earlier content; any other path is opened in place and is not atomic. Two flags may not name one file.
     const flags_and_paths = [_]struct { flag: []const u8, path: ?[]const u8 }{
         .{ .flag = "--timeline", .path = args.timeline },
         .{ .flag = "--gateway-pid-file", .path = args.@"gateway-pid-file" },

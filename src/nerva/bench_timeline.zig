@@ -84,6 +84,10 @@ fn process_id() std.posix.pid_t {
     return if (builtin.os.tag == .linux) std.os.linux.getpid() else std.c.getpid();
 }
 
+fn effective_user() std.posix.uid_t {
+    return if (builtin.os.tag == .linux) std.os.linux.geteuid() else std.c.geteuid();
+}
+
 /// A file the run could not write, kept until the cluster and the gateway are torn down.
 pub const FileFailure = struct {
     flag: []const u8,
@@ -99,12 +103,21 @@ pub const FileFailure = struct {
     }
 };
 
-/// An output file of `bench-load` (`--timeline`, `--gateway-pid-file`, `--output`). A regular file
-/// (or a path that does not exist yet) is written as a temporary file in the same directory and
-/// renamed into place by `commit`, so that a path holds either its earlier content or the whole
-/// new content, never an emptied file. A device (`/dev/full`) or another file that is not
-/// regular is written in place, and never renamed over. A path that is a dangling symbolic link is
-/// not followed: the rename replaces the link with a regular file.
+/// An output file of `bench-load` (`--timeline`, `--gateway-pid-file`, `--output`) (P414b).
+///
+/// A path that is not there yet, or that names a regular file this process owns, with one link and
+/// writable, is written as a temporary file in the same directory and renamed into place by
+/// `commit`, so that the path holds either its earlier content or the whole new content. The
+/// temporary file gets the file's permission bits and group. Every other path is opened as a plain
+/// open for writing does, exactly as before `OutFile`: a file of another owner (the rename would
+/// fail in a sticky directory, or change the owner), a file with several links (the rename would
+/// break the link), a file in a directory that cannot be written, a dangling symbolic link (it is
+/// followed) and anything that is not a regular file (a device such as `/dev/full`, a pipe, a
+/// socket, `/dev/fd/N`). That open is **not atomic**: a regular file is truncated when it is
+/// opened, so a later failure leaves it empty. A FIFO blocks the open until a reader opens it.
+///
+/// Between looking at a path and opening it another process may replace what it names; a benchmark
+/// that writes into a directory someone else is renaming in is not defended against.
 pub const OutFile = struct {
     file: std.fs.File,
     /// The path as given (borrowed, for messages).
@@ -115,44 +128,75 @@ pub const OutFile = struct {
     temp: ?[]const u8,
     gpa: std.mem.Allocator,
     committed: bool = false,
+    /// Whether `final` is a regular file (a reader may delete it), however it is written.
+    regular_file: bool = false,
 
-    /// Opens (creating, never emptying a file that is already there) what `path` names, or
-    /// returns the error that `path_error_reason` words (NRV-E0728). The permissions are the ones
-    /// a plain open for writing has: an existing file that cannot be written is refused (the
-    /// rename must not replace it), and a writable file in a directory that cannot be written is
-    /// written in place. A FIFO is opened for writing and blocks until a reader opens it, as
-    /// `cat > fifo` does.
+    /// Opens (creating; emptying only a file that is written in place) what `path` names, or
+    /// returns the error that `path_error_reason` words (NRV-E0728).
     pub fn open(gpa: std.mem.Allocator, path: []const u8) !OutFile {
         // What `path` names is looked at as given: `/dev/stdout` resolves to `pipe:[N]` when
-        // stdout is a pipe, which is no path to write. Anything that is not a regular file (a
-        // device, a pipe, a socket, `/dev/fd/N`) is written in place, as before.
-        const kind = stat_kind(path);
-        if (kind) |k| {
-            if (k == .directory) return error.IsDir;
-            if (k != .file) {
-                const file = try std.fs.cwd().createFile(path, .{ .truncate = false });
-                const final = try gpa.dupe(u8, path);
-                return .{ .file = file, .requested = path, .final = final, .temp = null, .gpa = gpa };
-            }
-            // A rename would replace a read-only file that a plain open refuses.
-            try std.posix.access(path, std.posix.W_OK);
+        // stdout is a pipe, which is no path to write.
+        const found = look(path, 0);
+        if (found) |st| {
+            if (st.mode & std.posix.S.IFMT == std.posix.S.IFDIR) return error.IsDir;
         }
+        const regular_file = if (found) |st| st.mode & std.posix.S.IFMT == std.posix.S.IFREG else true;
+        const atomic = if (found) |st|
+            regular_file and st.nlink == 1 and st.uid == effective_user() and
+                access_writable(path)
+        else
+            // Nothing there: a dangling link is followed by a plain open, so it is not replaced.
+            !is_link(path);
+        if (atomic) {
+            if (try open_temp(gpa, path, found)) |out| return out;
+        }
+        const file = try std.fs.cwd().createFile(path, .{ .truncate = regular_file });
+        errdefer file.close();
+        const final = try gpa.dupe(u8, path);
+        return .{
+            .file = file,
+            .requested = path,
+            .final = final,
+            .temp = null,
+            .gpa = gpa,
+            .regular_file = regular_file,
+        };
+    }
+
+    /// The temporary file for `path`, or null if its directory cannot be written (a plain open
+    /// of the target is then the way, if it can be written at all).
+    fn open_temp(gpa: std.mem.Allocator, path: []const u8, found: ?std.posix.Stat) !?OutFile {
         const resolved: ?[]u8 = std.fs.cwd().realpathAlloc(gpa, path) catch null;
         const final = resolved orelse try gpa.dupe(u8, path);
         errdefer gpa.free(final);
         const temp = try temp_path(gpa, final);
         errdefer gpa.free(temp);
-        const file = std.fs.cwd().createFile(temp, .{}) catch |err| switch (err) {
-            // A writable file in a directory that is not: written in place, as a plain open is.
+        const file = std.fs.cwd().createFile(temp, .{ .read = true }) catch |err| switch (err) {
             error.AccessDenied => {
-                if (kind == null) return err;
-                const in_place = try std.fs.cwd().createFile(final, .{});
                 gpa.free(temp);
-                return .{ .file = in_place, .requested = path, .final = final, .temp = null, .gpa = gpa };
+                gpa.free(final);
+                return null;
             },
             else => return err,
         };
-        return .{ .file = file, .requested = path, .final = final, .temp = temp, .gpa = gpa };
+        errdefer {
+            file.close();
+            std.fs.cwd().deleteFile(temp) catch {};
+        }
+        if (found) |st| {
+            // What a plain open keeps: the permission bits (the temporary file's came from the
+            // umask) and the group. Best effort for the group: the owner may not be in it.
+            try file.chmod(@intCast(st.mode & 0o7777));
+            std.posix.fchown(file.handle, null, st.gid) catch {};
+        }
+        return .{
+            .file = file,
+            .requested = path,
+            .final = final,
+            .temp = temp,
+            .gpa = gpa,
+            .regular_file = true,
+        };
     }
 
     /// The temporary file beside `final`: `.nerva-<hash of the name>.<pid>.tmp`, whose length does
@@ -167,16 +211,37 @@ pub const OutFile = struct {
 
     /// Whether `final` is a regular file this run makes (a reader may delete it).
     pub fn regular(out: *const OutFile) bool {
-        return out.temp != null or out.committed;
+        return out.regular_file;
     }
 
-    /// Puts the written content at its path.
+    /// Puts the written content at its path. If the rename is refused after all (the directory
+    /// changed under the run), the content is copied into the path in place instead, which is not
+    /// atomic but loses nothing; only if that fails too is the error returned.
     pub fn commit(out: *OutFile) !void {
         const temp = out.temp orelse return;
-        try std.fs.cwd().rename(temp, out.final);
+        std.fs.cwd().rename(temp, out.final) catch {
+            try out.copy_in_place();
+            std.fs.cwd().deleteFile(temp) catch {};
+            out.gpa.free(temp);
+            out.temp = null;
+            out.committed = true;
+            return;
+        };
         out.gpa.free(temp);
         out.temp = null;
         out.committed = true;
+    }
+
+    fn copy_in_place(out: *OutFile) !void {
+        const target = try std.fs.cwd().createFile(out.final, .{});
+        defer target.close();
+        try out.file.seekTo(0);
+        var buffer: [4096]u8 = undefined;
+        while (true) {
+            const n = try out.file.read(&buffer);
+            if (n == 0) break;
+            try target.writeAll(buffer[0..n]);
+        }
     }
 
     /// Closes the file and removes a temporary file that was never committed.
@@ -189,6 +254,20 @@ pub const OutFile = struct {
         out.gpa.free(out.final);
     }
 };
+
+fn look(path: []const u8, flags: u32) ?std.posix.Stat {
+    return std.posix.fstatat(std.posix.AT.FDCWD, path, flags) catch null;
+}
+
+fn is_link(path: []const u8) bool {
+    const st = look(path, std.posix.AT.SYMLINK_NOFOLLOW) orelse return false;
+    return st.mode & std.posix.S.IFMT == std.posix.S.IFLNK;
+}
+
+fn access_writable(path: []const u8) bool {
+    std.posix.access(path, std.posix.W_OK) catch return false;
+    return true;
+}
 
 /// Whether two paths name the same file: the same path once resolved, or the same device and
 /// inode. A path that does not exist is resolved through its directory. A device (`/dev/null`,
@@ -216,21 +295,6 @@ const Identity = struct {
         gpa.free(identity_.path);
     }
 };
-
-/// The kind of what `path` names (following links, without opening it), or null if nothing is
-/// there or it cannot be looked at.
-fn stat_kind(path: []const u8) ?std.fs.File.Kind {
-    const st = std.posix.fstatat(std.posix.AT.FDCWD, path, 0) catch return null;
-    return switch (st.mode & std.posix.S.IFMT) {
-        std.posix.S.IFREG => .file,
-        std.posix.S.IFDIR => .directory,
-        std.posix.S.IFCHR => .character_device,
-        std.posix.S.IFBLK => .block_device,
-        std.posix.S.IFIFO => .named_pipe,
-        std.posix.S.IFSOCK => .unix_domain_socket,
-        else => .unknown,
-    };
-}
 
 /// Looks at `path` as given, so that `/dev/stdout` on a pipe (which resolves to `pipe:[N]`) is
 /// a pipe and not a missing file. A file that is not regular is written in place and never
@@ -763,23 +827,32 @@ test "OutFile: a pipe (/dev/fd/N) is written in place, never resolved to pipe:[N
     try testing.expect(!(try same_file(gpa, path, path)));
 }
 
-test "OutFile: a read-only file is refused, a writable file in a read-only directory is written" {
+fn tmp_path(gpa: std.mem.Allocator, tmp: *testing.TmpDir, name: []const u8) ![]u8 {
+    const root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(root);
+    return std.fs.path.join(gpa, &.{ root, name });
+}
+
+fn link_count(dir: std.fs.Dir, name: []const u8) !usize {
+    const st = try std.posix.fstatat(dir.fd, name, 0);
+    return @intCast(st.nlink);
+}
+
+test "OutFile: a read-only file is refused, a writable file in a read-only directory is written in place" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     // Root bypasses the mode bits.
     if (std.os.linux.getuid() == 0) return error.SkipZigTest;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const gpa = testing.allocator;
-    const root = try tmp.dir.realpathAlloc(gpa, ".");
-    defer gpa.free(root);
     var buffer: [16]u8 = undefined;
 
     try tmp.dir.writeFile(.{ .sub_path = "locked", .data = "earlier\n" });
     {
         try std.posix.fchmodat(tmp.dir.fd, "locked", 0o444, 0);
-        const path = try std.fs.path.join(gpa, &.{ root, "locked" });
+        const path = try tmp_path(gpa, &tmp, "locked");
         defer gpa.free(path);
-        try testing.expectError(error.PermissionDenied, OutFile.open(gpa, path));
+        try testing.expectError(error.AccessDenied, OutFile.open(gpa, path));
         try testing.expectEqualStrings("earlier\n", try tmp.dir.readFile("locked", &buffer));
     }
 
@@ -790,19 +863,152 @@ test "OutFile: a read-only file is refused, a writable file in a read-only direc
     try std.posix.fchmodat(tmp.dir.fd, "sealed", 0o555, 0);
     defer std.posix.fchmodat(tmp.dir.fd, "sealed", 0o755, 0) catch {};
     {
-        const path = try std.fs.path.join(gpa, &.{ root, "sealed", "open" });
+        const path = try tmp_path(gpa, &tmp, "sealed/open");
         defer gpa.free(path);
         var out = try OutFile.open(gpa, path);
         defer out.deinit();
+        // Not atomic: written in place, and emptied when opened (P414b).
         try testing.expect(out.temp == null);
+        try testing.expect(out.regular());
+        try testing.expectEqualStrings("", try sealed.readFile("open", &buffer));
         try out.file.writeAll("new\n");
         try out.commit();
         try testing.expectEqualStrings("new\n", try sealed.readFile("open", &buffer));
         // A file that is not there yet in that directory cannot be made.
-        const fresh = try std.fs.path.join(gpa, &.{ root, "sealed", "fresh" });
+        const fresh = try tmp_path(gpa, &tmp, "sealed/fresh");
         defer gpa.free(fresh);
         try testing.expectError(error.AccessDenied, OutFile.open(gpa, fresh));
     }
+}
+
+test "OutFile: the file's permission bits survive the rename" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const gpa = testing.allocator;
+    var buffer: [16]u8 = undefined;
+    for ([_]u32{ 0o600, 0o664, 0o640 }) |mode| {
+        try tmp.dir.writeFile(.{ .sub_path = "m", .data = "earlier\n" });
+        try std.posix.fchmodat(tmp.dir.fd, "m", @intCast(mode), 0);
+        const path = try tmp_path(gpa, &tmp, "m");
+        defer gpa.free(path);
+        var out = try OutFile.open(gpa, path);
+        defer out.deinit();
+        try testing.expect(out.temp != null);
+        try out.file.writeAll("new\n");
+        try out.commit();
+        try testing.expectEqualStrings("new\n", try tmp.dir.readFile("m", &buffer));
+        const st = try std.posix.fstatat(tmp.dir.fd, "m", 0);
+        try testing.expectEqual(mode, @as(u32, st.mode) & 0o7777);
+    }
+}
+
+test "OutFile: a file with another link is written in place, and both names see it" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const gpa = testing.allocator;
+    var buffer: [16]u8 = undefined;
+    try tmp.dir.writeFile(.{ .sub_path = "a", .data = "earlier\n" });
+    try std.posix.linkat(tmp.dir.fd, "a", tmp.dir.fd, "b", 0);
+    const path = try tmp_path(gpa, &tmp, "a");
+    defer gpa.free(path);
+    var out = try OutFile.open(gpa, path);
+    defer out.deinit();
+    try testing.expect(out.temp == null);
+    try out.file.writeAll("new\n");
+    try out.commit();
+    try testing.expectEqual(@as(usize, 2), try link_count(tmp.dir, "a"));
+    try testing.expectEqualStrings("new\n", try tmp.dir.readFile("b", &buffer));
+}
+
+test "OutFile: a dangling symbolic link is followed, not replaced" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const gpa = testing.allocator;
+    var buffer: [16]u8 = undefined;
+    try tmp.dir.symLink("target", "link", .{});
+    const path = try tmp_path(gpa, &tmp, "link");
+    defer gpa.free(path);
+    var out = try OutFile.open(gpa, path);
+    defer out.deinit();
+    try testing.expect(out.temp == null);
+    try out.file.writeAll("new\n");
+    try out.commit();
+    try testing.expectEqualStrings("new\n", try tmp.dir.readFile("target", &buffer));
+    const st = try std.posix.fstatat(tmp.dir.fd, "link", std.posix.AT.SYMLINK_NOFOLLOW);
+    try testing.expectEqual(@as(u32, std.posix.S.IFLNK), st.mode & std.posix.S.IFMT);
+}
+
+test "OutFile: a file of another user in a sticky directory is written in place (root)" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    // Only root can make a file of another user; a plain open writes it, the rename could not.
+    if (std.os.linux.getuid() != 0) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const gpa = testing.allocator;
+    var buffer: [16]u8 = undefined;
+    try tmp.dir.writeFile(.{ .sub_path = "theirs", .data = "earlier\n" });
+    try std.posix.fchmodat(tmp.dir.fd, "theirs", 0o666, 0);
+    {
+        const theirs = try tmp.dir.openFile("theirs", .{});
+        defer theirs.close();
+        try std.posix.fchown(theirs.handle, 12345, 12345);
+    }
+    try std.posix.fchmodat(tmp.dir.fd, ".", 0o1777, 0);
+    const path = try tmp_path(gpa, &tmp, "theirs");
+    defer gpa.free(path);
+    var out = try OutFile.open(gpa, path);
+    defer out.deinit();
+    try testing.expect(out.temp == null);
+    try out.file.writeAll("new\n");
+    try out.commit();
+    try testing.expectEqualStrings("new\n", try tmp.dir.readFile("theirs", &buffer));
+    const st = try std.posix.fstatat(tmp.dir.fd, "theirs", 0);
+    try testing.expectEqual(@as(u32, 12345), st.uid);
+    try testing.expectEqual(@as(u32, 0o666), st.mode & 0o7777);
+}
+
+test "OutFile: a rename refused at commit falls back to writing in place, so the result is kept" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (std.os.linux.getuid() == 0) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const gpa = testing.allocator;
+    var buffer: [16]u8 = undefined;
+    try tmp.dir.makeDir("d");
+    var dir = try tmp.dir.openDir("d", .{});
+    defer dir.close();
+    try dir.writeFile(.{ .sub_path = "f", .data = "earlier\n" });
+    const path = try tmp_path(gpa, &tmp, "d/f");
+    defer gpa.free(path);
+    var out = try OutFile.open(gpa, path);
+    defer out.deinit();
+    try testing.expect(out.temp != null);
+    try out.file.writeAll("new\n");
+    // The directory stops being writable under the run.
+    try std.posix.fchmodat(tmp.dir.fd, "d", 0o555, 0);
+    defer std.posix.fchmodat(tmp.dir.fd, "d", 0o755, 0) catch {};
+    try out.commit();
+    try testing.expect(out.temp == null);
+    try testing.expectEqualStrings("new\n", try dir.readFile("f", &buffer));
+}
+
+test "OutFile: a plain-open file is a regular file the PID file's reader may delete" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const gpa = testing.allocator;
+    try tmp.dir.writeFile(.{ .sub_path = "a", .data = "x" });
+    try std.posix.linkat(tmp.dir.fd, "a", tmp.dir.fd, "b", 0);
+    const path = try tmp_path(gpa, &tmp, "a");
+    defer gpa.free(path);
+    var out = try OutFile.open(gpa, path);
+    defer out.deinit();
+    try testing.expect(out.regular());
+    var device = try OutFile.open(gpa, "/dev/null");
+    defer device.deinit();
+    try testing.expect(!device.regular());
 }
 
 test "OutFile: a name of NAME_MAX bytes still has a temporary file" {

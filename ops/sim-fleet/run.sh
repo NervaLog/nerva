@@ -80,6 +80,10 @@ vsr_superblock_quorums vsr_multi_batch nerva_adds nerva_http_head nerva_document
     : "${SIM_FLEET_REPLAY_TIMEOUT:=1800}"
     : "${SIM_FLEET_GIT_TIMEOUT:=300}"
     : "${SIM_FLEET_BUILD_TIMEOUT:=3600}"
+    # A commit whose build failed is built again after this many seconds, at most this many times
+    # (#289); then it stays in state/broken until main moves or an operator clears it.
+    : "${SIM_FLEET_BROKEN_RETRY_SECONDS:=7200}"
+    : "${SIM_FLEET_BROKEN_RETRIES:=3}"
     : "${SIM_FLEET_REPORT_TIMEOUT:=600}"
     # Bytes of a failing seed's output kept for the reporter (it puts at most 8 KiB in an issue).
     : "${SIM_FLEET_TAIL_BYTES:=65536}"
@@ -96,6 +100,15 @@ vsr_superblock_quorums vsr_multi_batch nerva_adds nerva_http_head nerva_document
         log "SIM_FLEET_ALARM_ROUNDS must be a positive whole number, not '$SIM_FLEET_ALARM_ROUNDS'"
         exit 2
     fi
+
+    for v in SIM_FLEET_BROKEN_RETRIES SIM_FLEET_BROKEN_RETRY_SECONDS; do
+        if [[ ! "${!v}" =~ ^[0-9]{1,6}$ ]]; then
+            log "error[NRV-E0740]: $v must be a non-negative whole number, not '${!v}'"
+            exit 2
+        fi
+        # A leading zero is not octal: `08` is 8, `07200` is 7200.
+        printf -v "$v" '%d' "$((10#${!v}))"
+    done
 
     (( SIM_FLEET_WORKERS_VOPR_NERVA + SIM_FLEET_WORKERS_VOPR_TESTING + SIM_FLEET_WORKERS_FUZZ \
         + SIM_FLEET_WORKERS_MIXED <= 1024 )) || { log "more than 1024 workers"; exit 2; }
@@ -134,6 +147,7 @@ vsr_superblock_quorums vsr_multi_batch nerva_adds nerva_http_head nerva_document
     # Remembered across restarts: a restart neither rebuilds a good commit nor retries a bad one.
     built=$(cat "$STATE/built" 2>/dev/null || true)
     broken=$(cat "$STATE/broken" 2>/dev/null || true)
+    broken_tries=0
     if [[ -n "$built" && ! -x "$STATE/bin/$built/fuzz" ]]; then built=""; fi
     log "workers: vopr-nerva $SIM_FLEET_WORKERS_VOPR_NERVA, vopr-testing" \
         "$SIM_FLEET_WORKERS_VOPR_TESTING, fuzz $SIM_FLEET_WORKERS_FUZZ, mixed" \
@@ -243,29 +257,62 @@ log() {
     printf '%s sim-fleet: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"
 }
 
-# Fetches the branch; if its tip is a commit not built (and not already known to fail to build),
-# builds it into a directory of its own and switches to it only once every build succeeded. A
-# build that fails leaves the last good binaries in use and is logged once.
+# Fetches the branch; if its tip is a commit not built, builds it into a directory of its own and
+# switches to it only once every build succeeded. A tip in `state/broken` is built again only when
+# `broken_retry_due` says so (#289). A build that fails leaves the last good binaries in use and
+# is logged once.
 follow_main() {
     if ! timeout "$SIM_FLEET_GIT_TIMEOUT" git fetch --quiet origin "$SIM_FLEET_BRANCH"; then
         log "git fetch failed or timed out; keeping ${built:-nothing}"
+        restore_built
         return 0
     fi
     local head
     head=$(git rev-parse FETCH_HEAD)
-    if [[ "$head" == "$built" || "$head" == "$broken" ]]; then
+    if [[ "$head" == "$built" ]]; then
+        restore_built
         return 0
     fi
+    local retry=0
+    if [[ "$head" == "$broken" ]]; then
+        if ! broken_retry_due; then
+            restore_built
+            return 0
+        fi
+        retry=1
+    else
+        broken_tries=0
+    fi
     prune_cache
-    git checkout --quiet --detach "$head"
+    # A failed checkout can leave HEAD on the unbuilt head and the tree torn: put the built commit
+    # back, so a restart in this round does not start that run.sh.
+    checkout_commit "$head" || { restore_built; return 0; }
+    if (( retry )); then
+        # Recorded after the checkout and before the build: a checkout that fails builds nothing
+        # and costs no attempt, but a build killed midway (a restart, the OOM killer) counts,
+        # otherwise every boot would start it again, without a bound.
+        broken_tries=$(( broken_tries + 1 ))
+        echo "$head $broken_tries $(date +%s)" >"$STATE/broken-tries.new"
+        mv "$STATE/broken-tries.new" "$STATE/broken-tries"
+        log "retrying the build of $head (failed before; attempt $broken_tries" \
+            "of $(( SIM_FLEET_BROKEN_RETRIES + 1 )))"
+    fi
     log "building $head"
     rm -rf "$STATE/bin/$head"
+    # A retry keeps its own log (build.log.2 ...): at most SIM_FLEET_BROKEN_RETRIES + 1 files.
+    local suffix=""
+    if (( retry )); then
+        suffix=".$broken_tries"
+    else
+        rm -f "$STATE"/build.log.[0-9]*   # an earlier head's retry logs
+    fi
     # `9>&-`: a build left behind by a killed loop must not hold the loop's lock.
     if timeout "$SIM_FLEET_BUILD_TIMEOUT" bash -c 'set -euo pipefail; build_into "$1"' _ \
-        "$STATE/bin/$head" >"$STATE/build.log" 2>&1 9>&-; then
+        "$STATE/bin/$head" >"$STATE/build.log$suffix" 2>&1 9>&-; then
         echo "$head" >"$STATE/built.new"
         mv "$STATE/built.new" "$STATE/built"
         built=$head
+        rm -f "$STATE/broken-tries"
         log "built $head"
         prune_bin
         reexec_if_changed "$head"
@@ -275,23 +322,93 @@ follow_main() {
         echo "$head" >"$STATE/broken.new"
         mv "$STATE/broken.new" "$STATE/broken"
         broken=$head
-        log "build of $head FAILED or timed out (see $STATE/build.log); still testing" \
+        (( retry )) || broken_tries=1
+        echo "$head $broken_tries $(date +%s)" >"$STATE/broken-tries.new"
+        mv "$STATE/broken-tries.new" "$STATE/broken-tries"
+        log "build of $head FAILED or timed out (see $STATE/build.log$suffix); still testing" \
             "${built:-nothing}"
         # The unit starts the checkout's run.sh at a restart: it must be the built commit's, next
         # to that commit's reporter, not the one that failed to build (#432). And the run.sh
         # running now may be the unbuilt head's (a restart during the build): hand over to the
         # built commit's, as after a successful build (#424).
-        if [[ -n "$built" ]]; then
-            git checkout --quiet --detach "$built"
-            reexec_if_changed "$built"
-        fi
+        restore_built
     fi
+}
+
+# True when the broken head has been built fewer than SIM_FLEET_BROKEN_RETRIES + 1 times and the
+# last start or failure is SIM_FLEET_BROKEN_RETRY_SECONDS old. `state/broken-tries` is
+# `<sha> <builds started> <epoch of the last start or failure>`; a file that is missing, torn or
+# for another commit counts as one build just now, so a bad file never retries in a loop. Sets
+# `broken_tries`.
+broken_retry_due() {
+    local sha="" n="" at=""
+    { read -r sha n at <"$STATE/broken-tries"; } 2>/dev/null || true
+    if [[ "$sha" != "$broken" || ! "$n" =~ ^[0-9]{1,6}$ || ! "$at" =~ ^[0-9]{1,12}$ ]]; then
+        broken_tries=1
+        echo "$broken 1 $(date +%s)" >"$STATE/broken-tries.new"
+        mv "$STATE/broken-tries.new" "$STATE/broken-tries"
+        return 1
+    fi
+    broken_tries=$(( 10#$n ))
+    (( broken_tries <= SIM_FLEET_BROKEN_RETRIES )) &&
+        (( $(date +%s) - 10#$at >= SIM_FLEET_BROKEN_RETRY_SECONDS ))
+}
+
+# The checkout and the run.sh running are the built commit's, else puts the checkout back and
+# hands over to that commit's run.sh. A restart during a build, or a crash between recording a
+# failed build and undoing its checkout, leaves the unbuilt head's (#424, #432); so does a
+# fetch that fails, or a main reverted to the built commit, on the next round. Called at every
+# return of follow_main that does not build. A checkout that is on the built commit but not clean
+# (a restore that wrote a file short) is forced again every round, and its run.sh is never
+# exec'd: only a clean tree's is.
+restore_built() {
+    if [[ -z "$built" ]]; then return 0; fi
+    if [[ "$(git rev-parse HEAD)" != "$built" ]] || ! tree_clean; then
+        if [[ "$(git rev-parse HEAD)" != "$built" ]]; then
+            log "checkout is on $(git rev-parse HEAD), not the built commit $built; restoring it"
+        else
+            log "checkout of the built commit $built is not clean; restoring it"
+        fi
+        # Stays on the run.sh running: the checkout's is of no known commit.
+        checkout_commit "$built" || return 0
+    fi
+    reexec_if_changed "$built"
+}
+
+# True when no tracked file differs from HEAD. A `git status` that fails reads as dirty. Untracked
+# files are not looked at: the toolchain and build outputs are ignored, and the one gap is a
+# deleted file git could not unlink (NRV-E0731's row).
+tree_clean() {
+    local st
+    st=$(git status --porcelain --untracked-files=no 2>/dev/null) || return 1
+    [[ -z "$st" ]]
+}
+
+# `git checkout` of $1, which must not end the loop: under set -e a stale .git/index.lock or a
+# commit the checkout does not have would exit 128 at every restart, a systemd loop with no limit.
+# One coded line per call (two at most a round: the head, then the restore), and the caller carries
+# on with what it has.
+checkout_commit() {
+    local err="$STATE/checkout.err"
+    # --force: the checkout is the fleet's own, so a file a failed checkout left modified is
+    # overwritten, not a reason to refuse every later one (#439).
+    if git checkout --force --quiet --detach "$1" 2>"$err"; then
+        # git can exit 0 after failing to write a file (a full disk, a read-only directory): a
+        # mixed tree must never be built or recorded as built (#439).
+        if tree_clean; then return 0; fi
+        echo "tree is not clean after the checkout: $(git status --porcelain \
+            --untracked-files=no 2>&1 | head -n1)" >"$err"
+    fi
+    log "error[NRV-E0731]: cannot check out $1 ($(head -n1 "$err" | cut -c1-200));" \
+        "still testing ${built:-nothing}"
+    return 1
 }
 
 # After a build of $1: if that commit's run.sh is not the one bash loaded, runs that one instead,
 # with the same arguments and the environment it was started with (#424). Without it, a changed
-# interface between run.sh and sim_fleet.py (#382's --round-id) failed every ingest. Once per built commit: the marker
-# SIM_FLEET_REEXEC names the commit the run.sh just exec'd came from, so it does not exec again.
+# interface between run.sh and sim_fleet.py (#382's --round-id) failed every ingest. Once per
+# built commit: the marker SIM_FLEET_REEXEC names the commit the run.sh just exec'd came from, so
+# it does not exec again.
 # The lock (fd 9) is closed first; the new run.sh takes it. Needs RUN_ARGS, RUN_SH_SUM, ORIG_ENV.
 reexec_if_changed() {
     local head=$1 new="$SIM_FLEET_REPO_DIR/ops/sim-fleet/run.sh" sum

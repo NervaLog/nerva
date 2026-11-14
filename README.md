@@ -534,15 +534,23 @@ runs the first s seconds as usual, but leaves their operations out of the summar
 throughput and percentiles); their timeline lines carry `"warmup":true`. `--warmup` + `--seconds`
 is at most 3600, and the summary JSON gains `"warmup"` and `"late_operations"` members.
 `--timeline`, `--gateway-pid-file` and `--output` are all opened before anything starts, so a bad
-path is refused at once with NRV-E0728. A regular file (or a path not made yet) is written as a
-temporary file beside its path and renamed into place when it is complete, so a path holds either
-its earlier content or the whole new content, and an earlier file survives any later failure (a read-only file is refused, and a writable file in a read-only directory is written in place, as a plain open does); the
-temporary file (`.nerva-<hash>.<pid>.tmp` beside the path) is removed on every failure path, but a run killed by a signal leaves it behind. Anything else (a device such as `/dev/full`, a pipe, `/dev/stdout`
-on a pipe, `/dev/fd/N`) is written in place, never renamed over. Two flags that name one file (the same path, or the same inode) are refused with
+path is refused at once with NRV-E0728. A path not made yet, or a regular file you
+own, with one link and writable, is written as a temporary file beside its path
+(`.nerva-<hash>.<pid>.tmp`, with the file's permission bits and group) and renamed into place when
+it is complete, so the path holds either its earlier content or the whole new content; the
+temporary file is removed on every failure path, but a run killed by a signal leaves it behind, and
+a rename refused after the run falls back to writing the content in place, so it is not lost. Every
+other path is opened as a plain open for writing does, which is **not atomic**: a regular file is
+truncated when it is opened, so a later failure leaves it empty. That covers a file of another
+owner, a file with several links, a file in a directory you cannot write, a dangling symbolic link
+(it is followed, and its target made) and anything that is not a regular file (a device such as
+`/dev/full`, a pipe, `/dev/stdout` on a pipe, `/dev/fd/N`); a FIFO blocks the run's start until a
+reader opens it, as `cat > fifo` does. A file you cannot write is refused (P414b). Two flags that name one file (the same path, or the same inode) are refused with
 NRV-E0728 ("another output flag names the same file"); a device such as `/dev/null` may be named
-twice. A path that is a dangling symbolic link is replaced by the new file, not followed. A later
+twice. A later
 write failure prints the same line after the cluster and the gateway it started are torn down. The
-PID file is removed when the gateway stops. A value out of range (`--clients`, `--batch`, `--keys`, `--hot`, `--warmup` plus
+PID file, if it is a regular file, is removed when the gateway stops (if its directory lets the
+run remove it). A value out of range (`--clients`, `--batch`, `--keys`, `--hot`, `--warmup` plus
 `--seconds`, `--local`'s client limit) is NRV-E0002. For the `botpike` workload only
 (refused for the others): `--gateway-statsd=<host:port>` (checked before anything starts, NRV-E0736)
 passes `--statsd` to the gateway it starts, `--gateway-pid-file=<file>` writes the gateway's PID there right after it spawns, and

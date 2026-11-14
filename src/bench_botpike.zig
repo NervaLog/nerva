@@ -147,7 +147,8 @@ pub const Gateway = struct {
             const pid = try std.fmt.bufPrint(&pid_buffer, "{}\n", .{gateway.process.id});
             out.file.writeAll(pid) catch |err| return pid_failure(options, out, err);
             out.commit() catch |err| return pid_failure(options, out, err);
-            // Set only for a regular file: `stop` deletes it, which must not be a device.
+            // Set for any regular file, written in place or renamed: `stop` deletes it, which must
+            // not be a device.
             if (out.regular()) gateway.pid_file = out.final;
         }
 
