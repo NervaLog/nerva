@@ -115,10 +115,12 @@ jobs:
     needs: version
     uses: ./.github/workflows/ci.yml
     # ci.yml's `changes` job asks for pull-requests: read; a called workflow cannot hold more
-    # than its caller grants.
+    # than its caller grants. `issues: write` is for ci.yml's `alarm` job (P376), which a release's
+    # call skips (`repos-fresh` runs on pushes of CI itself); the grant is checked when the file loads.
     permissions:
       contents: read
       pull-requests: read
+      issues: write
 
   # The packaging tests on this very commit (docs/briefs/v0.7.1.md, demo row 6; #384): called, not
   # observed, so a later push to main cannot cancel it, a red run stops the draft, and its result is
@@ -301,5 +303,6 @@ jobs:
     uses: ./.github/workflows/release-finish.yml
     permissions:
       contents: write
+      issues: write
     with:
       tag: ${{ needs.version.outputs.tag }}
