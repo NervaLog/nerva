@@ -140,7 +140,7 @@ The release candidate is `main` at `c886c9f0e5e4cffd12597cc29f46a4535fe6b254` (P
 from their records.
 
 - **Simulation: shipped before the full 24 hours on the candidate, by the owner's waiver**
-  (P{N}). The fleet ran `5d7d806`, whose pinned code is the candidate's, for 15.0 hours over
+  (P451). The fleet ran `5d7d806`, whose pinned code is the candidate's, for 15.0 hours over
   2026-11-12 and 2026-11-13: 74,305 seeds (VOPR, the testing VOPR and every fuzzer), none failed
   ([the fleet's tracker, #177](https://github.com/NervaLog/nerva/issues/177)). The soak of
   `c886c9f` itself had not reached 24 hours when the owner chose to tag. No `sim-fleet` issue
@@ -162,7 +162,7 @@ from their records.
   (#405); the only finding still open is #372 (SHOULD), whose fix is deferred to after v0.7.1
   (#395). The verdicts: the first reviewer (Fable, P369), "ship after MUSTs: one MUST, about the
   release process, not the code" (#371, fixed by #374 and the re-pin P388); the second, "ship
-  v0.7.1, no MUSTs". The owner waives #372 for this release (P{N}); it is a known issue below. P369's short review of what ships after
+  v0.7.1, no MUSTs". The owner waives #372 for this release (P451); it is a known issue below. P369's short review of what ships after
   `5d7d806` (release automation, packages, the installer, the env examples): "ship once #384 is
   fixed or waived"; [#384](https://github.com/NervaLog/nerva/issues/384) was fixed by #386. Earlier rounds on older commits: #315 to #321 and
   #328.
