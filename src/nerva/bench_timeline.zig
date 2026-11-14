@@ -14,6 +14,7 @@
 //! `bench_load.zig` is an executable with no test root.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const assert = std.debug.assert;
 
 const vsr = @import("../vsr.zig");
@@ -78,6 +79,11 @@ pub fn path_error_reason(err: anyerror) []const u8 {
     };
 }
 
+/// The process ID; `std.os.linux.getpid` is a raw Linux system call, so other systems ask libc.
+fn process_id() std.posix.pid_t {
+    return if (builtin.os.tag == .linux) std.os.linux.getpid() else std.c.getpid();
+}
+
 /// A file the run could not write, kept until the cluster and the gateway are torn down.
 pub const FileFailure = struct {
     flag: []const u8,
@@ -97,7 +103,8 @@ pub const FileFailure = struct {
 /// (or a path that does not exist yet) is written as a temporary file in the same directory and
 /// renamed into place by `commit`, so that a path holds either its earlier content or the whole
 /// new content, never an emptied file. A device (`/dev/full`) or another file that is not
-/// regular is written in place, and never renamed over.
+/// regular is written in place, and never renamed over. A path that is a dangling symbolic link is
+/// not followed: the rename replaces the link with a regular file.
 pub const OutFile = struct {
     file: std.fs.File,
     /// The path as given (borrowed, for messages).
@@ -120,7 +127,7 @@ pub const OutFile = struct {
             const file = try std.fs.cwd().createFile(final, .{ .truncate = false });
             return .{ .file = file, .requested = path, .final = final, .temp = null, .gpa = gpa };
         }
-        const temp = try std.fmt.allocPrint(gpa, "{s}.{d}.tmp", .{ final, std.os.linux.getpid() });
+        const temp = try std.fmt.allocPrint(gpa, "{s}.{d}.tmp", .{ final, process_id() });
         errdefer gpa.free(temp);
         const file = try std.fs.cwd().createFile(temp, .{});
         return .{ .file = file, .requested = path, .final = final, .temp = temp, .gpa = gpa };
@@ -152,12 +159,14 @@ pub const OutFile = struct {
 };
 
 /// Whether two paths name the same file: the same path once resolved, or the same device and
-/// inode. A path that does not exist is resolved through its directory.
+/// inode. A path that does not exist is resolved through its directory. A device (`/dev/null`,
+/// `/dev/stdout`) is written in place and never replaced, so two flags may name one.
 pub fn same_file(gpa: std.mem.Allocator, a: []const u8, b: []const u8) !bool {
     const identity_a = try identity(gpa, a);
     defer identity_a.deinit(gpa);
     const identity_b = try identity(gpa, b);
     defer identity_b.deinit(gpa);
+    if (identity_a.device or identity_b.device) return false;
     if (std.mem.eql(u8, identity_a.path, identity_b.path)) return true;
     if (identity_a.node != null and identity_b.node != null) {
         return identity_a.node.?.dev == identity_b.node.?.dev and
@@ -169,6 +178,7 @@ pub fn same_file(gpa: std.mem.Allocator, a: []const u8, b: []const u8) !bool {
 const Identity = struct {
     path: []const u8,
     node: ?struct { dev: u64, ino: u64 },
+    device: bool = false,
 
     fn deinit(identity_: Identity, gpa: std.mem.Allocator) void {
         gpa.free(identity_.path);
@@ -178,7 +188,12 @@ const Identity = struct {
 fn identity(gpa: std.mem.Allocator, path: []const u8) !Identity {
     if (std.fs.cwd().realpathAlloc(gpa, path)) |resolved| {
         const st = try std.posix.fstatat(std.posix.AT.FDCWD, resolved, 0);
-        return .{ .path = resolved, .node = .{ .dev = @intCast(st.dev), .ino = @intCast(st.ino) } };
+        const device = st.mode & std.posix.S.IFMT == std.posix.S.IFCHR;
+        return .{
+            .path = resolved,
+            .node = .{ .dev = @intCast(st.dev), .ino = @intCast(st.ino) },
+            .device = device,
+        };
     } else |_| {}
     const directory = std.fs.path.dirname(path) orelse ".";
     const base = std.fs.path.basename(path);

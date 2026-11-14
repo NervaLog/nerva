@@ -296,7 +296,7 @@ def main():
             with open(keep, "w") as handle:
                 handle.write("previous-result\n")
             if label.startswith("timeline"):
-                argv = ["--timeline=/dev/full", f"--output={keep}"]
+                argv = ["--workload=c1", "--timeline=/dev/full", f"--output={keep}"]
             else:
                 argv = [f"--timeline={keep}"] + extra
             result = run(bench, ["--local", "--seconds=1"] + argv, timeout=120)
