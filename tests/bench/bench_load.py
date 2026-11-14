@@ -58,6 +58,11 @@ def children():
 BASELINE = None
 
 
+def stray_files(cwd):
+    """What a run left in its cwd, besides the .zig-cache its local cluster uses."""
+    return [name for name in os.listdir(cwd) if name != ".zig-cache"]
+
+
 def assert_clean(label):
     """No replica or gateway of this case survives it, and no cluster directory (it is torn down)."""
     deadline = time.time() + 5
@@ -306,6 +311,43 @@ def main():
             assert [n for n in os.listdir(tmp) if n.endswith(".tmp")] == [], label
             assert_clean(label)
         print("ok a later failure leaves an earlier output file as it was")
+        # A pipe is written in place: /dev/stdout, /dev/fd/N (process substitution) and
+        # /dev/stdout twice reach the reader, and no `pipe:[N]` file is made in the cwd.
+        piped_cwd = os.path.join(tmp, "pipecwd")
+        os.makedirs(piped_cwd)
+        for label, flags in [
+            ("--output=/dev/stdout", ["--output=/dev/stdout"]),
+            ("--timeline=/dev/stdout", ["--timeline=/dev/stdout"]),
+            ("--timeline and --output both /dev/stdout",
+             ["--timeline=/dev/stdout", "--output=/dev/stdout"]),
+        ]:
+            result = subprocess.run(
+                [bench, "--local", "--workload=c1", "--seconds=1"] + flags,
+                cwd=piped_cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60)
+            assert result.returncode == 0, (label, result.returncode, result.stderr[-300:])
+            assert "t_us" in result.stdout or "{" in result.stdout, (label, "nothing on the pipe")
+            assert stray_files(piped_cwd) == [], (label, stray_files(piped_cwd))
+        # The output file is a pipe made by the shell (process substitution, /dev/fd/N).
+        captured = os.path.join(tmp, "captured.out")
+        subprocess.run(
+            ["bash", "-c", f'"$0" --local --workload=c1 --seconds=1 --output=>(cat > "{captured}")',
+             bench], cwd=piped_cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60,
+            check=True)
+        for _ in range(50):
+            if os.path.exists(captured) and os.path.getsize(captured) > 0:
+                break
+            time.sleep(0.1)
+        assert os.path.getsize(captured) > 0, "nothing reached the process substitution"
+        assert stray_files(piped_cwd) == [], stray_files(piped_cwd)
+        # A path that cannot be looked at is one coded line, not a panic (NRV-E0728).
+        result = run(bench, ["--local", "--workload=c1", "--seconds=1",
+                             "--timeline=/dev/stdout", "--output=" + "a" * 5000], timeout=30)
+        lines = [line for line in result.stderr.splitlines() if line.strip()]
+        assert result.returncode == 1 and len(lines) == 1 and lines[0].startswith(
+            "error[NRV-E0728]: bench-load: --output: cannot write "), (result.returncode, lines)
+        assert lines[0].endswith("the path is too long"), lines
+        assert_clean("unreadable path")
+        print("ok a pipe is written in place; an unreadable path is refused in one line")
         # Two output flags may not name one file (same path, or the same inode): NRV-E0728.
         same = os.path.join(tmp, "same.out")
         link = os.path.join(tmp, "same.link")

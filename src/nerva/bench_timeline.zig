@@ -119,14 +119,19 @@ pub const OutFile = struct {
     /// Opens (creating, never emptying a file that is already there) what `path` names, or
     /// returns the error that `path_error_reason` words (NRV-E0728).
     pub fn open(gpa: std.mem.Allocator, path: []const u8) !OutFile {
+        // What `path` names is looked at as given: `/dev/stdout` resolves to `pipe:[N]` when
+        // stdout is a pipe, which is no path to write. Anything that is not a regular file (a
+        // device, a pipe, a socket, `/dev/fd/N`) is written in place, as before.
+        if (stat_kind(path)) |kind| {
+            if (kind != .file) {
+                const file = try std.fs.cwd().createFile(path, .{ .truncate = false });
+                const final = try gpa.dupe(u8, path);
+                return .{ .file = file, .requested = path, .final = final, .temp = null, .gpa = gpa };
+            }
+        }
         const resolved: ?[]u8 = std.fs.cwd().realpathAlloc(gpa, path) catch null;
         const final = resolved orelse try gpa.dupe(u8, path);
         errdefer gpa.free(final);
-        const stat: ?std.fs.File.Stat = std.fs.cwd().statFile(final) catch null;
-        if (stat != null and stat.?.kind != .file) {
-            const file = try std.fs.cwd().createFile(final, .{ .truncate = false });
-            return .{ .file = file, .requested = path, .final = final, .temp = null, .gpa = gpa };
-        }
         const temp = try std.fmt.allocPrint(gpa, "{s}.{d}.tmp", .{ final, process_id() });
         errdefer gpa.free(temp);
         const file = try std.fs.cwd().createFile(temp, .{});
@@ -185,16 +190,39 @@ const Identity = struct {
     }
 };
 
+/// The kind of what `path` names (following links, without opening it), or null if nothing is
+/// there or it cannot be looked at.
+fn stat_kind(path: []const u8) ?std.fs.File.Kind {
+    const st = std.posix.fstatat(std.posix.AT.FDCWD, path, 0) catch return null;
+    return switch (st.mode & std.posix.S.IFMT) {
+        std.posix.S.IFREG => .file,
+        std.posix.S.IFDIR => .directory,
+        std.posix.S.IFCHR => .character_device,
+        std.posix.S.IFBLK => .block_device,
+        std.posix.S.IFIFO => .named_pipe,
+        std.posix.S.IFSOCK => .unix_domain_socket,
+        else => .unknown,
+    };
+}
+
+/// Looks at `path` as given, so that `/dev/stdout` on a pipe (which resolves to `pipe:[N]`) is
+/// a pipe and not a missing file. A file that is not regular is written in place and never
+/// replaced (`device`). An error other than "nothing there" is returned (NRV-E0728 words it).
 fn identity(gpa: std.mem.Allocator, path: []const u8) !Identity {
-    if (std.fs.cwd().realpathAlloc(gpa, path)) |resolved| {
-        const st = try std.posix.fstatat(std.posix.AT.FDCWD, resolved, 0);
-        const device = st.mode & std.posix.S.IFMT == std.posix.S.IFCHR;
+    if (std.posix.fstatat(std.posix.AT.FDCWD, path, 0)) |st| {
+        const device = st.mode & std.posix.S.IFMT != std.posix.S.IFREG and
+            st.mode & std.posix.S.IFMT != std.posix.S.IFDIR;
+        const resolved: []u8 = std.fs.cwd().realpathAlloc(gpa, path) catch
+            try gpa.dupe(u8, path);
         return .{
             .path = resolved,
             .node = .{ .dev = @intCast(st.dev), .ino = @intCast(st.ino) },
             .device = device,
         };
-    } else |_| {}
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    }
     const directory = std.fs.path.dirname(path) orelse ".";
     const base = std.fs.path.basename(path);
     const parent = std.fs.cwd().realpathAlloc(gpa, directory) catch
@@ -684,4 +712,39 @@ test "OutFile: the path keeps its content until commit; a device is written in p
     defer device.deinit();
     try testing.expect(device.temp == null);
     try device.commit();
+}
+
+test "OutFile: a pipe (/dev/fd/N) is written in place, never resolved to pipe:[N] and renamed" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const fds = try std.posix.pipe();
+    defer std.posix.close(fds[0]);
+    defer std.posix.close(fds[1]);
+    const path = try std.fmt.allocPrint(gpa, "/dev/fd/{d}", .{fds[1]});
+    defer gpa.free(path);
+    {
+        var out = try OutFile.open(gpa, path);
+        defer out.deinit();
+        try testing.expect(out.temp == null);
+        try out.file.writeAll("piped\n");
+        try out.commit();
+    }
+    var buffer: [16]u8 = undefined;
+    const n = try std.posix.read(fds[0], &buffer);
+    try testing.expectEqualStrings("piped\n", buffer[0..n]);
+    // Two flags naming one pipe do not collide: it is written in place.
+    try testing.expect(!(try same_file(gpa, path, path)));
+}
+
+test "same_file: a path that cannot be looked at is an error, and leaks nothing" {
+    const gpa = testing.allocator;
+    const long = try gpa.alloc(u8, 5000);
+    defer gpa.free(long);
+    @memset(long, 'a');
+    try testing.expectError(error.NameTooLong, same_file(gpa, long, "/dev/null"));
+    try testing.expectError(error.NameTooLong, same_file(gpa, "/dev/null", long));
+    try testing.expectEqualStrings(
+        "the path is too long",
+        path_error_reason(error.NameTooLong),
+    );
 }

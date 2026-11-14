@@ -213,7 +213,11 @@ fn run_flags(gpa: std.mem.Allocator, args: CLIArgs, failure: *?bench_timeline.Fi
         const later_path = later.path orelse continue;
         for (flags_and_paths[0..i]) |earlier| {
             const earlier_path = earlier.path orelse continue;
-            if (try bench_timeline.same_file(gpa, earlier_path, later_path)) {
+            const same = bench_timeline.same_file(gpa, earlier_path, later_path) catch |err| {
+                failure.* = .{ .flag = later.flag, .path = later_path, .err = err };
+                return error.FileWriteFailed;
+            };
+            if (same) {
                 failure.* = .{ .flag = later.flag, .path = later_path, .err = error.OutputsCollide };
                 return error.FileWriteFailed;
             }
