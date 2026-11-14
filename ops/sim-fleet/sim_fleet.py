@@ -69,6 +69,10 @@ MARKER = re.compile(r"<!-- vopr-fleet fingerprint: ([0-9a-f]{32}) -->")
 # open `sim-fleet` issues. It carries no fingerprint, so `markers` never reads it as a failure.
 ALARM_MARKER = "<!-- vopr-fleet alarm: rounds failing -->"
 ALARM_ROUNDS_MAX = 1_000_000
+# The state file's schema rule (#289): while `version` is 1, a schema grows by optional fields only.
+# A reader gives every new field a default (`entry.get("refused", 0)`), so a file an older reporter
+# wrote still loads, and `load_state` checks only the fields that were always there. A field that
+# is required, renamed, retyped or dropped needs a new `version` and a migration, in the same commit.
 STATE_VERSION = 1
 
 # Bounds. Every collection this reads or keeps has one.
@@ -354,8 +358,7 @@ def read_result(round_dir, worker, line, counts, source_root):
         raise BadInput(f"{worker}/results: seed or exit code out of range: {line!r}")
     count = counts.setdefault(target, {"seeds": 0, "failed": 0, "timeouts": 0, "host": 0})
     count["seeds"] += 1
-    if hasattr(counts, "busy"):
-        counts.busy[worker] = counts.busy.get(worker, 0) + min(int(seconds), SEED_SECONDS_MAX)
+    counts.busy[worker] = counts.busy.get(worker, 0) + min(int(seconds), SEED_SECONDS_MAX)
     if code == 0:
         return None
     if code in HOST_CODES:
@@ -533,7 +536,7 @@ def kind_of(target):
 def round_seconds(counts):
     """A round's hours, as seconds: its busiest worker's. Workers run at once, so no worker's
     busy time exceeds the round's wall time, and the fleet never claims more than ran."""
-    return max(getattr(counts, "busy", {}).values(), default=0)
+    return max(counts.busy.values(), default=0)
 
 
 def commit_entry(entries, commit, sequence):
@@ -575,7 +578,7 @@ def refuse_round(state, commit, now):
     assert entry["refused"] > 0 and day["refused"] > 0
 
 
-def count_round(day, counts, commit, state=None):
+def count_round(day, counts, commit, state):
     day["rounds"] += 1
     day["commit"] = commit
     for target, count in counts.items():
@@ -583,10 +586,9 @@ def count_round(day, counts, commit, state=None):
                                                    "host": 0})
         for key in total:
             total[key] += count[key]
-    if state is not None:
-        state["sequence"] += 1
-        add_round(commit_entry(day.setdefault("commits", {}), commit, state["sequence"]), counts)
-        add_round(commit_entry(state["commits"], commit, state["sequence"]), counts)
+    state["sequence"] += 1
+    add_round(commit_entry(day.setdefault("commits", {}), commit, state["sequence"]), counts)
+    add_round(commit_entry(state["commits"], commit, state["sequence"]), counts)
 
 
 def record_fingerprints(state, commit, groups):
@@ -682,9 +684,11 @@ def totals_text(state, ymd_day, day):
         out.append("")
         out.append("Commits that ran:")
         for sha in sorted(day["commits"], key=lambda sha: day["commits"][sha]["last"]):
+            total = state["commits"].get(sha)
+            # An evicted commit has no total: the day's figure is not "in all" (#289).
+            in_all = f"{hours_text(total['seconds'])} h in all" if total else "total forgotten"
             out.append(f"- `{sha[:7]}`: {hours_text(day['commits'][sha]['seconds'])} h that day, "
-                       f"{hours_text(state['commits'].get(sha, day['commits'][sha])['seconds'])}"
-                       f" h in all, {seeds_of(day['commits'][sha])} seeds that day")
+                       f"{in_all}, {seeds_of(day['commits'][sha])} seeds that day")
     if day["seen"]:
         out.append("")
         out.append("Failures by issue:")

@@ -852,6 +852,15 @@ class Soak(unittest.TestCase):
                       "- `1a2b3c4`: 1.0 h that day, 2.0 h in all, 4 seeds that day\n"
                       "- `9f8e7d6`: 0.5 h that day, 0.5 h in all, 4 seeds that day\n", text)
 
+    def test_an_evicted_commit_has_no_total_in_the_daily_comment(self):
+        github, state = Recorder(), fleet.new_state()
+        ingest(self, github, state, soak_round(self, 3600), SHA_A, DAY_ONE)
+        del state["commits"][SHA_A]
+        day = state["days"][fleet.ymd(DAY_ONE)]
+        text = fleet.totals_text(state, fleet.ymd(DAY_ONE), day)
+        self.assertIn("- `1a2b3c4`: 1.0 h that day, total forgotten, 4 seeds that day\n", text)
+        self.assertNotIn("h in all", text)
+
     def test_a_state_from_before_the_counting_loads_and_starts_counting(self):
         path = os.path.join(tempfile.mkdtemp(), "state.json")
         Path(path).write_text(json.dumps({"version": 1, "filed": {}, "days": {}, "hold_until": 0}))
