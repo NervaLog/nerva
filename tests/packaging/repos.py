@@ -34,7 +34,7 @@ sys.path.insert(0, str(SCRIPTS))
 import test_package_repos as H  # noqa: E402  (the harness: Base, packages, the stand-in gh)
 
 IMAGES = ["debian:12", "debian:13", "ubuntu:22.04", "ubuntu:24.04", "rockylinux:9", "fedora:43", "fedora:44"]
-SPEC = ROOT / "docs/releases/packages.md"
+SPEC = ROOT / "docs/INSTALL.md"
 CHECK = SCRIPTS / "repo_install_check.sh"
 failures = []
 
@@ -52,7 +52,7 @@ def ok(what):
 
 def spec_blocks():
     text = SPEC.read_text()
-    section = text.split("## Install instructions", 1)[1].split("\n## ", 1)[0]
+    section = text.split("### The apt and dnf repositories", 1)[1].split("\n### ", 1)[0]
     return re.findall(r"```bash\n(.*?)```", section, re.S)
 
 

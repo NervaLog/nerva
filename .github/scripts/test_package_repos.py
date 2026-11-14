@@ -1220,6 +1220,16 @@ class Publish(Base):
         rc, _, err = self.publish("v0.7.2")
         self.assert_diag(rc, err, "NRV-E1144")
 
+    def test_a_signing_failure_is_e1144_and_carries_gpgs_last_line(self):
+        self.bound("v0.7.2")
+        real = shutil.which("gpg")
+        (self.tmp / "bin/gpg").write_text(
+            f'#!/bin/sh\ncase " $* " in *" --clearsign "*) echo "gpg: signing failed: Inappropriate ioctl for device" >&2; exit 2;; esac\nexec {real} "$@"\n')
+        (self.tmp / "bin/gpg").chmod(0o755)
+        rc, _, err = self.publish("v0.7.2")
+        self.assert_diag(rc, err, "NRV-E1144", what="(gpg: gpg: signing failed: Inappropriate ioctl for device)")
+        self.assert_no_secrets(self.last.stdout, self.last.stderr)
+
     def test_a_tool_of_another_version_is_e1139(self):
         self.bound("v0.7.2")
         for ver in ("RPM version 4.19.1", "RPM version 4.18.20", "RPM version 4.18.2.1"):

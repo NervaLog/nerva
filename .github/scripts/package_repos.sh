@@ -218,10 +218,13 @@ setup_keys() {
   fi
 }
 
-sign_clear() { gpg --batch --yes --digest-algo SHA512 --clearsign "${@:3}" -o "$2" "$1" 2>/dev/null || sign_failed "$1"; }
-sign_detach() { gpg --batch --yes --digest-algo SHA512 --detach-sign --armor "${@:3}" -o "$2" "$1" 2>/dev/null || sign_failed "$1"; }
+sign_clear() { gpg --batch --yes --digest-algo SHA512 --clearsign "${@:3}" -o "$2" "$1" 2>"$W/gpg.err" || sign_failed "$1"; }
+sign_detach() { gpg --batch --yes --digest-algo SHA512 --detach-sign --armor "${@:3}" -o "$2" "$1" 2>"$W/gpg.err" || sign_failed "$1"; }
+# gpg's own last line (it prints no secret) is part of the cause: the key or passphrase is not the only way signing fails.
 sign_failed() {
-  refuse NRV-E1144 "signing $(basename "$1") failed" "gpg refused the key or its passphrase" \
+  local why
+  why=$(tail -n1 "$W/gpg.err" 2>/dev/null | tr -d '\r' | cut -c1-200) || why=
+  refuse NRV-E1144 "signing $(basename "$1") failed" "gpg refused the key or its passphrase${why:+ (gpg: $why)}" \
     "Check the signing key and the package's NEVRA and payload against the release's file, then run again"
 }
 

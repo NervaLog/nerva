@@ -7,6 +7,16 @@
 set -euo pipefail
 
 main() {
+    # What follow_main re-execs with, and the checksum of the run.sh bash loaded (#424): bash reads
+    # this file once, but the checkout it follows rewrites it in place.
+    RUN_ARGS=("$@")
+    # The SIM_FLEET_* environment as the unit gave it, before the defaults below land in it: the
+    # re-exec restores exactly this, so the new run.sh computes its own defaults (#424, review).
+    ORIG_ENV=()
+    local name
+    for name in $(compgen -e SIM_FLEET_); do ORIG_ENV+=("$name=${!name}"); done
+    RUN_SH=$(readlink -f "${BASH_SOURCE[0]}")
+    RUN_SH_SUM=$(sha256sum "$RUN_SH" | cut -d' ' -f1)
     : "${SIM_FLEET_HOME:=/var/lib/sim-fleet}"
     : "${SIM_FLEET_DRY_RUN:=}"
     # A dry run gets a checkout and a state of its own: it must not touch the service's.
@@ -25,7 +35,6 @@ main() {
     # the smaller of every core but one (git, builds and the reporter) and what memory holds.
     : "${SIM_FLEET_SEED_MEMORY_MB:=4096}"
     : "${SIM_FLEET_RESERVE_MB:=1024}"
-    local name
     for name in SIM_FLEET_SEED_MEMORY_MB SIM_FLEET_RESERVE_MB; do
         if [[ ! "${!name}" =~ ^[0-9]+$ ]] || (( 10#${!name} == 0 )); then
             log "$name must be a positive whole number of MB, not '${!name}'"
@@ -79,6 +88,14 @@ vsr_superblock_quorums vsr_multi_batch nerva_adds nerva_http_head nerva_document
     : "${SIM_FLEET_ROUNDS:=0}"
     : "${SIM_FLEET_IDLE_SECONDS:=60}"
     : "${SIM_FLEET_PYTHON:=python3}"
+    # Consecutive failing rounds (ingest failed or left no record, or a worker died) before the
+    # alarm (NRV-E0730, P429).
+    : "${SIM_FLEET_ALARM_ROUNDS:=3}"
+    if [[ ! "$SIM_FLEET_ALARM_ROUNDS" =~ ^[0-9]{1,6}$ ]] ||
+        (( 10#$SIM_FLEET_ALARM_ROUNDS == 0 )); then
+        log "SIM_FLEET_ALARM_ROUNDS must be a positive whole number, not '$SIM_FLEET_ALARM_ROUNDS'"
+        exit 2
+    fi
 
     (( SIM_FLEET_WORKERS_VOPR_NERVA + SIM_FLEET_WORKERS_VOPR_TESTING + SIM_FLEET_WORKERS_FUZZ \
         + SIM_FLEET_WORKERS_MIXED <= 1024 )) || { log "more than 1024 workers"; exit 2; }
@@ -128,7 +145,7 @@ vsr_superblock_quorums vsr_multi_batch nerva_adds nerva_http_head nerva_document
         bin="$STATE/bin/$built" round="$STATE/round"
         settle_leftover
     fi
-    local rounds=0
+    rounds=0
     while (( SIM_FLEET_ROUNDS == 0 || rounds < SIM_FLEET_ROUNDS )); do
         rounds=$(( rounds + 1 ))
         follow_main
@@ -232,15 +249,19 @@ log() {
 follow_main() {
     if ! timeout "$SIM_FLEET_GIT_TIMEOUT" git fetch --quiet origin "$SIM_FLEET_BRANCH"; then
         log "git fetch failed or timed out; keeping ${built:-nothing}"
+        restore_built
         return 0
     fi
     local head
     head=$(git rev-parse FETCH_HEAD)
     if [[ "$head" == "$built" || "$head" == "$broken" ]]; then
+        restore_built
         return 0
     fi
     prune_cache
-    git checkout --quiet --detach "$head"
+    # A failed checkout can leave HEAD on the unbuilt head and the tree torn: put the built commit
+    # back, so a restart in this round does not start that run.sh.
+    checkout_commit "$head" || { restore_built; return 0; }
     log "building $head"
     rm -rf "$STATE/bin/$head"
     # `9>&-`: a build left behind by a killed loop must not hold the loop's lock.
@@ -251,14 +272,97 @@ follow_main() {
         built=$head
         log "built $head"
         prune_bin
+        reexec_if_changed "$head"
     else
         rm -rf "$STATE/bin/$head"
+        # Recorded first: a crash before the checkout is undone must not rebuild $head.
         echo "$head" >"$STATE/broken.new"
         mv "$STATE/broken.new" "$STATE/broken"
         broken=$head
         log "build of $head FAILED or timed out (see $STATE/build.log); still testing" \
             "${built:-nothing}"
+        # The unit starts the checkout's run.sh at a restart: it must be the built commit's, next
+        # to that commit's reporter, not the one that failed to build (#432). And the run.sh
+        # running now may be the unbuilt head's (a restart during the build): hand over to the
+        # built commit's, as after a successful build (#424).
+        restore_built
     fi
+}
+
+# The checkout and the run.sh running are the built commit's, else puts the checkout back and
+# hands over to that commit's run.sh. A restart during a build, or a crash between recording a
+# failed build and undoing its checkout, leaves the unbuilt head's (#424, #432); so does a
+# fetch that fails, or a main reverted to the built commit, on the next round. Called at every
+# return of follow_main that does not build. A checkout that is on the built commit but not clean
+# (a restore that wrote a file short) is forced again every round, and its run.sh is never
+# exec'd: only a clean tree's is.
+restore_built() {
+    if [[ -z "$built" ]]; then return 0; fi
+    if [[ "$(git rev-parse HEAD)" != "$built" ]] || ! tree_clean; then
+        log "checkout is not clean on the built commit $built; restoring it"
+        # Stays on the run.sh running: the checkout's is of no known commit.
+        checkout_commit "$built" || return 0
+    fi
+    reexec_if_changed "$built"
+}
+
+# True when no tracked file differs from HEAD. A `git status` that fails reads as dirty. Untracked
+# files are not looked at: the toolchain and build outputs are ignored, and the one gap is a
+# deleted file git could not unlink (NRV-E0731's row).
+tree_clean() {
+    local st
+    st=$(git status --porcelain --untracked-files=no 2>/dev/null) || return 1
+    [[ -z "$st" ]]
+}
+
+# `git checkout` of $1, which must not end the loop: under set -e a stale .git/index.lock or a
+# commit the checkout does not have would exit 128 at every restart, a systemd loop with no limit.
+# One coded line per call (two at most a round: the head, then the restore), and the caller carries
+# on with what it has.
+checkout_commit() {
+    local err="$STATE/checkout.err"
+    # --force: the checkout is the fleet's own, so a file a failed checkout left modified is
+    # overwritten, not a reason to refuse every later one (#439).
+    if git checkout --force --quiet --detach "$1" 2>"$err"; then
+        # git can exit 0 after failing to write a file (a full disk, a read-only directory): a
+        # mixed tree must never be built or recorded as built (#439).
+        if tree_clean; then return 0; fi
+        echo "tree is not clean after the checkout: $(git status --porcelain \
+            --untracked-files=no 2>&1 | head -n1)" >"$err"
+    fi
+    log "error[NRV-E0731]: cannot check out $1 ($(head -n1 "$err" | cut -c1-200));" \
+        "still testing ${built:-nothing}"
+    return 1
+}
+
+# After a build of $1: if that commit's run.sh is not the one bash loaded, runs that one instead,
+# with the same arguments and the environment it was started with (#424). Without it, a changed
+# interface between run.sh and sim_fleet.py (#382's --round-id) failed every ingest. Once per
+# built commit: the marker SIM_FLEET_REEXEC names the commit the run.sh just exec'd came from, so
+# it does not exec again.
+# The lock (fd 9) is closed first; the new run.sh takes it. Needs RUN_ARGS, RUN_SH_SUM, ORIG_ENV.
+reexec_if_changed() {
+    local head=$1 new="$SIM_FLEET_REPO_DIR/ops/sim-fleet/run.sh" sum
+    if [[ "${SIM_FLEET_REEXEC:-}" == "$head" ]]; then return 0; fi
+    [[ -r "$new" ]] || return 0
+    sum=$(sha256sum "$new" | cut -d' ' -f1)
+    if [[ "$sum" == "$RUN_SH_SUM" ]]; then return 0; fi
+    # A run.sh that does not parse would kill the loop and crash-loop the unit: stay on this one.
+    if ! bash -n "$new" 2>/dev/null; then
+        log "ALARM error[NRV-E0730]: run.sh of $head does not parse (bash -n); staying on the" \
+            "run.sh that is running"
+        return 0
+    fi
+    log "run.sh of $head differs from the one running; re-executing it"
+    local rounds_left=${SIM_FLEET_ROUNDS:-0} name kv
+    # The rounds a dry run or a test asked for are counted from the first run.sh.
+    if (( rounds_left != 0 )); then rounds_left=$(( rounds_left - ${rounds:-1} + 1 )); fi
+    # The environment this run.sh was started with, not the one it has since filled in.
+    for name in $(compgen -e SIM_FLEET_); do unset "$name"; done
+    for kv in ${ORIG_ENV[@]+"${ORIG_ENV[@]}"}; do export "${kv%%=*}=${kv#*=}"; done
+    export SIM_FLEET_REEXEC=$head
+    if (( rounds_left != 0 )); then export SIM_FLEET_ROUNDS=$rounds_left; fi
+    exec bash "$new" "${RUN_ARGS[@]}" 9>&-
 }
 
 # The five binaries of one commit, built as CI and fuzz_loop.sh build them (ReleaseSafe), and
@@ -445,7 +549,10 @@ worker() {
 # kept in `last-failed-round` for a look.
 settle() {
     local id=$1 commit=$2 code=1
-    if [[ "${3:-}" != refuse ]]; then
+    if [[ "${3:-}" == refuse ]]; then
+        # code stays 1: a refused round is a failing round.
+        :
+    else
         code=0
         ingest_round "$id" "$commit" || code=$?
         if ! recorded "$id"; then
@@ -462,6 +569,7 @@ settle() {
             "it stays in $round, and the loop stops"
         exit 1
     fi
+    note_round "$code" "$id" "$commit"
     if (( code == 0 )); then
         rm -rf "$round"
     else
@@ -470,6 +578,40 @@ settle() {
         log "round $id is recorded, refused or with sim_fleet.py exit $code; the round is kept" \
             "in $STATE/last-failed-round for a look"
     fi
+}
+
+# Counts consecutive failing rounds ($1 is the round's code: not 0 is failing) in
+# $STATE/failing-rounds (`<count> <alarmed 0|1>`, so a restart keeps it). At SIM_FLEET_ALARM_ROUNDS
+# in a row: one loud line, and `sim_fleet.py alarm` files or comments on the `sim-fleet` issue,
+# once per streak; if that fails, it is tried again at the next failing round. A round that
+# counts ends the streak (#424, NRV-E0730, P429).
+note_round() {
+    local code=$1 id=$2 commit=$3 count=0 alarmed=0 file="$STATE/failing-rounds"
+    if (( code == 0 )); then
+        rm -f "$file"
+        return 0
+    fi
+    if [[ -r "$file" ]]; then read -r count alarmed <"$file" || true; fi
+    [[ "$count" =~ ^[0-9]{1,9}$ ]] || count=0
+    [[ "$alarmed" == 1 ]] || alarmed=0
+    count=$(( 10#$count + 1 ))
+    if (( count >= ${SIM_FLEET_ALARM_ROUNDS:-3} && alarmed == 0 )); then
+        log "ALARM error[NRV-E0730]: $count rounds in a row failed (the latest, $id of" \
+            "${commit:0:7}); soak reads no hours until one counts. See $STATE/last-failed-round"
+        set -- alarm --rounds "$count" --round-id "$id" --commit "$commit"
+        if [[ -n "$SIM_FLEET_DRY_RUN" ]]; then
+            set -- "$@" --dry-run
+        else
+            set -- "$@" --repo "$SIM_FLEET_GH_REPO" --token-file "$token_file"
+        fi
+        if timeout "$SIM_FLEET_REPORT_TIMEOUT" "$SIM_FLEET_PYTHON" -I "$bin/sim_fleet.py" "$@"; then
+            alarmed=1
+        else
+            log "the alarm was not filed; asking again at the next failing round"
+        fi
+    fi
+    echo "$count $alarmed" >"$file.new" && mv "$file.new" "$file" ||
+        log "cannot save $file; the count of failing rounds restarts"
 }
 
 # `sim_fleet.py ingest` of round $1 of commit $2 (its exit code).
