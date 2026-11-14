@@ -357,6 +357,25 @@ def main():
                 target = os.path.join(tmp, f"{flags}.nerva")
                 check("import " + name, imp + ["--input=" + flagged, target], code, 1, text)
                 assert not os.path.exists(target)
+            # The write path, from real exports (P426): a release `export` writes flags 0, a
+            # keys-off `export` writes bit 0; a release import refuses the latter from the real
+            # file, leaving nothing behind, and a keys-off import accepts it. The bit marks the
+            # exporting build, not the cluster, so a release export of a keys-off cluster is 0.
+            assert real[12:16] == bytes(4), real[12:16]
+            off_out = os.path.join(tmp, "off.export")
+            made = run(nerva_off, export + ["--output=" + off_out])
+            assert made.returncode == 0, made.stderr[-2000:]
+            with open(off_out, "rb") as f:
+                off_bytes = f.read()
+            assert off_bytes[12:16] == b"\x01\x00\x00\x00", off_bytes[12:16]
+            off_target = os.path.join(tmp, "off.nerva")
+            check("import real keys-off export", imp + ["--input=" + off_out, off_target],
+                  "NRV-E0732", 1, "deduplication off")
+            assert not os.path.exists(off_target)
+            assert not os.path.exists(off_target + ".importing")
+            accepted = run(nerva_off, imp + ["--input=" + off_out, off_target])
+            assert accepted.returncode == 0, accepted.stderr[-2000:]
+            assert os.path.exists(off_target)
             # A port that is taken.
             with socket.socket() as taken:
                 taken.bind(("127.0.0.1", 0))
