@@ -507,10 +507,17 @@ test "statsd_refusal: the rule of nerva api --statsd, and the command line's len
     for ([_][]const u8{ "", "notanaddress", "127.0.0.1:0", "127.0.0.1:65536", "[fdaa::2", "localhost:8125" }) |text| {
         try testing.expect(statsd_refusal(text) != null);
     }
+    // The longest address `nerva api --statsd` accepts, a bracketed IPv6 address with a port, is
+    // far under the bound, so no accepted value reaches 119 bytes: the length check only guards
+    // `statsd_buffer`, and a text of exactly that length is refused as an address, not as too long.
+    const ipv6_longest = "[ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff]:65535";
+    try testing.expectEqual(@as(?[]const u8, null), statsd_refusal(ipv6_longest));
+    try testing.expect(ipv6_longest.len < statsd_length_max);
     // Too long: the refusal comes from the length, whatever the text.
     const long = "a" ** (statsd_length_max - 5) ++ ":8125";
     try testing.expectEqual(@as(usize, statsd_length_max), long.len);
-    try testing.expect(statsd_refusal(long) != null); // not an address, but within the length
+    const exact = statsd_refusal(long).?; // within the length, so refused only as an address
+    try testing.expect(std.mem.indexOf(u8, exact, "119 bytes") == null);
     try testing.expect(statsd_refusal(long ++ "0") != null);
     try testing.expect(std.mem.indexOf(u8, statsd_refusal(long ++ "0").?, "119") != null);
 }

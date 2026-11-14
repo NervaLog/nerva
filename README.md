@@ -533,9 +533,9 @@ one line per second of `--warmup` + `--seconds`, empty seconds included. `--warm
 runs the first s seconds as usual, but leaves their operations out of the summary JSON (counts,
 throughput and percentiles); their timeline lines carry `"warmup":true`. `--warmup` + `--seconds`
 is at most 3600, and the summary JSON gains `"warmup"` and `"late_operations"` members.
-`--timeline` and `--gateway-pid-file` are created before the run, so a bad path is refused at
-once with NRV-E0728 (the same line if a later write fails, printed after the cluster and the gateway
-it started are torn down). A regular `--timeline` or `--gateway-pid-file` that the run did not fill is
+`--timeline`, `--gateway-pid-file` and `--output` are all opened before any is emptied, so a bad path
+is refused at once with NRV-E0728 and leaves an earlier file at the others untouched (the same line if a later write fails, printed after the cluster and the gateway
+it started are torn down). A regular file one of them made that the run did not fill is
 removed again on every failure path (never a device such as `/dev/full`), and the PID file is removed
 when the gateway stops. A value out of range (`--clients`, `--batch`, `--keys`, `--hot`, `--warmup` plus
 `--seconds`, `--local`'s client limit) is NRV-E0002. For the `botpike` workload only

@@ -247,13 +247,44 @@ def main():
             assert result.returncode == 1 and len(lines) == 1, (label, lines)
             assert lines[0].startswith("error[NRV-E0002]: bench-load: --"), (label, lines)
         print("ok out-of-range flags refused (NRV-E0002)")
-        # A failed run leaves neither an empty PID file nor an empty timeline behind.
-        left = os.path.join(tmp, "left.pid")
-        result = run(bench, ["--local", "--workload=botpike", "--seconds=1", f"--gateway-pid-file={left}",
-                             "--gateway-statsd=127.0.0.1:0"], timeout=30)
-        assert not os.path.exists(left), "an empty PID file is left by a refused run"
-        assert_clean("refused run")
-
+        # Every output is opened before any is emptied: an earlier result at --timeline survives a
+        # refused --gateway-pid-file or --output, and no file of the refused run is left. The
+        # statsd address is valid, so the run gets as far as the PID file (without the fix the
+        # timeline is truncated first).
+        for flag, label in [("--gateway-pid-file", "PID file"), ("--output", "output")]:
+            keep = os.path.join(tmp, "keep.jsonl")
+            with open(keep, "w") as handle:
+                handle.write("previous-result\n")
+            bad = os.path.join(tmp, "no-such-dir", "out")
+            result = run(bench, ["--local", "--workload=botpike", "--seconds=1", f"--timeline={keep}",
+                                 f"{flag}={bad}", "--gateway-statsd=127.0.0.1:8125"], timeout=30)
+            lines = [line for line in result.stderr.splitlines() if line.strip()]
+            assert result.returncode == 1 and len(lines) == 1, (label, lines)
+            assert lines[0].startswith(f"error[NRV-E0728]: bench-load: {flag}: cannot write "), lines
+            assert "error." not in lines[0] and not result.stdout, (label, lines, result.stdout)
+            with open(keep) as handle:
+                assert handle.read() == "previous-result\n", f"{label}: the earlier timeline was emptied"
+            assert_clean(f"refused {label}")
+        print("ok a refused output leaves an earlier timeline untouched (NRV-E0728)")
+        # A bad --output is refused before the run, one coded line, with no timeline made.
+        timeline = os.path.join(tmp, "fresh.jsonl")
+        result = run(bench, ["--local", "--workload=c1", "--seconds=1", f"--timeline={timeline}",
+                             "--output=/no/such/dir/out.json"], timeout=30)
+        lines = [line for line in result.stderr.splitlines() if line.strip()]
+        assert result.returncode == 1 and len(lines) == 1 and lines[0].startswith(
+            "error[NRV-E0728]: bench-load: --output: cannot write /no/such/dir/out.json"), lines
+        assert not os.path.exists(timeline), "a timeline is left by a refused run"
+        assert_clean("bad --output")
+        # A finished timeline survives a failed --output write (/dev/full is a device: not removed).
+        timeline = os.path.join(tmp, "survives.jsonl")
+        result = run(bench, ["--local", "--workload=c1", "--seconds=1", f"--timeline={timeline}",
+                             "--output=/dev/full"], timeout=60)
+        lines = [line for line in result.stderr.splitlines() if line.strip()]
+        assert result.returncode == 1 and len(lines) == 1 and lines[0].startswith(
+            "error[NRV-E0728]: bench-load: --output: cannot write /dev/full"), lines
+        assert os.path.getsize(timeline) > 0, "the finished timeline was lost"
+        assert_clean("failed --output write")
+        print("ok --output refused up front; a finished timeline survives (NRV-E0728)")
 
 if __name__ == "__main__":
     main()
