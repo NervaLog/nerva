@@ -3,7 +3,7 @@
 //!
 //! Every operation belongs to the second in which it **ended**, counted from the run's start. An
 //! operation that began before the end of the run but ended after it (up to the client timeout
-//! later) belongs to no second: it is counted apart, as `late` (P414b). Each
+//! later) belongs to no second: it is counted apart, as `late` (P414). Each
 //! second holds a `LatencyHistogram` and the counters of its operations. The run's summary is the
 //! merge of the seconds after the warm-up, so the warm-up's operations are left out of it (and of
 //! its counters), and the lines `--timeline` writes merge back to exactly that histogram.
@@ -63,7 +63,7 @@ pub const Summary = struct {
     late: u64 = 0,
 };
 
-/// Why a file `--timeline` or `--gateway-pid-file` names cannot be created, in words (NRV-E0727).
+/// Why a file `--timeline` or `--gateway-pid-file` names cannot be written, in words (NRV-E0728).
 pub fn path_error_reason(err: anyerror) []const u8 {
     return switch (err) {
         error.FileNotFound => "its directory does not exist",
@@ -73,8 +73,17 @@ pub fn path_error_reason(err: anyerror) []const u8 {
         error.NameTooLong => "the path is too long",
         error.NoSpaceLeft => "no space left on the device",
         error.ReadOnlyFileSystem => "the file system is read-only",
-        else => "it cannot be created",
+        else => "it cannot be written",
     };
+}
+
+/// Ends the process with NRV-E0728: one line, no raw Zig error.
+pub fn file_fail(flag: []const u8, path: []const u8, err: anyerror) noreturn {
+    std.io.getStdErr().writer().print(
+        "error[NRV-E0728]: bench-load: {s}: cannot write {s}: {s}\n",
+        .{ flag, path, path_error_reason(err) },
+    ) catch {};
+    std.process.exit(1);
 }
 
 /// Why `--warmup` and `--seconds` are refused, or null if they are accepted.

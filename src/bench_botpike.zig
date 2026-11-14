@@ -142,9 +142,12 @@ pub const Gateway = struct {
         if (options.pid_file) |path| {
             var pid_buffer: [32]u8 = undefined;
             const pid = try std.fmt.bufPrint(&pid_buffer, "{}\n", .{gateway.process.id});
+            std.fs.cwd().writeFile(.{ .sub_path = path, .data = pid }) catch |err| {
+                gateway.stop();
+                bench_timeline.file_fail("--gateway-pid-file", path, err);
+            };
+            // Set only once written: `stop` deletes the file, which must not be a device.
             gateway.pid_file = path;
-            // `bench_load.zig` made the file before the run, so this only fails if it was removed.
-            try std.fs.cwd().writeFile(.{ .sub_path = path, .data = pid });
         }
 
         // The replicas may still be starting: wait until the gateway has a session.
@@ -371,7 +374,7 @@ const Caller = struct {
                 caller.settle(reserved)
             else
                 caller.reserve()) catch |err| {
-                // What the submit counted before it failed still counts (P414b).
+                // What the submit counted before it failed still counts (P414).
                 caller.recorder.record(time.monotonic().ns, null, caller.outcome.counts().sub(counts_before));
                 return err;
             };

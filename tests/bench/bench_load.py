@@ -14,7 +14,7 @@ which the owner has to approve (PR #414's question).
   names a live `nerva api` while the run lasts, and is gone after.
 - `--gateway-stderr=inherit` passes the gateway's lines on; `t_us` is wall-clock time.
 - A bad `--gateway-statsd` (too long, malformed, port 0) is refused at once with NRV-E0736.
-- A bad `--timeline` or `--gateway-pid-file` path is refused at once with NRV-E0727, before any
+- A bad `--timeline` or `--gateway-pid-file` path is refused at once with NRV-E0728, before any
   cluster starts; so is `--gateway-stderr` on a workload with no gateway.
 """
 import json
@@ -116,7 +116,11 @@ def botpike(bench, tmp):
     # Inherited: the gateway's own lines (`nerva api` logs the replica connections) reach our stderr.
     assert "message_bus" in stderr or "nerva" in stderr.lower(), ("no gateway stderr", stderr[-500:])
     assert not os.path.exists(pid_file), "the PID file outlives the gateway"
-    assert not os.path.exists(f"/proc/{pid}") or b"api" not in open(f"/proc/{pid}/cmdline", "rb").read()
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            assert b"api" not in f.read(), "the gateway outlives the run"
+    except FileNotFoundError:
+        pass  # gone, or reaped between the check and the read: both are what we want
     lines = read_timeline(timeline)
     assert len(lines) == WARMUP + SECONDS + 3, len(lines)
     summary = json.loads(stdout)
@@ -134,8 +138,20 @@ def refusal(bench, argv, label, flag):
     assert result.returncode == 1, (label, result.returncode, result.stderr)
     assert result.stdout == "", (label, "it ran", result.stdout)
     assert time.time() - started < 15, (label, "slow: the cluster started")
-    assert len(lines) == 1 and lines[0].startswith("error[NRV-E0727]: bench-load: " + flag), (label, lines)
+    assert len(lines) == 1 and lines[0].startswith("error[NRV-E0728]: bench-load: " + flag), (label, lines)
     assert not re.search(r"\berror\.[A-Z]", result.stderr) and "FileNotFound" not in result.stderr, label
+    print(f"ok {label}")
+
+
+def write_failure(bench, argv, label, flag):
+    """The file was made, then a write failed (/dev/full): one coded line, no raw Zig error."""
+    result = run(bench, argv, timeout=120)
+    lines = [line for line in result.stderr.splitlines() if line.strip()]
+    assert result.returncode == 1, (label, result.returncode, result.stderr[-500:])
+    assert lines and lines[-1] == (
+        f"error[NRV-E0728]: bench-load: {flag}: cannot write /dev/full: no space left on the device"
+    ), (label, lines[-3:])
+    assert not re.search(r"\berror\.[A-Z]|NoSpaceLeft", result.stderr), label
     print(f"ok {label}")
 
 
@@ -166,8 +182,21 @@ def main():
         for value in ["ignore", "inherit"]:
             result = run(bench, ["--local", "--workload=c1", "--seconds=1",
                                  f"--gateway-stderr={value}"], timeout=30)
-            assert result.returncode == 1 and "only for the botpike workload" in result.stderr, value
-        print("ok --gateway-stderr refused for c1")
+            lines = [line for line in result.stderr.splitlines() if line.strip()]
+            assert result.returncode == 1 and len(lines) == 1, (value, lines)
+            assert lines[0].startswith("error[NRV-E0001]: bench-load: --gateway-stderr is only for the botpike workload"), lines
+        print("ok --gateway-stderr refused for c1 (NRV-E0001)")
+        result = run(bench, ["--local", "--workload=c1", "--warmup=2000", "--seconds=2000"], timeout=30)
+        lines = [line for line in result.stderr.splitlines() if line.strip()]
+        assert result.returncode == 1 and len(lines) == 1, lines
+        assert lines[0].startswith("error[NRV-E0001]: bench-load: --warmup plus --seconds"), lines
+        print("ok --warmup plus --seconds over 3600 refused (NRV-E0001)")
+        # A write that fails after the file was made (/dev/full: ENOSPC) is one coded line too.
+        write_failure(bench, ["--local", "--workload=c1", "--seconds=1", "--timeline=/dev/full"],
+                      "timeline write fails", "--timeline")
+        write_failure(bench, ["--local", "--workload=botpike", "--seconds=1",
+                              "--gateway-pid-file=/dev/full"],
+                      "PID file write fails", "--gateway-pid-file")
 
 
 if __name__ == "__main__":

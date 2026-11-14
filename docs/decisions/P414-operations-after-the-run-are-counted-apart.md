@@ -1,8 +1,7 @@
 ---
-id: P414b
+id: P414
 date: 2026-11-14
 area: Testing
-amends: P414
 ---
 
 # `bench-load` counts an operation that ends after the run apart, instead of in the last second

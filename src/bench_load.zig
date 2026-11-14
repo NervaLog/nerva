@@ -138,6 +138,7 @@ pub fn main() !void {
     };
     const gpa = gpa_instance.allocator();
 
+    stdx.Flags.fatal_hook = flag_fatal;
     var flags = stdx.Flags.init(gpa);
     defer flags.deinit(gpa);
     const args = flags.parse(CLIArgs);
@@ -184,7 +185,7 @@ pub fn main() !void {
         }
     }
 
-    // The files this run writes are made now, so that a bad path costs no measurement (NRV-E0727).
+    // The files this run writes are made now, so that a bad path costs no measurement (NRV-E0728).
     const timeline_file: ?std.fs.File = if (args.timeline) |path|
         file_create("--timeline", path)
     else
@@ -238,20 +239,20 @@ pub fn main() !void {
         var lines = std.ArrayList(u8).init(gpa);
         defer lines.deinit();
         try timeline.write(lines.writer());
-        try file.writeAll(lines.items);
+        file.writeAll(lines.items) catch |err| bench_timeline.file_fail("--timeline", args.timeline.?, err);
     }
     if (result.failures > 0) std.process.exit(1);
 }
 
-/// Creates (or empties) the file a flag names, or ends the process with NRV-E0727.
+/// Creates (or empties) the file a flag names, or ends the process with NRV-E0728.
 fn file_create(flag: []const u8, path: []const u8) std.fs.File {
-    return std.fs.cwd().createFile(path, .{}) catch |err| {
-        std.io.getStdErr().writer().print(
-            "error[NRV-E0727]: bench-load: {s}: cannot write {s}: {s}\n",
-            .{ flag, path, bench_timeline.path_error_reason(err) },
-        ) catch {};
-        std.process.exit(1);
-    };
+    return std.fs.cwd().createFile(path, .{}) catch |err| bench_timeline.file_fail(flag, path, err);
+}
+
+/// The flag parser's failures, and this command's own flag checks, as NRV-E0001 (one line).
+fn flag_fatal(message: []const u8) noreturn {
+    std.io.getStdErr().writer().print("error[NRV-E0001]: bench-load: {s}\n", .{message}) catch {};
+    std.process.exit(1);
 }
 
 /// Writes every key once (in batches), so that reads find rows and versions.
@@ -488,7 +489,7 @@ const Worker = struct {
             }
             const counts_before = worker.result.counts();
             worker.operation(client) catch |err| {
-                // What the operation counted before it failed still counts (P414b).
+                // What the operation counted before it failed still counts (P414).
                 worker.recorder.record(time.monotonic().ns, null, worker.result.counts().sub(counts_before));
                 return err;
             };

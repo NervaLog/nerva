@@ -525,7 +525,7 @@ release build.
 `t_us` is wall-clock (`CLOCK_REALTIME`) µs at the second's start, so it can be compared with log
 lines stamped by the clock; latencies are still timed with the monotonic clock. An operation
 belongs to the second in which it ended; one that began before the end of the run and ended after
-it is in no second and no number, and is counted as `"late_operations"` in the summary JSON (P414b).
+it is in no second and no number, and is counted as `"late_operations"` in the summary JSON (P414).
 `buckets` lists the second's non-zero latency-histogram
 buckets as (index, count), so any set of seconds can be merged into one histogram (bucket i < 16
 holds exactly i µs; above that each power of two is split into 16 equal buckets). There is always
@@ -534,7 +534,7 @@ runs the first s seconds as usual, but leaves their operations out of the summar
 throughput and percentiles); their timeline lines carry `"warmup":true`. `--warmup` + `--seconds`
 is at most 3600, and the summary JSON gains `"warmup"` and `"late_operations"` members.
 `--timeline` and `--gateway-pid-file` are created before the run, so a bad path is refused at
-once with NRV-E0727; the PID file is removed when the gateway stops. For the `botpike` workload only
+once with NRV-E0728 (the same line if a later write fails); the PID file is removed when the gateway stops. For the `botpike` workload only
 (refused for the others): `--gateway-statsd=<host:port>` (checked before anything starts, NRV-E0736)
 passes `--statsd` to the gateway it starts, `--gateway-pid-file=<file>` writes the gateway's PID there right after it spawns, and
 `--gateway-stderr=inherit|ignore` (default `ignore`) passes the gateway's stderr through to
