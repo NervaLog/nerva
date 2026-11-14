@@ -71,9 +71,21 @@ git_auth() {
 value_re='^[+-][[:space:]]*(url|version|sha256)[[:space:]]+"'
 
 tap_diff() {
-  local old=$1 new=$2 changed
-  # `diff` exits 1 when the files differ; only its lines matter.
-  changed=$(diff -U0 "$old" "$new" | grep -E '^[+-]' | grep -vE '^(\+\+\+|---) ' | grep -vE "$value_re" || true)
+  local old=$1 new=$2 changed raw rc=0 f
+  for f in "$old" "$new"; do
+    if [[ ! -f "$f" || ! -r "$f" ]]; then
+      refuse NRV-E1135 "cannot compare the formulas: $f is not a readable file" \
+        "the formula to check or to commit was not found at that path" \
+        "run the failed job again; the formula artifact must be downloaded before this step"
+    fi
+  done
+  # `diff` exits 1 when the files differ and 2 on trouble; only exit 2 is a failure.
+  raw=$(diff -U0 "$old" "$new") || rc=$?
+  if ((rc > 1)); then
+    refuse NRV-E1135 "cannot compare the formulas $old and $new" "diff exited with status $rc" \
+      "run the failed job again"
+  fi
+  changed=$(grep -E '^[+-]' <<< "$raw" | grep -vE '^(\+\+\+|---) ' | grep -vE "$value_re" || true)
   if [[ -n "$changed" ]]; then
     refuse NRV-E1135 "the new formula changes more than its url, version and sha256" \
       "the tap's Formula/nerva.rb differs from the generated one in other lines: $(head -n3 <<< "$changed" | tr '\n' ' ')" \
@@ -103,6 +115,13 @@ scrub() { tr '\n' ' ' < "$1" | sed -E 's#(https?://)[^/@ ]*@#\1#g'; }
 # write=yes commit it to its ref (main, or rc/<tag> for a prerelease) and push.
 tap_run() {
   local tag=$1 formula=$2 write=$3 ref old
+  # The workflow passes the formula relative to its checkout; the cd below leaves it.
+  if [[ ! -f "$formula" ]]; then
+    refuse NRV-E1135 "the formula $formula does not exist" \
+      "the formula to check or to commit was not found at that path" \
+      "run the failed job again; the formula artifact must be downloaded before this step"
+  fi
+  [[ "$formula" == /* ]] || formula=$PWD/$formula
   ref=$("$self" tap-ref "$tag")
   # work is global: the EXIT trap runs after this function has returned
   work=$(mktemp -d)
