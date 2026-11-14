@@ -56,8 +56,9 @@ written for people running Nerva: new capabilities with examples, fixes with the
 upgrade steps), then bump `VERSION` (and add a worklog note, `worklog/<number>.md`) in its own commit.
 The section becomes the GitHub release notes; a version without one is refused. The `VERSION` commit
 then runs the rest unattended: the draft, then `release-finish.yml`, which signs the Mac zip and
-checks it, publishes the draft, commits the Homebrew formula to the tap and opens the site's pull
-request. The owner's single approval of the `apple-signing` environment ships all of it. If a run
+checks it, publishes the draft, publishes the apt and dnf repositories at `packages.nerva.pro`
+(`repos-ready` before the publish, `repos` after it, then `repos-verify`; docs/releases/packages.md),
+commits the Homebrew formula to the tap and opens the site's pull request. The owner's single approval of the `apple-signing` environment ships all of it. If a run
 stops, `release-finish.yml` can be started by hand from `main` with the tag, to recover it.
 A session never approves a deployment (an environment's required review); only the owner does (P360).
 
@@ -308,8 +309,9 @@ work done.
 
 ## README and site status (adopted from Zigbox, P147)
 
-- The site is its own repository, `NervaLog/nervalog.github.io` (P148): `index.html`, served by
-  GitHub Pages from that repository's `main` at <https://nervalog.github.io/>. README's
+- The site is its own repository, `NervaLog/nervalog.github.io` (P148): `index.html`, built and
+  deployed as a Cloudflare Worker (static assets, Workers Builds) from that repository's `main`
+  at <https://nerva.pro/> (P365, P410). README's
   Production table and the site (the `SITE`, `GOALS`, `PRODUCTION`, `NEXT` and `RELEASES` data
   at the top of its script) show the same status: change the site in the same session that
   changes a status here. Never mark anything delivered before its demo is green in CI; never show
@@ -328,5 +330,7 @@ work done.
 
 - `perf_event_open` is denied, so `benchmark.perf: usage example` fails (see above).
 - There is no Docker, so Jepsen does not run here; it runs on the R1 host.
+- The session proxy cannot reach Cloudflare (the dashboard, the API, `nerva.pro`'s settings); the
+  owner does those steps (docs/releases/packages.md, "Setup").
 - The repository moved from `Botpike/nerva-ledger` to `NervaLog/nerva`; GitHub redirects the old
   name for reads only. File issues on `NervaLog/nerva`.

@@ -4,8 +4,10 @@ Nerva v0.7.1 is not released yet. This page says how each kind of download insta
 release can be used from its notes alone. Until the release exists, the file names below are the
 names the release process is set up to give its assets (the release workflow for the Linux
 assets, `zig build -Drelease mac-release` for the Mac zip), and the Homebrew tap and the packages are
-built but not published: check the release page for what it actually lists. Nothing here is
-signed by a Linux key; what is signed or checked is said under each heading.
+built but not published: check the release page for what it actually lists. The Linux
+repositories at `packages.nerva.pro` are signed (see [Linux](#the-apt-and-dnf-repositories));
+the files on the release page are not, and are checked with `SHA256SUMS`. What is signed or
+checked is said under each heading.
 
 Nerva is for development and evaluation on macOS, and for production on Linux (x86_64 with AES, or
 aarch64). Nerva is alpha: see [MATURITY.md](./MATURITY.md) for what that promises.
@@ -20,7 +22,7 @@ re-records them. Outputs marked "not run" were written from the files and not ru
 | You have | Take | Section |
 |---|---|---|
 | a Mac | Homebrew, or the zip | [macOS](#macos) |
-| Linux with systemd, production | the tarball and `install.sh`, or the `.deb` or `.rpm` | [Linux](#linux) |
+| Linux with systemd, production | the apt or dnf repository, or the tarball and `install.sh`, or the `.deb` or `.rpm` | [Linux](#linux) |
 | Linux, to try it | the tarball, run by hand | [QUICKSTART.md](./QUICKSTART.md) |
 | any machine with a compiler | the source | [From source](#from-source) |
 
@@ -79,9 +81,102 @@ failure behavior, and the production claims in this repository are Linux's.
 
 ## Linux
 
-Download the file for your machine (`uname -m` says `x86_64` or `aarch64`).
+### The apt and dnf repositories
+
+`https://packages.nerva.pro` serves signed apt and dnf repositories with every release (v0.7.1 and
+later). The repository's metadata and its rpms are signed with one key, and its fingerprint is
+
+```
+949F066FB37C440E54B2A902AEA7B66340A6DBAB
+```
+
+It is `packaging/keys/fingerprints` in this repository, the `current` line. Check it before you
+trust the key: the key file comes from GitHub, and the steps below show you the fingerprint.
+
+**Debian 12 and 13, Ubuntu 22.04 and 24.04** (apt 2.4 or later reads an armored key file):
+
+```bash
+sudo install -d -m 0755 /etc/apt/keyrings
+curl -fsSL https://raw.githubusercontent.com/NervaLog/nerva/main/packaging/keys/nerva-release.asc | sudo tee /etc/apt/keyrings/nerva.asc > /dev/null
+gpg --show-keys /etc/apt/keyrings/nerva.asc     # the pub line's fingerprint must be 949F066FB37C440E54B2A902AEA7B66340A6DBAB
+sudo tee /etc/apt/sources.list.d/nerva.sources > /dev/null <<'EOF'
+Types: deb
+URIs: https://packages.nerva.pro/apt
+Suites: stable
+Components: main
+Architectures: amd64 arm64
+Signed-By: /etc/apt/keyrings/nerva.asc
+EOF
+sudo apt update && sudo apt install nerva
+```
+
+(A minimal Debian or Ubuntu image has neither `curl` nor `ca-certificates`: install both first,
+`sudo apt install curl ca-certificates`. `gpg` is not there either. Compare the fingerprint on
+another machine, or install `gnupg` first. `Architectures` keeps apt from asking for i386 on hosts with multiarch. To
+pin Nerva, pin by Origin, `o=Nerva`: the Suite name `stable` is also Debian's.)
+
+**Fedora 43 and later, Rocky Linux and RHEL 9** (Fedora 41 and 42 are past their end of life and
+are not supported):
+
+```bash
+sudo tee /etc/yum.repos.d/nerva.repo > /dev/null <<'EOF'
+[nerva]
+name=Nerva
+baseurl=https://packages.nerva.pro/rpm/stable
+enabled=1
+gpgcheck=1
+repo_gpgcheck=1
+gpgkey=https://raw.githubusercontent.com/NervaLog/nerva/main/packaging/keys/nerva-release.asc
+EOF
+sudo dnf install nerva      # dnf shows the key's fingerprint and asks: it must be 949F066FB37C440E54B2A902AEA7B66340A6DBAB
+```
+
+- **dnf 5 (Fedora 43 and later here)** fetches the key from `gpgkey=` and asks once; answering yes
+  imports it for both the repository's metadata and the packages. Do not import it with
+  `rpm --import` instead: dnf 5 then cannot verify `repomd.xml` ("Signing key not found"). On
+  Fedora 43 and 44, update dnf5 first (`sudo dnf upgrade dnf5`) if the import hangs.
+- **Fallback, if `repo_gpgcheck` still fails:** `repo_gpgcheck=0`. Each rpm is still checked
+  against the key (`gpgcheck=1`), so nothing unsigned installs. What it gives up: the signed
+  metadata, so a mirror or a bucket token holder could offer an older signed Nerva, or hide a new
+  one.
+- **Upgrades:** `sudo apt update && sudo apt upgrade`, or `sudo dnf upgrade nerva`. A package
+  upgrade replaces the binary and never restarts a replica (P295b). Restart them as OPERATING.md
+  says.
+- **Candidates:** use `Suites: rc`, or `baseurl=https://packages.nerva.pro/rpm/rc`. That channel
+  also has every release.
+- **Switching from a downloaded package:** add the repository. The package installed from the file
+  is the same package, and the next upgrade comes from the repository.
+
+**Check the key through a second channel.** The key file comes from GitHub. `nerva.pro`
+publishes the same key by WKD, from another repository and another host. Both must show the same
+fingerprint, `949F066FB37C440E54B2A902AEA7B66340A6DBAB`:
+
+```bash
+curl -fsSL 'https://nerva.pro/.well-known/openpgpkey/hu/ndqm47zydhyqyzabecddtdk1q3bponab?l=nerva' | gpg --show-keys
+```
+
+If the two disagree, stop and do not install. Report it as a security issue. (With GnuPG's own
+lookup, `gpg --auto-key-locate clear,wkd --locate-external-keys nerva@nerva.pro` does the same,
+but it imports the key into your keyring.)
+
+**A new signing key, every two years.** There is one key, with no subkeys, so a rotation is a new
+key with a new fingerprint (P392). Nothing changes until the CHANGELOG and the pinned issue
+announce it, and the announcement carries the new fingerprint: compare it, through both channels
+above, before you accept it.
+
+- **apt:** run the `curl` line above again, and check the new fingerprint. If you miss it,
+  `apt update` fails with `NO_PUBKEY` after the switch, and the same line fixes it.
+- **dnf:** run `sudo dnf upgrade --refresh nerva`. dnf asks to import the new key from `gpgkey=`:
+  answer yes only if its fingerprint is the announced one. On dnf 5, a host that has not received
+  the new key skips the repository and exits 0 ("Signing key not found"), so read the output of an
+  upgrade, not its exit status.
+
+The repository's rpms and metadata are signed, while the files on the release page are not, and
+are checked with `SHA256SUMS`.
 
 ### The tarball and `install.sh`
+
+Without the repository, download the file for your machine (`uname -m` says `x86_64` or `aarch64`).
 
 `nerva-v0.7.1-x86_64-linux.tar.gz` and `nerva-v0.7.1-aarch64-linux.tar.gz` unpack to a directory of
 the same name that holds `nerva`, `LICENSE`, `NOTICE`, `install.sh`, the units `nerva@.service`
@@ -152,8 +247,9 @@ user, `/var/lib/nerva` and `/etc/nerva`, but **do not put the examples in `/etc/
 them there yourself ([QUICKSTART.md](./QUICKSTART.md#three-hosts)). They format, enable and start
 nothing, and removing them leaves your data, your settings and the user.
 
-**They are not signed in v0.7.1**, and there is no apt or dnf repository yet (they are planned for v0.7.2): you download the file,
-[check it against `SHA256SUMS`](#checking-a-download), and install it from disk.
+**The files on the release page are not signed**: you download the file,
+[check it against `SHA256SUMS`](#checking-a-download), and install it from disk. The
+[repository](#the-apt-and-dnf-repositories) serves the same packages, signed.
 
 ```bash
 sudo apt install ./nerva_0.7.1-1_amd64.deb         # Debian 12, Ubuntu 24.04
