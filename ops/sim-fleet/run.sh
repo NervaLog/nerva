@@ -271,14 +271,20 @@ follow_main() {
         reexec_if_changed "$head"
     else
         rm -rf "$STATE/bin/$head"
-        # The unit starts the checkout's run.sh at a restart: it must be the built commit's, next
-        # to that commit's reporter, not the one that failed to build (#432).
-        if [[ -n "$built" ]]; then git checkout --quiet --detach "$built"; fi
+        # Recorded first: a crash before the checkout is undone must not rebuild $head.
         echo "$head" >"$STATE/broken.new"
         mv "$STATE/broken.new" "$STATE/broken"
         broken=$head
         log "build of $head FAILED or timed out (see $STATE/build.log); still testing" \
             "${built:-nothing}"
+        # The unit starts the checkout's run.sh at a restart: it must be the built commit's, next
+        # to that commit's reporter, not the one that failed to build (#432). And the run.sh
+        # running now may be the unbuilt head's (a restart during the build): hand over to the
+        # built commit's, as after a successful build (#424).
+        if [[ -n "$built" ]]; then
+            git checkout --quiet --detach "$built"
+            reexec_if_changed "$built"
+        fi
     fi
 }
 

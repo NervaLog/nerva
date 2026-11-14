@@ -11,7 +11,7 @@ The decision, for #424:
 
 - **Re-exec.** `run.sh` takes the SHA-256 of itself at start. After `follow_main` builds a commit,
   if that checkout's `ops/sim-fleet/run.sh` has another checksum, it `exec`s it (`bash <new>
-  <same arguments>`, same environment, fd 9 (the lock) closed first), at most once per built
+  <same arguments>`, the environment it was started with (`SIM_FLEET_*` as the unit gave them), fd 9 (the lock) closed first), at most once per built
   commit: `SIM_FLEET_REEXEC=<commit>` is exported and a `run.sh` that finds its own commit there
   does not exec again. A bounded `SIM_FLEET_ROUNDS` carries over what is left.
 - **Alarm.** `SIM_FLEET_ALARM_ROUNDS` (default 3) consecutive failing rounds raise NRV-E0730.

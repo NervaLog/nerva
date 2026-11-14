@@ -1687,12 +1687,72 @@ class FailedBuild(unittest.TestCase):
              f'build_into() {{ return 1; }}; export -f build_into; prune_cache() {{ :; }}; '
              f'STATE="{state}"; built={v1}; broken=""; cd "{repo}"; SIM_FLEET_BRANCH=main; '
              f'SIM_FLEET_GIT_TIMEOUT=60; SIM_FLEET_BUILD_TIMEOUT=60; '
+             f'SIM_FLEET_REPO_DIR="{repo}"; RUN_ARGS=(a); RUN_SH_SUM=0; ORIG_ENV=(); '
              f'git checkout -q --detach {v1}; git remote set-url origin "{remote}"; '
              f'follow_main; echo "HEAD=$(git rev-parse HEAD) broken=$broken built=$built"'],
             env={"PATH": os.environ["PATH"], "HOME": d}, capture_output=True, text=True,
             timeout=60)
         self.assertIn(f"HEAD={v1} broken={v2} built={v1}", out.stdout, out.stderr)
         self.assertIn("FAILED", out.stderr)
+
+    def test_broken_is_written_before_the_checkout_and_the_built_run_sh_takes_over(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(subprocess.run, ["rm", "-rf", d])
+        remote, repo, state = (os.path.join(d, n) for n in ("remote", "repo", "state"))
+        os.makedirs(os.path.join(remote, "ops", "sim-fleet"))
+        self.git(remote, "init", "-q", "-b", "main")
+        run_sh = Path(remote, "ops", "sim-fleet", "run.sh")
+        run_sh.write_text('#!/usr/bin/env bash\necho "BUILT-RUN-SH marker=${SIM_FLEET_REEXEC:-}"\n')
+        self.git(remote, "add", "-A")
+        self.git(remote, "commit", "-q", "-m", "v1")
+        v1 = self.git(remote, "rev-parse", "HEAD")
+        subprocess.run(["git", "clone", "-q", remote, repo], check=True)
+        run_sh.write_text('#!/usr/bin/env bash\necho "UNBUILT-RUN-SH"\n')
+        self.git(remote, "commit", "-q", "-a", "-m", "v2")
+        v2 = self.git(remote, "rev-parse", "HEAD")
+        os.makedirs(state)
+        # The running run.sh is the unbuilt head's (RUN_SH_SUM is another file's). `git checkout`
+        # is a function that fails if `broken` is not on disk yet.
+        out = subprocess.run(
+            ["bash", "-c", f'source "{HERE}/run.sh"; log() {{ echo "$*" >&2; }}; '
+             f'build_into() {{ return 1; }}; export -f build_into; prune_cache() {{ :; }}; '
+             f'STATE="{state}"; built={v1}; broken=""; cd "{repo}"; SIM_FLEET_BRANCH=main; '
+             f'SIM_FLEET_GIT_TIMEOUT=60; SIM_FLEET_BUILD_TIMEOUT=60; '
+             f'SIM_FLEET_REPO_DIR="{repo}"; RUN_ARGS=(a); RUN_SH_SUM=0; ORIG_ENV=(); '
+             f'git() {{ if [[ "$1" == checkout && "$4" == "{v1}" ]]; then '
+             f'echo "BROKEN-ON-DISK=$(cat "{state}/broken")"; fi; command git "$@"; }}; '
+             f'git checkout -q --detach {v1}; git remote set-url origin "{remote}"; '
+             f'follow_main; echo NOT-REACHED'],
+            env={"PATH": os.environ["PATH"], "HOME": d}, capture_output=True, text=True,
+            timeout=60)
+        self.assertIn(f"BROKEN-ON-DISK={v2}", out.stdout, out.stderr)
+        self.assertIn(f"BUILT-RUN-SH marker={v1}", out.stdout, out.stderr)
+        self.assertNotIn("UNBUILT-RUN-SH", out.stdout)
+        self.assertNotIn("NOT-REACHED", out.stdout)
+
+
+class AlarmRoundsSetting(unittest.TestCase):
+    """SIM_FLEET_ALARM_ROUNDS is a whole number from 1 to 999999 (NRV-E0730's threshold)."""
+
+    def check(self, value):
+        home = tempfile.mkdtemp()
+        self.addCleanup(subprocess.run, ["rm", "-rf", home])
+        return subprocess.run(
+            ["bash", f"{HERE}/run.sh"],
+            env={"PATH": os.environ["PATH"], "SIM_FLEET_HOME": home,
+                 "SIM_FLEET_ALARM_ROUNDS": value}, capture_output=True, text=True, timeout=30)
+
+    def test_zero_text_and_too_many_digits_are_refused(self):
+        for bad in ("0", "abc", "1000000", "-1"):
+            out = self.check(bad)
+            self.assertEqual(out.returncode, 2, (bad, out.stdout + out.stderr))
+            self.assertIn("SIM_FLEET_ALARM_ROUNDS must be a positive whole number", out.stdout + out.stderr)
+
+    def test_the_largest_value_passes_this_check(self):
+        # It stops later (no token), not at the alarm setting.
+        out = self.check("999999")
+        self.assertNotIn("SIM_FLEET_ALARM_ROUNDS must be", out.stdout + out.stderr)
+        self.assertIn("no token", out.stdout + out.stderr)
 
 
 class Alarm(unittest.TestCase):
