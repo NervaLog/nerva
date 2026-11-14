@@ -376,6 +376,13 @@ const Identity = struct {
     }
 };
 
+/// A device or inode number as an unsigned value. Darwin's `dev_t` is a signed 32-bit integer
+/// and a device's number can be negative, so the bits are kept, never cast.
+fn unsigned(value: anytype) u64 {
+    const Unsigned = std.meta.Int(.unsigned, @bitSizeOf(@TypeOf(value)));
+    return @as(Unsigned, @bitCast(value));
+}
+
 /// Looks at `path` as given, so that `/dev/stdout` on a pipe (which resolves to `pipe:[N]`) is
 /// a pipe and not a missing file. A file that is not regular is written in place and never
 /// replaced (`device`). An error other than "nothing there" is returned (NRV-E0728 words it).
@@ -387,7 +394,7 @@ fn identity(gpa: std.mem.Allocator, path: []const u8) !Identity {
             try gpa.dupe(u8, path);
         return .{
             .path = resolved,
-            .node = .{ .dev = @intCast(st.dev), .ino = @intCast(st.ino) },
+            .node = .{ .dev = unsigned(st.dev), .ino = unsigned(st.ino) },
             .device = device,
         };
     } else |err| switch (err) {
