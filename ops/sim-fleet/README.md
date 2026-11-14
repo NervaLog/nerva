@@ -19,7 +19,15 @@ takes `flock` on `state/lock`) loops over rounds:
    deadline for all of it; `./zig/download.sh` first, so a toolchain bump is followed). Only a
    build that succeeded becomes the one in use (`state/built`); a tip that does not build is
    recorded in `state/broken`, logged once, and the last good build keeps running. Both survive a
-   restart, so a restart neither rebuilds a good commit nor retries a bad one.
+   restart, so a restart does not rebuild a good commit. A commit that failed to build is built
+   again once `SIM_FLEET_BROKEN_RETRY_SECONDS` (7200) have passed since its last failure, at most
+   `SIM_FLEET_BROKEN_RETRIES` (3) times (four builds in all), so one transient failure (a network blip while the
+   toolchain downloads) does not leave a candidate unsoaked; each retry logs `retrying the build
+   of <sha>`. The count is `state/broken-tries` (`<sha> <failed builds> <epoch of the last>`); a
+   new main commit starts its own count, and a build that succeeds deletes the file. A restart
+   does not reset it. To clear it by hand (a commit out of attempts, or a cause fixed on the
+   host), as `simfleet`: `rm state/broken state/broken-tries`, then `systemctl restart
+   sim-fleet`; the next round builds the tip at once.
 2. **Workers**, one core and about 4 GB of RAM each, `SIM_FLEET_WORKERS` of them (default: the
    smaller of every core but one, which is left for git, builds and the reporter, and
    `memory / SIM_FLEET_SEED_MEMORY_MB`, at least 1; memory is MemTotal minus
@@ -93,6 +101,9 @@ one.
   is over; the rounds in between are counted, and their failures are reported when they recur.
   A tracking issue that refuses the totals is retried each round. A request never follows a
   redirect, so the token never goes to another host.
+- The state file's `version` stays 1 while its schema only grows optional fields (a reader gives
+  each a default, so a file an older reporter wrote still loads); a field that is required,
+  renamed, retyped or dropped needs a new `version` and a migration in the same commit (#289).
 - Filed fingerprints are in `/var/lib/sim-fleet/state/state.json`. If that file is missing, the
   issue markers rebuild it (the latest 500 issues labelled `sim-fleet`) before anything is filed;
   until they can be read, rounds are still counted and nothing is filed. A state file that exists

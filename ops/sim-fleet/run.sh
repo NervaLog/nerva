@@ -80,6 +80,10 @@ vsr_superblock_quorums vsr_multi_batch nerva_adds nerva_http_head nerva_document
     : "${SIM_FLEET_REPLAY_TIMEOUT:=1800}"
     : "${SIM_FLEET_GIT_TIMEOUT:=300}"
     : "${SIM_FLEET_BUILD_TIMEOUT:=3600}"
+    # A commit whose build failed is built again after this many seconds, at most this many times
+    # (#289); then it stays in state/broken until main moves or an operator clears it.
+    : "${SIM_FLEET_BROKEN_RETRY_SECONDS:=7200}"
+    : "${SIM_FLEET_BROKEN_RETRIES:=3}"
     : "${SIM_FLEET_REPORT_TIMEOUT:=600}"
     # Bytes of a failing seed's output kept for the reporter (it puts at most 8 KiB in an issue).
     : "${SIM_FLEET_TAIL_BYTES:=65536}"
@@ -134,6 +138,7 @@ vsr_superblock_quorums vsr_multi_batch nerva_adds nerva_http_head nerva_document
     # Remembered across restarts: a restart neither rebuilds a good commit nor retries a bad one.
     built=$(cat "$STATE/built" 2>/dev/null || true)
     broken=$(cat "$STATE/broken" 2>/dev/null || true)
+    broken_tries=0
     if [[ -n "$built" && ! -x "$STATE/bin/$built/fuzz" ]]; then built=""; fi
     log "workers: vopr-nerva $SIM_FLEET_WORKERS_VOPR_NERVA, vopr-testing" \
         "$SIM_FLEET_WORKERS_VOPR_TESTING, fuzz $SIM_FLEET_WORKERS_FUZZ, mixed" \
@@ -254,9 +259,19 @@ follow_main() {
     fi
     local head
     head=$(git rev-parse FETCH_HEAD)
-    if [[ "$head" == "$built" || "$head" == "$broken" ]]; then
+    if [[ "$head" == "$built" ]]; then
         restore_built
         return 0
+    fi
+    if [[ "$head" == "$broken" ]]; then
+        if ! broken_retry_due; then
+            restore_built
+            return 0
+        fi
+        log "retrying the build of $head (failed before; attempt $(( broken_tries + 1 ))" \
+            "of $(( SIM_FLEET_BROKEN_RETRIES + 1 )))"
+    else
+        broken_tries=0
     fi
     prune_cache
     # A failed checkout can leave HEAD on the unbuilt head and the tree torn: put the built commit
@@ -270,6 +285,7 @@ follow_main() {
         echo "$head" >"$STATE/built.new"
         mv "$STATE/built.new" "$STATE/built"
         built=$head
+        rm -f "$STATE/broken-tries"
         log "built $head"
         prune_bin
         reexec_if_changed "$head"
@@ -279,6 +295,9 @@ follow_main() {
         echo "$head" >"$STATE/broken.new"
         mv "$STATE/broken.new" "$STATE/broken"
         broken=$head
+        broken_tries=$(( broken_tries + 1 ))
+        echo "$head $broken_tries $(date +%s)" >"$STATE/broken-tries.new"
+        mv "$STATE/broken-tries.new" "$STATE/broken-tries"
         log "build of $head FAILED or timed out (see $STATE/build.log); still testing" \
             "${built:-nothing}"
         # The unit starts the checkout's run.sh at a restart: it must be the built commit's, next
@@ -287,6 +306,24 @@ follow_main() {
         # built commit's, as after a successful build (#424).
         restore_built
     fi
+}
+
+# True when the broken head has been retried fewer than SIM_FLEET_BROKEN_RETRIES times and the
+# last failure is SIM_FLEET_BROKEN_RETRY_SECONDS old. `state/broken-tries` is `<sha> <failed builds>
+# <epoch of the last>`; a file that is missing, torn or for another commit counts as one failed
+# build just now, so a bad file never retries in a loop. Sets `broken_tries`.
+broken_retry_due() {
+    local sha="" n="" at=""
+    { read -r sha n at <"$STATE/broken-tries"; } 2>/dev/null || true
+    if [[ "$sha" != "$broken" || ! "$n" =~ ^[0-9]{1,6}$ || ! "$at" =~ ^[0-9]{1,12}$ ]]; then
+        broken_tries=1
+        echo "$broken 1 $(date +%s)" >"$STATE/broken-tries.new"
+        mv "$STATE/broken-tries.new" "$STATE/broken-tries"
+        return 1
+    fi
+    broken_tries=$(( 10#$n ))
+    (( broken_tries <= SIM_FLEET_BROKEN_RETRIES )) &&
+        (( $(date +%s) - 10#$at >= SIM_FLEET_BROKEN_RETRY_SECONDS ))
 }
 
 # The checkout and the run.sh running are the built commit's, else puts the checkout back and
@@ -299,7 +336,11 @@ follow_main() {
 restore_built() {
     if [[ -z "$built" ]]; then return 0; fi
     if [[ "$(git rev-parse HEAD)" != "$built" ]] || ! tree_clean; then
-        log "checkout is not clean on the built commit $built; restoring it"
+        if [[ "$(git rev-parse HEAD)" != "$built" ]]; then
+            log "checkout is on $(git rev-parse HEAD), not the built commit $built; restoring it"
+        else
+            log "checkout of the built commit $built is not clean; restoring it"
+        fi
         # Stays on the run.sh running: the checkout's is of no known commit.
         checkout_commit "$built" || return 0
     fi
