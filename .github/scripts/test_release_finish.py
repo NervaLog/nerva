@@ -783,20 +783,22 @@ class Workflow(unittest.TestCase):
     def test_secrets_are_inherited_only_by_the_signing_call_and_by_release_yml(self):
         # A called workflow sees no secret, its environment's included, unless the caller passes
         # it: without these two, v0.7.1's signing saw every APPLE_* secret empty (NRV-E1121).
+        # Only the key itself counts, never a comment that mentions it.
+        key = re.compile(r"(?m)^    secrets: inherit$")
         jobs = self.text.split("\njobs:\n")[1]
         inheriting = [
             name
             for name in re.findall(r"(?m)^  ([a-z-]+):$", jobs)
-            if "secrets: inherit"
-            in re.split(r"\n  [a-z-]+:\n", jobs.split(f"\n  {name}:\n")[1])[0]
+            if key.search(re.split(r"\n  [a-z-]+:\n", jobs.split(f"\n  {name}:\n")[1])[0])
         ]
         self.assertEqual(inheriting, ["mac"])
+        self.assertEqual(len(key.findall(self.text)), 1)
         release = (WORKFLOW.parent / "release.yml").read_text()
         finish = release.split("\n  finish:\n")[1]
         finish = re.split(r"\n  [a-z-]+:\n", finish)[0]
         self.assertIn("uses: ./.github/workflows/release-finish.yml", finish)
-        self.assertIn("secrets: inherit", finish)
-        self.assertEqual(release.count("secrets: inherit"), 1)
+        self.assertRegex(finish, key)
+        self.assertEqual(len(key.findall(release)), 1)
 
     def test_every_job_declares_its_permissions(self):
         jobs = self.text.split("\njobs:\n")[1]
