@@ -25,7 +25,8 @@ const SuperBlockHeader = superblock.SuperBlockHeader;
 pub const kernel_version_min = Version{ .major = 5, .minor = 11 };
 /// A killed process's lock can linger while `io_uring` tears its ring down (the vendored open
 /// waits 250 ms for it; a loaded host needs longer, #288, P290). Bounded: 40 x 50 ms = 2 s, then
-/// the lock is refused as held (NRV-E0703).
+/// the lock is refused as held (NRV-E0703). A lock whose holder `/proc/locks` shows alive is
+/// refused at the first attempt, naming its pid (#294, P294).
 const lock_retry_ms = 50;
 const lock_wait_ms = 2000;
 const lock_attempts = lock_wait_ms / lock_retry_ms;
@@ -51,7 +52,8 @@ pub const Refusal = union(enum) {
     not_a_file,
     damaged: []const u8,
     other_release: vsr.Release,
-    locked,
+    /// Held by another process: the pid of the live holder `/proc/locks` showed, else null.
+    locked: ?posix.pid_t,
     direct_io_unsupported,
 };
 
@@ -107,27 +109,128 @@ pub fn open_check(
     const stat = try posix.fstat(fd);
     if (!posix.S.ISREG(stat.mode) and !posix.S.ISBLK(stat.mode)) return .not_a_file;
 
-    if (!try lock_free(fd)) return .locked;
+    switch (try lock_wait(&LockProbe{ .fd = fd, .stat = stat })) {
+        .free => {},
+        .held => |pid| return .{ .locked = pid },
+    }
     if (try superblock_refusal(gpa, fd)) |refusal| return refusal;
     if (direct_io == .required and posix.S.ISREG(stat.mode) and
         !try direct_io_supported(path, fd)) return .direct_io_unsupported;
     return null;
 }
 
-/// True if no other open file description holds the lock; takes it and drops it at once.
-fn lock_free(fd: posix.fd_t) !bool {
-    for (0..lock_attempts) |_| {
-        posix.flock(fd, posix.LOCK.EX | posix.LOCK.NB) catch |err| switch (err) {
-            error.WouldBlock => {
-                std.time.sleep(lock_retry_ms * std.time.ns_per_ms);
-                continue;
-            },
+/// The outcome of waiting for the data file's lock.
+const LockWait = union(enum) {
+    free,
+    /// Still held: by this live process, or by one `/proc/locks` did not show alive (null).
+    held: ?posix.pid_t,
+};
+
+/// Waits for no other open file description to hold the lock, taking it and dropping it at once.
+/// `probe` has `try_lock() !bool` (true: taken and dropped), `live_holder() ?pid` and `sleep()`.
+/// A live holder ends the wait at once; otherwise at most `lock_attempts` attempts, none followed
+/// by a sleep after the last.
+fn lock_wait(probe: anytype) !LockWait {
+    for (0..lock_attempts) |attempt| {
+        if (try probe.try_lock()) return .free;
+        if (probe.live_holder()) |pid| return .{ .held = pid };
+        if (attempt + 1 < lock_attempts) probe.sleep();
+    }
+    return .{ .held = null };
+}
+
+const LockProbe = struct {
+    fd: posix.fd_t,
+    stat: posix.Stat,
+
+    fn try_lock(probe: *const LockProbe) !bool {
+        posix.flock(probe.fd, posix.LOCK.EX | posix.LOCK.NB) catch |err| switch (err) {
+            error.WouldBlock => return false,
             else => return err,
         };
-        try posix.flock(fd, posix.LOCK.UN);
+        try posix.flock(probe.fd, posix.LOCK.UN);
         return true;
     }
-    return false;
+
+    /// The pid `/proc/locks` shows holding this file's `flock`, if that process is alive. Null
+    /// when it is gone, or when this cannot be told (not Linux, `/proc/locks` unreadable or over
+    /// `proc_locks_size_max`, a file system whose device `/proc/locks` names differently): the
+    /// caller then keeps the bounded wait.
+    fn live_holder(probe: *const LockProbe) ?posix.pid_t {
+        if (!posix.S.ISREG(probe.stat.mode)) return null;
+        var buffer: [proc_locks_size_max + 1]u8 = undefined;
+        const file = std.fs.openFileAbsolute("/proc/locks", .{}) catch return null;
+        defer file.close();
+        const length = file.readAll(&buffer) catch return null;
+        if (length > proc_locks_size_max) return null;
+        const pid = proc_locks_holder(
+            buffer[0..length],
+            device_major(probe.stat.dev),
+            device_minor(probe.stat.dev),
+            probe.stat.ino,
+        ) orelse return null;
+        return if (process_alive(pid)) pid else null;
+    }
+
+    fn sleep(_: *const LockProbe) void {
+        std.time.sleep(lock_retry_ms * std.time.ns_per_ms);
+    }
+};
+
+/// The most of `/proc/locks` read; a longer table is not used.
+const proc_locks_size_max = 1 << 16;
+
+fn device_major(dev: u64) u32 {
+    return @intCast(((dev >> 8) & 0xfff) | ((dev >> 32) & ~@as(u64, 0xfff)));
+}
+
+fn device_minor(dev: u64) u32 {
+    return @intCast((dev & 0xff) | ((dev >> 12) & ~@as(u64, 0xff)));
+}
+
+/// The pid of the first `FLOCK` holder (not a waiter) of the file `major:minor:inode` in the text
+/// of `/proc/locks` (`1: FLOCK  ADVISORY  WRITE 2145 00:27:20 0 EOF`), or null: no such lock, or
+/// a pid of 0 (a holder in another pid namespace).
+fn proc_locks_holder(text: []const u8, major: u32, minor: u32, inode: u64) ?posix.pid_t {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        var fields = std.mem.tokenizeAny(u8, line, " \t");
+        _ = fields.next() orelse continue; // "1:"
+        const kind = fields.next() orelse continue;
+        if (!std.mem.eql(u8, kind, "FLOCK")) continue; // also skips a waiter's "->"
+        _ = fields.next() orelse continue; // ADVISORY
+        _ = fields.next() orelse continue; // WRITE
+        const pid_text = fields.next() orelse continue;
+        const file_text = fields.next() orelse continue;
+        var parts = std.mem.splitScalar(u8, file_text, ':');
+        const line_major = std.fmt.parseInt(u32, parts.next() orelse continue, 16) catch continue;
+        const line_minor = std.fmt.parseInt(u32, parts.next() orelse continue, 16) catch continue;
+        const line_inode = std.fmt.parseInt(u64, parts.next() orelse continue, 10) catch continue;
+        if (parts.next() != null) continue;
+        if (line_major != major or line_minor != minor or line_inode != inode) continue;
+        const pid = std.fmt.parseInt(posix.pid_t, pid_text, 10) catch continue;
+        return if (pid > 0) pid else null;
+    }
+    return null;
+}
+
+/// Whether `pid` is a process that is not exiting: a zombie has released its files, so its lock
+/// is only lingering (#288).
+fn process_alive(pid: posix.pid_t) bool {
+    posix.kill(pid, 0) catch |err| switch (err) {
+        error.PermissionDenied => {},
+        else => return false,
+    };
+    var path_buffer: [32]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buffer, "/proc/{}/stat", .{pid}) catch unreachable;
+    const file = std.fs.openFileAbsolute(path, .{}) catch return true;
+    defer file.close();
+    var buffer: [512]u8 = undefined;
+    const length = file.readAll(&buffer) catch return true;
+    // `pid (comm) S ...`: the state follows the last ')', as comm may hold one.
+    const close = std.mem.lastIndexOfScalar(u8, buffer[0..length], ')') orelse return true;
+    if (close + 2 >= length) return true;
+    return buffer[close + 2] != 'Z' and buffer[close + 2] != 'X';
 }
 
 fn superblock_refusal(gpa: std.mem.Allocator, fd: posix.fd_t) !?Refusal {
@@ -211,7 +314,13 @@ pub fn refuse(path: []const u8, refusal: Refusal) noreturn {
             "upgrade by export and import (README, \"Upgrading a cluster\"); nothing was changed",
             .{},
         ),
-        .locked => diagnostic.fail(
+        .locked => |holder| if (holder) |pid| diagnostic.fail(
+            "NRV-E0703",
+            "{s}: another process holds {s} (pid {})",
+            .{ diagnostic.command, path, pid },
+            "stop the other replica that uses this data file",
+            .{},
+        ) else diagnostic.fail(
             "NRV-E0703",
             "{s}: another process holds {s}",
             .{ diagnostic.command, path },
@@ -280,7 +389,7 @@ test "preflight: a missing file, a directory, zeros, a short file" {
     try testing.expect((try open_check(gpa, empty, .disabled)).? == .damaged);
 }
 
-test "preflight: a held lock" {
+test "preflight: a lock held by a live process is refused at once, naming its pid" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -291,34 +400,105 @@ test "preflight: a held lock" {
     const file = try std.fs.createFileAbsolute(path, .{});
     defer file.close();
     try posix.flock(file.handle, posix.LOCK.EX | posix.LOCK.NB);
-    try testing.expect((try open_check(testing.allocator, path, .disabled)).? == .locked);
+    const started = std.time.milliTimestamp();
+    const refusal = (try open_check(testing.allocator, path, .disabled)).?;
+    // The holder is this process: alive, so no 2 s wait. Skipped where /proc/locks does not name
+    // the file (it then waits the bound and names no pid).
+    if (refusal.locked) |pid| {
+        try testing.expectEqual(std.os.linux.getpid(), pid);
+        try testing.expect(std.time.milliTimestamp() - started < lock_wait_ms / 2);
+    }
+    try testing.expect(refusal == .locked);
     try posix.flock(file.handle, posix.LOCK.UN);
     // Free: the next check goes on to the superblock, which an empty file lacks.
     try testing.expect((try open_check(testing.allocator, path, .disabled)).? == .damaged);
 }
 
-test "preflight: a lock released within the wait is not refused" {
+/// A probe that frees the lock after `free_after` failed attempts, and counts what it is asked.
+const FakeProbe = struct {
+    free_after: u32,
+    holder: ?posix.pid_t = null,
+    tries: u32 = 0,
+    sleeps: u32 = 0,
+
+    fn try_lock(probe: *FakeProbe) !bool {
+        probe.tries += 1;
+        return probe.tries > probe.free_after;
+    }
+
+    fn live_holder(probe: *const FakeProbe) ?posix.pid_t {
+        return probe.holder;
+    }
+
+    fn sleep(probe: *FakeProbe) void {
+        probe.sleeps += 1;
+    }
+};
+
+test "preflight: a lock whose holder is gone is retried up to the bound and no further" {
+    // At the bound: free on the last attempt.
+    var at = FakeProbe{ .free_after = lock_attempts - 1 };
+    try testing.expect(try lock_wait(&at) == .free);
+    try testing.expectEqual(@as(u32, lock_attempts), at.tries);
+    try testing.expectEqual(@as(u32, lock_attempts - 1), at.sleeps);
+
+    // One past it: refused after `lock_attempts` attempts, and no sleep after the last.
+    var past = FakeProbe{ .free_after = lock_attempts };
+    const waited = try lock_wait(&past);
+    try testing.expect(waited == .held and waited.held == null);
+    try testing.expectEqual(@as(u32, lock_attempts), past.tries);
+    try testing.expectEqual(@as(u32, lock_attempts - 1), past.sleeps);
+
+    // Free at once: no sleep.
+    var now = FakeProbe{ .free_after = 0 };
+    try testing.expect(try lock_wait(&now) == .free);
+    try testing.expectEqual(@as(u32, 0), now.sleeps);
+}
+
+test "preflight: a lock whose holder is alive is refused on the first attempt" {
+    var probe = FakeProbe{ .free_after = lock_attempts, .holder = 4242 };
+    const waited = try lock_wait(&probe);
+    try testing.expectEqual(@as(?posix.pid_t, 4242), waited.held);
+    try testing.expectEqual(@as(u32, 1), probe.tries);
+    try testing.expectEqual(@as(u32, 0), probe.sleeps);
+}
+
+test "preflight: /proc/locks names the holder of a file" {
+    const text =
+        "1: POSIX  ADVISORY  WRITE 900 08:01:77 0 EOF\n" ++
+        "2: FLOCK  ADVISORY  WRITE 2145 00:27:20 0 EOF\n" ++
+        "2: -> FLOCK  ADVISORY  WRITE 3000 00:27:20 0 EOF\n" ++
+        "3: FLOCK  ADVISORY  WRITE 0 00:27:21 0 EOF\n" ++
+        "4: OFDLCK ADVISORY  READ -1 00:27:22 0 EOF\n" ++
+        "bad line\n";
+    try testing.expectEqual(@as(?posix.pid_t, 2145), proc_locks_holder(text, 0, 0x27, 20));
+    // Not that file, a POSIX lock, a holder in another pid namespace, no table.
+    try testing.expectEqual(@as(?posix.pid_t, null), proc_locks_holder(text, 0, 0x27, 99));
+    try testing.expectEqual(@as(?posix.pid_t, null), proc_locks_holder(text, 8, 1, 77));
+    try testing.expectEqual(@as(?posix.pid_t, null), proc_locks_holder(text, 0, 0x27, 21));
+    try testing.expectEqual(@as(?posix.pid_t, null), proc_locks_holder(text, 0, 0x27, 22));
+    try testing.expectEqual(@as(?posix.pid_t, null), proc_locks_holder("", 0, 0, 1));
+}
+
+test "preflight: a process is alive unless it is gone" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const dir = try tmp.dir.realpath(".", &buffer);
-    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buffer, "{s}/lingering", .{dir});
-    const file = try std.fs.createFileAbsolute(path, .{});
-    defer file.close();
-    try posix.flock(file.handle, posix.LOCK.EX | posix.LOCK.NB);
-    // Another thread frees the lock after 1 s, beyond the vendored open's 250 ms, as the kernel
-    // does when it finishes tearing a killed process's ring down.
-    const releaser = try std.Thread.spawn(.{}, struct {
-        fn run(fd: posix.fd_t) void {
-            std.time.sleep(1000 * std.time.ns_per_ms);
-            posix.flock(fd, posix.LOCK.UN) catch @panic("unlock");
-        }
-    }.run, .{file.handle});
-    defer releaser.join();
-    // Free by then: the check goes on to the superblock, which an empty file lacks.
-    try testing.expect((try open_check(testing.allocator, path, .disabled)).? == .damaged);
+    try testing.expect(process_alive(std.os.linux.getpid()));
+    // The kernel's pid_max is at most 2^22: above it, no such process.
+    try testing.expect(!process_alive(1 << 23));
+}
+
+/// glibc's `makedev`, the inverse of the splits above.
+fn makedev(major: u64, minor: u64) u64 {
+    return ((major & 0xfff) << 8) | ((major & ~@as(u64, 0xfff)) << 32) |
+        (minor & 0xff) | ((minor & ~@as(u64, 0xff)) << 12);
+}
+
+test "preflight: device numbers split as the kernel prints them" {
+    // makedev(8, 1) and a device with a minor over 255.
+    try testing.expectEqual(@as(u32, 8), device_major(makedev(8, 1)));
+    try testing.expectEqual(@as(u32, 1), device_minor(makedev(8, 1)));
+    try testing.expectEqual(@as(u32, 259), device_major(makedev(259, 300)));
+    try testing.expectEqual(@as(u32, 300), device_minor(makedev(259, 300)));
 }
 
 test "preflight: every refusal has a registered code and a message" {
