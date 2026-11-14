@@ -166,24 +166,25 @@ def main():
             expect(result, "NRV-E0010", 1, "start: cannot send statsd to", f"start statsd {statsd}")
             assert "cannot listen" not in result.stderr and "NRV-B0004" not in result.stderr
             seen.append("NRV-E0010")
-        # An unroutable address: the replica keeps running, warns once and never exits E0010. A
-        # replica of three that never meets its peers does not commit, so there is no metrics
-        # emit to wait for in a short run; the unit test (src/nerva/statsd_unroutable.zig) holds
-        # the once-only warning, and here the start must simply survive.
+        # An unroutable address: the replica keeps running, warns once and never exits E0010. The
+        # metrics emit is a 10 s timer that does not depend on commits; the first emit's failure is
+        # reported at the second, about 20 s after open, so wait for the line (bounded).
         with socket.socket() as probe:
             probe.bind(("127.0.0.1", 0))
             free_statsd_port = probe.getsockname()[1]
         process = subprocess.Popen(
             [nerva, "start", f"--addresses=127.0.0.1:{free_statsd_port},127.0.0.1:1,127.0.0.1:2",
              "--development", "--statsd=255.255.255.255:8125", data],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
         try:
-            time.sleep(3)
+            time.sleep(25)
             assert process.poll() is None, "start did not run on with an unsendable --statsd"
         finally:
             process.kill()
             stderr = process.communicate()[1]
-        assert "NRV-E0010" not in stderr and stderr.count("NRV-W0733") <= 1, stderr[-1000:]
+        assert "NRV-E0010" not in stderr, stderr[-1000:]
+        assert stderr.count("NRV-W0733") == 1, stderr[-1000:]
+        seen.append("NRV-W0733")
         # A start that failed must not leave its --trace file behind: the operator fixes the flag
         # and starts again with the same path, which must not be refused as E0004 (#197).
         trace_again = os.path.join(tmp, "trace-again")

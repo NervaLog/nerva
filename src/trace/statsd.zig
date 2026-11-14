@@ -121,7 +121,8 @@ pub const StatsD = struct {
             /// Nerva (P427): the socket is not connected, so a destination with no route does
             /// not fail `init_udp`; each packet is sent to `address`, and a failure is counted.
             address: std.net.Address,
-            /// The first failure is warned about once (NRV-W0733); later ones only count.
+            /// A failure is warned about once (NRV-W0733); later ones only count, until an emit with no
+            /// failure re-arms the warning.
             send_failure_warned: bool = false,
             send_failure_errno: std.posix.E = .SUCCESS,
         },
@@ -236,18 +237,25 @@ pub const StatsD = struct {
             log_buffer.clearRetainingCapacity();
         }
 
-        if (self.implementation == .udp and self.implementation.udp.send_callback_error_count > 0) {
+        if (self.implementation == .udp) {
             const udp = &self.implementation.udp;
-            if (!udp.send_failure_warned) {
-                udp.send_failure_warned = true;
-                log.warn("NRV-W0733 {}: cannot send statsd to {}: {s}; the metrics sent " ++
-                    "there are dropped, and the replica keeps running", .{
-                    self.process_id,
-                    udp.address,
-                    @tagName(udp.send_failure_errno),
-                });
+            if (udp.send_callback_error_count > 0) {
+                if (!udp.send_failure_warned) {
+                    udp.send_failure_warned = true;
+                    log.warn("NRV-W0733 {}: cannot send statsd to {}: {s}; the metrics sent " ++
+                        "there are dropped, and the replica keeps running", .{
+                        self.process_id,
+                        udp.address,
+                        send_failure_reason(udp.send_failure_errno),
+                    });
+                }
+                udp.send_callback_error_count = 0;
+            } else {
+                // A clean emit re-arms the warning: a transient failure (a full buffer) does not
+                // use up the only warning, and a later one names its own cause.
+                udp.send_failure_warned = false;
+                udp.send_failure_errno = .SUCCESS;
             }
-            udp.send_callback_error_count = 0;
         }
 
         var send_ready: u32 = 0;
@@ -322,6 +330,16 @@ pub const StatsD = struct {
         }
 
         return @intCast(send_sizes.count());
+    }
+
+    /// What an operator can act on, not an errno tag (NRV-W0733).
+    fn send_failure_reason(errno: std.posix.E) []const u8 {
+        return switch (errno) {
+            .ACCES, .PERM => "not allowed to send there (a broadcast address?)",
+            .NETUNREACH, .HOSTUNREACH, .NETDOWN => "no route to it",
+            .AGAIN, .NOBUFS => "no buffer space to send",
+            else => "the send failed",
+        };
     }
 
     fn emit_buffer(self: *StatsD, send_completion: *IO.Completion, send_buffer: []const u8) void {
