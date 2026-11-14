@@ -291,9 +291,10 @@ request fails except as retried under its key, and the view hashes agree before 
 ## R7 · Retention: bounded growth
 
 **Goal:** history and view versions are kept for a declared horizon, then trimmed, so disk use,
-export and import are bounded by the live set plus one horizon (P422).
+export and import are bounded by the live set plus one horizon and, under overload, the trimming backlog, which
+drains (P422, Q8).
 
-**Why:** history, changes and view versions have no retention (README, roadmap item 6; GOALS-1.0).
+**Why:** history, changes and view versions have no retention (GOALS-1.0; README, "No retention yet").
 Commit keys and facts stay kept (P123); their retention is cut from R7 (P422).
 
 **Scope:**
@@ -301,7 +302,8 @@ Commit keys and facts stay kept (P123); their retention is cut from R7 (P422).
 - A horizon per kind, declared in the log: row and record history, and view and group versions.
 - The primary's pulses write tombstones for what is older, deterministically, keeping each
   object's latest change; compaction only reclaims the tombstones (P422).
-- As-of reads, history pages and the feed below the horizon answer `before_horizon`.
+- As-of reads, history pages and the feed below the horizon answer `before_horizon`; the feed does so unless
+  it opts in to the compacted prefix, as `nerva view` and export do (P422).
 
 **Demo script:** a real three-replica cluster with a 60 s horizon, over 30 horizons of load
 (P422). Data, export time and memory stay flat under a load that rewrites a fixed set. A read

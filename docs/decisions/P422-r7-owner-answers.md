@@ -2,7 +2,7 @@
 id: P422
 date: 2026-11-13
 area: Releases
-amends: P394
+amends: P394, N27, N62
 ---
 
 # The owner answered R7's eight questions: the brief's recommendations, with keys and facts cut
@@ -24,8 +24,8 @@ removed.
    consumer that counts changes is never silently wrong. Cost: the opt-in is one more flag.
 3. **The demo's time scale.** 60 s horizon over 30 horizons on a real cluster, with the VOPR
    drawing horizons per seed beside it. Reason: the owner chose the real cluster over a
-   VOPR-only demo. Cost: about 35 minutes of demo, and `docs/demos/r7.md` amends PRODUCTION.md's
-   "at simulated time".
+   VOPR-only demo. Cost: about 35 minutes of demo. PRODUCTION.md's demo is amended here, and
+   `docs/demos/r7.md` records the time-scale cut.
 4. **The default horizon.** Forever: nothing is trimmed unless declared. Reason: the owner chose
    it so no cluster loses data it never asked to lose, and behaviour holds across export and
    import into R7's release. Cost: a cluster that never declares one grows as today.
@@ -52,6 +52,9 @@ removed.
 ## Text amended
 
 - `docs/GOALS-1.0.md`, goal 7: no longer lists "retention of keys and facts" as next.
+- `docs/ROADMAP.md`, R7: no horizon for commit keys and no `key_expired`.
+- `docs/NON-GOALS.md` and `docs/MATURITY.md`: keys stay kept after R7; only history and view
+  versions are bounded.
 - `docs/PRODUCTION.md`, R7: scope, goal, why, demo and the table row read "history and view
   versions trimmed below a horizon; bounded by the live set plus one horizon".
 - `README.md`: R7's Production table row has the same scope. Its status stays "Brief written".
