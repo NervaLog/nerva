@@ -26,7 +26,7 @@ pub const kernel_version_min = Version{ .major = 5, .minor = 11 };
 /// A killed process's lock can linger while `io_uring` tears its ring down (the vendored open
 /// waits 250 ms for it; a loaded host needs longer, #288, P290). Bounded: 40 x 50 ms = 2 s, then
 /// the lock is refused as held (NRV-E0703). A lock whose holder `/proc/locks` shows alive is
-/// refused at the first attempt, naming its pid (#294, P294).
+/// refused at the first attempt, naming its pid (#294, P431).
 const lock_retry_ms = 50;
 const lock_wait_ms = 2000;
 const lock_attempts = lock_wait_ms / lock_retry_ms;
