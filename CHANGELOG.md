@@ -140,12 +140,12 @@ The release candidate is `main` at `c886c9f0e5e4cffd12597cc29f46a4535fe6b254` (P
 from their records, except the reviewers' verdicts, which are quoted from their reports (P451).
 
 - **Simulation: shipped before the full 24 hours on the candidate, by the owner's waiver**
-  (P451). The fleet ran `5d7d806`, whose pinned code is the candidate's, for 15.0 hours from
-  2026-11-11 to 2026-11-13. On 2026-11-12 and 2026-11-13, the days the tracker reported (the
-  0.2 hours of 2026-11-11 have no report): 74,305 seeds (VOPR, the testing VOPR and every fuzzer), none failed as counted by
+  (P451). The fleet ran `5d7d806`, whose pinned code is the candidate's, for 15.0 hours on
+  2026-11-12 and 2026-11-13: 74,305 seeds (VOPR, the testing VOPR and every fuzzer), none failed as counted by
   `5d7d806`'s own fleet loop, which could miss a refused round or a dead worker until #382
   ([#370](https://github.com/NervaLog/nerva/issues/370), [#387](https://github.com/NervaLog/nerva/issues/387); the host's journal and `last-failed-round` were not checked for a refused round, and a dead
-  worker leaves no record at `5d7d806`), and 6 ran past their
+  worker leaves no record in the round or the state file at `5d7d806`, at most the failing
+  command's own message in the journal), and 6 ran past their
   per-seed deadline (5 `vopr-nerva`, 1 `vopr-testing`), which P287b counts as not clean; the owner
   waived them too. Their seed numbers were not kept, so they cannot be replayed, and the six stay
   unexplained. The fleet does not yet keep such seeds; until it does and every one it records on
