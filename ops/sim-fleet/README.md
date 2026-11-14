@@ -207,9 +207,12 @@ empty.
 **Redeploying** (a change to `ops/sim-fleet/`): the reporter is the copy built with each commit,
 and a running `run.sh` hands over to the `run.sh` of each commit it builds (#424, P429): when that
 file's checksum differs from the one it loaded, it logs `run.sh of <sha> differs from the one
-running; re-executing it` and `exec`s it with the same arguments and environment, once per built
-commit (`SIM_FLEET_REEXEC` names the commit, so the new one does not exec again). A restart also
-picks up the checkout's `run.sh`. A fleet pinned (`SIM_FLEET_BRANCH`) to a commit older than
+running; re-executing it` and `exec`s it with the same arguments and the environment the unit gave it (not the defaults the old
+`run.sh` filled in), once per built
+commit (`SIM_FLEET_REEXEC` names the commit, so the new one does not exec again). A `run.sh` that fails `bash -n` is not exec'd (one `NRV-E0730` line). A build that fails puts the
+checkout back on the built commit, so a restart never starts an unbuilt `run.sh` (#432). A restart
+also picks up the checkout's `run.sh`: the fleet running before this change has no re-exec, so
+restart it once after the merge for it to take effect at once. A fleet pinned (`SIM_FLEET_BRANCH`) to a commit older than
 this change still runs that commit's `run.sh`: restart the unit after a re-pin.
 After a change to the unit or `setup.sh`, as root: `sh /var/lib/sim-fleet/nerva/ops/
 sim-fleet/setup.sh && systemctl restart sim-fleet`.

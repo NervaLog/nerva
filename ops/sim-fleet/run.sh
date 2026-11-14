@@ -10,6 +10,11 @@ main() {
     # What follow_main re-execs with, and the checksum of the run.sh bash loaded (#424): bash reads
     # this file once, but the checkout it follows rewrites it in place.
     RUN_ARGS=("$@")
+    # The SIM_FLEET_* environment as the unit gave it, before the defaults below land in it: the
+    # re-exec restores exactly this, so the new run.sh computes its own defaults (#424, review).
+    ORIG_ENV=()
+    local name
+    for name in $(compgen -e SIM_FLEET_); do ORIG_ENV+=("$name=${!name}"); done
     RUN_SH=$(readlink -f "${BASH_SOURCE[0]}")
     RUN_SH_SUM=$(sha256sum "$RUN_SH" | cut -d' ' -f1)
     : "${SIM_FLEET_HOME:=/var/lib/sim-fleet}"
@@ -30,7 +35,6 @@ main() {
     # the smaller of every core but one (git, builds and the reporter) and what memory holds.
     : "${SIM_FLEET_SEED_MEMORY_MB:=4096}"
     : "${SIM_FLEET_RESERVE_MB:=1024}"
-    local name
     for name in SIM_FLEET_SEED_MEMORY_MB SIM_FLEET_RESERVE_MB; do
         if [[ ! "${!name}" =~ ^[0-9]+$ ]] || (( 10#${!name} == 0 )); then
             log "$name must be a positive whole number of MB, not '${!name}'"
@@ -87,7 +91,8 @@ vsr_superblock_quorums vsr_multi_batch nerva_adds nerva_http_head nerva_document
     # Consecutive failing rounds (ingest failed or left no record, or a worker died) before the
     # alarm (NRV-E0730, P429).
     : "${SIM_FLEET_ALARM_ROUNDS:=3}"
-    if [[ ! "$SIM_FLEET_ALARM_ROUNDS" =~ ^[0-9]{1,6}$ ]] || (( 10#$SIM_FLEET_ALARM_ROUNDS == 0 )); then
+    if [[ ! "$SIM_FLEET_ALARM_ROUNDS" =~ ^[0-9]{1,6}$ ]] ||
+        (( 10#$SIM_FLEET_ALARM_ROUNDS == 0 )); then
         log "SIM_FLEET_ALARM_ROUNDS must be a positive whole number, not '$SIM_FLEET_ALARM_ROUNDS'"
         exit 2
     fi
@@ -266,6 +271,9 @@ follow_main() {
         reexec_if_changed "$head"
     else
         rm -rf "$STATE/bin/$head"
+        # The unit starts the checkout's run.sh at a restart: it must be the built commit's, next
+        # to that commit's reporter, not the one that failed to build (#432).
+        if [[ -n "$built" ]]; then git checkout --quiet --detach "$built"; fi
         echo "$head" >"$STATE/broken.new"
         mv "$STATE/broken.new" "$STATE/broken"
         broken=$head
@@ -275,20 +283,31 @@ follow_main() {
 }
 
 # After a build of $1: if that commit's run.sh is not the one bash loaded, runs that one instead,
-# with the same arguments and environment (#424). Without it, a changed interface between run.sh
-# and sim_fleet.py (#382's --round-id) failed every ingest. Once per built commit: the marker
+# with the same arguments and the environment it was started with (#424). Without it, a changed
+# interface between run.sh and sim_fleet.py (#382's --round-id) failed every ingest. Once per built commit: the marker
 # SIM_FLEET_REEXEC names the commit the run.sh just exec'd came from, so it does not exec again.
-# The lock (fd 9) is closed first; the new run.sh takes it. Needs RUN_ARGS, RUN_SH_SUM.
+# The lock (fd 9) is closed first; the new run.sh takes it. Needs RUN_ARGS, RUN_SH_SUM, ORIG_ENV.
 reexec_if_changed() {
     local head=$1 new="$SIM_FLEET_REPO_DIR/ops/sim-fleet/run.sh" sum
     if [[ "${SIM_FLEET_REEXEC:-}" == "$head" ]]; then return 0; fi
     [[ -r "$new" ]] || return 0
     sum=$(sha256sum "$new" | cut -d' ' -f1)
     if [[ "$sum" == "$RUN_SH_SUM" ]]; then return 0; fi
+    # A run.sh that does not parse would kill the loop and crash-loop the unit: stay on this one.
+    if ! bash -n "$new" 2>/dev/null; then
+        log "ALARM error[NRV-E0730]: run.sh of $head does not parse (bash -n); staying on the" \
+            "run.sh that is running"
+        return 0
+    fi
     log "run.sh of $head differs from the one running; re-executing it"
-    export SIM_FLEET_REEXEC=$head
+    local rounds_left=${SIM_FLEET_ROUNDS:-0} name kv
     # The rounds a dry run or a test asked for are counted from the first run.sh.
-    if (( ${SIM_FLEET_ROUNDS:-0} != 0 )); then export SIM_FLEET_ROUNDS=$(( SIM_FLEET_ROUNDS - ${rounds:-1} + 1 )); fi
+    if (( rounds_left != 0 )); then rounds_left=$(( rounds_left - ${rounds:-1} + 1 )); fi
+    # The environment this run.sh was started with, not the one it has since filled in.
+    for name in $(compgen -e SIM_FLEET_); do unset "$name"; done
+    for kv in ${ORIG_ENV[@]+"${ORIG_ENV[@]}"}; do export "${kv%%=*}=${kv#*=}"; done
+    export SIM_FLEET_REEXEC=$head
+    if (( rounds_left != 0 )); then export SIM_FLEET_ROUNDS=$rounds_left; fi
     exec bash "$new" "${RUN_ARGS[@]}" 9>&-
 }
 

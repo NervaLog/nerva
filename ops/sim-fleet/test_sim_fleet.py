@@ -1587,18 +1587,22 @@ class Reexec(unittest.TestCase):
             'rounds=${SIM_FLEET_ROUNDS:-} extra=${EXTRA:-}"\n'
             'if { true >&9; } 2>/dev/null; then echo FD9; fi\n')
 
-    def call(self, marker="", old_sum="0" * 64, rounds_setting="0"):
+    mutate = ""
+
+    def call(self, marker="", old_sum="0" * 64, rounds_setting="0", orig="", env_extra=None):
         env = {"PATH": os.environ["PATH"], "EXTRA": "kept", "SIM_FLEET_ROUNDS": rounds_setting}
+        env.update(env_extra or {})
         if marker:
             env["SIM_FLEET_REEXEC"] = marker
         return subprocess.run(
             ["bash", "-c", f'source "{HERE}/run.sh"; log() {{ echo "$*" >&2; }}; '
              f'SIM_FLEET_REPO_DIR="{self.repo}"; RUN_ARGS=(a b); RUN_SH_SUM={old_sum}; rounds=2; '
+             f'{self.mutate}ORIG_ENV=({orig}); '
              f'exec 9>"{self.dir}/lock"; reexec_if_changed {SHA_A}; echo RETURNED'],
             env=env, capture_output=True, text=True, timeout=30)
 
     def test_a_changed_run_sh_is_exec_d_with_its_arguments_and_environment(self):
-        out = self.call()
+        out = self.call(orig="SIM_FLEET_ROUNDS=0")
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertIn(f"NEW args=a b marker={SHA_A} rounds=0 extra=kept", out.stdout)
         self.assertNotIn("RETURNED", out.stdout)
@@ -1624,6 +1628,62 @@ class Reexec(unittest.TestCase):
     def test_a_missing_run_sh_changes_nothing(self):
         os.unlink(self.new)
         self.assertEqual(self.call().stdout.strip(), "RETURNED")
+
+    def test_the_new_run_sh_gets_the_environment_it_was_started_with(self):
+        # fleet.env exports these empty; the old run.sh filled them with its own defaults.
+        Path(self.new).write_text(
+            '#!/usr/bin/env bash\necho "NEW fuzzers=[${SIM_FLEET_FUZZERS-unset}] '
+            'workers=[${SIM_FLEET_WORKERS-unset}] split=[${SIM_FLEET_WORKERS_MIXED-unset}] '
+            'kept=[${SIM_FLEET_KEPT-unset}]"\n')
+        out = self.call(
+            orig="SIM_FLEET_FUZZERS= SIM_FLEET_WORKERS= SIM_FLEET_KEPT=yes",
+            env_extra={"SIM_FLEET_FUZZERS": "old default list", "SIM_FLEET_WORKERS": "3",
+                       "SIM_FLEET_WORKERS_MIXED": "0"})
+        # Empty stays empty (so the new defaults apply), a variable the old run.sh created is
+        # gone, and one the unit set keeps its value.
+        self.assertIn("NEW fuzzers=[] workers=[] split=[unset] kept=[yes]", out.stdout, out.stderr)
+
+    def test_a_run_sh_that_does_not_parse_is_not_exec_d(self):
+        Path(self.new).write_text("#!/usr/bin/env bash\nif then fi (\n")
+        out = self.call()
+        self.assertEqual(out.stdout.strip(), "RETURNED", out.stderr)
+        self.assertIn("NRV-E0730", out.stderr)
+        self.assertIn("does not parse", out.stderr)
+
+
+class FailedBuild(unittest.TestCase):
+    """A build that fails leaves the checkout at the built commit, not the broken one (#432)."""
+
+    def git(self, cwd, *args):
+        return subprocess.run(["git", "-C", cwd, "-c", "user.name=t", "-c", "user.email=t@t",
+                               *args], capture_output=True, text=True, check=True).stdout.strip()
+
+    def test_the_checkout_holds_the_built_commit_after_a_failed_build(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(subprocess.run, ["rm", "-rf", d])
+        remote, repo, state = (os.path.join(d, n) for n in ("remote", "repo", "state"))
+        os.makedirs(remote)
+        self.git(remote, "init", "-q", "-b", "main")
+        Path(remote, "f").write_text("v1")
+        self.git(remote, "add", "f")
+        self.git(remote, "commit", "-q", "-m", "v1")
+        v1 = self.git(remote, "rev-parse", "HEAD")
+        subprocess.run(["git", "clone", "-q", remote, repo], check=True)
+        Path(remote, "f").write_text("v2")
+        self.git(remote, "commit", "-q", "-a", "-m", "v2")
+        v2 = self.git(remote, "rev-parse", "HEAD")
+        os.makedirs(state)
+        out = subprocess.run(
+            ["bash", "-c", f'source "{HERE}/run.sh"; log() {{ echo "$*" >&2; }}; '
+             f'build_into() {{ return 1; }}; export -f build_into; prune_cache() {{ :; }}; '
+             f'STATE="{state}"; built={v1}; broken=""; cd "{repo}"; SIM_FLEET_BRANCH=main; '
+             f'SIM_FLEET_GIT_TIMEOUT=60; SIM_FLEET_BUILD_TIMEOUT=60; '
+             f'git checkout -q --detach {v1}; git remote set-url origin "{remote}"; '
+             f'follow_main; echo "HEAD=$(git rev-parse HEAD) broken=$broken built=$built"'],
+            env={"PATH": os.environ["PATH"], "HOME": d}, capture_output=True, text=True,
+            timeout=60)
+        self.assertIn(f"HEAD={v1} broken={v2} built={v1}", out.stdout, out.stderr)
+        self.assertIn("FAILED", out.stderr)
 
 
 class Alarm(unittest.TestCase):
