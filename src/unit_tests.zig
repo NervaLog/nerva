@@ -72,6 +72,7 @@ comptime {
     _ = @import("testing/table.zig");
     _ = @import("trace.zig");
     _ = @import("trace/event.zig");
+    _ = @import("trace/statsd.zig");
     _ = @import("vsr/checksum.zig");
     _ = @import("vsr/checksum_benchmark.zig");
     _ = @import("vsr/clock.zig");
