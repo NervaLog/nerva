@@ -207,7 +207,11 @@ def main():
         # A start that failed must not leave its --trace file behind: the operator fixes the flag
         # and starts again with the same path, which must not be refused as E0004 (#197).
         trace_again = os.path.join(tmp, "trace-again")
-        if statsd_bad:  # only a host without IPv6 can fail a start on --statsd now (P427)
+        # Only a host without IPv6 sockets can fail `start` on --statsd now (P427): no address is
+        # unroutable on both families, since an unroutable one only warns. On a host with IPv6
+        # (GitHub's runners) this E0010 and #197 case is skipped, not covered; the `api` check
+        # below still registers NRV-E0010.
+        if statsd_bad:
             result = run(nerva, ["start", "--addresses=127.0.0.1:1,127.0.0.1:2,127.0.0.1:3",
                                  "--development", "--trace=" + trace_again,
                                  f"--statsd={statsd_bad[0]}", data], {})

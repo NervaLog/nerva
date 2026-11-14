@@ -121,10 +121,14 @@ pub const StatsD = struct {
             /// Nerva (P427): the socket is not connected, so a destination with no route does
             /// not fail `init_udp`; each packet is sent to `address`, and a failure is counted.
             address: std.net.Address,
-            /// A failure is warned about once (NRV-W0733); later ones only count, until an emit with no
-            /// failure re-arms the warning.
+            /// A route failure is warned about once (NRV-W0733); later ones only count, until an
+            /// emit with no failure re-arms the warning.
             send_failure_warned: bool = false,
             send_failure_errno: std.posix.E = .SUCCESS,
+            /// A full socket buffer (`EAGAIN`/`ENOBUFS`) is not a route failure: the rest of the
+            /// emit is dropped, counted here, and never warned about.
+            send_buffer_full: bool = false,
+            send_dropped_count: u64 = 0,
         },
         log,
     },
@@ -239,6 +243,7 @@ pub const StatsD = struct {
 
         if (self.implementation == .udp) {
             const udp = &self.implementation.udp;
+            udp.send_buffer_full = false;
             if (udp.send_callback_error_count > 0) {
                 if (!udp.send_failure_warned) {
                     udp.send_failure_warned = true;
@@ -337,7 +342,6 @@ pub const StatsD = struct {
         return switch (errno) {
             .ACCES, .PERM => "not allowed to send there (a broadcast address?)",
             .NETUNREACH, .HOSTUNREACH, .NETDOWN => "no route to it",
-            .AGAIN, .NOBUFS => "no buffer space to send",
             else => "the send failed",
         };
     }
@@ -353,6 +357,10 @@ pub const StatsD = struct {
                     .macos, .ios, .tvos, .watchos, .visionos => 0x80, // MSG_DONTWAIT
                     else => @compileError("statsd send: unsupported OS"),
                 };
+                if (udp.send_buffer_full) {
+                    udp.send_dropped_count += 1;
+                    return StatsD.send_callback(self, send_completion, send_buffer.len);
+                }
                 const result = std.posix.system.sendto(
                     udp.socket,
                     send_buffer.ptr,
@@ -363,6 +371,12 @@ pub const StatsD = struct {
                 );
                 const errno = std.posix.errno(result);
                 if (errno == .SUCCESS and result == send_buffer.len) {
+                    StatsD.send_callback(self, send_completion, send_buffer.len);
+                } else if (errno == .AGAIN or errno == .NOBUFS) {
+                    // Upstream's blocking send waited for space; this drops the rest of the emit
+                    // quietly instead of logging a route failure that does not exist.
+                    udp.send_buffer_full = true;
+                    udp.send_dropped_count += 1;
                     StatsD.send_callback(self, send_completion, send_buffer.len);
                 } else {
                     if (udp.send_failure_errno == .SUCCESS) udp.send_failure_errno = errno;
