@@ -34,9 +34,10 @@ const diagnostic = @import("diagnostic.zig");
 pub const memory_reserve: u64 = 256 * stdx.MiB;
 /// The most of one `/proc` or cgroup file read; a longer file is a refusal.
 pub const file_size_max = 4096;
-/// The most lines `/proc/self/cgroup` may have; more is a refusal. v1 has one per hierarchy (usually 11 to 13), each
+/// The most lines `/proc/self/cgroup` may have; more is a refusal. v1 has one per hierarchy (usually 11 to 13;
+/// a hybrid host with every controller on its own may have more), each
 /// carrying the same path of up to `path_size_max` bytes, plus the hierarchy id and controllers.
-pub const cgroup_lines_max = 16;
+pub const cgroup_lines_max = 32;
 /// The most levels walked, the root included; a deeper cgroup is a refusal.
 pub const cgroup_depth_max = 32;
 /// v1 reports "no limit" as a value at or above this.
@@ -318,9 +319,12 @@ pub fn refuse_unreadable(refusal: Refusal) noreturn {
         .{switch (refusal.reason) {
             .absent => "mount /proc (and the cgroup filesystem) where this replica runs, or run it on a machine that has them",
             .unreadable => "give this process read access to that file, or run it on a machine whose /proc and cgroup files are readable",
-            .too_deep => "run this replica in a shallower cgroup (at most 32 levels)",
+            .too_deep => std.fmt.comptimePrint("run this replica in a shallower cgroup (at most {d} levels)", .{cgroup_depth_max}),
             .too_large => if (std.mem.eql(u8, refusal.file(), "/proc/self/cgroup"))
-                "run this replica in a cgroup with a shorter path (at most 512 bytes) and at most 16 hierarchies"
+                std.fmt.comptimePrint(
+                    "run this replica in a cgroup with a shorter path (at most {d} bytes) and at most {d} hierarchies",
+                    .{ path_size_max, cgroup_lines_max },
+                )
             else
                 "fix or remove that file's limit, or run on a machine whose /proc and cgroup files are readable",
             .unparsable => "fix or remove that file's limit, or run on a machine whose /proc and cgroup files are readable",
@@ -653,20 +657,26 @@ test "start_memory: /proc/self/cgroup at 10,240 bytes is read, one past is too_l
     }
 }
 
-test "start_memory: 16 lines of /proc/self/cgroup are read and 17 are too_large" {
+test "start_memory: cgroup_lines_max lines of /proc/self/cgroup are read and one more is too_large" {
     var fixture = Fixture.init();
     defer fixture.deinit();
     try fixture.meminfo(8 * 1024 * 1024);
     try fixture.write("sys/fs/cgroup/memory/a/memory.limit_in_bytes", "1073741824\n");
-    var text: [1024]u8 = undefined;
+    var text: [2048]u8 = undefined;
     var stream = std.io.fixedBufferStream(&text);
     try stream.writer().writeAll("4:memory:/a\n");
-    for (1..cgroup_lines_max) |id| try stream.writer().print("{d}:x{d}:/\n", .{ id + 10, id });
+    // 17 lines pass (a host with every v1 controller on its own hierarchy, and more).
+    for (1..17) |id| try stream.writer().print("{d}:x{d}:/\n", .{ id + 10, id });
+    try fixture.write("proc/self/cgroup", text[0..stream.pos]);
+    try std.testing.expectEqual(@as(u64, 1024 * mib), read_from(fixture.tmp.dir).visible.bytes);
+    for (17..cgroup_lines_max) |id| try stream.writer().print("{d}:x{d}:/\n", .{ id + 10, id });
     try fixture.write("proc/self/cgroup", text[0..stream.pos]);
     try std.testing.expectEqual(@as(u64, 1024 * mib), read_from(fixture.tmp.dir).visible.bytes);
     try stream.writer().writeAll("99:y:/\n");
     try fixture.write("proc/self/cgroup", text[0..stream.pos]);
-    try std.testing.expectEqual(Reason.too_large, read_from(fixture.tmp.dir).refused.reason);
+    const refused = read_from(fixture.tmp.dir).refused;
+    try std.testing.expectEqual(Reason.too_large, refused.reason);
+    try std.testing.expectEqualStrings("/proc/self/cgroup", refused.file());
 }
 
 test "start_memory: a v2 host with no /sys/fs/cgroup reads MemTotal alone (P416c)" {
