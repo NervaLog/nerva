@@ -250,13 +250,30 @@ fn stat_exiting(text: []const u8) bool {
 /// SIGKILL (signal 9) in the signal masks of `/proc/<pid>/status`: bit 8.
 const sigkill_mask: u64 = 0x100;
 
-/// Whether the text of `/proc/<pid>/status` shows SIGKILL pending in `SigPnd` (the thread's) or
-/// `ShdPnd` (the process's). `kill` sets it at once; `PF_EXITING` only follows when the task runs
-/// `do_exit`, which a task in uninterruptible sleep or not yet scheduled has not reached. False for
-/// text that does not parse.
-fn status_sigkill_pending(text: []const u8) bool {
-    var lines = std.mem.tokenizeScalar(u8, text, '\n');
-    while (lines.next()) |line| {
+/// What `/proc/<pid>` says about a process: it is exiting, it is not, or that could not be told.
+const Exiting = enum { yes, no, unknown };
+
+/// Most lines of `/proc/<pid>/status` read: the file has about 60, and `Groups:` (one line, up to
+/// 65536 entries) is skipped without being held.
+const status_lines_max = 256;
+
+/// Whether the text of `/proc/<pid>/status`, read through `reader`, shows SIGKILL pending in
+/// `SigPnd` (the thread's) or `ShdPnd` (the process's). `kill` sets it at once; `PF_EXITING` only
+/// follows when the task runs `do_exit`, which a task in uninterruptible sleep or not yet scheduled
+/// has not reached. Read line by line: `Groups:` comes before the masks and can be far longer than
+/// any buffer, so a line that does not fit is skipped. `.unknown` unless both masks were read and
+/// parsed.
+fn status_sigkill_pending(reader: anytype) Exiting {
+    var line_buffer: [128]u8 = undefined;
+    var seen_thread = false;
+    var seen_process = false;
+    var pending = false;
+    for (0..status_lines_max) |_| {
+        const line = reader.readUntilDelimiterOrEof(&line_buffer, '\n') catch |err| {
+            if (err != error.StreamTooLong) return .unknown;
+            reader.skipUntilDelimiterOrEof('\n') catch return .unknown;
+            continue;
+        } orelse break;
         const prefix = if (std.mem.startsWith(u8, line, "SigPnd:"))
             "SigPnd:"
         else if (std.mem.startsWith(u8, line, "ShdPnd:"))
@@ -264,15 +281,18 @@ fn status_sigkill_pending(text: []const u8) bool {
         else
             continue;
         const mask = std.fmt.parseInt(u64, std.mem.trim(u8, line[prefix.len..], " \t"), 16) catch continue;
-        if (mask & sigkill_mask != 0) return true;
+        if (prefix[1] == 'i') seen_thread = true else seen_process = true;
+        if (mask & sigkill_mask != 0) pending = true;
+        if (seen_thread and seen_process) break;
     }
-    return false;
+    if (pending) return .yes;
+    return if (seen_thread and seen_process) .no else .unknown;
 }
 
-/// Reads up to `buffer.len` bytes of `/proc/<pid>/<name>`; null where it cannot be read.
-fn proc_read(pid: posix.pid_t, name: []const u8, buffer: []u8) ?[]const u8 {
+/// Reads up to `buffer.len` bytes of `/proc/<pid>/stat`; null where it cannot be read.
+fn proc_stat_read(pid: posix.pid_t, buffer: []u8) ?[]const u8 {
     var path_buffer: [48]u8 = undefined;
-    const path = std.fmt.bufPrint(&path_buffer, "/proc/{}/{s}", .{ pid, name }) catch unreachable;
+    const path = std.fmt.bufPrint(&path_buffer, "/proc/{}/stat", .{pid}) catch unreachable;
     const file = std.fs.openFileAbsolute(path, .{}) catch return null;
     defer file.close();
     const length = file.readAll(buffer) catch return null;
@@ -281,18 +301,18 @@ fn proc_read(pid: posix.pid_t, name: []const u8, buffer: []u8) ?[]const u8 {
 
 /// Whether process `pid` is exiting: in `do_exit` (`PF_EXITING`) or with SIGKILL pending. A process
 /// killed with SIGKILL keeps its descriptors until `exit_files`, after in-flight direct IO is
-/// cancelled, so it is not yet a live holder. False where `/proc/<pid>/stat` or `status` cannot be
-/// read, or the signal masks lie past the first 4 KiB of `status` (they are well within it).
-fn process_exiting(pid: posix.pid_t) bool {
+/// cancelled, so it is not yet a live holder. `.unknown` where `/proc/<pid>/stat` or `status` cannot
+/// be read (the process is gone) or `status` shows no masks.
+fn process_exiting(pid: posix.pid_t) Exiting {
     var stat_buffer: [512]u8 = undefined;
-    if (proc_read(pid, "stat", &stat_buffer)) |text| {
-        if (stat_exiting(text)) return true;
-    }
-    var status_buffer: [4096]u8 = undefined;
-    if (proc_read(pid, "status", &status_buffer)) |text| {
-        if (status_sigkill_pending(text)) return true;
-    }
-    return false;
+    const stat_text = proc_stat_read(pid, &stat_buffer) orelse return .unknown;
+    if (stat_exiting(stat_text)) return .yes;
+    var path_buffer: [48]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buffer, "/proc/{}/status", .{pid}) catch unreachable;
+    const file = std.fs.openFileAbsolute(path, .{}) catch return .unknown;
+    defer file.close();
+    var buffered = std.io.bufferedReader(file.reader());
+    return status_sigkill_pending(buffered.reader());
 }
 
 /// Whether process `pid` has the file `stat` describes open (same device and inode) and is not
@@ -306,7 +326,8 @@ fn process_holds_file(pid: posix.pid_t, stat: posix.Stat) bool {
     var dir = std.fs.openDirAbsolute(path, .{ .iterate = true }) catch return false;
     defer dir.close();
     if (!dir_holds_file(dir, device_major(stat.dev), device_minor(stat.dev), stat.ino)) return false;
-    return !process_exiting(pid);
+    // Only a process known to be running is a holder: gone, unreadable or unclear is not.
+    return process_exiting(pid) == .no;
 }
 
 /// Whether one of the first `proc_fd_scan_max` entries of `dir` (a `/proc/<pid>/fd`) is the file
@@ -706,17 +727,46 @@ test "preflight: a lock released within the wait is not refused" {
     try testing.expect(refusal == .damaged);
 }
 
+fn status_text_pending(text: []const u8) Exiting {
+    var stream = std.io.fixedBufferStream(text);
+    return status_sigkill_pending(stream.reader());
+}
+
 test "preflight: SIGKILL pending is exiting" {
-    try testing.expect(!status_sigkill_pending("Name:\tx\nSigPnd:\t0000000000000000\nShdPnd:\t0000000000000000\n"));
-    try testing.expect(status_sigkill_pending("SigPnd:\t0000000000000100\nShdPnd:\t0000000000000000\n"));
-    try testing.expect(status_sigkill_pending("SigPnd:\t0000000000000000\nShdPnd:\t0000000000000100\n"));
+    try testing.expectEqual(Exiting.no, status_text_pending("Name:\tx\nSigPnd:\t0000000000000000\nShdPnd:\t0000000000000000\n"));
+    try testing.expectEqual(Exiting.yes, status_text_pending("SigPnd:\t0000000000000100\nShdPnd:\t0000000000000000\n"));
+    try testing.expectEqual(Exiting.yes, status_text_pending("SigPnd:\t0000000000000000\nShdPnd:\t0000000000000100\n"));
     // Other signals pending (SIGTERM 0x4000, SIGINT 0x2) are not SIGKILL.
-    try testing.expect(!status_sigkill_pending("SigPnd:\t0000000000004002\nShdPnd:\t0000000000004002\n"));
-    try testing.expect(status_sigkill_pending("SigPnd:\t0000000000000101\n"));
-    // Not parseable: not exiting.
-    try testing.expect(!status_sigkill_pending(""));
-    try testing.expect(!status_sigkill_pending("SigPnd:\tzz\nShdPnd:\n"));
-    try testing.expect(!status_sigkill_pending("XSigPnd:\t0000000000000100\n"));
+    try testing.expectEqual(Exiting.no, status_text_pending("SigPnd:\t0000000000004002\nShdPnd:\t0000000000004002\n"));
+    try testing.expectEqual(Exiting.yes, status_text_pending("SigPnd:\t0000000000000101\n"));
+    // Not parseable, or a mask missing: unknown.
+    try testing.expectEqual(Exiting.unknown, status_text_pending(""));
+    try testing.expectEqual(Exiting.unknown, status_text_pending("SigPnd:\tzz\nShdPnd:\n"));
+    try testing.expectEqual(Exiting.unknown, status_text_pending("XSigPnd:\t0000000000000100\n"));
+    try testing.expectEqual(Exiting.unknown, status_text_pending("SigPnd:\t0000000000000000\n"));
+}
+
+test "preflight: a long Groups line does not hide the signal masks" {
+    // 450 groups put SigPnd past byte 4096 of a real status; 70000 entries is past any buffer.
+    var text = std.ArrayList(u8).init(testing.allocator);
+    defer text.deinit();
+    try text.appendSlice("Name:\tnerva\nGroups:\t");
+    for (0..70000) |i| try text.writer().print("{} ", .{1000000 + i});
+    try text.appendSlice("\nNStgid:\t1\nSigPnd:\t0000000000000000\nShdPnd:\t0000000000000100\n");
+    try testing.expect(text.items.len > 4096 * 16);
+    try testing.expectEqual(Exiting.yes, status_text_pending(text.items));
+    // Running, with the masks past the long line: known, not unknown.
+    const tail = std.mem.indexOf(u8, text.items, "SigPnd:").?;
+    @memcpy(text.items[tail + 8 ..][0..16], "0000000000000000");
+    const shd = std.mem.indexOf(u8, text.items, "ShdPnd:").?;
+    @memcpy(text.items[shd + 8 ..][0..16], "0000000000000000");
+    try testing.expectEqual(Exiting.no, status_text_pending(text.items));
+    // The masks never come (more than status_lines_max lines): unknown.
+    var many = std.ArrayList(u8).init(testing.allocator);
+    defer many.deinit();
+    for (0..status_lines_max + 1) |_| try many.appendSlice("Key:\tv\n");
+    try many.appendSlice("SigPnd:\t0\nShdPnd:\t0\n");
+    try testing.expectEqual(Exiting.unknown, status_text_pending(many.items));
 }
 
 test "preflight: a process that is exiting is not a holder" {
@@ -732,8 +782,9 @@ test "preflight: a process that is exiting is not a holder" {
     try testing.expect(!stat_exiting("42 (nerva) S 1 2 3"));
     try testing.expect(!stat_exiting("42 (nerva) S 1 2 3 4 5 x"));
     // This process, running this test, is not exiting.
-    try testing.expect(!process_exiting(linux.getpid()));
-    try testing.expect(!process_exiting(1 << 23));
+    try testing.expectEqual(Exiting.no, process_exiting(linux.getpid()));
+    // A pid that is gone cannot be told: unknown, so not a holder.
+    try testing.expectEqual(Exiting.unknown, process_exiting(1 << 23));
 }
 
 test "preflight: a descriptor scan stops at its bound" {

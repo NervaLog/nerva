@@ -32,7 +32,9 @@ amends: P290
   (`PF_EXITING` in `/proc/<pid>/stat`, still in `do_exit` before `exit_files`, or SIGKILL pending
   in `SigPnd` or `ShdPnd` of `/proc/<pid>/status`, which covers a holder in uninterruptible sleep
   or not yet scheduled) is not named, so
-  `kill -9; start` waits as under P290. A holder run by another user is never named (its
+  `kill -9; start` waits as under P290. `status` is read line by line (at most 256 lines, a long
+  `Groups:` line skipped), and a holder whose `stat` or `status` cannot be read (it vanished), or
+  shows no signal masks, is not named either: only a process known to be running is. A holder run by another user is never named (its
   `/proc/<pid>/fd` is unreadable to this process, `hidepid` or not), and this process's own pid is
   never named. Each attempt costs up to 4096 `statx` calls with `AT_STATX_DONT_SYNC`, so a
   descriptor on a hung NFS or FUSE file does not block the scan; a live holder with that many
