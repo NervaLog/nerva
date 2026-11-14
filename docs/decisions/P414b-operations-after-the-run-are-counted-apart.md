@@ -23,3 +23,6 @@ first operations clamped into second 0; that clamp is gone because they now wait
 **Cost.** The summary JSON gains `late_operations`. A run's last operations, which are the slowest
 when a stall begins at the end, are not in the percentiles; `late_operations` is how a reader
 learns of them.
+
+An operation that fails (a timeout, an eviction) keeps what it counted before it failed: the
+counters reach the timeline and the summary with no latency sample, and the caller then stops.

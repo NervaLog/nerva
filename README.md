@@ -535,10 +535,11 @@ throughput and percentiles); their timeline lines carry `"warmup":true`. `--warm
 is at most 3600, and the summary JSON gains `"warmup"` and `"late_operations"` members.
 `--timeline` and `--gateway-pid-file` are created before the run, so a bad path is refused at
 once with NRV-E0727; the PID file is removed when the gateway stops. For the `botpike` workload only
-(refused for the others): `--gateway-statsd=<host:port>` passes `--statsd` to the gateway it
-starts, `--gateway-pid-file=<file>` writes the gateway's PID there right after it spawns, and
+(refused for the others): `--gateway-statsd=<host:port>` (checked before anything starts, NRV-E0736)
+passes `--statsd` to the gateway it starts, `--gateway-pid-file=<file>` writes the gateway's PID there right after it spawns, and
 `--gateway-stderr=inherit|ignore` (default `ignore`) passes the gateway's stderr through to
-`bench-load`'s own stderr.
+`bench-load`'s own stderr. A PID file outlives a `bench-load` that a signal killed: a reader checks
+that `/proc/<pid>/cmdline` is `nerva api`.
 
 ### Nightly performance
 

@@ -41,8 +41,6 @@ const table: u32 = 1;
 const local_clients_max = 6;
 const batch_max = 1024;
 const history_limit = 64;
-/// `--warmup` + `--seconds` at most: one timeline line a second (bench_timeline.zig).
-const timeline_seconds_max = bench_timeline.seconds_max;
 const timeout = stdx.Duration.seconds(30);
 
 const Workload = enum {
@@ -178,6 +176,13 @@ pub fn main() !void {
         args.@"gateway-pid-file" != null,
         args.@"gateway-stderr" != null,
     )) |reason| stdx.Flags.fatal("{s}", .{reason});
+
+    if (args.@"gateway-statsd") |text| {
+        if (bench_timeline.statsd_refusal(text)) |reason| {
+            std.io.getStdErr().writer().print("error[NRV-E0736]: bench-load: {s}\n", .{reason}) catch {};
+            std.process.exit(1);
+        }
+    }
 
     // The files this run writes are made now, so that a bad path costs no measurement (NRV-E0727).
     const timeline_file: ?std.fs.File = if (args.timeline) |path|
@@ -482,7 +487,11 @@ const Worker = struct {
                 due = now;
             }
             const counts_before = worker.result.counts();
-            try worker.operation(client);
+            worker.operation(client) catch |err| {
+                // What the operation counted before it failed still counts (P414b).
+                worker.recorder.record(time.monotonic().ns, null, worker.result.counts().sub(counts_before));
+                return err;
+            };
             const ended = time.monotonic();
             worker.recorder.record(
                 ended.ns,

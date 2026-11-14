@@ -367,10 +367,14 @@ const Caller = struct {
             const pending = caller.pending;
             caller.pending = null;
             const counts_before = caller.outcome.counts();
-            const done = if (pending) |reserved|
-                try caller.settle(reserved)
+            const done = (if (pending) |reserved|
+                caller.settle(reserved)
             else
-                try caller.reserve();
+                caller.reserve()) catch |err| {
+                // What the submit counted before it failed still counts (P414b).
+                caller.recorder.record(time.monotonic().ns, null, caller.outcome.counts().sub(counts_before));
+                return err;
+            };
             // A submit that failed on the wire is not a latency sample of the cluster, but its
             // requests and errors still count in the second it ended in.
             const ended = time.monotonic();

@@ -16,6 +16,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 
+const vsr = @import("../vsr.zig");
 const LatencyHistogram = @import("latency_histogram.zig").LatencyHistogram;
 
 /// `--warmup` + `--seconds` at most: one timeline line a second for an hour, so at most
@@ -83,6 +84,21 @@ pub fn seconds_refusal(warmup: u32, seconds: u32) ?[]const u8 {
     if (warmup > seconds_max or seconds > seconds_max or warmup + seconds > seconds_max) {
         return "--warmup plus --seconds must be at most 3600 (the timeline's bound)";
     }
+    return null;
+}
+
+/// The longest `--gateway-statsd` the gateway's command line holds (`--statsd=` takes 9 of 128).
+pub const statsd_length_max = 119;
+
+/// Why `--gateway-statsd` is refused, or null if the gateway's `--statsd` will take it (NRV-E0736).
+/// The rule is `nerva api --statsd`'s: a non-zero port and an address in `<host:port>` form.
+pub fn statsd_refusal(text: []const u8) ?[]const u8 {
+    if (text.len == 0 or text.len > statsd_length_max) {
+        return "--gateway-statsd must be 1 to 119 bytes long";
+    }
+    const address = vsr.parse_address_and_port(.{ .string = text, .port_default = 8125 }) catch
+        return "--gateway-statsd must be <host:port>, for example 127.0.0.1:8125";
+    if (address.port == 0) return "--gateway-statsd must be <host:port> with a port above 0";
     return null;
 }
 
@@ -460,4 +476,19 @@ test "path_error_reason names no Zig error" {
         try testing.expect(std.mem.indexOf(u8, path_error_reason(err), "error.") == null);
     }
     try testing.expectEqualStrings("its directory does not exist", path_error_reason(error.FileNotFound));
+}
+
+test "statsd_refusal: the rule of nerva api --statsd, and the command line's length" {
+    for ([_][]const u8{ "127.0.0.1:8125", "10.0.0.7", "9125", "[fdaa::2]:9125" }) |text| {
+        try testing.expectEqual(@as(?[]const u8, null), statsd_refusal(text));
+    }
+    for ([_][]const u8{ "", "notanaddress", "127.0.0.1:0", "127.0.0.1:65536", "[fdaa::2", "localhost:8125" }) |text| {
+        try testing.expect(statsd_refusal(text) != null);
+    }
+    // Too long: the refusal comes from the length, whatever the text.
+    const long = "a" ** (statsd_length_max - 5) ++ ":8125";
+    try testing.expectEqual(@as(usize, statsd_length_max), long.len);
+    try testing.expect(statsd_refusal(long) != null); // not an address, but within the length
+    try testing.expect(statsd_refusal(long ++ "0") != null);
+    try testing.expect(std.mem.indexOf(u8, statsd_refusal(long ++ "0").?, "119") != null);
 }
