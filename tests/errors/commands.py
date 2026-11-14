@@ -239,7 +239,7 @@ def main():
         assert sha(data) == before
 
         # A binary with multiversion sections that hold no bundle: NRV-E0719, not a replica
-        # that runs as one release (P415). Needs objcopy; E0720 and E0726 are unit-tested.
+        # that runs as one release (P415). Needs objcopy; E0726 is unit-tested.
         objcopy = shutil.which("objcopy")
         if objcopy:
             junk = os.path.join(tmp, "junk-section")
@@ -252,6 +252,22 @@ def main():
             os.chmod(damaged_bundle, 0o755)
             check("start with a damaged bundle", start + [data], "NRV-E0719", 1,
                   "bundle of releases cannot be read", nerva=damaged_bundle)
+            assert sha(data) == before
+            # NRV-E0720 before the bundle is opened, in the test build only, where the sysctl
+            # path can be named; a release build ignores the variable.
+            refused = os.path.join(tmp, "memfd_noexec")
+            with open(refused, "w") as f:
+                f.write("2\n")
+            damaged_off = os.path.join(tmp, "nerva-damaged-bundle-off")
+            subprocess.run([objcopy, "--add-section", f".tb_mvb={junk}",
+                            "--add-section", f".tb_mvh={junk}", nerva_off, damaged_off],
+                           check=True)
+            os.chmod(damaged_off, 0o755)
+            env_noexec = {"NERVA_MEMFD_NOEXEC_PATH": refused}
+            check("start with memfd_noexec 2", start + [data], "NRV-E0720", 1,
+                  "vm.memfd_noexec is 2", env=env_noexec, nerva=damaged_off)
+            check("release build ignores the sysctl override", start + [data], "NRV-E0719", 1,
+                  "bundle of releases cannot be read", env=env_noexec, nerva=damaged_bundle)
             assert sha(data) == before
 
         # The test build with commit-key deduplication off (R1): E0717 without --development,

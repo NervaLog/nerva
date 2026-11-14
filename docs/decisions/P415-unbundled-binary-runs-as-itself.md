@@ -20,7 +20,7 @@ silently dropped to its own release would stay behind when the cluster upgrades.
 `test:integration` and `demo_r5`, which run unbundled binaries. Falling back on every error would
 hide a damaged bundle.
 
-**Cost.** One extra read of the executable at start (a few MiB). A binary whose sections are
+**Cost.** One extra read of the whole executable at start, up to the native platform's `multiversion_binary_platform_size_max` (64 MiB; 128 MiB in a Debug build), and refused beyond it. A binary whose sections are
 present but corrupt is told apart from an unbundled one only by `parse_elf`'s error.
 The two new gauges (`replica_release`, `replica_releases_offered`) are emitted from
 `command_start`, not `replica.zig`, to keep the vendored patch to the one call site (and clear of #412).

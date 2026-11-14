@@ -175,7 +175,7 @@ fn run() !void {
             var multiversion_bundled = false;
             var multiversion: Multiversion = Multiversion.single_release(config.process.release);
             if (tag == .start) {
-                multiversion_bundled = bundle_open(gpa, &io, &multiversion_os);
+                multiversion_bundled = bundle_open(gpa, &io, &multiversion_os, args.path);
                 if (multiversion_bundled) multiversion = multiversion_os.multiversion();
                 const releases_run = multiversion.releases_bundled();
                 preflight.start(gpa, args.path, if (!constants.direct_io)
@@ -183,11 +183,7 @@ fn run() !void {
                 else if (args.development)
                     .optional
                 else
-                    .required, releases_run.slice(), if (multiversion_bundled)
-                    (std.posix.getenv("NERVA_MEMFD_NOEXEC_PATH") orelse
-                        preflight.memfd_noexec_path)
-                else
-                    null);
+                    .required, releases_run.slice());
             }
             defer if (multiversion_bundled) multiversion_os.deinit(gpa);
 
@@ -865,30 +861,51 @@ fn command_start(
     var gauge_ticks: u64 = 0;
     while (true) {
         replica.tick();
-        // The release this replica runs and how many it bundles, once a second.
+        // The release this replica runs and the highest it offers, once a second.
         if (gauge_ticks % (std.time.ms_per_s / constants.tick_ms) == 0) {
             tracer.gauge(.replica_release, replica.release.value);
             // Read each time: replacing the binary on disk changes what this replica offers.
-            tracer.gauge(.replica_releases_offered, multiversion.releases_bundled().count);
+            tracer.gauge(.replica_releases_offered, releases_offered(multiversion));
         }
         gauge_ticks +%= 1;
         try io.run_for_ns(constants.tick_ms * std.time.ns_per_ms);
     }
 }
 
+/// The highest release `multiversion` offers: the gauge `replica_releases_offered`, which says
+/// when every replica carries the next release (not how many releases it bundles).
+fn releases_offered(multiversion: Multiversion) u32 {
+    return multiversion.releases_bundled().last().value;
+}
+
 /// Opens the release bundle of this binary into `multiversion_os`: true when it has one. An
 /// unbundled binary (a build, or the first release) runs only itself. A bundle that cannot be
 /// read is refused (NRV-E0719), and so is a binary that cannot be read at all (NRV-E0726):
 /// running as one release would strand a cluster that upgrades (P415).
-fn bundle_open(gpa: std.mem.Allocator, io: *IO, multiversion_os: *MultiversionOS) bool {
+fn bundle_open(
+    gpa: std.mem.Allocator,
+    io: *IO,
+    multiversion_os: *MultiversionOS,
+    data_path: []const u8,
+) bool {
     const exe_path = mv.self_exe_path(gpa) catch bundle_unreadable("its path is unknown");
     defer gpa.free(exe_path);
 
     const present = bundle_present(gpa, exe_path) catch |err| switch (err) {
         error.BinaryTooLarge => bundle_fail("the binary is larger than any bundle can be"),
+        error.OutOfMemory => bundle_unreadable("out of memory"),
         error.BinaryUnreadable => bundle_unreadable("the file could not be opened or read"),
     };
     if (!present) return false;
+
+    // Before `MultiversionOS.init`, whose `memfd_create` a hardened kernel may refuse. The
+    // sysctl path is overridable in the test build only (`-Dtest-commit-keys=off`): a release
+    // binary cannot be told to skip the refusal.
+    const memfd_noexec_path = if (!commit_keys_deduplicate)
+        std.posix.getenv("NERVA_MEMFD_NOEXEC_PATH") orelse preflight.memfd_noexec_path
+    else
+        preflight.memfd_noexec_path;
+    preflight.memfd_check(data_path, memfd_noexec_path);
 
     multiversion_os.* = MultiversionOS.init(gpa, io, exe_path, .native) catch |err|
         bundle_fail(bundle_cause(err));
@@ -901,7 +918,7 @@ fn bundle_cause(err: anyerror) []const u8 {
     return switch (err) {
         error.OutOfMemory => "out of memory",
         error.RunningVersionNotIncluded => "it does not include the release it is running",
-        else => "its sections are damaged or inconsistent",
+        else => "its sections are damaged, inconsistent or could not be read",
     };
 }
 
@@ -926,20 +943,26 @@ fn bundle_unreadable(cause: []const u8) noreturn {
     );
 }
 
-const BundleReadError = error{ BinaryTooLarge, BinaryUnreadable };
+/// The largest binary `MultiversionOS` accepts for the native platform.
+const bundle_size_max = constants.multiversion_binary_platform_size_max(.{
+    .macos = builtin.target.os.tag == .macos,
+    .debug = builtin.mode == .Debug,
+});
+
+const BundleReadError = error{ BinaryTooLarge, BinaryUnreadable, OutOfMemory };
 
 /// Whether the executable at `exe_path` carries the multiversion sections. Only a binary without
-/// them is unbundled; a failure to read it says nothing, and is an error (P415). Bounded by
-/// `multiversion_binary_size_max`.
+/// them is unbundled; a failure to read it says nothing, and is an error (P415). Bounded by the
+/// native platform's `multiversion_binary_platform_size_max`.
 fn bundle_present(gpa: std.mem.Allocator, exe_path: [:0]const u8) BundleReadError!bool {
     // Only Linux switches release (P259); a Mach-O binary has no ELF sections to read.
     if (builtin.target.os.tag != .linux) return false;
     const file = std.fs.openFileAbsolute(exe_path, .{}) catch return error.BinaryUnreadable;
     defer file.close();
     const size = file.getEndPos() catch return error.BinaryUnreadable;
-    if (size > constants.multiversion_binary_size_max) return error.BinaryTooLarge;
+    if (size > bundle_size_max) return error.BinaryTooLarge;
     const buffer = gpa.alignedAlloc(u8, @alignOf(std.elf.Elf64_Ehdr), size) catch
-        return error.BinaryUnreadable;
+        return error.OutOfMemory;
     defer gpa.free(buffer);
     const read = file.readAll(buffer) catch return error.BinaryUnreadable;
     if (read != size) return error.BinaryUnreadable;
@@ -1098,4 +1121,29 @@ fn gateway_keys(comptime command: []const u8) http_connection.Keys {
 fn on_listening(address: std.net.Address) void {
     const stdout = std.io.getStdOut().writer();
     stdout.print("{}\n", .{address.getPort()}) catch {};
+}
+
+test "releases_offered is the highest release bundled, not how many" {
+    const Release = vsr.Release;
+    const two = struct {
+        fn releases_bundled(_: *anyopaque) mv.ReleaseList {
+            var list: mv.ReleaseList = .empty;
+            list.push(Release.from(.{ .major = 0, .minor = 7, .patch = 0 }));
+            list.push(Release.from(.{ .major = 0, .minor = 7, .patch = 1 }));
+            return list;
+        }
+        fn release_execute(_: *anyopaque, _: Release) void {}
+        fn tick(_: *anyopaque) void {}
+    };
+    const vtable: Multiversion.VTable = .{
+        .releases_bundled = two.releases_bundled,
+        .release_execute = two.release_execute,
+        .tick = two.tick,
+    };
+    const multiversion: Multiversion = .{ .context = @constCast(&{}), .vtable = &vtable };
+    try std.testing.expectEqual(
+        Release.from(.{ .major = 0, .minor = 7, .patch = 1 }).value,
+        releases_offered(multiversion),
+    );
+    try std.testing.expectEqual(@as(u16, 2), multiversion.releases_bundled().count);
 }

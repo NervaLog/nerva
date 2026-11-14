@@ -326,22 +326,23 @@ pub fn refuse(path: []const u8, refusal: Refusal) noreturn {
     }
 }
 
+/// Refuses (NRV-E0720) when the kernel forbids executing from memory; `nerva start` calls it only
+/// for a binary that bundles another release, since only then can the replica switch (R6, P259),
+/// and before the `memfd` is created. The path is a parameter so that a test build can name
+/// another one.
+pub fn memfd_check(path: []const u8, memfd_noexec_file: []const u8) void {
+    if (memfd_noexec_refused(memfd_noexec_file)) refuse(path, .memfd_noexec);
+}
+
 /// The pre-flight of `nerva start`: refuses or returns.
 ///
 /// `releases_run` is every release this binary can run (its multiversion's `releases_bundled()`).
-/// `memfd_noexec_path` is checked first when the binary bundles another release, since only then
-/// can the replica switch (R6, P259): the path is a parameter so that a test build can name
-/// another one.
 pub fn start(
     gpa: std.mem.Allocator,
     path: []const u8,
     direct_io: DirectIO,
     releases_run: []const vsr.Release,
-    memfd_noexec: ?[]const u8,
 ) void {
-    if (memfd_noexec) |memfd_noexec_file| {
-        if (memfd_noexec_refused(memfd_noexec_file)) refuse(path, .memfd_noexec);
-    }
     const refusal = open_check(gpa, path, direct_io, releases_run) catch |err|
         diagnostic.fail_file(path, err);
     if (refusal) |reason| refuse(path, reason);
