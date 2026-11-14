@@ -154,6 +154,10 @@ jobs:
         if: needs.changes.outputs.code != 'false'
         run: .github/scripts/docs_only_test.sh
 
+      - name: Quickstart loop script (its refusals, NRV-E0741 and NRV-E0742)
+        if: needs.changes.outputs.code != 'false'
+        run: scripts/quickstart_loop_test.sh
+
       # The package repositories' tools, pinned to what ubuntu-24.04 offers and asserted, so a
       # runner-image change fails here (NRV-E1139) and does not silently change the bytes
       # (docs/releases/packages.md, "Tools on the runner, pinned"). gpg is the image's 2.4.
