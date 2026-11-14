@@ -201,8 +201,9 @@ fn run_flags(gpa: std.mem.Allocator, args: CLIArgs, failure: *?bench_timeline.Fi
     }
 
     // The files this run writes are opened now, so that a bad path costs no measurement
-    // (NRV-E0728). As on main, a path is created or truncated, and a failed run leaves it so
-    // (P414d).
+    // (NRV-E0728). Each is created or truncated here, as main's `--output` is, but before the run
+    // rather than after it: a run that fails now leaves an existing `--output` empty, where main
+    // left it as it was (P414d).
     var timeline_out = if (args.timeline) |path|
         try file_open("--timeline", path, failure)
     else

@@ -63,7 +63,7 @@ pub const Summary = struct {
     late: u64 = 0,
 };
 
-/// Why a file `--timeline` or `--gateway-pid-file` names cannot be written, in words (NRV-E0728).
+/// Why a file `--timeline`, `--gateway-pid-file` or `--output` names cannot be written, in words (NRV-E0728).
 pub fn path_error_reason(err: anyerror) []const u8 {
     return switch (err) {
         error.FileNotFound => "its directory does not exist",
@@ -557,7 +557,7 @@ test "OutFile: a new file is created, an existing one truncated, a device is not
         try out.write("first\n");
     }
     {
-        // Opened, not yet written: as on main, the earlier content is already gone.
+        // Opened, not yet written: the earlier content is already gone (P414d).
         var out = try OutFile.open(path);
         defer out.deinit();
         try testing.expectEqual(@as(u64, 0), (try out.file.stat()).size);

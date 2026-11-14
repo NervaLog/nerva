@@ -534,13 +534,14 @@ runs the first s seconds as usual, but leaves their operations out of the summar
 throughput and percentiles); their timeline lines carry `"warmup":true`. `--warmup` + `--seconds`
 is at most 3600, and the summary JSON gains `"warmup"` and `"late_operations"` members.
 `--timeline`, `--gateway-pid-file` and `--output` are all opened before anything starts, so a bad
-path is refused at once with NRV-E0728. They are opened as `--output` is on `main`: a missing file is
-created, an existing one is truncated (P414d). There is no temporary file and no rename: a run that
-fails leaves a truncated or short file, and two flags that name one file overwrite each other. The
+path is refused at once with NRV-E0728. They are created or truncated as `main`'s `--output` is, but
+before the run, not after it (P414d): a run that fails now leaves an existing `--output` empty,
+where `main` left it as it was. There is no temporary file and no rename: a failed run leaves a
+truncated or short file, and two flags that name one file overwrite each other. The
 timeline and the summary are written when the run ends, and a write that fails prints the same line
-after the cluster and the gateway it started are torn down. The PID file is replaced when the
+after the cluster and the gateway it started are torn down. The PID file is truncated before the run, written when the
 gateway spawns and, if it is a regular file, removed when the gateway stops (a device such as
-`/dev/null` is never removed). A value out of range (`--clients`, `--batch`, `--keys`, `--hot`, `--warmup` plus
+`/dev/null` is never removed); a run that fails before the spawn leaves it empty. A value out of range (`--clients`, `--batch`, `--keys`, `--hot`, `--warmup` plus
 `--seconds`, `--local`'s client limit) is NRV-E0002. For the `botpike` workload only
 (refused for the others): `--gateway-statsd=<host:port>` (checked before anything starts, NRV-E0736)
 passes `--statsd` to the gateway it starts, `--gateway-pid-file=<file>` writes the gateway's PID there right after it spawns, and

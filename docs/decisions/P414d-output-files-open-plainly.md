@@ -2,13 +2,13 @@
 id: P414d
 date: 2026-11-14
 area: Testing
-amends: P414
 ---
 
 # `bench-load` opens its output files plainly, as `main` does
 
 **Decision.** `--timeline`, `--gateway-pid-file` and `--output` are opened with a plain
-create-or-truncate (`OutFile.open`), as `bench-load`'s `--output` is on `main`. There is no temporary
+create-or-truncate (`OutFile.open`), the same open as `main`'s `--output`, but made before the run
+rather than after it (see Cost). There is no temporary
 file, no rename, no check that two flags name different files, and no symbolic-link or inode
 analysis. The files are opened before anything starts, so a path that cannot be opened is one
 NRV-E0728 line and costs no measurement; the timeline and the summary are written when the run
@@ -20,7 +20,8 @@ This is the owner's choice (option b, 2026-11-14), after two review rounds on an
 **Reason.** `bench-load` is a benchmark tool, not a store. Atomic replacement needed an
 identity, ownership and link policy larger than the feature it protected.
 
-**Cost.** A failed run can leave a truncated or empty output file, as on `main`, because the file
-is opened (and truncated) before the run. Two flags naming one file overwrite each other, and a
+**Cost.** A failed run can leave an existing `--output` empty, which `main` did not: `main` wrote
+it only after the run (`writeFile`), so a run that failed first left the old file intact. This is
+the one behaviour change for `--output`; `--timeline` and the PID file are new. Two flags naming one file overwrite each other, and a
 later flag that cannot be opened leaves the earlier flags' files truncated. A write that fails
 leaves the file short.
