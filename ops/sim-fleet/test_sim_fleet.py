@@ -2129,17 +2129,19 @@ class BrokenRetry(unittest.TestCase):
         return subprocess.run(["git", "-C", cwd, "-c", "user.name=t", "-c", "user.email=t@t",
                                *args], capture_output=True, text=True, check=True).stdout.strip()
 
-    def rounds(self, n, builds_ok=False, retries=2, seconds=0):
+    def rounds(self, n, builds_ok=False, retries=2, seconds=0, kill=False):
         """Runs follow_main n times (a fresh shell each, as a restart); one line per round."""
         lines = []
         for _ in range(n):
             broken = Path(self.state, "broken")
             built = Path(self.state, "built")
             ok = "return 0" if builds_ok else "return 1"
+            if kill:  # The loop dies (SIGKILL, as a restart or the OOM killer) mid-build.
+                ok = 'kill -9 "$MAIN"; sleep 30'
             out = subprocess.run(
                 ["bash", "-c", f'source "{HERE}/run.sh"; log() {{ echo "$*" >&2; }}; '
                  f'build_into() {{ echo x >>"{self.d}/builds"; {ok}; }}; '
-                 f'export -f build_into; export d="{self.d}"; prune_cache() {{ :; }}; '
+                 f'export -f build_into; export d="{self.d}" MAIN=$$; prune_cache() {{ :; }}; '
                  f'STATE="{self.state}"; cd "{self.repo}"; SIM_FLEET_BRANCH=main; '
                  f'SIM_FLEET_GIT_TIMEOUT=60; SIM_FLEET_BUILD_TIMEOUT=60; '
                  f'SIM_FLEET_BROKEN_RETRIES={retries}; SIM_FLEET_BROKEN_RETRY_SECONDS={seconds}; '
@@ -2163,6 +2165,22 @@ class BrokenRetry(unittest.TestCase):
         self.assertEqual(self.builds(), 3)
         self.assertTrue(Path(self.state, "broken-tries").read_text().startswith(
             f"{self.v2} 3 "))
+
+    def test_a_retry_killed_midway_still_counts(self):
+        self.rounds(1)  # The first build fails: v2 is broken.
+        for _ in range(6):  # Six boots, each killed during its retry build.
+            self.rounds(1, kill=True)
+        # One build, then retries 2 and 3 (killed), and no more: retries + 1 builds in all.
+        self.assertEqual(self.builds(), 3)
+        self.assertTrue(Path(self.state, "broken-tries").read_text().startswith(f"{self.v2} 3 "))
+        out = self.rounds(1)[0]
+        self.assertNotIn("retrying", out.stderr)
+        self.assertEqual(self.builds(), 3)
+
+    def test_each_retry_keeps_its_own_build_log(self):
+        self.rounds(6)
+        logs = sorted(p.name for p in Path(self.state).glob("build.log*"))
+        self.assertEqual(logs, ["build.log", "build.log.2", "build.log.3"])
 
     def test_a_broken_commit_is_not_retried_before_the_wait_is_over(self):
         self.rounds(4, seconds=3600)
@@ -2190,6 +2208,30 @@ class BrokenRetry(unittest.TestCase):
         self.rounds(1)
         self.assertEqual(self.builds(), 4)
         self.assertTrue(Path(self.state, "broken-tries").read_text().startswith(f"{v3} 1 "))
+
+
+class BrokenRetrySettings(unittest.TestCase):
+    """The retry bound and wait are non-negative whole numbers."""
+
+    def run_sh(self, **env):
+        home = tempfile.mkdtemp()
+        self.addCleanup(subprocess.run, ["rm", "-rf", home])
+        return subprocess.run(["bash", f"{HERE}/run.sh"],
+                              env={"PATH": os.environ["PATH"], "SIM_FLEET_HOME": home, **env},
+                              capture_output=True, text=True, timeout=30)
+
+    def test_text_and_negatives_are_refused(self):
+        for var in ("SIM_FLEET_BROKEN_RETRIES", "SIM_FLEET_BROKEN_RETRY_SECONDS"):
+            for bad in ("three", "-1"):
+                out = self.run_sh(**{var: bad})
+                self.assertEqual(out.returncode, 2, (var, bad, out.stdout + out.stderr))
+                self.assertIn(f"{var} must be a non-negative whole number",
+                              out.stdout + out.stderr)
+
+    def test_zero_passes_this_check(self):
+        out = self.run_sh(SIM_FLEET_BROKEN_RETRIES="0", SIM_FLEET_BROKEN_RETRY_SECONDS="0")
+        self.assertNotIn("must be a non-negative", out.stdout + out.stderr)
+        self.assertIn("no token", out.stdout + out.stderr)
 
 
 if __name__ == "__main__":

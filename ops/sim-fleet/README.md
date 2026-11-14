@@ -22,12 +22,13 @@ takes `flock` on `state/lock`) loops over rounds:
    restart, so a restart does not rebuild a good commit. A commit that failed to build is built
    again once `SIM_FLEET_BROKEN_RETRY_SECONDS` (7200) have passed since its last failure, at most
    `SIM_FLEET_BROKEN_RETRIES` (3) times (four builds in all), so one transient failure (a network
-   blip while the toolchain downloads) does not leave a candidate unsoaked; each retry logs
-   `retrying the build of <sha>`. The count is `state/broken-tries` (`<sha> <failed builds> <epoch
-   of the last>`); a new main commit starts its own count, and a build that succeeds deletes the file. A restart
-   does not reset it. To clear it by hand (a commit out of attempts, or a cause fixed on the
-   host), as `simfleet`: `rm state/broken state/broken-tries`, then `systemctl restart
-   sim-fleet`; the next round builds the tip at once.
+   blip while the toolchain downloads) does not leave a candidate unsoaked; each retry keeps its log
+   (`state/build.log.<attempt>`) and logs `retrying the build of <sha>`. The count is
+   `state/broken-tries` (`<sha> <builds started> <epoch of the last start or failure>`, written
+   before each retry builds, so a build killed midway counts); a new main commit starts its own
+   count, and a build that succeeds deletes the file. A restart does not reset it. To clear it by
+   hand (a commit out of attempts, or a cause fixed on the host), as `simfleet`: `rm state/broken
+   state/broken-tries`, then `systemctl restart sim-fleet`; the next round builds the tip at once.
 2. **Workers**, one core and about 4 GB of RAM each, `SIM_FLEET_WORKERS` of them (default: the
    smaller of every core but one, which is left for git, builds and the reporter, and
    `memory / SIM_FLEET_SEED_MEMORY_MB`, at least 1; memory is MemTotal minus
