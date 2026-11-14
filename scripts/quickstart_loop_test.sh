@@ -76,6 +76,7 @@ real_mktemp=$(command -v mktemp)
 printf '#!/usr/bin/env bash\nd=$("%s" "$@") || exit\n: > "$d/run_1"\necho "$d"\n' "$real_mktemp" > "$tmp/bin/mktemp"
 chmod +x "$tmp/bin/mktemp"
 expect "run dir not creatable" 2 "run 1: cannot create or enter" env PATH="$tmp/bin:$PATH" "$script" "$tmp/nerva" 1 "$tmp/w8"
+# The cleanup removes $tmp/w8, a run dir the script did not create (the stand-in made run_1 in it); safe because $tmp is this test's own mktemp -d.
 clean "$tmp/w8" "run dir refusal"
 
 # A busy port.
