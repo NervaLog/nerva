@@ -5,7 +5,7 @@ publishes a version's section as its GitHub release notes, and refuses to releas
 without one. Design reasons are in [docs/DECISIONS.md](./docs/DECISIONS.md); the full log of
 work is [WORKLOG.md](./WORKLOG.md).
 
-## v0.7.1 — TO FILL (the release date; not before 2026-11-14, the end of the soak)
+## v0.7.1 — 2026-11-14
 <!-- site: The first release for outside users: a signed and notarized Mac binary with a Homebrew tap, Linux packages and an installer. -->
 
 The first Nerva release for people outside the project. It changes no data file, protocol or
@@ -136,14 +136,18 @@ The README's first line no longer says "toy / research": it gives the label and 
 ### What was tested
 
 The release candidate is `main` at `c886c9f0e5e4cffd12597cc29f46a4535fe6b254` (P388; it replaced `5d7d806`, whose `src/`,
-`build.zig`, `build.zig.zon` and `zig/` are identical). The figures below are filled in
-after the soak and the reviews, and are quoted here from their records. Each placeholder below
-marks what is not in yet.
-**TO FILL:** the heading's date, set in the `VERSION` commit; the heading's own placeholder is not
-scanned by the release check, so this line makes the release refuse a stale one.
+`build.zig`, `build.zig.zon` and `zig/` are identical). The figures below are quoted
+from their records, except the reviewers' verdicts, which are quoted from their reports (P451).
 
-- **Simulation:** **TO FILL** (the `sim_fleet.py soak --commit <candidate>` line: at least
-  24.0 hours of fleet rounds on the candidate, and no open `sim-fleet` issue against it).
+- **Simulation: shipped before the full 24 hours on the candidate, by the owner's waiver**
+  (P451). The fleet ran `5d7d806`, whose pinned code is the candidate's, for 15.0 hours over
+  2026-11-12 and 2026-11-13: 74,305 seeds (VOPR, the testing VOPR and every fuzzer), none failed, and 6 ran past their
+  per-seed deadline (5 `vopr-nerva`, 1 `vopr-testing`), which P287b counts as not clean; the owner
+  waived them too. Their seed numbers were not kept, so they cannot be replayed: the fleet will
+  keep the seed of every one past its deadline, and replay any that recur ([#452](https://github.com/NervaLog/nerva/issues/452);
+  [the fleet's tracker, #177](https://github.com/NervaLog/nerva/issues/177)). The soak of
+  `c886c9f` itself had not reached 24 hours when the owner chose to tag. No open issue reports
+  a failing fleet seed against `5d7d806` or `c886c9f`; the open fleet issues (#443, #444, #446, #447) are about the fleet's own loop.
 - **Jepsen:** `retry` and `bank` both passed on `5d7d806`, the candidate's ancestor with the same
   pinned code, with nemeses `kill,partition` and `--time-limit 1200`: runs [43075322433](https://github.com/NervaLog/nerva/actions/runs/43075322433)
   (`retry`) and [43075317959](https://github.com/NervaLog/nerva/actions/runs/43075317959)
@@ -159,10 +163,12 @@ scanned by the release check, so this line makes the release refuse a stale one.
   [#379](https://github.com/NervaLog/nerva/issues/379) and
   [#380](https://github.com/NervaLog/nerva/issues/380). #379 and #380 closed on 2026-11-13
   (#405); the only finding still open is #372 (SHOULD), whose fix is deferred to after v0.7.1
-  (#395). **TO FILL:** each reviewer's verdict (none is recorded in the issues or the repository)
-  and the owner's written waiver of #372. **TO FILL:** the verdict of P369's short review of what ships after
-  `5d7d806` (release automation, packages, the installer, the env examples); it has run, and its
-  one finding is [#384](https://github.com/NervaLog/nerva/issues/384), listed here only. Earlier rounds on older commits: #315 to #321 and
+  (#395). The verdicts, as each reviewer reported them to the
+  release's supervisor (quoted in P451): the first reviewer (Fable, P369), "ship after MUSTs: one MUST, about the
+  release process, not the code" (#371, fixed by #374); the second, "ship
+  v0.7.1, no MUSTs". The owner waives #372 for this release (P451); it is a known issue below. P369's short review of what ships after
+  `5d7d806` (release automation, packages, the installer, the env examples): "ship once #384 is
+  fixed or waived"; [#384](https://github.com/NervaLog/nerva/issues/384) was fixed by #386. Earlier rounds on older commits: #315 to #321 and
   #328.
 - **macOS:** the release workflow's Mac job (`mac-sign.yml`) signs and notarizes the zip after the
   owner approves the `apple-signing` environment, and uploads it to the draft release; the owner's
@@ -242,6 +248,9 @@ Open issues an operator should know about before relying on this release:
 - **#292:** `install.sh --upgrade` does not check that the replicas are stopped, and does not
   warn when a package's `/usr/bin/nerva` is shadowed by `/usr/local/bin/nerva`.
 - **#296:** the `.deb` and `.rpm` are unsigned, and there is no package repository.
+- **#372:** `nerva format` into a directory you may not write answers NRV-E0007, "cannot
+  listen", and into a directory that does not exist answers `bug[NRV-B0004]`. Check that the
+  directory exists and that the user running `format` may write it (`runuser -u nerva`).
 
 ## v0.7.0 — 2026-11-10
 
