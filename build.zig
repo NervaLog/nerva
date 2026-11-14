@@ -21,22 +21,13 @@ const release_test_other = "0.0.200";
 // The next release `test:release` builds, to roll a cluster from `release` to it (R6, P259): this
 // release with its patch plus 200, which no real release uses. It bundles this build's `nerva`.
 const release_test_next = release_plus_200(release);
-// The one past release a binary bundles, so that a cluster can move from it to `release` one
-// replica at a time (R6, P259). None until the packer exists (R6 slice 3). A release that rolls
-// keeps `release_client_min` at or below the bundled release, so that the past release's clients
-// stay valid after the switch.
-const release_bundled: ?[]const u8 = null;
-
+// The past release a binary bundles is not named here: `-Dbundle` gives a binary, and `nerva_pack`
+// (`bundle.refusal`, NRV-E0725) refuses one that is not lower than `release` or whose clients
+// `release_client_min` would refuse after the switch (R6, P259).
 comptime {
-    @setEvalBranchQuota(10_000);
     const current = std.SemanticVersion.parse(release) catch unreachable;
     const client_min = std.SemanticVersion.parse(release_client_min) catch unreachable;
     assert(client_min.order(current) != .gt);
-    if (release_bundled) |bundled_text| {
-        const bundled = std.SemanticVersion.parse(bundled_text) catch unreachable;
-        assert(bundled.order(current) == .lt);
-        assert(client_min.order(bundled) != .gt);
-    }
 }
 
 fn release_plus_200(comptime text: []const u8) []const u8 {
@@ -260,7 +251,8 @@ pub fn build(b: *std.Build) !void {
         break :strip objcopy.getOutput();
     } else null;
     const nerva = nerva_full;
-    // The packer runs on the build host: it runs both binaries to read their facts.
+    // The packer runs both binaries to read their facts, so a pack is native only: it is built for
+    // the target, and `-Dbundle` with a foreign `-Dtarget` fails when it runs.
     const nerva_pack = b.addExecutable(.{
         .name = "nerva_pack",
         .root_module = b.createModule(.{

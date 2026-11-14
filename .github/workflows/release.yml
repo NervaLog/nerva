@@ -190,8 +190,13 @@ jobs:
         run: |
           for target in x86_64-linux aarch64-linux; do
             debug="dist/nerva-$TAG-$target.debug"
-            for section in .text .rodata; do
-              cmp <(readelf -x "$section" "$debug") <(readelf -x "$section" "bin/$target/nerva") \
+            for section in .text .rodata .data .data.rel.ro .eh_frame; do
+              want=$(readelf -x "$section" "$debug" 2>&1) || true
+              case "$want" in
+                *"Hex dump of section"*) ;;
+                *) echo "::error::$debug has no $section to compare"; exit 1 ;;
+              esac
+              [ "$want" = "$(readelf -x "$section" "bin/$target/nerva" 2>&1)" ] \
                 || { echo "::error::$debug differs from the $target binary in $section"; exit 1; }
             done
           done
@@ -265,8 +270,10 @@ jobs:
             echo "---"
             echo
             echo "Nerva at commit $GITHUB_SHA. Binaries report \`$BINARY_VERSION\`." \
-              "Check downloads against \`SHA256SUMS\`, which lists the tarballs, the packages and" \
-              "the bill of materials. The macOS zip is checked against its own" \
+              "Check downloads against \`SHA256SUMS\`, which lists the tarballs, the packages," \
+              "the \`.debug\` files and the bill of materials. Each Linux tarball's binary is" \
+              "stripped; its \`.debug\` file is the same build with symbols, to read a" \
+              "core dump or a stack trace. The macOS zip is checked against its own" \
               "\`.zip.sha256\`. What the binaries are built from is in \`nerva-$TAG.cdx.json\`" \
               "(CycloneDX)."
           } > notes.md

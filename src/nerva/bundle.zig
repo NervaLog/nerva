@@ -10,6 +10,7 @@
 //! .tb_mvb   the past release's whole executable, unchanged
 //! .tb_mvh   `MultiversionHeader` (upstream's, used as is)
 //! the section names, and the section headers, with the two sections above last
+//! "nervapaknervapak"                        <- a trailer: this is a packed binary
 //! ```
 //!
 //! Both sections are not loaded (no `SHF_ALLOC`), so the kernel runs the outer binary exactly as
@@ -17,6 +18,9 @@
 //! the whole file with the header zeroed (`multiversion.zig`, `target_update`), and copies a past
 //! release out of the body into a `memfd` to execute it. The checks below repeat those, so that a
 //! packed binary is proven to open before it is installed.
+//!
+//! A damaged binary is never read as "no bundle": a trailer that is nearly there, or either section
+//! name, with the sections not found, is damage (NRV-E0719), so one changed byte anywhere is caught.
 //!
 //! The past release is an unpacked build (one release, no sections). A packed binary given as the
 //! past release is stripped first (`strip`): the layout above only appends, and the one field the
@@ -45,6 +49,10 @@ const Release = multiversion.Release;
 /// The name of the two sections, as `multiversion.zig` looks them up.
 const section_body_name = ".tb_mvb";
 const section_header_name = ".tb_mvh";
+/// The last bytes of a packed binary, after the section header table. It is how a binary that
+/// `pack` wrote is told from one it did not even when a changed byte hides the section table or
+/// the names (NRV-E0719, not "no bundle"): see `bundle_traces`.
+const trailer = "nervapaknervapak";
 
 /// What the packer writes into `Header.reserved`, so that `strip` can undo the append. Upstream
 /// leaves `reserved` unchecked for new fields.
@@ -124,7 +132,7 @@ pub const Refusal = enum {
     /// Its format digest differs: the move is an export and an import (P259c).
     format_differs,
     /// This release's `release_client_min` is above the past release: the clients of the past
-    /// release would be refused after the switch (build.zig's comptime check says the same).
+    /// release would be refused after the switch.
     client_min_above_past,
 
     pub fn text(refusal_: Refusal) []const u8 {
@@ -173,26 +181,55 @@ pub fn size_max_default(debug: bool) u64 {
 }
 
 /// The sections of `bytes`, or null when it has neither. Errors from `multiversion.parse_elf`
-/// other than "not found" are a damaged binary.
+/// other than "not found" are a damaged binary, and so is a section table that names one of the
+/// two sections but does not give both: `pack` writes both or neither, so one changed byte in a
+/// name or a section header cannot turn a bundle into "no bundle".
 fn sections_find(bytes: []align(8) const u8) !?Offsets {
     // `elf.Header.parse` panics on a wrong magic or version byte in this toolchain; a damaged
     // file must be an error, so the identification is checked first.
     const ehdr = try ehdr_read(bytes);
     if (ehdr.e_ident[elf.EI_VERSION] != 1) return error.NotElf;
     const parsed = multiversion.parse_elf(bytes) catch |err| switch (err) {
-        error.MultiversionHeaderOrBodyNotFound => return null,
+        error.MultiversionHeaderOrBodyNotFound => {
+            if (try bundle_traces(bytes, ehdr)) return error.Damaged;
+            return null;
+        },
         else => return err,
     };
     const found = switch (builtin.cpu.arch) {
         .x86_64 => parsed.x86_64,
         .aarch64 => parsed.aarch64,
         else => comptime unreachable,
-    } orelse return null;
+    } orelse {
+        if (try bundle_traces(bytes, ehdr)) return error.Damaged;
+        return null;
+    };
     return .{
         .header_offset = found.header_offset,
         .body_offset = found.body_offset,
         .body_size = found.body_size,
     };
+}
+
+/// Whether `bytes` is, or was, a binary `pack` wrote: its tail resembles `trailer` (at least half
+/// of its bytes match, so that one changed byte still shows it), or its section name table has
+/// either section's name.
+fn bundle_traces(bytes: []const u8, ehdr: elf.Elf64_Ehdr) !bool {
+    if (bytes.len >= trailer.len) {
+        var matching: usize = 0;
+        for (bytes[bytes.len - trailer.len ..], trailer) |actual, expected| {
+            if (actual == expected) matching += 1;
+        }
+        if (matching >= trailer.len / 2) return true;
+    }
+    const shstr = shdr_read(bytes, ehdr, ehdr.e_shstrndx);
+    if (shstr.sh_type != elf.SHT_STRTAB) return error.NotElf;
+    if (shstr.sh_offset > bytes.len or shstr.sh_size > bytes.len - shstr.sh_offset) {
+        return error.NotElf;
+    }
+    const names = bytes[shstr.sh_offset..][0..shstr.sh_size];
+    return mem.indexOf(u8, names, section_header_name) != null or
+        mem.indexOf(u8, names, section_body_name) != null;
 }
 
 const Offsets = struct { header_offset: u32, body_offset: u32, body_size: u32 };
@@ -244,7 +281,7 @@ pub fn pack(
     const names_end = input.len + past.bytes.len + @sizeOf(Header) + names_old.len +
         names_extra.len;
     const total = mem.alignForward(u64, names_end, 8) +
-        (shdr_count_old + 2) * @sizeOf(elf.Elf64_Shdr);
+        (shdr_count_old + 2) * @sizeOf(elf.Elf64_Shdr) + trailer.len;
     if (total > options.size_max) return error.SizeMax;
 
     var out = try std.ArrayListAligned(u8, 8).initCapacity(allocator, @intCast(total));
@@ -293,6 +330,7 @@ pub fn pack(
     );
     out.appendSliceAssumeCapacity(mem.asBytes(&body_shdr));
     out.appendSliceAssumeCapacity(mem.asBytes(&header_shdr));
+    out.appendSliceAssumeCapacity(trailer);
     assert(out.items.len == total);
 
     var ehdr_new = ehdr;
@@ -351,8 +389,9 @@ pub const Bundle = struct {
 /// sections: it bundles nothing.
 pub fn verify(bytes: []align(8) u8) VerifyError!?Bundle {
     const offsets = (sections_find(bytes) catch return error.Damaged) orelse return null;
-    if (offsets.header_offset + @sizeOf(Header) > bytes.len) return error.Damaged;
-    if (offsets.body_offset + offsets.body_size > bytes.len) return error.Damaged;
+    // In `u64`: the offsets come from the file, and `u32` sums of them would overflow.
+    if (@as(u64, offsets.header_offset) + @sizeOf(Header) > bytes.len) return error.Damaged;
+    if (@as(u64, offsets.body_offset) + offsets.body_size > bytes.len) return error.Damaged;
 
     const header_bytes = bytes[offsets.header_offset..][0..@sizeOf(Header)];
     // `init_from_bytes` asserts this field is set before it checksums the header.
@@ -369,27 +408,30 @@ pub fn verify(bytes: []align(8) u8) VerifyError!?Bundle {
 
     const body = bytes[offsets.body_offset..][0..offsets.body_size];
     header.past.verify_checksums(body) catch return error.Damaged;
-    assert(header.past.count == 1); // releases_bundled_max (P259): one past release.
+    // `releases_bundled_max` (P259): one past release. Read from a file, so not an assertion.
+    if (header.past.count != 1) return error.Damaged;
     const past = body[header.past.offsets[0]..][0..header.past.sizes[0]];
     return .{ .header = header, .past = past };
 }
 
 /// `bytes` without the two sections: the executable `pack` was given. A binary without them is
-/// copied as it is.
+/// copied as it is. Null when the bundle is one this packer did not write; `error.Damaged` when
+/// it is one it wrote and a check fails.
 pub fn strip(allocator: mem.Allocator, bytes: []align(8) const u8) !?[]align(8) u8 {
     // Not an ELF executable (a test's stub), or one without the sections: nothing to take off.
     const found = sections_find(bytes) catch |err| switch (err) {
         error.NotElf => null,
-        else => return null,
+        else => return error.Damaged,
     };
     const offsets = found orelse {
         const copy = try allocator.alignedAlloc(u8, 8, bytes.len);
         @memcpy(copy, bytes);
         return copy;
     };
+    if (@as(u64, offsets.header_offset) + @sizeOf(Header) > bytes.len) return error.Damaged;
     const header = Header.init_from_bytes(
         bytes[offsets.header_offset..][0..@sizeOf(Header)],
-    ) catch return null;
+    ) catch return error.Damaged;
     const origin = mem.bytesToValue(Origin, header.reserved[0..@sizeOf(Origin)]);
     if (!mem.eql(u8, &origin.magic, &Origin.magic_value)) return null;
 
@@ -403,7 +445,7 @@ pub fn strip(allocator: mem.Allocator, bytes: []align(8) const u8) !?[]align(8) 
     @memcpy(out[0..@sizeOf(elf.Elf64_Ehdr)], mem.asBytes(&ehdr));
     if (multiversion.checksum.checksum(out) != header.current_checksum) {
         allocator.free(out);
-        return null;
+        return error.Damaged;
     }
     return out;
 }
@@ -604,19 +646,16 @@ test "bundle: one changed byte anywhere in the packed binary is damage" {
     const buffer = try testing.allocator.alignedAlloc(u8, 8, packed_bytes.len);
     defer testing.allocator.free(buffer);
     // Every byte, one at a time: the code, the past release, the header, the section names and
-    // the section headers. Either the sections are no longer found, or a checksum fails.
+    // the section headers. The checksum of the whole file covers all of them, and a name or a
+    // section header changed so that a section is no longer found is damage too, never "no
+    // bundle" (NRV-E0719).
     for (0..packed_bytes.len) |index| {
         @memcpy(buffer, packed_bytes);
         buffer[index] ^= 1;
-        const result = verify(buffer);
-        if (result) |bundle| {
-            // Bytes the checks cannot see: the ELF bytes that do not name the sections, the
-            // dead section headers of the linked executable, padding. None of them is inside
-            // what is hashed except by `checksum_binary_without_header`, which covers the file.
-            try testing.expect(bundle == null);
-        } else |err| {
-            try testing.expectEqual(error.Damaged, err);
-        }
+        testing.expectError(error.Damaged, verify(buffer)) catch |err| {
+            std.debug.print("byte {} changed: not damage\n", .{index});
+            return err;
+        };
     }
 }
 

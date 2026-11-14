@@ -35,7 +35,7 @@ pub fn main() !void {
     var debug = false;
     var size_max: ?u64 = null;
 
-    const args = try std.process.argsAlloc(allocator);
+    const args = std.process.argsAlloc(allocator) catch |err| diagnostic.unexpected(err);
     var index: usize = 1;
     while (index < args.len) : (index += 1) {
         const arg = args[index];
@@ -57,8 +57,11 @@ pub fn main() !void {
     }
     if (input == null or past_path == null or output == null) usage();
 
-    const current_facts = try facts_read(allocator, input.?);
-    const past_facts = try facts_read(allocator, past_path.?);
+    // Both files are read before either is run: a file that cannot be read is said so first.
+    const input_bytes = file_read(allocator, input.?);
+    const past_loaded = file_read(allocator, past_path.?);
+    const current_facts = facts_read(allocator, input.?);
+    const past_facts = facts_read(allocator, past_path.?);
     if (bundle.refusal(current_facts, past_facts)) |refusal| {
         diagnostic.fail(
             "NRV-E0725",
@@ -69,9 +72,16 @@ pub fn main() !void {
         );
     }
 
-    const input_bytes = try file_read(allocator, input.?);
-    const past_loaded = try file_read(allocator, past_path.?);
-    const past_bytes = (try bundle.strip(allocator, past_loaded)) orelse diagnostic.fail(
+    const past_bytes = (bundle.strip(allocator, past_loaded) catch |err| switch (err) {
+        error.OutOfMemory => diagnostic.unexpected(err),
+        else => diagnostic.fail(
+            "NRV-E0719",
+            "pack: {s} carries a bundle that is damaged",
+            .{past_path.?},
+            "download the release again and check it against SHA256SUMS",
+            .{},
+        ),
+    }) orelse diagnostic.fail(
         "NRV-E0719",
         "pack: {s} has a bundle this packer did not write; it cannot be bundled",
         .{past_path.?},
@@ -100,15 +110,16 @@ pub fn main() !void {
             "pack on Linux, from a `zig build` output",
             .{},
         ),
-        error.OutOfMemory => return err,
+        error.OutOfMemory => diagnostic.unexpected(err),
     };
 
     // Written whole, then renamed: a failed build leaves no half-packed `nerva`.
     const directory = std.fs.cwd();
-    var atomic = try directory.atomicFile(output.?, .{ .mode = 0o755 });
+    var atomic = directory.atomicFile(output.?, .{ .mode = 0o755 }) catch |err|
+        diagnostic.fail_file(output.?, err);
     defer atomic.deinit();
-    try atomic.file.writeAll(packed_bytes);
-    try atomic.finish();
+    atomic.file.writeAll(packed_bytes) catch |err| diagnostic.fail_file(output.?, err);
+    atomic.finish() catch |err| diagnostic.fail_file(output.?, err);
 }
 
 fn usage() noreturn {
@@ -121,10 +132,10 @@ fn usage() noreturn {
     );
 }
 
-fn file_read(allocator: mem.Allocator, path: []const u8) ![]align(8) u8 {
+fn file_read(allocator: mem.Allocator, path: []const u8) []align(8) u8 {
     const file = std.fs.cwd().openFile(path, .{}) catch |err| diagnostic.fail_file(path, err);
     defer file.close();
-    const size = try file.getEndPos();
+    const size = file.getEndPos() catch |err| diagnostic.fail_file(path, err);
     if (size > file_size_max) diagnostic.fail(
         "NRV-E0719",
         "pack: {s} is over {} bytes",
@@ -132,14 +143,23 @@ fn file_read(allocator: mem.Allocator, path: []const u8) ![]align(8) u8 {
         "pack executables, not archives",
         .{},
     );
-    const bytes = try allocator.alignedAlloc(u8, 8, size);
-    assert(try file.readAll(bytes) == size);
+    const bytes = allocator.alignedAlloc(u8, 8, size) catch |err| diagnostic.unexpected(err);
+    // A file that changed after its size was read, or one whose size is not its length, is not
+    // what was asked to be packed (a read of the file's own bytes is never an assertion).
+    const read = file.readAll(bytes) catch |err| diagnostic.fail_file(path, err);
+    if (read != size) diagnostic.fail(
+        "NRV-E0727",
+        "pack: {s} was not read in full ({} of {} bytes): it changed while it was read",
+        .{ path, read, size },
+        "pack a file nothing is writing, and run the build again",
+        .{},
+    );
     return bytes;
 }
 
 /// What `<exe> version --verbose` says. An executable that does not run, or does not say the
 /// four facts (a build without its commit), cannot be bundled or bundle.
-fn facts_read(allocator: mem.Allocator, exe: []const u8) !bundle.Facts {
+fn facts_read(allocator: mem.Allocator, exe: []const u8) bundle.Facts {
     const result = std.process.Child.run(.{
         .allocator = allocator,
         .argv = &.{ exe, "version", "--verbose" },
@@ -151,6 +171,23 @@ fn facts_read(allocator: mem.Allocator, exe: []const u8) !bundle.Facts {
         "pack on the platform both binaries are for",
         .{},
     );
+    // A binary that says NRV-E0719 for `version` is a packed one that fails its own check.
+    if (result.term != .Exited or result.term.Exited != 0) {
+        if (mem.indexOf(u8, result.stderr, "NRV-E0719") != null) diagnostic.fail(
+            "NRV-E0719",
+            "pack: {s} carries a bundle that is damaged (`version` says so)",
+            .{exe},
+            "download the release again and check it against SHA256SUMS",
+            .{},
+        );
+        diagnostic.fail(
+            "NRV-E0725",
+            "pack: {s} does not run here (`version --verbose` failed)",
+            .{exe},
+            "pack on the platform both binaries are for",
+            .{},
+        );
+    }
     const facts = bundle.Facts.parse(result.stdout) catch diagnostic.fail(
         "NRV-E0725",
         "pack: {s} does not say its release, format and commit (`version --verbose`)",

@@ -7,9 +7,13 @@ Usage: bundle.py <nerva> <nerva_next> <nerva_pack>
 release). Checks, without a cluster:
 - `nerva_next version` lists the bundled release, `nerva version` bundles none, and the format
   digests are equal;
-- one changed byte anywhere in the bundle is refused with NRV-E0719, never run;
+- one changed byte in each part of the bundle (the code, the past release, the header, the
+  section names, the section table, the trailer) is refused with NRV-E0719, never run or read
+  as "bundles none";
 - the packer refuses, with NRV-E0725 and no output, a past release that is not lower, of another
   format digest, or whose clients the next release would refuse;
+- the packer refuses an input it cannot read in full (NRV-E0727) or an output it cannot write
+  (NRV-E0810), with a code and no error name;
 - the packer refuses a result over its size limit with NRV-E0719, and writes it at the limit;
 - the packed binary is under `multiversion_binary_platform_size_max` (64 MiB); the margin is
   printed.
@@ -58,6 +62,12 @@ def main():
         shutil.rmtree(work, ignore_errors=True)
 
 
+def past_stub_ok(work, base):
+    path = os.path.join(work, "past_stub_ok")
+    stub(path, facts_text("0.0.5", base[1], base[2], base[3]))
+    return path
+
+
 def check(nerva, nerva_next, nerva_pack, work):
     past = facts(nerva)
     next_ = facts(nerva_next)
@@ -88,8 +98,13 @@ def check(nerva, nerva_next, nerva_pack, work):
     # section table. Each is refused with NRV-E0719, never run.
     data = open(nerva_next, "rb").read()
     body = data.index(b"\x7fELF\x02\x01\x01\x00", 8)  # The past release's own ELF header.
+    # The names the sections are found by, and the trailer: a changed byte there must not read as
+    # "bundles none".
     places = [("linked tail", body - 100), ("bundle", body + 4096),
-              ("header", data.index(b"nervapak")), ("section table", len(data) - 100)]
+              ("header", data.index(b"nervapak")), ("section table", len(data) - 100),
+              ("header section name", data.rindex(b".tb_mvh\x00") + 3),
+              ("body section name", data.rindex(b".tb_mvb\x00") + 3),
+              ("trailer", len(data) - 1), ("trailer start", len(data) - 16)]
     for name, offset in places:
         damaged = os.path.join(work, "damaged")
         changed = bytearray(data)
@@ -116,6 +131,18 @@ def check(nerva, nerva_next, nerva_pack, work):
         assert result.returncode == 1, (name, result.returncode, result.stderr)
         assert "NRV-E0725" in result.stderr, (name, result.stderr)
         assert not os.path.exists(output), name
+
+    # A file the packer cannot read in full (a `/sys` file's size is not its length), and one it
+    # cannot write, are refused with a code, never with an error name.
+    if os.path.exists("/sys/kernel/mm/transparent_hugepage/enabled"):
+        result = run([nerva_pack, "--input", nerva_next,
+                      "--past", "/sys/kernel/mm/transparent_hugepage/enabled",
+                      "--output", os.path.join(work, "short")])
+        assert result.returncode == 1 and "NRV-E0727" in result.stderr, result.stderr
+    result = run([nerva_pack, "--input", nerva, "--past", past_stub_ok(work, base),
+                  "--output", os.path.join(work, "no", "such", "directory", "nerva")])
+    assert result.returncode == 1 and "NRV-E0810" in result.stderr, result.stderr
+    assert "error." not in result.stderr, result.stderr
 
     # The size limit: written at exactly the size it takes, refused one byte under it.
     past_stub = os.path.join(work, "past_stub")

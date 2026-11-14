@@ -19,4 +19,4 @@ verification. Appending keeps the packed binary reproducible from the two inputs
 
 **Costs.** The packer runs both binaries (`version --verbose`) for their facts, so a pack is native.
 `header.reserved` holds a 16-byte record of the original section table, so `strip` can give back the
-linked executable; nothing else reads it. Linux ELF only (macOS and Windows are not packed).
+linked executable; nothing else reads it. A 16-byte trailer ends the file, so that a binary `pack` wrote whose section table or names a changed byte hides is damaged (NRV-E0719) and not "bundles none"; a later release's `strip` reads this layout too, so it is now a format of its own. Linux ELF only (macOS and Windows are not packed).

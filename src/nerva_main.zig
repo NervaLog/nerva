@@ -877,27 +877,25 @@ fn listen_remote_warn(comptime command: []const u8, args: anytype) void {
         "beside the client", .{});
 }
 
-/// `nerva version`: the first line is the one the release workflow and scripts read; the rest
-/// say what an upgrade needs to compare (R6, P259b). `bundles` lists the past releases this
-/// binary can also run; none yet. `--verbose` adds what the digest is made of and the commit.
 /// The past release this executable carries (R6 slice 3), checked as `start` will check it:
-/// null when it carries none. A damaged one is NRV-E0719, and `version` says so rather than
-/// naming a release it could not run.
+/// null when it carries none. A damaged one, or one that cannot be read, is NRV-E0719, and
+/// `version` says so rather than naming a release it could not run. Only a binary that is not
+/// an ELF executable (the Mac builds) bundles nothing without being read; once its magic is
+/// ELF, any failure to read the rest is not an answer to "does it bundle?". The one buffer
+/// lives as long as the process.
 fn bundle_of_self() ?bundle.Bundle {
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const path = std.fs.selfExePath(&path_buffer) catch return null;
-    const file = std.fs.openFileAbsolute(path, .{}) catch return null;
+    const path = std.fs.selfExePath(&path_buffer) catch return bundle_damaged();
+    const file = std.fs.openFileAbsolute(path, .{}) catch return bundle_damaged();
     defer file.close();
-    // Only an ELF executable can carry a bundle (the packer is ELF only); a Mach-O one, as the
-    // Mac builds are, bundles nothing.
     var magic: [4]u8 = undefined;
-    if ((file.readAll(&magic) catch return null) != magic.len) return null;
-    if (!std.mem.eql(u8, &magic, std.elf.MAGIC)) return null;
-    file.seekTo(0) catch return null;
-    const size = file.getEndPos() catch return null;
+    const magic_read = file.readAll(&magic) catch return bundle_damaged();
+    if (magic_read != magic.len or !std.mem.eql(u8, &magic, std.elf.MAGIC)) return null;
+    file.seekTo(0) catch return bundle_damaged();
+    const size = file.getEndPos() catch return bundle_damaged();
     if (size > constants.multiversion_binary_size_max) return bundle_damaged();
-    const bytes = std.heap.page_allocator.alignedAlloc(u8, 8, size) catch return null;
-    if ((file.readAll(bytes) catch return null) != size) return null;
+    const bytes = std.heap.page_allocator.alignedAlloc(u8, 8, size) catch return bundle_damaged();
+    if ((file.readAll(bytes) catch return bundle_damaged()) != size) return bundle_damaged();
     return bundle.verify(bytes) catch bundle_damaged();
 }
 
@@ -911,6 +909,10 @@ fn bundle_damaged() noreturn {
     );
 }
 
+/// `nerva version`: the first line is the one the release workflow and scripts read; the rest
+/// say what an upgrade needs to compare (R6, P259b). `bundles` names the past release this
+/// binary can also run, `none` when it carries none. `--verbose` adds what the digest is made of
+/// and the commit.
 fn version_write(writer: anytype, verbose: bool) !void {
     const release = config.process.release.triple();
     const release_client_min = config.process.release_client_min.triple();
