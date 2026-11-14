@@ -131,27 +131,41 @@ def wait_for(condition, seconds, what):
         time.sleep(0.1)
 
 
-def refuses_other_release(nerva, cluster):
-    """#95: `nerva start` on a data file of another release is refused with NRV-E0701, and the
-    file is not touched (it used to panic with `multiversion unsupported`)."""
+def refuses_other_release(nerva, nerva_other, cluster):
+    """#95: `nerva start` on a data file of another release is refused, and the file is not
+    touched (it used to panic with `multiversion unsupported`). A file above every release the
+    binary runs is NRV-E0718 (the cluster has upgraded past it, P259); one below, NRV-E0701."""
     cluster.stop(2)
-    copy = os.path.join(cluster.tmp, "other-release.nerva")
-    shutil.copy(cluster.data_file(2), copy)
+    cluster.stop(0)
 
-    def digest():
-        with open(copy, "rb") as f:
-            return hashlib.sha256(f.read()).hexdigest()
+    def refused(binary, source, code, release):
+        copy = os.path.join(cluster.tmp, f"other-release-{code}.nerva")
+        shutil.copy(source, copy)
 
-    before = digest()
-    result = subprocess.run(
-        [nerva, "start", f"--addresses={cluster.addresses}", "--development", copy],
-        capture_output=True, text=True, timeout=60)
-    first = result.stderr.splitlines()[0] if result.stderr else ""
-    assert result.returncode == 1, (result.returncode, result.stderr[-2000:])
-    assert first.startswith("error[NRV-E0701]: start: "), result.stderr[-2000:]
-    assert "release 0.0.200" in first, first
-    assert "panic" not in result.stderr and "multiversion" not in result.stderr, result.stderr
-    assert digest() == before, "the data file changed"
+        def digest():
+            with open(copy, "rb") as f:
+                return hashlib.sha256(f.read()).hexdigest()
+
+        before = digest()
+        result = subprocess.run(
+            [binary, "start", f"--addresses={cluster.addresses}", "--development", copy],
+            capture_output=True, text=True, timeout=60)
+        first = result.stderr.splitlines()[0] if result.stderr else ""
+        assert result.returncode == 1, (result.returncode, result.stderr[-2000:])
+        assert first.startswith(f"error[NRV-{code}]: start: "), result.stderr[-2000:]
+        assert f"release {release}" in first, first  # the file's release
+        assert "panic" not in result.stderr and "multiversion" not in result.stderr, result.stderr
+        assert digest() == before, "the data file changed"
+        if code == "E0701":  # unbundled binary: the export and import hint, never recover
+            assert "upgrade by export and import" in result.stderr, result.stderr[-2000:]
+            assert "nerva recover" not in result.stderr, result.stderr[-2000:]
+
+    # Written by 0.0.200, started by this binary: the cluster is past it.
+    refused(nerva, cluster.data_file(2), "E0718", "0.0.200")
+    # Written by this binary, started by 0.0.200: another release, below it.
+    first = subprocess.run([nerva, "version"], capture_output=True, text=True).stdout
+    release_this = first.split("Nerva version ")[1].split()[0].split("+")[0]
+    refused(nerva_other, cluster.data_file(0), "E0701", release_this)
 
 
 def main():
@@ -163,9 +177,10 @@ def main():
         assert statuses == [200] * 20, statuses
 
         # Each side says it ignores the other.
-        wait_for(lambda: "replica 2 runs release 0.0.200" in cluster.log(0), 10, "replica 0's log")
-        wait_for(lambda: "replica 0 runs release " in cluster.log(2) and
-                 "replica 1 runs release " in cluster.log(2), 10, "replica 2's log")
+        wait_for(lambda: "NRV-W0702 replica 2 runs release 0.0.200" in cluster.log(0), 10,
+                 "replica 0's log")
+        wait_for(lambda: "NRV-W0702 replica 0 runs release " in cluster.log(2) and
+                 "NRV-W0702 replica 1 runs release " in cluster.log(2), 10, "replica 2's log")
 
         # Replica 2 does not count toward a quorum: without replica 1, nothing commits.
         cluster.stop(1)
@@ -186,7 +201,7 @@ def main():
         for index, replica in enumerate(cluster.replicas):
             assert replica.poll() is None, f"replica {index} exited: {cluster.log(index)[-2000:]}"
             assert "panic" not in cluster.log(index), cluster.log(index)[-2000:]
-        refuses_other_release(nerva, cluster)
+        refuses_other_release(nerva, nerva_other, cluster)
         print(f"mixed releases: PASSED (replica 2 on another release ignored; {CHECKPOINT_OPS} "
               f"commits past the first checkpoint in {time.monotonic() - started:.0f} s)")
     finally:

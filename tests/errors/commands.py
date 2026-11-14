@@ -238,6 +238,59 @@ def main():
             check("start locked file", start + [data], "NRV-E0703", 1, "another process holds")
         assert sha(data) == before
 
+        # A binary with multiversion sections that hold no bundle: NRV-E0719, not a replica
+        # that runs as one release (P415). Needs objcopy; E0726 and the size bound are
+        # unit-tested on `bundle_present` (src/nerva_main.zig), which a test as root can reach.
+        # Only the two cases that run the release build need vm.memfd_noexec to be 0 (the
+        # kernel check, NRV-E0720, comes first); the E0720 cases name their own sysctl file.
+        objcopy = shutil.which("objcopy")
+        try:
+            with open("/proc/sys/vm/memfd_noexec") as f:
+                memfd_noexec = f.read().strip()
+        except OSError:
+            memfd_noexec = "0"  # No such sysctl (kernel before 6.3): nothing refuses.
+        if not objcopy:
+            print("SKIP damaged-bundle cases (NRV-E0719, NRV-E0720): objcopy is not installed")
+        else:
+            junk = os.path.join(tmp, "junk-section")
+            with open(junk, "wb") as f:
+                f.write(b"not a bundle" * 100)
+            damaged_bundle = os.path.join(tmp, "nerva-damaged-bundle")
+            subprocess.run([objcopy, "--add-section", f".tb_mvb={junk}",
+                            "--add-section", f".tb_mvh={junk}", nerva, damaged_bundle],
+                           check=True)
+            os.chmod(damaged_bundle, 0o755)
+            if memfd_noexec == "0":
+                check("start with a damaged bundle", start + [data], "NRV-E0719", 1,
+                      "bundle of releases cannot be read", nerva=damaged_bundle)
+                assert sha(data) == before
+            else:
+                print(f"SKIP damaged bundle (NRV-E0719): vm.memfd_noexec is {memfd_noexec}, "
+                      f"and the host's kernel check (NRV-E0720) comes first")
+            # NRV-E0720 before the bundle is opened, in the test build only, where the sysctl
+            # path can be named; a release build ignores the variable.
+            refused = os.path.join(tmp, "memfd_noexec")
+            with open(refused, "w") as f:
+                f.write("2\n")
+            damaged_off = os.path.join(tmp, "nerva-damaged-bundle-off")
+            subprocess.run([objcopy, "--add-section", f".tb_mvb={junk}",
+                            "--add-section", f".tb_mvh={junk}", nerva_off, damaged_off],
+                           check=True)
+            os.chmod(damaged_off, 0o755)
+            env_noexec = {"NERVA_MEMFD_NOEXEC_PATH": refused}
+            check("start with memfd_noexec 2", start + [data], "NRV-E0720", 1,
+                  "vm.memfd_noexec is not 0", env=env_noexec, nerva=damaged_off)
+            with open(refused, "w") as f:
+                f.write("1\n")
+            check("start with memfd_noexec 1", start + [data], "NRV-E0720", 1,
+                  "vm.memfd_noexec is not 0", env=env_noexec, nerva=damaged_off)
+            # These two do not depend on the host: the sysctl path is the test's own file.
+            if memfd_noexec == "0":
+                check("release build ignores the sysctl override", start + [data], "NRV-E0719",
+                      1, "bundle of releases cannot be read", env=env_noexec,
+                      nerva=damaged_bundle)
+            assert sha(data) == before
+
         # The test build with commit-key deduplication off (R1): E0717 without --development,
         # W0701 before the data file is opened with it, `+keys-off` in `version`; a release
         # build has none of the three.

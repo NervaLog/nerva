@@ -63,6 +63,7 @@ comptime {
     _ = @import("nerva/views.zig");
     _ = @import("nerva/vopr_start.zig");
     _ = @import("nerva/wire_code.zig");
+    _ = @import("nerva_main.zig");
     _ = @import("queue.zig");
     _ = @import("stack.zig");
     _ = @import("testing/exhaustigen.zig");

@@ -8,7 +8,11 @@ const std = @import("std");
 const log = std.log.scoped(.main);
 
 const stdx = @import("stdx");
+const builtin = @import("builtin");
 const vsr = @import("vsr.zig");
+const mv = vsr.multiversion;
+const Multiversion = mv.Multiversion;
+const MultiversionOS = mv.MultiversionOS;
 const constants = @import("constants.zig");
 const config = constants.config;
 const cli = @import("nerva/cli.zig");
@@ -161,16 +165,27 @@ fn run() !void {
                 log.warn("NRV-W0701 start: commit-key deduplication is off: " ++
                     "a resent key commits again", .{});
             }
-            if (tag == .start) preflight.start(gpa, args.path, if (!constants.direct_io)
-                .disabled
-            else if (args.development)
-                .optional
-            else
-                .required);
-
             // Initialise IO before creating any file, so a failure leaves nothing behind.
             var io = try IO.init(if (tag == .format) 2048 else 128, 0);
             defer io.deinit();
+
+            // `start` runs every release its binary bundles (R6, P259): found before the data
+            // file is checked, since the file's release is judged against them.
+            var multiversion_os: MultiversionOS = undefined;
+            var multiversion_bundled = false;
+            var multiversion: Multiversion = Multiversion.single_release(config.process.release);
+            if (tag == .start) {
+                multiversion_bundled = bundle_open(gpa, &io, &multiversion_os, args.path);
+                if (multiversion_bundled) multiversion = multiversion_os.multiversion();
+                const releases_run = multiversion.releases_bundled();
+                preflight.start(gpa, args.path, if (!constants.direct_io)
+                    .disabled
+                else if (args.development)
+                    .optional
+                else
+                    .required, releases_run.slice());
+            }
+            defer if (multiversion_bundled) multiversion_os.deinit(gpa);
 
             var time_os: stdx.TimeOS = .{};
             const time = time_os.interface();
@@ -254,7 +269,16 @@ fn run() !void {
 
             switch (tag) {
                 .format => try command_format(gpa, &storage, args),
-                .start => try command_start(gpa, &io, time, &tracer, &storage, args),
+                .start => try command_start(
+                    gpa,
+                    &io,
+                    time,
+                    &tracer,
+                    &storage,
+                    args,
+                    multiversion,
+                    if (multiversion_bundled) &multiversion_os else null,
+                ),
                 .version, .view, .api, .@"export", .backup, .import, .restore, .recover => comptime unreachable,
             }
         },
@@ -729,6 +753,8 @@ fn command_start(
     tracer: *Tracer,
     storage: *Storage,
     args: *const cli.Command.Start,
+    multiversion: Multiversion,
+    multiversion_os: ?*MultiversionOS,
 ) !void {
     const peer_keys = cluster_keys(args);
 
@@ -747,8 +773,8 @@ fn command_start(
         .node_count = args.addresses.members_count(),
         .release = config.process.release,
         .release_client_min = config.process.release_client_min,
-        .multiversion = .single_release(config.process.release),
-        // Nerva bundles only its own release: peers of another release are ignored (N61, #34).
+        .multiversion = multiversion,
+        // Peers of a release this binary cannot run are ignored (N61, P259).
         .release_peers_strict = true,
         // Replicas prove to each other that they hold the cluster key (P102).
         .peer_keys = peer_keys,
@@ -790,6 +816,11 @@ fn command_start(
         else => |e| return e,
     };
 
+    // Poll the binary on disk for a newer bundle, as upstream does after opening.
+    if (builtin.target.os.tag == .linux) {
+        if (multiversion_os) |os| os.timeout_start(replica.replica);
+    }
+
     // Startup succeeded: the trace file is the operator's now, whatever happens later.
     diagnostic.cleanup_clear();
 
@@ -827,10 +858,121 @@ fn command_start(
         @panic("This is a test binary, but the cluster id is non-zero.");
     }
 
+    var gauge_ticks: u64 = 0;
     while (true) {
         replica.tick();
+        // The release this replica runs and the highest it offers, once a second.
+        if (gauge_ticks % (std.time.ms_per_s / constants.tick_ms) == 0) {
+            tracer.gauge(.replica_release, replica.release.value);
+            // Read each time: replacing the binary on disk changes what a bundled replica
+            // offers. An unbundled one polls nothing and keeps offering its own release (P415d).
+            tracer.gauge(.replica_releases_offered, releases_offered(multiversion));
+        }
+        gauge_ticks +%= 1;
         try io.run_for_ns(constants.tick_ms * std.time.ns_per_ms);
     }
+}
+
+/// The highest release `multiversion` offers: the gauge `replica_releases_offered`, which says
+/// when every replica carries the next release (not how many releases it bundles).
+fn releases_offered(multiversion: Multiversion) u32 {
+    return multiversion.releases_bundled().last().value;
+}
+
+/// Opens the release bundle of this binary into `multiversion_os`: true when it has one. An
+/// unbundled binary (a build, or the first release) runs only itself. A bundle that cannot be
+/// read is refused (NRV-E0719), and so is a binary that cannot be read at all (NRV-E0726):
+/// running as one release would strand a cluster that upgrades (P415).
+fn bundle_open(
+    gpa: std.mem.Allocator,
+    io: *IO,
+    multiversion_os: *MultiversionOS,
+    data_path: []const u8,
+) bool {
+    const exe_path = mv.self_exe_path(gpa) catch bundle_unreadable("its path is unknown");
+    defer gpa.free(exe_path);
+
+    const present = bundle_present(gpa, exe_path) catch |err| switch (err) {
+        error.BinaryTooLarge => bundle_fail("the binary is larger than a bundle-carrying binary can be"),
+        error.OutOfMemory => bundle_unreadable("out of memory"),
+        error.BinaryUnreadable => bundle_unreadable("the file could not be opened or read"),
+    };
+    if (!present) return false;
+
+    // Before `MultiversionOS.init`, whose `memfd` a hardened kernel seals non-executable or
+    // refuses (`vm.memfd_noexec` 1 or 2, P415c). The sysctl path is overridable in the test build only (`-Dtest-commit-keys=off`): a release
+    // binary cannot be told to skip the refusal.
+    const memfd_noexec_path = if (!commit_keys_deduplicate)
+        std.posix.getenv("NERVA_MEMFD_NOEXEC_PATH") orelse preflight.memfd_noexec_path
+    else
+        preflight.memfd_noexec_path;
+    preflight.memfd_check(data_path, memfd_noexec_path);
+
+    multiversion_os.* = MultiversionOS.init(gpa, io, exe_path, .native) catch |err|
+        bundle_fail(bundle_cause(err));
+    multiversion_os.open_sync() catch |err| bundle_fail(bundle_cause(err));
+    return true;
+}
+
+/// The words for why a bundle that exists could not be opened; never a Zig error name.
+fn bundle_cause(err: anyerror) []const u8 {
+    return switch (err) {
+        error.OutOfMemory => "out of memory",
+        error.RunningVersionNotIncluded => "it does not include the release it is running",
+        else => "its sections are damaged, inconsistent or could not be read",
+    };
+}
+
+fn bundle_fail(cause: []const u8) noreturn {
+    diagnostic.fail(
+        "NRV-E0719",
+        "start: this binary's bundle of releases cannot be read: {s}",
+        .{cause},
+        "download the release again; nothing was changed",
+        .{},
+    );
+}
+
+fn bundle_unreadable(cause: []const u8) noreturn {
+    diagnostic.fail(
+        "NRV-E0726",
+        "start: this binary cannot be read to look for its bundle of releases: {s}",
+        .{cause},
+        "check that the process may read its own executable and has file descriptors to spare, " ++
+            "then start it again; nothing was changed",
+        .{},
+    );
+}
+
+/// The largest binary `MultiversionOS` accepts for the native platform.
+const bundle_size_max = constants.multiversion_binary_platform_size_max(.{
+    .macos = builtin.target.os.tag == .macos,
+    .debug = builtin.mode == .Debug,
+});
+
+const BundleReadError = error{ BinaryTooLarge, BinaryUnreadable, OutOfMemory };
+
+/// Whether the executable at `exe_path` carries the multiversion sections. Only a binary without
+/// them is unbundled; a failure to read it says nothing, and is an error (P415). Bounded by the
+/// native platform's `multiversion_binary_platform_size_max`.
+fn bundle_present(gpa: std.mem.Allocator, exe_path: [:0]const u8) BundleReadError!bool {
+    // Only Linux switches release (P259); a Mach-O binary has no ELF sections to read.
+    if (builtin.target.os.tag != .linux) return false;
+    const file = std.fs.openFileAbsolute(exe_path, .{}) catch return error.BinaryUnreadable;
+    defer file.close();
+    const size = file.getEndPos() catch return error.BinaryUnreadable;
+    if (size > bundle_size_max) return error.BinaryTooLarge;
+    const buffer = gpa.alignedAlloc(u8, @alignOf(std.elf.Elf64_Ehdr), size) catch
+        return error.OutOfMemory;
+    defer gpa.free(buffer);
+    const read = file.readAll(buffer) catch return error.BinaryUnreadable;
+    if (read != size) return error.BinaryUnreadable;
+    _ = mv.parse_elf(buffer) catch |err| switch (err) {
+        error.MultiversionHeaderOrBodyNotFound => return false,
+        // Present but unreadable: open_sync reports it.
+        else => return true,
+    };
+    return true;
 }
 
 /// The cluster keys replicas authenticate each other with (P102), from `NERVA_CLUSTER_KEY` and
@@ -980,4 +1122,67 @@ fn gateway_keys(comptime command: []const u8) http_connection.Keys {
 fn on_listening(address: std.net.Address) void {
     const stdout = std.io.getStdOut().writer();
     stdout.print("{}\n", .{address.getPort()}) catch {};
+}
+
+test "releases_offered is the highest release bundled, not how many" {
+    const Release = vsr.Release;
+    const two = struct {
+        fn releases_bundled(_: *anyopaque) mv.ReleaseList {
+            var list: mv.ReleaseList = .empty;
+            list.push(Release.from(.{ .major = 0, .minor = 7, .patch = 0 }));
+            list.push(Release.from(.{ .major = 0, .minor = 7, .patch = 1 }));
+            return list;
+        }
+        fn release_execute(_: *anyopaque, _: Release) void {}
+        fn tick(_: *anyopaque) void {}
+    };
+    const vtable: Multiversion.VTable = .{
+        .releases_bundled = two.releases_bundled,
+        .release_execute = two.release_execute,
+        .tick = two.tick,
+    };
+    const multiversion: Multiversion = .{ .context = @constCast(&{}), .vtable = &vtable };
+    try std.testing.expectEqual(
+        Release.from(.{ .major = 0, .minor = 7, .patch = 1 }).value,
+        releases_offered(multiversion),
+    );
+    try std.testing.expectEqual(@as(u16, 2), multiversion.releases_bundled().count);
+}
+
+test "bundle_present: unreadable, too large, out of memory, unbundled" {
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = try tmp.dir.realpath(".", &dir_buffer);
+
+    // A path that does not exist is the cause of NRV-E0726, never "unbundled".
+    var missing_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const missing = try std.fmt.bufPrintZ(&missing_buffer, "{s}/missing", .{dir});
+    try testing.expectError(error.BinaryUnreadable, bundle_present(testing.allocator, missing));
+
+    // One byte past the bound is refused before anything is allocated; a sparse file costs no disk.
+    {
+        const file = try tmp.dir.createFile("large", .{});
+        defer file.close();
+        try file.setEndPos(bundle_size_max + 1);
+    }
+    var large_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const large = try std.fmt.bufPrintZ(&large_buffer, "{s}/large", .{dir});
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    try testing.expectError(error.BinaryTooLarge, bundle_present(failing.allocator(), large));
+    try testing.expectEqual(@as(usize, 0), failing.allocations);
+
+    // At the bound it is read: the allocation is reached, and its failure is out of memory.
+    {
+        const file = try tmp.dir.openFile("large", .{ .mode = .read_write });
+        defer file.close();
+        try file.setEndPos(bundle_size_max);
+    }
+    failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    try testing.expectError(error.OutOfMemory, bundle_present(failing.allocator(), large));
+
+    // This test binary has no multiversion sections.
+    try testing.expect(!(try bundle_present(testing.allocator, "/proc/self/exe")));
 }
