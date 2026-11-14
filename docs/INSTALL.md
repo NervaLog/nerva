@@ -147,8 +147,9 @@ sudo dnf install nerva      # dnf shows the key's fingerprint and asks: it must 
 - **Switching from a downloaded package:** add the repository. The package installed from the file
   is the same package, and the next upgrade comes from the repository.
 
-**Check the key through a second channel.** The key file comes from GitHub. `nerva.pro`
-publishes the same key by WKD, from another repository and another host. Both must show the same
+**Check the key through a second channel.** The key file comes from GitHub. From v0.7.1,
+`nerva.pro` will publish the same key by WKD, from another repository and another host (until the
+release publishes it, the `curl` below answers 404). Both must show the same
 fingerprint, `949F066FB37C440E54B2A902AEA7B66340A6DBAB`:
 
 ```bash
@@ -166,10 +167,12 @@ above, before you accept it.
 
 - **apt:** run the `curl` line above again, and check the new fingerprint. If you miss it,
   `apt update` fails with `NO_PUBKEY` after the switch, and the same line fixes it.
-- **dnf:** run `sudo dnf upgrade --refresh nerva`. dnf asks to import the new key from `gpgkey=`:
-  answer yes only if its fingerprint is the announced one. On dnf 5, a host that has not received
-  the new key skips the repository and exits 0 ("Signing key not found"), so read the output of an
-  upgrade, not its exit status.
+- **dnf:** not yet tested for a primary-key rotation (P392 measured only a subkey rotation).
+  Run `sudo dnf upgrade --refresh nerva` and read its output, not its exit status. dnf 4 asks to
+  import the new key from `gpgkey=`: answer yes only if its fingerprint is the announced one. dnf 5
+  may print "Signing key not found", skip the repository and exit 0 (P392). If `nerva` stays on
+  the old release, do not use `rpm --import` (dnf 5 cannot use a key imported that way, see
+  above): follow the steps in the announcement, which will say how to move to the new key.
 
 The repository's rpms and metadata are signed, while the files on the release page are not, and
 are checked with `SHA256SUMS`.
