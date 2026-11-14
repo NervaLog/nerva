@@ -254,6 +254,8 @@ jobs:
           python3 .github/scripts/sbom.py "$TAG" "$GITHUB_SHA" > "dist/nerva-$TAG.cdx.json"
           (cd dist && sha256sum -- *.tar.gz *.deb *.rpm *.debug *.cdx.json > SHA256SUMS && sha256sum -c SHA256SUMS)
           test "$(wc -l < dist/SHA256SUMS)" = 11
+          # P417d: a .debug file is "signed" by being listed in SHA256SUMS, which is signed (P417c).
+          for f in dist/*.debug; do grep -q -- "  $(basename "$f")\$" dist/SHA256SUMS; done
 
       # A DRAFT, not a release: it names this commit as the target and creates no tag until it is
       # published, by the owner, after they upload the Mac zip (docs/briefs/v0.7.1.md, step 6).
