@@ -36,7 +36,12 @@ fetch() {
         "www.apple.com/certificateauthority did not answer, or answered with an error" \
         "run again; if it repeats, check Apple's certificate page for a moved file"
     fi
-    got=$(openssl dgst -sha256 -r "$dir/$name" | cut -d ' ' -f 1)
+    if ! got=$(openssl dgst -sha256 -r "$dir/$name" 2> /dev/null | cut -d ' ' -f 1) || [[ -z "$got" ]]; then
+      rm -f "$dir/$name"
+      fail "the SHA-256 of Apple's $name could not be computed" \
+        "'openssl dgst' is missing or failed on the downloaded file" \
+        "run again; if it repeats, the runner image is broken"
+    fi
     if [[ "$got" != "$sum" ]]; then
       rm -f "$dir/$name"
       fail "Apple's $name has SHA-256 $got, not the pinned $sum" \

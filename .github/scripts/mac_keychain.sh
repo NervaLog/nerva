@@ -97,11 +97,19 @@ rewrap() {
   rm -f "$p12pem"
 }
 
-# import_intermediates <keychain>: Apple's public intermediates give the leaf its chain.
+# import_intermediates <keychain>: Apple's public intermediates give the leaf its chain. A .p12
+# that already holds one (the old checklist packed the G2 in) has put it in the keychain with the
+# identity, and `security import` refuses a duplicate (errSecDuplicateItem), so a certificate whose
+# SHA-1 `find-certificate` already lists is skipped. If the SHA-1 cannot be made, it is imported.
 # (Called inside `step`'s `if`, where `set -e` is off.)
 import_intermediates() {
-  local f
+  local f held sha
   for f in "${ca_files[@]}"; do
+    held=$(security find-certificate -a -Z "$1" 2> /dev/null) || held=''
+    sha=$(openssl dgst -sha1 -r "$APPLE_CA_DIR/$f" 2> /dev/null | cut -d ' ' -f 1)
+    if [[ -n "$sha" ]] && grep -qi "SHA-1 hash: $sha" <<< "$held"; then
+      continue
+    fi
     security import "$APPLE_CA_DIR/$f" -k "$1" > /dev/null || return 1
   done
 }

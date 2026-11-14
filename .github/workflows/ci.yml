@@ -573,6 +573,8 @@ jobs:
         if: needs.changes.outputs.code != 'false'
         run: |
           set -eu
+          # As mac-sign.yml: macOS's own tools (LibreSSL's openssl), not Homebrew's.
+          export PATH=/usr/bin:/bin:/usr/sbin:/sbin
           .github/scripts/mac_ca.sh fetch "$RUNNER_TEMP/apple-ca"
           echo "APPLE_CA_DIR=$RUNNER_TEMP/apple-ca" >> "$GITHUB_ENV"
 
@@ -633,7 +635,7 @@ jobs:
             test ! -e "$RUNNER_TEMP/nerva-id.p12" && test ! -e "$RUNNER_TEMP/nerva-notary.p8"
             .github/scripts/mac_keychain.sh destroy
           }
-          # No intermediates directory, or one with a file missing: NRV-E1166, before anything is touched.
+          # No intermediates directory: NRV-E1166, before anything is touched (a missing file is test_mac_sign.py's).
           APPLE_CA_DIR=$RUNNER_TEMP/nowhere APPLE_DEVELOPER_ID_P12=$good APPLE_DEVELOPER_ID_P12_PASSWORD=$p12pw \
             expect 'Apple.s intermediate DeveloperIDG2CA.cer is not in APPLE_CA_DIR' \
             .github/scripts/mac_keychain.sh create --skip-notary
@@ -666,7 +668,7 @@ jobs:
           rm -f "$RUNNER_TEMP/test.key" "$RUNNER_TEMP/test.crt" "$RUNNER_TEMP/test.p12"
 
           # Apple's two intermediates were imported beside the identity.
-          security find-certificate -a -c "Developer ID Certification Authority" "$kc" | grep -q 'labl'
+          test "$(security find-certificate -a -c "Developer ID Certification Authority" "$kc" | grep -c '"labl"')" = 2
 
           # The keychain exists, is the default and heads the search list.
           test -f "$kc"

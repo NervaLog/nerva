@@ -9,6 +9,7 @@ Stand-ins for macOS's `security`, `xcrun` and `codesign` and for `gh` (scripts t
 environment variables) stand for the real ones, so the failures that need Apple's secrets or a
 broken runner are triggered here; ci.yml's `mac-keychain` job triggers the rest with the real tools."""
 import base64
+import hashlib
 import os
 import subprocess
 import tempfile
@@ -24,7 +25,10 @@ SECURITY = """#!/bin/sh
 [ "$1" = "$FAIL_ON" ] && { echo "security: $1 failed (stand-in)" >&2; exit 1; }
 case "$1" in
   import) printf '%s\\n' "$*" >> "$SECURITY_LOG"
-    case "$2" in *.cer) [ -n "$FAIL_CER" ] && { echo "security: cer refused (stand-in)" >&2; exit 1; } ;; *) cp "$2" "$IMPORTED" ;; esac ;;
+    case "$2" in *.cer) sha=$(openssl dgst -sha1 -r "$2" | cut -d ' ' -f 1)
+      case "$KC_CERTS" in *"$sha"*) echo "SecKeychainItemImport: The specified item already exists in the keychain." >&2; exit 1 ;; esac
+      [ -n "$FAIL_CER" ] && { echo "security: cer refused (stand-in)" >&2; exit 1; } ;; *) cp "$2" "$IMPORTED" ;; esac ;;
+  find-certificate) printf '%s\\n' "$KC_CERTS" ;;
   find-identity) printf '%s\\n' "$IDENTITIES" ;;
   list-keychains|default-keychain) case " $* " in *" -s "*) ;; *) echo '    "/Users/runner/Library/Keychains/login.keychain-db"' ;; esac ;;
 esac
@@ -72,7 +76,7 @@ class Keychain(unittest.TestCase):
         self.ca = Path(self.tmp.name) / "apple-ca"
         self.ca.mkdir()
         for name in ("DeveloperIDG2CA.cer", "DeveloperIDCA.cer"):
-            (self.ca / name).write_text("stand-in certificate")
+            (self.ca / name).write_text("stand-in certificate " + name)
         stub(self.bin, "security", SECURITY)
         stub(self.bin, "xcrun", XCRUN)
 
@@ -136,6 +140,19 @@ class Keychain(unittest.TestCase):
         imports = [l for l in self.log.read_text().splitlines() if "DeveloperID" in l]
         self.assertEqual(len(imports), 2, imports)
         self.assertTrue(imports[0].endswith("DeveloperIDG2CA.cer -k " + str(self.runner / "nerva-signing.keychain-db")))
+
+    def test_an_intermediate_the_p12_already_put_in_the_keychain_is_skipped(self):
+        sha = hashlib.sha1((self.ca / "DeveloperIDG2CA.cer").read_bytes()).hexdigest().upper()
+        result = self.create(KC_CERTS=f"SHA-1 hash: {sha}")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        imports = [l for l in self.log.read_text().splitlines() if "DeveloperID" in l]
+        self.assertEqual(len(imports), 1, imports)
+        self.assertIn("DeveloperIDCA.cer", imports[0])
+
+    def test_a_duplicate_is_refused_when_the_keychain_does_not_list_it(self):
+        # The stand-in refuses a duplicate as macOS does: if the listing fails, the import is tried and refused.
+        sha = hashlib.sha1((self.ca / "DeveloperIDG2CA.cer").read_bytes()).hexdigest()
+        self.assertEqual(self.create(KC_CERTS=f"sha1 {sha}", FAIL_ON="find-certificate").returncode, 1)
 
     def test_a_missing_intermediates_directory_or_file_is_refused_before_anything_is_touched(self):
         for extra in ({"APPLE_CA_DIR": None}, {"APPLE_CA_DIR": str(self.runner / "nowhere")}):
@@ -251,6 +268,13 @@ class AppleCa(unittest.TestCase):
         err = self.fetch('#!/bin/sh\n# curl ... -o FILE URL\nwhile [ "$1" != -o ]; do shift; done\necho forged > "$2"\n')
         self.assertIn("error[NRV-E1165]: mac_ca.sh: Apple's DeveloperIDG2CA.cer has SHA-256 ", err)
         self.assertIn("not the pinned f16cd3c54c7f83cea4bf1a3e6a0819c8aaa8e4a1528fd144715f350643d2df3a", err)
+        self.assertEqual(list(self.dir.iterdir()), [])
+
+    def test_an_openssl_that_fails_is_refused_with_its_code(self):
+        stub(self.bin, "openssl", "#!/bin/sh\necho 'openssl: broken (stand-in)' >&2\nexit 1\n")
+        err = self.fetch('#!/bin/sh\nwhile [ "$1" != -o ]; do shift; done\necho x > "$2"\n')
+        self.assertIn("error[NRV-E1165]: mac_ca.sh: the SHA-256 of Apple's DeveloperIDG2CA.cer could not be computed", err)
+        self.assertNotIn("openssl: broken", err)
         self.assertEqual(list(self.dir.iterdir()), [])
 
     def test_a_download_that_fails_is_refused(self):
