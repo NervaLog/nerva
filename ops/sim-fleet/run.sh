@@ -253,7 +253,17 @@ follow_main() {
     fi
     local head
     head=$(git rev-parse FETCH_HEAD)
-    if [[ "$head" == "$built" || "$head" == "$broken" ]]; then
+    if [[ "$head" == "$built" ]]; then
+        return 0
+    fi
+    if [[ "$head" == "$broken" ]]; then
+        # A failed build writes `broken` before it checks the built commit out again: a crash in
+        # between leaves the checkout, and the run.sh the unit starts, on the unbuilt head (#424).
+        if [[ -n "$built" && "$(git rev-parse HEAD)" != "$built" ]]; then
+            log "checkout is not on the built commit $built; restoring it"
+            git checkout --quiet --detach "$built"
+            reexec_if_changed "$built"
+        fi
         return 0
     fi
     prune_cache
@@ -290,8 +300,9 @@ follow_main() {
 
 # After a build of $1: if that commit's run.sh is not the one bash loaded, runs that one instead,
 # with the same arguments and the environment it was started with (#424). Without it, a changed
-# interface between run.sh and sim_fleet.py (#382's --round-id) failed every ingest. Once per built commit: the marker
-# SIM_FLEET_REEXEC names the commit the run.sh just exec'd came from, so it does not exec again.
+# interface between run.sh and sim_fleet.py (#382's --round-id) failed every ingest. Once per
+# built commit: the marker SIM_FLEET_REEXEC names the commit the run.sh just exec'd came from, so
+# it does not exec again.
 # The lock (fd 9) is closed first; the new run.sh takes it. Needs RUN_ARGS, RUN_SH_SUM, ORIG_ENV.
 reexec_if_changed() {
     local head=$1 new="$SIM_FLEET_REPO_DIR/ops/sim-fleet/run.sh" sum

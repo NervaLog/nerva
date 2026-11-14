@@ -1730,6 +1730,65 @@ class FailedBuild(unittest.TestCase):
         self.assertNotIn("UNBUILT-RUN-SH", out.stdout)
         self.assertNotIn("NOT-REACHED", out.stdout)
 
+    def test_a_restart_on_the_unbuilt_head_goes_back_to_the_built_commit(self):
+        # The loop died after writing `broken` and before the checkout back: the restart finds
+        # head == broken, HEAD on the unbuilt head, and must still hand over to the built run.sh.
+        d = tempfile.mkdtemp()
+        self.addCleanup(subprocess.run, ["rm", "-rf", d])
+        remote, repo, state = (os.path.join(d, n) for n in ("remote", "repo", "state"))
+        os.makedirs(os.path.join(remote, "ops", "sim-fleet"))
+        self.git(remote, "init", "-q", "-b", "main")
+        run_sh = Path(remote, "ops", "sim-fleet", "run.sh")
+        run_sh.write_text('#!/usr/bin/env bash\necho "BUILT-RUN-SH marker=${SIM_FLEET_REEXEC:-}"\n')
+        self.git(remote, "add", "-A")
+        self.git(remote, "commit", "-q", "-m", "v1")
+        v1 = self.git(remote, "rev-parse", "HEAD")
+        subprocess.run(["git", "clone", "-q", remote, repo], check=True)
+        run_sh.write_text('#!/usr/bin/env bash\necho "UNBUILT-RUN-SH"\n')
+        self.git(remote, "commit", "-q", "-a", "-m", "v2")
+        v2 = self.git(remote, "rev-parse", "HEAD")
+        os.makedirs(state)
+        out = subprocess.run(
+            ["bash", "-c", f'source "{HERE}/run.sh"; log() {{ echo "$*" >&2; }}; '
+             f'build_into() {{ return 1; }}; export -f build_into; prune_cache() {{ :; }}; '
+             f'STATE="{state}"; built={v1}; broken={v2}; cd "{repo}"; SIM_FLEET_BRANCH=main; '
+             f'SIM_FLEET_GIT_TIMEOUT=60; SIM_FLEET_BUILD_TIMEOUT=60; '
+             f'SIM_FLEET_REPO_DIR="{repo}"; RUN_ARGS=(a); RUN_SH_SUM=0; ORIG_ENV=(); '
+             f'git remote set-url origin "{remote}"; git fetch -q origin main; '
+             f'git checkout -q --detach {v2}; '
+             f'follow_main; echo "NOT-REACHED"'],
+            env={"PATH": os.environ["PATH"], "HOME": d}, capture_output=True, text=True,
+            timeout=60)
+        self.assertIn(f"BUILT-RUN-SH marker={v1}", out.stdout, out.stderr)
+        self.assertNotIn("UNBUILT-RUN-SH", out.stdout)
+        self.assertNotIn("NOT-REACHED", out.stdout)
+
+    def test_a_restart_already_on_the_built_commit_stays_put(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(subprocess.run, ["rm", "-rf", d])
+        remote, repo, state = (os.path.join(d, n) for n in ("remote", "repo", "state"))
+        os.makedirs(remote)
+        self.git(remote, "init", "-q", "-b", "main")
+        Path(remote, "f").write_text("v1")
+        self.git(remote, "add", "f")
+        self.git(remote, "commit", "-q", "-m", "v1")
+        v1 = self.git(remote, "rev-parse", "HEAD")
+        subprocess.run(["git", "clone", "-q", remote, repo], check=True)
+        Path(remote, "f").write_text("v2")
+        self.git(remote, "commit", "-q", "-a", "-m", "v2")
+        v2 = self.git(remote, "rev-parse", "HEAD")
+        os.makedirs(state)
+        out = subprocess.run(
+            ["bash", "-c", f'source "{HERE}/run.sh"; log() {{ echo "$*" >&2; }}; '
+             f'STATE="{state}"; built={v1}; broken={v2}; cd "{repo}"; SIM_FLEET_BRANCH=main; '
+             f'SIM_FLEET_GIT_TIMEOUT=60; SIM_FLEET_REPO_DIR="{repo}"; '
+             f'git remote set-url origin "{remote}"; git checkout -q --detach {v1}; '
+             f'follow_main; echo "HEAD=$(git rev-parse HEAD)"'],
+            env={"PATH": os.environ["PATH"], "HOME": d}, capture_output=True, text=True,
+            timeout=60)
+        self.assertIn(f"HEAD={v1}", out.stdout, out.stderr)
+        self.assertNotIn("restoring", out.stderr)
+
 
 class AlarmRoundsSetting(unittest.TestCase):
     """SIM_FLEET_ALARM_ROUNDS is a whole number from 1 to 999999 (NRV-E0730's threshold)."""
@@ -1746,7 +1805,8 @@ class AlarmRoundsSetting(unittest.TestCase):
         for bad in ("0", "abc", "1000000", "-1"):
             out = self.check(bad)
             self.assertEqual(out.returncode, 2, (bad, out.stdout + out.stderr))
-            self.assertIn("SIM_FLEET_ALARM_ROUNDS must be a positive whole number", out.stdout + out.stderr)
+            self.assertIn("SIM_FLEET_ALARM_ROUNDS must be a positive whole number",
+                          out.stdout + out.stderr)
 
     def test_the_largest_value_passes_this_check(self):
         # It stops later (no token), not at the alarm setting.
