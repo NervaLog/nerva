@@ -381,8 +381,7 @@ fn import_run(
             command ++ ": {s}: the export came from a test build with commit-key " ++
                 "deduplication off, which a release build does not import",
             .{args.input},
-            "import it with the same test build (-Dtest-commit-keys=off), or export again " ++
-                "from a release build",
+            "import it with the same test build (-Dtest-commit-keys=off)",
             .{},
         );
     }
