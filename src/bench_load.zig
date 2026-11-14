@@ -202,8 +202,9 @@ fn run_flags(gpa: std.mem.Allocator, args: CLIArgs, failure: *?bench_timeline.Fi
 
     // The files this run writes are opened now, so that a bad path costs no measurement
     // (NRV-E0728). A new file, or a regular file this user owns (one link, writable), is written
-    // beside its path and renamed into place once whole (`OutFile`, P414b), so that a later failure
-    // leaves its earlier content; any other path is opened in place and is not atomic. Two flags may not name one file.
+    // beside its path and renamed into place once whole (`OutFile`, P414b); any other path is
+    // opened in place and written, and truncated, only once the run has succeeded (P414c), so
+    // that a later failure leaves its earlier content in both. Two flags may not name one file.
     const flags_and_paths = [_]struct { flag: []const u8, path: ?[]const u8 }{
         .{ .flag = "--timeline", .path = args.timeline },
         .{ .flag = "--gateway-pid-file", .path = args.@"gateway-pid-file" },
@@ -277,27 +278,20 @@ fn run_flags(gpa: std.mem.Allocator, args: CLIArgs, failure: *?bench_timeline.Fi
     defer json.deinit();
     try result_write(json.writer(), &config, &result);
     try json.append('\n');
+    // Nothing is written to a file before this point: a run that fails leaves each path as it was
+    // (P414c). The finished timeline survives whatever happens to the summary after it.
     if (timeline_out) |*out| {
         var lines = std.ArrayList(u8).init(gpa);
         defer lines.deinit();
         try timeline.write(lines.writer());
-        out.file.writeAll(lines.items) catch |err| {
-            failure.* = .{ .flag = "--timeline", .path = args.timeline.?, .err = err };
-            return error.FileWriteFailed;
-        };
-        // The finished timeline survives whatever happens to the summary after it.
-        out.commit() catch |err| {
-            failure.* = .{ .flag = "--timeline", .path = args.timeline.?, .err = err };
+        out.finish(lines.items) catch |err| {
+            failure.* = bench_timeline.FileFailure.of("--timeline", out, err);
             return error.FileWriteFailed;
         };
     }
     if (output_out) |*out| {
-        out.file.writeAll(json.items) catch |err| {
-            failure.* = .{ .flag = "--output", .path = args.output.?, .err = err };
-            return error.FileWriteFailed;
-        };
-        out.commit() catch |err| {
-            failure.* = .{ .flag = "--output", .path = args.output.?, .err = err };
+        out.finish(json.items) catch |err| {
+            failure.* = bench_timeline.FileFailure.of("--output", out, err);
             return error.FileWriteFailed;
         };
     } else {

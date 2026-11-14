@@ -536,17 +536,22 @@ is at most 3600, and the summary JSON gains `"warmup"` and `"late_operations"` m
 `--timeline`, `--gateway-pid-file` and `--output` are all opened before anything starts, so a bad
 path is refused at once with NRV-E0728. A path not made yet, or a regular file you
 own, with one link and writable, is written as a temporary file beside its path
-(`.nerva-<hash>.<pid>.tmp`, with the file's permission bits and group) and renamed into place when
-it is complete, so the path holds either its earlier content or the whole new content; the
-temporary file is removed on every failure path, but a run killed by a signal leaves it behind, and
-a rename refused after the run falls back to writing the content in place, so it is not lost. Every
-other path is opened as a plain open for writing does, which is **not atomic**: a regular file is
-truncated when it is opened, so a later failure leaves it empty. That covers a file of another
+(`.nerva-<hash>.<pid>.<random>.tmp`, created exclusively, so a symbolic link planted at its name is
+never followed; a taken name is retried with another, 8 times at most, then the path is refused
+with NRV-E0728) with the file's permission bits and group, and renamed into place when it is
+complete, so the path holds either its earlier content or the whole new content. The temporary
+file is removed on every failure path, except that a run killed by a signal leaves it behind, and
+that a rename refused after the run falls back to writing the content into the path in place: if
+that fails too, the temporary file is **kept**, NRV-E0728 names it ("the result is kept in
+<file>") and the path itself may be empty. Every other path is opened as a plain open for writing
+does, as on `main`, which is **not atomic**: nothing is written before the run has succeeded (a
+missing file is created empty, an existing one is opened for writing), and then the file is
+truncated and written, so a run that fails leaves the earlier content and a write that fails after
+the truncation leaves the file short. That covers a file of another
 owner, a file with several links, a file in a directory you cannot write, a dangling symbolic link
 (it is followed, and its target made) and anything that is not a regular file (a device such as
 `/dev/full`, a pipe, `/dev/stdout` on a pipe, `/dev/fd/N`); a FIFO blocks the run's start until a
-reader opens it, as `cat > fifo` does. A file you cannot write is refused (P414b). Two flags that name one file (the same path, or the same inode) are refused with
-NRV-E0728 ("another output flag names the same file"); a device such as `/dev/null` may be named
+reader opens it, as `cat > fifo` does. A file you cannot write is refused (P414b, P414c). NRV-E0728 ("another output flag names the same file"); a device such as `/dev/null` may be named
 twice. A later
 write failure prints the same line after the cluster and the gateway it started are torn down. The
 PID file, if it is a regular file, is removed when the gateway stops (if its directory lets the

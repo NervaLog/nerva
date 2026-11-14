@@ -271,6 +271,20 @@ def main():
                 assert handle.read() == "previous-result\n", f"{label}: the earlier timeline was emptied"
             assert_clean(f"refused {label}")
         print("ok a refused output leaves an earlier timeline untouched (NRV-E0728)")
+        # A plain-opened output (a hard-linked file is written in place, not renamed) is changed only
+        # once the run has succeeded, as on main (P414c): a refused later flag leaves it as it was.
+        hard = os.path.join(tmp, "hard.json")
+        with open(hard, "w") as handle:
+            handle.write("previous-result\n")
+        os.link(hard, hard + ".twin")
+        result = run(bench, ["--local", "--workload=botpike", "--seconds=1", f"--output={hard}",
+                             f"--gateway-pid-file={os.path.join(tmp, 'no-such-dir', 'pid')}",
+                             "--gateway-statsd=127.0.0.1:8125"], timeout=30)
+        assert result.returncode == 1 and "NRV-E0728" in result.stderr, result.stderr
+        with open(hard) as handle:
+            assert handle.read() == "previous-result\n", "a hard-linked --output was emptied by a refused run"
+        assert_clean("refused run with a hard-linked output")
+        print("ok a plain-opened output is untouched by a refused run (P414c)")
         # A bad --output is refused before the run, one coded line, with no timeline made.
         timeline = os.path.join(tmp, "fresh.jsonl")
         result = run(bench, ["--local", "--workload=c1", "--seconds=1", f"--timeline={timeline}",

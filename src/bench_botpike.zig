@@ -145,8 +145,7 @@ pub const Gateway = struct {
         if (options.pid_file) |out| {
             var pid_buffer: [32]u8 = undefined;
             const pid = try std.fmt.bufPrint(&pid_buffer, "{}\n", .{gateway.process.id});
-            out.file.writeAll(pid) catch |err| return pid_failure(options, out, err);
-            out.commit() catch |err| return pid_failure(options, out, err);
+            out.finish(pid) catch |err| return pid_failure(options, out, err);
             // Set for any regular file, written in place or renamed: `stop` deletes it, which must
             // not be a device.
             if (out.regular()) gateway.pid_file = out.final;
@@ -164,13 +163,15 @@ pub const Gateway = struct {
     }
 
     fn pid_failure(options: GatewayOptions, out: *const bench_timeline.OutFile, err: anyerror) error{FileWriteFailed} {
-        if (options.failure) |failure| failure.* = .{ .flag = "--gateway-pid-file", .path = out.requested, .err = err };
+        if (options.failure) |failure| failure.* = bench_timeline.FileFailure.of("--gateway-pid-file", out, err);
         return error.FileWriteFailed;
     }
 
     pub fn stop(gateway: *Gateway) void {
         _ = gateway.process.kill() catch {};
         // The PID names a process that is gone: a reader must not find one (it could be reused).
+        // The path is resolved when the file is opened, so a symbolic link's target is deleted
+        // and the link left (P414c).
         if (gateway.pid_file) |path| std.fs.cwd().deleteFile(path) catch {};
         gateway.pid_file = null;
     }
