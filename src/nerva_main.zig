@@ -25,6 +25,7 @@ const import_ = @import("nerva/import.zig");
 const recover = @import("nerva/recover.zig");
 const backup = @import("nerva/backup.zig");
 const release_peers = @import("nerva/release_peers.zig");
+const bundle = @import("nerva/bundle.zig");
 const format_digest = @import("nerva/format_digest.zig");
 const peer_auth = @import("nerva/peer_auth.zig");
 const preflight = @import("nerva/preflight.zig");
@@ -99,7 +100,15 @@ fn run() !void {
     diagnostic.command = @tagName(command);
     switch (command) {
         .version => |args| {
-            try version_write(std.io.getStdOut().writer(), args.verbose);
+            // Built whole, then written once: a reader that stops early (`| head -n1`) closes the
+            // pipe, which is its answer and not a bug (#420).
+            var text = std.ArrayList(u8).init(gpa);
+            defer text.deinit();
+            try version_write(text.writer(), args.verbose);
+            std.io.getStdOut().writeAll(text.items) catch |err| switch (err) {
+                error.BrokenPipe => {},
+                else => return err,
+            };
             return;
         },
         .view => |*args| {
@@ -868,9 +877,42 @@ fn listen_remote_warn(comptime command: []const u8, args: anytype) void {
         "beside the client", .{});
 }
 
+/// The past release this executable carries (R6 slice 3), checked as `start` will check it:
+/// null when it carries none. A damaged one, or one that cannot be read, is NRV-E0719, and
+/// `version` says so rather than naming a release it could not run. Only a binary that is not
+/// an ELF executable (the Mac builds) bundles nothing without being read; once its magic is
+/// ELF, any failure to read the rest is not an answer to "does it bundle?". The one buffer
+/// lives as long as the process.
+fn bundle_of_self() ?bundle.Bundle {
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path = std.fs.selfExePath(&path_buffer) catch return bundle_damaged();
+    const file = std.fs.openFileAbsolute(path, .{}) catch return bundle_damaged();
+    defer file.close();
+    var magic: [4]u8 = undefined;
+    const magic_read = file.readAll(&magic) catch return bundle_damaged();
+    if (magic_read != magic.len or !std.mem.eql(u8, &magic, std.elf.MAGIC)) return null;
+    file.seekTo(0) catch return bundle_damaged();
+    const size = file.getEndPos() catch return bundle_damaged();
+    if (size > constants.multiversion_binary_size_max) return bundle_damaged();
+    const bytes = std.heap.page_allocator.alignedAlloc(u8, 8, size) catch return bundle_damaged();
+    if ((file.readAll(bytes) catch return bundle_damaged()) != size) return bundle_damaged();
+    return bundle.verify(bytes) catch bundle_damaged();
+}
+
+fn bundle_damaged() noreturn {
+    diagnostic.fail(
+        "NRV-E0719",
+        "version: this binary's bundled release is damaged or cannot be read",
+        .{},
+        "download the release again and check it against SHA256SUMS",
+        .{},
+    );
+}
+
 /// `nerva version`: the first line is the one the release workflow and scripts read; the rest
-/// say what an upgrade needs to compare (R6, P259b). `bundles` lists the past releases this
-/// binary can also run; none yet. `--verbose` adds what the digest is made of and the commit.
+/// say what an upgrade needs to compare (R6, P259b). `bundles` names the past release this
+/// binary can also run, `none` when it carries none. `--verbose` adds what the digest is made of
+/// and the commit.
 fn version_write(writer: anytype, verbose: bool) !void {
     const release = config.process.release.triple();
     const release_client_min = config.process.release_client_min.triple();
@@ -885,7 +927,7 @@ fn version_write(writer: anytype, verbose: bool) !void {
         release_client_min.patch,
     });
     try writer.print("format {s}\n", .{format_digest.hex(&format_digest.format_digest)});
-    try writer.writeAll("bundles none\n");
+    try bundle.bundles_text(writer, bundle_of_self());
     // The release a person downloaded, from `VERSION` (v0.7.1, P284); not in the format digest.
     try writer.print("version {s}\n", .{release_version});
     if (!verbose) return;

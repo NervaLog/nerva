@@ -248,11 +248,12 @@ class MacDraft(unittest.TestCase):
 
 
 def release_assets(tag, extra=(), without=()):
-    """The twelve names a release is published with, as the comma-joined list `gh` prints."""
+    """The fourteen names a release is published with, as the comma-joined list `gh` prints."""
     filever = tag[1:].replace("-", ".")
     names = [f"nerva-{tag}-{t}.tar.gz" for t in ("x86_64-linux", "aarch64-linux", "x86_64-macos", "aarch64-macos")]
     names += [f"nerva_{filever}-1_amd64.deb", f"nerva_{filever}-1_arm64.deb",
               f"nerva-{filever}-1.x86_64.rpm", f"nerva-{filever}-1.aarch64.rpm",
+              f"nerva-{tag}-x86_64-linux.debug", f"nerva-{tag}-aarch64-linux.debug",
               f"nerva-{tag}.cdx.json", "SHA256SUMS",
               f"nerva-{tag}-universal-macos.zip", f"nerva-{tag}-universal-macos.zip.sha256"]
     return ",".join([n for n in names if n not in without] + list(extra))
@@ -548,6 +549,51 @@ class PublishReady(unittest.TestCase):
                 result = run("publish-ready", tag, path_dir=d)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout, "0123456789abcdef0123456789abcdef01234567\n")
+
+    def test_the_signature_is_optional_before_repos_ready_and_required_after_it(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.gh(d, assets=release_assets("v0.7.1", extra=("SHA256SUMS.asc",)))
+            self.assertEqual(run("publish-ready", "v0.7.1", path_dir=d).returncode, 0)
+            self.assertEqual(run("publish-ready", "v0.7.1", "signed", path_dir=d).returncode, 0)
+            self.gh(d)
+            self.assertEqual(run("publish-ready", "v0.7.1", path_dir=d).returncode, 0)
+            result = run("publish-ready", "v0.7.1", "signed", path_dir=d)
+            self.refused(result, "NRV-E1131", "does not hold exactly the assets it is published with")
+            self.assertIn("SHA256SUMS.asc", result.stderr)
+            self.assertEqual(run("publish-ready", "v0.7.1", "other", path_dir=d).returncode, 64)
+
+    def test_the_pre_p417_set_of_v0_7_1_is_accepted_without_a_signature(self):
+        tag = "v0.7.1"
+        with tempfile.TemporaryDirectory() as d:
+            self.gh(d, tag, assets=release_assets(tag, without=(f"nerva-{tag}-x86_64-linux.debug",
+                                                                f"nerva-{tag}-aarch64-linux.debug")))
+            self.assertEqual(run("publish-ready", tag, path_dir=d).returncode, 0, tag)
+            self.assertEqual(run("publish-ready", tag, "signed", path_dir=d).returncode, 0, tag)
+
+    def test_a_release_candidate_or_older_version_is_not_the_pre_p417_set(self):
+        for tag in ("v0.7.1-rc.9", "v0.7.0"):
+            with tempfile.TemporaryDirectory() as d:
+                self.gh(d, tag, assets=release_assets(tag, without=(f"nerva-{tag}-x86_64-linux.debug",
+                                                                    f"nerva-{tag}-aarch64-linux.debug")))
+                self.refused(run("publish-ready", tag, path_dir=d), "NRV-E1131", ".debug")
+
+    def test_a_stray_debug_file_does_not_make_a_name_match_across_commas(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.gh(d, assets=release_assets("v0.7.1", without=("nerva-v0.7.1-x86_64-linux.debug",
+                                                                "nerva-v0.7.1-aarch64-linux.debug"), extra=("core.debug",)))
+            self.refused(run("publish-ready", "v0.7.1", path_dir=d), "NRV-E1131", "core.debug")
+
+    def test_the_pre_p417_set_is_refused_for_a_later_version_and_when_half_signed(self):
+        no_debug = lambda tag: tuple(f"nerva-{tag}-{t}-linux.debug" for t in ("x86_64", "aarch64"))
+        with tempfile.TemporaryDirectory() as d:
+            self.gh(d, "v0.7.2", assets=release_assets("v0.7.2", without=no_debug("v0.7.2")))
+            self.refused(run("publish-ready", "v0.7.2", path_dir=d), "NRV-E1131", ".debug")
+            # one .debug file present: not the pre-P417 set, even for v0.7.1
+            self.gh(d, assets=release_assets("v0.7.1", without=("nerva-v0.7.1-aarch64-linux.debug",)))
+            self.refused(run("publish-ready", "v0.7.1", path_dir=d), "NRV-E1131", "aarch64-linux.debug")
+            # a signature without the debug files: not the pre-P417 set either
+            self.gh(d, assets=release_assets("v0.7.1", without=no_debug("v0.7.1"), extra=("SHA256SUMS.asc",)))
+            self.refused(run("publish-ready", "v0.7.1", path_dir=d), "NRV-E1131", ".debug")
 
     def test_a_release_that_is_already_published_carries_on(self):
         with tempfile.TemporaryDirectory() as d:
