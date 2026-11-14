@@ -257,6 +257,18 @@ const Exiting = enum { yes, no, unknown };
 /// 65536 entries) is skipped without being held.
 const status_lines_max = 256;
 
+/// Most bytes of `/proc/<pid>/status` read: `Groups:` is at most 65536 entries of 11 bytes (about
+/// 720 KB), so 1 MiB holds any real file; past it the masks are not found and the answer is unknown.
+const status_size_max = 1 << 20;
+
+/// Longest status line held; a longer one (`Groups:`) is skipped.
+const status_line_size_max = 128;
+
+comptime {
+    assert(status_size_max > 65536 * 11);
+    assert(status_line_size_max >= "SigPnd:\t".len + 16 + 1);
+}
+
 /// Whether the text of `/proc/<pid>/status`, read through `reader`, shows SIGKILL pending in
 /// `SigPnd` (the thread's) or `ShdPnd` (the process's). `kill` sets it at once; `PF_EXITING` only
 /// follows when the task runs `do_exit`, which a task in uninterruptible sleep or not yet scheduled
@@ -264,7 +276,7 @@ const status_lines_max = 256;
 /// any buffer, so a line that does not fit is skipped. `.unknown` unless both masks were read and
 /// parsed.
 fn status_sigkill_pending(reader: anytype) Exiting {
-    var line_buffer: [128]u8 = undefined;
+    var line_buffer: [status_line_size_max]u8 = undefined;
     var seen_thread = false;
     var seen_process = false;
     var pending = false;
@@ -311,8 +323,17 @@ fn process_exiting(pid: posix.pid_t) Exiting {
     const path = std.fmt.bufPrint(&path_buffer, "/proc/{}/status", .{pid}) catch unreachable;
     const file = std.fs.openFileAbsolute(path, .{}) catch return .unknown;
     defer file.close();
+    return status_file_exiting(file);
+}
+
+/// `status_sigkill_pending` over an open `/proc/<pid>/status`, reading at most `status_size_max`
+/// bytes through a buffered reader.
+fn status_file_exiting(file: std.fs.File) Exiting {
     var buffered = std.io.bufferedReader(file.reader());
-    return status_sigkill_pending(buffered.reader());
+    var limited = std.io.limitedReader(buffered.reader(), status_size_max);
+    const result = status_sigkill_pending(limited.reader());
+    assert(limited.bytes_left <= status_size_max);
+    return result;
 }
 
 /// Whether process `pid` has the file `stat` describes open (same device and inode) and is not
@@ -767,6 +788,46 @@ test "preflight: a long Groups line does not hide the signal masks" {
     for (0..status_lines_max + 1) |_| try many.appendSlice("Key:\tv\n");
     try many.appendSlice("SigPnd:\t0\nShdPnd:\t0\n");
     try testing.expectEqual(Exiting.unknown, status_text_pending(many.items));
+    // At the bound: the masks on lines status_lines_max - 1 and status_lines_max are read; one line
+    // later the second is not.
+    var edge = std.ArrayList(u8).init(testing.allocator);
+    defer edge.deinit();
+    for (0..status_lines_max - 2) |_| try edge.appendSlice("Key:\tv\n");
+    try edge.appendSlice("SigPnd:\t0\nShdPnd:\t0\n");
+    try testing.expectEqual(Exiting.no, status_text_pending(edge.items));
+    edge.clearRetainingCapacity();
+    for (0..status_lines_max - 1) |_| try edge.appendSlice("Key:\tv\n");
+    try edge.appendSlice("SigPnd:\t0\nShdPnd:\t0\n");
+    try testing.expectEqual(Exiting.unknown, status_text_pending(edge.items));
+}
+
+test "preflight: a status file is read whole past 4 KiB, up to its byte bound" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const mask_line = "ShdPnd:\t0";
+    // A Groups line longer than 4 KiB, then SigPnd, then ShdPnd with its last byte at `size`.
+    for ([_]struct { size: usize, expected: Exiting }{
+        .{ .size = 5000, .expected = .no },
+        .{ .size = status_size_max, .expected = .no },
+        .{ .size = status_size_max + 1, .expected = .unknown },
+    }) |case| {
+        var text = std.ArrayList(u8).init(testing.allocator);
+        defer text.deinit();
+        const tail = "\nSigPnd:\t0\n" ++ mask_line;
+        try text.appendSlice("Groups:\t");
+        try text.appendNTimes('7', case.size - text.items.len - tail.len);
+        try text.appendSlice(tail);
+        try testing.expectEqual(case.size, text.items.len);
+        try tmp.dir.writeFile(.{ .sub_path = "status", .data = text.items });
+        const file = try tmp.dir.openFile("status", .{});
+        defer file.close();
+        try testing.expectEqual(case.expected, status_file_exiting(file));
+    }
+    // SIGKILL pending past a long Groups line, read from a real file.
+    try tmp.dir.writeFile(.{ .sub_path = "status", .data = "Groups:\t" ++ "7" ** 5000 ++ "\nSigPnd:\t0\nShdPnd:\t100\n" });
+    const file = try tmp.dir.openFile("status", .{});
+    defer file.close();
+    try testing.expectEqual(Exiting.yes, status_file_exiting(file));
 }
 
 test "preflight: a process that is exiting is not a holder" {
