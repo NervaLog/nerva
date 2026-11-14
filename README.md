@@ -304,7 +304,7 @@ nerva start --addresses=3001,3002,3003 0_0.nerva   # and 0_1, 0_2
 - **Format versions.** An export of a cluster with records or indexes is version 2 (P123b);
   any other is version 1, which every release since v0.4.0 reads. A release reads both. The header's reserved word is a flags word (P426): a release writes 0, so its exports read
   in every release; an export from a keys-off test build sets bit 0, which a release refuses by
-  name (NRV-E0732) and an earlier release as corrupt (NRV-E0804). From
+  name (NRV-E0812) and an earlier release as corrupt (NRV-E0804). From
   v0.5.0 to v0.6.0, rows in tables from `2147483648` up must move below it first: those tables
   now hold records, and `import` refuses such rows by name (P123e).
 - **Memory.** v0.6.0's replica takes about 0.5 GiB more than v0.5.0's (3.0 GB at startup with

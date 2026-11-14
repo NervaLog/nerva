@@ -62,7 +62,6 @@ pub const table = [_]Entry{
     .{ .code = "NRV-E0715", .summary = "An earlier `nerva recover` did not finish", .exit = exit_operator },
     .{ .code = "NRV-E0716", .summary = "`nerva recover`'s session was evicted before it finished", .exit = exit_operator },
     .{ .code = "NRV-E0717", .summary = "A test build with commit-key deduplication off was started without `--development`", .exit = exit_operator },
-    .{ .code = "NRV-E0732", .summary = "A release build was given an export from a test build with commit-key deduplication off", .exit = exit_operator },
     .{ .code = "NRV-E0801", .summary = "The cluster did not answer the export", .exit = exit_operator },
     .{ .code = "NRV-E0802", .summary = "`--as-of` is past the latest op", .exit = exit_operator },
     .{ .code = "NRV-E0803", .summary = "The export would be refused by `nerva import`", .exit = exit_operator },
@@ -73,6 +72,7 @@ pub const table = [_]Entry{
     .{ .code = "NRV-E0808", .summary = "A backup's manifest is missing, malformed, too large or of an unknown version", .exit = exit_operator },
     .{ .code = "NRV-E0809", .summary = "A backup does not match its manifest: size, SHA-256, op, version, a view hash or a ledger total", .exit = exit_operator },
     .{ .code = "NRV-E0810", .summary = "A file `export` or `import` was given cannot be opened, read or written", .exit = exit_operator },
+    .{ .code = "NRV-E0812", .summary = "A release build was given an export from a test build with commit-key deduplication off", .exit = exit_operator },
     .{ .code = "NRV-E0901", .summary = "`NERVA_CLUSTER_KEY` is missing, short, or wrongly paired with `_NEXT`", .exit = exit_operator },
     .{ .code = "NRV-B0004", .summary = "A `nerva` command hit an error it did not expect", .exit = exit_internal },
 };

@@ -10,7 +10,7 @@ area: Releases
 (`export_file.flag_keys_off`) marks **the exporting binary's build**, not the cluster: it is set
 only by a `nerva export` built with commit-key deduplication off (`-Dtest-commit-keys=off`); a release build writes 0, so a release export is byte-identical to
 before. The format version does not change. A reader refuses any other set bit as corrupt (NRV-E0804),
-as it refused any non-zero word. A release build that reads bit 0 refuses with NRV-E0732 (`import` and
+as it refused any non-zero word. A release build that reads bit 0 refuses with NRV-E0812 (`import` and
 `restore`, after pass 1 and before the data file is created); a keys-off build accepts it (#357).
 
 **Owner's answer (2026-11-14).** Option (a) of the question on #426, over a version 3 with a build-mark
@@ -27,6 +27,6 @@ so no operator meets it. The export's SHA-256 covers the header, so a keys-off e
 differs from a release's of the same log.
 The bit does not follow the cluster: a release `nerva export` of a keys-off cluster writes 0, and a
 release import accepts it (#357's own repro still succeeds). Without #354, a keys-off export of a
-release cluster succeeds, carries the bit, and import then refuses it with E0732. Marking the cluster's mode needs the cluster to report it over the wire,
+release cluster succeeds, carries the bit, and import then refuses it with E0812. Marking the cluster's mode needs the cluster to report it over the wire,
 which this decision does not do. A future flag that older releases must refuse comes with a
 `format_version` bump, so they report NRV-E0805 (version not read), not NRV-E0804 (corrupt).

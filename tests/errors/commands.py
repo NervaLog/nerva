@@ -339,7 +339,7 @@ def main():
                   "NRV-E0805", 1, "version")
             # A keys-off export (P426): flag bit 0 at byte 12. The end record (the last 44 bytes:
             # size, kind, the SHA-256 of every byte before it, the CRC-32 of those) is rebuilt, so
-            # only the flag is refused. A release build names it (E0732); an unknown bit is corrupt.
+            # only the flag is refused. A release build names it (E0812); an unknown bit is corrupt.
             with open(out, "rb") as f:
                 real = f.read()
 
@@ -349,7 +349,7 @@ def main():
                 end = real[-44:-36] + hashlib.sha256(body).digest()
                 return bytes(body) + end + zlib.crc32(end).to_bytes(4, "little")
             assert with_flags(0) == real, "the end record is not rebuilt as assumed"
-            for name, flags, code, text in (("keys off", 1, "NRV-E0732", "deduplication off"),
+            for name, flags, code, text in (("keys off", 1, "NRV-E0812", "deduplication off"),
                                             ("unknown flag", 2, "NRV-E0804", "flag")):
                 flagged = os.path.join(tmp, f"{flags}.export")
                 with open(flagged, "wb") as f:
@@ -377,7 +377,7 @@ def main():
             assert off_bytes[12:16] == b"\x01\x00\x00\x00", off_bytes[12:16]
             off_target = os.path.join(tmp, "off.nerva")
             check("import real keys-off export", imp + ["--input=" + off_out, off_target],
-                  "NRV-E0732", 1, "deduplication off")
+                  "NRV-E0812", 1, "deduplication off")
             assert not os.path.exists(off_target)
             assert not os.path.exists(off_target + ".importing")
             accepted = run(nerva_off, imp + ["--input=" + off_out, off_target])

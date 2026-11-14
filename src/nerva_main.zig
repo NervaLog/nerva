@@ -377,7 +377,7 @@ fn import_run(
         import_failed(command, args.input, args.path, err);
     if (commit_keys_deduplicate and plan.flags & export_file.flag_keys_off != 0) {
         diagnostic.fail(
-            "NRV-E0732",
+            "NRV-E0812",
             command ++ ": {s}: the export came from a test build with commit-key " ++
                 "deduplication off, which a release build does not import",
             .{args.input},

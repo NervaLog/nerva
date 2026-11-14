@@ -14,7 +14,7 @@
 //! then `end` and nothing after.
 //!
 //! Flags (P426): bit 0 (`flag_keys_off`) says a test build with commit-key deduplication off
-//! wrote the export, which a release build refuses to import (NRV-E0732). A release build writes
+//! wrote the export, which a release build refuses to import (NRV-E0812). A release build writes
 //! 0, so its exports are byte-identical to those before the flags; every other bit is reserved,
 //! and a reader refuses a set one as corrupt. A release from before P426 reads the whole word as
 //! reserved zero, so it refuses a keys-off export as corrupt.
