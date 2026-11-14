@@ -22,6 +22,10 @@ on:
       tag:
         required: true
         type: string
+    outputs:
+      attempt:
+        description: 'The run attempt the owner approved (NRV-E1153: package publication must be the same attempt)'
+        value: ${{ jobs.sign.outputs.attempt }}
   workflow_dispatch:
     inputs:
       tag:
@@ -42,6 +46,8 @@ jobs:
     # Notarization usually takes minutes; Apple sometimes takes longer.
     timeout-minutes: 75
     environment: apple-signing
+    outputs:
+      attempt: ${{ github.run_attempt }}
     permissions:
       contents: write # gh release upload to the draft; GH_TOKEN goes only to the steps that need it
     env:

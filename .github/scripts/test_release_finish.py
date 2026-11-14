@@ -5,11 +5,13 @@ repository root: python3 -I .github/scripts/test_release_finish.py
 A stand-in `gh` (a script that logs its arguments and answers from environment variables) stands for
 the real one; the tap and the site are bare git repositories in a temporary directory, so the real
 `git` clones, commits and pushes to them."""
+import http.server
 import json
 import os
 import re
 import subprocess
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -85,11 +87,70 @@ exit 0
 """
 
 
+WKD_HASH = "ndqm47zydhyqyzabecddtdk1q3bponab"
+WKD = ".well-known/openpgpkey"
+
+
+def make_key():
+    """A throwaway armored key, made once: the release key file of these tests."""
+    with tempfile.TemporaryDirectory() as home:
+        os.chmod(home, 0o700)
+        env = dict(os.environ, GNUPGHOME=home)
+        subprocess.run(["gpg", "--batch", "--quiet", "--passphrase", "", "--quick-generate-key",
+                        "Nerva Test <nerva@nerva.pro>", "ed25519", "sign", "never"],
+                       env=env, check=True, capture_output=True)
+        out = subprocess.run(["gpg", "--batch", "--armor", "--export"], env=env, check=True,
+                             capture_output=True, text=True).stdout
+        subprocess.run(["gpgconf", "--kill", "all"], env=env, capture_output=True)
+        return out
+
+
+def dearmor(armored):
+    with tempfile.TemporaryDirectory() as home:
+        os.chmod(home, 0o700)
+        return subprocess.run(["gpg", "--batch", "--quiet", "--dearmor"], input=armored.encode(),
+                              env=dict(os.environ, GNUPGHOME=home), check=True,
+                              capture_output=True).stdout
+
+
 def git(*args, cwd=None):
     return subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *args], cwd=cwd, capture_output=True, text=True, check=True).stdout
 
 
 class Finish(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.key = make_key()
+        cls.key_bin = dearmor(cls.key)
+
+    def make_source(self):
+        """This repository as the workflow's checkout sees it: `self.src` is a clone of `origin`
+        taken before any tag exists (the release's tag is made after the checkout), main holds the
+        key file from v0.7.1 on, v0.7.0 has none, and v0.7.2-rc.1 is tagged on a branch off main."""
+        work = self.dir / "srcwork"
+        self.origin = self.dir / "origin.git"
+        git("init", "-q", "-b", "main", str(work))
+        (work / "README.md").write_text("one\n")
+        git("add", ".", cwd=work)
+        git("commit", "-q", "-m", "before the key", cwd=work)
+        git("tag", "v0.7.0", cwd=work)
+        (work / "packaging/keys").mkdir(parents=True)
+        (work / "packaging/keys/nerva-release.asc").write_text(self.key)
+        git("add", ".", cwd=work)
+        git("commit", "-q", "-m", "the key", cwd=work)
+        git("tag", "v0.7.1", cwd=work)
+        git("tag", "v0.7.1-rc.2", cwd=work)
+        git("checkout", "-q", "-b", "cand", cwd=work)
+        (work / "packaging/keys/nerva-release.asc").write_text("not a key\n")
+        git("commit", "-q", "-am", "a broken key on a branch", cwd=work)
+        git("tag", "v0.7.2-rc.1", cwd=work)
+        git("tag", "v0.7.3", cwd=work)
+        git("checkout", "-q", "main", cwd=work)
+        git("clone", "-q", "--bare", str(work), str(self.origin))
+        self.src = self.dir / "src"
+        # the checkout is taken before the release's tag exists: it holds main and none of the tags
+        git("clone", "-q", "--no-tags", f"file://{self.origin}", str(self.src))
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -100,6 +161,7 @@ class Finish(unittest.TestCase):
         (self.bin / "gh").chmod(0o755)
         self.log = self.dir / "gh.log"
         self.log.write_text("")
+        self.make_source()
         self.env = dict(
             os.environ, GITHUB_REPOSITORY="o/r", GH_TOKEN="s3cret-token", GH_LOG=str(self.log),
             PATH=f"{self.bin}:{os.environ['PATH']}", BOT_NAME="nerva-release[bot]",
@@ -111,7 +173,7 @@ class Finish(unittest.TestCase):
 
     def run_script(self, *args, **env):
         result = subprocess.run([str(SCRIPT), *args], capture_output=True, text=True,
-                                env=dict(self.env, **env))
+                                cwd=self.src, env=dict(self.env, **env))
         self.assertNotIn("s3cret-token", result.stdout + result.stderr)
         return result
 
@@ -548,6 +610,162 @@ class Finish(unittest.TestCase):
         self.refused(self.run_script("site-wait", "7", "prerelease"), "NRV-E1136", "did not pass site-check")
 
 
+    # the WKD pair, written into the site's pull request (P398)
+    def site_files(self, bare, ref):
+        return git("ls-tree", "-r", "--name-only", ref, cwd=bare).split()
+
+    def test_a_release_writes_both_wkd_files_into_the_site_pull_request(self):
+        url, bare = self.bare("site", {"index.html": PAGE})
+        result = self.run_script("site", "v0.7.1", "2026-11-13", "A line.", SITE_URL=url, CHECK="success")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(git("show", f"release/v0.7.1:{WKD}/policy", cwd=bare), "")
+        key = subprocess.run(["git", "show", f"release/v0.7.1:{WKD}/hu/{WKD_HASH}"], cwd=bare,
+                             capture_output=True, check=True).stdout
+        self.assertEqual(key, self.key_bin)
+        # only the page and the two files; the site's main is untouched until the merge
+        diff = git("diff", "--name-only", "main", "release/v0.7.1", cwd=bare).split()
+        self.assertEqual(sorted(diff), sorted(["index.html", f"{WKD}/policy", f"{WKD}/hu/{WKD_HASH}"]))
+        self.assertEqual(self.site_files(bare, "main"), ["index.html"])
+
+    def test_a_candidate_on_main_writes_the_files_too(self):
+        url, bare = self.bare("site", {"index.html": PAGE})
+        self.assertEqual(self.run_script("site", "v0.7.1-rc.2", "2026-11-13", "Release candidate v0.7.1-rc.2.", SITE_URL=url).returncode, 0)
+        self.assertIn(f"{WKD}/hu/{WKD_HASH}", self.site_files(bare, "release/v0.7.1-rc.2"))
+
+    def test_a_candidate_tagged_on_a_branch_leaves_the_wkd_files_as_the_site_has_them(self):
+        # the tag's key file is not even a key: it is never read as one, because the tag is not on main
+        url, bare = self.bare("site", {"index.html": PAGE})
+        result = self.run_script("site", "v0.7.2-rc.1", "2026-11-13", "Release candidate v0.7.2-rc.1.", SITE_URL=url)
+        self.assertEqual(result.returncode, 1, result.stderr)  # a broken key file refuses first, see below
+        # a branch candidate with a good key file: on the branch, off main
+        work = self.dir / "srcwork"
+        git("checkout", "-q", "cand", cwd=work)
+        (work / "packaging/keys/nerva-release.asc").write_text(self.key + "\n")
+        git("commit", "-q", "-am", "a key", cwd=work)
+        git("tag", "v0.7.2-rc.2", cwd=work)
+        git("push", "-q", str(self.origin), "cand", "v0.7.2-rc.2", cwd=work)
+        # the site already holds a WKD pair from an earlier release: it stays as it is
+        url, bare = self.bare("site2", {"index.html": PAGE, f"{WKD}/policy": "", f"{WKD}/hu/{WKD_HASH}": "old"})
+        result = self.run_script("site", "v0.7.2-rc.2", "2026-11-13", "Release candidate v0.7.2-rc.2.", SITE_URL=url)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("is not on main", result.stderr)
+        self.assertEqual(git("show", f"release/v0.7.2-rc.2:{WKD}/hu/{WKD_HASH}", cwd=bare), "old")
+        self.assertEqual(git("diff", "--name-only", "main", "release/v0.7.2-rc.2", cwd=bare).split(), ["index.html"])
+
+    def test_a_tag_without_a_key_file_writes_no_wkd_file(self):
+        older = PAGE.replace("0.7.0", "0.6.9")
+        url, bare = self.bare("site", {"index.html": older})
+        # v0.7.0 has no key file: the site's pull request is the page alone
+        result = self.run_script("site", "v0.7.0", "2026-11-10", "A line.", SITE_URL=url, CHECK="success")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("has no packaging/keys/nerva-release.asc", result.stderr)
+        self.assertEqual(self.site_files(bare, "release/v0.7.0"), ["index.html"])
+
+    def test_an_existing_policy_file_is_kept_and_a_rerun_adds_nothing(self):
+        url, bare = self.bare("site", {"index.html": PAGE, f"{WKD}/policy": "# kept\n"})
+        self.run_script("site", "v0.7.1", "2026-11-13", "A line.", SITE_URL=url, CHECK="success")
+        tip = git("rev-parse", "release/v0.7.1", cwd=bare).strip()
+        self.assertEqual(git("show", f"release/v0.7.1:{WKD}/policy", cwd=bare), "# kept\n")
+        self.run_script("site", "v0.7.1", "2026-11-13", "A line.", SITE_URL=url, CHECK="success")
+        self.assertEqual(git("rev-parse", "release/v0.7.1", cwd=bare).strip(), tip)
+
+    def test_a_key_file_that_is_not_a_key_is_refused_before_anything_is_pushed(self):
+        url, bare = self.bare("site", {"index.html": PAGE})
+        result = self.run_script("site", "v0.7.3", "2026-11-13", "A line.", SITE_URL=url)
+        self.refused(result, "NRV-E1136", "is not an armored key")
+        self.assertNotIn("release/v0.7.3", git("branch", "-a", cwd=bare))
+        self.assertNotIn("pr create", self.calls())
+
+    def test_a_tag_this_repository_does_not_have_is_refused(self):
+        url, _ = self.bare("site", {"index.html": PAGE})
+        self.refused(self.run_script("site", "v0.9.9", "2026-11-13", "A line.", SITE_URL=url),
+                     "NRV-E1136", "cannot read the tag v0.9.9")
+
+    # site-live (NRV-E1151, E1162)
+    def serve(self, routes):
+        """A local stand-in for nerva.pro. routes: {path: (status, body)}; a callable body is
+        called with the request count of the path. Returns the base URL; self.seen lists
+        (path, Cache-Control) of the requests."""
+        seen, counts = [], {}
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(handler):
+                path = handler.path.split("?")[0]
+                seen.append((handler.path, handler.headers.get("Cache-Control")))
+                counts[path] = counts.get(path, 0) + 1
+                status, body = routes.get(path, (404, b"not found"))
+                if callable(body):
+                    body = body(counts[path])
+                handler.send_response(status)
+                handler.send_header("Content-Length", str(len(body)))
+                handler.end_headers()
+                handler.wfile.write(body)
+            def log_message(handler, *args):
+                pass
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.seen = seen
+        return f"http://127.0.0.1:{server.server_address[1]}"
+
+    LIVE = dict(SITE_LIVE_WAIT_SECONDS="3", SITE_POLL_SECONDS="1")
+
+    def test_site_live_passes_when_the_page_and_the_wkd_key_are_the_releases(self):
+        page = PAGE.replace('{v:"0.7.0"', '{v:"0.7.1", date:"2026-11-13", d:"A."},\n  {v:"0.7.0"').encode()
+        base = self.serve({"/": (200, page), f"/{WKD}/hu/{WKD_HASH}": (200, self.key_bin)})
+        result = self.run_script("site-live", "v0.7.1", SITE_LIVE_URL=base, **self.LIVE)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("shows 0.7.1", result.stdout)
+        # the page is asked for uncached; the WKD file as users ask for it, with its l= parameter
+        self.assertEqual(self.seen[0], ("/", "no-cache"))
+        self.assertEqual(self.seen[-1][0], f"/{WKD}/hu/{WKD_HASH}?l=nerva")
+        self.assertIsNone(self.seen[-1][1])
+
+    def test_site_live_waits_for_the_page_and_then_passes(self):
+        entry = '{v:"0.7.1", date:"2026-11-13", d:"A."}'
+        base = self.serve({"/": (200, lambda n: (entry if n >= 3 else "{v:\"0.7.0\"").encode()),
+                           f"/{WKD}/hu/{WKD_HASH}": (200, self.key_bin)})
+        result = self.run_script("site-live", "v0.7.1", SITE_LIVE_URL=base, SITE_LIVE_WAIT_SECONDS="10", SITE_POLL_SECONDS="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([p for p, _ in self.seen].count("/"), 3)
+
+    def test_site_live_refuses_a_page_that_never_shows_the_release(self):
+        base = self.serve({"/": (200, b'{v:"0.7.0"'), f"/{WKD}/hu/{WKD_HASH}": (200, self.key_bin)})
+        result = self.run_script("site-live", "v0.7.1", SITE_LIVE_URL=base, SITE_LIVE_WAIT_SECONDS="2", SITE_POLL_SECONDS="1")
+        self.refused(result, "NRV-E1151", "nerva.pro does not show 0.7.1")
+        self.assertIn("packages are unaffected", result.stderr)
+        self.assertIn("nerva-site Worker's builds", result.stderr)
+        self.assertNotIn("Pages", result.stderr)
+        # an unreachable site is the same: "not yet" until the deadline
+        result = self.run_script("site-live", "v0.7.1", SITE_LIVE_URL="http://127.0.0.1:9", SITE_LIVE_WAIT_SECONDS="1", SITE_POLL_SECONDS="1")
+        self.refused(result, "NRV-E1151", "does not show 0.7.1")
+
+    def test_site_live_refuses_a_wkd_key_that_differs(self):
+        page = b'{v:"0.7.1", date:"2026-11-13", d:"A."}'
+        for served in ((200, b"another key"), (200, b""), (404, b"not found"), (500, b"oops")):
+            base = self.serve({"/": (200, page), f"/{WKD}/hu/{WKD_HASH}": served})
+            result = self.run_script("site-live", "v0.7.1", SITE_LIVE_URL=base, **self.LIVE)
+            self.refused(result, "NRV-E1162", "WKD key differs from packaging/keys at v0.7.1")
+            self.assertIn(f"served status {served[0]}", result.stderr)
+
+    def test_site_live_without_a_reference_key_file_requires_a_404(self):
+        page = b'{v:"0.7.0", date:"2026-11-10", d:"A."}'
+        base = self.serve({"/": (200, page)})
+        result = self.run_script("site-live", "v0.7.0", SITE_LIVE_URL=base, **self.LIVE)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("has no packaging/keys/nerva-release.asc", result.stdout)
+        # the SPA-style answer, the page with 200, is not a 404
+        base = self.serve({"/": (200, page), f"/{WKD}/hu/{WKD_HASH}": (200, page)})
+        self.refused(self.run_script("site-live", "v0.7.0", SITE_LIVE_URL=base, **self.LIVE), "NRV-E1162",
+                     "serves a WKD file (status 200) although v0.7.0 has no")
+
+    def test_site_live_is_for_releases_only(self):
+        for tag in ("v0.7.1-rc.2", "0.7.1", "v0.7.1; true"):
+            result = self.run_script("site-live", tag)
+            self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(self.run_script("site-live", "v0.7.1", SITE_POLL_SECONDS="0").returncode, 1)
+
+
 class Workflow(unittest.TestCase):
     """Properties of release-finish.yml that a review checks by eye, kept as tests."""
 
@@ -579,7 +797,7 @@ class Workflow(unittest.TestCase):
 
     def test_publish_waits_for_the_mac_checks_and_names_its_environment(self):
         publish = self.text.split("\n  publish:\n")[1].split("\n  verify:\n")[0]
-        self.assertIn("needs: [guard, mac, mac-verify]", publish)
+        self.assertIn("needs: [guard, mac, mac-verify, repos-ready]", publish)
         self.assertIn("environment: release-publish", publish)
         # the tap and the site come after the draft is public
         self.assertLess(publish.index('release_finish.sh publish "$TAG"'), publish.index('release_finish.sh tap "$TAG"'))
@@ -634,6 +852,244 @@ class Workflow(unittest.TestCase):
         self.assertIn("needs: [version, ci, packages]", draft)
         self.assertNotIn("\n    if:", draft)
         self.assertIn("workflow_call:", (ROOT / ".github/workflows/packages.yml").read_text())
+
+
+def job(text, name):
+    """The text of one job of a workflow file."""
+    body = "\n" + text.split("\njobs:\n")[1]
+    return re.split(r"\n  [a-z-]+:\n", body.split(f"\n  {name}:\n")[1])[0]
+
+
+class PackageRepos(unittest.TestCase):
+    """The package repositories' jobs (docs/releases/packages.md, slice 4), kept as tests."""
+
+    flows = ROOT / ".github/workflows"
+    finish = WORKFLOW.read_text()
+    refresh = (flows / "package-repos-refresh.yml").read_text()
+    watch = (flows / "package-repos-watch.yml").read_text()
+    ci = (flows / "ci.yml").read_text()
+
+    def test_the_bucket_group_is_on_exactly_three_jobs_and_queues_without_cancelling(self):
+        group = "concurrency:\n      group: nerva-packages-bucket\n      cancel-in-progress: false\n      queue: max\n"
+        found = []
+        for path in sorted(self.flows.glob("*.yml")):
+            text = path.read_text()
+            self.assertEqual(text.count("group: nerva-packages-bucket"), text.count(group), path.name)
+            for name in re.findall(r"(?m)^  ([a-z-]+):$", text.split("\njobs:\n")[1]) if "\njobs:\n" in text else []:
+                if group in job(text, name):
+                    found.append((path.name, name))
+        self.assertEqual(sorted(found), [("package-repos-refresh.yml", "refresh"), ("release-finish.yml", "repos"),
+                                 ("release-finish.yml", "repos-ready")])
+
+    def test_publish_waits_for_the_binding_and_reports_whether_it_is_public(self):
+        publish = job(self.finish, "publish")
+        self.assertIn("needs: [guard, mac, mac-verify, repos-ready]", publish)
+        self.assertIn("needs.repos-ready.result == 'success'", publish)
+        self.assertIn("public: ${{ steps.public.outputs.public }}", publish)
+        last = publish.split("\n      - name: ")[-1]
+        self.assertTrue(last.startswith("Is the release public"), last[:40])
+        self.assertIn("if: ${{ always() && steps.ready.conclusion == 'success' }}", last)
+        self.assertIn("releases/tags/$TAG", last)
+        self.assertNotIn("exit 1", last)
+
+    def test_repos_is_gated_on_the_publication_and_not_on_the_jobs_success(self):
+        repos = job(self.finish, "repos")
+        self.assertIn("needs: [guard, repos-ready, publish]", repos)
+        self.assertIn("if: ${{ !cancelled() && needs.repos-ready.result == 'success' && needs.publish.outputs.public == 'true' }}", repos)
+        self.assertIn("environment: package-repos", repos)
+        self.assertIn("package_repos.sh publish", repos)
+        self.assertEqual(job(self.finish, "verify").count("repos"), 0)  # brew waits for neither
+
+    def test_repos_ready_binds_the_approved_attempt_before_publish(self):
+        ready = job(self.finish, "repos-ready")
+        self.assertIn("MAC_ATTEMPT: ${{ needs.mac.outputs.attempt }}", ready)
+        self.assertIn("environment: package-repos", ready)
+        self.assertIn("package_repos.sh ready", ready)
+        self.assertIn("COMMIT: ${{ steps.ready.outputs.commit }}", ready)
+        self.assertIn('GITHUB_SHA="$COMMIT" .github/scripts/package_repos.sh ready', ready)
+        self.assertNotIn("GITHUB_SHA: ", ready)  # GitHub ignores an override of GITHUB_* in env:
+        mac = (self.flows / "mac-sign.yml").read_text()
+        self.assertIn("attempt: ${{ github.run_attempt }}", mac)
+        self.assertIn("value: ${{ jobs.sign.outputs.attempt }}", mac)
+        # no secret reaches any step but the one that binds
+        for step in ready.split("\n      - ")[1:]:
+            self.assertEqual("secrets." in step, "package_repos.sh ready" in step, step[:50])
+
+    def test_the_signing_secrets_reach_only_the_steps_that_write_the_bucket(self):
+        for text, names in ((self.finish, ("repos-ready", "repos")), (self.refresh, ("refresh",))):
+            for name in names:
+                for step in job(text, name).split("\n      - ")[1:]:
+                    self.assertEqual("secrets." in step, "package_repos.sh" in step and "cleanup" not in step, step[:50])
+        for other in ("publish", "site-verify", "repos-verify", "alarm", "guard"):
+            self.assertNotIn("secrets.R2_", job(self.finish, other))
+            self.assertNotIn("secrets.REPO_SIGNING", job(self.finish, other))
+        for text in (self.watch, self.ci):
+            self.assertNotIn("secrets.R2_", text)
+            self.assertNotIn("secrets.REPO_SIGNING", text)
+
+    def test_repos_verify_is_sixteen_cells_with_every_image_pinned_by_digest(self):
+        verify = job(self.finish, "repos-verify")
+        self.assertIn("runner: [ubuntu-24.04, ubuntu-24.04-arm]", verify)
+        distros = re.search(r"distro: \[(.*?)\]", verify).group(1).split(", ")
+        self.assertEqual(len(distros), 8)
+        images = re.findall(r"\{ distro: (\S+), image: (\S+), mgr: (apt|dnf) \}", verify)
+        self.assertEqual([d for d, _, _ in images], distros)
+        for _, image, _ in images:
+            self.assertRegex(image, r"^docker\.io/library/[a-z]+@sha256:[0-9a-f]{64}$")
+        self.assertIn("needs: [guard, repos]", verify)
+        self.assertNotIn("environment:", verify)
+        self.assertNotIn("secrets.", verify)
+
+    def test_site_verify_is_a_release_only_job_with_no_permissions(self):
+        site = job(self.finish, "site-verify")
+        self.assertIn("permissions: {}", site)
+        self.assertNotIn("environment:", site)
+        self.assertNotIn("secrets.", site)
+        self.assertIn("!contains(inputs.tag, '-')", site)
+        self.assertIn("needs.publish.result == 'success'", site)
+        self.assertIn("release_finish.sh site-live", site)
+
+    def test_every_alarm_holds_issues_write_only_and_never_fails_the_run(self):
+        alarms = {"release-finish.yml": self.finish, "package-repos-refresh.yml": self.refresh,
+                  "package-repos-watch.yml": self.watch, "ci.yml": self.ci}
+        for name, text in alarms.items():
+            alarm = job(text, "alarm")
+            self.assertIn("permissions:\n      issues: write\n", alarm, name)
+            self.assertIn("continue-on-error: true", alarm, name)
+            self.assertNotIn("environment:", alarm, name)
+            self.assertNotIn("secrets.", alarm, name)
+            self.assertIn("persist-credentials: false", alarm, name)
+            self.assertIn("if: ${{ always() && ", alarm.replace("if: >-\n      ${{ always() && ", "if: ${{ always() && "), name)
+            self.assertIn("repos_alarm.sh", alarm, name)
+            # cancelled alarms for repos-ready and repos, in release-finish.yml, and nowhere else
+            self.assertEqual("cancelled" in alarm.split("repos_alarm.sh")[0].split("steps:")[0], name == "release-finish.yml", name)
+        alarm = job(self.finish, "alarm")
+        self.assertIn("needs.repos-ready.result == 'cancelled' || needs.repos.result == 'cancelled'", alarm.replace("\n      ", " "))
+        self.assertIn("needs: [repos-ready, repos, repos-verify]", alarm)
+        self.assertIn("needs.refresh.outputs.missed == 'true'", job(self.refresh, "alarm"))
+
+    def test_the_refresh_runs_weekly_from_main_and_takes_its_two_inputs(self):
+        self.assertIn("cron: '17 5 * * 1'", self.refresh)
+        self.assertIn("alarm_test:", self.refresh)
+        self.assertIn("rpm_key:", self.refresh)
+        refresh = job(self.refresh, "refresh")
+        self.assertIn("if: github.ref == 'refs/heads/main'", refresh)
+        self.assertIn("environment: package-repos", refresh)
+        self.assertIn("timeout-minutes: 90", refresh)
+        self.assertIn("missed: ${{ steps.missed.outputs.missed }}", refresh)
+        self.assertLess(refresh.index("alarm-test"), refresh.index("secrets."))
+        self.assertLess(refresh.index("alarm-test"), refresh.index("package_repos.sh refresh"))
+        self.assertIn("TRIGGERING_ACTOR: ${{ github.triggering_actor }}", refresh)
+
+    def test_the_freshness_watches_run_only_when_the_repositories_are_live_and_write_nothing(self):
+        fresh = job(self.ci, "repos-fresh")
+        self.assertIn("github.event_name == 'push'", fresh)
+        self.assertIn("vars.REPOS_LIVE == 'true'", fresh)
+        self.assertIn("github.workflow == 'CI'", fresh)  # not in release.yml's call
+        self.assertIn("package_repos.sh fresh", fresh)
+        self.assertNotIn("pull_request", fresh)
+        self.assertNotIn("environment:", fresh)
+        self.assertNotIn("repos-fresh", job(self.ci, "unit"))  # no job needs it
+        self.assertEqual(self.ci.count("needs: repos-fresh"), 1)
+        watch = job(self.watch, "watch")
+        self.assertIn("vars.REPOS_LIVE == 'true'", watch)
+        self.assertIn("package_repos.sh fresh", watch)
+        self.assertIn("-gt 45", watch)
+        self.assertIn("cron: '41 6 * * *'", self.watch)
+        self.assertNotIn("environment:", watch)
+
+    def test_release_finish_describes_the_direct_merge_not_an_auto_merge(self):
+        self.assertNotIn("auto-merge", self.finish.split("\njobs:\n")[0])
+
+    def test_release_workflow_lets_the_called_ci_hold_the_alarm_permission(self):
+        release = (self.flows / "release.yml").read_text()
+        call = release.split("\n  ci:\n")[1].split("\n\n")[0]
+        self.assertIn("issues: write", call)
+
+    def test_release_workflow_lets_the_finish_call_hold_the_alarm_permission(self):
+        release = (self.flows / "release.yml").read_text()
+        call = release.split("\n  finish:\n")[1].split("\n    with:")[0]
+        self.assertIn("contents: write\n      issues: write", call)
+
+    def test_all_package_workflows_read_the_base_url_from_the_variable(self):
+        for name in ("ci.yml", "package-repos-watch.yml", "package-repos-refresh.yml", "release-finish.yml"):
+            text = (self.flows / name).read_text()
+            self.assertNotIn("https://packages.nerva.pro", text.replace("${BASE_URL:-https://packages.nerva.pro}", ""), name)
+
+    def test_refresh_passes_with_a_notice_until_setup_is_done(self):
+        refresh = (self.flows / "package-repos-refresh.yml").read_text()
+        self.assertIn("::notice::the package repositories' setup is not done", refresh)
+        self.assertEqual(refresh.count("if: ${{ steps.setup.outputs.complete == 'true' }}"), 3)
+
+    @staticmethod
+    def step_script(text, name):
+        """The `run: |` block of the step called `name`, dedented."""
+        lines = text.split("\n")
+        start = next(i for i, line in enumerate(lines) if line.strip() == f"- name: {name}")
+        at = next(i for i in range(start, len(lines)) if lines[i].strip() == "run: |")
+        indent = len(lines[at]) - len(lines[at].lstrip()) + 2
+        body = []
+        for line in lines[at + 1:]:
+            if line.strip() and len(line) - len(line.lstrip()) < indent:
+                break
+            body.append(line[indent:])
+        return "\n".join(body)
+
+    def run_step(self, script, env, path_dir=None):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "output"
+            out.touch()
+            full = {"PATH": (f"{path_dir}:" if path_dir else "") + os.environ["PATH"], "GITHUB_OUTPUT": str(out), **env}
+            result = subprocess.run(["bash", "-eo", "pipefail", "-c", script], env=full, cwd=ROOT,
+                                    capture_output=True, text=True, timeout=60)
+            return result, out.read_text()
+
+    def test_the_base_url_is_a_repository_variable_in_the_setup(self):
+        # P404: repos-fresh, the watch and repos-verify have no environment, so only a repository
+        # variable reaches them.
+        spec = (ROOT / "docs/releases/packages.md").read_text()
+        sets = re.findall(r"(?m)^gh variable set PACKAGES_BASE_URL .*$", spec)
+        self.assertEqual(len(sets), 1)
+        self.assertNotIn("--env", sets[0])
+        for text, name in ((self.ci, "repos-fresh"), (self.watch, "watch"), (self.finish, "repos-verify")):
+            body = job(text, name)
+            self.assertIn("vars.PACKAGES_BASE_URL", body, name)
+            self.assertNotIn("environment:", body, name)
+
+    def test_repos_verify_refuses_an_empty_base_url_and_never_falls_back(self):
+        body = job(self.finish, "repos-verify")
+        self.assertNotIn("${BASE_URL:-", body)
+        script = self.step_script(self.finish, "Install nerva from the repository in ${{ matrix.distro }}")
+        result, _ = self.run_step(script, {"TAG": "v0.7.1", "BASE_URL": "", "IMAGE": "x", "MGR": "apt"})
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("error[NRV-E1139]: release-finish.yml: the repository variable PACKAGES_BASE_URL is not set", result.stderr)
+        self.assertIn("  fix    ", result.stderr)
+
+    def test_refresh_refuses_a_missing_bucket_once_the_repositories_are_live(self):
+        script = self.step_script(self.refresh, "Setup is done")
+        result, out = self.run_step(script, {"R2_BUCKET": "", "REPOS_LIVE": "true"})
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("error[NRV-E1139]: package-repos-refresh.yml: the package-repos environment lacks R2_BUCKET", result.stderr)
+        self.assertIn("code=NRV-E1139", out)
+        self.assertIn("steps.setup.outputs.code", self.refresh)
+        result, out = self.run_step(script, {"R2_BUCKET": "", "REPOS_LIVE": ""})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("complete=false", out)
+        result, out = self.run_step(script, {"R2_BUCKET": "nerva-packages", "REPOS_LIVE": "true"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("complete=true", out)
+
+    def test_refresh_counts_missed_from_eight_days_in_seconds(self):
+        script = self.step_script(self.refresh, "The previous refresh ran")
+        for hours, missed in ((8 * 24 + 23, "true"), (8 * 24 + 1, "true"), (7 * 24 + 23, "false")):
+            with tempfile.TemporaryDirectory() as bin_dir:
+                when = time.strftime("%a, %d %b %Y %H:%M:%S UTC", time.gmtime(time.time() - hours * 3600))
+                fake = Path(bin_dir) / "curl"
+                fake.write_text(f"#!/bin/sh\nprintf 'Origin: nerva\\nDate: {when}\\n'\n")
+                fake.chmod(0o755)
+                result, out = self.run_step(script, {"BASE_URL": "https://example.invalid"}, bin_dir)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(f"missed={missed}", out, hours)
 
 
 if __name__ == "__main__":

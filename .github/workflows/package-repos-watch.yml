@@ -1,0 +1,88 @@
+# The daily watch over the package repositories (docs/releases/packages.md, "The 60-day rule"):
+# two clocks that depend on neither the weekly refresh nor on activity on main. It makes the same
+# freshness check as ci.yml's `repos-fresh` (`package_repos.sh fresh`: stable's InRelease must have
+# at least 10 days of `Valid-Until` left), and the 45-day commit-age check (GitHub disables a
+# schedule after 60 days without a commit on main). It runs only when the repository variable
+# REPOS_LIVE is `true`, which the pull request that records the rehearsal sets. No environment, no
+# secret; it never writes the bucket.
+name: Package repositories watch
+
+on:
+  schedule:
+    - cron: '41 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# `bash` here is `bash -eo pipefail`: a failing command in a pipeline fails the step.
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  watch:
+    if: ${{ vars.REPOS_LIVE == 'true' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      code: ${{ steps.fresh.outputs.code || steps.age.outputs.code }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+
+      - name: Repository freshness (Valid-Until at least 10 days ahead)
+        id: fresh
+        env:
+          # A repository variable, not the environment's: this job has no environment (P404).
+          PACKAGES_BASE_URL: ${{ vars.PACKAGES_BASE_URL }}
+        run: |
+          set -euo pipefail
+          .github/scripts/package_repos.sh fresh
+
+      # `if: always()`: a stale repository must not hide a repository that is about to lose its refresh.
+      - name: The newest commit on main is under 45 days old
+        id: age
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if ! when=$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq .commit.committer.date); then
+            echo "::warning::cannot read the newest commit on main (GitHub did not answer); the next run asks again"
+            exit 0
+          fi
+          age=$((($(date -u +%s) - $(date -u -d "$when" +%s)) / 86400))
+          if [ "$age" -gt 45 ]; then
+            echo "code=NRV-E1150" >> "$GITHUB_OUTPUT"
+            printf 'error[NRV-E1150]: package-repos-watch.yml: the repository has had no commit for %s days; GitHub disables the weekly refresh at 60\n  cause  the newest commit on main is from %s\n  fix    Commit anything to main (a worklog note); the refresh never commits by itself\n' "$age" "$when" >&2
+            echo "::error::NRV-E1150 the repository has had no commit for $age days; GitHub disables the weekly refresh at 60" >&2
+            exit 1
+          fi
+
+  # `issues: write` and nothing else; no environment, no secret; it never changes the run's verdict.
+  alarm:
+    needs: watch
+    if: ${{ always() && contains(needs.*.result, 'failure') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    continue-on-error: true
+    permissions:
+      issues: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+
+      - name: File the alarm
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PACKAGE_REPOS_OWNER: ${{ vars.PACKAGE_REPOS_OWNER }}
+          CODE: ${{ needs.watch.outputs.code }}
+        run: |
+          set -euo pipefail
+          url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          .github/scripts/repos_alarm.sh package-repos-watch.yml watch "${CODE:-unknown}" "$url"

@@ -44,7 +44,11 @@ record alone, never by an exit code: after `ingest` it looks for the id in the s
 `refuse` if it is not there, and stops with the round kept if it is still not there. Both commands are idempotent for one id, so a round a stop or a crash left is
 ingested again safely. Exit codes are for people: `ingest` 0 counted (now or before), 1 not;
 `refuse` 0 recorded, 1 not; argparse's own 2 for a bad command line. The state is saved
-whatever GitHub answered. Standard library only.
+whatever GitHub answered.
+
+`alarm` (NRV-E0730, P429) is run.sh's report that rounds keep failing: it opens the one open
+`sim-fleet` issue marked `ALARM_MARKER`, or comments on it if it is open already. It reads no
+state file, so it works when `ingest` cannot. Exit 0 if filed, 1 if not. Standard library only.
 """
 
 import argparse
@@ -61,6 +65,14 @@ import urllib.request
 
 LABEL = "sim-fleet"
 MARKER = re.compile(r"<!-- vopr-fleet fingerprint: ([0-9a-f]{32}) -->")
+# The one issue the alarm (NRV-E0730, P429) files or comments on, found by this marker among the
+# open `sim-fleet` issues. It carries no fingerprint, so `markers` never reads it as a failure.
+ALARM_MARKER = "<!-- vopr-fleet alarm: rounds failing -->"
+ALARM_ROUNDS_MAX = 1_000_000
+# The state file's schema rule (#289): while `version` is 1, a schema grows by optional fields only.
+# A reader gives every new field a default (`entry.get("refused", 0)`), so a file an older reporter
+# wrote still loads, and `load_state` checks only the fields that were always there. A field that
+# is required, renamed, retyped or dropped needs a new `version` and a migration, in the same commit.
 STATE_VERSION = 1
 
 # Bounds. Every collection this reads or keeps has one.
@@ -346,8 +358,7 @@ def read_result(round_dir, worker, line, counts, source_root):
         raise BadInput(f"{worker}/results: seed or exit code out of range: {line!r}")
     count = counts.setdefault(target, {"seeds": 0, "failed": 0, "timeouts": 0, "host": 0})
     count["seeds"] += 1
-    if hasattr(counts, "busy"):
-        counts.busy[worker] = counts.busy.get(worker, 0) + min(int(seconds), SEED_SECONDS_MAX)
+    counts.busy[worker] = counts.busy.get(worker, 0) + min(int(seconds), SEED_SECONDS_MAX)
     if code == 0:
         return None
     if code in HOST_CODES:
@@ -525,7 +536,7 @@ def kind_of(target):
 def round_seconds(counts):
     """A round's hours, as seconds: its busiest worker's. Workers run at once, so no worker's
     busy time exceeds the round's wall time, and the fleet never claims more than ran."""
-    return max(getattr(counts, "busy", {}).values(), default=0)
+    return max(counts.busy.values(), default=0)
 
 
 def commit_entry(entries, commit, sequence):
@@ -567,7 +578,7 @@ def refuse_round(state, commit, now):
     assert entry["refused"] > 0 and day["refused"] > 0
 
 
-def count_round(day, counts, commit, state=None):
+def count_round(day, counts, commit, state):
     day["rounds"] += 1
     day["commit"] = commit
     for target, count in counts.items():
@@ -575,10 +586,9 @@ def count_round(day, counts, commit, state=None):
                                                    "host": 0})
         for key in total:
             total[key] += count[key]
-    if state is not None:
-        state["sequence"] += 1
-        add_round(commit_entry(day.setdefault("commits", {}), commit, state["sequence"]), counts)
-        add_round(commit_entry(state["commits"], commit, state["sequence"]), counts)
+    state["sequence"] += 1
+    add_round(commit_entry(day.setdefault("commits", {}), commit, state["sequence"]), counts)
+    add_round(commit_entry(state["commits"], commit, state["sequence"]), counts)
 
 
 def record_fingerprints(state, commit, groups):
@@ -674,9 +684,11 @@ def totals_text(state, ymd_day, day):
         out.append("")
         out.append("Commits that ran:")
         for sha in sorted(day["commits"], key=lambda sha: day["commits"][sha]["last"]):
+            total = state["commits"].get(sha)
+            # An evicted commit has no total: the day's figure is not "in all" (#289).
+            in_all = f"{hours_text(total['seconds'])} h in all" if total else "total forgotten"
             out.append(f"- `{sha[:7]}`: {hours_text(day['commits'][sha]['seconds'])} h that day, "
-                       f"{hours_text(state['commits'].get(sha, day['commits'][sha])['seconds'])}"
-                       f" h in all, {seeds_of(day['commits'][sha])} seeds that day")
+                       f"{in_all}, {seeds_of(day['commits'][sha])} seeds that day")
     if day["seen"]:
         out.append("")
         out.append("Failures by issue:")
@@ -794,6 +806,21 @@ class GitHub:
                 break
         return found
 
+    def find_open(self, marker):
+        """The number of the open `sim-fleet` issue whose body holds `marker` (the latest
+        FIND_PAGES_MAX * FIND_PAGE_SIZE open ones), or None."""
+        for page in range(1, FIND_PAGES_MAX + 1):
+            rows = self.request("GET", f"/issues?labels={LABEL}&state=open&per_page="
+                                       f"{FIND_PAGE_SIZE}&page={page}")
+            if not isinstance(rows, list):
+                raise GitHubError("refused", "not a list of issues")
+            for row in rows:
+                if marker in (row.get("body") or ""):
+                    return int(row["number"])
+            if len(rows) < FIND_PAGE_SIZE:
+                break
+        return None
+
     def open(self, title, body):
         reply = self.request("POST", "/issues", {"title": title, "body": body,
                                                  "labels": [LABEL]})
@@ -816,6 +843,9 @@ class DryRun:
 
     def markers(self):
         return {}
+
+    def find_open(self, marker):
+        return None
 
     def open(self, title, body):
         number = self.next
@@ -1088,6 +1118,48 @@ def refuse_main(args, now, log):
     return 0 if save_record(args.state, state, args.round_id, args.commit, "refused", log) else 1
 
 
+def alarm_text(args):
+    return (f"error[NRV-E0730]: the fleet's last {args.rounds} rounds in a row failed to be "
+            f"counted (the latest on commit {args.commit[:7]}, round {args.round_id}).\n\n"
+            f"A round fails when `sim_fleet.py ingest` exits non-zero or leaves no record, or "
+            f"when a worker died and the round was refused. No hours of the commit accrue "
+            f"while this goes on: `soak` reads 0.0 h. The latest failed round is kept in "
+            f"`state/last-failed-round` on the host; the journal (`journalctl -u sim-fleet`) "
+            f"says why. Fix: see NRV-E0730 in docs/ERRORS.md.\n\n{ALARM_MARKER}\n")
+
+
+def alarm_main(args, log):
+    """Files (or, if it is open already, comments on) the one open `sim-fleet` issue that says
+    rounds keep failing. Exit 0 if it did, else 1; run.sh asks again at the next failing round."""
+    if not ROUND_ID.fullmatch(args.round_id):
+        log("--round-id must be <seconds>-<16 hex digits>")
+        return 1
+    if not 1 <= args.rounds <= ALARM_ROUNDS_MAX:
+        log(f"--rounds must be 1..{ALARM_ROUNDS_MAX}")
+        return 1
+    if not args.dry_run and not (args.repo and args.token_file):
+        log("--repo and --token-file are required unless --dry-run")
+        return 1
+    try:
+        github = DryRun(print) if args.dry_run else \
+            GitHub(args.repo, read_token(args.token_file), log)
+        text = alarm_text(args)
+        number = github.find_open(ALARM_MARKER)
+        if number is None:
+            number = github.open("sim-fleet: rounds keep failing (NRV-E0730)", text)
+            log(f"alarm: filed issue #{number}")
+        else:
+            github.comment(number, text)
+            log(f"alarm: commented on issue #{number}")
+    except Environment as err:
+        log(f"alarm not filed: {err}")
+        return 1
+    except GitHubError as err:
+        log(f"alarm not filed: GitHub said {err}")
+        return 1
+    return 0
+
+
 def main(argv, now=None):
     parser = argparse.ArgumentParser(prog="sim_fleet.py")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1108,6 +1180,13 @@ def main(argv, now=None):
     cmd.add_argument("--tracker", type=int)
     cmd.add_argument("--dry-run", action="store_true")
     cmd.add_argument("--source-root", help="the checkout the binaries were built in")
+    alarm = sub.add_parser("alarm")
+    alarm.add_argument("--rounds", required=True, type=int, help="consecutive failing rounds")
+    alarm.add_argument("--round-id", required=True)
+    alarm.add_argument("--commit", required=True, type=commit_argument)
+    alarm.add_argument("--repo")
+    alarm.add_argument("--token-file")
+    alarm.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
     now = int(time.time()) if now is None else now
 
@@ -1118,6 +1197,8 @@ def main(argv, now=None):
         return soak_main(args, log)
     if args.command == "refuse":
         return refuse_main(args, now, log)
+    if args.command == "alarm":
+        return alarm_main(args, log)
     return ingest_main(args, now, log)
 
 
