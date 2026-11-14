@@ -35,7 +35,7 @@ green in CI, with a link to the run.
 | R4 · Gateway | Beside its client, never ambiguous, observable: a gateway per client process, no ambiguous 503, metrics | Delivered 2026-11-06 ([demo](https://github.com/NervaLog/nerva/actions/runs/42136037296/job/127624296815), [docs/demos/r4.md](./demos/r4.md)) |
 | R5 · Recover | Replace a lost replica, and restore from a backup, with the cluster open | Delivered 2026-11-05 ([demo](https://github.com/NervaLog/nerva/actions/runs/41997293568/job/127143488126), [docs/demos/r5.md](./demos/r5.md)) |
 | R6 · Upgrade | Rolling upgrades between releases with the same data format | Brief written ([docs/briefs/r6.md](./briefs/r6.md)) |
-| R7 · Retention | Commit keys, history and view versions trimmed below a horizon: bounded growth | Brief written ([docs/briefs/r7.md](./briefs/r7.md)) |
+| R7 · Retention | History and view versions trimmed below a horizon; bounded by the live set plus one horizon (P422) | Brief written ([docs/briefs/r7.md](./briefs/r7.md)) |
 | R8 · Native client | The client library over a C ABI, called from the JVM: no gateway, no JSON, batching as TigerBeetle's clients do | Brief written ([docs/briefs/r8.md](./briefs/r8.md)) |
 
 **The gate for strangers' money** (Botpike's invite-only launch on Nerva, Botpike/app P121b) is
@@ -290,21 +290,22 @@ request fails except as retried under its key, and the view hashes agree before 
 
 ## R7 · Retention: bounded growth
 
-**Goal:** what Nerva keeps for reading the past is kept for a declared horizon, then trimmed, so
-disk use, export and import stay bounded.
+**Goal:** history and view versions are kept for a declared horizon, then trimmed, so disk use,
+export and import are bounded by the live set plus one horizon (P422).
 
-**Why:** commit keys are kept forever (README, "Commit keys"), and history, changes and view versions
-have no retention (README, roadmap item 6; GOALS-1.0).
+**Why:** history, changes and view versions have no retention (README, roadmap item 6; GOALS-1.0).
+Commit keys and facts stay kept (P123); their retention is cut from R7 (P422).
 
 **Scope:**
 
-- A horizon per kind, declared in the log: commit keys, row history, view versions.
-- Compaction drops what is older, deterministically.
-- A key older than its horizon answers `key_expired`, never "committed again".
-- As-of reads before the horizon answer `before_horizon`.
+- A horizon per kind, declared in the log: row and record history, and view and group versions.
+- The primary's pulses write tombstones for what is older, deterministically, keeping each
+  object's latest change; compaction only reclaims the tombstones (P422).
+- As-of reads, history pages and the feed below the horizon answer `before_horizon`.
 
-**Demo script:** a cluster with a 1-day horizon at simulated time. Data, export time and memory
-stay flat across 30 simulated days of load. A retry of an expired key is refused as expired.
+**Demo script:** a real three-replica cluster with a 60 s horizon, over 30 horizons of load
+(P422). Data, export time and memory stay flat under a load that rewrites a fixed set. A read
+below the horizon is refused as `before_horizon`.
 
 ## R8 · Native client: no gateway in the client's path
 

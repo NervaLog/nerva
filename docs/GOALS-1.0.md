@@ -117,7 +117,7 @@ balances kept in a dedicated ledger, with Nerva holding facts, receipts and view
    through the generic API, balances in declared ledgers (G8, N75).
    - The engine side is in v0.6.0: commit keys (P123), records (P123b), declared indexes
      (P123c) and views over records (P123d), from the inventory in
-     `docs/design/phase-b-storage.md`. Not yet: `group_by` on `bytes` fields, index reads as of
-     a past op, and retention of keys and facts.
+     `docs/design/phase-b-storage.md`. Not yet: `group_by` on `bytes` fields and index reads as of
+     a past op. Keys and facts are kept (P123, P422).
    - The application side is next: its ledger on commit keys, then its facts as records, step
      by step (`docs/test-plan-0.6.0.md` items 1 to 3).
