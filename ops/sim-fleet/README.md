@@ -217,12 +217,13 @@ exec'd (one `NRV-E0730` line). A build that fails puts the checkout back on the 
 hands over to that commit's `run.sh` if the running one differs, so after a failed build a
 restart never starts an unbuilt `run.sh` (#432). A restart that finds the checkout still on the
 unbuilt head (the loop died between recording the failure and the checkout) puts it back and
-hands over the same way. A restart *during* a build still starts the checkout's, the unbuilt
-head's; that `run.sh` hands over at the end of the build, failed or not. A restart
-also picks up the checkout's `run.sh`: the fleet running before this change has no re-exec, so
+hands over the same way, as does a round whose fetch fails or whose main is back at the built
+commit. A restart *during* a build still starts the checkout's, the unbuilt head's; that
+`run.sh` hands over at the end of the build, or at the next round if the build was cut short.
+A restart also picks up the checkout's `run.sh`: the fleet running before this change has no re-exec, so
 restart it once after the merge for it to take effect at once. A fleet pinned
-(`SIM_FLEET_BRANCH`) to a commit older than
-this change still runs that commit's `run.sh`: restart the unit after a re-pin.
+(`SIM_FLEET_BRANCH`) to a commit older than this change still runs that commit's `run.sh`:
+restart the unit after a re-pin.
 After a change to the unit or `setup.sh`, as root: `sh /var/lib/sim-fleet/nerva/ops/
 sim-fleet/setup.sh && systemctl restart sim-fleet`.
 

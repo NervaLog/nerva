@@ -1763,6 +1763,46 @@ class FailedBuild(unittest.TestCase):
         self.assertNotIn("UNBUILT-RUN-SH", out.stdout)
         self.assertNotIn("NOT-REACHED", out.stdout)
 
+    def _restore_case(self, set_remote_url, built_is_head):
+        """HEAD is on the unbuilt v2 (a restart during its build); returns follow_main's output."""
+        d = tempfile.mkdtemp()
+        self.addCleanup(subprocess.run, ["rm", "-rf", d])
+        remote, repo, state = (os.path.join(d, n) for n in ("remote", "repo", "state"))
+        os.makedirs(os.path.join(remote, "ops", "sim-fleet"))
+        self.git(remote, "init", "-q", "-b", "main")
+        run_sh = Path(remote, "ops", "sim-fleet", "run.sh")
+        run_sh.write_text('#!/usr/bin/env bash\necho "BUILT-RUN-SH marker=${SIM_FLEET_REEXEC:-}"\n')
+        self.git(remote, "add", "-A")
+        self.git(remote, "commit", "-q", "-m", "v1")
+        v1 = self.git(remote, "rev-parse", "HEAD")
+        subprocess.run(["git", "clone", "-q", remote, repo], check=True)
+        run_sh.write_text('#!/usr/bin/env bash\necho "UNBUILT-RUN-SH"\n')
+        self.git(remote, "commit", "-q", "-a", "-m", "v2")
+        v2 = self.git(remote, "rev-parse", "HEAD")
+        self.git(repo, "fetch", "-q", "origin", "main")
+        if built_is_head:  # main was reverted to the built commit
+            self.git(remote, "reset", "-q", "--hard", v1)
+        os.makedirs(state)
+        url = remote if set_remote_url else os.path.join(d, "gone")
+        return subprocess.run(
+            ["bash", "-c", f'source "{HERE}/run.sh"; log() {{ echo "$*" >&2; }}; '
+             f'STATE="{state}"; built={v1}; broken=""; cd "{repo}"; SIM_FLEET_BRANCH=main; '
+             f'SIM_FLEET_GIT_TIMEOUT=60; SIM_FLEET_REPO_DIR="{repo}"; RUN_ARGS=(a); '
+             f'RUN_SH_SUM=0; ORIG_ENV=(); git checkout -q --detach {v2}; '
+             f'git remote set-url origin "{url}"; follow_main; echo NOT-REACHED'],
+            env={"PATH": os.environ["PATH"], "HOME": d}, capture_output=True, text=True,
+            timeout=60)
+
+    def test_a_failed_fetch_still_hands_over_to_the_built_run_sh(self):
+        out = self._restore_case(set_remote_url=False, built_is_head=False)
+        self.assertIn("BUILT-RUN-SH", out.stdout, out.stderr)
+        self.assertNotIn("UNBUILT-RUN-SH", out.stdout)
+
+    def test_a_main_reverted_to_the_built_commit_hands_over_to_the_built_run_sh(self):
+        out = self._restore_case(set_remote_url=True, built_is_head=True)
+        self.assertIn("BUILT-RUN-SH", out.stdout, out.stderr)
+        self.assertNotIn("UNBUILT-RUN-SH", out.stdout)
+
     def test_a_restart_already_on_the_built_commit_stays_put(self):
         d = tempfile.mkdtemp()
         self.addCleanup(subprocess.run, ["rm", "-rf", d])

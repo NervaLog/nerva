@@ -249,21 +249,13 @@ log() {
 follow_main() {
     if ! timeout "$SIM_FLEET_GIT_TIMEOUT" git fetch --quiet origin "$SIM_FLEET_BRANCH"; then
         log "git fetch failed or timed out; keeping ${built:-nothing}"
+        restore_built
         return 0
     fi
     local head
     head=$(git rev-parse FETCH_HEAD)
-    if [[ "$head" == "$built" ]]; then
-        return 0
-    fi
-    if [[ "$head" == "$broken" ]]; then
-        # A failed build writes `broken` before it checks the built commit out again: a crash in
-        # between leaves the checkout, and the run.sh the unit starts, on the unbuilt head (#424).
-        if [[ -n "$built" && "$(git rev-parse HEAD)" != "$built" ]]; then
-            log "checkout is not on the built commit $built; restoring it"
-            git checkout --quiet --detach "$built"
-            reexec_if_changed "$built"
-        fi
+    if [[ "$head" == "$built" || "$head" == "$broken" ]]; then
+        restore_built
         return 0
     fi
     prune_cache
@@ -291,11 +283,22 @@ follow_main() {
         # to that commit's reporter, not the one that failed to build (#432). And the run.sh
         # running now may be the unbuilt head's (a restart during the build): hand over to the
         # built commit's, as after a successful build (#424).
-        if [[ -n "$built" ]]; then
-            git checkout --quiet --detach "$built"
-            reexec_if_changed "$built"
-        fi
+        restore_built
     fi
+}
+
+# The checkout and the run.sh running are the built commit's, else puts the checkout back and
+# hands over to that commit's run.sh. A restart during a build, or a crash between recording a
+# failed build and undoing its checkout, leaves the unbuilt head's (#424, #432); so does a
+# fetch that fails, or a main reverted to the built commit, on the next round. Called at every
+# return of follow_main that does not build.
+restore_built() {
+    if [[ -z "$built" ]]; then return 0; fi
+    if [[ "$(git rev-parse HEAD)" != "$built" ]]; then
+        log "checkout is not on the built commit $built; restoring it"
+        git checkout --quiet --detach "$built"
+    fi
+    reexec_if_changed "$built"
 }
 
 # After a build of $1: if that commit's run.sh is not the one bash loaded, runs that one instead,
