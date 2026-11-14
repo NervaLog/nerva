@@ -235,8 +235,18 @@ def main():
         before = sha(data)
         with open(data, "rb") as holder:
             fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            # The pid is named where /proc/locks names this file as os.stat does; on a file
+            # system that differs (btrfs subvolumes, overlayfs) it is not, and the refusal is
+            # the same without it.
+            info = os.fstat(holder.fileno())
+            key = f"{os.major(info.st_dev):02x}:{os.minor(info.st_dev):02x}:{info.st_ino} "
+            try:
+                with open("/proc/locks") as table:
+                    named = any(key in line for line in table)
+            except OSError:
+                named = False
             check("start locked file", start + [data], "NRV-E0703", 1,
-                  f"another process holds {data} (pid {os.getpid()})")
+                  f"another process holds {data}" + (f" (pid {os.getpid()})" if named else ""))
         assert sha(data) == before
 
         # The test build with commit-key deduplication off (R1): E0717 without --development,

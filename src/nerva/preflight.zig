@@ -13,6 +13,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const assert = std.debug.assert;
 const posix = std.posix;
+const linux = std.os.linux;
 
 const stdx = @import("stdx");
 const vsr = @import("../vsr.zig");
@@ -155,7 +156,8 @@ const LockProbe = struct {
     /// The pid `/proc/locks` shows holding this file's `flock`, if that process has the file open.
     /// `/proc/locks` keeps the pid a lock was taken by after that process is reaped, and the
     /// number may be reused, so the pid is named only when `/proc/<pid>/fd` has this very file.
-    /// Null when no such process (gone, a zombie, reused, another user's under `hidepid`), or
+    /// Null when no such process (gone, a zombie, exiting, reused, another user's: its descriptors
+    /// are never readable to this one, `hidepid` or not), or
     /// when this cannot be told (not Linux, `/proc/locks` unreadable or over `proc_locks_size_max`,
     /// a file system whose device `/proc/locks` names differently): the caller then keeps the
     /// bounded wait.
@@ -171,6 +173,7 @@ const LockProbe = struct {
             device_minor(probe.stat.dev),
             probe.stat.ino,
         ) orelse return null;
+        if (pid == std.os.linux.getpid()) return null; // never this process's own descriptor
         return if (process_holds_file(pid, probe.stat)) pid else null;
     }
 
@@ -228,22 +231,73 @@ fn proc_locks_holder(text: []const u8, major: u32, minor: u32, inode: u64) ?posi
     return null;
 }
 
-/// Whether process `pid` has the file `stat` describes open (same device and inode): a zombie or
-/// an exited process has no descriptors, and a reused pid has other files. Only `/proc/<pid>/fd`
-/// is used, so the answer is in the namespace `/proc/locks` is in. False where the directory
-/// cannot be read, or has more than `proc_fd_scan_max` entries without the file.
+/// The `PF_EXITING` flag of `/proc/<pid>/stat`: the process is in `do_exit`.
+const pf_exiting = 0x4;
+
+/// Whether the text of `/proc/<pid>/stat` says the process is exiting (`PF_EXITING`, `flags`, field
+/// 9). `comm` (field 2) may hold spaces and parentheses, so fields are counted after the last ')'.
+/// False for text that does not parse.
+fn stat_exiting(text: []const u8) bool {
+    const close = std.mem.lastIndexOfScalar(u8, text, ')') orelse return false;
+    var fields = std.mem.tokenizeAny(u8, text[close + 1 ..], " \n");
+    // Fields 3 to 8: state, ppid, pgrp, session, tty_nr, tpgid; then field 9.
+    for (0..6) |_| _ = fields.next() orelse return false;
+    const flags_text = fields.next() orelse return false;
+    const flags = std.fmt.parseInt(u64, flags_text, 10) catch return false;
+    return flags & pf_exiting != 0;
+}
+
+/// Whether process `pid` is in `do_exit`. A process killed with SIGKILL keeps its descriptors
+/// until `exit_files`, after in-flight direct IO is cancelled, so it is not yet a live holder.
+/// False where `/proc/<pid>/stat` cannot be read.
+fn process_exiting(pid: posix.pid_t) bool {
+    var path_buffer: [32]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buffer, "/proc/{}/stat", .{pid}) catch unreachable;
+    const file = std.fs.openFileAbsolute(path, .{}) catch return false;
+    defer file.close();
+    var buffer: [512]u8 = undefined;
+    const length = file.readAll(&buffer) catch return false;
+    return stat_exiting(buffer[0..length]);
+}
+
+/// Whether process `pid` has the file `stat` describes open (same device and inode) and is not
+/// exiting: a zombie or an exited process has no descriptors, and a reused pid has other files.
+/// Only `/proc/<pid>/fd` is used, so the answer is in the namespace `/proc/locks` is in. False
+/// where the directory cannot be read (another user's process is never readable), or has more than
+/// `proc_fd_scan_max` entries without the file.
 fn process_holds_file(pid: posix.pid_t, stat: posix.Stat) bool {
     var path_buffer: [32]u8 = undefined;
     const path = std.fmt.bufPrint(&path_buffer, "/proc/{}/fd", .{pid}) catch unreachable;
     var dir = std.fs.openDirAbsolute(path, .{ .iterate = true }) catch return false;
     defer dir.close();
+    if (!dir_holds_file(dir, device_major(stat.dev), device_minor(stat.dev), stat.ino)) return false;
+    return !process_exiting(pid);
+}
+
+/// Whether one of the first `proc_fd_scan_max` entries of `dir` (a `/proc/<pid>/fd`) is the file
+/// `major:minor:inode`. Each entry costs one `statx` that does not sync with a server
+/// (`AT_STATX_DONT_SYNC`), so a descriptor on a hung NFS or FUSE file does not block it.
+fn dir_holds_file(dir: std.fs.Dir, major: u32, minor: u32, inode: u64) bool {
     var entries = dir.iterate();
     var scanned: u32 = 0;
     while (entries.next() catch return false) |entry| {
         if (scanned == proc_fd_scan_max) return false;
         scanned += 1;
-        const entry_stat = posix.fstatat(dir.fd, entry.name, 0) catch continue;
-        if (entry_stat.dev == stat.dev and entry_stat.ino == stat.ino) return true;
+        var name: [std.fs.max_name_bytes + 1]u8 = undefined;
+        if (entry.name.len >= name.len) continue;
+        @memcpy(name[0..entry.name.len], entry.name);
+        name[entry.name.len] = 0;
+        var statx: linux.Statx = undefined;
+        const rc = linux.statx(
+            dir.fd,
+            @ptrCast(&name),
+            linux.AT.STATX_DONT_SYNC,
+            linux.STATX_INO,
+            &statx,
+        );
+        if (linux.E.init(rc) != .SUCCESS) continue;
+        if (statx.mask & linux.STATX_INO == 0) continue;
+        if (statx.dev_major == major and statx.dev_minor == minor and statx.ino == inode) return true;
     }
     return false;
 }
@@ -414,17 +468,32 @@ test "preflight: a lock held by a live process is refused at once, naming its pi
     const path = try std.fmt.bufPrint(&path_buffer, "{s}/held", .{dir});
     const file = try std.fs.createFileAbsolute(path, .{});
     defer file.close();
-    try posix.flock(file.handle, posix.LOCK.EX | posix.LOCK.NB);
+    // A live holder other than this process: the child takes the lock through the inherited
+    // descriptor, tells the parent, and sleeps until killed.
+    const ready = try posix.pipe();
+    const child = try posix.fork();
+    if (child == 0) {
+        posix.flock(file.handle, posix.LOCK.EX | posix.LOCK.NB) catch posix.exit(1);
+        _ = posix.write(ready[1], "x") catch posix.exit(1);
+        std.time.sleep(60 * std.time.ns_per_s);
+        posix.exit(0);
+    }
+    posix.close(ready[1]);
+    defer posix.close(ready[0]);
+    var byte: [1]u8 = undefined;
+    try testing.expectEqual(@as(usize, 1), try posix.read(ready[0], &byte));
     const started = std.time.milliTimestamp();
     const refusal = (try open_check(testing.allocator, path, .disabled)).?;
     try testing.expect(refusal == .locked);
-    // The holder is this process: alive and with the file open, so no 2 s wait. Where /proc/locks
-    // names the file differently (overlayfs, btrfs subvolumes) it waits the bound and names no
-    // pid; tests/errors/commands.py asserts the pid on CI's file system.
+    // Alive with the file open, so no 2 s wait. Where /proc/locks names the file differently
+    // (overlayfs, btrfs subvolumes) it waits the bound and names no pid; tests/errors/commands.py
+    // asserts the pid where the file system allows.
     if (refusal.locked) |pid| {
-        try testing.expectEqual(std.os.linux.getpid(), pid);
+        try testing.expectEqual(child, pid);
         try testing.expect(std.time.milliTimestamp() - started < lock_wait_ms / 2);
     }
+    posix.kill(child, posix.SIG.KILL) catch unreachable;
+    _ = posix.waitpid(child, 0);
     try posix.flock(file.handle, posix.LOCK.UN);
     // Free: the next check goes on to the superblock, which an empty file lacks.
     try testing.expect((try open_check(testing.allocator, path, .disabled)).? == .damaged);
@@ -596,6 +665,80 @@ test "preflight: a lock released within the wait is not refused" {
     releaser.join();
     // Free within the wait: the check went on to the superblock, which an empty file lacks.
     try testing.expect(refusal == .damaged);
+}
+
+test "preflight: a process that is exiting is not a holder" {
+    // Fields 3 to 8 are "S 1 2 3 4 5"; flags (field 9) 4194304 has PF_EXITING clear, 4194308 set.
+    try testing.expect(!stat_exiting("42 (nerva) S 1 2 3 4 5 4194304 0 0"));
+    try testing.expect(stat_exiting("42 (nerva) Z 1 2 3 4 5 4194308 0 0"));
+    // A comm with spaces and ") " in it: fields are counted after the last ')'.
+    try testing.expect(stat_exiting("42 (a) b (c d) S 1 2 3 4 5 4 0 0\n"));
+    try testing.expect(!stat_exiting("42 (a) 4 (c d) S 1 2 3 4 5 0 0 0\n"));
+    // Not parseable: not exiting.
+    try testing.expect(!stat_exiting(""));
+    try testing.expect(!stat_exiting("42 nerva S 1 2 3 4 5 4"));
+    try testing.expect(!stat_exiting("42 (nerva) S 1 2 3"));
+    try testing.expect(!stat_exiting("42 (nerva) S 1 2 3 4 5 x"));
+    // This process, running this test, is not exiting.
+    try testing.expect(!process_exiting(linux.getpid()));
+    try testing.expect(!process_exiting(1 << 23));
+}
+
+test "preflight: a descriptor scan stops at its bound" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try tmp.dir.realpath(".", &buffer);
+    var target_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const target_path = try std.fmt.bufPrint(&target_buffer, "{s}/target", .{root});
+    var decoy_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const decoy_path = try std.fmt.bufPrint(&decoy_buffer, "{s}/decoy", .{root});
+    (try std.fs.createFileAbsolute(target_path, .{})).close();
+    (try std.fs.createFileAbsolute(decoy_path, .{})).close();
+    const target = blk: {
+        const f = try std.fs.openFileAbsolute(target_path, .{});
+        defer f.close();
+        break :blk try posix.fstat(f.handle);
+    };
+    try tmp.dir.makeDir("fds");
+    var fds = try tmp.dir.openDir("fds", .{ .iterate = true });
+    defer fds.close();
+    // The same symlinks as a process's /proc/<pid>/fd: every one a decoy, one more than the bound.
+    var names: [proc_fd_scan_max + 1][8]u8 = undefined;
+    for (&names, 0..) |*name, index| {
+        _ = std.fmt.bufPrint(name, "{d:0>8}", .{index}) catch unreachable;
+        try fds.symLink(decoy_path, name, .{});
+    }
+    const major = device_major(target.dev);
+    const minor = device_minor(target.dev);
+    try testing.expect(!dir_holds_file(fds, major, minor, target.ino));
+    // The kernel's order of the entries, which the file system chooses.
+    var order: [proc_fd_scan_max + 1][8]u8 = undefined;
+    var count: usize = 0;
+    var entries = fds.iterate();
+    while (try entries.next()) |entry| : (count += 1) @memcpy(&order[count], entry.name);
+    try testing.expectEqual(proc_fd_scan_max + 1, count);
+    // The target at the last position scanned is found; one past it, not. Some file systems list a
+    // recreated name first, so the target's position is read back, not assumed.
+    for ([_]struct { index: usize, found: bool }{
+        .{ .index = proc_fd_scan_max - 1, .found = true },
+        .{ .index = proc_fd_scan_max, .found = false },
+    }) |case| {
+        const name = order[case.index];
+        try fds.deleteFile(&name);
+        try fds.symLink(target_path, &name, .{});
+        var position: usize = 0;
+        var again = fds.iterate();
+        while (try again.next()) |entry| : (position += 1) {
+            if (std.mem.eql(u8, entry.name, &name)) break;
+        }
+        if (position == case.index) {
+            try testing.expectEqual(case.found, dir_holds_file(fds, major, minor, target.ino));
+        }
+        try fds.deleteFile(&name);
+        try fds.symLink(decoy_path, &name, .{});
+    }
 }
 
 /// glibc's `makedev`, the inverse of the splits above.

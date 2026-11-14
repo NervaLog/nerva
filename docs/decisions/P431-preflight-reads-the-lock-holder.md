@@ -27,6 +27,11 @@ amends: P290
 - **Cost:** a lock held by a live process that exits within the 2 s is now refused, where P290
   would have waited for it; the supervisor restarts as it would for any E0703. A child that
   inherited the descriptor of a dead holder keeps the lock under the dead pid: it waits the 2 s and
-  is refused without a pid. A holder that is dying but still has the file open (state `D` after `kill -9`) is refused at once
-  with its pid, not waited for. The exit status of E0703 (#294's second point) is for #292, not
+  is refused without a pid. A holder that is exiting
+  (`PF_EXITING` in `/proc/<pid>/stat`, still in `do_exit` before `exit_files`) is not named, so
+  `kill -9; start` waits as under P290. A holder run by another user is never named (its
+  `/proc/<pid>/fd` is unreadable to this process, `hidepid` or not), and this process's own pid is
+  never named. Each attempt costs up to 4096 `statx` calls with `AT_STATX_DONT_SYNC`, so a
+  descriptor on a hung NFS or FUSE file does not block the scan; a live holder with that many
+  descriptors makes the wait longer than 2 s. The exit status of E0703 (#294's second point) is for #292, not
   decided here.
