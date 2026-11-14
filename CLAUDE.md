@@ -57,7 +57,7 @@ upgrade steps), then bump `VERSION` (and add a worklog note, `worklog/<number>.m
 The section becomes the GitHub release notes; a version without one is refused. The `VERSION` commit
 then runs the rest unattended: the draft, then `release-finish.yml`, which signs the Mac zip and
 checks it, publishes the draft, publishes the apt and dnf repositories at `packages.nerva.pro`
-(`repos-ready` before the publish, `repos` after it, then `repos-verify`; docs/releases/packages.md),
+(`repos-ready` before the publish, `repos` after it, then `repos-verify`, then `site-verify`; docs/releases/packages.md),
 commits the Homebrew formula to the tap and opens the site's pull request. The owner's single approval of the `apple-signing` environment ships all of it. If a run
 stops, `release-finish.yml` can be started by hand from `main` with the tag, to recover it.
 A session never approves a deployment (an environment's required review); only the owner does (P360).

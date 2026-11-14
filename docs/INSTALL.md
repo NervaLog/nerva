@@ -5,7 +5,7 @@ release can be used from its notes alone. Until the release exists, the file nam
 names the release process is set up to give its assets (the release workflow for the Linux
 assets, `zig build -Drelease mac-release` for the Mac zip), and the Homebrew tap and the packages are
 built but not published: check the release page for what it actually lists. The Linux
-repositories at `packages.nerva.pro` are signed (see [Linux](#the-apt-and-dnf-repositories));
+repositories at `packages.nerva.pro`, once v0.7.1 is released, are signed (see [Linux](#the-apt-and-dnf-repositories));
 the files on the release page are not, and are checked with `SHA256SUMS`. What is signed or
 checked is said under each heading.
 
@@ -83,8 +83,8 @@ failure behavior, and the production claims in this repository are Linux's.
 
 ### The apt and dnf repositories
 
-`https://packages.nerva.pro` serves signed apt and dnf repositories with every release (v0.7.1 and
-later). The repository's metadata and its rpms are signed with one key, and its fingerprint is
+`https://packages.nerva.pro` will serve signed apt and dnf repositories with every release from
+v0.7.1 on; it serves nothing until v0.7.1 is released, so `apt update` fails against it before then. The repository's metadata and its rpms are signed with one key, and its fingerprint is
 
 ```
 949F066FB37C440E54B2A902AEA7B66340A6DBAB
