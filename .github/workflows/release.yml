@@ -271,7 +271,8 @@ jobs:
   # draft and stops there (it is finished by dispatching release-finish.yml from main with its tag);
   # the workflow's own `guard` and each environment's main-only deployment rule are the other guards.
   # A prerelease draft may target only main plus VERSION and CHANGELOG.md (release_check.sh
-  # mac-draft, P343). The workflow takes no inherited secrets.
+  # mac-draft, P343). It inherits this repository's secrets: a called workflow sees none, its jobs'
+  # environment secrets included, unless the caller passes them (P<PR>).
   finish:
     needs: [version, release]
     if: github.ref == 'refs/heads/main'
@@ -279,5 +280,6 @@ jobs:
     permissions:
       contents: write
       issues: write
+    secrets: inherit
     with:
       tag: ${{ needs.version.outputs.tag }}

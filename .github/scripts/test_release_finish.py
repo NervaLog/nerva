@@ -777,9 +777,26 @@ class Workflow(unittest.TestCase):
             if m and not m.group(1).startswith("./"):
                 self.assertRegex(m.group(1), r"@[0-9a-f]{40}$", line)
 
-    def test_no_pull_request_target_and_no_secrets_inherit(self):
+    def test_no_pull_request_target(self):
         self.assertNotIn("pull_request_target", self.text)
-        self.assertNotIn("secrets: inherit", self.text)
+
+    def test_secrets_are_inherited_only_by_the_signing_call_and_by_release_yml(self):
+        # A called workflow sees no secret, its environment's included, unless the caller passes
+        # it: without these two, v0.7.1's signing saw every APPLE_* secret empty (NRV-E1121).
+        jobs = self.text.split("\njobs:\n")[1]
+        inheriting = [
+            name
+            for name in re.findall(r"(?m)^  ([a-z-]+):$", jobs)
+            if "secrets: inherit"
+            in re.split(r"\n  [a-z-]+:\n", jobs.split(f"\n  {name}:\n")[1])[0]
+        ]
+        self.assertEqual(inheriting, ["mac"])
+        release = (WORKFLOW.parent / "release.yml").read_text()
+        finish = release.split("\n  finish:\n")[1]
+        finish = re.split(r"\n  [a-z-]+:\n", finish)[0]
+        self.assertIn("uses: ./.github/workflows/release-finish.yml", finish)
+        self.assertIn("secrets: inherit", finish)
+        self.assertEqual(release.count("secrets: inherit"), 1)
 
     def test_every_job_declares_its_permissions(self):
         jobs = self.text.split("\njobs:\n")[1]
