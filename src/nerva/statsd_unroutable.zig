@@ -78,7 +78,7 @@ test "statsd: a reachable collector still receives the packets" {
         .revents = 0,
     }};
     try std.testing.expectEqual(@as(usize, 1), try std.posix.poll(&poll_fds, 5_000));
-    const received = try std.posix.recv(collector, &packet, std.posix.MSG.DONTWAIT);
+    const received = try std.posix.recv(collector, &packet, 0);
     try std.testing.expect(std.mem.indexOf(u8, packet[0..received], "replica_commit_min") != null);
 }
 
