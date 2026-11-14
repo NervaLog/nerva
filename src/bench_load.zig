@@ -201,41 +201,20 @@ fn run_flags(gpa: std.mem.Allocator, args: CLIArgs, failure: *?bench_timeline.Fi
     }
 
     // The files this run writes are opened now, so that a bad path costs no measurement
-    // (NRV-E0728). A new file, or a regular file this user owns (one link, writable), is written
-    // beside its path and renamed into place once whole (`OutFile`, P414b); any other path is
-    // opened in place and written, and truncated, only once the run has succeeded (P414c), so
-    // that a later failure leaves its earlier content in both. Two flags may not name one file.
-    const flags_and_paths = [_]struct { flag: []const u8, path: ?[]const u8 }{
-        .{ .flag = "--timeline", .path = args.timeline },
-        .{ .flag = "--gateway-pid-file", .path = args.@"gateway-pid-file" },
-        .{ .flag = "--output", .path = args.output },
-    };
-    for (flags_and_paths, 0..) |later, i| {
-        const later_path = later.path orelse continue;
-        for (flags_and_paths[0..i]) |earlier| {
-            const earlier_path = earlier.path orelse continue;
-            const same = bench_timeline.same_file(gpa, earlier_path, later_path) catch |err| {
-                failure.* = .{ .flag = later.flag, .path = later_path, .err = err };
-                return error.FileWriteFailed;
-            };
-            if (same) {
-                failure.* = .{ .flag = later.flag, .path = later_path, .err = error.OutputsCollide };
-                return error.FileWriteFailed;
-            }
-        }
-    }
+    // (NRV-E0728). As on main, a path is created or truncated, and a failed run leaves it so
+    // (P414d).
     var timeline_out = if (args.timeline) |path|
-        try file_open("--timeline", gpa, path, failure)
+        try file_open("--timeline", path, failure)
     else
         null;
     defer if (timeline_out) |*out| out.deinit();
     var pid_out = if (args.@"gateway-pid-file") |path|
-        try file_open("--gateway-pid-file", gpa, path, failure)
+        try file_open("--gateway-pid-file", path, failure)
     else
         null;
     defer if (pid_out) |*out| out.deinit();
     var output_out = if (args.output) |path|
-        try file_open("--output", gpa, path, failure)
+        try file_open("--output", path, failure)
     else
         null;
     defer if (output_out) |*out| out.deinit();
@@ -278,22 +257,19 @@ fn run_flags(gpa: std.mem.Allocator, args: CLIArgs, failure: *?bench_timeline.Fi
     defer json.deinit();
     try result_write(json.writer(), &config, &result);
     try json.append('\n');
-    // Nothing is written to `--timeline` or `--output` before this point: a run that fails leaves
-    // each as it was (P414c). The PID file is the exception: it is replaced when the gateway
-    // spawns and removed when it stops. The finished timeline survives whatever happens to the
-    // summary after it.
+    // The finished timeline survives whatever happens to the summary after it.
     if (timeline_out) |*out| {
         var lines = std.ArrayList(u8).init(gpa);
         defer lines.deinit();
         try timeline.write(lines.writer());
-        out.finish(lines.items) catch |err| {
-            failure.* = bench_timeline.FileFailure.of("--timeline", out, err);
+        out.write(lines.items) catch |err| {
+            failure.* = .{ .flag = "--timeline", .path = out.path, .err = err };
             return error.FileWriteFailed;
         };
     }
     if (output_out) |*out| {
-        out.finish(json.items) catch |err| {
-            failure.* = bench_timeline.FileFailure.of("--output", out, err);
+        out.write(json.items) catch |err| {
+            failure.* = .{ .flag = "--output", .path = out.path, .err = err };
             return error.FileWriteFailed;
         };
     } else {
@@ -306,11 +282,10 @@ fn run_flags(gpa: std.mem.Allocator, args: CLIArgs, failure: *?bench_timeline.Fi
 /// (NRV-E0728; `main` reports it after the defers have run).
 fn file_open(
     flag: []const u8,
-    gpa: std.mem.Allocator,
     path: []const u8,
     failure: *?bench_timeline.FileFailure,
 ) !bench_timeline.OutFile {
-    return bench_timeline.OutFile.open(gpa, path) catch |err| {
+    return bench_timeline.OutFile.open(path) catch |err| {
         failure.* = .{ .flag = flag, .path = path, .err = err };
         return error.FileWriteFailed;
     };

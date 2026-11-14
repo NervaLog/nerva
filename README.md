@@ -534,35 +534,13 @@ runs the first s seconds as usual, but leaves their operations out of the summar
 throughput and percentiles); their timeline lines carry `"warmup":true`. `--warmup` + `--seconds`
 is at most 3600, and the summary JSON gains `"warmup"` and `"late_operations"` members.
 `--timeline`, `--gateway-pid-file` and `--output` are all opened before anything starts, so a bad
-path is refused at once with NRV-E0728. A path not made yet, or a regular file you
-own, with one link and writable, is written as a temporary file beside its path
-(`.nerva-<hash>.<pid>.<random>.tmp`, created exclusively, so a symbolic link planted at its name is
-never followed; a taken name is retried with another, 8 times at most, then the path is refused
-with NRV-E0728) with the file's permission bits and group, and renamed into place when it is
-complete, so the path holds either its earlier content or the whole new content. The temporary
-file is removed on every failure path, except that a run killed by a signal leaves it behind, and
-that a rename refused after the run falls back to writing the content into the path in place: if
-that fails too, the temporary file is **kept**, NRV-E0728 names it ("the result is kept in
-<file>") and the path itself may be empty. Every other path is opened as a plain open for writing
-does, as on `main`, which is **not atomic**: nothing is written before the run has succeeded (a
-missing file is created empty, an existing one is opened for writing), and then the file is
-truncated and written, so a run that fails leaves the earlier content and a write that fails after
-the truncation leaves the file short. That covers a file of another
-owner, a file with several links, a file in a directory you cannot write, a dangling symbolic link
-(it is followed, and its target made) and anything that is not a regular file (a device such as
-`/dev/full`, a pipe, `/dev/stdout` on a pipe, `/dev/fd/N`); a FIFO blocks the run's start until a
-reader opens it, as `cat > fifo` does. A file you cannot write is refused (P414b, P414c). Where
-`fs.protected_regular` is set (the systemd default), the kernel refuses even root's open of
-another user's file in a sticky, world-writable directory, and NRV-E0728 says "permission denied".
-Two flags may not name one file, whatever the names: the same path, a hard link, or symbolic links
-(a dangling one is followed to the file it would make) that resolve to one file are refused with
-NRV-E0728 ("another output flag names the same file"); a device such as `/dev/null` may be named
-twice. A later
-write failure prints the same line after the cluster and the gateway it started are torn down. The
-PID file is the one path a failed run does not leave as it was: it is replaced when the gateway
-spawns, and, if it is a regular file, removed when the gateway stops (if its directory lets the
-run remove it), so a run that fails after the spawn leaves no file at that path, while one that
-fails before the spawn leaves an earlier file untouched. A value out of range (`--clients`, `--batch`, `--keys`, `--hot`, `--warmup` plus
+path is refused at once with NRV-E0728. They are opened as `--output` is on `main`: a missing file is
+created, an existing one is truncated (P414d). There is no temporary file and no rename: a run that
+fails leaves a truncated or short file, and two flags that name one file overwrite each other. The
+timeline and the summary are written when the run ends, and a write that fails prints the same line
+after the cluster and the gateway it started are torn down. The PID file is replaced when the
+gateway spawns and, if it is a regular file, removed when the gateway stops (a device such as
+`/dev/null` is never removed). A value out of range (`--clients`, `--batch`, `--keys`, `--hot`, `--warmup` plus
 `--seconds`, `--local`'s client limit) is NRV-E0002. For the `botpike` workload only
 (refused for the others): `--gateway-statsd=<host:port>` (checked before anything starts, NRV-E0736)
 passes `--statsd` to the gateway it starts, `--gateway-pid-file=<file>` writes the gateway's PID there right after it spawns, and

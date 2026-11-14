@@ -84,7 +84,7 @@ const Outcome = struct {
 pub const GatewayOptions = struct {
     /// `nerva api --statsd`.
     statsd: ?[]const u8 = null,
-    /// Where the gateway's PID is written, right after it spawns (committed once written).
+    /// Where the gateway's PID is written, right after it spawns .
     pid_file: ?*bench_timeline.OutFile = null,
     /// Pass the gateway's stderr on to this process's instead of dropping it.
     inherit_stderr: bool = false,
@@ -145,10 +145,9 @@ pub const Gateway = struct {
         if (options.pid_file) |out| {
             var pid_buffer: [32]u8 = undefined;
             const pid = try std.fmt.bufPrint(&pid_buffer, "{}\n", .{gateway.process.id});
-            out.finish(pid) catch |err| return pid_failure(options, out, err);
-            // Set for any regular file, written in place or renamed: `stop` deletes it, which must
-            // not be a device.
-            if (out.regular()) gateway.pid_file = out.final;
+            out.write(pid) catch |err| return pid_failure(options, out, err);
+            // `stop` deletes it, which must not be a device.
+            if (out.regular) gateway.pid_file = out.path;
         }
 
         // The replicas may still be starting: wait until the gateway has a session.
@@ -163,15 +162,13 @@ pub const Gateway = struct {
     }
 
     fn pid_failure(options: GatewayOptions, out: *const bench_timeline.OutFile, err: anyerror) error{FileWriteFailed} {
-        if (options.failure) |failure| failure.* = bench_timeline.FileFailure.of("--gateway-pid-file", out, err);
+        if (options.failure) |failure| failure.* = bench_timeline.FileFailure{ .flag = "--gateway-pid-file", .path = out.path, .err = err };
         return error.FileWriteFailed;
     }
 
     pub fn stop(gateway: *Gateway) void {
         _ = gateway.process.kill() catch {};
         // The PID names a process that is gone: a reader must not find one (it could be reused).
-        // The path is resolved when the file is opened, so a symbolic link's target is deleted
-        // and the link left (P414c).
         if (gateway.pid_file) |path| std.fs.cwd().deleteFile(path) catch {};
         gateway.pid_file = null;
     }

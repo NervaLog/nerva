@@ -252,47 +252,13 @@ def main():
             assert result.returncode == 1 and len(lines) == 1, (label, lines)
             assert lines[0].startswith("error[NRV-E0002]: bench-load: --"), (label, lines)
         print("ok out-of-range flags refused (NRV-E0002)")
-        # Every output is opened before any is emptied: an earlier result at --timeline survives a
-        # refused --gateway-pid-file or --output, and no file of the refused run is left. The
-        # statsd address is valid, so the run gets as far as the PID file (without the fix the
-        # timeline is truncated first).
-        for flag, label in [("--gateway-pid-file", "PID file"), ("--output", "output")]:
-            keep = os.path.join(tmp, "keep.jsonl")
-            with open(keep, "w") as handle:
-                handle.write("previous-result\n")
-            bad = os.path.join(tmp, "no-such-dir", "out")
-            result = run(bench, ["--local", "--workload=botpike", "--seconds=1", f"--timeline={keep}",
-                                 f"{flag}={bad}", "--gateway-statsd=127.0.0.1:8125"], timeout=30)
-            lines = [line for line in result.stderr.splitlines() if line.strip()]
-            assert result.returncode == 1 and len(lines) == 1, (label, lines)
-            assert lines[0].startswith(f"error[NRV-E0728]: bench-load: {flag}: cannot write "), lines
-            assert "error." not in lines[0] and not result.stdout, (label, lines, result.stdout)
-            with open(keep) as handle:
-                assert handle.read() == "previous-result\n", f"{label}: the earlier timeline was emptied"
-            assert_clean(f"refused {label}")
-        print("ok a refused output leaves an earlier timeline untouched (NRV-E0728)")
-        # A plain-opened output (a hard-linked file is written in place, not renamed) is changed only
-        # once the run has succeeded, as on main (P414c): a refused later flag leaves it as it was.
-        hard = os.path.join(tmp, "hard.json")
-        with open(hard, "w") as handle:
-            handle.write("previous-result\n")
-        os.link(hard, hard + ".twin")
-        result = run(bench, ["--local", "--workload=botpike", "--seconds=1", f"--output={hard}",
-                             f"--gateway-pid-file={os.path.join(tmp, 'no-such-dir', 'pid')}",
-                             "--gateway-statsd=127.0.0.1:8125"], timeout=30)
-        assert result.returncode == 1 and "NRV-E0728" in result.stderr, result.stderr
-        with open(hard) as handle:
-            assert handle.read() == "previous-result\n", "a hard-linked --output was emptied by a refused run"
-        assert_clean("refused run with a hard-linked output")
-        print("ok a plain-opened output is untouched by a refused run (P414c)")
-        # A bad --output is refused before the run, one coded line, with no timeline made.
+        # A bad --output is refused before the run, one coded line.
         timeline = os.path.join(tmp, "fresh.jsonl")
         result = run(bench, ["--local", "--workload=c1", "--seconds=1", f"--timeline={timeline}",
                              "--output=/no/such/dir/out.json"], timeout=30)
         lines = [line for line in result.stderr.splitlines() if line.strip()]
         assert result.returncode == 1 and len(lines) == 1 and lines[0].startswith(
             "error[NRV-E0728]: bench-load: --output: cannot write /no/such/dir/out.json"), lines
-        assert not os.path.exists(timeline), "a timeline is left by a refused run"
         assert_clean("bad --output")
         # A finished timeline survives a failed --output write (/dev/full is a device: not removed).
         timeline = os.path.join(tmp, "survives.jsonl")
@@ -304,27 +270,6 @@ def main():
         assert os.path.getsize(timeline) > 0, "the finished timeline was lost"
         assert_clean("failed --output write")
         print("ok --output refused up front; a finished timeline survives (NRV-E0728)")
-        # An earlier --timeline / --output survives any later failure: a PID file that cannot be
-        # written, a gateway that does not start, a timeline that cannot be written.
-        for label, extra in [
-            ("PID file on /dev/full", ["--workload=botpike", "--gateway-pid-file=/dev/full"]),
-            ("--nerva=/bin/false", ["--workload=botpike", "--nerva=/bin/false"]),
-            ("timeline on /dev/full", ["--workload=c1"]),
-        ]:
-            keep = os.path.join(tmp, "earlier.json")
-            with open(keep, "w") as handle:
-                handle.write("previous-result\n")
-            if label.startswith("timeline"):
-                argv = ["--workload=c1", "--timeline=/dev/full", f"--output={keep}"]
-            else:
-                argv = [f"--timeline={keep}"] + extra
-            result = run(bench, ["--local", "--seconds=1"] + argv, timeout=120)
-            assert result.returncode == 1, (label, result.returncode, result.stderr[-300:])
-            with open(keep) as handle:
-                assert handle.read() == "previous-result\n", f"{label}: the earlier file was emptied"
-            assert [n for n in os.listdir(tmp) if n.endswith(".tmp")] == [], label
-            assert_clean(label)
-        print("ok a later failure leaves an earlier output file as it was")
         # A pipe is written in place: /dev/stdout, /dev/fd/N (process substitution) and
         # /dev/stdout twice reach the reader, and no `pipe:[N]` file is made in the cwd.
         piped_cwd = os.path.join(tmp, "pipecwd")
@@ -368,43 +313,6 @@ def main():
         assert lines[0].endswith("the path is too long"), lines
         assert_clean("unreadable path")
         print("ok a pipe is written in place; an unreadable path is refused in one line")
-        # Two output flags may not name one file (same path, or the same inode): NRV-E0728.
-        same = os.path.join(tmp, "same.out")
-        link = os.path.join(tmp, "same.link")
-        with open(same, "w") as handle:
-            handle.write("previous-result\n")
-        os.link(same, link)
-        # Dangling links: the target is not made yet, and a plain open would make it.
-        dangling = os.path.join(tmp, "dangling.target")
-        link_a = os.path.join(tmp, "dangling.a")
-        link_b = os.path.join(tmp, "dangling.b")
-        os.symlink("dangling.target", link_a)
-        os.symlink(dangling, link_b)
-        for label, argv, flag in [
-            ("--timeline = --gateway-pid-file", [f"--timeline={same}", f"--gateway-pid-file={same}"],
-             "--gateway-pid-file"),
-            ("--timeline = --output", [f"--timeline={same}", f"--output={same}"], "--output"),
-            ("--output = --timeline by hard link", [f"--timeline={same}", f"--output={link}"],
-             "--output"),
-            ("one path not made yet", [f"--timeline={tmp}/new.out", f"--output={tmp}/./new.out"],
-             "--output"),
-            ("a dangling link and its target", [f"--timeline={link_a}", f"--output={dangling}"],
-             "--output"),
-            ("two dangling links to one file", [f"--timeline={link_a}", f"--output={link_b}"],
-             "--output"),
-        ]:
-            result = run(bench, ["--local", "--workload=botpike", "--seconds=1"] + argv, timeout=30)
-            lines = [line for line in result.stderr.splitlines() if line.strip()]
-            assert result.returncode == 1 and len(lines) == 1, (label, lines)
-            assert lines[0].startswith(f"error[NRV-E0728]: bench-load: {flag}: cannot write "), lines
-            assert lines[0].endswith("another output flag names the same file"), lines
-            assert not result.stdout, label
-            with open(same) as handle:
-                assert handle.read() == "previous-result\n", label
-            assert not os.path.exists(os.path.join(tmp, "new.out")), label
-            assert not os.path.exists(dangling), label
-            assert_clean(label)
-        print("ok two output flags naming one file are refused (NRV-E0728)")
 
 
 if __name__ == "__main__":
