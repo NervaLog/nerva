@@ -46,7 +46,7 @@ ingested again safely. Exit codes are for people: `ingest` 0 counted (now or bef
 `refuse` 0 recorded, 1 not; argparse's own 2 for a bad command line. The state is saved
 whatever GitHub answered.
 
-`alarm` (NRV-E0730, P<n>) is run.sh's report that rounds keep failing: it opens the one open
+`alarm` (NRV-E0730, P429) is run.sh's report that rounds keep failing: it opens the one open
 `sim-fleet` issue marked `ALARM_MARKER`, or comments on it if it is open already. It reads no
 state file, so it works when `ingest` cannot. Exit 0 if filed, 1 if not. Standard library only.
 """
@@ -65,7 +65,7 @@ import urllib.request
 
 LABEL = "sim-fleet"
 MARKER = re.compile(r"<!-- vopr-fleet fingerprint: ([0-9a-f]{32}) -->")
-# The one issue the alarm (NRV-E0730, P<n>) files or comments on, found by this marker among the
+# The one issue the alarm (NRV-E0730, P429) files or comments on, found by this marker among the
 # open `sim-fleet` issues. It carries no fingerprint, so `markers` never reads it as a failure.
 ALARM_MARKER = "<!-- vopr-fleet alarm: rounds failing -->"
 ALARM_ROUNDS_MAX = 1_000_000

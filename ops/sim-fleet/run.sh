@@ -85,7 +85,7 @@ vsr_superblock_quorums vsr_multi_batch nerva_adds nerva_http_head nerva_document
     : "${SIM_FLEET_IDLE_SECONDS:=60}"
     : "${SIM_FLEET_PYTHON:=python3}"
     # Consecutive failing rounds (ingest failed or left no record, or a worker died) before the
-    # alarm (NRV-E0730, P<n>).
+    # alarm (NRV-E0730, P429).
     : "${SIM_FLEET_ALARM_ROUNDS:=3}"
     if [[ ! "$SIM_FLEET_ALARM_ROUNDS" =~ ^[0-9]{1,6}$ ]] || (( 10#$SIM_FLEET_ALARM_ROUNDS == 0 )); then
         log "SIM_FLEET_ALARM_ROUNDS must be a positive whole number, not '$SIM_FLEET_ALARM_ROUNDS'"
@@ -511,7 +511,7 @@ settle() {
 # $STATE/failing-rounds (`<count> <alarmed 0|1>`, so a restart keeps it). At SIM_FLEET_ALARM_ROUNDS
 # in a row: one loud line, and `sim_fleet.py alarm` files or comments on the `sim-fleet` issue,
 # once per streak; if that fails, it is tried again at the next failing round. A round that
-# counts ends the streak (#424, NRV-E0730, P<n>).
+# counts ends the streak (#424, NRV-E0730, P429).
 note_round() {
     local code=$1 id=$2 commit=$3 count=0 alarmed=0 file="$STATE/failing-rounds"
     if (( code == 0 )); then

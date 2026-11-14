@@ -1663,7 +1663,13 @@ class Alarm(unittest.TestCase):
         self.assertIn("alarm not filed", err)
 
     def test_a_bad_round_id_or_count_is_exit_1(self):
-        for bad in (["--round-id", "x"], ["--rounds", "0"]):
+        github = Recorder()
+        github.find_open = lambda marker: None
+        argv = list(self.ARGS)
+        argv[argv.index("--rounds") + 1] = str(fleet.ALARM_ROUNDS_MAX)  # The bound itself passes.
+        self.assertEqual(self.run_alarm(github, argv)[0], 0)
+        for bad in (["--round-id", "x"], ["--rounds", "0"],
+                    ["--rounds", str(fleet.ALARM_ROUNDS_MAX + 1)]):
             argv = [a for a in self.ARGS]
             argv[argv.index(bad[0]) + 1] = bad[1]
             self.assertEqual(self.run_alarm(Recorder(), argv)[0], 1)
