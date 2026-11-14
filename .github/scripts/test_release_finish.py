@@ -574,6 +574,15 @@ class Finish(unittest.TestCase):
         self.assertEqual(bad.returncode, 1)
         self.assertIn("error[NRV-E1132]: site_release.py: ", bad.stderr)
 
+    def test_site_check_runs_by_the_relative_path_the_workflow_uses(self):
+        # #464: release-finish.yml runs .github/scripts/release_finish.sh from the checkout's root,
+        # and site_clone cds into a scratch clone before the script finds site_release.py.
+        url, _ = self.bare("site", {"index.html": PAGE})
+        result = subprocess.run([".github/scripts/release_finish.sh", "site-check", "v0.7.1", "A line."],
+                                capture_output=True, text=True, cwd=ROOT, env=dict(self.env, SITE_URL=url))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("the site would take the entry for v0.7.1", result.stdout + result.stderr)
+
     def test_a_site_edit_that_is_refused_pushes_nothing(self):
         url, bare = self.bare("site", {"index.html": PAGE})
         result = self.run_script("site", "v0.6.0", "2026-11-13", "A line.", SITE_URL=url)

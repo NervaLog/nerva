@@ -38,6 +38,10 @@
 # and SITE_LIVE_WAIT_SECONDS (900), polling every SITE_POLL_SECONDS.
 set -euo pipefail
 
+# The script's own path, absolute: site_clone and the tap steps cd into scratch clones, and $0 is
+# relative when the workflow runs .github/scripts/release_finish.sh (#464).
+here=$(cd "$(dirname "$0")" && pwd)
+self=$here/$(basename "$0")
 where=release-finish.yml
 tap_url=${TAP_URL:-https://github.com/NervaLog/homebrew-tap.git}
 site_repo=${SITE_REPO:-NervaLog/nervalog.github.io}
@@ -99,7 +103,7 @@ scrub() { tr '\n' ' ' < "$1" | sed -E 's#(https?://)[^/@ ]*@#\1#g'; }
 # write=yes commit it to its ref (main, or rc/<tag> for a prerelease) and push.
 tap_run() {
   local tag=$1 formula=$2 write=$3 ref old
-  ref=$("$0" tap-ref "$tag")
+  ref=$("$self" tap-ref "$tag")
   # work is global: the EXIT trap runs after this function has returned
   work=$(mktemp -d)
   trap 'rm -rf "$work"' EXIT
@@ -295,7 +299,7 @@ case "${1:-}" in
     sha=$(head -n1 "$shafile" | awk '{ print $1 }')
     url="https://github.com/NervaLog/nerva/releases/download/$tag/nerva-$tag-universal-macos.zip"
     sed -e "s#@URL@#$url#" -e "s#@VERSION@#${tag#v}#" -e "s#@SHA256@#$sha#" \
-      "$(dirname "$0")/../../packaging/homebrew/nerva.rb" > "$out"
+      "$here/../../packaging/homebrew/nerva.rb" > "$out"
     ;;
   latest-check)
     tag=${2:?usage: release_finish.sh latest-check <tag>}
@@ -333,7 +337,7 @@ case "${1:-}" in
     fi
     # A published release is where an earlier run stopped: carry on to the tag check.
     if [[ "$draft" == true ]]; then
-      "$0" latest-check "$tag"
+      "$self" latest-check "$tag"
       # Publishing a draft attaches it to an existing tag: a tag at another commit is refused first.
       work=$(mktemp -d)
       trap 'rm -rf "$work"' EXIT
@@ -380,7 +384,7 @@ case "${1:-}" in
     trap 'rm -rf "$work"' EXIT
     site_clone "$work"
     # The publication date is not known yet; today's stands in, and only the shape is checked.
-    python3 -I "$(dirname "$0")/site_release.py" index.html "${tag#v}" "$(date -u +%F)" "$line" >&2
+    python3 -I "$here/site_release.py" index.html "${tag#v}" "$(date -u +%F)" "$line" >&2
     echo "release_finish.sh: the site would take the entry for $tag"
     ;;
   site)
@@ -401,7 +405,7 @@ case "${1:-}" in
     else
       git checkout --quiet -b "$branch"
     fi
-    python3 -I "$(dirname "$0")/site_release.py" index.html "$version" "$date" "$line" >&2
+    python3 -I "$here/site_release.py" index.html "$version" "$date" "$line" >&2
     # The WKD pair (P398): written when the tag's commit is an ancestor of main, so a release's and a
     # main candidate's pull request carry this release's key; a candidate tagged on a branch leaves
     # the files as the site's main has them (its pull request is never merged, and is checked
