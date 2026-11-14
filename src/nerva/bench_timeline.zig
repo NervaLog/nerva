@@ -72,6 +72,7 @@ pub fn path_error_reason(err: anyerror) []const u8 {
         error.NotDir => "a part of its path is not a directory",
         error.NameTooLong => "the path is too long",
         error.NoSpaceLeft => "no space left on the device",
+        error.OutputsCollide => "another output flag names the same file",
         error.ReadOnlyFileSystem => "the file system is read-only",
         else => "it cannot be written",
     };
@@ -92,11 +93,99 @@ pub const FileFailure = struct {
     }
 };
 
-/// Ends the process with NRV-E0728: one line, no raw Zig error. Only for a failure before anything
-/// runs; once a cluster or gateway exists, return `error.FileWriteFailed` and report afterwards.
-pub fn file_fail(flag: []const u8, path: []const u8, err: anyerror) noreturn {
-    (FileFailure{ .flag = flag, .path = path, .err = err }).report();
-    std.process.exit(1);
+/// An output file of `bench-load` (`--timeline`, `--gateway-pid-file`, `--output`). A regular file
+/// (or a path that does not exist yet) is written as a temporary file in the same directory and
+/// renamed into place by `commit`, so that a path holds either its earlier content or the whole
+/// new content, never an emptied file. A device (`/dev/full`) or another file that is not
+/// regular is written in place, and never renamed over.
+pub const OutFile = struct {
+    file: std.fs.File,
+    /// The path as given (borrowed, for messages).
+    requested: []const u8,
+    /// Where the content ends up (owned).
+    final: []const u8,
+    /// The temporary file, until `commit` or `deinit`; null for one written in place.
+    temp: ?[]const u8,
+    gpa: std.mem.Allocator,
+    committed: bool = false,
+
+    /// Opens (creating, never emptying a file that is already there) what `path` names, or
+    /// returns the error that `path_error_reason` words (NRV-E0728).
+    pub fn open(gpa: std.mem.Allocator, path: []const u8) !OutFile {
+        const resolved: ?[]u8 = std.fs.cwd().realpathAlloc(gpa, path) catch null;
+        const final = resolved orelse try gpa.dupe(u8, path);
+        errdefer gpa.free(final);
+        const stat: ?std.fs.File.Stat = std.fs.cwd().statFile(final) catch null;
+        if (stat != null and stat.?.kind != .file) {
+            const file = try std.fs.cwd().createFile(final, .{ .truncate = false });
+            return .{ .file = file, .requested = path, .final = final, .temp = null, .gpa = gpa };
+        }
+        const temp = try std.fmt.allocPrint(gpa, "{s}.{d}.tmp", .{ final, std.os.linux.getpid() });
+        errdefer gpa.free(temp);
+        const file = try std.fs.cwd().createFile(temp, .{});
+        return .{ .file = file, .requested = path, .final = final, .temp = temp, .gpa = gpa };
+    }
+
+    /// Whether `final` is a regular file this run makes (a reader may delete it).
+    pub fn regular(out: *const OutFile) bool {
+        return out.temp != null or out.committed;
+    }
+
+    /// Puts the written content at its path.
+    pub fn commit(out: *OutFile) !void {
+        const temp = out.temp orelse return;
+        try std.fs.cwd().rename(temp, out.final);
+        out.gpa.free(temp);
+        out.temp = null;
+        out.committed = true;
+    }
+
+    /// Closes the file and removes a temporary file that was never committed.
+    pub fn deinit(out: *OutFile) void {
+        out.file.close();
+        if (out.temp) |temp| {
+            std.fs.cwd().deleteFile(temp) catch {};
+            out.gpa.free(temp);
+        }
+        out.gpa.free(out.final);
+    }
+};
+
+/// Whether two paths name the same file: the same path once resolved, or the same device and
+/// inode. A path that does not exist is resolved through its directory.
+pub fn same_file(gpa: std.mem.Allocator, a: []const u8, b: []const u8) !bool {
+    const identity_a = try identity(gpa, a);
+    defer identity_a.deinit(gpa);
+    const identity_b = try identity(gpa, b);
+    defer identity_b.deinit(gpa);
+    if (std.mem.eql(u8, identity_a.path, identity_b.path)) return true;
+    if (identity_a.node != null and identity_b.node != null) {
+        return identity_a.node.?.dev == identity_b.node.?.dev and
+            identity_a.node.?.ino == identity_b.node.?.ino;
+    }
+    return false;
+}
+
+const Identity = struct {
+    path: []const u8,
+    node: ?struct { dev: u64, ino: u64 },
+
+    fn deinit(identity_: Identity, gpa: std.mem.Allocator) void {
+        gpa.free(identity_.path);
+    }
+};
+
+fn identity(gpa: std.mem.Allocator, path: []const u8) !Identity {
+    if (std.fs.cwd().realpathAlloc(gpa, path)) |resolved| {
+        const st = try std.posix.fstatat(std.posix.AT.FDCWD, resolved, 0);
+        return .{ .path = resolved, .node = .{ .dev = @intCast(st.dev), .ino = @intCast(st.ino) } };
+    } else |_| {}
+    const directory = std.fs.path.dirname(path) orelse ".";
+    const base = std.fs.path.basename(path);
+    const parent = std.fs.cwd().realpathAlloc(gpa, directory) catch
+        return .{ .path = try gpa.dupe(u8, path), .node = null };
+    defer gpa.free(parent);
+    return .{ .path = try std.fs.path.join(gpa, &.{ parent, base }), .node = null };
 }
 
 /// Why `--warmup` and `--seconds` are refused, or null if they are accepted.
@@ -520,4 +609,64 @@ test "statsd_refusal: the rule of nerva api --statsd, and the command line's len
     try testing.expect(std.mem.indexOf(u8, exact, "119 bytes") == null);
     try testing.expect(statsd_refusal(long ++ "0") != null);
     try testing.expect(std.mem.indexOf(u8, statsd_refusal(long ++ "0").?, "119") != null);
+}
+
+test "same_file: one path twice, a hard link and a path not made yet; not two files" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "a", .data = "x" });
+    try tmp.dir.writeFile(.{ .sub_path = "b", .data = "x" });
+    try std.posix.linkat(tmp.dir.fd, "a", tmp.dir.fd, "c", 0);
+    const gpa = testing.allocator;
+    const root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(root);
+    const a = try std.fs.path.join(gpa, &.{ root, "a" });
+    defer gpa.free(a);
+    const b = try std.fs.path.join(gpa, &.{ root, "b" });
+    defer gpa.free(b);
+    const c = try std.fs.path.join(gpa, &.{ root, "c" });
+    defer gpa.free(c);
+    const new1 = try std.fs.path.join(gpa, &.{ root, "new" });
+    defer gpa.free(new1);
+    const new2 = try std.fs.path.join(gpa, &.{ root, ".", "new" });
+    defer gpa.free(new2);
+    try testing.expect(try same_file(gpa, a, a));
+    try testing.expect(try same_file(gpa, a, c));
+    try testing.expect(!(try same_file(gpa, a, b)));
+    try testing.expect(try same_file(gpa, new1, new2));
+    try testing.expect(!(try same_file(gpa, new1, a)));
+}
+
+test "OutFile: the path keeps its content until commit; a device is written in place" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "keep", .data = "earlier\n" });
+    const gpa = testing.allocator;
+    const root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(root);
+    const path = try std.fs.path.join(gpa, &.{ root, "keep" });
+    defer gpa.free(path);
+    {
+        var out = try OutFile.open(gpa, path);
+        defer out.deinit();
+        try out.file.writeAll("new\n");
+        // Never committed: the earlier content stays, and no temporary file is left.
+    }
+    var buffer: [16]u8 = undefined;
+    try testing.expectEqualStrings("earlier\n", try tmp.dir.readFile("keep", &buffer));
+    var count: usize = 0;
+    var it = tmp.dir.iterate();
+    while (try it.next()) |_| count += 1;
+    try testing.expectEqual(@as(usize, 1), count);
+    {
+        var out = try OutFile.open(gpa, path);
+        defer out.deinit();
+        try out.file.writeAll("new\n");
+        try out.commit();
+    }
+    try testing.expectEqualStrings("new\n", try tmp.dir.readFile("keep", &buffer));
+    var device = try OutFile.open(gpa, "/dev/null");
+    defer device.deinit();
+    try testing.expect(device.temp == null);
+    try device.commit();
 }

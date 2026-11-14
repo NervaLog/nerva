@@ -186,9 +186,9 @@ def write_failure(bench, argv, label, flag):
     result = run(bench, argv, timeout=120)
     lines = [line for line in result.stderr.splitlines() if line.strip()]
     assert result.returncode == 1, (label, result.returncode, result.stderr[-500:])
-    assert lines and lines[-1] == (
+    assert len(lines) == 1 and lines[0] == (
         f"error[NRV-E0728]: bench-load: {flag}: cannot write /dev/full: no space left on the device"
-    ), (label, lines[-3:])
+    ), (label, lines)
     assert not re.search(r"\berror\.[A-Z]|NoSpaceLeft", result.stderr), label
     assert_clean(label)
     print(f"ok {label}")
@@ -285,6 +285,54 @@ def main():
         assert os.path.getsize(timeline) > 0, "the finished timeline was lost"
         assert_clean("failed --output write")
         print("ok --output refused up front; a finished timeline survives (NRV-E0728)")
+        # An earlier --timeline / --output survives any later failure: a PID file that cannot be
+        # written, a gateway that does not start, a timeline that cannot be written.
+        for label, extra in [
+            ("PID file on /dev/full", ["--workload=botpike", "--gateway-pid-file=/dev/full"]),
+            ("--nerva=/bin/false", ["--workload=botpike", "--nerva=/bin/false"]),
+            ("timeline on /dev/full", ["--workload=c1"]),
+        ]:
+            keep = os.path.join(tmp, "earlier.json")
+            with open(keep, "w") as handle:
+                handle.write("previous-result\n")
+            if label.startswith("timeline"):
+                argv = ["--timeline=/dev/full", f"--output={keep}"]
+            else:
+                argv = [f"--timeline={keep}"] + extra
+            result = run(bench, ["--local", "--seconds=1"] + argv, timeout=120)
+            assert result.returncode == 1, (label, result.returncode, result.stderr[-300:])
+            with open(keep) as handle:
+                assert handle.read() == "previous-result\n", f"{label}: the earlier file was emptied"
+            assert [n for n in os.listdir(tmp) if n.endswith(".tmp")] == [], label
+            assert_clean(label)
+        print("ok a later failure leaves an earlier output file as it was")
+        # Two output flags may not name one file (same path, or the same inode): NRV-E0728.
+        same = os.path.join(tmp, "same.out")
+        link = os.path.join(tmp, "same.link")
+        with open(same, "w") as handle:
+            handle.write("previous-result\n")
+        os.link(same, link)
+        for label, argv, flag in [
+            ("--timeline = --gateway-pid-file", [f"--timeline={same}", f"--gateway-pid-file={same}"],
+             "--gateway-pid-file"),
+            ("--timeline = --output", [f"--timeline={same}", f"--output={same}"], "--output"),
+            ("--output = --timeline by hard link", [f"--timeline={same}", f"--output={link}"],
+             "--output"),
+            ("one path not made yet", [f"--timeline={tmp}/new.out", f"--output={tmp}/./new.out"],
+             "--output"),
+        ]:
+            result = run(bench, ["--local", "--workload=botpike", "--seconds=1"] + argv, timeout=30)
+            lines = [line for line in result.stderr.splitlines() if line.strip()]
+            assert result.returncode == 1 and len(lines) == 1, (label, lines)
+            assert lines[0].startswith(f"error[NRV-E0728]: bench-load: {flag}: cannot write "), lines
+            assert lines[0].endswith("another output flag names the same file"), lines
+            assert not result.stdout, label
+            with open(same) as handle:
+                assert handle.read() == "previous-result\n", label
+            assert not os.path.exists(os.path.join(tmp, "new.out")), label
+            assert_clean(label)
+        print("ok two output flags naming one file are refused (NRV-E0728)")
+
 
 if __name__ == "__main__":
     main()

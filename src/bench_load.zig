@@ -201,38 +201,39 @@ fn run_flags(gpa: std.mem.Allocator, args: CLIArgs, failure: *?bench_timeline.Fi
     }
 
     // The files this run writes are opened now, so that a bad path costs no measurement
-    // (NRV-E0728). Every one is opened before any is emptied: a refusal then leaves an earlier
-    // file at a path untouched, and removes only the files this run made. After the run, a regular
-    // file that does not end with its content is removed too (an empty or truncated file would
-    // pass for a result); a device such as /dev/full is never removed.
-    var finished = false;
-    var timeline_made: ?[]const u8 = null;
-    var pid_made: ?[]const u8 = null;
-    var output_made: ?[]const u8 = null;
-    defer if (!finished) {
-        if (timeline_made) |path| std.fs.cwd().deleteFile(path) catch {};
-        if (pid_made) |path| std.fs.cwd().deleteFile(path) catch {};
-        if (output_made) |path| std.fs.cwd().deleteFile(path) catch {};
+    // (NRV-E0728). A regular file is written as a temporary file beside it and renamed into place
+    // once its content is whole (`OutFile`), so that a failure at any later step leaves every
+    // path with its earlier content, and no temporary file. Two flags may not name one file.
+    const flags_and_paths = [_]struct { flag: []const u8, path: ?[]const u8 }{
+        .{ .flag = "--timeline", .path = args.timeline },
+        .{ .flag = "--gateway-pid-file", .path = args.@"gateway-pid-file" },
+        .{ .flag = "--output", .path = args.output },
     };
-    const timeline_file: ?std.fs.File = if (args.timeline) |path|
-        try file_open("--timeline", path, &timeline_made, failure)
-    else
-        null;
-    defer if (timeline_file) |file| file.close();
-    const pid_file: ?std.fs.File = if (args.@"gateway-pid-file") |path|
-        try file_open("--gateway-pid-file", path, &pid_made, failure)
-    else
-        null;
-    defer if (pid_file) |file| file.close();
-    const output_file: ?std.fs.File = if (args.output) |path|
-        try file_open("--output", path, &output_made, failure)
-    else
-        null;
-    defer if (output_file) |file| file.close();
-    // All three opened: now they may be emptied.
-    inline for (.{ timeline_file, pid_file, output_file }) |file| {
-        if (file) |f| if (is_regular(f)) f.setEndPos(0) catch {};
+    for (flags_and_paths, 0..) |later, i| {
+        const later_path = later.path orelse continue;
+        for (flags_and_paths[0..i]) |earlier| {
+            const earlier_path = earlier.path orelse continue;
+            if (try bench_timeline.same_file(gpa, earlier_path, later_path)) {
+                failure.* = .{ .flag = later.flag, .path = later_path, .err = error.OutputsCollide };
+                return error.FileWriteFailed;
+            }
+        }
     }
+    var timeline_out = if (args.timeline) |path|
+        try file_open("--timeline", gpa, path, failure)
+    else
+        null;
+    defer if (timeline_out) |*out| out.deinit();
+    var pid_out = if (args.@"gateway-pid-file") |path|
+        try file_open("--gateway-pid-file", gpa, path, failure)
+    else
+        null;
+    defer if (pid_out) |*out| out.deinit();
+    var output_out = if (args.output) |path|
+        try file_open("--output", gpa, path, failure)
+    else
+        null;
+    defer if (output_out) |*out| out.deinit();
 
     const config: Config = .{
         .workload = args.workload,
@@ -260,7 +261,7 @@ fn run_flags(gpa: std.mem.Allocator, args: CLIArgs, failure: *?bench_timeline.Fi
     const result = if (gateway_workload)
         try run_botpike(gpa, args.cluster, addresses_text, args.nerva orelse nerva_exe_built, &config, &timeline, .{
             .statsd = args.@"gateway-statsd",
-            .pid_file = args.@"gateway-pid-file",
+            .pid_file = if (pid_out) |*out| out else null,
             .inherit_stderr = args.@"gateway-stderr" == @as(?GatewayStderr, .inherit),
             .failure = failure,
         })
@@ -272,50 +273,47 @@ fn run_flags(gpa: std.mem.Allocator, args: CLIArgs, failure: *?bench_timeline.Fi
     defer json.deinit();
     try result_write(json.writer(), &config, &result);
     try json.append('\n');
-    if (timeline_file) |file| {
+    if (timeline_out) |*out| {
         var lines = std.ArrayList(u8).init(gpa);
         defer lines.deinit();
         try timeline.write(lines.writer());
-        file.writeAll(lines.items) catch |err| {
+        out.file.writeAll(lines.items) catch |err| {
             failure.* = .{ .flag = "--timeline", .path = args.timeline.?, .err = err };
             return error.FileWriteFailed;
         };
         // The finished timeline survives whatever happens to the summary after it.
-        timeline_made = null;
+        out.commit() catch |err| {
+            failure.* = .{ .flag = "--timeline", .path = args.timeline.?, .err = err };
+            return error.FileWriteFailed;
+        };
     }
-    if (output_file) |file| {
-        file.writeAll(json.items) catch |err| {
+    if (output_out) |*out| {
+        out.file.writeAll(json.items) catch |err| {
+            failure.* = .{ .flag = "--output", .path = args.output.?, .err = err };
+            return error.FileWriteFailed;
+        };
+        out.commit() catch |err| {
             failure.* = .{ .flag = "--output", .path = args.output.?, .err = err };
             return error.FileWriteFailed;
         };
     } else {
         try std.io.getStdOut().writeAll(json.items);
     }
-    finished = true;
     return result.failures > 0;
 }
 
-/// Opens (creating, never emptying) the file a flag names, or records the failure and returns
-/// `error.FileWriteFailed` (NRV-E0728; `main` reports it after the defers have run). `made` is set
-/// to the path if this call created a regular file, and not for one that was already there.
+/// Opens the file a flag names, or records the failure and returns `error.FileWriteFailed`
+/// (NRV-E0728; `main` reports it after the defers have run).
 fn file_open(
     flag: []const u8,
+    gpa: std.mem.Allocator,
     path: []const u8,
-    made: *?[]const u8,
     failure: *?bench_timeline.FileFailure,
-) !std.fs.File {
-    const existed = if (std.fs.cwd().access(path, .{})) true else |_| false;
-    const file = std.fs.cwd().createFile(path, .{ .truncate = false }) catch |err| {
+) !bench_timeline.OutFile {
+    return bench_timeline.OutFile.open(gpa, path) catch |err| {
         failure.* = .{ .flag = flag, .path = path, .err = err };
         return error.FileWriteFailed;
     };
-    if (!existed and is_regular(file)) made.* = path;
-    return file;
-}
-
-fn is_regular(file: std.fs.File) bool {
-    const stat = file.stat() catch return false;
-    return stat.kind == .file;
 }
 
 /// A flag's value out of range, as NRV-E0002 (one line), like `cli.zig`.

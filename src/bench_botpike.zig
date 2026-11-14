@@ -84,8 +84,8 @@ const Outcome = struct {
 pub const GatewayOptions = struct {
     /// `nerva api --statsd`.
     statsd: ?[]const u8 = null,
-    /// Where the gateway's PID is written, right after it spawns.
-    pid_file: ?[]const u8 = null,
+    /// Where the gateway's PID is written, right after it spawns (committed once written).
+    pid_file: ?*bench_timeline.OutFile = null,
     /// Pass the gateway's stderr on to this process's instead of dropping it.
     inherit_stderr: bool = false,
     /// Set when the PID file cannot be written; `start` then returns `error.FileWriteFailed`, so
@@ -142,16 +142,13 @@ pub const Gateway = struct {
         try gateway.process.spawn();
         errdefer gateway.stop();
 
-        if (options.pid_file) |path| {
+        if (options.pid_file) |out| {
             var pid_buffer: [32]u8 = undefined;
             const pid = try std.fmt.bufPrint(&pid_buffer, "{}\n", .{gateway.process.id});
-            std.fs.cwd().writeFile(.{ .sub_path = path, .data = pid }) catch |err| {
-                if (options.failure) |failure| failure.* = .{ .flag = "--gateway-pid-file", .path = path, .err = err };
-                return error.FileWriteFailed;
-            };
+            out.file.writeAll(pid) catch |err| return pid_failure(options, out, err);
+            out.commit() catch |err| return pid_failure(options, out, err);
             // Set only for a regular file: `stop` deletes it, which must not be a device.
-            const stat = std.fs.cwd().statFile(path) catch null;
-            if (stat != null and stat.?.kind == .file) gateway.pid_file = path;
+            if (out.regular()) gateway.pid_file = out.final;
         }
 
         // The replicas may still be starting: wait until the gateway has a session.
@@ -163,6 +160,11 @@ pub const Gateway = struct {
             std.time.sleep(100 * std.time.ns_per_ms);
         }
         return error.GatewayNotReady;
+    }
+
+    fn pid_failure(options: GatewayOptions, out: *const bench_timeline.OutFile, err: anyerror) error{FileWriteFailed} {
+        if (options.failure) |failure| failure.* = .{ .flag = "--gateway-pid-file", .path = out.requested, .err = err };
+        return error.FileWriteFailed;
     }
 
     pub fn stop(gateway: *Gateway) void {
