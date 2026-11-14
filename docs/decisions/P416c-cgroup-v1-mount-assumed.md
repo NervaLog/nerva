@@ -19,5 +19,8 @@ revision of this PR refused such a host, with no flag to get past it; that stran
 catch a case this decision accepts.) Reading `mountinfo` would
 add a parser and another file whose failure modes need refusals.
 
-**Cost.** On such a host a cgroup limit is missed and an oversized cache can still be OOM-killed
+**Cost.** The same fallback covers cgroup v2 where `/sys/fs/cgroup` is not mounted (a sandbox or
+rootless runtime that masks it): `/proc/self/cgroup` says `0::/...`, `memory.max` is absent, and
+that is "no limit", with no warning (no new code is added for it; tested). On such a host, or the v1
+one above, a cgroup limit is missed and an oversized cache can still be OOM-killed
 with no message of Nerva's. If a report shows one, parse `mountinfo` then.

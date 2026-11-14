@@ -738,24 +738,9 @@ fn command_start(
     // `MemoryBudget` refuses, before touching the memory, the allocation that passes it.
     const visible = switch (start_memory.read()) {
         .visible => |visible| visible,
-        .refused => |refusal| diagnostic.fail(
-            "NRV-E0723",
-            "start: cannot tell how much memory this replica may use: {s} cannot be used ({s})",
-            .{ refusal.file(), @tagName(refusal.reason) },
-            "{s}",
-            .{switch (refusal.reason) {
-                .absent => "mount /proc (and the cgroup filesystem) where this replica runs, or run it on a machine that has them",
-                .unreadable => "give this process read access to that file, or run it on a machine whose /proc and cgroup files are readable",
-                .too_deep => "run this replica in a shallower cgroup (at most 32 levels)",
-                .too_large => if (std.mem.eql(u8, refusal.file(), "/proc/self/cgroup"))
-                    "run this replica in a cgroup with a shorter path (at most 512 bytes)"
-                else
-                    "fix or remove that file's limit, or run on a machine whose /proc and cgroup files are readable",
-                .unparsable => "fix or remove that file's limit, or run on a machine whose /proc and cgroup files are readable",
-            }},
-        ),
+        .refused => |refusal| start_memory.refuse_unreadable(refusal),
     };
-    const budget_bytes = start_memory.budget(visible.bytes) orelse memory_refuse(args, &visible, 0);
+    const budget_bytes = start_memory.budget(visible.bytes) orelse start_memory.refuse_caches(@as(u64, args.cache_grid_blocks) * constants.block_size, args.cache_rows_count, &visible, 0);
     var memory_budget = MemoryBudget.init(base_allocator, @intCast(@min(budget_bytes, std.math.maxInt(usize))));
     var counting_allocator = vsr.CountingAllocator.init(memory_budget.allocator());
     const gpa = counting_allocator.allocator();
@@ -766,7 +751,7 @@ fn command_start(
         .message_bus = .tcp,
     } }) catch |err| switch (err) {
         error.OutOfMemory => if (memory_budget.exceeded)
-            memory_refuse(args, &visible, budget_bytes)
+            start_memory.refuse_caches(@as(u64, args.cache_grid_blocks) * constants.block_size, args.cache_rows_count, &visible, budget_bytes)
         else
             return err,
     };
@@ -818,7 +803,7 @@ fn command_start(
             .{},
         ),
         error.OutOfMemory => if (memory_budget.exceeded)
-            memory_refuse(args, &visible, budget_bytes)
+            start_memory.refuse_caches(@as(u64, args.cache_grid_blocks) * constants.block_size, args.cache_rows_count, &visible, budget_bytes)
         else
             return error.OutOfMemory,
         else => |e| return e,
@@ -865,35 +850,6 @@ fn command_start(
         replica.tick();
         try io.run_for_ns(constants.tick_ms * std.time.ns_per_ms);
     }
-}
-
-/// NRV-E0723: the caches do not fit what this replica may use (R3, P406d). Names the flags and
-/// where the limit came from; never a value to lower to, since the total need is unknown here.
-fn memory_refuse(args: *const cli.Command.Start, visible: *const start_memory.Visible, budget: u64) noreturn {
-    var source_buffer: [640]u8 = undefined;
-    const source = switch (visible.source) {
-        .meminfo => std.fmt.bufPrint(&source_buffer, "MemTotal {} MiB", .{visible.bytes / MiB}),
-        else => std.fmt.bufPrint(&source_buffer, "cgroup {s} {} MiB at {s}", .{
-            visible.file_name(),
-            visible.bytes / MiB,
-            visible.path(),
-        }),
-    } catch "the limit";
-    diagnostic.fail(
-        "NRV-E0723",
-        "start: the caches do not fit: this replica may use {} MiB ({s}, less {} MiB), and needs " ++
-            "more than that with --cache-grid={}MiB --cache-rows={} rows",
-        .{
-            budget / MiB,
-            source,
-            start_memory.memory_reserve / MiB,
-            @as(u64, args.cache_grid_blocks) * constants.block_size / MiB,
-            args.cache_rows_count,
-        },
-        "lower --cache-grid or --cache-rows (README, \"Caches\"), or give the machine or its " ++
-            "cgroup more memory",
-        .{},
-    );
 }
 
 /// The cluster keys replicas authenticate each other with (P102), from `NERVA_CLUSTER_KEY` and

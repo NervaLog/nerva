@@ -18,14 +18,15 @@
 //!   mount root's limit alone.
 //!
 //! A file that is absent is no limit at its level. One that cannot be parsed, is over
-//! `file_size_max` (`/proc/self/cgroup`: `cgroup_file_size_max`), or sits deeper than `cgroup_depth_max` is a refusal naming the file, never a
-//! guess. Every read takes a root directory, so that tests use a fake `/proc` and `/sys`.
+//! `file_size_max` (`/proc/self/cgroup`: `cgroup_file_size_max` bytes, `cgroup_lines_max` lines),
+//! or sits deeper than `cgroup_depth_max` is a refusal naming the file, never a guess. Every read takes a root directory, so that tests use a fake `/proc` and `/sys`.
 
 const std = @import("std");
 const assert = std.debug.assert;
 const builtin = @import("builtin");
 const stdx = @import("stdx");
 const MemoryBudget = @import("api/memory_budget.zig");
+const diagnostic = @import("diagnostic.zig");
 
 /// What the process beyond its counted allocations needs: the binary, stacks, page tables, the
 /// `Tracer`, `IO` and `Storage` allocated before `command_start`, and the base allocator's page
@@ -33,7 +34,7 @@ const MemoryBudget = @import("api/memory_budget.zig");
 pub const memory_reserve: u64 = 256 * stdx.MiB;
 /// The most of one `/proc` or cgroup file read; a longer file is a refusal.
 pub const file_size_max = 4096;
-/// The most lines of `/proc/self/cgroup` read: v1 has one per hierarchy (usually 11 to 13), each
+/// The most lines `/proc/self/cgroup` may have; more is a refusal. v1 has one per hierarchy (usually 11 to 13), each
 /// carrying the same path of up to `path_size_max` bytes, plus the hierarchy id and controllers.
 pub const cgroup_lines_max = 16;
 /// The most levels walked, the root included; a deeper cgroup is a refusal.
@@ -126,6 +127,14 @@ pub fn read_from(root: std.fs.Dir) Result {
     var membership_buffer: [cgroup_file_size_max + 1]u8 = undefined;
     const cgroup_file = file_read(root, "proc/self/cgroup", &membership_buffer) catch |err|
         return refuse(reason_of(err), "/proc/self/cgroup");
+    if (cgroup_file) |text| {
+        var lines: u32 = 0;
+        var split = std.mem.splitScalar(u8, text, '\n');
+        while (split.next()) |line| {
+            if (line.len > 0) lines += 1;
+        }
+        if (lines > cgroup_lines_max) return refuse(.too_large, "/proc/self/cgroup");
+    }
     const membership = cgroup_membership(cgroup_file orelse return .{ .visible = result }) orelse
         return .{ .visible = result };
 
@@ -140,10 +149,8 @@ pub fn read_from(root: std.fs.Dir) Result {
         .meminfo => unreachable,
     };
 
-    // A path not under the mount (no cgroup namespace): the mount root's limit alone.
-    // `membership.path` points into `buffer`, which the reads below reuse: keep a copy.
+    // `membership.path` points into `membership_buffer`, which nothing below touches.
     var path_buffer: [name_size_max]u8 = undefined;
-    var cgroup_buffer: [path_size_max]u8 = undefined;
     if (membership.path.len > path_size_max) {
         return refuse(.too_large, "/proc/self/cgroup");
     }
@@ -152,8 +159,8 @@ pub fn read_from(root: std.fs.Dir) Result {
     if (membership.source == .cgroup_v1 and !dir_exists(root, base, "/", &path_buffer)) {
         return .{ .visible = result };
     }
-    @memcpy(cgroup_buffer[0..membership.path.len], membership.path);
-    const cgroup_path = cgroup_buffer[0..membership.path.len];
+    const cgroup_path = membership.path;
+    // A path not under the mount (no cgroup namespace): the mount root's limit alone.
     const under_mount = dir_exists(root, base, cgroup_path, &path_buffer);
     const walk_path: []const u8 = if (under_mount) cgroup_path else "/";
 
@@ -168,7 +175,10 @@ pub fn read_from(root: std.fs.Dir) Result {
     }
 
     var level_path: []const u8 = walk_path;
+    var walked: u32 = 0;
     while (true) {
+        walked += 1;
+        assert(walked <= levels and walked <= cgroup_depth_max);
         var file_buffer: [name_size_max]u8 = undefined;
         const name = join(&file_buffer, base, level_path, limit_file);
         const content = file_read(root, name, &buffer) catch |err|
@@ -296,6 +306,55 @@ fn refuse(reason: Reason, file: []const u8) Result {
     @memcpy(refusal.file_buffer[slash..][0..file.len], file);
     refusal.file_length = file.len + slash;
     return .{ .refused = refusal };
+}
+
+/// NRV-E0723, the first headline: what this replica may use could not be read.
+pub fn refuse_unreadable(refusal: Refusal) noreturn {
+    diagnostic.fail(
+        "NRV-E0723",
+        "start: cannot tell how much memory this replica may use: {s} cannot be used ({s})",
+        .{ refusal.file(), @tagName(refusal.reason) },
+        "{s}",
+        .{switch (refusal.reason) {
+            .absent => "mount /proc (and the cgroup filesystem) where this replica runs, or run it on a machine that has them",
+            .unreadable => "give this process read access to that file, or run it on a machine whose /proc and cgroup files are readable",
+            .too_deep => "run this replica in a shallower cgroup (at most 32 levels)",
+            .too_large => if (std.mem.eql(u8, refusal.file(), "/proc/self/cgroup"))
+                "run this replica in a cgroup with a shorter path (at most 512 bytes) and at most 16 hierarchies"
+            else
+                "fix or remove that file's limit, or run on a machine whose /proc and cgroup files are readable",
+            .unparsable => "fix or remove that file's limit, or run on a machine whose /proc and cgroup files are readable",
+        }},
+    );
+}
+
+/// NRV-E0723, the second headline: the caches do not fit what this replica may use. Names the
+/// flags and where the limit came from; never a value to lower to, since the total need is
+/// unknown here. `budget_bytes` is what `budget` returned, 0 when it returned null.
+pub fn refuse_caches(
+    cache_grid_bytes: u64,
+    cache_rows: u64,
+    visible: *const Visible,
+    budget_bytes: u64,
+) noreturn {
+    var source_buffer: [640]u8 = undefined;
+    const source = switch (visible.source) {
+        .meminfo => std.fmt.bufPrint(&source_buffer, "MemTotal {} MiB", .{visible.bytes / stdx.MiB}),
+        else => std.fmt.bufPrint(&source_buffer, "cgroup {s} {} MiB at {s}", .{
+            visible.file_name(),
+            visible.bytes / stdx.MiB,
+            visible.path(),
+        }),
+    } catch "the limit";
+    diagnostic.fail(
+        "NRV-E0723",
+        "start: the caches do not fit: this replica may use {} MiB ({s}, less {} MiB), and needs " ++
+            "more than that with --cache-grid={}MiB --cache-rows={} rows",
+        .{ budget_bytes / stdx.MiB, source, memory_reserve / stdx.MiB, cache_grid_bytes / stdx.MiB, cache_rows },
+        "lower --cache-grid or --cache-rows (README, \"Caches\"), or give the machine or its " ++
+            "cgroup more memory",
+        .{},
+    );
 }
 
 // Tests build a fake root: `proc/meminfo`, `proc/self/cgroup` and `sys/fs/cgroup/...`.
@@ -567,4 +626,55 @@ test "start_memory: twelve v1 lines of a 512-byte path are accepted" {
     const result = read_from(fixture.tmp.dir);
     try std.testing.expectEqual(@as(u64, 1024 * mib), result.visible.bytes);
     try std.testing.expectEqual(Source.cgroup_v1, result.visible.source);
+}
+
+test "start_memory: /proc/self/cgroup at 10,240 bytes is read, one past is too_large" {
+    var fixture = Fixture.init();
+    defer fixture.deinit();
+    try fixture.meminfo(8 * 1024 * 1024);
+    try fixture.write("sys/fs/cgroup/memory/a/memory.limit_in_bytes", "1073741824\n");
+    var text: [cgroup_file_size_max + 1]u8 = undefined;
+    const head = "4:memory:/a\n";
+    for ([_]usize{ cgroup_file_size_max, cgroup_file_size_max + 1 }) |size| {
+        @memcpy(text[0..head.len], head);
+        // One long line that names no path: only its bytes count.
+        @memset(text[head.len..size], 'z');
+        text[head.len + 0] = '9';
+        text[head.len + 1] = ':';
+        text[size - 1] = '\n';
+        try fixture.write("proc/self/cgroup", text[0..size]);
+        const result = read_from(fixture.tmp.dir);
+        if (size == cgroup_file_size_max) {
+            try std.testing.expectEqual(@as(u64, 1024 * mib), result.visible.bytes);
+        } else {
+            try std.testing.expectEqual(Reason.too_large, result.refused.reason);
+            try std.testing.expectEqualStrings("/proc/self/cgroup", result.refused.file());
+        }
+    }
+}
+
+test "start_memory: 16 lines of /proc/self/cgroup are read and 17 are too_large" {
+    var fixture = Fixture.init();
+    defer fixture.deinit();
+    try fixture.meminfo(8 * 1024 * 1024);
+    try fixture.write("sys/fs/cgroup/memory/a/memory.limit_in_bytes", "1073741824\n");
+    var text: [1024]u8 = undefined;
+    var stream = std.io.fixedBufferStream(&text);
+    try stream.writer().writeAll("4:memory:/a\n");
+    for (1..cgroup_lines_max) |id| try stream.writer().print("{d}:x{d}:/\n", .{ id + 10, id });
+    try fixture.write("proc/self/cgroup", text[0..stream.pos]);
+    try std.testing.expectEqual(@as(u64, 1024 * mib), read_from(fixture.tmp.dir).visible.bytes);
+    try stream.writer().writeAll("99:y:/\n");
+    try fixture.write("proc/self/cgroup", text[0..stream.pos]);
+    try std.testing.expectEqual(Reason.too_large, read_from(fixture.tmp.dir).refused.reason);
+}
+
+test "start_memory: a v2 host with no /sys/fs/cgroup reads MemTotal alone (P416c)" {
+    var fixture = Fixture.init();
+    defer fixture.deinit();
+    try fixture.meminfo(8 * 1024 * 1024);
+    try fixture.write("proc/self/cgroup", "0::/a/b\n");
+    const result = read_from(fixture.tmp.dir);
+    try std.testing.expectEqual(Source.meminfo, result.visible.source);
+    try std.testing.expectEqual(@as(u64, 8 * 1024 * mib), result.visible.bytes);
 }
