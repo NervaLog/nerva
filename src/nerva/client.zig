@@ -14,6 +14,7 @@ const vsr = @import("../vsr.zig");
 const constants = @import("../constants.zig");
 const nerva = @import("../nerva.zig");
 const timings = @import("timings.zig");
+const release_eviction = @import("release_eviction.zig");
 const IO = @import("../io.zig").IO;
 const MessageBus = @import("../message_bus.zig").MessageBusType(IO);
 const MessagePool = @import("../message_pool.zig").MessagePool;
@@ -778,6 +779,11 @@ pub const Client = struct {
     fn on_eviction(vsr_client: *VSRClient, eviction: *const Message.Eviction) void {
         const client: *Client = @fieldParentPtr("vsr_client", vsr_client);
         log.warn("evicted: {s}", .{@tagName(eviction.header.reason)});
+        release_eviction.record(
+            eviction.header.reason,
+            vsr_client.release,
+            eviction.header.release,
+        );
         // The VSR client's contract asks the callback to deinit it, but the callback runs inside
         // the message bus's receive path, which goes on to use the buffer `deinit` would free
         // (#52). `Client.deinit` deinits it instead. Nothing drives its IO after the call that

@@ -26,6 +26,7 @@ const MessageBus = @import("../message_bus.zig").MessageBusType(IO);
 const Storage = @import("../storage.zig").StorageType(IO);
 const StateMachine = @import("state_machine.zig").StateMachineType(Storage);
 const release_peers = @import("release_peers.zig");
+const release_eviction = @import("release_eviction.zig");
 const diag = @import("diagnostic.zig");
 
 const VSRClient = vsr.ClientType(StateMachine.Operation, MessageBus);
@@ -76,13 +77,17 @@ pub fn run(gpa: std.mem.Allocator, options: Options) void {
                 "with fewer, restore from a backup",
             .{},
         ),
-        error.Evicted => diag.fail(
-            "NRV-E0716",
-            "recover: the cluster evicted this session before it finished",
-            .{},
-            "run nerva recover again; the cluster holds at most {} client sessions",
-            .{constants.clients_max},
-        ),
+        error.Evicted => {
+            // Evicted for its release: NRV-E0609/E0610, not "too many sessions".
+            diag.fail_release_eviction();
+            diag.fail(
+                "NRV-E0716",
+                "recover: the cluster evicted this session before it finished",
+                .{},
+                "run nerva recover again; the cluster holds at most {} client sessions",
+                .{constants.clients_max},
+            );
+        },
         else => diag.fail_file(options.path, err),
     };
     log.info("recover: replica {} of cluster {} formatted at view {} (the cluster was at " ++
@@ -172,6 +177,11 @@ const Session = struct {
     fn on_eviction(vsr_client: *VSRClient, eviction: *const Message.Eviction) void {
         const session: *Session = @fieldParentPtr("vsr_client", vsr_client);
         log.warn("evicted: {s}", .{@tagName(eviction.header.reason)});
+        release_eviction.record(
+            eviction.header.reason,
+            config.process.release,
+            eviction.header.release,
+        );
         // The callback runs inside the message bus's receive path: the client is only
         // deinitialized once the loop below stops (as `Client.on_eviction`, #52).
         session.evicted = true;

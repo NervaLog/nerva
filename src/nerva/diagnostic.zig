@@ -18,6 +18,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const assert = std.debug.assert;
+const release_eviction = @import("release_eviction.zig");
 
 pub const exit_operator: u8 = 1;
 pub const exit_environment: u8 = 2;
@@ -48,6 +49,8 @@ pub const table = [_]Entry{
     .{ .code = "NRV-E0009", .summary = "`--listen` is not loopback and `--listen-remote` was not given", .exit = exit_operator },
     .{ .code = "NRV-E0010", .summary = "A replica or gateway cannot send its metrics to `--statsd`", .exit = exit_operator },
     .{ .code = "NRV-E0604", .summary = "A gateway or view server could not reach the cluster", .exit = exit_operator },
+    .{ .code = "NRV-E0609", .summary = "The client (a gateway, `nerva view`, a command) is of a newer release than the cluster runs; it was evicted (`client_release_too_high`)", .exit = exit_operator },
+    .{ .code = "NRV-E0610", .summary = "The client's release is below the cluster's `release_client_min`; it was evicted (`client_release_too_low`)", .exit = exit_operator },
     .{ .code = "NRV-E0701", .summary = "The data file was written by another release", .exit = exit_operator },
     .{ .code = "NRV-E0702", .summary = "The data file is not a Nerva data file, or is damaged", .exit = exit_operator },
     .{ .code = "NRV-E0703", .summary = "Another process holds the data file", .exit = exit_operator },
@@ -350,8 +353,28 @@ pub fn fail(
     print_and_exit(stream.getWritten(), comptime entry(code).exit);
 }
 
+/// If the client was evicted because of its release (`release_eviction.record`), prints
+/// NRV-E0609 (too new) or NRV-E0610 (below `release_client_min`) and exits; otherwise returns.
+pub fn fail_release_eviction() void {
+    const eviction = release_eviction.take() orelse return;
+    if (eviction.too_high()) fail(
+        "NRV-E0609",
+        "{s}: the cluster runs release {}; this client, release {}, is newer, so it was evicted",
+        .{ command, eviction.cluster, eviction.client },
+        "move the cluster to release {} first, or run this command at release {}",
+        .{ eviction.client, eviction.cluster },
+    ) else fail(
+        "NRV-E0610",
+        "{s}: the cluster runs release {}; this client, release {}, is below its release_client_min, so it was evicted",
+        .{ command, eviction.cluster, eviction.client },
+        "upgrade this client to at least the cluster's release_client_min (`nerva version` on a replica's binary prints it)",
+        .{},
+    );
+}
+
 /// An error a command did not expect: `bug[NRV-B0004]`, the name only under `--log-debug`.
 pub fn unexpected(err: anyerror) noreturn {
+    if (err == error.Evicted) fail_release_eviction();
     var buffer: [block_size_max]u8 = undefined;
     var stream = std.io.fixedBufferStream(&buffer);
     const writer = stream.writer();
