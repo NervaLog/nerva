@@ -307,7 +307,15 @@ restore_built() {
 # One coded line per call (a round at most), and the caller carries on with what it has.
 checkout_commit() {
     local err="$STATE/checkout.err"
-    if git checkout --quiet --detach "$1" 2>"$err"; then return 0; fi
+    # --force: the checkout is the fleet's own, so a file a failed checkout left modified is
+    # overwritten, not a reason to refuse every later one (#439).
+    if git checkout --force --quiet --detach "$1" 2>"$err"; then
+        # git can exit 0 after failing to write a file (a full disk, a read-only directory): a
+        # mixed tree must never be built or recorded as built (#439).
+        if [[ -z "$(git status --porcelain --untracked-files=no 2>>"$err")" ]]; then return 0; fi
+        echo "tree is not clean after the checkout: $(git status --porcelain --untracked-files=no \
+            2>/dev/null | head -n1)" >"$err"
+    fi
     log "error[NRV-E0731]: cannot check out $1 ($(head -n1 "$err" | cut -c1-200));" \
         "still testing ${built:-nothing}"
     return 1

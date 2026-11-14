@@ -220,8 +220,11 @@ unbuilt head (the loop died between recording the failure and the checkout) puts
 hands over the same way, as does a round whose fetch fails or whose main is back at the built
 commit. A restart *during* a build still starts the checkout's, the unbuilt head's; that
 `run.sh` hands over at the end of the build, or at the next round if the build was cut short.
-A checkout that fails (a stale `.git/index.lock`, an unknown commit) logs `error[NRV-E0731]`
-once per round and the loop keeps testing the built commit. A restart also picks up the
+A checkout that fails (a stale `.git/index.lock`, an unknown commit, a tree left dirty by a full
+disk) logs `error[NRV-E0731]` once per round and the loop keeps testing the built commit; the
+checkout is forced, and a tree that is not clean afterwards is never built (#439). For an unknown
+built commit, `git -C <checkout> fetch origin <built commit>` or wait for main's next commit;
+do not delete `state/built`. A restart also picks up the
 checkout's `run.sh`: the fleet running before this change has no re-exec, so restart it once
 after the merge for it to take effect at once. A fleet pinned (`SIM_FLEET_BRANCH`) to a commit
 older than this change still runs that commit's `run.sh`: restart the unit after a re-pin.

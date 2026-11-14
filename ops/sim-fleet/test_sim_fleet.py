@@ -1719,7 +1719,7 @@ class FailedBuild(unittest.TestCase):
              f'STATE="{state}"; built={v1}; broken=""; cd "{repo}"; SIM_FLEET_BRANCH=main; '
              f'SIM_FLEET_GIT_TIMEOUT=60; SIM_FLEET_BUILD_TIMEOUT=60; '
              f'SIM_FLEET_REPO_DIR="{repo}"; RUN_ARGS=(a); RUN_SH_SUM=0; ORIG_ENV=(); '
-             f'git() {{ if [[ "$1" == checkout && "$4" == "{v1}" ]]; then '
+             f'git() {{ if [[ "$1" == checkout && "${{@: -1}}" == "{v1}" ]]; then '
              f'echo "BROKEN-ON-DISK=$(cat "{state}/broken")"; fi; command git "$@"; }}; '
              f'git checkout -q --detach {v1}; git remote set-url origin "{remote}"; '
              f'follow_main; echo NOT-REACHED'],
@@ -1846,6 +1846,50 @@ class FailedBuild(unittest.TestCase):
 
     def test_an_unknown_built_commit_does_not_end_the_loop(self):
         self._checkout_fails(lock=False, built_known=False, on_unbuilt=True)
+
+    def _dirty_case(self, dirty_after):
+        """A new head to check out; the tree is dirty before it, or git leaves it dirty (#439)."""
+        d = tempfile.mkdtemp()
+        self.addCleanup(subprocess.run, ["rm", "-rf", d])
+        remote, repo, state = (os.path.join(d, n) for n in ("remote", "repo", "state"))
+        os.makedirs(remote)
+        self.git(remote, "init", "-q", "-b", "main")
+        Path(remote, "f").write_text("v1")
+        self.git(remote, "add", "f")
+        self.git(remote, "commit", "-q", "-m", "v1")
+        v1 = self.git(remote, "rev-parse", "HEAD")
+        subprocess.run(["git", "clone", "-q", remote, repo], check=True)
+        Path(remote, "f").write_text("v2")
+        self.git(remote, "commit", "-q", "-a", "-m", "v2")
+        os.makedirs(state)
+        # build_into records what the tree held when it was built.
+        script = (f'source "{HERE}/run.sh"; log() {{ echo "$*" >&2; }}; '
+                  f'build_into() {{ cp f "{state}/tree-built"; return 0; }}; '
+                  f'prune_cache() {{ :; }}; STATE="{state}"; built={v1}; broken=; '
+                  f'cd "{repo}"; SIM_FLEET_BRANCH=main; SIM_FLEET_GIT_TIMEOUT=60; '
+                  f'SIM_FLEET_BUILD_TIMEOUT=60; SIM_FLEET_REPO_DIR="{repo}"; RUN_ARGS=(a); '
+                  f'RUN_SH_SUM=0; ORIG_ENV=(); ')
+        if dirty_after:
+            # git exits 0 but a file was not written (a full disk).
+            script += ('git() { command git "$@"; local rc=$?; '
+                       'if [[ "$1" == checkout ]]; then echo torn > f; fi; return $rc; }; ')
+        else:
+            script += 'echo torn > f; '
+        return subprocess.run(["bash", "-c", script + 'follow_main; echo "RC=$?"'],
+                              env={"PATH": os.environ["PATH"], "HOME": d}, capture_output=True,
+                              text=True, timeout=60), repo
+
+    def test_a_dirty_tree_is_forced_clean_by_the_next_checkout(self):
+        out, repo = self._dirty_case(dirty_after=False)
+        self.assertEqual(Path(os.path.join(os.path.dirname(repo), 'state', 'tree-built')).read_text(), "v2", out.stderr)
+        self.assertNotIn("NRV-E0731", out.stderr)
+
+    def test_a_checkout_that_leaves_the_tree_dirty_is_not_built(self):
+        out, repo = self._dirty_case(dirty_after=True)
+        self.assertIn("RC=0", out.stdout, out.stderr)
+        self.assertFalse(Path(os.path.join(os.path.dirname(repo), 'state', 'tree-built')).exists(), out.stderr)
+        self.assertEqual(out.stderr.count("NRV-E0731"), 1, out.stderr)
+        self.assertIn("tree is not clean", out.stderr)
 
     def test_a_restart_already_on_the_built_commit_stays_put(self):
         d = tempfile.mkdtemp()
