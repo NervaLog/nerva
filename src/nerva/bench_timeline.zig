@@ -1093,7 +1093,11 @@ test "OutFile: a file of another user in a sticky directory is written in place 
     // default) the kernel refuses an O_CREAT open, even by root, of a file in a sticky,
     // world-writable directory that is neither the opener's nor the directory owner's. This test
     // is about `OutFile`'s choice, not about that sysctl, so it does not depend on it.
-    try std.posix.fchown(tmp.dir.fd, 12345, 12345);
+    {
+        var directory = try tmp.dir.openDir(".", .{ .iterate = true });
+        defer directory.close();
+        try std.posix.fchown(directory.fd, 12345, 12345);
+    }
     try std.posix.fchmodat(tmp.dir.fd, ".", 0o1777, 0);
     const path = try tmp_path(gpa, &tmp, "theirs");
     defer gpa.free(path);
