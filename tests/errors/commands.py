@@ -239,7 +239,8 @@ def main():
         assert sha(data) == before
 
         # A binary with multiversion sections that hold no bundle: NRV-E0719, not a replica
-        # that runs as one release (P415). Needs objcopy; E0726 is unit-tested.
+        # that runs as one release (P415). Needs objcopy; E0726 and the size bound are
+        # unit-tested on `bundle_present` (src/nerva_main.zig), which a test as root can reach.
         objcopy = shutil.which("objcopy")
         if objcopy:
             junk = os.path.join(tmp, "junk-section")
@@ -265,7 +266,11 @@ def main():
             os.chmod(damaged_off, 0o755)
             env_noexec = {"NERVA_MEMFD_NOEXEC_PATH": refused}
             check("start with memfd_noexec 2", start + [data], "NRV-E0720", 1,
-                  "vm.memfd_noexec is 2", env=env_noexec, nerva=damaged_off)
+                  "vm.memfd_noexec is not 0", env=env_noexec, nerva=damaged_off)
+            with open(refused, "w") as f:
+                f.write("1\n")
+            check("start with memfd_noexec 1", start + [data], "NRV-E0720", 1,
+                  "vm.memfd_noexec is not 0", env=env_noexec, nerva=damaged_off)
             check("release build ignores the sysctl override", start + [data], "NRV-E0719", 1,
                   "bundle of releases cannot be read", env=env_noexec, nerva=damaged_bundle)
             assert sha(data) == before

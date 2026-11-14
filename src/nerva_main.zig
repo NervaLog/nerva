@@ -864,7 +864,8 @@ fn command_start(
         // The release this replica runs and the highest it offers, once a second.
         if (gauge_ticks % (std.time.ms_per_s / constants.tick_ms) == 0) {
             tracer.gauge(.replica_release, replica.release.value);
-            // Read each time: replacing the binary on disk changes what this replica offers.
+            // Read each time: replacing the binary on disk changes what a bundled replica
+            // offers. An unbundled one polls nothing and keeps offering its own release (P415d).
             tracer.gauge(.replica_releases_offered, releases_offered(multiversion));
         }
         gauge_ticks +%= 1;
@@ -892,14 +893,14 @@ fn bundle_open(
     defer gpa.free(exe_path);
 
     const present = bundle_present(gpa, exe_path) catch |err| switch (err) {
-        error.BinaryTooLarge => bundle_fail("the binary is larger than any bundle can be"),
+        error.BinaryTooLarge => bundle_fail("the binary is larger than a bundle-carrying binary can be"),
         error.OutOfMemory => bundle_unreadable("out of memory"),
         error.BinaryUnreadable => bundle_unreadable("the file could not be opened or read"),
     };
     if (!present) return false;
 
-    // Before `MultiversionOS.init`, whose `memfd_create` a hardened kernel may refuse. The
-    // sysctl path is overridable in the test build only (`-Dtest-commit-keys=off`): a release
+    // Before `MultiversionOS.init`, whose `memfd` a hardened kernel seals non-executable or
+    // refuses (`vm.memfd_noexec` 1 or 2, P415c). The sysctl path is overridable in the test build only (`-Dtest-commit-keys=off`): a release
     // binary cannot be told to skip the refusal.
     const memfd_noexec_path = if (!commit_keys_deduplicate)
         std.posix.getenv("NERVA_MEMFD_NOEXEC_PATH") orelse preflight.memfd_noexec_path
@@ -1146,4 +1147,42 @@ test "releases_offered is the highest release bundled, not how many" {
         releases_offered(multiversion),
     );
     try std.testing.expectEqual(@as(u16, 2), multiversion.releases_bundled().count);
+}
+
+test "bundle_present: unreadable, too large, out of memory, unbundled" {
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = try tmp.dir.realpath(".", &dir_buffer);
+
+    // A path that does not exist is the cause of NRV-E0726, never "unbundled".
+    var missing_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const missing = try std.fmt.bufPrintZ(&missing_buffer, "{s}/missing", .{dir});
+    try testing.expectError(error.BinaryUnreadable, bundle_present(testing.allocator, missing));
+
+    // One byte past the bound is refused before anything is allocated; a sparse file costs no disk.
+    {
+        const file = try tmp.dir.createFile("large", .{});
+        defer file.close();
+        try file.setEndPos(bundle_size_max + 1);
+    }
+    var large_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const large = try std.fmt.bufPrintZ(&large_buffer, "{s}/large", .{dir});
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    try testing.expectError(error.BinaryTooLarge, bundle_present(failing.allocator(), large));
+    try testing.expectEqual(@as(usize, 0), failing.allocations);
+
+    // At the bound it is read: the allocation is reached, and its failure is out of memory.
+    {
+        const file = try tmp.dir.openFile("large", .{ .mode = .read_write });
+        defer file.close();
+        try file.setEndPos(bundle_size_max);
+    }
+    failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    try testing.expectError(error.OutOfMemory, bundle_present(failing.allocator(), large));
+
+    // This test binary has no multiversion sections.
+    try testing.expect(!(try bundle_present(testing.allocator, "/proc/self/exe")));
 }

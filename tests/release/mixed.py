@@ -174,9 +174,10 @@ def main():
         assert statuses == [200] * 20, statuses
 
         # Each side says it ignores the other.
-        wait_for(lambda: "replica 2 runs release 0.0.200" in cluster.log(0), 10, "replica 0's log")
-        wait_for(lambda: "replica 0 runs release " in cluster.log(2) and
-                 "replica 1 runs release " in cluster.log(2), 10, "replica 2's log")
+        wait_for(lambda: "NRV-W0702 replica 2 runs release 0.0.200" in cluster.log(0), 10,
+                 "replica 0's log")
+        wait_for(lambda: "NRV-W0702 replica 0 runs release " in cluster.log(2) and
+                 "NRV-W0702 replica 1 runs release " in cluster.log(2), 10, "replica 2's log")
 
         # Replica 2 does not count toward a quorum: without replica 1, nothing commits.
         cluster.stop(1)

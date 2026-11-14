@@ -57,7 +57,7 @@ pub const Refusal = union(enum) {
     cluster_upgraded: ReleaseRefusal,
     locked,
     direct_io_unsupported,
-    /// `vm.memfd_noexec = 2`: this replica could not switch release (NRV-E0720).
+    /// `vm.memfd_noexec` is not 0: this replica could not switch release (NRV-E0720).
     memfd_noexec,
 };
 
@@ -208,15 +208,19 @@ pub fn release_refusal(release: vsr.Release, releases_run: []const vsr.Release) 
     return .{ .other_release = refusal };
 }
 
-/// Whether the kernel forbids executing from memory: `vm.memfd_noexec` is 2. Absent (a kernel
-/// before 6.3) or unreadable is not a refusal.
+/// Whether the kernel forbids executing from memory: `vm.memfd_noexec` is anything but 0. The
+/// vendored `memfd_create` passes only `MFD_CLOEXEC`, so with 1 the kernel seals the `memfd`
+/// non-executable ("without MFD_EXEC nor MFD_NOEXEC_SEAL acts like MFD_NOEXEC_SEAL", kernel
+/// `vm.memfd_noexec`), and with 2 it seals it (6.6 on) or fails the create (6.3 to 6.5): either
+/// way `execveat` gets `EACCES` at the switch. Absent (a kernel before 6.3) or unreadable is not
+/// a refusal.
 pub fn memfd_noexec_refused(path: []const u8) bool {
     const file = std.fs.openFileAbsolute(path, .{}) catch return false;
     defer file.close();
     var buffer: [16]u8 = undefined;
     const count = file.read(&buffer) catch return false;
     const text = std.mem.trim(u8, buffer[0..count], " \n");
-    return std.mem.eql(u8, text, "2");
+    return text.len > 0 and !std.mem.eql(u8, text, "0");
 }
 
 /// As the vendored open decides it, but on the file itself: `O_DIRECT` is refused with
@@ -273,19 +277,29 @@ pub fn refuse(path: []const u8, refusal: Refusal) noreturn {
             "check the path; restore the replica from a backup, or replace it",
             .{},
         ),
-        .other_release => |mismatch| diagnostic.fail(
-            "NRV-E0701",
-            "{s}: {s} was written by release {}, and this binary runs {} and bundles {}",
-            .{
-                diagnostic.command,
-                path,
-                mismatch.file,
-                constants.config.process.release,
-                Bundled{ .releases_run = mismatch.releases_run },
-            },
-            "upgrade by export and import (README, \"Upgrading a cluster\"); nothing was changed",
-            .{},
-        ),
+        .other_release => |mismatch| {
+            // Below every bundled release: the cluster rolled on without this replica, and the
+            // fix is for this replica alone. Otherwise another release: export and import.
+            const behind = mismatch.file.value < mismatch.releases_run[0].value;
+            diagnostic.fail(
+                "NRV-E0701",
+                "{s}: {s} was written by release {}, and this binary runs {} and bundles {}",
+                .{
+                    diagnostic.command,
+                    path,
+                    mismatch.file,
+                    constants.config.process.release,
+                    Bundled{ .releases_run = mismatch.releases_run },
+                },
+                "{s}; nothing was changed",
+                .{if (behind)
+                    "this replica fell behind the cluster's releases: replace it with " ++
+                        "nerva recover (README, \"Replacing a lost replica\"), or upgrade the " ++
+                        "whole cluster by export and import"
+                else
+                    "upgrade by export and import (README, \"Upgrading a cluster\")"},
+            );
+        },
         .cluster_upgraded => |mismatch| diagnostic.fail(
             "NRV-E0718",
             "{s}: {s} belongs to a cluster that runs release {}, and this binary runs {} and " ++
@@ -303,9 +317,9 @@ pub fn refuse(path: []const u8, refusal: Refusal) noreturn {
         ),
         .memfd_noexec => diagnostic.fail(
             "NRV-E0720",
-            "{s}: vm.memfd_noexec is 2: this replica could not switch release",
+            "{s}: vm.memfd_noexec is not 0: this replica could not switch release",
             .{diagnostic.command},
-            "set vm.memfd_noexec to 0 or 1, or upgrade this cluster by export and import; " ++
+            "set vm.memfd_noexec to 0, or upgrade this cluster by export and import; " ++
                 "nothing was changed",
             .{},
         ),
@@ -473,7 +487,7 @@ test "preflight: a checkpoint's release against the releases this binary runs" {
     try testing.expect(release_refusal(beyond, &bundle).? == .cluster_upgraded);
 }
 
-test "preflight: vm.memfd_noexec of 2 is refused, 0, 1 and absent are not" {
+test "preflight: vm.memfd_noexec other than 0 is refused, 0 and absent are not" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -482,7 +496,7 @@ test "preflight: vm.memfd_noexec of 2 is refused, 0, 1 and absent are not" {
     const path = try std.fmt.bufPrint(&path_buffer, "{s}/memfd_noexec", .{dir});
 
     try testing.expect(!memfd_noexec_refused(path));
-    inline for (.{ .{ "0\n", false }, .{ "1\n", false }, .{ "2\n", true } }) |case| {
+    inline for (.{ .{ "0\n", false }, .{ "1\n", true }, .{ "2\n", true } }) |case| {
         try tmp.dir.writeFile(.{ .sub_path = "memfd_noexec", .data = case[0] });
         try testing.expectEqual(case[1], memfd_noexec_refused(path));
     }
