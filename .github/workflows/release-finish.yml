@@ -89,7 +89,7 @@ jobs:
 
   # The existing signing job, as it is: environment apple-signing, so the owner approves the run.
   # A called workflow sees no secret, its environment's included, unless the caller passes them:
-  # without inheriting them every APPLE_* secret is empty there (NRV-E1121, v0.7.1, P<PR>).
+  # without inheriting them every APPLE_* secret is empty there (NRV-E1121, v0.7.1, P459).
   mac:
     needs: guard
     if: needs.guard.outputs.published != 'true'
