@@ -460,7 +460,15 @@ sums_check() { # <sig> <data>
   gpgv --keyring "$W/ring.gpg" --status-fd 3 "$1" "$2" 3>"$W/sums.status" 2>/dev/null || true
   check_sigs "$W/sums.status" 1 1 releasegpg
 }
-e1165() { refuse NRV-E1165 "$1" "$2" "Sign the draft's SHA256SUMS with the release key (run repos-ready again), or delete the draft and run release.yml again"; }
+e1165() { refuse NRV-E1165 "$1" "$2" "A SHA256SUMS.asc already on the draft is never replaced: delete that asset (gh release delete-asset <tag> SHA256SUMS.asc), then run repos-ready again to sign the sums; or delete the draft and run release.yml again"; }
+# P417e: a release up to v0.7.1 with no .debug and no SHA256SUMS.asc asset is the pre-P417 set (v0.7.1
+# was published before P417 merged): nine lines in SHA256SUMS, no signature. Needs rel_fetch. The same
+# test is release_check.sh publish-ready's.
+legacy_release() { # <tag>
+  local core=${1#v}; core=${core%%-*}
+  [ "$(printf '%s\n%s\n' "$core" 0.7.1 | sort -V | tail -n1)" = 0.7.1 ] &&
+    ! awk '$1=="A" && ($3 ~ /^nerva-.*\.debug$/ || $3=="SHA256SUMS.asc") {f=1} END{exit !f}' "$W/rel.$1"
+}
 sums_sign() { # <tag>: reads and writes $W/draft; uploads SHA256SUMS.asc when the draft has none
   local tag=$1 rc=0
   rel_download "$tag" SHA256SUMS.asc "$W/draft/SHA256SUMS.asc" || rc=$?
@@ -488,6 +496,7 @@ cmd_sums_verify() {
   mkdir -p "$W/draft"; read_fingerprints; rm -rf "$GNUPGHOME"; mkdir -m 700 "$GNUPGHOME"
   gpg --batch --dearmor <"$keys_dir/nerva-release.asc" >"$W/ring.gpg"
   rel_fetch "$tag" || e1155_now "reading the release $tag failed"
+  if legacy_release "$tag"; then notice "$tag is the pre-P417 set: its SHA256SUMS is not signed"; return 0; fi
   for name in SHA256SUMS SHA256SUMS.asc; do
     rc=0; rel_download "$tag" "$name" "$W/draft/$name" || rc=$?
     case $rc in 0) ;; 2) e1165 "the release $tag has no $name" "SHA256SUMS is signed by repos-ready before the release is published" ;; *) e1155_now "downloading $name failed" ;; esac
@@ -497,6 +506,15 @@ cmd_sums_verify() {
 }
 
 filever() { local v=${1#v}; printf '%s' "${v/-rc./.rc.}"; }
+# The files SHA256SUMS lists (P417e): four tarballs, four packages, the two Linux .debug files and the
+# bill of materials; the pre-P417 set has no .debug.
+sums_names() { # <tag> <legacy 0|1>
+  local t=$1
+  printf '%s\n' "nerva-$t-x86_64-linux.tar.gz" "nerva-$t-aarch64-linux.tar.gz" "nerva-$t-x86_64-macos.tar.gz" \
+    "nerva-$t-aarch64-macos.tar.gz" "nerva-$t.cdx.json"
+  [ "$2" = 1 ] || printf '%s\n' "nerva-$t-x86_64-linux.debug" "nerva-$t-aarch64-linux.debug"
+  package_names "$t"
+}
 package_names() { # <tag>: the release's four package names
   local fv; fv=$(filever "$1")
   printf '%s\n' "nerva_${fv}-1_amd64.deb" "nerva_${fv}-1_arm64.deb" "nerva-${fv}-1.x86_64.rpm" "nerva-${fv}-1.aarch64.rpm"
@@ -707,23 +725,26 @@ cmd_ready() {
   [ "$(rel_state "$tag")" = draft ] || refuse NRV-E1148 "the release $tag does not read draft though guard saw a draft" \
     "it was published or deleted since" "Restore the asset the approved run bound, or release a new version, then run again"
   draft_ids=$(awk '$1=="A"{print $2, $3}' "$W/rel.$tag" | sort)
-  # exactly four packages, matching SHA256SUMS
+  # exactly four packages, and every file SHA256SUMS lists, matching it (P417e)
   names=$(package_names "$tag" | sort)
   [ "$(awk '$1=="A" && $3 ~ /^nerva[_-].*\.(deb|rpm)$/ {print $3}' "$W/rel.$tag" | sort)" = "$names" ] ||
     e1140 "the draft does not hold exactly the four packages" "expected $names"
   mkdir -p "$W/draft"
-  n=0
-  for name in SHA256SUMS $names; do
-    n=$((n + 1)); [ "$n" -le 5 ] || bug "ready counted more than five assets"
-    local rc=0; rel_download "$tag" "$name" "$W/draft/$name" || rc=$?
-    case $rc in 0) ;; 2) e1140 "the draft has no $name" "expected five assets" ;; *) e1155_now "downloading $name failed" ;; esac
-  done
-  for name in $names; do
+  local rc=0; rel_download "$tag" SHA256SUMS "$W/draft/SHA256SUMS" || rc=$?
+  case $rc in 0) ;; 2) e1140 "the draft has no SHA256SUMS" "expected SHA256SUMS" ;; *) e1155_now "downloading SHA256SUMS failed" ;; esac
+  legacy=0; legacy_release "$tag" && legacy=1
+  listed_want=$(sums_names "$tag" "$legacy" | sort)
+  listed=$(awk '{n = $2; sub(/^\*/, "", n); print n}' "$W/draft/SHA256SUMS" | sort)
+  [ "$listed" = "$listed_want" ] || e1140 "SHA256SUMS does not list exactly the files of the release ($(diff <(echo "$listed_want") <(echo "$listed") | tr '\n' ' '))" \
+    "a line is missing, extra, repeated or malformed"
+  while read -r name; do
     want=$(awk -v n="$name" '$2 == n || $2 == "*" n {print $1}' "$W/draft/SHA256SUMS" | head -n1)
-    [[ $want =~ ^[0-9a-f]{64}$ ]] || e1140 "SHA256SUMS has no line for $name" "every package is listed"
+    [[ $want =~ ^[0-9a-f]{64}$ && ! $want =~ ^0+$ ]] || e1140 "SHA256SUMS has no real hash for $name" "every listed file has a 64-digit hash that is not zero"
+    rc=0; rel_download "$tag" "$name" "$W/draft/$name" || rc=$?
+    case $rc in 0) ;; 2) e1140 "the draft has no $name, which SHA256SUMS lists" "every listed file is on the draft" ;; *) e1155_now "downloading $name failed" ;; esac
     got=$(sha_of "$W/draft/$name")
     [ "$got" = "$want" ] || e1140 "$name does not match SHA256SUMS" "the file hashes to $got, SHA256SUMS says $want"
-  done
+  done <<<"$listed_want"
   rel_forget "$tag"
   rel_fetch "$tag" || e1155_now "reading the release $tag again failed"
   [ "$(rel_state "$tag")" = draft ] || refuse NRV-E1148 "the release $tag was published while its packages were read" \
@@ -731,7 +752,7 @@ cmd_ready() {
   ids2=$(awk '$1=="A"{print $2, $3}' "$W/rel.$tag" | sort)
   [ "$draft_ids" = "$ids2" ] || refuse NRV-E1148 "the draft's assets changed while they were read" \
     "the bytes read may not be what the owner approved" "Restore the asset the approved run bound, or release a new version, then run again"
-  sums_sign "$tag"
+  if [ "$legacy" = 1 ]; then notice "$tag is the pre-P417 set: SHA256SUMS is not signed"; else sums_sign "$tag"; fi
   # the entries this tag wants
   : >"$W/want"
   for name in $names; do

@@ -75,6 +75,12 @@ def keys():
     return _keys
 
 
+def sums_of(files):
+    """The SHA256SUMS text over {name: bytes}, without SHA256SUMS itself."""
+    return "".join(f"{hashlib.sha256(b).hexdigest()}  {n}\n"
+                   for n, b in sorted(files.items()) if n != "SHA256SUMS").encode()
+
+
 def packages(tag, salt=""):
     """The four packages of a release and its SHA256SUMS, built once. Returns {name: bytes}."""
     if (tag, salt) in _pkgs:
@@ -111,8 +117,13 @@ def packages(tag, salt=""):
         built = next((top / "RPMS").rglob("*.rpm"))
         name = f"nerva-{fv}-1.{rarch}.rpm"
         out[name] = built.read_bytes()
-    sums = "".join(f"{hashlib.sha256(b).hexdigest()}  {n}\n" for n, b in sorted(out.items()))
-    out["SHA256SUMS"] = sums.encode()
+    # The other files SHA256SUMS lists (P417e): four tarballs, two .debug files, the bill of materials.
+    for t in ("x86_64-linux", "aarch64-linux", "x86_64-macos", "aarch64-macos"):
+        out[f"nerva-{tag}-{t}.tar.gz"] = f"tarball {t} {salt}".encode()
+    for t in ("x86_64-linux", "aarch64-linux"):
+        out[f"nerva-{tag}-{t}.debug"] = f"debug {t} {salt}".encode()
+    out[f"nerva-{tag}.cdx.json"] = f"{{\"salt\": \"{salt}\"}}".encode()
+    out["SHA256SUMS"] = sums_of(out)
     _pkgs[(tag, salt)] = out
     return out
 
@@ -671,11 +682,87 @@ class Ready(Base):
         self.release("v0.7.1")
         self.assertEqual(self.ready("v0.7.1")[0], 0)
         self.releases = json.loads((self.gh_dir / "releases.json").read_text())  # the stand-in added the .asc
-        self.replace_asset("v0.7.1", "SHA256SUMS", self.asset_bytes("v0.7.1", "SHA256SUMS") + b"0" * 64 + b"  stray\n")
+        # the same lines in another order: every hash still matches, the signature does not
+        self.sums_edit("v0.7.1", lambda ls: ls[::-1])
         rc, _, err = self.ready("v0.7.1")
         self.assert_diag(rc, err, "NRV-E1165")
         self.assertEqual(self.code(), "NRV-E1165")
         self.assertEqual(len(self.uploads()), 1)
+
+    # ---- every file SHA256SUMS lists is hashed before it is signed (P417e) ---------------------
+
+    def sums_edit(self, tag, fn):
+        text = self.asset_bytes(tag, "SHA256SUMS").decode()
+        self.replace_asset(tag, "SHA256SUMS", "".join(fn(text.splitlines(True))).encode())
+
+    def refused_unsigned(self, what):
+        rc, _, err = self.ready("v0.7.1")
+        self.assert_diag(rc, err, "NRV-E1140", what)
+        self.assertEqual(self.uploads(), [])
+        self.assertIsNone(self.asset_bytes("v0.7.1", "SHA256SUMS.asc"))
+
+    def test_a_zero_hash_for_a_debug_file_is_refused_and_nothing_is_signed(self):
+        self.release("v0.7.1")
+        self.sums_edit("v0.7.1", lambda ls: [("0" * 64 + l[64:]) if ".debug" in l else l for l in ls])
+        self.refused_unsigned("no real hash")
+
+    def test_a_wrong_hash_for_a_debug_file_is_refused_and_nothing_is_signed(self):
+        self.release("v0.7.1")
+        self.sums_edit("v0.7.1", lambda ls: [("1" * 64 + l[64:]) if ".debug" in l else l for l in ls])
+        self.refused_unsigned("does not match SHA256SUMS")
+
+    def test_a_missing_line_is_refused_and_nothing_is_signed(self):
+        self.release("v0.7.1")
+        self.sums_edit("v0.7.1", lambda ls: [l for l in ls if "aarch64-linux.debug" not in l])
+        self.refused_unsigned("does not list exactly")
+
+    def test_an_extra_line_is_refused_and_nothing_is_signed(self):
+        self.release("v0.7.1")
+        self.sums_edit("v0.7.1", lambda ls: ls + ["a" * 64 + "  stray-file\n"])
+        self.refused_unsigned("does not list exactly")
+
+    def test_a_listed_file_missing_from_the_draft_is_refused_and_nothing_is_signed(self):
+        self.release("v0.7.1", drop=("nerva-v0.7.1-x86_64-linux.debug",))
+        self.refused_unsigned("has no nerva-v0.7.1-x86_64-linux.debug")
+
+    def test_a_signature_by_a_key_that_is_not_the_pinned_one_is_refused_and_not_replaced(self):
+        self.release("v0.7.1")
+        sums = self.asset_bytes("v0.7.1", "SHA256SUMS")
+        home = self.tmp / "other"
+        home.mkdir(mode=0o700)
+        env = {**os.environ, "GNUPGHOME": str(home)}
+        subprocess.run(["gpg", "--batch", "--import"], input=self.k["c"][1], text=True, env=env,
+                       capture_output=True, check=True)
+        (self.tmp / "sums").write_bytes(sums)
+        subprocess.run(["gpg", "--batch", "--pinentry-mode", "loopback", "--passphrase", PASS["c"],
+                        "--digest-algo", "SHA512", "--armor", "--detach-sign", "-u", self.k["c"][0],
+                        "-o", str(self.tmp / "sums.asc"), str(self.tmp / "sums")],
+                       check=True, capture_output=True, env=env)
+        self.release("v0.7.1", extra_assets=[("SHA256SUMS.asc", (self.tmp / "sums.asc").read_bytes())])
+        rc, _, err = self.ready("v0.7.1")
+        m = self.assert_diag(rc, err, "NRV-E1165", "does not verify")
+        self.assertIn("delete that asset", m.group(3))
+        self.assertEqual(self.uploads(), [])
+
+    def legacy_release(self, tag):
+        """The pre-P417 set: no .debug files, nine lines in SHA256SUMS."""
+        debug = tuple(n for n in packages(tag) if n.endswith(".debug"))
+        self.release(tag, drop=debug)
+        self.sums_edit(tag, lambda ls: [l for l in ls if ".debug" not in l])
+
+    def test_the_pre_p417_set_of_v0_7_1_is_accepted_unsigned_and_sums_verify_passes(self):
+        self.legacy_release("v0.7.1")
+        rc, _, err = self.ready("v0.7.1")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self.uploads(), [])
+        rc, _, err = self.run_script("sums-verify", "v0.7.1")
+        self.assertEqual(rc, 0, err)
+
+    def test_the_pre_p417_set_is_refused_for_a_later_version(self):
+        self.legacy_release("v0.7.2")
+        rc, _, err = self.ready("v0.7.2")
+        self.assert_diag(rc, err, "NRV-E1140", "does not list exactly")
+        self.assertEqual(self.uploads(), [])
 
     def test_a_failed_upload_of_the_signature_is_e1155(self):
         self.release("v0.7.1")
@@ -728,8 +815,7 @@ class Ready(Base):
         mixed = {n: (old[n] if n in rpms else new[n]) for n in new if n != "SHA256SUMS"}
         for n, b in mixed.items():
             self.replace_asset("v0.7.1", n, b)
-        self.replace_asset("v0.7.1", "SHA256SUMS", "".join(
-            f"{hashlib.sha256(b).hexdigest()}  {n}\n" for n, b in sorted(mixed.items())).encode())
+        self.replace_asset("v0.7.1", "SHA256SUMS", sums_of(mixed))
         before = self.manifest()
         rc, _, err = self.ready("v0.7.1", GITHUB_RUN_ATTEMPT="2", MAC_ATTEMPT="2")
         self.assert_diag(rc, err, "NRV-E1141")
