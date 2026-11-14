@@ -147,8 +147,8 @@ create() {
   for name in "${names[@]}"; do
     if [[ -z "${!name:-}" ]]; then
       refuse "the signing secret $name is empty" \
-        "the environment apple-signing does not hold it, or this run was not approved for it" \
-        "set $name in the environment apple-signing (the owner's setup checklist), then run again"
+        "apple-signing does not hold it, the run was not approved, or a caller passes no secrets" \
+        "set $name in apple-signing; if set, check each call of mac-sign.yml has secrets: inherit"
     fi
   done
 
