@@ -136,12 +136,14 @@ The README's first line no longer says "toy / research": it gives the label and 
 ### What was tested
 
 The release candidate is `main` at `c886c9f0e5e4cffd12597cc29f46a4535fe6b254` (P388; it replaced `5d7d806`, whose `src/`,
-`build.zig`, `build.zig.zon` and `zig/` are identical). The figures below are filled in
-from their records.
+`build.zig`, `build.zig.zon` and `zig/` are identical). The figures below are quoted
+from their records, except the reviewers' verdicts, which are quoted from their reports (P451).
 
 - **Simulation: shipped before the full 24 hours on the candidate, by the owner's waiver**
   (P451). The fleet ran `5d7d806`, whose pinned code is the candidate's, for 15.0 hours over
-  2026-11-12 and 2026-11-13: 74,305 seeds (VOPR, the testing VOPR and every fuzzer), none failed
+  2026-11-12 and 2026-11-13: 74,305 seeds (VOPR, the testing VOPR and every fuzzer), none failed, and 6 ran past their
+  per-seed deadline (5 `vopr-nerva`, 1 `vopr-testing`), which P287b counts as not clean; the owner
+  waived them too, and they are replayed after the tag ([#452](https://github.com/NervaLog/nerva/issues/452))
   ([the fleet's tracker, #177](https://github.com/NervaLog/nerva/issues/177)). The soak of
   `c886c9f` itself had not reached 24 hours when the owner chose to tag. No open issue reports
   a failing fleet seed against `5d7d806` or `c886c9f`; the open fleet issues (#443, #444, #446, #447) are about the fleet's own loop.
