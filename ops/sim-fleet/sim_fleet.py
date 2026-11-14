@@ -346,8 +346,7 @@ def read_result(round_dir, worker, line, counts, source_root):
         raise BadInput(f"{worker}/results: seed or exit code out of range: {line!r}")
     count = counts.setdefault(target, {"seeds": 0, "failed": 0, "timeouts": 0, "host": 0})
     count["seeds"] += 1
-    if hasattr(counts, "busy"):
-        counts.busy[worker] = counts.busy.get(worker, 0) + min(int(seconds), SEED_SECONDS_MAX)
+    counts.busy[worker] = counts.busy.get(worker, 0) + min(int(seconds), SEED_SECONDS_MAX)
     if code == 0:
         return None
     if code in HOST_CODES:
@@ -525,7 +524,7 @@ def kind_of(target):
 def round_seconds(counts):
     """A round's hours, as seconds: its busiest worker's. Workers run at once, so no worker's
     busy time exceeds the round's wall time, and the fleet never claims more than ran."""
-    return max(getattr(counts, "busy", {}).values(), default=0)
+    return max(counts.busy.values(), default=0)
 
 
 def commit_entry(entries, commit, sequence):
@@ -567,7 +566,7 @@ def refuse_round(state, commit, now):
     assert entry["refused"] > 0 and day["refused"] > 0
 
 
-def count_round(day, counts, commit, state=None):
+def count_round(day, counts, commit, state):
     day["rounds"] += 1
     day["commit"] = commit
     for target, count in counts.items():
@@ -575,10 +574,9 @@ def count_round(day, counts, commit, state=None):
                                                    "host": 0})
         for key in total:
             total[key] += count[key]
-    if state is not None:
-        state["sequence"] += 1
-        add_round(commit_entry(day.setdefault("commits", {}), commit, state["sequence"]), counts)
-        add_round(commit_entry(state["commits"], commit, state["sequence"]), counts)
+    state["sequence"] += 1
+    add_round(commit_entry(day.setdefault("commits", {}), commit, state["sequence"]), counts)
+    add_round(commit_entry(state["commits"], commit, state["sequence"]), counts)
 
 
 def record_fingerprints(state, commit, groups):
