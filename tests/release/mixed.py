@@ -156,6 +156,9 @@ def refuses_other_release(nerva, nerva_other, cluster):
         assert f"release {release}" in first, first  # the file's release
         assert "panic" not in result.stderr and "multiversion" not in result.stderr, result.stderr
         assert digest() == before, "the data file changed"
+        if code == "E0701":  # unbundled binary: the export and import hint, never recover
+            assert "upgrade by export and import" in result.stderr, result.stderr[-2000:]
+            assert "nerva recover" not in result.stderr, result.stderr[-2000:]
 
     # Written by 0.0.200, started by this binary: the cluster is past it.
     refused(nerva, cluster.data_file(2), "E0718", "0.0.200")
