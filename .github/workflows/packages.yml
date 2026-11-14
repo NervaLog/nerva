@@ -15,7 +15,7 @@ name: Packages
 on:
   push:
     branches: [main]
-    # No Markdown starts a run, except docs/INSTALL.md, which tests/packaging/repos.py reads (P<PR>).
+    # No Markdown starts a run, except docs/INSTALL.md, which tests/packaging/repos.py reads (P461).
     paths: ['**', '!**.md', 'docs/INSTALL.md']
   pull_request:
     branches: [main]
