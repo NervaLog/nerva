@@ -143,8 +143,9 @@ from their records, except the reviewers' verdicts, which are quoted from their 
   (P451). The fleet ran `5d7d806`, whose pinned code is the candidate's, for 15.0 hours over
   2026-11-12 and 2026-11-13: 74,305 seeds (VOPR, the testing VOPR and every fuzzer), none failed, and 6 ran past their
   per-seed deadline (5 `vopr-nerva`, 1 `vopr-testing`), which P287b counts as not clean; the owner
-  waived them too. Their seed numbers were not kept, so they cannot be replayed: the fleet will
-  keep the seed of every one past its deadline, and replay any that recur ([#452](https://github.com/NervaLog/nerva/issues/452);
+  waived them too. Their seed numbers were not kept, so they cannot be replayed, and the six stay
+  unexplained. The fleet does not yet keep such seeds; until it does and every one it records on
+  `c886c9f` or later has been replayed, this is open ([#452](https://github.com/NervaLog/nerva/issues/452);
   [the fleet's tracker, #177](https://github.com/NervaLog/nerva/issues/177)). The soak of
   `c886c9f` itself had not reached 24 hours when the owner chose to tag. No open issue reports
   a failing fleet seed against `5d7d806` or `c886c9f`; the open fleet issues (#443, #444, #446, #447) are about the fleet's own loop.
