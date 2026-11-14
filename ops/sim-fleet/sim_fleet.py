@@ -61,6 +61,10 @@ import urllib.request
 
 LABEL = "sim-fleet"
 MARKER = re.compile(r"<!-- vopr-fleet fingerprint: ([0-9a-f]{32}) -->")
+# The state file's schema rule (#289): while `version` is 1, a schema grows by optional fields only.
+# A reader gives every new field a default (`entry.get("refused", 0)`), so a file an older reporter
+# wrote still loads, and `load_state` checks only the fields that were always there. A field that
+# is required, renamed, retyped or dropped needs a new `version` and a migration, in the same commit.
 STATE_VERSION = 1
 
 # Bounds. Every collection this reads or keeps has one.
