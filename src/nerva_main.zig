@@ -878,7 +878,7 @@ fn command_start(
 
 /// Opens the release bundle of this binary into `multiversion_os`: true when it has one. An
 /// unbundled binary (a build, or the first release) runs only itself. A bundle that cannot be
-/// read is refused (NRV-E0719), and so is a binary that cannot be read at all (NRV-E0721):
+/// read is refused (NRV-E0719), and so is a binary that cannot be read at all (NRV-E0726):
 /// running as one release would strand a cluster that upgrades (P415).
 fn bundle_open(gpa: std.mem.Allocator, io: *IO, multiversion_os: *MultiversionOS) bool {
     const exe_path = mv.self_exe_path(gpa) catch bundle_unreadable("its path is unknown");
@@ -917,7 +917,7 @@ fn bundle_fail(cause: []const u8) noreturn {
 
 fn bundle_unreadable(cause: []const u8) noreturn {
     diagnostic.fail(
-        "NRV-E0721",
+        "NRV-E0726",
         "start: this binary cannot be read to look for its bundle of releases: {s}",
         .{cause},
         "check that the process may read its own executable and has file descriptors to spare, " ++

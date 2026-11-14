@@ -239,7 +239,7 @@ def main():
         assert sha(data) == before
 
         # A binary with multiversion sections that hold no bundle: NRV-E0719, not a replica
-        # that runs as one release (P415). Needs objcopy; E0720 and E0721 are unit-tested.
+        # that runs as one release (P415). Needs objcopy; E0720 and E0726 are unit-tested.
         objcopy = shutil.which("objcopy")
         if objcopy:
             junk = os.path.join(tmp, "junk-section")
