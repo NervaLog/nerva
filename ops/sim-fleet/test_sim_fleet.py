@@ -1881,15 +1881,58 @@ class FailedBuild(unittest.TestCase):
 
     def test_a_dirty_tree_is_forced_clean_by_the_next_checkout(self):
         out, repo = self._dirty_case(dirty_after=False)
-        self.assertEqual(Path(os.path.join(os.path.dirname(repo), 'state', 'tree-built')).read_text(), "v2", out.stderr)
+        tree_built = Path(os.path.dirname(repo), "state", "tree-built")
+        self.assertEqual(tree_built.read_text(), "v2", out.stderr)
         self.assertNotIn("NRV-E0731", out.stderr)
 
     def test_a_checkout_that_leaves_the_tree_dirty_is_not_built(self):
         out, repo = self._dirty_case(dirty_after=True)
         self.assertIn("RC=0", out.stdout, out.stderr)
-        self.assertFalse(Path(os.path.join(os.path.dirname(repo), 'state', 'tree-built')).exists(), out.stderr)
-        self.assertEqual(out.stderr.count("NRV-E0731"), 1, out.stderr)
+        tree_built = Path(os.path.dirname(repo), "state", "tree-built")
+        self.assertFalse(tree_built.exists(), out.stderr)
+        # The new head's checkout, then the restore of the built commit, both torn by the wrapper.
+        self.assertEqual(out.stderr.count("NRV-E0731"), 2, out.stderr)
         self.assertIn("tree is not clean", out.stderr)
+        # HEAD is back on the built commit, not left on the unbuilt head.
+        self.assertEqual(self.git(repo, "rev-parse", "HEAD"),
+                         self.git(repo, "rev-parse", "origin/main~1"), out.stderr)
+
+    def test_a_torn_restore_is_forced_again_and_not_exec_d_until_clean(self):
+        """Round 1 tears run.sh on the restore checkout; round 2 must heal it, not exec it."""
+        d = tempfile.mkdtemp()
+        self.addCleanup(subprocess.run, ["rm", "-rf", d])
+        remote, repo, state = (os.path.join(d, n) for n in ("remote", "repo", "state"))
+        os.makedirs(os.path.join(remote, "ops", "sim-fleet"))
+        self.git(remote, "init", "-q", "-b", "main")
+        run_sh = Path(remote, "ops", "sim-fleet", "run.sh")
+        run_sh.write_text('#!/usr/bin/env bash\necho "BUILT-RUN-SH"\n')
+        self.git(remote, "add", "-A")
+        self.git(remote, "commit", "-q", "-m", "v1")
+        v1 = self.git(remote, "rev-parse", "HEAD")
+        subprocess.run(["git", "clone", "-q", remote, repo], check=True)
+        run_sh.write_text('#!/usr/bin/env bash\necho "UNBUILT-RUN-SH"\n')
+        self.git(remote, "commit", "-q", "-a", "-m", "v2")
+        v2 = self.git(remote, "rev-parse", "HEAD")
+        self.git(repo, "fetch", "-q", "origin", "main")
+        os.makedirs(state)
+        out = subprocess.run(
+            ["bash", "-c", f'source "{HERE}/run.sh"; log() {{ echo "$*" >&2; }}; '
+             f'prune_cache() {{ :; }}; STATE="{state}"; built={v1}; broken={v2}; cd "{repo}"; '
+             f'SIM_FLEET_BRANCH=main; SIM_FLEET_GIT_TIMEOUT=60; SIM_FLEET_REPO_DIR="{repo}"; '
+             f'RUN_ARGS=(a); RUN_SH_SUM=0; ORIG_ENV=(); git checkout -q --detach {v2}; '
+             # git exits 0 but writes run.sh short, in round 1 only (a full disk).
+             f'tear=1; git() {{ command git "$@"; local rc=$?; if [[ "$1" == checkout && '
+             f'$tear == 1 ]]; then echo "echo TORN-RUN-SH" > ops/sim-fleet/run.sh; fi; '
+             f'return $rc; }}; '
+             f'follow_main; echo "ROUND1 head=$(git rev-parse HEAD) '
+             f'dirty=$(git status --porcelain -uno)"; tear=0; follow_main; echo NOT-REACHED'],
+            env={"PATH": os.environ["PATH"], "HOME": d}, capture_output=True, text=True,
+            timeout=60)
+        self.assertIn("ROUND1", out.stdout, out.stderr)
+        self.assertIn("dirty= M ops/sim-fleet/run.sh", out.stdout, out.stderr)
+        self.assertNotIn("TORN-RUN-SH", out.stdout)
+        self.assertIn("BUILT-RUN-SH", out.stdout, out.stderr)
+        self.assertNotIn("NOT-REACHED", out.stdout)
 
     def test_a_restart_already_on_the_built_commit_stays_put(self):
         d = tempfile.mkdtemp()

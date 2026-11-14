@@ -221,8 +221,10 @@ hands over the same way, as does a round whose fetch fails or whose main is back
 commit. A restart *during* a build still starts the checkout's, the unbuilt head's; that
 `run.sh` hands over at the end of the build, or at the next round if the build was cut short.
 A checkout that fails (a stale `.git/index.lock`, an unknown commit, a tree left dirty by a full
-disk) logs `error[NRV-E0731]` once per round and the loop keeps testing the built commit; the
-checkout is forced, and a tree that is not clean afterwards is never built (#439). For an unknown
+disk) logs `error[NRV-E0731]` at most twice per round and the loop keeps testing the
+built commit; the checkout is forced, a tree that is not clean afterwards is never built (#439),
+and every round forces the built commit's checkout again until the tree is clean. Only the journal
+shows E0731: it raises no alarm. For an unknown
 built commit, `git -C <checkout> fetch origin <built commit>` or wait for main's next commit;
 do not delete `state/built`. A restart also picks up the
 checkout's `run.sh`: the fleet running before this change has no re-exec, so restart it once
