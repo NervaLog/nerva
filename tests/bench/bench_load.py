@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """`bench-load`'s workloads against a real local cluster (R3 slice 1, P414).
 
-Usage: bench_load.py <bench-load>
+Usage: ./zig/zig build bench:build && python3 tests/bench/bench_load.py zig-out/bin/bench-load
+
+Not in `test:integration` yet: that wiring is a change to `build.zig`, a vendored file (UPSTREAM.md),
+which the owner has to approve (PR #414's question).
 
 - Every workload (closed loop, and an open loop) writes `warmup + seconds` timeline lines, the
   warm-up's flagged, one second apart, none empty (a run that drops the warm-up from its length
