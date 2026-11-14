@@ -21,6 +21,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import zlib
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "api"))
 from api import Cluster  # noqa: E402
@@ -336,6 +337,26 @@ def main():
             check("import future version",
                   imp + ["--input=" + future, os.path.join(tmp, "g.nerva")],
                   "NRV-E0805", 1, "version")
+            # A keys-off export (P426): flag bit 0 at byte 12. The end record (the last 44 bytes:
+            # size, kind, the SHA-256 of every byte before it, the CRC-32 of those) is rebuilt, so
+            # only the flag is refused. A release build names it (E0732); an unknown bit is corrupt.
+            with open(out, "rb") as f:
+                real = f.read()
+
+            def with_flags(flags):
+                body = bytearray(real[:-44])
+                body[12:16] = flags.to_bytes(4, "little")
+                end = real[-44:-36] + hashlib.sha256(body).digest()
+                return bytes(body) + end + zlib.crc32(end).to_bytes(4, "little")
+            assert with_flags(0) == real, "the end record is not rebuilt as assumed"
+            for name, flags, code, text in (("keys off", 1, "NRV-E0732", "deduplication off"),
+                                            ("unknown flag", 2, "NRV-E0804", "flag")):
+                flagged = os.path.join(tmp, f"{flags}.export")
+                with open(flagged, "wb") as f:
+                    f.write(with_flags(flags))
+                target = os.path.join(tmp, f"{flags}.nerva")
+                check("import " + name, imp + ["--input=" + flagged, target], code, 1, text)
+                assert not os.path.exists(target)
             # A port that is taken.
             with socket.socket() as taken:
                 taken.bind(("127.0.0.1", 0))

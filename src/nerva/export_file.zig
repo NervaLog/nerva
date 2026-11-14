@@ -4,7 +4,7 @@
 //! Release-independent: it carries what a client can read (changes, names, ops, definitions),
 //! never a data file's structures, so that one release's export is another release's input.
 //!
-//!     header   "NERVAEXP", format version (u32), reserved (u32, zero)
+//!     header   "NERVAEXP", format version (u32), flags (u32)
 //!     record*  size (u32), kind (u32), body (`size` bytes, fixed per kind), CRC-32 of the three
 //!     end      a record of kind `end` whose body is the SHA-256 of every byte before it
 //!
@@ -12,6 +12,12 @@
 //! records', strictly by timestamp), views (by id, 1, 2, …), ledgers (by op), indexes (by id),
 //! view checks, ledger checks, table checks (by table), record checks (by table), the summary,
 //! then `end` and nothing after.
+//!
+//! Flags (P426): bit 0 (`flag_keys_off`) says a test build with commit-key deduplication off
+//! wrote the export, which a release build refuses to import (NRV-E0732). A release build writes
+//! 0, so its exports are byte-identical to those before the flags; every other bit is reserved,
+//! and a reader refuses a set one as corrupt. A release from before P426 reads the whole word as
+//! reserved zero, so it refuses a keys-off export as corrupt.
 //!
 //! Version 2 (P123b) adds records' changes, indexes and record checks, and three counts to the
 //! summary. A writer writes version 1 when it has none of them, so that a release that reads
@@ -28,6 +34,10 @@ const nerva = @import("../nerva.zig");
 pub const magic = "NERVAEXP".*;
 pub const format_version_max: u32 = 2;
 pub const header_size = magic.len + 4 + 4;
+
+/// Header flags (P426). Bit 0: written by a build with commit-key deduplication off.
+pub const flag_keys_off: u32 = 1 << 0;
+pub const flags_known: u32 = flag_keys_off;
 
 /// Distinct tables one export may check (each has a `check_table` record).
 pub const tables_max = 1 << 16;
@@ -512,14 +522,16 @@ pub fn WriterType(comptime Inner: type) type {
         /// file imported from it records (`VSRState.origin`, P90).
         digest: [32]u8 = undefined,
 
-        /// `version`: 1 if the export holds no records and no indexes, else 2.
-        pub fn init(inner: Inner, version: u32) !Writer {
+        /// `version`: 1 if the export holds no records and no indexes, else 2. `flags`: the header's
+        /// flags, 0 from a release build.
+        pub fn init(inner: Inner, version: u32, flags: u32) !Writer {
             assert(version >= 1 and version <= format_version_max);
+            assert(flags & ~flags_known == 0);
             var writer: Writer = .{ .inner = inner, .hash = .init(.{}), .version = version };
             var header: [header_size]u8 = undefined;
             header[0..magic.len].* = magic;
             std.mem.writeInt(u32, header[8..12], version, .little);
-            std.mem.writeInt(u32, header[12..16], 0, .little);
+            std.mem.writeInt(u32, header[12..16], flags, .little);
             try writer.write_bytes(&header);
             return writer;
         }
@@ -577,6 +589,8 @@ pub fn ReaderType(comptime Inner: type) type {
         inner: Inner,
         hash: std.crypto.hash.sha2.Sha256,
         version: u32 = 0,
+        /// The header's flags (`flag_keys_off`); only known bits are ever set.
+        flags: u32 = 0,
         body: [Body.body_size_max]u8 = undefined,
         section: u32 = 0,
         state: enum { records, ended } = .records,
@@ -609,8 +623,9 @@ pub fn ReaderType(comptime Inner: type) type {
             if (reader.version == 0 or reader.version > format_version_max) {
                 return error.VersionUnsupported;
             }
-            if (std.mem.readInt(u32, header[12..16], .little) != 0) {
-                return corrupt("the header's reserved bytes are not zero");
+            reader.flags = std.mem.readInt(u32, header[12..16], .little);
+            if (reader.flags & ~flags_known != 0) {
+                return corrupt("the header sets a flag this release does not know");
             }
             return reader;
         }
@@ -830,7 +845,7 @@ fn test_records(arena: std.mem.Allocator) ![]const Record {
 
 fn test_encode(arena: std.mem.Allocator, records: []const Record) ![]u8 {
     var out = std.ArrayList(u8).init(arena);
-    var writer = try WriterType(std.ArrayList(u8).Writer).init(out.writer(), 1);
+    var writer = try WriterType(std.ArrayList(u8).Writer).init(out.writer(), 1, 0);
     for (records) |*record| try writer.write(record);
     try writer.finish();
     return out.items;
@@ -866,7 +881,7 @@ test "export file: the writer and the reader name an export by its end record (P
 
     const records = try test_records(arena);
     var out = std.ArrayList(u8).init(arena);
-    var writer = try WriterType(std.ArrayList(u8).Writer).init(out.writer(), 1);
+    var writer = try WriterType(std.ArrayList(u8).Writer).init(out.writer(), 1, 0);
     for (records) |*record| try writer.write(record);
     try writer.finish();
     // The end record's body, the last 32 bytes before its CRC-32.
@@ -882,10 +897,48 @@ test "export file: the writer and the reader name an export by its end record (P
     var other = try arena.dupe(Record, records);
     other[other.len - 1].summary.as_of += 1;
     var out_other = std.ArrayList(u8).init(arena);
-    var writer_other = try WriterType(std.ArrayList(u8).Writer).init(out_other.writer(), 1);
+    var writer_other = try WriterType(std.ArrayList(u8).Writer).init(out_other.writer(), 1, 0);
     for (other) |*record| try writer_other.write(record);
     try writer_other.finish();
     try testing.expect(!std.mem.eql(u8, &writer.digest, &writer_other.digest));
+}
+
+test "export file: header flags (P426)" {
+    var arena_instance = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_instance.deinit();
+    const arena = arena_instance.allocator();
+    const records = try test_records(arena);
+    const bytes = try test_encode(arena, records);
+
+    // A release build writes flags 0: the header's last four bytes are the zeros the reserved
+    // word held, so an export from the last release is read as it was, and ours is the same.
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0 }, bytes[12..16]);
+    {
+        var stream = std.io.fixedBufferStream(bytes);
+        const reader = try ReaderType(@TypeOf(stream).Reader).init(stream.reader());
+        try testing.expectEqual(@as(u32, 0), reader.flags);
+    }
+
+    // A keys-off build's flag round-trips, and the export has the same size (its SHA-256 covers the header, so the digest differs).
+    var out = std.ArrayList(u8).init(arena);
+    var writer = try WriterType(std.ArrayList(u8).Writer).init(out.writer(), 1, flag_keys_off);
+    for (records) |*record| try writer.write(record);
+    try writer.finish();
+    try testing.expectEqual(bytes.len, out.items.len);
+    var stream = std.io.fixedBufferStream(out.items);
+    var reader = try ReaderType(@TypeOf(stream).Reader).init(stream.reader());
+    try testing.expectEqual(flag_keys_off, reader.flags);
+    var count: usize = 0;
+    while (try reader.next()) |_| count += 1;
+    try testing.expectEqual(records.len, count);
+
+    // An unknown bit is corrupt, as a non-zero reserved word was.
+    const unknown = try arena.dupe(u8, bytes);
+    unknown[12] = 0x02;
+    try testing.expectError(error.Corrupt, test_decode(arena, unknown));
+    unknown[12] = 0;
+    unknown[15] = 0x80;
+    try testing.expectError(error.Corrupt, test_decode(arena, unknown));
 }
 
 test "export file: one byte changed, a truncation, or a record moved, each fails" {
@@ -1005,7 +1058,7 @@ test "export file: version 2 carries records, indexes and record checks" {
     } });
 
     var out = std.ArrayList(u8).init(arena);
-    var writer = try WriterType(std.ArrayList(u8).Writer).init(out.writer(), 2);
+    var writer = try WriterType(std.ArrayList(u8).Writer).init(out.writer(), 2, 0);
     for (records.items) |*record| try writer.write(record);
     try writer.finish();
     try testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, out.items[8..12], .little));
@@ -1023,7 +1076,7 @@ test "export file: version 2 carries records, indexes and record checks" {
     var reordered = try arena.dupe(Record, records.items);
     reordered[1].record_change.timestamp = 10;
     var out_bad = std.ArrayList(u8).init(arena);
-    var writer_bad = try WriterType(std.ArrayList(u8).Writer).init(out_bad.writer(), 2);
+    var writer_bad = try WriterType(std.ArrayList(u8).Writer).init(out_bad.writer(), 2, 0);
     for (reordered) |*record| try writer_bad.write(record);
     try writer_bad.finish();
     try testing.expectError(error.Corrupt, test_decode(arena, out_bad.items));

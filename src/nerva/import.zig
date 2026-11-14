@@ -65,6 +65,8 @@ pub const PlanView = struct {
 pub const Plan = struct {
     /// The export file's format version.
     version: u32,
+    /// The export header's flags (`export_file.flag_keys_off`, P426).
+    flags: u32,
     summary: export_file.Summary,
     /// The export's identity, its `end` record's SHA-256: the data file's `VSRState.origin`
     /// (P90).
@@ -121,6 +123,7 @@ pub fn plan_bytes(arena: std.mem.Allocator, bytes: []const u8) !Plan {
 fn plan_read(arena: std.mem.Allocator, reader: anytype) !Plan {
     var result: Plan = .{
         .version = reader.version,
+        .flags = reader.flags,
         .summary = undefined,
         .origin = undefined,
         .timestamp_max = 0,
