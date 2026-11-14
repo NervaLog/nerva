@@ -26,7 +26,7 @@ header's reserved bytes are not zero"), not by name. Keys-off builds are test bu
 so no operator meets it. The export's SHA-256 covers the header, so a keys-off export's digest
 differs from a release's of the same log.
 The bit does not follow the cluster: a release `nerva export` of a keys-off cluster writes 0, and a
-release import accepts it (#357's own repro still succeeds); a release cluster's export made by a
-keys-off binary is refused. Marking the cluster's mode needs the cluster to report it over the wire,
+release import accepts it (#357's own repro still succeeds). A keys-off export of a release cluster
+would also carry the bit, but #354 stops a keys-off client reaching a release cluster. Marking the cluster's mode needs the cluster to report it over the wire,
 which this decision does not do. A future flag that older releases must refuse comes with a
 `format_version` bump, so they report NRV-E0805 (version not read), not NRV-E0804 (corrupt).

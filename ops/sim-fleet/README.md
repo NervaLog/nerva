@@ -115,6 +115,15 @@ one.
   did not exit 0 on, is kept in `state/last-failed-round/` for a look. `ingest` and `refuse` do
   nothing for a round already recorded, so no round is counted twice. A refused round makes its
   commit not clean for `soak`, and the tracker's daily totals say how many rounds were refused.
+- **Repeated failing rounds raise an alarm** (#424, NRV-E0730, P429). A round fails when
+  `ingest` exits non-zero or leaves no record, or a worker died. After
+  `SIM_FLEET_ALARM_ROUNDS` (default 3) in a row, `run.sh` logs one `ALARM error[NRV-E0730]` line
+  and `sim_fleet.py alarm` opens, or comments on, the open `sim-fleet` issue "rounds keep
+  failing". The streak is `state/failing-rounds`; a round that counts ends it. Without it
+  `soak` reads `0.0 h` silently.
+  The fleet never closes that issue: a person closes it once the cause is fixed. While it is
+  open it blocks the release gate (a release needs no open `sim-fleet` issue against the commit),
+  and later alarms comment on it instead of filing a new one.
 - **A restart is safe.** A round that a stop, a reboot or a crash left in `state/round/` is
   settled from the results its workers wrote, before the next one starts, under the round's own
   commit: its finished seeds count, and a failing one makes that commit not clean (a seed's
@@ -198,8 +207,16 @@ host shows now), installs the unit and enables it, and caps the journal at 2 GB.
 copied only if it is not there yet. The service is (re)started only if the token file is not
 empty.
 
-**Redeploying** (a change to `ops/sim-fleet/`): `run.sh` is read from the checkout, which follows
-`main`, so a restart picks up the new one, and the reporter is the copy built with each commit.
+**Redeploying** (a change to `ops/sim-fleet/`): the reporter is the copy built with each commit,
+and a running `run.sh` hands over to the `run.sh` of each commit it builds (#424, P429): when that
+file's checksum differs from the one it loaded, it logs `run.sh of <sha> differs from the one
+running; re-executing it` and `exec`s it with the same arguments and the environment the unit gave it (not the defaults the old
+`run.sh` filled in), once per built
+commit (`SIM_FLEET_REEXEC` names the commit, so the new one does not exec again). A `run.sh` that fails `bash -n` is not exec'd (one `NRV-E0730` line). A build that fails puts the
+checkout back on the built commit and hands over to that commit's `run.sh` if the running one differs, so after a failed build a restart never starts an unbuilt `run.sh` (#432). A restart *during* a build still starts the checkout's, the unbuilt head's; that `run.sh` hands over at the end of the build, failed or not. A restart
+also picks up the checkout's `run.sh`: the fleet running before this change has no re-exec, so
+restart it once after the merge for it to take effect at once. A fleet pinned (`SIM_FLEET_BRANCH`) to a commit older than
+this change still runs that commit's `run.sh`: restart the unit after a re-pin.
 After a change to the unit or `setup.sh`, as root: `sh /var/lib/sim-fleet/nerva/ops/
 sim-fleet/setup.sh && systemctl restart sim-fleet`.
 
@@ -295,9 +312,9 @@ after the first build; the log says `settling round ... left by a stop or a
 crash`). Read `soak` for the old candidate only after that line, and for the new one only after
 its first round ends.
 
-**The candidate must contain this loop.** `run.sh` runs from the checkout it builds, and the
-reporter is copied from the commit it built, so pinning the fleet to a commit runs that commit's
-`run.sh` and `sim_fleet.py`. The guarantees above (#370, #387, P382) hold only for a candidate
+**The candidate must contain this loop.** `run.sh` runs from the checkout it builds (a running one re-execs the `run.sh` of each commit it
+builds, P429), and the reporter is copied from the commit it built, so pinning the fleet to a commit
+runs that commit's `run.sh` and `sim_fleet.py`. The guarantees above (#370, #387, P382) hold only for a candidate
 that contains #382. An older candidate runs the old loop: its reporter refuses `ingest
 --round-id` and `refuse`, the new `run.sh` exits 1, systemd restarts the checkout's old `run.sh`,
 and that deletes the round in flight uncounted. Pin a candidate that contains #382; one whose

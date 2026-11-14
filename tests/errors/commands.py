@@ -361,9 +361,16 @@ def main():
             # keys-off `export` writes bit 0; a release import refuses the latter from the real
             # file, leaving nothing behind, and a keys-off import accepts it. The bit marks the
             # exporting build, not the cluster, so a release export of a keys-off cluster is 0.
+            # The keys-off export is of a keys-off cluster: a keys-off client does not reach a
+            # release cluster once its release is refused (#354), so this holds with and without it.
             assert real[12:16] == bytes(4), real[12:16]
             off_out = os.path.join(tmp, "off.export")
-            made = run(nerva_off, export + ["--output=" + off_out])
+            cluster_off = Cluster(nerva_off)
+            try:
+                export_off = ["export", "--cluster=0", f"--addresses={cluster_off.address}"]
+                made = run(nerva_off, export_off + ["--output=" + off_out])
+            finally:
+                cluster_off.close()
             assert made.returncode == 0, made.stderr[-2000:]
             with open(off_out, "rb") as f:
                 off_bytes = f.read()
