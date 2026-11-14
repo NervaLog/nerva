@@ -86,8 +86,11 @@ fn process_id() std.posix.pid_t {
     return if (builtin.os.tag == .linux) std.os.linux.getpid() else std.c.getpid();
 }
 
+/// `std.c` of the pinned Zig has no `geteuid`, so Darwin's libc is asked directly.
+extern "c" fn geteuid() std.posix.uid_t;
+
 fn effective_user() std.posix.uid_t {
-    return if (builtin.os.tag == .linux) std.os.linux.geteuid() else std.c.geteuid();
+    return if (builtin.os.tag == .linux) std.os.linux.geteuid() else geteuid();
 }
 
 /// A file the run could not write, kept until the cluster and the gateway are torn down.
@@ -409,21 +412,33 @@ const symlinks_max = 40;
 
 /// The path a plain open of `path` would create: `path` itself, or, while it is a symbolic link,
 /// the link's target (relative to the link's directory). A chain of more than `symlinks_max` links
-/// is `error.SymLinkLoop`. The caller frees the result.
+/// is `error.SymLinkLoop`, and one longer than a path may be is `error.NameTooLong`. Only "not a
+/// link" and "nothing there" end the chain; any other failure to read a link is returned, so that
+/// the caller refuses (NRV-E0728) and never guesses an identity. The caller frees the result.
 fn dangling_target(gpa: std.mem.Allocator, path: []const u8) ![]u8 {
     var current = try gpa.dupe(u8, path);
     errdefer gpa.free(current);
     var hops: u32 = 0;
     while (true) {
         var buffer: [std.fs.max_path_bytes]u8 = undefined;
-        const target = std.posix.readlinkat(std.posix.AT.FDCWD, current, &buffer) catch
-            return current; // Not a link (or nothing there): `current` is what an open makes.
+        const target = std.posix.readlinkat(std.posix.AT.FDCWD, current, &buffer) catch |err| {
+            switch (err) {
+                // Not a link, or nothing there: `current` is what an open makes.
+                error.NotLink, error.FileNotFound => return current,
+                else => return err,
+            }
+        };
         if (hops == symlinks_max) return error.SymLinkLoop;
         hops += 1;
         const next = if (std.fs.path.isAbsolute(target))
             try gpa.dupe(u8, target)
         else
             try std.fs.path.join(gpa, &.{ std.fs.path.dirname(current) orelse ".", target });
+        // A path of `max_path_bytes` or more is refused by the kernel (ENAMETOOLONG).
+        if (next.len >= std.fs.max_path_bytes) {
+            gpa.free(next);
+            return error.NameTooLong;
+        }
         gpa.free(current);
         current = next;
     }
@@ -909,6 +924,39 @@ test "same_file: a dangling symbolic link and its target, or two links to one mi
     try tmp.dir.writeFile(.{ .sub_path = "target", .data = "x" });
     try testing.expect(try same_file(gpa, link, target));
     try testing.expect(try same_file(gpa, up, chain));
+}
+
+test "same_file: a loop of symbolic links, and a relative chain longer than a path, are refused" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const gpa = testing.allocator;
+    try tmp.dir.symLink("b", "a", .{});
+    try tmp.dir.symLink("a", "b", .{});
+    const a = try tmp_path(gpa, &tmp, "a");
+    defer gpa.free(a);
+    const other = try tmp_path(gpa, &tmp, "other");
+    defer gpa.free(other);
+    try testing.expectError(error.SymLinkLoop, same_file(gpa, a, other));
+    try testing.expectEqualStrings(
+        "it is a loop of symbolic links",
+        path_error_reason(error.SymLinkLoop),
+    );
+    // Thirty links, each through a real 200-byte directory and back ("d/../next"): the chain's
+    // path grows by 204 bytes a hop and passes `max_path_bytes` before it ends; swallowing the
+    // kernel's error there would call it "not a link" and lose the collision.
+    const piece = "d" ** 200;
+    try tmp.dir.makeDir(piece);
+    var name_buffer: [8]u8 = undefined;
+    var i: usize = 0;
+    while (i < 30) : (i += 1) {
+        const link_name = try std.fmt.bufPrint(&name_buffer, "l{d}", .{i});
+        var target_buffer: [300]u8 = undefined;
+        const next = try std.fmt.bufPrint(&target_buffer, "{s}/../l{d}", .{ piece, i + 1 });
+        try tmp.dir.symLink(next, link_name, .{});
+    }
+    const start = try tmp_path(gpa, &tmp, "l0");
+    defer gpa.free(start);
+    try testing.expectError(error.NameTooLong, same_file(gpa, start, other));
 }
 
 test "OutFile: the path keeps its content until commit; a device is written in place" {
