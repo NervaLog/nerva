@@ -2182,6 +2182,14 @@ class BrokenRetry(unittest.TestCase):
         logs = sorted(p.name for p in Path(self.state).glob("build.log*"))
         self.assertEqual(logs, ["build.log", "build.log.2", "build.log.3"])
 
+    def test_a_new_head_removes_the_earlier_heads_retry_logs(self):
+        self.rounds(6)
+        Path(self.remote, "f").write_text("v3")
+        self.git(self.remote, "commit", "-q", "-a", "-m", "v3")
+        self.rounds(1)
+        logs = sorted(p.name for p in Path(self.state).glob("build.log*"))
+        self.assertEqual(logs, ["build.log"])
+
     def test_a_broken_commit_is_not_retried_before_the_wait_is_over(self):
         self.rounds(4, seconds=3600)
         self.assertEqual(self.builds(), 1)
@@ -2225,8 +2233,26 @@ class BrokenRetrySettings(unittest.TestCase):
             for bad in ("three", "-1"):
                 out = self.run_sh(**{var: bad})
                 self.assertEqual(out.returncode, 2, (var, bad, out.stdout + out.stderr))
-                self.assertIn(f"{var} must be a non-negative whole number",
+                self.assertIn(f"error[NRV-E0740]: {var} must be a non-negative whole number",
                               out.stdout + out.stderr)
+
+    def test_leading_zeros_are_decimal_not_octal(self):
+        for bad in ("08", "0900", "07200"):
+            for var in ("SIM_FLEET_BROKEN_RETRIES", "SIM_FLEET_BROKEN_RETRY_SECONDS"):
+                out = self.run_sh(**{var: bad})
+                self.assertNotIn("NRV-E0740", out.stdout + out.stderr, (var, bad))
+                self.assertNotIn("value too great", out.stdout + out.stderr, (var, bad))
+                self.assertIn("no token", out.stdout + out.stderr, (var, bad))
+
+    def test_leading_zeros_are_normalised_in_the_script(self):
+        script = (f'source <(sed -n "/^for v in SIM_FLEET_BROKEN_RETRIES/,/^done/p" '
+                  f'<(sed "s/^ *//" {HERE}/run.sh)); '
+                  f'echo "$SIM_FLEET_BROKEN_RETRIES $SIM_FLEET_BROKEN_RETRY_SECONDS"')
+        out = subprocess.run(["bash", "-c", "log(){ echo \"$*\"; }; " + script],
+                             env={"PATH": os.environ["PATH"], "SIM_FLEET_BROKEN_RETRIES": "08",
+                                  "SIM_FLEET_BROKEN_RETRY_SECONDS": "07200"},
+                             capture_output=True, text=True, timeout=30)
+        self.assertEqual(out.stdout.strip(), "8 7200", out.stdout + out.stderr)
 
     def test_zero_passes_this_check(self):
         out = self.run_sh(SIM_FLEET_BROKEN_RETRIES="0", SIM_FLEET_BROKEN_RETRY_SECONDS="0")

@@ -103,9 +103,11 @@ vsr_superblock_quorums vsr_multi_batch nerva_adds nerva_http_head nerva_document
 
     for v in SIM_FLEET_BROKEN_RETRIES SIM_FLEET_BROKEN_RETRY_SECONDS; do
         if [[ ! "${!v}" =~ ^[0-9]{1,6}$ ]]; then
-            log "$v must be a non-negative whole number, not '${!v}'"
+            log "error[NRV-E0740]: $v must be a non-negative whole number, not '${!v}'"
             exit 2
         fi
+        # A leading zero is not octal: `08` is 8, `07200` is 7200.
+        printf -v "$v" '%d' "$((10#${!v}))"
     done
 
     (( SIM_FLEET_WORKERS_VOPR_NERVA + SIM_FLEET_WORKERS_VOPR_TESTING + SIM_FLEET_WORKERS_FUZZ \
@@ -296,7 +298,11 @@ follow_main() {
     rm -rf "$STATE/bin/$head"
     # A retry keeps its own log (build.log.2 ...): at most SIM_FLEET_BROKEN_RETRIES + 1 files.
     local suffix=""
-    (( retry )) && suffix=".$broken_tries"
+    if (( retry )); then
+        suffix=".$broken_tries"
+    else
+        rm -f "$STATE"/build.log.[0-9]*   # an earlier head's retry logs
+    fi
     # `9>&-`: a build left behind by a killed loop must not hold the loop's lock.
     if timeout "$SIM_FLEET_BUILD_TIMEOUT" bash -c 'set -euo pipefail; build_into "$1"' _ \
         "$STATE/bin/$head" >"$STATE/build.log$suffix" 2>&1 9>&-; then
