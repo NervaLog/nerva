@@ -140,16 +140,19 @@ The release candidate is `main` at `c886c9f0e5e4cffd12597cc29f46a4535fe6b254` (P
 from their records, except the reviewers' verdicts, which are quoted from their reports (P451).
 
 - **Simulation: shipped before the full 24 hours on the candidate, by the owner's waiver**
-  (P451). The fleet ran `5d7d806`, whose pinned code is the candidate's, for 15.0 hours over
-  2026-11-12 and 2026-11-13: 74,305 seeds (VOPR, the testing VOPR and every fuzzer), none failed as counted by
+  (P451). The fleet ran `5d7d806`, whose pinned code is the candidate's, for 15.0 hours from
+  2026-11-11 to 2026-11-13. On 2026-11-12 and 2026-11-13, the days the tracker reported (the
+  0.2 hours of 2026-11-11 have no report): 74,305 seeds (VOPR, the testing VOPR and every fuzzer), none failed as counted by
   `5d7d806`'s own fleet loop, which could miss a refused round or a dead worker until #382
-  ([#370](https://github.com/NervaLog/nerva/issues/370), [#387](https://github.com/NervaLog/nerva/issues/387); the host's journal was not checked for either), and 6 ran past their
+  ([#370](https://github.com/NervaLog/nerva/issues/370), [#387](https://github.com/NervaLog/nerva/issues/387); the host's journal and `last-failed-round` were not checked for a refused round, and a dead
+  worker leaves no record at `5d7d806`), and 6 ran past their
   per-seed deadline (5 `vopr-nerva`, 1 `vopr-testing`), which P287b counts as not clean; the owner
   waived them too. Their seed numbers were not kept, so they cannot be replayed, and the six stay
   unexplained. The fleet does not yet keep such seeds; until it does and every one it records on
   `c886c9f` or later has been replayed, this is open ([#452](https://github.com/NervaLog/nerva/issues/452);
   [the fleet's tracker, #177](https://github.com/NervaLog/nerva/issues/177)). The soak of
-  `c886c9f` itself had not reached 24 hours when the owner chose to tag. No open issue reports
+  `c886c9f` itself had not reached 24 hours when the owner chose to tag, and its own soak line
+  (`sim_fleet.py soak`, on the fleet host) was not read; the tracker reports no hours on it. No open issue reports
   a failing fleet seed against `5d7d806` or `c886c9f`; the open fleet issues (#443, #444, #446, #447) are about the fleet's own loop.
 - **Jepsen:** `retry` and `bank` both passed on `5d7d806`, the candidate's ancestor with the same
   pinned code, with nemeses `kill,partition` and `--time-limit 1200`: runs [43075322433](https://github.com/NervaLog/nerva/actions/runs/43075322433)
