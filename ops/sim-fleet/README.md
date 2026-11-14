@@ -20,12 +20,12 @@ takes `flock` on `state/lock`) loops over rounds:
    build that succeeded becomes the one in use (`state/built`); a tip that does not build is
    recorded in `state/broken`, logged once, and the last good build keeps running. Both survive a
    restart, so a restart does not rebuild a good commit. A commit that failed to build is built
-   again once `SIM_FLEET_BROKEN_RETRY_SECONDS` (7200) have passed since its last failure, at most
+   again once `SIM_FLEET_BROKEN_RETRY_SECONDS` (7200) have passed since its last start or failure, at most
    `SIM_FLEET_BROKEN_RETRIES` (3) times (four builds in all), so one transient failure (a network
    blip while the toolchain downloads) does not leave a candidate unsoaked; each retry keeps its log
    (`state/build.log.<attempt>`) and logs `retrying the build of <sha>`. The count is
    `state/broken-tries` (`<sha> <builds started> <epoch of the last start or failure>`, written
-   before each retry builds, so a build killed midway counts); a new main commit starts its own
+   after a retry's checkout and before it builds: a failed checkout costs no attempt, a build killed midway counts); a new main commit starts its own
    count, and a build that succeeds deletes the file. A restart does not reset it. To clear it by
    hand (a commit out of attempts, or a cause fixed on the host), as `simfleet`: `rm state/broken
    state/broken-tries`, then `systemctl restart sim-fleet`; the next round builds the tip at once.

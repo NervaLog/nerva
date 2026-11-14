@@ -2129,7 +2129,7 @@ class BrokenRetry(unittest.TestCase):
         return subprocess.run(["git", "-C", cwd, "-c", "user.name=t", "-c", "user.email=t@t",
                                *args], capture_output=True, text=True, check=True).stdout.strip()
 
-    def rounds(self, n, builds_ok=False, retries=2, seconds=0, kill=False):
+    def rounds(self, n, builds_ok=False, retries=2, seconds=0, kill=False, no_checkout=False):
         """Runs follow_main n times (a fresh shell each, as a restart); one line per round."""
         lines = []
         for _ in range(n):
@@ -2149,6 +2149,7 @@ class BrokenRetry(unittest.TestCase):
                  f'built=$(cat "{built}" 2>/dev/null || echo {self.v1}); '
                  f'broken=$(cat "{broken}" 2>/dev/null || true); broken_tries=0; '
                  f'git checkout -q --detach "$built"; git remote set-url origin "{self.remote}"; '
+                 f'{"checkout_commit() { return 1; }; " if no_checkout else ""}'
                  f'follow_main; echo "built=$built broken=$broken"'],
                 env={"PATH": os.environ["PATH"], "HOME": self.d}, capture_output=True,
                 text=True, timeout=60)
@@ -2176,6 +2177,15 @@ class BrokenRetry(unittest.TestCase):
         out = self.rounds(1)[0]
         self.assertNotIn("retrying", out.stderr)
         self.assertEqual(self.builds(), 3)
+
+    def test_a_failed_checkout_does_not_use_up_a_retry(self):
+        self.rounds(1)  # The first build fails: v2 is broken.
+        self.rounds(5, no_checkout=True)  # Retries are due, but no checkout succeeds.
+        self.assertEqual(self.builds(), 1)
+        self.assertTrue(Path(self.state, "broken-tries").read_text().startswith(f"{self.v2} 1 "))
+        self.rounds(6)  # The checkout is fixed: both retries still run.
+        self.assertEqual(self.builds(), 3)
+        self.assertTrue(Path(self.state, "broken-tries").read_text().startswith(f"{self.v2} 3 "))
 
     def test_each_retry_keeps_its_own_build_log(self):
         self.rounds(6)
@@ -2235,6 +2245,14 @@ class BrokenRetrySettings(unittest.TestCase):
                 self.assertEqual(out.returncode, 2, (var, bad, out.stdout + out.stderr))
                 self.assertIn(f"error[NRV-E0740]: {var} must be a non-negative whole number",
                               out.stdout + out.stderr)
+
+    def test_the_six_digit_limit(self):
+        for var in ("SIM_FLEET_BROKEN_RETRIES", "SIM_FLEET_BROKEN_RETRY_SECONDS"):
+            out = self.run_sh(**{var: "999999"})
+            self.assertNotIn("NRV-E0740", out.stdout + out.stderr, var)
+            out = self.run_sh(**{var: "1000000"})
+            self.assertEqual(out.returncode, 2, (var, out.stdout + out.stderr))
+            self.assertIn(f"error[NRV-E0740]: {var} must be", out.stdout + out.stderr)
 
     def test_leading_zeros_are_decimal_not_octal(self):
         for bad in ("08", "0900", "07200"):

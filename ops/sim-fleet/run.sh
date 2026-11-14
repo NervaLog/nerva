@@ -280,13 +280,6 @@ follow_main() {
             return 0
         fi
         retry=1
-        # Recorded before the build, so a build killed midway (a restart, the OOM killer) counts:
-        # otherwise every boot would start it again, without a bound.
-        broken_tries=$(( broken_tries + 1 ))
-        echo "$head $broken_tries $(date +%s)" >"$STATE/broken-tries.new"
-        mv "$STATE/broken-tries.new" "$STATE/broken-tries"
-        log "retrying the build of $head (failed before; attempt $broken_tries" \
-            "of $(( SIM_FLEET_BROKEN_RETRIES + 1 )))"
     else
         broken_tries=0
     fi
@@ -294,6 +287,16 @@ follow_main() {
     # A failed checkout can leave HEAD on the unbuilt head and the tree torn: put the built commit
     # back, so a restart in this round does not start that run.sh.
     checkout_commit "$head" || { restore_built; return 0; }
+    if (( retry )); then
+        # Recorded after the checkout and before the build: a checkout that fails builds nothing
+        # and costs no attempt, but a build killed midway (a restart, the OOM killer) counts,
+        # otherwise every boot would start it again, without a bound.
+        broken_tries=$(( broken_tries + 1 ))
+        echo "$head $broken_tries $(date +%s)" >"$STATE/broken-tries.new"
+        mv "$STATE/broken-tries.new" "$STATE/broken-tries"
+        log "retrying the build of $head (failed before; attempt $broken_tries" \
+            "of $(( SIM_FLEET_BROKEN_RETRIES + 1 )))"
+    fi
     log "building $head"
     rm -rf "$STATE/bin/$head"
     # A retry keeps its own log (build.log.2 ...): at most SIM_FLEET_BROKEN_RETRIES + 1 files.

@@ -8,8 +8,8 @@ area: Ops
 
 **Decision.** `run.sh` builds a commit in `state/broken` again after 7200 s since its last
 start or failure, at most 3 times (four builds in all). `state/broken-tries` holds the commit, the
-builds started and the time of the last start or failure; the attempt is recorded before the build,
-so a build killed midway counts. A failed retry logs the existing "build FAILED" line and keeps its
+builds started and the time of the last start or failure; the attempt is recorded after the checkout
+and before the build, so a failed checkout (NRV-E0731) costs no attempt and a build killed midway counts. A failed retry logs the existing "build FAILED" line and keeps its
 own `build.log.<n>`; a new head removes the old retry logs. A malformed `SIM_FLEET_BROKEN_RETRIES`
 or `SIM_FLEET_BROKEN_RETRY_SECONDS` is refused with NRV-E0740; a leading zero is read as decimal.
 
