@@ -100,7 +100,15 @@ fn run() !void {
     diagnostic.command = @tagName(command);
     switch (command) {
         .version => |args| {
-            try version_write(std.io.getStdOut().writer(), args.verbose);
+            // Built whole, then written once: a reader that stops early (`| head -n1`) closes the
+            // pipe, which is its answer and not a bug (#420).
+            var text = std.ArrayList(u8).init(gpa);
+            defer text.deinit();
+            try version_write(text.writer(), args.verbose);
+            std.io.getStdOut().writeAll(text.items) catch |err| switch (err) {
+                error.BrokenPipe => {},
+                else => return err,
+            };
             return;
         },
         .view => |*args| {
@@ -880,6 +888,12 @@ fn bundle_of_self() ?bundle.Bundle {
     const path = std.fs.selfExePath(&path_buffer) catch return null;
     const file = std.fs.openFileAbsolute(path, .{}) catch return null;
     defer file.close();
+    // Only an ELF executable can carry a bundle (the packer is ELF only); a Mach-O one, as the
+    // Mac builds are, bundles nothing.
+    var magic: [4]u8 = undefined;
+    if ((file.readAll(&magic) catch return null) != magic.len) return null;
+    if (!std.mem.eql(u8, &magic, std.elf.MAGIC)) return null;
+    file.seekTo(0) catch return null;
     const size = file.getEndPos() catch return null;
     if (size > constants.multiversion_binary_size_max) return bundle_damaged();
     const bytes = std.heap.page_allocator.alignedAlloc(u8, 8, size) catch return null;

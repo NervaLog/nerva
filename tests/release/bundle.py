@@ -71,6 +71,12 @@ def check(nerva, nerva_next, nerva_pack, work):
     assert f"\nrelease {next_['release']}\n" in out, out
     assert next_["release"] != past["release"]
 
+    # A reader that stops after one line (`| head -n1`, as install.sh does) is not a bug (#420),
+    # however long `version` takes to read the binary: the whole text is written once.
+    for exe in (nerva, nerva_next):
+        piped = subprocess.run(f'"{exe}" version | head -n1', shell=True, capture_output=True, text=True)
+        assert piped.returncode == 0 and piped.stderr == "", (exe, piped.stderr)
+
     # The size, against the bound.
     size = os.path.getsize(nerva_next)
     assert size < PLATFORM_SIZE_MAX, f"packed binary is {size} bytes, over {PLATFORM_SIZE_MAX}"
