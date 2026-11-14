@@ -15,6 +15,8 @@ name: Packages
 on:
   push:
     branches: [main]
+    # No Markdown starts a run, except docs/INSTALL.md, which tests/packaging/repos.py reads (P<PR>).
+    paths: ['**', '!**.md', 'docs/INSTALL.md']
   pull_request:
     branches: [main]
     types: [opened, synchronize, reopened, ready_for_review]
@@ -28,6 +30,7 @@ on:
       - 'src/nerva_main.zig'
       - 'src/nerva/diagnostic.zig'
       - 'VERSION'
+      - '!**.md'
   workflow_dispatch:
   # release.yml calls it on the release commit and does not publish until it is green (#384, P386).
   workflow_call:
