@@ -37,7 +37,7 @@ promises below are all there are.
 ## What it does not promise
 
 - No rolling upgrades and no retention yet: commit keys, history and view versions grow without
-  bound, and an upgrade across a protocol release closes the cluster for as long as the export
+  bound (R7 will bound history and view versions; keys stay kept, P422), and an upgrade across a protocol release closes the cluster for as long as the export
   and import take ([docs/PRODUCTION.md](./PRODUCTION.md), R6 and R7).
 - Sizing was measured on one host, not on the three-machine topology (R3).
 - No security beyond what [SECURITY.md](../SECURITY.md) lists, and the
