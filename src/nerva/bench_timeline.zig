@@ -117,25 +117,52 @@ pub const OutFile = struct {
     committed: bool = false,
 
     /// Opens (creating, never emptying a file that is already there) what `path` names, or
-    /// returns the error that `path_error_reason` words (NRV-E0728).
+    /// returns the error that `path_error_reason` words (NRV-E0728). The permissions are the ones
+    /// a plain open for writing has: an existing file that cannot be written is refused (the
+    /// rename must not replace it), and a writable file in a directory that cannot be written is
+    /// written in place. A FIFO is opened for writing and blocks until a reader opens it, as
+    /// `cat > fifo` does.
     pub fn open(gpa: std.mem.Allocator, path: []const u8) !OutFile {
         // What `path` names is looked at as given: `/dev/stdout` resolves to `pipe:[N]` when
         // stdout is a pipe, which is no path to write. Anything that is not a regular file (a
         // device, a pipe, a socket, `/dev/fd/N`) is written in place, as before.
-        if (stat_kind(path)) |kind| {
-            if (kind != .file) {
+        const kind = stat_kind(path);
+        if (kind) |k| {
+            if (k == .directory) return error.IsDir;
+            if (k != .file) {
                 const file = try std.fs.cwd().createFile(path, .{ .truncate = false });
                 const final = try gpa.dupe(u8, path);
                 return .{ .file = file, .requested = path, .final = final, .temp = null, .gpa = gpa };
             }
+            // A rename would replace a read-only file that a plain open refuses.
+            try std.posix.access(path, std.posix.W_OK);
         }
         const resolved: ?[]u8 = std.fs.cwd().realpathAlloc(gpa, path) catch null;
         const final = resolved orelse try gpa.dupe(u8, path);
         errdefer gpa.free(final);
-        const temp = try std.fmt.allocPrint(gpa, "{s}.{d}.tmp", .{ final, process_id() });
+        const temp = try temp_path(gpa, final);
         errdefer gpa.free(temp);
-        const file = try std.fs.cwd().createFile(temp, .{});
+        const file = std.fs.cwd().createFile(temp, .{}) catch |err| switch (err) {
+            // A writable file in a directory that is not: written in place, as a plain open is.
+            error.AccessDenied => {
+                if (kind == null) return err;
+                const in_place = try std.fs.cwd().createFile(final, .{});
+                gpa.free(temp);
+                return .{ .file = in_place, .requested = path, .final = final, .temp = null, .gpa = gpa };
+            },
+            else => return err,
+        };
         return .{ .file = file, .requested = path, .final = final, .temp = temp, .gpa = gpa };
+    }
+
+    /// The temporary file beside `final`: `.nerva-<hash of the name>.<pid>.tmp`, whose length does
+    /// not depend on the name's, so that a name of `NAME_MAX` bytes still has a temporary file.
+    fn temp_path(gpa: std.mem.Allocator, final: []const u8) ![]u8 {
+        const hash = std.hash.Wyhash.hash(0, std.fs.path.basename(final));
+        const base = try std.fmt.allocPrint(gpa, ".nerva-{x:0>16}.{d}.tmp", .{ hash, process_id() });
+        defer gpa.free(base);
+        const directory = std.fs.path.dirname(final) orelse return gpa.dupe(u8, base);
+        return std.fs.path.join(gpa, &.{ directory, base });
     }
 
     /// Whether `final` is a regular file this run makes (a reader may delete it).
@@ -734,6 +761,67 @@ test "OutFile: a pipe (/dev/fd/N) is written in place, never resolved to pipe:[N
     try testing.expectEqualStrings("piped\n", buffer[0..n]);
     // Two flags naming one pipe do not collide: it is written in place.
     try testing.expect(!(try same_file(gpa, path, path)));
+}
+
+test "OutFile: a read-only file is refused, a writable file in a read-only directory is written" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    // Root bypasses the mode bits.
+    if (std.os.linux.getuid() == 0) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const gpa = testing.allocator;
+    const root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(root);
+    var buffer: [16]u8 = undefined;
+
+    try tmp.dir.writeFile(.{ .sub_path = "locked", .data = "earlier\n" });
+    {
+        try std.posix.fchmodat(tmp.dir.fd, "locked", 0o444, 0);
+        const path = try std.fs.path.join(gpa, &.{ root, "locked" });
+        defer gpa.free(path);
+        try testing.expectError(error.PermissionDenied, OutFile.open(gpa, path));
+        try testing.expectEqualStrings("earlier\n", try tmp.dir.readFile("locked", &buffer));
+    }
+
+    try tmp.dir.makeDir("sealed");
+    var sealed = try tmp.dir.openDir("sealed", .{});
+    defer sealed.close();
+    try sealed.writeFile(.{ .sub_path = "open", .data = "earlier\n" });
+    try std.posix.fchmodat(tmp.dir.fd, "sealed", 0o555, 0);
+    defer std.posix.fchmodat(tmp.dir.fd, "sealed", 0o755, 0) catch {};
+    {
+        const path = try std.fs.path.join(gpa, &.{ root, "sealed", "open" });
+        defer gpa.free(path);
+        var out = try OutFile.open(gpa, path);
+        defer out.deinit();
+        try testing.expect(out.temp == null);
+        try out.file.writeAll("new\n");
+        try out.commit();
+        try testing.expectEqualStrings("new\n", try sealed.readFile("open", &buffer));
+        // A file that is not there yet in that directory cannot be made.
+        const fresh = try std.fs.path.join(gpa, &.{ root, "sealed", "fresh" });
+        defer gpa.free(fresh);
+        try testing.expectError(error.AccessDenied, OutFile.open(gpa, fresh));
+    }
+}
+
+test "OutFile: a name of NAME_MAX bytes still has a temporary file" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const gpa = testing.allocator;
+    const root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(root);
+    const name = try gpa.alloc(u8, std.fs.max_name_bytes);
+    defer gpa.free(name);
+    @memset(name, 'n');
+    const path = try std.fs.path.join(gpa, &.{ root, name });
+    defer gpa.free(path);
+    var out = try OutFile.open(gpa, path);
+    defer out.deinit();
+    try out.file.writeAll("long\n");
+    try out.commit();
+    var buffer: [16]u8 = undefined;
+    try testing.expectEqualStrings("long\n", try tmp.dir.readFile(name, &buffer));
 }
 
 test "same_file: a path that cannot be looked at is an error, and leaks nothing" {

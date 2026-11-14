@@ -536,8 +536,8 @@ is at most 3600, and the summary JSON gains `"warmup"` and `"late_operations"` m
 `--timeline`, `--gateway-pid-file` and `--output` are all opened before anything starts, so a bad
 path is refused at once with NRV-E0728. A regular file (or a path not made yet) is written as a
 temporary file beside its path and renamed into place when it is complete, so a path holds either
-its earlier content or the whole new content, and an earlier file survives any later failure; the
-temporary file is removed on every failure path. Anything else (a device such as `/dev/full`, a pipe, `/dev/stdout`
+its earlier content or the whole new content, and an earlier file survives any later failure (a read-only file is refused, and a writable file in a read-only directory is written in place, as a plain open does); the
+temporary file (`.nerva-<hash>.<pid>.tmp` beside the path) is removed on every failure path, but a run killed by a signal leaves it behind. Anything else (a device such as `/dev/full`, a pipe, `/dev/stdout`
 on a pipe, `/dev/fd/N`) is written in place, never renamed over. Two flags that name one file (the same path, or the same inode) are refused with
 NRV-E0728 ("another output flag names the same file"); a device such as `/dev/null` may be named
 twice. A path that is a dangling symbolic link is replaced by the new file, not followed. A later

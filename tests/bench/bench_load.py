@@ -315,17 +315,23 @@ def main():
         # /dev/stdout twice reach the reader, and no `pipe:[N]` file is made in the cwd.
         piped_cwd = os.path.join(tmp, "pipecwd")
         os.makedirs(piped_cwd)
-        for label, flags in [
-            ("--output=/dev/stdout", ["--output=/dev/stdout"]),
-            ("--timeline=/dev/stdout", ["--timeline=/dev/stdout"]),
+        for label, flags, timeline in [
+            ("--output=/dev/stdout", ["--output=/dev/stdout"], False),
+            ("--timeline=/dev/stdout", ["--timeline=/dev/stdout"], True),
             ("--timeline and --output both /dev/stdout",
-             ["--timeline=/dev/stdout", "--output=/dev/stdout"]),
+             ["--timeline=/dev/stdout", "--output=/dev/stdout"], True),
         ]:
             result = subprocess.run(
                 [bench, "--local", "--workload=c1", "--seconds=1"] + flags,
                 cwd=piped_cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60)
             assert result.returncode == 0, (label, result.returncode, result.stderr[-300:])
-            assert "t_us" in result.stdout or "{" in result.stdout, (label, "nothing on the pipe")
+            # The timeline is one JSON object per line (second 0 first); the summary is JSON too.
+            if timeline:
+                first = json.loads(result.stdout.splitlines()[0])
+                assert "t_us" in first, (label, "no timeline line on the pipe", first)
+            else:
+                assert "t_us" not in result.stdout, (label, "a timeline on the pipe, none asked")
+                json.loads(result.stdout)
             assert stray_files(piped_cwd) == [], (label, stray_files(piped_cwd))
         # The output file is a pipe made by the shell (process substitution, /dev/fd/N).
         captured = os.path.join(tmp, "captured.out")
