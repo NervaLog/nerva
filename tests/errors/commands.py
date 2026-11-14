@@ -241,8 +241,20 @@ def main():
         # A binary with multiversion sections that hold no bundle: NRV-E0719, not a replica
         # that runs as one release (P415). Needs objcopy; E0726 and the size bound are
         # unit-tested on `bundle_present` (src/nerva_main.zig), which a test as root can reach.
+        # The E0719 case also needs vm.memfd_noexec to be 0: the kernel check (NRV-E0720) comes
+        # first, so any other value would give E0720 there.
         objcopy = shutil.which("objcopy")
-        if objcopy:
+        try:
+            with open("/proc/sys/vm/memfd_noexec") as f:
+                memfd_noexec = f.read().strip()
+        except OSError:
+            memfd_noexec = "0"  # No such sysctl (kernel before 6.3): nothing refuses.
+        if not objcopy:
+            print("SKIP damaged-bundle cases (NRV-E0719, NRV-E0720): objcopy is not installed")
+        elif memfd_noexec != "0":
+            print(f"SKIP damaged-bundle cases (NRV-E0719, NRV-E0720): vm.memfd_noexec is "
+                  f"{memfd_noexec}, and this test needs 0")
+        else:
             junk = os.path.join(tmp, "junk-section")
             with open(junk, "wb") as f:
                 f.write(b"not a bundle" * 100)

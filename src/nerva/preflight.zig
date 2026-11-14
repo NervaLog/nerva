@@ -253,6 +253,20 @@ fn direct_io_supported(path: []const u8, fd: posix.fd_t) !bool {
     }
 }
 
+/// The fix for NRV-E0701. Below every release of a binary that bundles another one, the cluster
+/// rolled on without this replica and the fix is for this replica alone. Otherwise (a single
+/// release binary, or a file between releases) it is the export and import upgrade.
+fn other_release_hint(mismatch: ReleaseRefusal) []const u8 {
+    const bundles_other = mismatch.releases_run.len > 1;
+    const behind = bundles_other and mismatch.file.value < mismatch.releases_run[0].value;
+    return if (behind)
+        "this replica fell behind the cluster's releases: replace it with " ++
+            "nerva recover (README, \"Replacing a lost replica\"), or upgrade the " ++
+            "whole cluster by export and import"
+    else
+        "upgrade by export and import (README, \"Upgrading a cluster\")";
+}
+
 /// Refuses with the code for `refusal`; never returns.
 pub fn refuse(path: []const u8, refusal: Refusal) noreturn {
     switch (refusal) {
@@ -278,9 +292,6 @@ pub fn refuse(path: []const u8, refusal: Refusal) noreturn {
             .{},
         ),
         .other_release => |mismatch| {
-            // Below every bundled release: the cluster rolled on without this replica, and the
-            // fix is for this replica alone. Otherwise another release: export and import.
-            const behind = mismatch.file.value < mismatch.releases_run[0].value;
             diagnostic.fail(
                 "NRV-E0701",
                 "{s}: {s} was written by release {}, and this binary runs {} and bundles {}",
@@ -292,12 +303,7 @@ pub fn refuse(path: []const u8, refusal: Refusal) noreturn {
                     Bundled{ .releases_run = mismatch.releases_run },
                 },
                 "{s}; nothing was changed",
-                .{if (behind)
-                    "this replica fell behind the cluster's releases: replace it with " ++
-                        "nerva recover (README, \"Replacing a lost replica\"), or upgrade the " ++
-                        "whole cluster by export and import"
-                else
-                    "upgrade by export and import (README, \"Upgrading a cluster\")"},
+                .{other_release_hint(mismatch)},
             );
         },
         .cluster_upgraded => |mismatch| diagnostic.fail(
@@ -449,6 +455,22 @@ test "preflight: a lock released within the wait is not refused" {
     defer releaser.join();
     // Free by then: the check goes on to the superblock, which an empty file lacks.
     try testing.expect((try open_check(testing.allocator, path, .disabled, &releases_single)).? == .damaged);
+}
+
+test "preflight: the NRV-E0701 hint offers recover only to a binary that bundles a release" {
+    const this = constants.config.process.release;
+    assert(this.value > 2);
+    const below: vsr.Release = .{ .value = this.value - 1 };
+    const old: vsr.Release = .{ .value = this.value - 2 };
+    const single = [_]vsr.Release{this};
+    const bundle = [_]vsr.Release{ below, this };
+    // Bundled: a file below every release is a replica that fell behind.
+    const bundled = other_release_hint(.{ .file = old, .releases_run = &bundle });
+    try testing.expect(std.mem.indexOf(u8, bundled, "nerva recover") != null);
+    // Unbundled: the export and import mistake, with no recover hint.
+    const unbundled = other_release_hint(.{ .file = below, .releases_run = &single });
+    try testing.expect(std.mem.indexOf(u8, unbundled, "nerva recover") == null);
+    try testing.expect(std.mem.indexOf(u8, unbundled, "export and import") != null);
 }
 
 test "preflight: every refusal has a registered code and a message" {
