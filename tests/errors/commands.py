@@ -235,7 +235,8 @@ def main():
         before = sha(data)
         with open(data, "rb") as holder:
             fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            check("start locked file", start + [data], "NRV-E0703", 1, "another process holds")
+            check("start locked file", start + [data], "NRV-E0703", 1,
+                  f"another process holds {data} (pid {os.getpid()})")
         assert sha(data) == before
 
         # The test build with commit-key deduplication off (R1): E0717 without --development,
