@@ -143,8 +143,8 @@ from their records.
   (P451). The fleet ran `5d7d806`, whose pinned code is the candidate's, for 15.0 hours over
   2026-11-12 and 2026-11-13: 74,305 seeds (VOPR, the testing VOPR and every fuzzer), none failed
   ([the fleet's tracker, #177](https://github.com/NervaLog/nerva/issues/177)). The soak of
-  `c886c9f` itself had not reached 24 hours when the owner chose to tag. No `sim-fleet` issue
-  reports a failing seed; the open ones (#443, #444, #446, #447) are about the fleet's own loop.
+  `c886c9f` itself had not reached 24 hours when the owner chose to tag. No open issue reports
+  a failing seed; the open fleet issues (#443, #444, #446, #447) are about the fleet's own loop.
 - **Jepsen:** `retry` and `bank` both passed on `5d7d806`, the candidate's ancestor with the same
   pinned code, with nemeses `kill,partition` and `--time-limit 1200`: runs [43075322433](https://github.com/NervaLog/nerva/actions/runs/43075322433)
   (`retry`) and [43075317959](https://github.com/NervaLog/nerva/actions/runs/43075317959)
@@ -160,8 +160,9 @@ from their records.
   [#379](https://github.com/NervaLog/nerva/issues/379) and
   [#380](https://github.com/NervaLog/nerva/issues/380). #379 and #380 closed on 2026-11-13
   (#405); the only finding still open is #372 (SHOULD), whose fix is deferred to after v0.7.1
-  (#395). The verdicts: the first reviewer (Fable, P369), "ship after MUSTs: one MUST, about the
-  release process, not the code" (#371, fixed by #374 and the re-pin P388); the second, "ship
+  (#395). The verdicts, as each reviewer reported them to the
+  release's supervisor (quoted in P451): the first reviewer (Fable, P369), "ship after MUSTs: one MUST, about the
+  release process, not the code" (#371, fixed by #374); the second, "ship
   v0.7.1, no MUSTs". The owner waives #372 for this release (P451); it is a known issue below. P369's short review of what ships after
   `5d7d806` (release automation, packages, the installer, the env examples): "ship once #384 is
   fixed or waived"; [#384](https://github.com/NervaLog/nerva/issues/384) was fixed by #386. Earlier rounds on older commits: #315 to #321 and
