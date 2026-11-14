@@ -1,0 +1,3 @@
+# P417e: the release tags published before P417 (no .debug files, no SHA256SUMS.asc); one per line.
+# package_repos.sh and release_check.sh both read this list. A tag is never added after its release.
+v0.7.1

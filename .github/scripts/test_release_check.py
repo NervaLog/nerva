@@ -563,12 +563,25 @@ class PublishReady(unittest.TestCase):
             self.assertEqual(run("publish-ready", "v0.7.1", "other", path_dir=d).returncode, 64)
 
     def test_the_pre_p417_set_of_v0_7_1_is_accepted_without_a_signature(self):
-        for tag in ("v0.7.1", "v0.7.1-rc.1", "v0.7.0"):
+        tag = "v0.7.1"
+        with tempfile.TemporaryDirectory() as d:
+            self.gh(d, tag, assets=release_assets(tag, without=(f"nerva-{tag}-x86_64-linux.debug",
+                                                                f"nerva-{tag}-aarch64-linux.debug")))
+            self.assertEqual(run("publish-ready", tag, path_dir=d).returncode, 0, tag)
+            self.assertEqual(run("publish-ready", tag, "signed", path_dir=d).returncode, 0, tag)
+
+    def test_a_release_candidate_or_older_version_is_not_the_pre_p417_set(self):
+        for tag in ("v0.7.1-rc.9", "v0.7.0"):
             with tempfile.TemporaryDirectory() as d:
                 self.gh(d, tag, assets=release_assets(tag, without=(f"nerva-{tag}-x86_64-linux.debug",
                                                                     f"nerva-{tag}-aarch64-linux.debug")))
-                self.assertEqual(run("publish-ready", tag, path_dir=d).returncode, 0, tag)
-                self.assertEqual(run("publish-ready", tag, "signed", path_dir=d).returncode, 0, tag)
+                self.refused(run("publish-ready", tag, path_dir=d), "NRV-E1131", ".debug")
+
+    def test_a_stray_debug_file_does_not_make_a_name_match_across_commas(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.gh(d, assets=release_assets("v0.7.1", without=("nerva-v0.7.1-x86_64-linux.debug",
+                                                                "nerva-v0.7.1-aarch64-linux.debug"), extra=("core.debug",)))
+            self.refused(run("publish-ready", "v0.7.1", path_dir=d), "NRV-E1131", "core.debug")
 
     def test_the_pre_p417_set_is_refused_for_a_later_version_and_when_half_signed(self):
         no_debug = lambda tag: tuple(f"nerva-{tag}-{t}-linux.debug" for t in ("x86_64", "aarch64"))

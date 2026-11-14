@@ -461,12 +461,11 @@ sums_check() { # <sig> <data>
   check_sigs "$W/sums.status" 1 1 releasegpg
 }
 e1165() { refuse NRV-E1165 "$1" "$2" "A SHA256SUMS.asc already on the draft is never replaced: delete that asset (gh release delete-asset <tag> SHA256SUMS.asc), then run repos-ready again to sign the sums; or delete the draft and run release.yml again"; }
-# P417e: a release up to v0.7.1 with no .debug and no SHA256SUMS.asc asset is the pre-P417 set (v0.7.1
-# was published before P417 merged): nine lines in SHA256SUMS, no signature. Needs rel_fetch. The same
+# P417e: a release tagged in pre_p417_tags (v0.7.1, published before P417 merged) with no .debug and no
+# SHA256SUMS.asc asset is the pre-P417 set: nine lines in SHA256SUMS, no signature. Needs rel_fetch. The same
 # test is release_check.sh publish-ready's.
 legacy_release() { # <tag>
-  local core=${1#v}; core=${core%%-*}
-  [ "$(printf '%s\n%s\n' "$core" 0.7.1 | sort -V | tail -n1)" = 0.7.1 ] &&
+  grep -qxF "$1" "$here/pre_p417_tags" &&
     ! awk '$1=="A" && ($3 ~ /^nerva-.*\.debug$/ || $3=="SHA256SUMS.asc") {f=1} END{exit !f}' "$W/rel.$1"
 }
 sums_sign() { # <tag>: reads and writes $W/draft; uploads SHA256SUMS.asc when the draft has none
@@ -734,6 +733,9 @@ cmd_ready() {
   case $rc in 0) ;; 2) e1140 "the draft has no SHA256SUMS" "expected SHA256SUMS" ;; *) e1155_now "downloading SHA256SUMS failed" ;; esac
   legacy=0; legacy_release "$tag" && legacy=1
   listed_want=$(sums_names "$tag" "$legacy" | sort)
+  # each line is what sha256sum writes: 64 hex digits, two spaces or a space and a star, one file name
+  ! grep -Evq '^[0-9a-f]{64}  [^ ]+$|^[0-9a-f]{64} \*[^ ]+$' "$W/draft/SHA256SUMS" ||
+    e1140 "SHA256SUMS has a line that sha256sum -c would not read" "every line is a 64-digit hash, two spaces (or a space and a star) and one file name, and nothing else"
   listed=$(awk '{n = $2; sub(/^\*/, "", n); print n}' "$W/draft/SHA256SUMS" | sort)
   [ "$listed" = "$listed_want" ] || e1140 "SHA256SUMS does not list exactly the files of the release ($(diff <(echo "$listed_want") <(echo "$listed") | tr '\n' ' '))" \
     "a line is missing, extra, repeated or malformed"

@@ -317,12 +317,11 @@ case "${1:-}" in
       "nerva-$tag-x86_64-linux.debug" "nerva-$tag-aarch64-linux.debug" \
       "nerva-$tag.cdx.json" SHA256SUMS \
       "nerva-$tag-universal-macos.zip" "nerva-$tag-universal-macos.zip.sha256" | LC_ALL=C sort)
-    # P417e: a release up to v0.7.1 that has neither a .debug file nor a SHA256SUMS.asc is the
+    # P417e: a release tagged in pre_p417_tags (v0.7.1) that has neither a .debug file nor a SHA256SUMS.asc is the
     # pre-P417 set (v0.7.1 was published before P417 merged): it is accepted as it was, with no
     # signature required. Package repositories' package_repos.sh has the same test (legacy_release).
-    core=${ver%%-*}
-    if [[ "$(printf '%s\n%s\n' "$core" 0.7.1 | sort -V | tail -n1)" == 0.7.1 ]] &&
-       ! grep -Eq '(^|,)(nerva-.*\.debug|SHA256SUMS\.asc)(,|$)' <<< "$names"; then
+    if grep -qxF "$tag" "$(dirname "${BASH_SOURCE[0]}")/pre_p417_tags" &&
+       ! tr ',' '\n' <<< "$names" | grep -Eq '^(nerva-.*\.debug|SHA256SUMS\.asc)$'; then
       expected=$(grep -v '\.debug$' <<< "$expected")
       [[ "$signed_sums" != signed ]] || signed_sums=
     fi

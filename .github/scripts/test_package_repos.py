@@ -721,6 +721,11 @@ class Ready(Base):
         self.sums_edit("v0.7.1", lambda ls: ls + ["a" * 64 + "  stray-file\n"])
         self.refused_unsigned("does not list exactly")
 
+    def test_a_line_with_extra_fields_is_refused_and_nothing_is_signed(self):
+        self.release("v0.7.1")
+        self.sums_edit("v0.7.1", lambda ls: [l.rstrip("\n") + " trailing-junk\n" if ".cdx.json" in l else l for l in ls])
+        self.refused_unsigned("sha256sum -c would not read")
+
     def test_a_listed_file_missing_from_the_draft_is_refused_and_nothing_is_signed(self):
         self.release("v0.7.1", drop=("nerva-v0.7.1-x86_64-linux.debug",))
         self.refused_unsigned("has no nerva-v0.7.1-x86_64-linux.debug")
@@ -763,6 +768,13 @@ class Ready(Base):
         rc, _, err = self.ready("v0.7.2")
         self.assert_diag(rc, err, "NRV-E1140", "does not list exactly")
         self.assertEqual(self.uploads(), [])
+
+    def test_the_pre_p417_set_is_refused_for_a_release_candidate_of_v0_7_1(self):
+        for tag in ("v0.7.1-rc.9", "v0.7.0"):
+            self.legacy_release(tag)
+            rc, _, err = self.ready(tag)
+            self.assert_diag(rc, err, "NRV-E1140", "does not list exactly")
+            self.assertEqual(self.uploads(), [])
 
     def test_a_failed_upload_of_the_signature_is_e1155(self):
         self.release("v0.7.1")
