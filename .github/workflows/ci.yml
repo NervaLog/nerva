@@ -662,6 +662,21 @@ jobs:
             .github/scripts/mac_keychain.sh create
           test ! -e "$kc"
 
+          # A .p12 packed under the old checklist already holds the G2 intermediate: the identity
+          # import puts it in the keychain, and `create` must skip it, not import it twice
+          # (errSecDuplicateItem). Real `security`, so `find-certificate -Z`'s format is checked.
+          /usr/bin/openssl x509 -inform der -in "$APPLE_CA_DIR/DeveloperIDG2CA.cer" -out "$RUNNER_TEMP/g2.pem"
+          /usr/bin/openssl pkcs12 -export -inkey "$RUNNER_TEMP/test.key" -in "$RUNNER_TEMP/test.crt" \
+            -certfile "$RUNNER_TEMP/g2.pem" -name "Nerva CI Test Signing" -passout "pass:$p12pw" \
+            -out "$RUNNER_TEMP/test-g2.p12"
+          APPLE_DEVELOPER_ID_P12=$(base64 < "$RUNNER_TEMP/test-g2.p12") \
+          APPLE_DEVELOPER_ID_P12_PASSWORD=$p12pw \
+            .github/scripts/mac_keychain.sh create --skip-notary
+          test "$(security find-certificate -a -c "Developer ID Certification Authority" "$kc" | grep -c '"labl"')" = 2
+          .github/scripts/mac_keychain.sh destroy
+          rm -f "$RUNNER_TEMP/g2.pem" "$RUNNER_TEMP/test-g2.p12"
+          test ! -e "$kc"
+
           APPLE_DEVELOPER_ID_P12=$good \
           APPLE_DEVELOPER_ID_P12_PASSWORD=$p12pw \
             .github/scripts/mac_keychain.sh create --skip-notary
