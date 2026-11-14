@@ -76,6 +76,7 @@ pub fn path_error_reason(err: anyerror) []const u8 {
         error.OutputsCollide => "another output flag names the same file",
         error.PathAlreadyExists => "every temporary file name next to it is taken",
         error.ReadOnlyFileSystem => "the file system is read-only",
+        error.SymLinkLoop => "it is a loop of symbolic links",
         else => "it cannot be written",
     };
 }
@@ -390,12 +391,42 @@ fn identity(gpa: std.mem.Allocator, path: []const u8) !Identity {
         error.FileNotFound => {},
         else => return err,
     }
-    const directory = std.fs.path.dirname(path) orelse ".";
-    const base = std.fs.path.basename(path);
+    // Nothing is there. A dangling symbolic link is followed by a plain open, which makes its
+    // target, so the target's name is the file's identity: a link and its target, or two links
+    // to one missing file, are one file.
+    const final = try dangling_target(gpa, path);
+    defer gpa.free(final);
+    const directory = std.fs.path.dirname(final) orelse ".";
+    const base = std.fs.path.basename(final);
     const parent = std.fs.cwd().realpathAlloc(gpa, directory) catch
-        return .{ .path = try gpa.dupe(u8, path), .node = null };
+        return .{ .path = try gpa.dupe(u8, final), .node = null };
     defer gpa.free(parent);
     return .{ .path = try std.fs.path.join(gpa, &.{ parent, base }), .node = null };
+}
+
+/// The most symbolic links `dangling_target` follows, as the kernel's own limit of 40.
+const symlinks_max = 40;
+
+/// The path a plain open of `path` would create: `path` itself, or, while it is a symbolic link,
+/// the link's target (relative to the link's directory). A chain of more than `symlinks_max` links
+/// is `error.SymLinkLoop`. The caller frees the result.
+fn dangling_target(gpa: std.mem.Allocator, path: []const u8) ![]u8 {
+    var current = try gpa.dupe(u8, path);
+    errdefer gpa.free(current);
+    var hops: u32 = 0;
+    while (true) {
+        var buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const target = std.posix.readlinkat(std.posix.AT.FDCWD, current, &buffer) catch
+            return current; // Not a link (or nothing there): `current` is what an open makes.
+        if (hops == symlinks_max) return error.SymLinkLoop;
+        hops += 1;
+        const next = if (std.fs.path.isAbsolute(target))
+            try gpa.dupe(u8, target)
+        else
+            try std.fs.path.join(gpa, &.{ std.fs.path.dirname(current) orelse ".", target });
+        gpa.free(current);
+        current = next;
+    }
 }
 
 /// Why `--warmup` and `--seconds` are refused, or null if they are accepted.
@@ -847,6 +878,39 @@ test "same_file: one path twice, a hard link and a path not made yet; not two fi
     try testing.expect(!(try same_file(gpa, new1, a)));
 }
 
+test "same_file: a dangling symbolic link and its target, or two links to one missing file" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const gpa = testing.allocator;
+    try tmp.dir.makeDir("sub");
+    try tmp.dir.writeFile(.{ .sub_path = "other", .data = "x" });
+    try tmp.dir.symLink("target", "link", .{}); // relative to the link's directory
+    try tmp.dir.symLink("link", "chain", .{}); // a link to a link
+    try tmp.dir.symLink("../target", "sub/up", .{});
+    const root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(root);
+    const target = try std.fs.path.join(gpa, &.{ root, "target" });
+    defer gpa.free(target);
+    const link = try std.fs.path.join(gpa, &.{ root, "link" });
+    defer gpa.free(link);
+    const chain = try std.fs.path.join(gpa, &.{ root, "chain" });
+    defer gpa.free(chain);
+    const up = try std.fs.path.join(gpa, &.{ root, "sub", "up" });
+    defer gpa.free(up);
+    const other = try std.fs.path.join(gpa, &.{ root, "other" });
+    defer gpa.free(other);
+    try testing.expect(try same_file(gpa, link, target));
+    try testing.expect(try same_file(gpa, target, link));
+    try testing.expect(try same_file(gpa, link, chain));
+    try testing.expect(try same_file(gpa, up, link));
+    try testing.expect(try same_file(gpa, up, target));
+    try testing.expect(!(try same_file(gpa, link, other)));
+    // The target now exists: the links resolve to it, and are still the same file.
+    try tmp.dir.writeFile(.{ .sub_path = "target", .data = "x" });
+    try testing.expect(try same_file(gpa, link, target));
+    try testing.expect(try same_file(gpa, up, chain));
+}
+
 test "OutFile: the path keeps its content until commit; a device is written in place" {
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -1025,6 +1089,11 @@ test "OutFile: a file of another user in a sticky directory is written in place 
         defer theirs.close();
         try std.posix.fchown(theirs.handle, 12345, 12345);
     }
+    // The directory belongs to the file's owner too: with `fs.protected_regular` set (the systemd
+    // default) the kernel refuses an O_CREAT open, even by root, of a file in a sticky,
+    // world-writable directory that is neither the opener's nor the directory owner's. This test
+    // is about `OutFile`'s choice, not about that sysctl, so it does not depend on it.
+    try std.posix.fchown(tmp.dir.fd, 12345, 12345);
     try std.posix.fchmodat(tmp.dir.fd, ".", 0o1777, 0);
     const path = try tmp_path(gpa, &tmp, "theirs");
     defer gpa.free(path);

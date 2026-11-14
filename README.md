@@ -551,11 +551,18 @@ the truncation leaves the file short. That covers a file of another
 owner, a file with several links, a file in a directory you cannot write, a dangling symbolic link
 (it is followed, and its target made) and anything that is not a regular file (a device such as
 `/dev/full`, a pipe, `/dev/stdout` on a pipe, `/dev/fd/N`); a FIFO blocks the run's start until a
-reader opens it, as `cat > fifo` does. A file you cannot write is refused (P414b, P414c). NRV-E0728 ("another output flag names the same file"); a device such as `/dev/null` may be named
+reader opens it, as `cat > fifo` does. A file you cannot write is refused (P414b, P414c). Where
+`fs.protected_regular` is set (the systemd default), the kernel refuses even root's open of
+another user's file in a sticky, world-writable directory, and NRV-E0728 says "permission denied".
+Two flags may not name one file, whatever the names: the same path, a hard link, or symbolic links
+(a dangling one is followed to the file it would make) that resolve to one file are refused with
+NRV-E0728 ("another output flag names the same file"); a device such as `/dev/null` may be named
 twice. A later
 write failure prints the same line after the cluster and the gateway it started are torn down. The
-PID file, if it is a regular file, is removed when the gateway stops (if its directory lets the
-run remove it). A value out of range (`--clients`, `--batch`, `--keys`, `--hot`, `--warmup` plus
+PID file is the one path a failed run does not leave as it was: it is replaced when the gateway
+spawns, and, if it is a regular file, removed when the gateway stops (if its directory lets the
+run remove it), so a run that fails after the spawn leaves no file at that path, while one that
+fails before the spawn leaves an earlier file untouched. A value out of range (`--clients`, `--batch`, `--keys`, `--hot`, `--warmup` plus
 `--seconds`, `--local`'s client limit) is NRV-E0002. For the `botpike` workload only
 (refused for the others): `--gateway-statsd=<host:port>` (checked before anything starts, NRV-E0736)
 passes `--statsd` to the gateway it starts, `--gateway-pid-file=<file>` writes the gateway's PID there right after it spawns, and

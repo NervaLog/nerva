@@ -278,8 +278,10 @@ fn run_flags(gpa: std.mem.Allocator, args: CLIArgs, failure: *?bench_timeline.Fi
     defer json.deinit();
     try result_write(json.writer(), &config, &result);
     try json.append('\n');
-    // Nothing is written to a file before this point: a run that fails leaves each path as it was
-    // (P414c). The finished timeline survives whatever happens to the summary after it.
+    // Nothing is written to `--timeline` or `--output` before this point: a run that fails leaves
+    // each as it was (P414c). The PID file is the exception: it is replaced when the gateway
+    // spawns and removed when it stops. The finished timeline survives whatever happens to the
+    // summary after it.
     if (timeline_out) |*out| {
         var lines = std.ArrayList(u8).init(gpa);
         defer lines.deinit();

@@ -374,6 +374,12 @@ def main():
         with open(same, "w") as handle:
             handle.write("previous-result\n")
         os.link(same, link)
+        # Dangling links: the target is not made yet, and a plain open would make it.
+        dangling = os.path.join(tmp, "dangling.target")
+        link_a = os.path.join(tmp, "dangling.a")
+        link_b = os.path.join(tmp, "dangling.b")
+        os.symlink("dangling.target", link_a)
+        os.symlink(dangling, link_b)
         for label, argv, flag in [
             ("--timeline = --gateway-pid-file", [f"--timeline={same}", f"--gateway-pid-file={same}"],
              "--gateway-pid-file"),
@@ -381,6 +387,10 @@ def main():
             ("--output = --timeline by hard link", [f"--timeline={same}", f"--output={link}"],
              "--output"),
             ("one path not made yet", [f"--timeline={tmp}/new.out", f"--output={tmp}/./new.out"],
+             "--output"),
+            ("a dangling link and its target", [f"--timeline={link_a}", f"--output={dangling}"],
+             "--output"),
+            ("two dangling links to one file", [f"--timeline={link_a}", f"--output={link_b}"],
              "--output"),
         ]:
             result = run(bench, ["--local", "--workload=botpike", "--seconds=1"] + argv, timeout=30)
@@ -392,6 +402,7 @@ def main():
             with open(same) as handle:
                 assert handle.read() == "previous-result\n", label
             assert not os.path.exists(os.path.join(tmp, "new.out")), label
+            assert not os.path.exists(dangling), label
             assert_clean(label)
         print("ok two output flags naming one file are refused (NRV-E0728)")
 
