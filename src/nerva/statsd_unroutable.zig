@@ -16,7 +16,10 @@ const fixtures = @import("../testing/fixtures.zig");
 
 fn tracer_udp(io: *IO, address: std.net.Address, time: stdx.Time) !Tracer {
     var tracer = try Tracer.init(std.testing.allocator, time, .unknown, .{
-        .statsd_options = .{ .udp = .{ .io = io, .address = try stdx.SocketAddress.from_std(address) } },
+        .statsd_options = .{ .udp = .{
+            .io = io,
+            .address = try stdx.SocketAddress.from_std(address),
+        } },
     });
     tracer.set_replica(.{ .cluster = 1, .replica = 0 });
     return tracer;
@@ -26,7 +29,8 @@ test "statsd: an address that cannot be sent to starts, warns once and drops" {
     var io = try IO.init(8, 0);
     defer io.deinit();
     var time_sim = fixtures.init_time(.{});
-    var tracer = try tracer_udp(&io, std.net.Address.initIp4(.{ 255, 255, 255, 255 }, 8125), time_sim.interface());
+    const broadcast = std.net.Address.initIp4(.{ 255, 255, 255, 255 }, 8125);
+    var tracer = try tracer_udp(&io, broadcast, time_sim.interface());
     defer tracer.deinit(std.testing.allocator);
 
     for (0..3) |round| {
@@ -42,7 +46,11 @@ test "statsd: an address that cannot be sent to starts, warns once and drops" {
 }
 
 test "statsd: a reachable collector still receives the packets" {
-    const collector = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.DGRAM | std.posix.SOCK.CLOEXEC, 0);
+    const collector = try std.posix.socket(
+        std.posix.AF.INET,
+        std.posix.SOCK.DGRAM | std.posix.SOCK.CLOEXEC,
+        0,
+    );
     defer std.posix.close(collector);
     var address = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
     try std.posix.bind(collector, &address.any, address.getOsSockLen());
@@ -59,18 +67,27 @@ test "statsd: a reachable collector still receives the packets" {
     tracer.emit_metrics();
     try std.testing.expectEqual(@as(u32, 0), tracer.statsd.send_in_flight_count);
     try std.testing.expect(!tracer.statsd.implementation.udp.send_failure_warned);
-    try std.testing.expectEqual(@as(u64, 0), tracer.statsd.implementation.udp.send_callback_error_count);
+    const udp = &tracer.statsd.implementation.udp;
+    try std.testing.expectEqual(@as(u64, 0), udp.send_callback_error_count);
 
     var packet: [1500]u8 = undefined;
     // Loopback delivery can be deferred to ksoftirqd on a loaded host: wait, bounded.
-    var poll_fds = [_]std.posix.pollfd{.{ .fd = collector, .events = std.posix.POLL.IN, .revents = 0 }};
+    var poll_fds = [_]std.posix.pollfd{.{
+        .fd = collector,
+        .events = std.posix.POLL.IN,
+        .revents = 0,
+    }};
     try std.testing.expectEqual(@as(usize, 1), try std.posix.poll(&poll_fds, 5_000));
     const received = try std.posix.recv(collector, &packet, std.posix.MSG.DONTWAIT);
     try std.testing.expect(std.mem.indexOf(u8, packet[0..received], "replica_commit_min") != null);
 }
 
 test "statsd: a clean emit re-arms the warning" {
-    const collector = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.DGRAM | std.posix.SOCK.CLOEXEC, 0);
+    const collector = try std.posix.socket(
+        std.posix.AF.INET,
+        std.posix.SOCK.DGRAM | std.posix.SOCK.CLOEXEC,
+        0,
+    );
     defer std.posix.close(collector);
     var good = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
     try std.posix.bind(collector, &good.any, good.getOsSockLen());

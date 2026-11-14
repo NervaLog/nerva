@@ -370,7 +370,8 @@ pub const StatsD = struct {
             .udp => |*udp| {
                 // Nerva (P427): `IO.send` has no destination, and sends on an unconnected socket
                 // fail. A datagram is taken whole or not at all, so the send is immediate and
-                // never blocks. A failure is counted by `send_callback`; a full buffer is counted apart.
+                // never blocks. A failure is counted by `send_callback`; a full buffer is counted
+                // apart.
                 const flags: u32 = switch (builtin.os.tag) {
                     .linux => std.posix.MSG.DONTWAIT | std.posix.MSG.NOSIGNAL,
                     .macos, .ios, .tvos, .watchos, .visionos => 0x80, // MSG_DONTWAIT
@@ -389,7 +390,9 @@ pub const StatsD = struct {
                     udp.address.getOsSockLen(),
                 );
                 const errno = std.posix.errno(result);
-                switch (send_outcome(errno, result, send_buffer.len)) {
+                // Libc returns isize, a raw syscall usize: classify on a usize either way.
+                const sent: usize = if (errno == .SUCCESS) @intCast(result) else 0;
+                switch (send_outcome(errno, sent, send_buffer.len)) {
                     .sent => StatsD.send_callback(self, send_completion, send_buffer.len),
                     .buffer_full => {
                         // Upstream's blocking send waited for space; this drops the rest of the
@@ -428,12 +431,13 @@ pub const StatsD = struct {
 
 test "send_outcome: a full buffer is not a route failure" {
     const E = std.posix.E;
-    try std.testing.expectEqual(StatsD.SendOutcome.sent, StatsD.send_outcome(.SUCCESS, 10, 10));
-    try std.testing.expectEqual(StatsD.SendOutcome.failed, StatsD.send_outcome(.SUCCESS, 5, 10));
-    try std.testing.expectEqual(StatsD.SendOutcome.buffer_full, StatsD.send_outcome(E.AGAIN, 0, 10));
-    try std.testing.expectEqual(StatsD.SendOutcome.buffer_full, StatsD.send_outcome(E.NOBUFS, 0, 10));
-    try std.testing.expectEqual(StatsD.SendOutcome.failed, StatsD.send_outcome(E.NETUNREACH, 0, 10));
-    try std.testing.expectEqual(StatsD.SendOutcome.failed, StatsD.send_outcome(E.ACCES, 0, 10));
+    const Outcome = StatsD.SendOutcome;
+    try std.testing.expectEqual(Outcome.sent, StatsD.send_outcome(.SUCCESS, 10, 10));
+    try std.testing.expectEqual(Outcome.failed, StatsD.send_outcome(.SUCCESS, 5, 10));
+    try std.testing.expectEqual(Outcome.buffer_full, StatsD.send_outcome(E.AGAIN, 0, 10));
+    try std.testing.expectEqual(Outcome.buffer_full, StatsD.send_outcome(E.NOBUFS, 0, 10));
+    try std.testing.expectEqual(Outcome.failed, StatsD.send_outcome(E.NETUNREACH, 0, 10));
+    try std.testing.expectEqual(Outcome.failed, StatsD.send_outcome(E.ACCES, 0, 10));
 }
 
 const TimingStat = enum { min, max, avg, sum, count };
