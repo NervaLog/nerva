@@ -238,6 +238,74 @@ def main():
             check("start locked file", start + [data], "NRV-E0703", 1, "another process holds")
         assert sha(data) == before
 
+        # The memory refusal (R3 slice 2, P406d): a --cache-grid above MemTotal is refused with
+        # E0723 before anything is written. Needs no cgroup, so it runs in any session.
+        with open("/proc/meminfo") as f:
+            total_kib = int(re.search(r"MemTotal:\s+(\d+) kB", f.read())[1])
+        grid_mib = (total_kib // 1024 // 1024 + 2) * 1024  # MemTotal rounded up, plus a GiB
+        before = sha(data)
+        check("start caches over MemTotal",
+              start + [f"--cache-grid={grid_mib}MiB", data], "NRV-E0723", 1, "--cache-grid")
+        assert sha(data) == before, "the refused start wrote to the data file"
+
+        # The other E0723 headline: a /proc/meminfo the replica cannot use, a garbage file bind
+        # mounted over it in a private mount namespace (`unshare -m`, or `-rm` without root).
+        # Skipped, and said so, where the sandbox does not let a process mount.
+        garbage = os.path.join(tmp, "meminfo")
+        with open(garbage, "w") as f:
+            f.write("MemTotal: lots kB\n")
+        script = 'mount --bind "$1" /proc/meminfo && shift && exec "$@"'
+        for flags in (["-m"], ["-r", "-m"]):
+            wrapper = ["unshare"] + flags + ["sh", "-c", script, "sh", garbage]
+            if subprocess.run(wrapper + ["true"], capture_output=True).returncode != 0:
+                continue
+            result = subprocess.run(wrapper + [nerva] + start + [data], capture_output=True,
+                                    text=True, timeout=120)
+            seen.append(expect(result, "NRV-E0723", 1, "cannot tell how much memory",
+                               "start unusable meminfo"))
+            assert "/proc/meminfo cannot be used (unparsable)" in result.stderr, result.stderr
+            assert sha(data) == before, "the refused start wrote to the data file"
+            break
+        else:
+            print("errors: skipped the unusable-meminfo start, this sandbox cannot mount")
+
+        # With a damaged superblock copy the refusal may repair that copy (the one write that
+        # can precede it, Replica.open) and nothing else: the WAL and grid zones, from the end
+        # of the 4 copies of 24,576 bytes, are byte for byte as before, and the file then opens.
+        superblock_zone = 4 * 24576
+
+        def sha_tail(path):
+            digest = hashlib.sha256()
+            with open(path, "rb") as f:
+                f.seek(superblock_zone)
+                while chunk := f.read(1 << 24):
+                    digest.update(chunk)
+            return digest.hexdigest()
+
+        repaired = os.path.join(tmp, "damaged-copy.nerva")
+        shutil.copyfile(data, repaired)
+        with open(repaired, "r+b") as f:
+            f.write(bytes(4096))  # the first sector of copy 0
+        tail = sha_tail(repaired)
+        check("start caches over MemTotal, one superblock copy damaged",
+              start + [f"--cache-grid={grid_mib}MiB", repaired], "NRV-E0723", 1, "--cache-grid")
+        assert sha_tail(repaired) == tail, "the refusal wrote past the superblock zone"
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            free_port_number = probe.getsockname()[1]
+        process = subprocess.Popen(
+            [nerva, "start", f"--addresses=127.0.0.1:{free_port_number},127.0.0.1:1,127.0.0.1:2",
+             "--development", "--cache-grid=512MiB", repaired],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            time.sleep(3)
+            assert process.poll() is None, "the repaired file did not open with 512MiB"
+        finally:
+            process.kill()
+            stderr = process.communicate()[1]
+        assert "NRV-E0723" not in stderr, stderr[-1000:]
+        os.unlink(repaired)
+
         # The test build with commit-key deduplication off (R1): E0717 without --development,
         # W0701 before the data file is opened with it, `+keys-off` in `version`; a release
         # build has none of the three.

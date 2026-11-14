@@ -28,6 +28,8 @@ const release_peers = @import("nerva/release_peers.zig");
 const format_digest = @import("nerva/format_digest.zig");
 const peer_auth = @import("nerva/peer_auth.zig");
 const preflight = @import("nerva/preflight.zig");
+const start_memory = @import("nerva/start_memory.zig");
+const MemoryBudget = @import("nerva/api/memory_budget.zig");
 
 const IO = @import("io.zig").IO;
 const Tracer = @import("trace.zig").Tracer;
@@ -732,14 +734,27 @@ fn command_start(
 ) !void {
     const peer_keys = cluster_keys(args);
 
-    var counting_allocator = vsr.CountingAllocator.init(base_allocator);
+    // What this replica may allocate: what it can see, less a reserve (R3, P406d). A one-shot
+    // `MemoryBudget` refuses, before touching the memory, the allocation that passes it.
+    const visible = switch (start_memory.read()) {
+        .visible => |visible| visible,
+        .refused => |refusal| start_memory.refuse_unreadable(refusal),
+    };
+    const budget_bytes = start_memory.budget(visible.bytes) orelse start_memory.refuse_caches(@as(u64, args.cache_grid_blocks) * constants.block_size, args.cache_rows_count, &visible, 0);
+    var memory_budget = MemoryBudget.init(base_allocator, @intCast(@min(budget_bytes, std.math.maxInt(usize))));
+    var counting_allocator = vsr.CountingAllocator.init(memory_budget.allocator());
     const gpa = counting_allocator.allocator();
 
-    var message_pool = try MessagePool.init(gpa, .{ .replica = .{
+    var message_pool = MessagePool.init(gpa, .{ .replica = .{
         .members_count = args.addresses.members_count(),
         .pipeline_requests_limit = args.pipeline_requests_limit,
         .message_bus = .tcp,
-    } });
+    } }) catch |err| switch (err) {
+        error.OutOfMemory => if (memory_budget.exceeded)
+            start_memory.refuse_caches(@as(u64, args.cache_grid_blocks) * constants.block_size, args.cache_rows_count, &visible, budget_bytes)
+        else
+            return err,
+    };
     defer message_pool.deinit(gpa);
 
     var replica: Replica = undefined;
@@ -787,6 +802,10 @@ fn command_start(
             "give every replica's address, in replica order",
             .{},
         ),
+        error.OutOfMemory => if (memory_budget.exceeded)
+            start_memory.refuse_caches(@as(u64, args.cache_grid_blocks) * constants.block_size, args.cache_rows_count, &visible, budget_bytes)
+        else
+            return error.OutOfMemory,
         else => |e| return e,
     };
 

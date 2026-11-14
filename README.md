@@ -307,7 +307,10 @@ nerva start --addresses=3001,3002,3003 0_0.nerva   # and 0_1, 0_2
   now hold records, and `import` refuses such rows by name (P123e).
 - **Memory.** v0.6.0's replica takes about 0.5 GiB more than v0.5.0's (3.0 GB at startup with
   the defaults, from 2.5 GB); `--cache-grid=512MiB` brings it back, at the cost of more reads
-  from disk (#127).
+  from disk (#127). `nerva start` reads the memory it can see (the smaller of MemTotal and
+  every cgroup limit above it), less 256 MiB, and refuses with NRV-E0723, naming `--cache-grid`
+  and `--cache-rows`, when the caches do not fit, instead of being OOM-killed; there is no flag
+  to skip it. Linux only (P416b): other hosts have no OOM killer to answer.
 - Measured (`perf/upgrade.py`, a 4-CPU sandbox, `--development`): a million changes over
   970,000 rows exported in 5.8 s (365 MiB at most) and imported in 14 s (1.2 GiB, the state
   machine's fixed allocation, as a replica's); the export file is 121 bytes a change.
