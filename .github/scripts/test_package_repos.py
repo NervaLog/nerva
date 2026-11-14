@@ -726,6 +726,18 @@ class Ready(Base):
         self.sums_edit("v0.7.1", lambda ls: [l.rstrip("\n") + " trailing-junk\n" if ".cdx.json" in l else l for l in ls])
         self.refused_unsigned("sha256sum -c would not read")
 
+    def test_whitespace_after_the_name_is_refused_and_nothing_is_signed(self):
+        for ws in ("\t", "\tjunk", " ", "\x0b", "\x0c"):
+            with self.subTest(ws=ws):
+                self.release("v0.7.1")
+                self.sums_edit("v0.7.1", lambda ls: [l.rstrip("\n") + ws + "\n" if ".cdx.json" in l else l for l in ls])
+                self.refused_unsigned("sha256sum -c would not read")
+
+    def test_a_crlf_sha256sums_is_refused_with_a_message_naming_the_crlf(self):
+        self.release("v0.7.1")
+        self.sums_edit("v0.7.1", lambda ls: [l.rstrip("\n") + "\r\n" for l in ls])
+        self.refused_unsigned("CRLF")
+
     def test_a_listed_file_missing_from_the_draft_is_refused_and_nothing_is_signed(self):
         self.release("v0.7.1", drop=("nerva-v0.7.1-x86_64-linux.debug",))
         self.refused_unsigned("has no nerva-v0.7.1-x86_64-linux.debug")

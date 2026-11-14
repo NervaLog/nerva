@@ -737,8 +737,10 @@ cmd_ready() {
   legacy=0; legacy_release "$tag" && legacy=1
   listed_want=$(sums_names "$tag" "$legacy" | sort)
   # each line is what sha256sum writes: 64 hex digits, two spaces or a space and a star, one file name
-  ! grep -Evq '^[0-9a-f]{64}  [^ ]+$|^[0-9a-f]{64} \*[^ ]+$' "$W/draft/SHA256SUMS" ||
-    e1140 "SHA256SUMS has a line that sha256sum -c would not read" "every line is a 64-digit hash, two spaces (or a space and a star) and one file name, and nothing else"
+  ! grep -q $'\r' "$W/draft/SHA256SUMS" ||
+    e1140 "SHA256SUMS has CRLF line endings, which sha256sum -c does not read" "every line ends in a bare newline"
+  ! grep -Evq '^[0-9a-f]{64}  [A-Za-z0-9._+-]+$|^[0-9a-f]{64} \*[A-Za-z0-9._+-]+$' "$W/draft/SHA256SUMS" ||
+    e1140 "SHA256SUMS has a line that sha256sum -c would not read" "every line is a 64-digit hash, two spaces (or a space and a star) and one file name of letters, digits and . _ + - only, and nothing else"
   listed=$(awk '{n = $2; sub(/^\*/, "", n); print n}' "$W/draft/SHA256SUMS" | sort)
   [ "$listed" = "$listed_want" ] || e1140 "SHA256SUMS does not list exactly the files of the release ($(diff <(echo "$listed_want") <(echo "$listed") | tr '\n' ' '))" \
     "a line is missing, extra, repeated or malformed"
