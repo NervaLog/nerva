@@ -907,8 +907,8 @@ v0.7.1 to 1.0, is in [docs/ROADMAP.md](./docs/ROADMAP.md).
 5. **Snapshots and subscriptions** — reads as of op `N` ✅ (`get_history`, `row?as_of=`, views
    `as_of`); change cursors ✅ (`get_changes`); view snapshots.
 6. **Facts beside money** — commit keys, records with 128-bit ids and declared indexes, written
-   in the transaction that moves the money (P123, P123b, P123c). ✅ Index reads as of a past op,
-   and retention of keys and facts, are next.
+   in the transaction that moves the money (P123, P123b, P123c). ✅ Index reads as of a past op
+   are next; keys and facts are kept (P123, P422).
 7. **Object storage tiering**, external operators, effect sinks.
 
 ## License
