@@ -10,9 +10,12 @@ amends: P196
 **Decision.** The owner answered the question on PR #427 with option (a): patch the vendored
 `StatsD.init_udp` (`src/trace/statsd.zig`, this patch only) so the UDP socket is not connected and
 each packet is sent to the address, as `nerva api`'s emitter does. An address this host has no
-route to, or may not send to (a broadcast address), no longer stops `nerva start`: it warns once
-with NRV-W0733 (at the emit after the first failed packet) and runs on; later failures are only
-counted. NRV-E0010 stays for a `--statsd` address whose family the host has no socket for.
+route to, or may not send to (a broadcast address), no longer stops `nerva start`: it warns
+with NRV-W0733 (at the emit after the first failed packet) and runs on. The warning is once per
+failing stretch: later failures are only counted, and an emit with no failure re-arms it, so a
+transient error (`EAGAIN`) does not use it up and a later failure names its own cause. Worst case,
+a route that fails and recovers on alternate emits, is one line per two emit intervals (20 s),
+still fewer than upstream's per-emit "failed to send N packets". NRV-E0010 stays for a `--statsd` address whose family the host has no socket for.
 
 **Reason.** The metrics are a side channel: a collector that is unreachable must not take a replica
 down (#198, and the same stance as P176d for the gateway). `IO.send` has no destination, so the

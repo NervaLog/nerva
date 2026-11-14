@@ -26,6 +26,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 from api import Cluster  # noqa: E402
 
 KEY = "errors-test-key"
+# `start --statsd=<unsendable>` (#198, P427): the NRV-W0733 line lands about 20 s after open (two
+# 10 s emits), so wait up to this long for it, then stay up this long (two more emits) to count.
+STATSD_WARN_DEADLINE_S = 90
+STATSD_QUIET_S = 25
 # The format digest of a `nerva` build (R6, P259b): what `nerva version` prints. It moves with any
 # change to a wire or storage layout (the state machine's, the message headers', the superblock's),
 # a tree id, the cluster config, the superblock version, the outputs of the pure key and id
@@ -166,22 +170,37 @@ def main():
             expect(result, "NRV-E0010", 1, "start: cannot send statsd to", f"start statsd {statsd}")
             assert "cannot listen" not in result.stderr and "NRV-B0004" not in result.stderr
             seen.append("NRV-E0010")
-        # An unroutable address: the replica keeps running, warns once and never exits E0010. The
-        # metrics emit is a 10 s timer that does not depend on commits; the first emit's failure is
-        # reported at the second, about 20 s after open, so wait for the line (bounded).
+        # An unroutable address: the replica keeps running and warns once per failing stretch, and
+        # never exits E0010. The metrics emit is a 10 s timer (replica ticks) that does not depend
+        # on commits; the first emit's failure is reported at the second, about 20 s after the
+        # superblock opens (24.5 s after launch, measured). Poll for the line against a generous
+        # deadline, then live through two more emits: a warning on every failing emit would show.
         with socket.socket() as probe:
             probe.bind(("127.0.0.1", 0))
             free_statsd_port = probe.getsockname()[1]
-        process = subprocess.Popen(
-            [nerva, "start", f"--addresses=127.0.0.1:{free_statsd_port},127.0.0.1:1,127.0.0.1:2",
-             "--development", "--statsd=255.255.255.255:8125", data],
-            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
-        try:
-            time.sleep(25)
-            assert process.poll() is None, "start did not run on with an unsendable --statsd"
-        finally:
-            process.kill()
-            stderr = process.communicate()[1]
+        stderr_path = os.path.join(tmp, "statsd-stderr")
+        with open(stderr_path, "w") as stderr_file:
+            process = subprocess.Popen(
+                [nerva, "start", f"--addresses=127.0.0.1:{free_statsd_port},127.0.0.1:1,127.0.0.1:2",
+                 "--development", "--statsd=255.255.255.255:8125", data],
+                stdout=subprocess.DEVNULL, stderr=stderr_file, text=True)
+            try:
+                def read_stderr():
+                    with open(stderr_path) as f:
+                        return f.read()
+                deadline = time.monotonic() + STATSD_WARN_DEADLINE_S
+                while "NRV-W0733" not in read_stderr():
+                    assert process.poll() is None, "start exited on an unsendable --statsd: " \
+                        + read_stderr()[-1000:]
+                    assert time.monotonic() < deadline, "no NRV-W0733 in time: " \
+                        + read_stderr()[-1000:]
+                    time.sleep(0.5)
+                time.sleep(STATSD_QUIET_S)
+                assert process.poll() is None, "start did not run on with an unsendable --statsd"
+            finally:
+                process.kill()
+                process.wait()
+        stderr = read_stderr()
         assert "NRV-E0010" not in stderr, stderr[-1000:]
         assert stderr.count("NRV-W0733") == 1, stderr[-1000:]
         seen.append("NRV-W0733")
