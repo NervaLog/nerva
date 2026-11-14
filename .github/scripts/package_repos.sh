@@ -16,6 +16,8 @@
 #   package_repos.sh served [<tag>]            what packages.nerva.pro serves equals the bucket
 #   package_repos.sh verify-manifest <file> <generation>   verify one manifest object exactly as a
 #                                              reader would and print the signed text (no bucket)
+#   package_repos.sh sums-verify <tag>         the release's SHA256SUMS.asc verifies against its
+#                                              SHA256SUMS under packaging/keys/ (no secret; P417c)
 #   package_repos.sh cleanup                   kill gpg-agent, remove the temporary directories
 #
 # Environment: R2_ENDPOINT, R2_BUCKET (empty: NRV-E1139), R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY (read by
@@ -450,6 +452,50 @@ rel_download() { # <tag> <name> <file>
   gh api -H "Accept: application/octet-stream" "repos/$GITHUB_REPOSITORY/releases/assets/$id" >"$3" 2>/dev/null || return 1
 }
 
+# SHA256SUMS.asc (P417c, amending P417b): the draft's SHA256SUMS, signed detached and armored by the
+# release key (the one key of P392), so a download is checked against the sums and the sums against
+# packaging/keys/nerva-release.asc. The pinned check is the Release.gpg one (current or next key,
+# RSA, SHA-512, class 00).
+sums_check() { # <sig> <data>
+  gpgv --keyring "$W/ring.gpg" --status-fd 3 "$1" "$2" 3>"$W/sums.status" 2>/dev/null || true
+  check_sigs "$W/sums.status" 1 1 releasegpg
+}
+e1165() { refuse NRV-E1165 "$1" "$2" "Sign the draft's SHA256SUMS with the release key (run repos-ready again), or delete the draft and run release.yml again"; }
+sums_sign() { # <tag>: reads and writes $W/draft; uploads SHA256SUMS.asc when the draft has none
+  local tag=$1 rc=0
+  rel_download "$tag" SHA256SUMS.asc "$W/draft/SHA256SUMS.asc" || rc=$?
+  case $rc in
+    0) sums_check "$W/draft/SHA256SUMS.asc" "$W/draft/SHA256SUMS" ||
+         e1165 "the draft's SHA256SUMS.asc does not verify against its SHA256SUMS ($sig_why)" "an earlier run signed other sums, or the file was replaced"
+       return 0 ;;
+    2) ;;
+    *) e1155_now "downloading SHA256SUMS.asc failed" ;;
+  esac
+  sign_detach "$W/draft/SHA256SUMS" "$W/draft/SHA256SUMS.asc" "${SIGN_U[@]}"
+  sums_check "$W/draft/SHA256SUMS.asc" "$W/draft/SHA256SUMS" ||
+    e1165 "SHA256SUMS.asc, just signed, does not verify under packaging/keys/ ($sig_why)" "the signing key and the pinned key file disagree"
+  gh release upload "$tag" "$W/draft/SHA256SUMS.asc" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 ||
+    e1155_now "uploading SHA256SUMS.asc to the draft failed"
+}
+
+# sums-verify <tag>: the release's SHA256SUMS.asc verifies against its SHA256SUMS under packaging/keys/
+# alone. No secret: the publish job runs it.
+cmd_sums_verify() {
+  local tag=$1 name rc
+  [[ $tag =~ $tag_re ]] || e1139 "the tag $tag is not a version tag" "sums-verify takes vX.Y.Z or vX.Y.Z-rc.N"
+  need_env GH_TOKEN GITHUB_REPOSITORY
+  need_tools gpg gpgv gh
+  mkdir -p "$W/draft"; read_fingerprints; rm -rf "$GNUPGHOME"; mkdir -m 700 "$GNUPGHOME"
+  gpg --batch --dearmor <"$keys_dir/nerva-release.asc" >"$W/ring.gpg"
+  rel_fetch "$tag" || e1155_now "reading the release $tag failed"
+  for name in SHA256SUMS SHA256SUMS.asc; do
+    rc=0; rel_download "$tag" "$name" "$W/draft/$name" || rc=$?
+    case $rc in 0) ;; 2) e1165 "the release $tag has no $name" "SHA256SUMS is signed by repos-ready before the release is published" ;; *) e1155_now "downloading $name failed" ;; esac
+  done
+  sums_check "$W/draft/SHA256SUMS.asc" "$W/draft/SHA256SUMS" ||
+    e1165 "SHA256SUMS.asc of $tag does not verify against its SHA256SUMS ($sig_why)" "the sums or the signature were replaced"
+}
+
 filever() { local v=${1#v}; printf '%s' "${v/-rc./.rc.}"; }
 package_names() { # <tag>: the release's four package names
   local fv; fv=$(filever "$1")
@@ -685,6 +731,7 @@ cmd_ready() {
   ids2=$(awk '$1=="A"{print $2, $3}' "$W/rel.$tag" | sort)
   [ "$draft_ids" = "$ids2" ] || refuse NRV-E1148 "the draft's assets changed while they were read" \
     "the bytes read may not be what the owner approved" "Restore the asset the approved run bound, or release a new version, then run again"
+  sums_sign "$tag"
   # the entries this tag wants
   : >"$W/want"
   for name in $names; do
@@ -1322,10 +1369,11 @@ main() {
     fresh) [ $# = 1 ] || usage; cmd_fresh ;;
     served) cmd_served "${2:-}" ;;
     verify-manifest) [ $# = 3 ] || usage; cmd_verify_manifest "$2" "$3" ;;
+    sums-verify) [ $# = 2 ] || usage; cmd_sums_verify "$2" ;;
     verify-sig) [ $# = 3 ] || [ $# = 4 ] || usage; cmd_verify_sig "$2" "$3" "${4:-}" ;;
     *) usage ;;
   esac
 }
-usage() { echo "usage: package_repos.sh ready <tag> <published> | publish <tag> | refresh | fresh | served [<tag>] | verify-manifest <file> <generation> | cleanup" >&2; exit 64; }
+usage() { echo "usage: package_repos.sh ready <tag> <published> | publish <tag> | refresh | fresh | served [<tag>] | verify-manifest <file> <generation> | sums-verify <tag> | cleanup" >&2; exit 64; }
 
 main "$@"

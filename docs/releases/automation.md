@@ -127,7 +127,8 @@ full commit SHA, as today.
      published, which a re-run continues past), its target resolves to the commit `mac-draft`
      accepts (main for a release; main plus `VERSION` and `CHANGELOG.md` for a prerelease), and
      its `prerelease` flag is true exactly when the tag has a `-` (NRV-E1133), its assets are exactly the twelve `release` built (P361, P417; `SHA256SUMS` lists eleven of them) plus `nerva-<tag>-universal-macos.zip` and
-     its `.zip.sha256`. It prints the commit.
+     its `.zip.sha256`. `SHA256SUMS.asc` (P417c, made by `repos-ready`) is allowed here and, with the argument `signed`
+     (the `publish` job, after `sums-verify`), required: fifteen assets. It prints the commit.
   3. Download the `homebrew-formula` artifact (`actions/download-artifact`, pinned). Refuse,
      with a new code, unless its `url` is
      `https://github.com/NervaLog/nerva/releases/download/<tag>/nerva-<tag>-universal-macos.zip`,

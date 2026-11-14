@@ -550,6 +550,18 @@ class PublishReady(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout, "0123456789abcdef0123456789abcdef01234567\n")
 
+    def test_the_signature_is_optional_before_repos_ready_and_required_after_it(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.gh(d, assets=release_assets("v0.7.1", extra=("SHA256SUMS.asc",)))
+            self.assertEqual(run("publish-ready", "v0.7.1", path_dir=d).returncode, 0)
+            self.assertEqual(run("publish-ready", "v0.7.1", "signed", path_dir=d).returncode, 0)
+            self.gh(d)
+            self.assertEqual(run("publish-ready", "v0.7.1", path_dir=d).returncode, 0)
+            result = run("publish-ready", "v0.7.1", "signed", path_dir=d)
+            self.refused(result, "NRV-E1131", "does not hold exactly the assets it is published with")
+            self.assertIn("SHA256SUMS.asc", result.stderr)
+            self.assertEqual(run("publish-ready", "v0.7.1", "other", path_dir=d).returncode, 64)
+
     def test_a_release_that_is_already_published_carries_on(self):
         with tempfile.TemporaryDirectory() as d:
             self.gh(d, draft="false")

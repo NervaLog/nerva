@@ -273,7 +273,9 @@ jobs:
             echo
             echo "Nerva at commit $GITHUB_SHA. Binaries report \`$BINARY_VERSION\`." \
               "Check downloads against \`SHA256SUMS\`, which lists the tarballs, the packages," \
-              "the \`.debug\` files and the bill of materials. Each Linux tarball's binary is" \
+              "the \`.debug\` files and the bill of materials. \`SHA256SUMS.asc\` is its detached" \
+              "signature, made with the release key in \`packaging/keys/nerva-release.asc\`:" \
+              "\`gpg --verify SHA256SUMS.asc SHA256SUMS\`. Each Linux tarball's binary is" \
               "stripped; its \`.debug\` file is the same build with symbols, to read a" \
               "core dump or a stack trace. The macOS zip is checked against its own" \
               "\`.zip.sha256\`. What the binaries are built from is in \`nerva-$TAG.cdx.json\`" \

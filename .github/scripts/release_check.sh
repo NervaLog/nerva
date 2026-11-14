@@ -11,7 +11,7 @@
 #                                              (prints mac-sign.yml: NRV-E1119, E1120, E1122, E1123, E1124)
 #   release_check.sh mac-same <tag> <signed-commit> <commit-now>   mac-sign.yml: NRV-E1128
 #   release_check.sh mac-upload <tag> <dir>    needs gh, GH_TOKEN; mac-sign.yml: NRV-E1129
-#   release_check.sh publish-ready <tag>       needs gh, GH_TOKEN and GITHUB_REPOSITORY; prints the commit
+#   release_check.sh publish-ready <tag> [signed]   needs gh, GH_TOKEN and GITHUB_REPOSITORY; prints the commit
 #                                              (the publish job: NRV-E1131, and E1120, E1122, E1124 for the target)
 #   release_check.sh candidate <tag> <commit>  needs git with the full history (the release commit's
 #                                              ancestors); NRV-E1158, P374
@@ -32,7 +32,7 @@
 # exactly the files of <dist-dir>: GitHub renames a file whose name has a character it does not keep.
 # `publish-ready` (the publish job of release-finish.yml) refuses a release that is missing or does
 # not hold exactly the fourteen assets it is published with, the twelve of `release` and the Mac zip with
-# its checksum (NRV-E1131), and applies mac-draft's checks of the target commit (NRV-E1120, E1122,
+# its checksum (NRV-E1131; with `signed` fifteen, SHA256SUMS.asc being the last, P417c), and applies mac-draft's checks of the target commit (NRV-E1120, E1122,
 # E1124); a release that is already published passes, so a re-run carries on.
 set -euo pipefail
 
@@ -275,7 +275,8 @@ case "${1:-}" in
     echo "$commit"
     ;;
   publish-ready)
-    tag=${2:?usage: release_check.sh publish-ready <tag>}
+    tag=${2:?usage: release_check.sh publish-ready <tag> [signed]}
+    signed_sums=${3:-}
     if ! [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
       refuse NRV-E1131 "'$tag' is not a release tag v<VERSION>" \
         "the tag must be v followed by the version (v0.7.1, v0.7.1-rc.1), with no space or other text" \
@@ -316,7 +317,18 @@ case "${1:-}" in
       "nerva-$tag-x86_64-linux.debug" "nerva-$tag-aarch64-linux.debug" \
       "nerva-$tag.cdx.json" SHA256SUMS \
       "nerva-$tag-universal-macos.zip" "nerva-$tag-universal-macos.zip.sha256" | LC_ALL=C sort)
+    # SHA256SUMS.asc (P417c) is added by `repos-ready`, after this check first runs: the first run
+    # takes the draft with or without it, and `signed` (the publish job) requires it.
+    if [[ "$signed_sums" == signed ]]; then
+      expected=$(printf '%s\n' "$expected" "SHA256SUMS.asc" | LC_ALL=C sort)
+    elif [[ -n "$signed_sums" ]]; then
+      echo "usage: release_check.sh publish-ready <tag> [signed]" >&2
+      exit 64
+    fi
     uploaded=$(tr ',' '\n' <<< "$names" | LC_ALL=C sort)
+    if [[ -z "$signed_sums" ]]; then
+      uploaded=$(grep -vx 'SHA256SUMS.asc' <<< "$uploaded" || true)
+    fi
     if [[ "$uploaded" != "$expected" ]]; then
       diff=$(diff <(echo "$expected") <(echo "$uploaded") | tr '\n' ' ' || true)
       refuse NRV-E1131 "the release $tag does not hold exactly the assets it is published with ($diff)" \
@@ -351,7 +363,7 @@ case "${1:-}" in
     fi
     ;;
   *)
-    echo "usage: release_check.sh ref <tag> <git-ref> | unreleased <tag> | binary <nerva> <version> | assets <tag> <dist-dir> | mac-draft <tag> | mac-same <tag> <signed> <now> | mac-upload <tag> <dir> | publish-ready <tag> | candidate <tag> <commit>" >&2
+    echo "usage: release_check.sh ref <tag> <git-ref> | unreleased <tag> | binary <nerva> <version> | assets <tag> <dist-dir> | mac-draft <tag> | mac-same <tag> <signed> <now> | mac-upload <tag> <dir> | publish-ready <tag> [signed] | candidate <tag> <commit>" >&2
     exit 2
     ;;
 esac

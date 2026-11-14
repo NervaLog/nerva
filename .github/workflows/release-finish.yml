@@ -220,9 +220,21 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          commit=$(.github/scripts/release_check.sh publish-ready "$TAG")
+          commit=$(.github/scripts/release_check.sh publish-ready "$TAG" signed)
           echo "commit=$commit" >> "$GITHUB_OUTPUT"
           echo "$TAG is ready, at $commit"
+
+      # No secret: the signature repos-ready made is checked against packaging/keys/ alone (P417c).
+      - name: SHA256SUMS is signed by the release key
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          .github/scripts/package_repos.sh sums-verify "$TAG"
+
+      - name: Remove the temporary keyring
+        if: always()
+        run: .github/scripts/package_repos.sh cleanup
 
       # A hand-dispatched finish must not publish a commit release.yml would have refused (NRV-E1158).
       - name: The release commit holds the candidate's code

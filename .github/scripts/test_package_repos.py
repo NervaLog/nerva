@@ -127,11 +127,27 @@ def tearDownModule():
 
 
 GH = """#!/usr/bin/env python3
-import json, os, subprocess, sys
+import json, os, shutil, subprocess, sys
 d = os.environ["GH_DIR"]
 args = sys.argv[1:]
 with open(d + "/log", "a") as f:
     f.write(" ".join(args) + "\\n")
+if args[:2] == ["release", "upload"]:
+    # gh release upload <tag> <file> --repo <r>: the file becomes an asset of the release, in every
+    # fixture the stand-in reads.
+    if "release/upload" in (open(d + "/fail").read().split() if os.path.exists(d + "/fail") else []):
+        sys.stderr.write("gh: HTTP 502\\n")
+        sys.exit(1)
+    new = max([int(x) for x in os.listdir(d + "/assets")] + [0]) + 1
+    shutil.copy(args[3], d + "/assets/" + str(new))
+    for fx in os.listdir(d):
+        if fx.startswith("releases.") and fx.endswith(".json"):
+            rels = json.load(open(d + "/" + fx))
+            for r in rels:
+                if r["tag_name"] == args[2]:
+                    r["assets"].append({"id": new, "name": os.path.basename(args[3])})
+            json.dump(rels, open(d + "/" + fx, "w"))
+    sys.exit(0)
 jq = path = None
 i = 1
 while i < len(args):
@@ -613,6 +629,82 @@ class Ready(Base):
         n = len(self.manifest_keys())
         self.assertEqual(self.ready("v0.7.1")[0], 0)
         self.assertEqual(len(self.manifest_keys()), n)
+
+    # ---- SHA256SUMS.asc (P417c) ---------------------------------------------------------------
+
+    def asset_bytes(self, tag, name):
+        for r in json.loads((self.gh_dir / "releases.json").read_text()):
+            if r["tag_name"] == tag:
+                for a in r["assets"]:
+                    if a["name"] == name:
+                        return (self.gh_dir / "assets" / str(a["id"])).read_bytes()
+        return None
+
+    def uploads(self):
+        log = self.gh_dir / "log"
+        return [l for l in log.read_text().splitlines() if l.startswith("release upload")] if log.exists() else []
+
+    def test_ready_signs_sha256sums_and_uploads_the_signature_to_the_draft(self):
+        self.release("v0.7.1")
+        rc, _, err = self.ready("v0.7.1")
+        self.assertEqual(rc, 0, err)
+        asc = self.asset_bytes("v0.7.1", "SHA256SUMS.asc")
+        self.assertIsNotNone(asc)
+        self.assertTrue(asc.startswith(b"-----BEGIN PGP SIGNATURE-----"))
+        self.assertEqual(len(self.uploads()), 1)
+        # What a reader does: the pinned check, against the key file alone.
+        (self.tmp / "s.asc").write_bytes(asc)
+        (self.tmp / "s").write_bytes(self.asset_bytes("v0.7.1", "SHA256SUMS"))
+        rc, _, err = self.run_script("verify-sig", "releasegpg", str(self.tmp / "s.asc"), str(self.tmp / "s"))
+        self.assertEqual(rc, 0, err)
+        self.assert_no_secrets(err)
+
+    def test_a_second_ready_keeps_the_signature_and_uploads_nothing(self):
+        self.release("v0.7.1")
+        self.assertEqual(self.ready("v0.7.1")[0], 0)
+        first = self.asset_bytes("v0.7.1", "SHA256SUMS.asc")
+        self.assertEqual(self.ready("v0.7.1")[0], 0)
+        self.assertEqual(len(self.uploads()), 1)
+        self.assertEqual(self.asset_bytes("v0.7.1", "SHA256SUMS.asc"), first)
+
+    def test_a_signature_of_other_sums_is_refused_and_not_replaced(self):
+        self.release("v0.7.1")
+        self.assertEqual(self.ready("v0.7.1")[0], 0)
+        self.releases = json.loads((self.gh_dir / "releases.json").read_text())  # the stand-in added the .asc
+        self.replace_asset("v0.7.1", "SHA256SUMS", self.asset_bytes("v0.7.1", "SHA256SUMS") + b"0" * 64 + b"  stray\n")
+        rc, _, err = self.ready("v0.7.1")
+        self.assert_diag(rc, err, "NRV-E1165")
+        self.assertEqual(self.code(), "NRV-E1165")
+        self.assertEqual(len(self.uploads()), 1)
+
+    def test_a_failed_upload_of_the_signature_is_e1155(self):
+        self.release("v0.7.1")
+        self.gh_fail("release/upload")
+        rc, _, err = self.ready("v0.7.1")
+        self.assert_diag(rc, err, "NRV-E1155")
+        self.assertIn("SHA256SUMS.asc", err)
+
+    def test_the_signing_key_not_being_the_pinned_one_signs_nothing(self):
+        self.release("v0.7.1")
+        rc, _, err = self.ready("v0.7.1", REPO_SIGNING_KEY=self.k["b"][1], REPO_SIGNING_PASSPHRASE=PASS["b"])
+        self.assert_diag(rc, err, "NRV-E1139")
+        self.assertEqual(self.uploads(), [])
+
+    def test_sums_verify_needs_no_secret_and_passes_a_signed_release(self):
+        self.release("v0.7.1")
+        self.assertEqual(self.ready("v0.7.1")[0], 0)
+        rc, _, err = self.run_script("sums-verify", "v0.7.1", REPO_SIGNING_KEY="", REPO_SIGNING_PASSPHRASE="")
+        self.assertEqual(rc, 0, err)
+
+    def test_sums_verify_refuses_an_unsigned_release_and_changed_sums(self):
+        self.release("v0.7.1")
+        rc, _, err = self.run_script("sums-verify", "v0.7.1")
+        self.assert_diag(rc, err, "NRV-E1165", "has no SHA256SUMS.asc")
+        self.assertEqual(self.ready("v0.7.1")[0], 0)
+        self.releases = json.loads((self.gh_dir / "releases.json").read_text())
+        self.replace_asset("v0.7.1", "SHA256SUMS", self.asset_bytes("v0.7.1", "SHA256SUMS") + b"x\n")
+        rc, _, err = self.run_script("sums-verify", "v0.7.1")
+        self.assert_diag(rc, err, "NRV-E1165", "does not verify")
 
     def test_a_rebind_by_a_later_attempt_when_no_object_exists(self):
         self.release("v0.7.1")
