@@ -18,7 +18,7 @@
 //!   mount root's limit alone.
 //!
 //! A file that is absent is no limit at its level. One that cannot be parsed, is over
-//! `file_size_max`, or sits deeper than `cgroup_depth_max` is a refusal naming the file, never a
+//! `file_size_max` (`/proc/self/cgroup`: `cgroup_file_size_max`), or sits deeper than `cgroup_depth_max` is a refusal naming the file, never a
 //! guess. Every read takes a root directory, so that tests use a fake `/proc` and `/sys`.
 
 const std = @import("std");
@@ -33,11 +33,18 @@ const MemoryBudget = @import("api/memory_budget.zig");
 pub const memory_reserve: u64 = 256 * stdx.MiB;
 /// The most of one `/proc` or cgroup file read; a longer file is a refusal.
 pub const file_size_max = 4096;
+/// The most lines of `/proc/self/cgroup` read: v1 has one per hierarchy (usually 11 to 13), each
+/// carrying the same path of up to `path_size_max` bytes, plus the hierarchy id and controllers.
+pub const cgroup_lines_max = 16;
 /// The most levels walked, the root included; a deeper cgroup is a refusal.
 pub const cgroup_depth_max = 32;
 /// v1 reports "no limit" as a value at or above this.
 const v1_unlimited_min: u64 = 1 << 62;
 const path_size_max = 512;
+/// A line of `/proc/self/cgroup` beyond its path: `<id>:<controllers>:` and the newline.
+const cgroup_line_prefix_max = 128;
+/// The most of `/proc/self/cgroup` read, so that a path of `path_size_max` is accepted on v1 too.
+const cgroup_file_size_max = cgroup_lines_max * (path_size_max + cgroup_line_prefix_max);
 /// The longest file name read: a cgroup path of `path_size_max`, the longer base
 /// (`sys/fs/cgroup/memory`), the longer file (`memory.limit_in_bytes`) and two slashes, with room.
 const name_size_max = path_size_max + 64;
@@ -116,7 +123,8 @@ pub fn read_from(root: std.fs.Dir) Result {
         return refuse(.unparsable, "/proc/meminfo");
     var result: Visible = .{ .bytes = total, .source = .meminfo };
 
-    const cgroup_file = file_read(root, "proc/self/cgroup", &buffer) catch |err|
+    var membership_buffer: [cgroup_file_size_max + 1]u8 = undefined;
+    const cgroup_file = file_read(root, "proc/self/cgroup", &membership_buffer) catch |err|
         return refuse(reason_of(err), "/proc/self/cgroup");
     const membership = cgroup_membership(cgroup_file orelse return .{ .visible = result }) orelse
         return .{ .visible = result };
@@ -140,9 +148,9 @@ pub fn read_from(root: std.fs.Dir) Result {
         return refuse(.too_large, "/proc/self/cgroup");
     }
     // A v1 `memory` line with no `memory` directory: the controller is mounted somewhere this
-    // walk does not look (`cpu,memory`), and no limit may be guessed.
+    // walk does not look; P416c: that is no limit at any level, so MemTotal alone.
     if (membership.source == .cgroup_v1 and !dir_exists(root, base, "/", &path_buffer)) {
-        return refuse(.absent, "/sys/fs/cgroup/memory");
+        return .{ .visible = result };
     }
     @memcpy(cgroup_buffer[0..membership.path.len], membership.path);
     const cgroup_path = cgroup_buffer[0..membership.path.len];
@@ -242,15 +250,15 @@ fn reason_of(err: ReadError) Reason {
     };
 }
 
-/// The file's bytes (at most `file_size_max`), null if it does not exist.
-fn file_read(root: std.fs.Dir, name: []const u8, buffer: *[file_size_max + 1]u8) ReadError!?[]const u8 {
+/// The file's bytes (at most `buffer.len - 1`), null if it does not exist.
+fn file_read(root: std.fs.Dir, name: []const u8, buffer: []u8) ReadError!?[]const u8 {
     const file = root.openFile(name, .{}) catch |err| switch (err) {
         error.FileNotFound, error.NotDir => return null,
         else => return error.Unreadable,
     };
     defer file.close();
     const length = file.readAll(buffer) catch return error.Unreadable;
-    if (length > file_size_max) return error.TooLarge;
+    if (length >= buffer.len) return error.TooLarge;
     return buffer[0..length];
 }
 
@@ -279,11 +287,14 @@ fn parent(path: []const u8) []const u8 {
     return if (end == 0) "/" else path[0..end];
 }
 
+/// The file is named absolutely: a name built from the root (`sys/fs/cgroup/...`) gets its `/`.
 fn refuse(reason: Reason, file: []const u8) Result {
     var refusal: Refusal = .{ .reason = reason };
-    const length = @min(file.len, name_size_max);
-    @memcpy(refusal.file_buffer[0..length], file[0..length]);
-    refusal.file_length = length;
+    const slash: usize = if (file.len > 0 and file[0] == '/') 0 else 1;
+    assert(file.len + slash <= name_size_max);
+    if (slash == 1) refusal.file_buffer[0] = '/';
+    @memcpy(refusal.file_buffer[slash..][0..file.len], file);
+    refusal.file_length = file.len + slash;
     return .{ .refused = refusal };
 }
 
@@ -405,7 +416,7 @@ test "start_memory: unparsable and oversized files are refusals naming the file"
     try fixture.write("sys/fs/cgroup/a/memory.max", "lots\n");
     const bad = read_from(fixture.tmp.dir);
     try std.testing.expectEqual(Reason.unparsable, bad.refused.reason);
-    try std.testing.expectEqualStrings("sys/fs/cgroup/a/memory.max", bad.refused.file());
+    try std.testing.expectEqualStrings("/sys/fs/cgroup/a/memory.max", bad.refused.file());
 
     // 4,096 bytes are read; 4,097 are a refusal.
     var text: [file_size_max + 1]u8 = undefined;
@@ -525,7 +536,35 @@ test "start_memory: absent and unreadable files are told apart from unparsable o
     // A v1 `memory` line with no memory directory: the controller is mounted elsewhere.
     try fixture.meminfo(8 * 1024 * 1024);
     try fixture.write("proc/self/cgroup", "4:cpu,memory:/a\n");
+    // P416c: no limit at any level, so MemTotal alone.
     const elsewhere = read_from(fixture.tmp.dir);
-    try std.testing.expectEqual(Reason.absent, elsewhere.refused.reason);
-    try std.testing.expectEqualStrings("/sys/fs/cgroup/memory", elsewhere.refused.file());
+    try std.testing.expectEqual(Source.meminfo, elsewhere.visible.source);
+    try std.testing.expectEqual(@as(u64, 8 * 1024 * mib), elsewhere.visible.bytes);
+}
+
+test "start_memory: twelve v1 lines of a 512-byte path are accepted" {
+    var fixture = Fixture.init();
+    defer fixture.deinit();
+    try fixture.meminfo(8 * 1024 * 1024);
+    // 512 bytes in 5 levels, repeated on 12 controller lines (about 6.7 KiB).
+    var path: [path_size_max]u8 = undefined;
+    @memset(&path, 'c');
+    var at: usize = 0;
+    while (at < path.len) : (at += 103) path[at] = '/';
+    const names = [_][]const u8{
+        "cpu,cpuacct", "memory", "pids",    "blkio",      "devices", "freezer",
+        "net_cls",     "cpuset", "hugetlb", "perf_event", "rdma",    "name=systemd",
+    };
+    var text: [cgroup_file_size_max]u8 = undefined;
+    var stream = std.io.fixedBufferStream(&text);
+    for (names, 1..) |controllers, id| {
+        try stream.writer().print("{d}:{s}:{s}\n", .{ id, controllers, path[0..] });
+    }
+    try std.testing.expect(stream.pos > file_size_max);
+    try fixture.write("proc/self/cgroup", text[0..stream.pos]);
+    var name: [1200]u8 = undefined;
+    try fixture.write(try std.fmt.bufPrint(&name, "sys/fs/cgroup/memory{s}/memory.limit_in_bytes", .{path[0..]}), "1073741824\n");
+    const result = read_from(fixture.tmp.dir);
+    try std.testing.expectEqual(@as(u64, 1024 * mib), result.visible.bytes);
+    try std.testing.expectEqual(Source.cgroup_v1, result.visible.source);
 }

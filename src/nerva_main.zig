@@ -746,7 +746,12 @@ fn command_start(
             .{switch (refusal.reason) {
                 .absent => "mount /proc (and the cgroup filesystem) where this replica runs, or run it on a machine that has them",
                 .unreadable => "give this process read access to that file, or run it on a machine whose /proc and cgroup files are readable",
-                .unparsable, .too_large, .too_deep => "fix or remove that file's limit, or run on a machine whose /proc and cgroup files are readable",
+                .too_deep => "run this replica in a shallower cgroup (at most 32 levels)",
+                .too_large => if (std.mem.eql(u8, refusal.file(), "/proc/self/cgroup"))
+                    "run this replica in a cgroup with a shorter path (at most 512 bytes)"
+                else
+                    "fix or remove that file's limit, or run on a machine whose /proc and cgroup files are readable",
+                .unparsable => "fix or remove that file's limit, or run on a machine whose /proc and cgroup files are readable",
             }},
         ),
     };
