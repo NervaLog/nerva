@@ -26,6 +26,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 from api import Cluster  # noqa: E402
 
 KEY = "errors-test-key"
+# `start --statsd=<unsendable>` (#198, P427): the NRV-W0733 line lands about 20 s after open (two
+# 10 s emits), so wait up to this long for it, then stay up this long (two more emits) to count.
+STATSD_WARN_DEADLINE_S = 90
+STATSD_QUIET_S = 25
 # The format digest of a `nerva` build (R6, P259b): what `nerva version` prints. It moves with any
 # change to a wire or storage layout (the state machine's, the message headers', the superblock's),
 # a tree id, the cluster config, the superblock version, the outputs of the pure key and id
@@ -152,9 +156,10 @@ def main():
         check("trace exists", ["start", "--addresses=127.0.0.1:1,127.0.0.1:2,127.0.0.1:3",
                                "--development", "--trace=" + trace, data],
               "NRV-E0004", 1, "--trace")
-        # A --statsd address this host cannot send to is the operator's: E0010 naming the flag,
-        # never B0004 (a broadcast address) or E0007 "cannot listen" (no IPv6) (#181, #184).
-        statsd_bad = ["255.255.255.255:8125"]
+        # A --statsd address this host has no socket for is the operator's: E0010 naming the flag,
+        # never E0007 "cannot listen" (no IPv6) (#181, #184). One it cannot send to (a broadcast
+        # address; no route, on other hosts) no longer stops `start`: NRV-W0733, once (#198, P427).
+        statsd_bad = []
         try:
             socket.socket(socket.AF_INET6, socket.SOCK_DGRAM).close()
         except OSError:
@@ -165,14 +170,53 @@ def main():
             expect(result, "NRV-E0010", 1, "start: cannot send statsd to", f"start statsd {statsd}")
             assert "cannot listen" not in result.stderr and "NRV-B0004" not in result.stderr
             seen.append("NRV-E0010")
+        # An unroutable address: the replica keeps running and warns once per failing stretch, and
+        # never exits E0010. The metrics emit is a 10 s timer (replica ticks) that does not depend
+        # on commits; the first emit's failure is reported at the second, about 20 s after the
+        # superblock opens (24.5 s after launch, measured). Poll for the line against a generous
+        # deadline, then live through two more emits: a warning on every failing emit would show.
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            free_statsd_port = probe.getsockname()[1]
+        stderr_path = os.path.join(tmp, "statsd-stderr")
+        with open(stderr_path, "w") as stderr_file:
+            process = subprocess.Popen(
+                [nerva, "start", f"--addresses=127.0.0.1:{free_statsd_port},127.0.0.1:1,127.0.0.1:2",
+                 "--development", "--statsd=255.255.255.255:8125", data],
+                stdout=subprocess.DEVNULL, stderr=stderr_file, text=True)
+            try:
+                def read_stderr():
+                    with open(stderr_path) as f:
+                        return f.read()
+                deadline = time.monotonic() + STATSD_WARN_DEADLINE_S
+                while "NRV-W0733" not in read_stderr():
+                    assert process.poll() is None, "start exited on an unsendable --statsd: " \
+                        + read_stderr()[-1000:]
+                    assert time.monotonic() < deadline, "no NRV-W0733 in time: " \
+                        + read_stderr()[-1000:]
+                    time.sleep(0.5)
+                time.sleep(STATSD_QUIET_S)
+                assert process.poll() is None, "start did not run on with an unsendable --statsd"
+            finally:
+                process.kill()
+                process.wait()
+        stderr = read_stderr()
+        assert "NRV-E0010" not in stderr, stderr[-1000:]
+        assert stderr.count("NRV-W0733") == 1, stderr[-1000:]
+        seen.append("NRV-W0733")
         # A start that failed must not leave its --trace file behind: the operator fixes the flag
         # and starts again with the same path, which must not be refused as E0004 (#197).
         trace_again = os.path.join(tmp, "trace-again")
-        result = run(nerva, ["start", "--addresses=127.0.0.1:1,127.0.0.1:2,127.0.0.1:3",
-                             "--development", "--trace=" + trace_again,
-                             f"--statsd={statsd_bad[0]}", data], {})
-        expect(result, "NRV-E0010", 1, "start: cannot send statsd to", "trace with bad statsd")
-        assert not os.path.exists(trace_again), "the failed start left its trace file"
+        # Only a host without IPv6 sockets can fail `start` on --statsd now (P427): no address is
+        # unroutable on both families, since an unroutable one only warns. On a host with IPv6
+        # (GitHub's runners) this E0010 and #197 case is skipped, not covered; the `api` check
+        # below still registers NRV-E0010.
+        if statsd_bad:
+            result = run(nerva, ["start", "--addresses=127.0.0.1:1,127.0.0.1:2,127.0.0.1:3",
+                                 "--development", "--trace=" + trace_again,
+                                 f"--statsd={statsd_bad[0]}", data], {})
+            expect(result, "NRV-E0010", 1, "start: cannot send statsd to", "trace with bad statsd")
+            assert not os.path.exists(trace_again), "the failed start left its trace file"
         # Every other startup failure removes it too: a held port (NRV-E0007), a missing cluster
         # key (NRV-E0901) and a missing address (NRV-E0710).
         with socket.socket() as held:

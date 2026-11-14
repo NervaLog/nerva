@@ -435,8 +435,9 @@ trace for [Perfetto](https://ui.perfetto.dev) or `chrome://tracing` to a new fil
 an existing one); tracing slows the replica, so use it to diagnose, not to time. The trace is
 written 64 KiB at a time and stops at `--trace-size-max` (default 1 GiB), or if writing it fails,
 with a warning in the log; the replica runs on (N71). A `--statsd` address this host cannot send to
-(no route to it, or a broadcast address) refuses the start with `error[NRV-E0010]`, before the
-replica's vendored open. The metrics most useful for performance work:
+(no route, or a broadcast address) does not stop `start`: it warns, `NRV-W0733`, drops the
+metrics and runs on (P427). An address family the host has no socket for refuses the start with
+`error[NRV-E0010]`, before the replica's vendored open. The metrics most useful for performance work:
 
 | Metric | What it measures |
 |---|---|

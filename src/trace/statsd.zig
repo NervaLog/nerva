@@ -1,5 +1,6 @@
 const std = @import("std");
 const stdx = @import("stdx");
+const builtin = @import("builtin");
 const assert = std.debug.assert;
 
 const constants = @import("../constants.zig");
@@ -117,6 +118,17 @@ pub const StatsD = struct {
             socket: std.posix.socket_t,
             io: *IO,
             send_callback_error_count: u64 = 0,
+            /// Nerva (P427): the socket is not connected, so a destination with no route does
+            /// not fail `init_udp`; each packet is sent to `address`, and a failure is counted.
+            address: std.net.Address,
+            /// A route failure is warned about once (NRV-W0733); later ones only count, until an
+            /// emit with no failure re-arms the warning.
+            send_failure_warned: bool = false,
+            send_failure_errno: std.posix.E = .SUCCESS,
+            /// A full socket buffer (`EAGAIN`/`ENOBUFS`) is not a route failure: the rest of the
+            /// emit is dropped, counted here, and never warned about.
+            send_buffer_full: bool = false,
+            send_dropped_count: u64 = 0,
         },
         log,
     },
@@ -140,10 +152,8 @@ pub const StatsD = struct {
         const send_buffer = try allocator.create([packet_count_max * packet_size_max]u8);
         errdefer allocator.destroy(send_buffer);
 
-        const address_std = address.to_std();
-        // 'Connect' the UDP socket, so we can just send() to it normally.
-        try std.posix.connect(socket, &address_std.any, address_std.getOsSockLen());
-
+        // Nerva (P427): not connected. `connect` fails with NetworkUnreachable when the host has
+        // no route to the collector, which stopped `nerva start`; packets are sent to the address.
         log.info("{}: sending statsd metrics to {}", .{ process_id, address });
 
         return .{
@@ -152,6 +162,7 @@ pub const StatsD = struct {
                 .udp = .{
                     .socket = socket,
                     .io = io,
+                    .address = address.to_std(),
                 },
             },
             .send_buffer = send_buffer,
@@ -230,12 +241,26 @@ pub const StatsD = struct {
             log_buffer.clearRetainingCapacity();
         }
 
-        if (self.implementation == .udp and self.implementation.udp.send_callback_error_count > 0) {
-            log.warn(
-                "{}: failed to send {} packets",
-                .{ self.process_id, self.implementation.udp.send_callback_error_count },
-            );
-            self.implementation.udp.send_callback_error_count = 0;
+        if (self.implementation == .udp) {
+            const udp = &self.implementation.udp;
+            udp.send_buffer_full = false;
+            if (udp.send_callback_error_count > 0) {
+                if (!udp.send_failure_warned) {
+                    udp.send_failure_warned = true;
+                    log.warn("NRV-W0733 {}: cannot send statsd to {}: {s}; the metrics sent " ++
+                        "there are dropped, and the replica keeps running", .{
+                        self.process_id,
+                        udp.address,
+                        send_failure_reason(udp.send_failure_errno),
+                    });
+                }
+                udp.send_callback_error_count = 0;
+            } else {
+                // A clean emit re-arms the warning: a transient failure (a full buffer) does not
+                // use up the only warning, and a later one names its own cause.
+                udp.send_failure_warned = false;
+                udp.send_failure_errno = .SUCCESS;
+            }
         }
 
         var send_ready: u32 = 0;
@@ -296,6 +321,10 @@ pub const StatsD = struct {
             }
         }
 
+        const dropped_before = if (self.implementation == .udp)
+            self.implementation.udp.send_dropped_count
+        else
+            0;
         var send_offset: u32 = 0;
         for (send_sizes.const_slice()) |send_size| {
             if (self.send_in_flight_count >= self.send_completions.len) {
@@ -309,20 +338,74 @@ pub const StatsD = struct {
             send_offset += send_size;
         }
 
-        return @intCast(send_sizes.count());
+        // Nerva (P427): packets dropped for a full socket buffer are not packets sent.
+        const dropped: u64 = if (self.implementation == .udp)
+            self.implementation.udp.send_dropped_count - dropped_before
+        else
+            0;
+        assert(dropped <= send_sizes.count());
+        return @intCast(send_sizes.count() - dropped);
+    }
+
+    const SendOutcome = enum { sent, buffer_full, failed };
+
+    /// Nerva (P427): classifies one `sendto` result. A full socket buffer is not a route failure.
+    fn send_outcome(errno: std.posix.E, result: usize, len: usize) SendOutcome {
+        if (errno == .SUCCESS and result == len) return .sent;
+        if (errno == .AGAIN or errno == .NOBUFS) return .buffer_full;
+        return .failed;
+    }
+
+    /// What an operator can act on, not an errno tag (NRV-W0733).
+    fn send_failure_reason(errno: std.posix.E) []const u8 {
+        return switch (errno) {
+            .ACCES, .PERM => "not allowed to send there (a broadcast address?)",
+            .NETUNREACH, .HOSTUNREACH, .NETDOWN => "no route to it",
+            else => "the send failed",
+        };
     }
 
     fn emit_buffer(self: *StatsD, send_completion: *IO.Completion, send_buffer: []const u8) void {
         switch (self.implementation) {
-            .udp => |udp| {
-                udp.io.send(
-                    *StatsD,
-                    self,
-                    StatsD.send_callback,
-                    send_completion,
+            .udp => |*udp| {
+                // Nerva (P427): `IO.send` has no destination, and sends on an unconnected socket
+                // fail. A datagram is taken whole or not at all, so the send is immediate and
+                // never blocks. A failure is counted by `send_callback`; a full buffer is counted
+                // apart.
+                const flags: u32 = switch (builtin.os.tag) {
+                    .linux => std.posix.MSG.DONTWAIT | std.posix.MSG.NOSIGNAL,
+                    .macos, .ios, .tvos, .watchos, .visionos => 0x80, // MSG_DONTWAIT
+                    else => @compileError("statsd send: unsupported OS"),
+                };
+                if (udp.send_buffer_full) {
+                    udp.send_dropped_count += 1;
+                    return StatsD.send_callback(self, send_completion, send_buffer.len);
+                }
+                const result = std.posix.system.sendto(
                     udp.socket,
-                    send_buffer,
+                    send_buffer.ptr,
+                    send_buffer.len,
+                    flags,
+                    &udp.address.any,
+                    udp.address.getOsSockLen(),
                 );
+                const errno = std.posix.errno(result);
+                // Libc returns isize, a raw syscall usize: classify on a usize either way.
+                const sent: usize = if (errno == .SUCCESS) @intCast(result) else 0;
+                switch (send_outcome(errno, sent, send_buffer.len)) {
+                    .sent => StatsD.send_callback(self, send_completion, send_buffer.len),
+                    .buffer_full => {
+                        // Upstream's blocking send waited for space; this drops the rest of the
+                        // emit quietly instead of logging a route failure that does not exist.
+                        udp.send_buffer_full = true;
+                        udp.send_dropped_count += 1;
+                        StatsD.send_callback(self, send_completion, send_buffer.len);
+                    },
+                    .failed => {
+                        if (udp.send_failure_errno == .SUCCESS) udp.send_failure_errno = errno;
+                        StatsD.send_callback(self, send_completion, error.ConnectionRefused);
+                    },
+                }
             },
             .log => {
                 self.log_buffer.?.appendSliceAssumeCapacity(send_buffer);
@@ -345,6 +428,17 @@ pub const StatsD = struct {
         completion.* = undefined;
     }
 };
+
+test "send_outcome: a full buffer is not a route failure" {
+    const E = std.posix.E;
+    const Outcome = StatsD.SendOutcome;
+    try std.testing.expectEqual(Outcome.sent, StatsD.send_outcome(.SUCCESS, 10, 10));
+    try std.testing.expectEqual(Outcome.failed, StatsD.send_outcome(.SUCCESS, 5, 10));
+    try std.testing.expectEqual(Outcome.buffer_full, StatsD.send_outcome(E.AGAIN, 0, 10));
+    try std.testing.expectEqual(Outcome.buffer_full, StatsD.send_outcome(E.NOBUFS, 0, 10));
+    try std.testing.expectEqual(Outcome.failed, StatsD.send_outcome(E.NETUNREACH, 0, 10));
+    try std.testing.expectEqual(Outcome.failed, StatsD.send_outcome(E.ACCES, 0, 10));
+}
 
 const TimingStat = enum { min, max, avg, sum, count };
 const Stat = union(enum) {
