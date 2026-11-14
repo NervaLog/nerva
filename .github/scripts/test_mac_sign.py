@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Tests for the failures of mac-sign.yml's scripts that have a code: mac_keychain.sh (NRV-E1121 and
-NRV-E1125), mac_zip_check.sh (NRV-E1126, NRV-E1127) and release_check.sh mac-same and mac-upload
+"""Tests for the failures of mac-sign.yml's scripts that have a code: mac_keychain.sh (NRV-E1121, NRV-E1125,
+NRV-E1166), mac_ca.sh (NRV-E1165) and
+mac_zip_check.sh (NRV-E1126, NRV-E1127) and release_check.sh mac-same and mac-upload
 (NRV-E1128, NRV-E1129). Run from the repository root:
 python3 .github/scripts/test_mac_sign.py
 
@@ -22,7 +23,8 @@ SECURITY = """#!/bin/sh
 # FAIL_ON: a subcommand that exits 1. IDENTITIES: what find-identity prints.
 [ "$1" = "$FAIL_ON" ] && { echo "security: $1 failed (stand-in)" >&2; exit 1; }
 case "$1" in
-  import) printf '%s\\n' "$*" >> "$SECURITY_LOG"; cp "$2" "$IMPORTED" ;;
+  import) printf '%s\\n' "$*" >> "$SECURITY_LOG"
+    case "$2" in *.cer) [ -n "$FAIL_CER" ] && { echo "security: cer refused (stand-in)" >&2; exit 1; } ;; *) cp "$2" "$IMPORTED" ;; esac ;;
   find-identity) printf '%s\\n' "$IDENTITIES" ;;
   list-keychains|default-keychain) case " $* " in *" -s "*) ;; *) echo '    "/Users/runner/Library/Keychains/login.keychain-db"' ;; esac ;;
 esac
@@ -67,6 +69,10 @@ class Keychain(unittest.TestCase):
         if not hasattr(Keychain, "p12"):
             with tempfile.TemporaryDirectory() as d:
                 Keychain.p12 = base64.b64encode(make_p12(d)).decode()
+        self.ca = Path(self.tmp.name) / "apple-ca"
+        self.ca.mkdir()
+        for name in ("DeveloperIDG2CA.cer", "DeveloperIDCA.cer"):
+            (self.ca / name).write_text("stand-in certificate")
         stub(self.bin, "security", SECURITY)
         stub(self.bin, "xcrun", XCRUN)
 
@@ -76,7 +82,7 @@ class Keychain(unittest.TestCase):
     def script(self, sub, *args, **extra):
         env = dict(os.environ, PATH=f"{self.bin}:{os.environ['PATH']}", RUNNER_TEMP=str(self.runner),
                    APPLE_DEVELOPER_ID_P12=self.p12, APPLE_DEVELOPER_ID_P12_PASSWORD=REAL_PASSWORD,
-                   SECURITY_LOG=str(self.log), IMPORTED=str(self.imported),
+                   SECURITY_LOG=str(self.log), APPLE_CA_DIR=str(self.ca), IMPORTED=str(self.imported),
                    APPLE_NOTARY_KEY_P8=b64("p8"), APPLE_NOTARY_KEY_ID="ABC123DEFG",
                    APPLE_NOTARY_ISSUER_ID="00000000-0000-0000-0000-000000000000",
                    IDENTITIES="     1) ABCDEF \"Developer ID Application: X\"\n     1 valid identities found")
@@ -124,6 +130,27 @@ class Keychain(unittest.TestCase):
     def test_a_secret_that_is_not_a_p12_is_refused(self):
         self.refused(self.create(APPLE_DEVELOPER_ID_P12=b64("not a p12")), "NRV-E1121",
                      "the keychain could not import APPLE_DEVELOPER_ID_P12")
+
+    def test_apple_intermediates_are_imported_before_the_identities_are_counted(self):
+        self.assertEqual(self.create().returncode, 0)
+        imports = [l for l in self.log.read_text().splitlines() if "DeveloperID" in l]
+        self.assertEqual(len(imports), 2, imports)
+        self.assertTrue(imports[0].endswith("DeveloperIDG2CA.cer -k " + str(self.runner / "nerva-signing.keychain-db")))
+
+    def test_a_missing_intermediates_directory_or_file_is_refused_before_anything_is_touched(self):
+        for extra in ({"APPLE_CA_DIR": None}, {"APPLE_CA_DIR": str(self.runner / "nowhere")}):
+            self.refused(self.create(**extra), "NRV-E1166", "is not in APPLE_CA_DIR")
+        (self.ca / "DeveloperIDCA.cer").unlink()
+        self.refused(self.create(), "NRV-E1166", "Apple's intermediate DeveloperIDCA.cer is not in APPLE_CA_DIR")
+        self.assertFalse(self.log.exists())
+        self.assertFalse((self.runner / "nerva-signing.keychain-db").exists())
+
+    def test_an_intermediate_that_security_refuses_is_refused(self):
+        result = self.create(FAIL_CER="1")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("error[NRV-E1125]: mac_keychain.sh: Apple's Developer ID intermediates could not be imported", result.stderr)
+        self.assertIn("\n  cause  ", result.stderr)
+        self.assertIn("\n  fix    ", result.stderr)
 
     def test_a_partition_list_that_fails_is_refused(self):
         self.refused(self.create(FAIL_ON="set-key-partition-list"), "NRV-E1121",
@@ -196,6 +223,43 @@ GOOD = ("Executable=/x/nerva\nIdentifier=nerva\nFormat=Mach-O universal\n"
         "CodeDirectory v=20500 flags=0x10000(runtime) hashes=1+7\n"
         "Authority=Developer ID Application: Nerva (ABCDE12345)\n"
         "Timestamp=Nov 11, 2026 at 10:00:00\n")
+
+
+class AppleCa(unittest.TestCase):
+    """mac_ca.sh fetch, with a stand-in curl: the real download and the pinned hashes run in ci.yml's
+    `mac-keychain` job."""
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.bin = Path(self.tmp.name) / "bin"
+        self.bin.mkdir()
+        self.dir = Path(self.tmp.name) / "apple-ca"
+
+    def fetch(self, curl, make_dir=False):
+        stub(self.bin, "curl", curl)
+        if make_dir:
+            self.dir.mkdir()
+        env = dict(os.environ, PATH=f"{self.bin}:{os.environ['PATH']}")
+        result = subprocess.run([str(SCRIPTS / "mac_ca.sh"), "fetch", str(self.dir)], capture_output=True, text=True, env=env)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("\n  cause  ", result.stderr)
+        self.assertIn("\n  fix    ", result.stderr)
+        self.assertIn("::error::NRV-E1165", result.stderr)
+        return result.stderr
+
+    def test_a_file_with_another_hash_is_refused_and_deleted(self):
+        err = self.fetch('#!/bin/sh\n# curl ... -o FILE URL\nwhile [ "$1" != -o ]; do shift; done\necho forged > "$2"\n')
+        self.assertIn("error[NRV-E1165]: mac_ca.sh: Apple's DeveloperIDG2CA.cer has SHA-256 ", err)
+        self.assertIn("not the pinned f16cd3c54c7f83cea4bf1a3e6a0819c8aaa8e4a1528fd144715f350643d2df3a", err)
+        self.assertEqual(list(self.dir.iterdir()), [])
+
+    def test_a_download_that_fails_is_refused(self):
+        err = self.fetch("#!/bin/sh\necho 'curl: (22) 404' >&2\nexit 22\n")
+        self.assertIn("error[NRV-E1165]: mac_ca.sh: Apple's DeveloperIDG2CA.cer could not be downloaded", err)
+
+    def test_an_existing_directory_is_refused(self):
+        err = self.fetch("#!/bin/sh\nexit 0\n", make_dir=True)
+        self.assertIn("could not be made", err)
 
 
 class ZipCheck(unittest.TestCase):
@@ -320,7 +384,7 @@ class DraftAfterSigning(unittest.TestCase):
         for call in ('mac_zip_check.sh" zig-out/mac-release "$TAG"', 'release_check.sh" mac-same "$TAG"',
                      'release_check.sh" mac-upload "$TAG"'):
             self.assertIn(call, workflow)
-        self.assertIn("for f in release_check.sh mac_keychain.sh mac_zip_check.sh; do", workflow)
+        self.assertIn("for f in release_check.sh mac_ca.sh mac_keychain.sh mac_zip_check.sh; do", workflow)
         self.assertNotIn("exit 1", workflow)
 
 

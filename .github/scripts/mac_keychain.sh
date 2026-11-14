@@ -7,8 +7,10 @@
 #   mac_keychain.sh destroy                  never fails on a runner; run it under `if: always()`; refused (NRV-E1125) without RUNNER_TEMP
 #
 # `create` needs APPLE_DEVELOPER_ID_P12 (base64 of the .p12: the Developer ID Application
-# certificate, its key and the Developer ID G2 intermediate) and APPLE_DEVELOPER_ID_P12_PASSWORD,
-# and, unless `--skip-notary`, APPLE_NOTARY_KEY_P8 (base64 of AuthKey_<id>.p8),
+# certificate and its key; Apple's intermediates need not be in it, P455), APPLE_DEVELOPER_ID_P12_PASSWORD,
+# APPLE_CA_DIR (the directory `mac_ca.sh fetch` filled with Apple's Developer ID G2 and Developer ID CA
+# intermediates, which `create` imports before it counts identities; refused with NRV-E1166 when it or
+# a file is missing) and, unless `--skip-notary`, APPLE_NOTARY_KEY_P8 (base64 of AuthKey_<id>.p8),
 # APPLE_NOTARY_KEY_ID and APPLE_NOTARY_ISSUER_ID. An empty one is refused with NRV-E1121 before
 # anything is touched. It makes a keychain with a random password, imports the identity, puts the
 # keychain first in the user search list and makes it the default (`mac-release` passes no
@@ -21,7 +23,7 @@
 # processes of the runner's VM can read it: on a hosted runner those are this job's own. The
 # re-wrapped file is deleted as soon as it is imported.
 # Every failure has a code, a headline, a cause and a fix (docs/ERRORS.md): NRV-E1121 for the
-# secrets and the identity (`refuse`), NRV-E1125 for the runner and the `security` commands that make
+# secrets and the identity (`refuse`), NRV-E1166 for the intermediates, NRV-E1125 for the runner and the `security` commands that make
 # and arrange the keychain (`fail`). Nothing ends in a raw command error.
 #
 # `--skip-notary` is for ci.yml's `mac-keychain` job only: a self-signed test certificate, no
@@ -36,6 +38,8 @@ p12="$RUNNER_TEMP/nerva-id.p12"
 p12w="$RUNNER_TEMP/nerva-id-rewrapped.p12"
 p12pem="$RUNNER_TEMP/nerva-id-rewrapped.pem"
 p8="$RUNNER_TEMP/nerva-notary.p8"
+APPLE_CA_DIR="${APPLE_CA_DIR:-}"
+ca_files=(DeveloperIDG2CA.cer DeveloperIDCA.cer)
 
 # fail <code> <headline> <cause> <fix>
 fail() {
@@ -93,6 +97,15 @@ rewrap() {
   rm -f "$p12pem"
 }
 
+# import_intermediates <keychain>: Apple's public intermediates give the leaf its chain.
+# (Called inside `step`'s `if`, where `set -e` is off.)
+import_intermediates() {
+  local f
+  for f in "${ca_files[@]}"; do
+    security import "$APPLE_CA_DIR/$f" -k "$1" > /dev/null || return 1
+  done
+}
+
 # arrange_keychains <keychain> <search list...>
 arrange_keychains() {
   local keychain=$1
@@ -128,6 +141,15 @@ create() {
       refuse "the signing secret $name is empty" \
         "the environment apple-signing does not hold it, or this run was not approved for it" \
         "set $name in the environment apple-signing (the owner's setup checklist), then run again"
+    fi
+  done
+
+  local f
+  for f in "${ca_files[@]}"; do
+    if [[ -z "$APPLE_CA_DIR" || ! -s "$APPLE_CA_DIR/$f" ]]; then
+      fail NRV-E1166 "Apple's intermediate $f is not in APPLE_CA_DIR ('$APPLE_CA_DIR')" \
+        "the step before did not run 'mac_ca.sh fetch' into that directory, or did not pass it on" \
+        "run 'mac_ca.sh fetch <dir>' in a step of its own and set APPLE_CA_DIR to <dir> for this one"
     fi
   done
 
@@ -178,6 +200,10 @@ create() {
       "export it again from Keychain Access, with its private key, and set APPLE_DEVELOPER_ID_P12 again"
   fi
   rm -f "$p12w"
+  step "Apple's Developer ID intermediates could not be imported into the keychain" \
+    "'security import' refused a file in APPLE_CA_DIR" \
+    "run again; if it repeats, the runner image is broken" \
+    import_intermediates "$kc"
   # Without this, codesign fails with errSecInternalComponent: there is no UI to allow it.
   if ! security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$pw" "$kc" > /dev/null 2>&1; then
     refuse "the keychain's signing key could not be opened for codesign" \
@@ -224,8 +250,8 @@ create() {
   if [[ $skip_notary == 0 ]]; then
     grep -q '^ *1 valid identities found' <<< "$found" || refuse \
       "the keychain does not hold exactly one valid code-signing identity" \
-      "the .p12 lacks the Developer ID Application certificate, its private key or the Developer ID G2 intermediate, or holds more than one identity" \
-      "export the certificate with its key and the G2 intermediate (the owner's setup checklist), one identity only"
+      "the .p12 lacks the Developer ID Application certificate or its private key, the certificate is expired, revoked or not issued by Apple's Developer ID G2 or Developer ID CA, or the .p12 holds more than one identity" \
+      "export the certificate with its key (the intermediates are not needed, P455; the owner's setup checklist), one identity only"
   else
     grep -q '^ *1) ' <<< "$found" || refuse \
       "the keychain holds no code-signing identity" \
