@@ -88,6 +88,9 @@ pub const GatewayOptions = struct {
     pid_file: ?[]const u8 = null,
     /// Pass the gateway's stderr on to this process's instead of dropping it.
     inherit_stderr: bool = false,
+    /// Set when the PID file cannot be written; `start` then returns `error.FileWriteFailed`, so
+    /// that the caller tears everything down before it reports NRV-E0728.
+    failure: ?*?bench_timeline.FileFailure = null,
 };
 
 /// A `nerva api` process on a free local port, in front of a cluster.
@@ -143,11 +146,12 @@ pub const Gateway = struct {
             var pid_buffer: [32]u8 = undefined;
             const pid = try std.fmt.bufPrint(&pid_buffer, "{}\n", .{gateway.process.id});
             std.fs.cwd().writeFile(.{ .sub_path = path, .data = pid }) catch |err| {
-                gateway.stop();
-                bench_timeline.file_fail("--gateway-pid-file", path, err);
+                if (options.failure) |failure| failure.* = .{ .flag = "--gateway-pid-file", .path = path, .err = err };
+                return error.FileWriteFailed;
             };
-            // Set only once written: `stop` deletes the file, which must not be a device.
-            gateway.pid_file = path;
+            // Set only for a regular file: `stop` deletes it, which must not be a device.
+            const stat = std.fs.cwd().statFile(path) catch null;
+            if (stat != null and stat.?.kind == .file) gateway.pid_file = path;
         }
 
         // The replicas may still be starting: wait until the gateway has a session.

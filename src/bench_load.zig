@@ -143,33 +143,48 @@ pub fn main() !void {
     defer flags.deinit(gpa);
     const args = flags.parse(CLIArgs);
 
+    var failure: ?bench_timeline.FileFailure = null;
+    const failed = run_flags(gpa, args, &failure) catch |err| switch (err) {
+        // Everything is torn down by now: report the file, then leave.
+        error.FileWriteFailed => {
+            failure.?.report();
+            std.process.exit(1);
+        },
+        else => return err,
+    };
+    if (failed) std.process.exit(1);
+}
+
+/// Checks the flags, runs the workload and writes the files; true if a request failed. Returns
+/// (never exits) once a cluster or gateway exists, so that `defer` tears them down.
+fn run_flags(gpa: std.mem.Allocator, args: CLIArgs, failure: *?bench_timeline.FileFailure) !bool {
     if (args.local == (args.addresses != null)) {
         stdx.Flags.fatal("exactly one of --local and --addresses is required", .{});
     }
-    if (args.clients == 0) stdx.Flags.fatal("--clients must be at least 1", .{});
+    if (args.clients == 0) range_fatal("--clients must be at least 1", .{});
     const gateway_workload = args.workload == .botpike;
     if (gateway_workload) {
         if (args.clients > botpike.callers_max) {
-            stdx.Flags.fatal("--clients allows at most {} for botpike", .{botpike.callers_max});
+            range_fatal("--clients allows at most {} for botpike", .{botpike.callers_max});
         }
         if (args.batch != 1) stdx.Flags.fatal("botpike takes no --batch", .{});
         if (args.rate != 0) stdx.Flags.fatal("botpike is a closed loop: no --rate", .{});
         if (args.keys < 2 or args.keys > 1_000_000) {
-            stdx.Flags.fatal("--keys (accounts) must be from 2 to 1000000 for botpike", .{});
+            range_fatal("--keys (accounts) must be from 2 to 1000000 for botpike", .{});
         }
     }
     if (args.local and !gateway_workload and args.clients > local_clients_max) {
-        stdx.Flags.fatal("--local allows at most {} clients", .{local_clients_max});
+        range_fatal("--local allows at most {} clients", .{local_clients_max});
     }
     if (args.batch == 0 or args.batch > batch_max) {
-        stdx.Flags.fatal("--batch must be from 1 to {}", .{batch_max});
+        range_fatal("--batch must be from 1 to {}", .{batch_max});
     }
-    if (args.keys < args.batch) stdx.Flags.fatal("--keys must be at least --batch", .{});
+    if (args.keys < args.batch) range_fatal("--keys must be at least --batch", .{});
     if (args.hot == 0 or args.hot > args.keys) {
-        stdx.Flags.fatal("--hot must be from 1 to --keys", .{});
+        range_fatal("--hot must be from 1 to --keys", .{});
     }
     if (bench_timeline.seconds_refusal(args.warmup, args.seconds)) |reason| {
-        stdx.Flags.fatal("{s}", .{reason});
+        range_fatal("{s}", .{reason});
     }
     if (bench_timeline.gateway_flags_refusal(
         gateway_workload,
@@ -186,12 +201,21 @@ pub fn main() !void {
     }
 
     // The files this run writes are made now, so that a bad path costs no measurement (NRV-E0728).
+    // A regular file made here is removed again unless the run ends with its content: an empty or
+    // truncated file would pass for a result (a device such as /dev/full is never removed).
+    var finished = false;
+    var timeline_made: ?[]const u8 = null;
+    var pid_made: ?[]const u8 = null;
+    defer if (!finished) {
+        if (timeline_made) |path| std.fs.cwd().deleteFile(path) catch {};
+        if (pid_made) |path| std.fs.cwd().deleteFile(path) catch {};
+    };
     const timeline_file: ?std.fs.File = if (args.timeline) |path|
-        file_create("--timeline", path)
+        file_create("--timeline", path, &timeline_made)
     else
         null;
     defer if (timeline_file) |file| file.close();
-    if (args.@"gateway-pid-file") |path| file_create("--gateway-pid-file", path).close();
+    if (args.@"gateway-pid-file") |path| file_create("--gateway-pid-file", path, &pid_made).close();
 
     const config: Config = .{
         .workload = args.workload,
@@ -221,6 +245,7 @@ pub fn main() !void {
             .statsd = args.@"gateway-statsd",
             .pid_file = args.@"gateway-pid-file",
             .inherit_stderr = args.@"gateway-stderr" == @as(?GatewayStderr, .inherit),
+            .failure = failure,
         })
     else result: {
         try preload(gpa, args.cluster, addresses, &config);
@@ -239,14 +264,30 @@ pub fn main() !void {
         var lines = std.ArrayList(u8).init(gpa);
         defer lines.deinit();
         try timeline.write(lines.writer());
-        file.writeAll(lines.items) catch |err| bench_timeline.file_fail("--timeline", args.timeline.?, err);
+        file.writeAll(lines.items) catch |err| {
+            failure.* = .{ .flag = "--timeline", .path = args.timeline.?, .err = err };
+            return error.FileWriteFailed;
+        };
     }
-    if (result.failures > 0) std.process.exit(1);
+    finished = true;
+    return result.failures > 0;
 }
 
-/// Creates (or empties) the file a flag names, or ends the process with NRV-E0728.
-fn file_create(flag: []const u8, path: []const u8) std.fs.File {
-    return std.fs.cwd().createFile(path, .{}) catch |err| bench_timeline.file_fail(flag, path, err);
+/// Creates (or empties) the file a flag names, or ends the process with NRV-E0728 (nothing runs
+/// yet). `made` is set to the path if the file is a regular one.
+fn file_create(flag: []const u8, path: []const u8, made: *?[]const u8) std.fs.File {
+    const file = std.fs.cwd().createFile(path, .{}) catch |err| bench_timeline.file_fail(flag, path, err);
+    const stat = file.stat() catch null;
+    if (stat != null and stat.?.kind == .file) made.* = path;
+    return file;
+}
+
+/// A flag's value out of range, as NRV-E0002 (one line), like `cli.zig`.
+fn range_fatal(comptime format: []const u8, arguments: anytype) noreturn {
+    var buffer: [256]u8 = undefined;
+    const message = std.fmt.bufPrint(&buffer, format, arguments) catch "a flag is out of range";
+    std.io.getStdErr().writer().print("error[NRV-E0002]: bench-load: {s}\n", .{message}) catch {};
+    std.process.exit(1);
 }
 
 /// The flag parser's failures, and this command's own flag checks, as NRV-E0001 (one line).

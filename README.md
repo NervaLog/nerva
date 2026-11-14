@@ -534,7 +534,11 @@ runs the first s seconds as usual, but leaves their operations out of the summar
 throughput and percentiles); their timeline lines carry `"warmup":true`. `--warmup` + `--seconds`
 is at most 3600, and the summary JSON gains `"warmup"` and `"late_operations"` members.
 `--timeline` and `--gateway-pid-file` are created before the run, so a bad path is refused at
-once with NRV-E0728 (the same line if a later write fails); the PID file is removed when the gateway stops. For the `botpike` workload only
+once with NRV-E0728 (the same line if a later write fails, printed after the cluster and the gateway
+it started are torn down). A regular `--timeline` or `--gateway-pid-file` that the run did not fill is
+removed again on every failure path (never a device such as `/dev/full`), and the PID file is removed
+when the gateway stops. A value out of range (`--clients`, `--batch`, `--keys`, `--hot`, `--warmup` plus
+`--seconds`, `--local`'s client limit) is NRV-E0002. For the `botpike` workload only
 (refused for the others): `--gateway-statsd=<host:port>` (checked before anything starts, NRV-E0736)
 passes `--statsd` to the gateway it starts, `--gateway-pid-file=<file>` writes the gateway's PID there right after it spawns, and
 `--gateway-stderr=inherit|ignore` (default `ignore`) passes the gateway's stderr through to

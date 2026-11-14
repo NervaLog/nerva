@@ -14,6 +14,8 @@ which the owner has to approve (PR #414's question).
   names a live `nerva api` while the run lasts, and is gone after.
 - `--gateway-stderr=inherit` passes the gateway's lines on; `t_us` is wall-clock time.
 - A bad `--gateway-statsd` (too long, malformed, port 0) is refused at once with NRV-E0736.
+- Flag values out of range are refused with NRV-E0002; a failed write after the cluster started tears
+  the cluster down first (no `nerva` process or cluster directory outlives any case).
 - A bad `--timeline` or `--gateway-pid-file` path is refused at once with NRV-E0728, before any
   cluster starts; so is `--gateway-stderr` on a workload with no gateway.
 """
@@ -33,6 +35,39 @@ CLOSED = ["c1", "c2", "c3", "c3_adds", "c4", "c5", "c7"]
 
 def run(bench, argv, timeout=180):
     return subprocess.run([bench] + argv, capture_output=True, text=True, timeout=timeout)
+
+
+def children():
+    """The `nerva` processes (replicas, gateways) and the cluster directories that exist now."""
+    found = set()
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/cmdline", "rb") as f:
+                argv = f.read().decode(errors="replace").split("\0")
+        except OSError:
+            continue
+        if argv[0].endswith("/nerva") or argv[0] == "nerva":
+            found.add(int(entry))
+    tmp = os.path.join(os.getcwd(), ".zig-cache", "tmp")
+    directories = {d for d in os.listdir(tmp) if d.startswith("nerva-bench-")} if os.path.isdir(tmp) else set()
+    return found, directories
+
+
+BASELINE = None
+
+
+def assert_clean(label):
+    """No replica or gateway of this case survives it, and no cluster directory (it is torn down)."""
+    deadline = time.time() + 5
+    while True:
+        found, directories = children()
+        leaked = (found - BASELINE[0], directories - BASELINE[1])
+        if not leaked[0] and not leaked[1]:
+            return
+        assert time.time() < deadline, (label, "left behind", leaked)
+        time.sleep(0.2)
 
 
 def read_timeline(path):
@@ -67,6 +102,7 @@ def workload(bench, tmp, name, extra, label):
     check_timeline(lines, summary, label)
     assert before * 1e6 <= lines[0]["t_us"] <= after * 1e6, (label, "t_us is not wall-clock")
     assert 0 <= summary["late_operations"] <= 2, (label, summary["late_operations"])
+    assert_clean(label)
     print(f"ok {label}")
 
 
@@ -128,6 +164,7 @@ def botpike(bench, tmp):
     assert 0 <= summary["late_operations"] <= 2, summary["late_operations"]
     assert all(line["count"] > 0 for line in lines), "an empty second"
     assert sum(line["count"] for line in lines[WARMUP:]) == json.loads(stdout)["operations"]
+    assert_clean("botpike")
     print("ok botpike statsd and pid file")
 
 
@@ -144,7 +181,8 @@ def refusal(bench, argv, label, flag):
 
 
 def write_failure(bench, argv, label, flag):
-    """The file was made, then a write failed (/dev/full): one coded line, no raw Zig error."""
+    """The file was made, then a write failed (/dev/full): one coded line, no raw Zig error, and the
+    cluster (and the gateway) the run started is gone."""
     result = run(bench, argv, timeout=120)
     lines = [line for line in result.stderr.splitlines() if line.strip()]
     assert result.returncode == 1, (label, result.returncode, result.stderr[-500:])
@@ -152,11 +190,14 @@ def write_failure(bench, argv, label, flag):
         f"error[NRV-E0728]: bench-load: {flag}: cannot write /dev/full: no space left on the device"
     ), (label, lines[-3:])
     assert not re.search(r"\berror\.[A-Z]|NoSpaceLeft", result.stderr), label
+    assert_clean(label)
     print(f"ok {label}")
 
 
 def main():
+    global BASELINE
     bench = os.path.abspath(sys.argv[1])
+    BASELINE = children()
     with tempfile.TemporaryDirectory() as tmp:
         for name in CLOSED:
             workload(bench, tmp, name, [], name)
@@ -189,14 +230,29 @@ def main():
         result = run(bench, ["--local", "--workload=c1", "--warmup=2000", "--seconds=2000"], timeout=30)
         lines = [line for line in result.stderr.splitlines() if line.strip()]
         assert result.returncode == 1 and len(lines) == 1, lines
-        assert lines[0].startswith("error[NRV-E0001]: bench-load: --warmup plus --seconds"), lines
-        print("ok --warmup plus --seconds over 3600 refused (NRV-E0001)")
+        assert lines[0].startswith("error[NRV-E0002]: bench-load: --warmup plus --seconds"), lines
+        print("ok --warmup plus --seconds over 3600 refused (NRV-E0002)")
         # A write that fails after the file was made (/dev/full: ENOSPC) is one coded line too.
         write_failure(bench, ["--local", "--workload=c1", "--seconds=1", "--timeline=/dev/full"],
                       "timeline write fails", "--timeline")
         write_failure(bench, ["--local", "--workload=botpike", "--seconds=1",
                               "--gateway-pid-file=/dev/full"],
                       "PID file write fails", "--gateway-pid-file")
+        # A bad value out of range is NRV-E0002, and nothing starts.
+        for argv, label in [(["--clients=0"], "--clients 0"), (["--batch=0"], "--batch 0"),
+                            (["--keys=1", "--batch=2"], "--keys under --batch"),
+                            (["--hot=0"], "--hot 0")]:
+            result = run(bench, ["--local", "--workload=c1", "--seconds=1"] + argv, timeout=30)
+            lines = [line for line in result.stderr.splitlines() if line.strip()]
+            assert result.returncode == 1 and len(lines) == 1, (label, lines)
+            assert lines[0].startswith("error[NRV-E0002]: bench-load: --"), (label, lines)
+        print("ok out-of-range flags refused (NRV-E0002)")
+        # A failed run leaves neither an empty PID file nor an empty timeline behind.
+        left = os.path.join(tmp, "left.pid")
+        result = run(bench, ["--local", "--workload=botpike", "--seconds=1", f"--gateway-pid-file={left}",
+                             "--gateway-statsd=127.0.0.1:0"], timeout=30)
+        assert not os.path.exists(left), "an empty PID file is left by a refused run"
+        assert_clean("refused run")
 
 
 if __name__ == "__main__":

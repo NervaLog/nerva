@@ -77,12 +77,25 @@ pub fn path_error_reason(err: anyerror) []const u8 {
     };
 }
 
-/// Ends the process with NRV-E0728: one line, no raw Zig error.
+/// A file the run could not write, kept until the cluster and the gateway are torn down.
+pub const FileFailure = struct {
+    flag: []const u8,
+    path: []const u8,
+    err: anyerror,
+
+    /// The one NRV-E0728 line, on stderr.
+    pub fn report(failure: FileFailure) void {
+        std.io.getStdErr().writer().print(
+            "error[NRV-E0728]: bench-load: {s}: cannot write {s}: {s}\n",
+            .{ failure.flag, failure.path, path_error_reason(failure.err) },
+        ) catch {};
+    }
+};
+
+/// Ends the process with NRV-E0728: one line, no raw Zig error. Only for a failure before anything
+/// runs; once a cluster or gateway exists, return `error.FileWriteFailed` and report afterwards.
 pub fn file_fail(flag: []const u8, path: []const u8, err: anyerror) noreturn {
-    std.io.getStdErr().writer().print(
-        "error[NRV-E0728]: bench-load: {s}: cannot write {s}: {s}\n",
-        .{ flag, path, path_error_reason(err) },
-    ) catch {};
+    (FileFailure{ .flag = flag, .path = path, .err = err }).report();
     std.process.exit(1);
 }
 
