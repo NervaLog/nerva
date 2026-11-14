@@ -72,6 +72,7 @@ pub const table = [_]Entry{
     .{ .code = "NRV-E0808", .summary = "A backup's manifest is missing, malformed, too large or of an unknown version", .exit = exit_operator },
     .{ .code = "NRV-E0809", .summary = "A backup does not match its manifest: size, SHA-256, op, version, a view hash or a ledger total", .exit = exit_operator },
     .{ .code = "NRV-E0810", .summary = "A file `export` or `import` was given cannot be opened, read or written", .exit = exit_operator },
+    .{ .code = "NRV-E0812", .summary = "A release build was given an export from a test build with commit-key deduplication off", .exit = exit_operator },
     .{ .code = "NRV-E0901", .summary = "`NERVA_CLUSTER_KEY` is missing, short, or wrongly paired with `_NEXT`", .exit = exit_operator },
     .{ .code = "NRV-B0004", .summary = "A `nerva` command hit an error it did not expect", .exit = exit_internal },
 };

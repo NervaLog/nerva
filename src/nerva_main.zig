@@ -375,6 +375,16 @@ fn import_run(
     defer arena.deinit();
     const plan = import_.plan(arena.allocator(), args.input) catch |err|
         import_failed(command, args.input, args.path, err);
+    if (commit_keys_deduplicate and plan.flags & export_file.flag_keys_off != 0) {
+        diagnostic.fail(
+            "NRV-E0812",
+            command ++ ": {s}: the export came from a test build with commit-key " ++
+                "deduplication off, which a release build does not import",
+            .{args.input},
+            "import it with the same test build (-Dtest-commit-keys=off)",
+            .{},
+        );
+    }
     if (manifest_path) |path| manifest_compare(command, args, path, &manifest, &plan);
     // Pass 2. Any failure removes the data file, which the import created.
     command_import(gpa, args, path_importing, &plan) catch |err| {
@@ -706,6 +716,8 @@ fn command_export(
     var writer = try export_file.WriterType(@TypeOf(buffered).Writer).init(
         buffered.writer(),
         try export_.format_version(&client),
+        // P426: a keys-off build says so, a release build writes 0.
+        if (commit_keys_deduplicate) 0 else export_file.flag_keys_off,
     );
     const summary = try export_.run(gpa, &client, &writer, args.as_of);
     try buffered.flush();

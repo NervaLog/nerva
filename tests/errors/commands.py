@@ -21,6 +21,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import zlib
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "api"))
 from api import Cluster  # noqa: E402
@@ -336,6 +337,52 @@ def main():
             check("import future version",
                   imp + ["--input=" + future, os.path.join(tmp, "g.nerva")],
                   "NRV-E0805", 1, "version")
+            # A keys-off export (P426): flag bit 0 at byte 12. The end record (the last 44 bytes:
+            # size, kind, the SHA-256 of every byte before it, the CRC-32 of those) is rebuilt, so
+            # only the flag is refused. A release build names it (E0812); an unknown bit is corrupt.
+            with open(out, "rb") as f:
+                real = f.read()
+
+            def with_flags(flags):
+                body = bytearray(real[:-44])
+                body[12:16] = flags.to_bytes(4, "little")
+                end = real[-44:-36] + hashlib.sha256(body).digest()
+                return bytes(body) + end + zlib.crc32(end).to_bytes(4, "little")
+            assert with_flags(0) == real, "the end record is not rebuilt as assumed"
+            for name, flags, code, text in (("keys off", 1, "NRV-E0812", "deduplication off"),
+                                            ("unknown flag", 2, "NRV-E0804", "flag")):
+                flagged = os.path.join(tmp, f"{flags}.export")
+                with open(flagged, "wb") as f:
+                    f.write(with_flags(flags))
+                target = os.path.join(tmp, f"{flags}.nerva")
+                check("import " + name, imp + ["--input=" + flagged, target], code, 1, text)
+                assert not os.path.exists(target)
+            # The write path, from real exports (P426): a release `export` writes flags 0, a
+            # keys-off `export` writes bit 0; a release import refuses the latter from the real
+            # file, leaving nothing behind, and a keys-off import accepts it. The bit marks the
+            # exporting build, not the cluster, so a release export of a keys-off cluster is 0.
+            # The keys-off export is of a keys-off cluster: a keys-off client does not reach a
+            # release cluster once its release is refused (#354), so this holds with and without it.
+            assert real[12:16] == bytes(4), real[12:16]
+            off_out = os.path.join(tmp, "off.export")
+            cluster_off = Cluster(nerva_off)
+            try:
+                export_off = ["export", "--cluster=0", f"--addresses={cluster_off.address}"]
+                made = run(nerva_off, export_off + ["--output=" + off_out])
+            finally:
+                cluster_off.close()
+            assert made.returncode == 0, made.stderr[-2000:]
+            with open(off_out, "rb") as f:
+                off_bytes = f.read()
+            assert off_bytes[12:16] == b"\x01\x00\x00\x00", off_bytes[12:16]
+            off_target = os.path.join(tmp, "off.nerva")
+            check("import real keys-off export", imp + ["--input=" + off_out, off_target],
+                  "NRV-E0812", 1, "deduplication off")
+            assert not os.path.exists(off_target)
+            assert not os.path.exists(off_target + ".importing")
+            accepted = run(nerva_off, imp + ["--input=" + off_out, off_target])
+            assert accepted.returncode == 0, accepted.stderr[-2000:]
+            assert os.path.exists(off_target)
             # A port that is taken.
             with socket.socket() as taken:
                 taken.bind(("127.0.0.1", 0))
