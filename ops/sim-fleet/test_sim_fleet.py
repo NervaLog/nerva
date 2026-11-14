@@ -2104,10 +2104,6 @@ class Rotation(unittest.TestCase):
         self.assertEqual(both, want)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class BrokenRetry(unittest.TestCase):
     """A commit whose build failed is retried after a bound, a bounded number of times (#289)."""
 
@@ -2194,3 +2190,7 @@ class BrokenRetry(unittest.TestCase):
         self.rounds(1)
         self.assertEqual(self.builds(), 4)
         self.assertTrue(Path(self.state, "broken-tries").read_text().startswith(f"{v3} 1 "))
+
+
+if __name__ == "__main__":
+    unittest.main()
