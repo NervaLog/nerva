@@ -2,6 +2,7 @@
 """Tests for sim_fleet.py (P147h), without network. Run from the repository root:
 python3 ops/sim-fleet/test_sim_fleet.py"""
 import contextlib
+import hashlib
 import http.client
 import importlib.util
 import io
@@ -1514,6 +1515,166 @@ class RunShSettle(unittest.TestCase):
         self.assertRegex(calls[1], r"^sync .*/round .*/state$")
         self.assertRegex(calls[2], r"^sync \S*/round/w0/results \S*/round/w0 \S*/round$")
         self.assertEqual(calls[3], "tail")
+
+
+
+    def settle_one(self, n, ingest="fail:2", alarm_rounds=3):
+        rid = f"{n}-{n:016x}"
+        self.leftover(["vopr-nerva 5 0 3600"], round_id=rid)
+        return self.sh(f'SIM_FLEET_ALARM_ROUNDS={alarm_rounds}; round="{self.round}"; '
+                       f'bin="{self.bin}"; settle {rid} {SHA_A}', ingest=ingest)
+
+    def streak(self):
+        path = os.path.join(self.state, "failing-rounds")
+        return Path(path).read_text().split() if os.path.exists(path) else None
+
+    def test_the_third_failing_round_raises_the_alarm_once(self):
+        for n in (1, 2):
+            out = self.settle_one(n)
+            self.assertNotIn("ALARM", out.stderr)
+            self.assertNotIn("would open", out.stdout)
+        out = self.settle_one(3)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("ALARM error[NRV-E0730]: 3 rounds in a row failed", out.stderr)
+        self.assertIn("would open issue [sim-fleet]", out.stdout)
+        self.assertEqual(self.streak(), ["3", "1"])
+        out = self.settle_one(4)  # The same streak: no second issue.
+        self.assertNotIn("ALARM", out.stderr)
+        self.assertNotIn("would open", out.stdout)
+        self.assertEqual(self.streak(), ["4", "1"])
+
+    def test_a_counted_round_ends_the_streak(self):
+        self.settle_one(1)
+        self.settle_one(2)
+        out = self.settle_one(3, ingest="")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIsNone(self.streak())
+        for n in (4, 5):
+            self.assertNotIn("ALARM", self.settle_one(n).stderr)
+
+    def test_a_refused_round_counts_as_failing(self):
+        for n in (1, 2, 3):
+            self.leftover(["vopr-nerva 5 0 3600"], round_id=f"{n}-{n:016x}")
+            out = self.sh(f'SIM_FLEET_ALARM_ROUNDS=3; round="{self.round}"; bin="{self.bin}"; '
+                          f'settle {n}-{n:016x} {SHA_A} refuse')
+        self.assertIn("ALARM", out.stderr)
+
+    def test_an_alarm_that_cannot_be_filed_is_asked_for_again(self):
+        # An old reporter that has no `alarm`: the link goes first, never its target.
+        os.unlink(os.path.join(self.bin, "sim_fleet.py"))
+        Path(self.bin, "sim_fleet.py").write_text(
+            "import runpy, sys\nif sys.argv[1] == 'alarm':\n    sys.exit(2)\n"
+            f"sys.argv[0] = r'{HERE / 'sim_fleet.py'}'\n"
+            f"runpy.run_path(sys.argv[0], run_name='__main__')\n")
+        for n in (1, 2, 3):
+            out = self.settle_one(n)
+        self.assertIn("the alarm was not filed", out.stderr)
+        self.assertEqual(self.streak(), ["3", "0"])
+
+
+class Reexec(unittest.TestCase):
+    """follow_main hands over to the run.sh of a commit it built, once (#424)."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(subprocess.run, ["rm", "-rf", self.dir])
+        self.repo = os.path.join(self.dir, "repo")
+        os.makedirs(os.path.join(self.repo, "ops", "sim-fleet"))
+        self.new = os.path.join(self.repo, "ops", "sim-fleet", "run.sh")
+        # The "new" run.sh says what it got, and whether fd 9 (the lock) came with it.
+        Path(self.new).write_text(
+            '#!/usr/bin/env bash\necho "NEW args=$* marker=${SIM_FLEET_REEXEC:-} '
+            'rounds=${SIM_FLEET_ROUNDS:-} extra=${EXTRA:-}"\n'
+            'if { true >&9; } 2>/dev/null; then echo FD9; fi\n')
+
+    def call(self, marker="", old_sum="0" * 64, rounds_setting="0"):
+        env = {"PATH": os.environ["PATH"], "EXTRA": "kept", "SIM_FLEET_ROUNDS": rounds_setting}
+        if marker:
+            env["SIM_FLEET_REEXEC"] = marker
+        return subprocess.run(
+            ["bash", "-c", f'source "{HERE}/run.sh"; log() {{ echo "$*" >&2; }}; '
+             f'SIM_FLEET_REPO_DIR="{self.repo}"; RUN_ARGS=(a b); RUN_SH_SUM={old_sum}; rounds=2; '
+             f'exec 9>"{self.dir}/lock"; reexec_if_changed {SHA_A}; echo RETURNED'],
+            env=env, capture_output=True, text=True, timeout=30)
+
+    def test_a_changed_run_sh_is_exec_d_with_its_arguments_and_environment(self):
+        out = self.call()
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn(f"NEW args=a b marker={SHA_A} rounds=0 extra=kept", out.stdout)
+        self.assertNotIn("RETURNED", out.stdout)
+        self.assertNotIn("FD9", out.stdout)  # The lock is the new run.sh's to take.
+        self.assertIn("differs from the one running", out.stderr)
+
+    def test_an_unchanged_run_sh_is_not_exec_d(self):
+        digest = hashlib.sha256(Path(self.new).read_bytes()).hexdigest()
+        out = self.call(old_sum=digest)
+        self.assertEqual(out.stdout.strip(), "RETURNED", out.stderr)
+
+    def test_once_per_commit_the_marker_stops_a_loop(self):
+        out = self.call(marker=SHA_A)
+        self.assertEqual(out.stdout.strip(), "RETURNED", out.stderr)
+        # Another commit's marker does not.
+        out = self.call(marker="f" * 40)
+        self.assertIn("NEW", out.stdout)
+
+    def test_the_rounds_a_run_asked_for_are_not_started_again(self):
+        out = self.call(rounds_setting="5")
+        self.assertIn("rounds=4", out.stdout)  # Round 2 had not run: 5 - 2 + 1.
+
+    def test_a_missing_run_sh_changes_nothing(self):
+        os.unlink(self.new)
+        self.assertEqual(self.call().stdout.strip(), "RETURNED")
+
+
+class Alarm(unittest.TestCase):
+    """`sim_fleet.py alarm` files one issue and comments on it after that."""
+
+    ARGS = ["alarm", "--rounds", "3", "--round-id", ID_A, "--commit", SHA_A,
+            "--repo", "NervaLog/nerva", "--token-file", "/x"]
+
+    def run_alarm(self, github, argv=None):
+        err = io.StringIO()
+        with mock.patch.object(fleet, "GitHub", lambda *a: github), \
+                mock.patch.object(fleet, "read_token", lambda path: "t"), \
+                contextlib.redirect_stderr(err):
+            return fleet.main(argv or self.ARGS), err.getvalue()
+
+    def test_it_opens_the_issue_then_comments_on_it(self):
+        github = Recorder()
+        github.found = None
+        github.find_open = lambda marker: github.found
+        self.assertEqual(self.run_alarm(github)[0], 0)
+        number, title, body = github.opened[0]
+        self.assertIn("NRV-E0730", title)
+        self.assertIn(fleet.ALARM_MARKER, body)
+        github.found = number  # The next streak finds it open.
+        self.assertEqual(self.run_alarm(github)[0], 0)
+        self.assertEqual(len(github.opened), 1)
+        self.assertEqual(github.comments[0][0], number)
+
+    def test_the_alarm_marker_is_not_a_failure_fingerprint(self):
+        self.assertIsNone(fleet.MARKER.search(fleet.ALARM_MARKER))
+
+    def test_github_down_is_exit_1_not_a_crash(self):
+        github = Recorder(fail={"open": fleet.GitHubError("unreachable", "no answer")})
+        github.find_open = lambda marker: None
+        code, err = self.run_alarm(github)
+        self.assertEqual(code, 1)
+        self.assertIn("alarm not filed", err)
+
+    def test_a_bad_round_id_or_count_is_exit_1(self):
+        for bad in (["--round-id", "x"], ["--rounds", "0"]):
+            argv = [a for a in self.ARGS]
+            argv[argv.index(bad[0]) + 1] = bad[1]
+            self.assertEqual(self.run_alarm(Recorder(), argv)[0], 1)
+
+    def test_dry_run_prints_the_issue(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = fleet.main(["alarm", "--rounds", "3", "--round-id", ID_A, "--commit", SHA_A,
+                               "--dry-run"])
+        self.assertEqual(code, 0)
+        self.assertIn("would open issue [sim-fleet]", out.getvalue())
 
 
 class Rotation(unittest.TestCase):

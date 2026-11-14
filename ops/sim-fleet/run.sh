@@ -7,6 +7,11 @@
 set -euo pipefail
 
 main() {
+    # What follow_main re-execs with, and the checksum of the run.sh bash loaded (#424): bash reads
+    # this file once, but the checkout it follows rewrites it in place.
+    RUN_ARGS=("$@")
+    RUN_SH=$(readlink -f "${BASH_SOURCE[0]}")
+    RUN_SH_SUM=$(sha256sum "$RUN_SH" | cut -d' ' -f1)
     : "${SIM_FLEET_HOME:=/var/lib/sim-fleet}"
     : "${SIM_FLEET_DRY_RUN:=}"
     # A dry run gets a checkout and a state of its own: it must not touch the service's.
@@ -79,6 +84,13 @@ vsr_superblock_quorums vsr_multi_batch nerva_adds nerva_http_head nerva_document
     : "${SIM_FLEET_ROUNDS:=0}"
     : "${SIM_FLEET_IDLE_SECONDS:=60}"
     : "${SIM_FLEET_PYTHON:=python3}"
+    # Consecutive failing rounds (ingest failed or left no record, or a worker died) before the
+    # alarm (NRV-E0730, P<n>).
+    : "${SIM_FLEET_ALARM_ROUNDS:=3}"
+    if [[ ! "$SIM_FLEET_ALARM_ROUNDS" =~ ^[0-9]{1,6}$ ]] || (( 10#$SIM_FLEET_ALARM_ROUNDS == 0 )); then
+        log "SIM_FLEET_ALARM_ROUNDS must be a positive whole number, not '$SIM_FLEET_ALARM_ROUNDS'"
+        exit 2
+    fi
 
     (( SIM_FLEET_WORKERS_VOPR_NERVA + SIM_FLEET_WORKERS_VOPR_TESTING + SIM_FLEET_WORKERS_FUZZ \
         + SIM_FLEET_WORKERS_MIXED <= 1024 )) || { log "more than 1024 workers"; exit 2; }
@@ -128,7 +140,7 @@ vsr_superblock_quorums vsr_multi_batch nerva_adds nerva_http_head nerva_document
         bin="$STATE/bin/$built" round="$STATE/round"
         settle_leftover
     fi
-    local rounds=0
+    rounds=0
     while (( SIM_FLEET_ROUNDS == 0 || rounds < SIM_FLEET_ROUNDS )); do
         rounds=$(( rounds + 1 ))
         follow_main
@@ -251,6 +263,7 @@ follow_main() {
         built=$head
         log "built $head"
         prune_bin
+        reexec_if_changed "$head"
     else
         rm -rf "$STATE/bin/$head"
         echo "$head" >"$STATE/broken.new"
@@ -259,6 +272,24 @@ follow_main() {
         log "build of $head FAILED or timed out (see $STATE/build.log); still testing" \
             "${built:-nothing}"
     fi
+}
+
+# After a build of $1: if that commit's run.sh is not the one bash loaded, runs that one instead,
+# with the same arguments and environment (#424). Without it, a changed interface between run.sh
+# and sim_fleet.py (#382's --round-id) failed every ingest. Once per built commit: the marker
+# SIM_FLEET_REEXEC names the commit the run.sh just exec'd came from, so it does not exec again.
+# The lock (fd 9) is closed first; the new run.sh takes it. Needs RUN_ARGS, RUN_SH_SUM.
+reexec_if_changed() {
+    local head=$1 new="$SIM_FLEET_REPO_DIR/ops/sim-fleet/run.sh" sum
+    if [[ "${SIM_FLEET_REEXEC:-}" == "$head" ]]; then return 0; fi
+    [[ -r "$new" ]] || return 0
+    sum=$(sha256sum "$new" | cut -d' ' -f1)
+    if [[ "$sum" == "$RUN_SH_SUM" ]]; then return 0; fi
+    log "run.sh of $head differs from the one running; re-executing it"
+    export SIM_FLEET_REEXEC=$head
+    # The rounds a dry run or a test asked for are counted from the first run.sh.
+    if (( ${SIM_FLEET_ROUNDS:-0} != 0 )); then export SIM_FLEET_ROUNDS=$(( SIM_FLEET_ROUNDS - ${rounds:-1} + 1 )); fi
+    exec bash "$new" "${RUN_ARGS[@]}" 9>&-
 }
 
 # The five binaries of one commit, built as CI and fuzz_loop.sh build them (ReleaseSafe), and
@@ -445,7 +476,10 @@ worker() {
 # kept in `last-failed-round` for a look.
 settle() {
     local id=$1 commit=$2 code=1
-    if [[ "${3:-}" != refuse ]]; then
+    if [[ "${3:-}" == refuse ]]; then
+        # code stays 1: a refused round is a failing round.
+        :
+    else
         code=0
         ingest_round "$id" "$commit" || code=$?
         if ! recorded "$id"; then
@@ -462,6 +496,7 @@ settle() {
             "it stays in $round, and the loop stops"
         exit 1
     fi
+    note_round "$code" "$id" "$commit"
     if (( code == 0 )); then
         rm -rf "$round"
     else
@@ -470,6 +505,40 @@ settle() {
         log "round $id is recorded, refused or with sim_fleet.py exit $code; the round is kept" \
             "in $STATE/last-failed-round for a look"
     fi
+}
+
+# Counts consecutive failing rounds ($1 is the round's code: not 0 is failing) in
+# $STATE/failing-rounds (`<count> <alarmed 0|1>`, so a restart keeps it). At SIM_FLEET_ALARM_ROUNDS
+# in a row: one loud line, and `sim_fleet.py alarm` files or comments on the `sim-fleet` issue,
+# once per streak; if that fails, it is tried again at the next failing round. A round that
+# counts ends the streak (#424, NRV-E0730, P<n>).
+note_round() {
+    local code=$1 id=$2 commit=$3 count=0 alarmed=0 file="$STATE/failing-rounds"
+    if (( code == 0 )); then
+        rm -f "$file"
+        return 0
+    fi
+    if [[ -r "$file" ]]; then read -r count alarmed <"$file" || true; fi
+    [[ "$count" =~ ^[0-9]{1,9}$ ]] || count=0
+    [[ "$alarmed" == 1 ]] || alarmed=0
+    count=$(( 10#$count + 1 ))
+    if (( count >= ${SIM_FLEET_ALARM_ROUNDS:-3} && alarmed == 0 )); then
+        log "ALARM error[NRV-E0730]: $count rounds in a row failed (the latest, $id of" \
+            "${commit:0:7}); soak reads no hours until one counts. See $STATE/last-failed-round"
+        set -- alarm --rounds "$count" --round-id "$id" --commit "$commit"
+        if [[ -n "$SIM_FLEET_DRY_RUN" ]]; then
+            set -- "$@" --dry-run
+        else
+            set -- "$@" --repo "$SIM_FLEET_GH_REPO" --token-file "$token_file"
+        fi
+        if timeout "$SIM_FLEET_REPORT_TIMEOUT" "$SIM_FLEET_PYTHON" -I "$bin/sim_fleet.py" "$@"; then
+            alarmed=1
+        else
+            log "the alarm was not filed; asking again at the next failing round"
+        fi
+    fi
+    echo "$count $alarmed" >"$file.new" && mv "$file.new" "$file" ||
+        log "cannot save $file; the count of failing rounds restarts"
 }
 
 # `sim_fleet.py ingest` of round $1 of commit $2 (its exit code).

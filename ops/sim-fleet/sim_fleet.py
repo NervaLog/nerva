@@ -44,7 +44,11 @@ record alone, never by an exit code: after `ingest` it looks for the id in the s
 `refuse` if it is not there, and stops with the round kept if it is still not there. Both commands are idempotent for one id, so a round a stop or a crash left is
 ingested again safely. Exit codes are for people: `ingest` 0 counted (now or before), 1 not;
 `refuse` 0 recorded, 1 not; argparse's own 2 for a bad command line. The state is saved
-whatever GitHub answered. Standard library only.
+whatever GitHub answered.
+
+`alarm` (NRV-E0730, P<n>) is run.sh's report that rounds keep failing: it opens the one open
+`sim-fleet` issue marked `ALARM_MARKER`, or comments on it if it is open already. It reads no
+state file, so it works when `ingest` cannot. Exit 0 if filed, 1 if not. Standard library only.
 """
 
 import argparse
@@ -61,6 +65,10 @@ import urllib.request
 
 LABEL = "sim-fleet"
 MARKER = re.compile(r"<!-- vopr-fleet fingerprint: ([0-9a-f]{32}) -->")
+# The one issue the alarm (NRV-E0730, P<n>) files or comments on, found by this marker among the
+# open `sim-fleet` issues. It carries no fingerprint, so `markers` never reads it as a failure.
+ALARM_MARKER = "<!-- vopr-fleet alarm: rounds failing -->"
+ALARM_ROUNDS_MAX = 1_000_000
 STATE_VERSION = 1
 
 # Bounds. Every collection this reads or keeps has one.
@@ -794,6 +802,21 @@ class GitHub:
                 break
         return found
 
+    def find_open(self, marker):
+        """The number of the open `sim-fleet` issue whose body holds `marker` (the latest
+        FIND_PAGES_MAX * FIND_PAGE_SIZE open ones), or None."""
+        for page in range(1, FIND_PAGES_MAX + 1):
+            rows = self.request("GET", f"/issues?labels={LABEL}&state=open&per_page="
+                                       f"{FIND_PAGE_SIZE}&page={page}")
+            if not isinstance(rows, list):
+                raise GitHubError("refused", "not a list of issues")
+            for row in rows:
+                if marker in (row.get("body") or ""):
+                    return int(row["number"])
+            if len(rows) < FIND_PAGE_SIZE:
+                break
+        return None
+
     def open(self, title, body):
         reply = self.request("POST", "/issues", {"title": title, "body": body,
                                                  "labels": [LABEL]})
@@ -816,6 +839,9 @@ class DryRun:
 
     def markers(self):
         return {}
+
+    def find_open(self, marker):
+        return None
 
     def open(self, title, body):
         number = self.next
@@ -1088,6 +1114,48 @@ def refuse_main(args, now, log):
     return 0 if save_record(args.state, state, args.round_id, args.commit, "refused", log) else 1
 
 
+def alarm_text(args):
+    return (f"error[NRV-E0730]: the fleet's last {args.rounds} rounds in a row failed to be "
+            f"counted (the latest on commit {args.commit[:7]}, round {args.round_id}).\n\n"
+            f"A round fails when `sim_fleet.py ingest` exits non-zero or leaves no record, or "
+            f"when a worker died and the round was refused. No hours of the commit accrue "
+            f"while this goes on: `soak` reads 0.0 h. The latest failed round is kept in "
+            f"`state/last-failed-round` on the host; the journal (`journalctl -u sim-fleet`) "
+            f"says why. Fix: see NRV-E0730 in docs/ERRORS.md.\n\n{ALARM_MARKER}\n")
+
+
+def alarm_main(args, log):
+    """Files (or, if it is open already, comments on) the one open `sim-fleet` issue that says
+    rounds keep failing. Exit 0 if it did, else 1; run.sh asks again at the next failing round."""
+    if not ROUND_ID.fullmatch(args.round_id):
+        log("--round-id must be <seconds>-<16 hex digits>")
+        return 1
+    if not 1 <= args.rounds <= ALARM_ROUNDS_MAX:
+        log(f"--rounds must be 1..{ALARM_ROUNDS_MAX}")
+        return 1
+    if not args.dry_run and not (args.repo and args.token_file):
+        log("--repo and --token-file are required unless --dry-run")
+        return 1
+    try:
+        github = DryRun(print) if args.dry_run else \
+            GitHub(args.repo, read_token(args.token_file), log)
+        text = alarm_text(args)
+        number = github.find_open(ALARM_MARKER)
+        if number is None:
+            number = github.open("sim-fleet: rounds keep failing (NRV-E0730)", text)
+            log(f"alarm: filed issue #{number}")
+        else:
+            github.comment(number, text)
+            log(f"alarm: commented on issue #{number}")
+    except Environment as err:
+        log(f"alarm not filed: {err}")
+        return 1
+    except GitHubError as err:
+        log(f"alarm not filed: GitHub said {err}")
+        return 1
+    return 0
+
+
 def main(argv, now=None):
     parser = argparse.ArgumentParser(prog="sim_fleet.py")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1108,6 +1176,13 @@ def main(argv, now=None):
     cmd.add_argument("--tracker", type=int)
     cmd.add_argument("--dry-run", action="store_true")
     cmd.add_argument("--source-root", help="the checkout the binaries were built in")
+    alarm = sub.add_parser("alarm")
+    alarm.add_argument("--rounds", required=True, type=int, help="consecutive failing rounds")
+    alarm.add_argument("--round-id", required=True)
+    alarm.add_argument("--commit", required=True, type=commit_argument)
+    alarm.add_argument("--repo")
+    alarm.add_argument("--token-file")
+    alarm.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
     now = int(time.time()) if now is None else now
 
@@ -1118,6 +1193,8 @@ def main(argv, now=None):
         return soak_main(args, log)
     if args.command == "refuse":
         return refuse_main(args, now, log)
+    if args.command == "alarm":
+        return alarm_main(args, log)
     return ingest_main(args, now, log)
 
 
