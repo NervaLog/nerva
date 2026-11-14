@@ -78,7 +78,7 @@ pub fn run(gpa: std.mem.Allocator, options: Options) void {
             .{},
         ),
         error.Evicted => {
-            // Evicted for its release: NRV-E0731, not "too many sessions".
+            // Evicted for its release: NRV-E0609/E0610, not "too many sessions".
             diag.fail_release_eviction();
             diag.fail(
                 "NRV-E0716",

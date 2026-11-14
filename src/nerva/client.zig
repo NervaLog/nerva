@@ -781,7 +781,7 @@ pub const Client = struct {
         log.warn("evicted: {s}", .{@tagName(eviction.header.reason)});
         release_eviction.record(
             eviction.header.reason,
-            constants.config.process.release,
+            vsr_client.release,
             eviction.header.release,
         );
         // The VSR client's contract asks the callback to deinit it, but the callback runs inside

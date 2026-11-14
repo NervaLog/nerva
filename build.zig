@@ -479,7 +479,6 @@ pub fn build(b: *std.Build) !void {
     var release_previous: ?*std.Build.Step = null;
     for ([_][2][]const u8{
         .{ "mixed.py", "" },
-        .{ "eviction.py", "" },
         .{ "upgrade.py", "" },
         .{ "upgrade.py", "--records" },
         .{ "origins.py", "" },

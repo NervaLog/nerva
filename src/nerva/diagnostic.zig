@@ -49,6 +49,8 @@ pub const table = [_]Entry{
     .{ .code = "NRV-E0009", .summary = "`--listen` is not loopback and `--listen-remote` was not given", .exit = exit_operator },
     .{ .code = "NRV-E0010", .summary = "A replica or gateway cannot send its metrics to `--statsd`", .exit = exit_operator },
     .{ .code = "NRV-E0604", .summary = "A gateway or view server could not reach the cluster", .exit = exit_operator },
+    .{ .code = "NRV-E0609", .summary = "The client (a gateway, `nerva view`, a command) is of a newer release than the cluster runs; it was evicted (`client_release_too_high`)", .exit = exit_operator },
+    .{ .code = "NRV-E0610", .summary = "The client's release is below the cluster's `release_client_min`; it was evicted (`client_release_too_low`)", .exit = exit_operator },
     .{ .code = "NRV-E0701", .summary = "The data file was written by another release", .exit = exit_operator },
     .{ .code = "NRV-E0702", .summary = "The data file is not a Nerva data file, or is damaged", .exit = exit_operator },
     .{ .code = "NRV-E0703", .summary = "Another process holds the data file", .exit = exit_operator },
@@ -63,7 +65,6 @@ pub const table = [_]Entry{
     .{ .code = "NRV-E0715", .summary = "An earlier `nerva recover` did not finish", .exit = exit_operator },
     .{ .code = "NRV-E0716", .summary = "`nerva recover`'s session was evicted before it finished", .exit = exit_operator },
     .{ .code = "NRV-E0717", .summary = "A test build with commit-key deduplication off was started without `--development`", .exit = exit_operator },
-    .{ .code = "NRV-E0731", .summary = "The cluster evicted the client because of its release", .exit = exit_operator },
     .{ .code = "NRV-E0801", .summary = "The cluster did not answer the export", .exit = exit_operator },
     .{ .code = "NRV-E0802", .summary = "`--as-of` is past the latest op", .exit = exit_operator },
     .{ .code = "NRV-E0803", .summary = "The export would be refused by `nerva import`", .exit = exit_operator },
@@ -353,20 +354,20 @@ pub fn fail(
 }
 
 /// If the client was evicted because of its release (`release_eviction.record`), prints
-/// NRV-E0731 and exits; otherwise returns.
+/// NRV-E0609 (too new) or NRV-E0610 (below `release_client_min`) and exits; otherwise returns.
 pub fn fail_release_eviction() void {
     const eviction = release_eviction.take() orelse return;
     if (eviction.too_high()) fail(
-        "NRV-E0731",
+        "NRV-E0609",
         "{s}: the cluster runs release {}; this client, release {}, is newer, so it was evicted",
         .{ command, eviction.cluster, eviction.client },
         "move the cluster to release {} first, or run this command at release {}",
         .{ eviction.client, eviction.cluster },
     ) else fail(
-        "NRV-E0731",
+        "NRV-E0610",
         "{s}: the cluster runs release {}; this client, release {}, is below its release_client_min, so it was evicted",
         .{ command, eviction.cluster, eviction.client },
-        "upgrade this client to at least the cluster's release_client_min (nerva version prints it)",
+        "upgrade this client to at least the cluster's release_client_min (`nerva version` on a replica's binary prints it)",
         .{},
     );
 }
