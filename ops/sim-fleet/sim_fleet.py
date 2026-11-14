@@ -672,9 +672,11 @@ def totals_text(state, ymd_day, day):
         out.append("")
         out.append("Commits that ran:")
         for sha in sorted(day["commits"], key=lambda sha: day["commits"][sha]["last"]):
+            total = state["commits"].get(sha)
+            # An evicted commit has no total: the day's figure is not "in all" (#289).
+            in_all = f"{hours_text(total['seconds'])} h in all" if total else "total forgotten"
             out.append(f"- `{sha[:7]}`: {hours_text(day['commits'][sha]['seconds'])} h that day, "
-                       f"{hours_text(state['commits'].get(sha, day['commits'][sha])['seconds'])}"
-                       f" h in all, {seeds_of(day['commits'][sha])} seeds that day")
+                       f"{in_all}, {seeds_of(day['commits'][sha])} seeds that day")
     if day["seen"]:
         out.append("")
         out.append("Failures by issue:")
