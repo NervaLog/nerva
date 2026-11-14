@@ -141,7 +141,9 @@ from their records, except the reviewers' verdicts, which are quoted from their 
 
 - **Simulation: shipped before the full 24 hours on the candidate, by the owner's waiver**
   (P451). The fleet ran `5d7d806`, whose pinned code is the candidate's, for 15.0 hours over
-  2026-11-12 and 2026-11-13: 74,305 seeds (VOPR, the testing VOPR and every fuzzer), none failed, and 6 ran past their
+  2026-11-12 and 2026-11-13: 74,305 seeds (VOPR, the testing VOPR and every fuzzer), none failed as counted by
+  `5d7d806`'s own fleet loop, which could miss a refused round or a dead worker until #382
+  ([#370](https://github.com/NervaLog/nerva/issues/370), [#387](https://github.com/NervaLog/nerva/issues/387); the host's journal was not checked for either), and 6 ran past their
   per-seed deadline (5 `vopr-nerva`, 1 `vopr-testing`), which P287b counts as not clean; the owner
   waived them too. Their seed numbers were not kept, so they cannot be replayed, and the six stay
   unexplained. The fleet does not yet keep such seeds; until it does and every one it records on
