@@ -144,7 +144,7 @@ from their records.
   2026-11-12 and 2026-11-13: 74,305 seeds (VOPR, the testing VOPR and every fuzzer), none failed
   ([the fleet's tracker, #177](https://github.com/NervaLog/nerva/issues/177)). The soak of
   `c886c9f` itself had not reached 24 hours when the owner chose to tag. No open issue reports
-  a failing seed; the open fleet issues (#443, #444, #446, #447) are about the fleet's own loop.
+  a failing fleet seed against `5d7d806` or `c886c9f`; the open fleet issues (#443, #444, #446, #447) are about the fleet's own loop.
 - **Jepsen:** `retry` and `bank` both passed on `5d7d806`, the candidate's ancestor with the same
   pinned code, with nemeses `kill,partition` and `--time-limit 1200`: runs [43075322433](https://github.com/NervaLog/nerva/actions/runs/43075322433)
   (`retry`) and [43075317959](https://github.com/NervaLog/nerva/actions/runs/43075317959)
