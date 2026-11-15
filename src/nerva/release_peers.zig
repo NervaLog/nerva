@@ -93,14 +93,14 @@ pub fn admits(
             // none can hear from it again (P90).
             if (prepare.replica == replica) return true;
             if (prepare.replica >= peer_origins.len) return false;
-            // Received directly from its maker: the connection must have announced the release
-            // and origin this replica runs, as for any other message of a peer (#358). Without
+            // Received directly from its maker: the connection must have announced a release this
+            // process runs and this replica's origin, as for any other message of a peer (#358). Without
             // it, a replica of another release that sends prepares before its first ping is heard
             // would have them handled.
             if (sender) |from| if (from == prepare.replica) {
                 const connection_release = peer_releases[from] orelse return false;
                 const connection_origin = peer_origins[from] orelse return false;
-                return connection_release.value == release.value and
+                return runs(releases_run, connection_release) and
                     std.mem.eql(u8, &connection_origin, origin);
             };
             if (peer_releases_last[prepare.replica]) |maker_release| {
@@ -486,6 +486,17 @@ test "release_peers: a bundle of two releases admits peers, prepares and blocks 
     try testing.expect(!peers.admits(prepare.frame_const()));
     prepare.release = release_newer; // The same client with one release is refused.
     try testing.expect(!peers_single.admits(prepare.frame_const()));
+
+    // Received directly from its maker, the connection must have announced a release this
+    // process runs: any of the bundle, not only the one this replica started as (#358, R6).
+    prepare.release = release_this;
+    prepare.replica = 3;
+    peers.sender = 3; // Announced `release_newer`, bundled.
+    try testing.expect(peers.admits(prepare.frame_const()));
+    prepare.replica = 5;
+    peers.sender = 5; // Announced `release_third`, not bundled.
+    try testing.expect(!peers.admits(prepare.frame_const()));
+    peers.sender = null;
 
     // A block, by the release it was made in.
     var block: Header.Block = std.mem.zeroInit(Header.Block, .{ .command = .block });

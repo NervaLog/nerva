@@ -22,12 +22,19 @@ replica of another release (or the keys-off build, P354) whose prepares arrive b
 ping was handled for about a ping interval. The bus did not pass the sender, so a directly
 received prepare could not be told from a relayed or repaired one (#358).
 
-**Rule.** A prepare whose connection is the maker's own is admitted only when that connection has
-announced this replica's release and origin. A relayed or repaired prepare, or one on a connection
+**Rule.** A prepare whose connection is the maker's own is admitted only when that peer's last
+announcement (`peer_releases`, cleared by the first tick that sees the peer disconnected) is a
+release this process runs (one of its bundle, R6) and this replica's origin. A relayed or repaired prepare, or one on a connection
 whose peer is not yet known, keeps N61's and P90's rule (its maker's last announcement, admitted if
 none), so a dead primary's prepares are still repaired.
 
 **Cost.** A connection not yet identified as a replica's (its first message was a prepare) still
-gets the lenient rule: the window is narrowed, not closed there. The VOPR does not exercise the new
-rule (the simulated bus never names a sender); `release_peers` unit tests and
-`tests/release/mixed.py` (replicas restarting beside an other-release primary) do.
+gets the lenient rule. With cluster keys, which `nerva start` requires (P102), the handshake sets the
+peer before any replica message is delivered, so only keys-off and test builds have that case. A
+maker that reconnects within one tick keeps its previous announcement until it pings, as for every
+other peer message. The VOPR does not exercise the new rule (the simulated bus never names a
+sender), and nothing tests the bus wiring itself (`recv_from` set in `recv_buffer_consume`). The
+`release_peers` unit tests cover the rule, including a bundle. `tests/release/mixed.py` (replicas
+restarting beside an other-release primary) is a no-regression smoke test, not a test of the rule:
+the restarted replicas drop the other-release primary's view-0 prepares as an older view whichever
+rule `admits` applies.
