@@ -17,7 +17,7 @@ release). Checks, without a cluster:
 - the packer refuses a result over its size limit with NRV-E0719, and writes it at the limit;
 - the packed binary is under `multiversion_binary_platform_size_max` (64 MiB); the margin is
   printed.
-`nerva_next start` on N's data file (the switch) is slice 2's test, `rolling.py`.
+`nerva_next start` on N's data file (the switch) is not here: it needs slice 2's multiversion `start` (#415), so it belongs to slice 5's `rolling.py`, or to this file once #415 is merged (recorded in docs/demos/r6.md).
 """
 import os
 import re

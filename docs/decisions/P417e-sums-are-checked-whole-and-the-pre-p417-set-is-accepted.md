@@ -27,3 +27,4 @@ An `.asc` already on a draft is never replaced; NRV-E1168's fix now says to dele
 is the exact tag and the absent assets together, so any other release that lost its `.debug` files is refused.
 **Cost.** The check downloads every listed asset (the tarballs too) in `repos-ready`; the cutover is one
 list file, read by two scripts.
+**Process rule.** If `release/candidate` moves past P417's merge before `v0.7.1` is tagged, remove `v0.7.1` from `.github/scripts/pre_p417_tags` in the same pull request: that release's draft is then built with `.debug` files and a signable `SHA256SUMS`, and listing it would let it publish unsigned.

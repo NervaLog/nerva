@@ -463,7 +463,7 @@ sums_check() { # <sig> <data>
   gpgv --keyring "$W/ring.gpg" --status-fd 3 "$1" "$2" 3>"$W/sums.status" 2>/dev/null || true
   check_sigs "$W/sums.status" 1 1 releasegpg
 }
-e1165() { refuse NRV-E1168 "$1" "$2" "A SHA256SUMS.asc already on the draft is never replaced: delete that asset (gh release delete-asset <tag> SHA256SUMS.asc), then run repos-ready again to sign the sums; or delete the draft and run release.yml again"; }
+e1168() { refuse NRV-E1168 "$1" "$2" "A SHA256SUMS.asc already on the draft is never replaced: delete that asset (gh release delete-asset <tag> SHA256SUMS.asc), then run repos-ready again to sign the sums; or delete the draft and run release.yml again"; }
 # P417e: a release tagged in pre_p417_tags (v0.7.1, published before P417 merged) with no .debug and no
 # SHA256SUMS.asc asset is the pre-P417 set: nine lines in SHA256SUMS, no signature. Needs rel_fetch. The same
 # test is release_check.sh publish-ready's.
@@ -476,14 +476,14 @@ sums_sign() { # <tag>: reads and writes $W/draft; uploads SHA256SUMS.asc when th
   rel_download "$tag" SHA256SUMS.asc "$W/draft/SHA256SUMS.asc" || rc=$?
   case $rc in
     0) sums_check "$W/draft/SHA256SUMS.asc" "$W/draft/SHA256SUMS" ||
-         e1165 "the draft's SHA256SUMS.asc does not verify against its SHA256SUMS ($sig_why)" "an earlier run signed other sums, or the file was replaced"
+         e1168 "the draft's SHA256SUMS.asc does not verify against its SHA256SUMS ($sig_why)" "an earlier run signed other sums, or the file was replaced"
        return 0 ;;
     2) ;;
     *) e1155_now "downloading SHA256SUMS.asc failed" ;;
   esac
   sign_detach "$W/draft/SHA256SUMS" "$W/draft/SHA256SUMS.asc" "${SIGN_U[@]}"
   sums_check "$W/draft/SHA256SUMS.asc" "$W/draft/SHA256SUMS" ||
-    e1165 "SHA256SUMS.asc, just signed, does not verify under packaging/keys/ ($sig_why)" "the signing key and the pinned key file disagree"
+    e1168 "SHA256SUMS.asc, just signed, does not verify under packaging/keys/ ($sig_why)" "the signing key and the pinned key file disagree"
   gh release upload "$tag" "$W/draft/SHA256SUMS.asc" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 ||
     e1155_now "uploading SHA256SUMS.asc to the draft failed"
 }
@@ -501,10 +501,10 @@ cmd_sums_verify() {
   if legacy_release "$tag"; then notice "$tag is the pre-P417 set: its SHA256SUMS is not signed"; return 0; fi
   for name in SHA256SUMS SHA256SUMS.asc; do
     rc=0; rel_download "$tag" "$name" "$W/draft/$name" || rc=$?
-    case $rc in 0) ;; 2) e1165 "the release $tag has no $name" "SHA256SUMS is signed by repos-ready before the release is published" ;; *) e1155_now "downloading $name failed" ;; esac
+    case $rc in 0) ;; 2) e1168 "the release $tag has no $name" "SHA256SUMS is signed by repos-ready before the release is published" ;; *) e1155_now "downloading $name failed" ;; esac
   done
   sums_check "$W/draft/SHA256SUMS.asc" "$W/draft/SHA256SUMS" ||
-    e1165 "SHA256SUMS.asc of $tag does not verify against its SHA256SUMS ($sig_why)" "the sums or the signature were replaced"
+    e1168 "SHA256SUMS.asc of $tag does not verify against its SHA256SUMS ($sig_why)" "the sums or the signature were replaced"
 }
 
 filever() { local v=${1#v}; printf '%s' "${v/-rc./.rc.}"; }
