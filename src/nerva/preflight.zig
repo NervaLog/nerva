@@ -842,6 +842,8 @@ test "preflight: a process that is exiting is not a holder" {
     try testing.expect(!stat_exiting("42 nerva S 1 2 3 4 5 4"));
     try testing.expect(!stat_exiting("42 (nerva) S 1 2 3"));
     try testing.expect(!stat_exiting("42 (nerva) S 1 2 3 4 5 x"));
+    // The rest reads /proc, which only Linux has.
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
     // This process, running this test, is not exiting.
     try testing.expectEqual(Exiting.no, process_exiting(linux.getpid()));
     // A pid that is gone cannot be told: unknown, so not a holder.
