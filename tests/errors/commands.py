@@ -302,18 +302,26 @@ def main():
             os.chmod(damaged_bundle, 0o755)
             # One section of the two only: `parse_elf` finds no bundle, but the names are still
             # there. `version` calls that damaged, and `start` must too, never run it as one
-            # release (P417).
+            # release (P417). Built from a stripped copy: objcopy writes `.symtab`, `.strtab`
+            # and `.shstrtab` after an added section, and on the unstripped binary `parse_elf`
+            # fails on that layout before it looks for the bundle, so the check would pass
+            # without `damaged_when_unbundled`.
+            stripped = os.path.join(tmp, "nerva-stripped")
+            subprocess.run([objcopy, "--strip-all", nerva, stripped], check=True)
             half_bundle = os.path.join(tmp, "nerva-half-bundle")
-            subprocess.run([objcopy, "--add-section", f".tb_mvb={junk}", nerva, half_bundle],
+            subprocess.run([objcopy, "--add-section", f".tb_mvb={junk}", stripped, half_bundle],
                            check=True)
             os.chmod(half_bundle, 0o755)
             check("version with half a bundle", ["version"], "NRV-E0719", 1,
                   "bundled release is damaged", nerva=half_bundle)
+            # `start` reads the bundle before the kernel check, so half a bundle is NRV-E0719
+            # whatever the sysctl says.
+            check("start with half a bundle", start + [data], "NRV-E0719", 1,
+                  "bundle of releases cannot be read", nerva=half_bundle)
+            assert sha(data) == before
             if memfd_noexec == "0":
                 check("start with a damaged bundle", start + [data], "NRV-E0719", 1,
                       "bundle of releases cannot be read", nerva=damaged_bundle)
-                check("start with half a bundle", start + [data], "NRV-E0719", 1,
-                      "bundle of releases cannot be read", nerva=half_bundle)
                 assert sha(data) == before
             else:
                 print(f"SKIP damaged bundle (NRV-E0719): vm.memfd_noexec is {memfd_noexec}, "

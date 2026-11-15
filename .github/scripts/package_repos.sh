@@ -463,7 +463,7 @@ sums_check() { # <sig> <data>
   gpgv --keyring "$W/ring.gpg" --status-fd 3 "$1" "$2" 3>"$W/sums.status" 2>/dev/null || true
   check_sigs "$W/sums.status" 1 1 releasegpg
 }
-e1165() { refuse NRV-E1165 "$1" "$2" "A SHA256SUMS.asc already on the draft is never replaced: delete that asset (gh release delete-asset <tag> SHA256SUMS.asc), then run repos-ready again to sign the sums; or delete the draft and run release.yml again"; }
+e1165() { refuse NRV-E1168 "$1" "$2" "A SHA256SUMS.asc already on the draft is never replaced: delete that asset (gh release delete-asset <tag> SHA256SUMS.asc), then run repos-ready again to sign the sums; or delete the draft and run release.yml again"; }
 # P417e: a release tagged in pre_p417_tags (v0.7.1, published before P417 merged) with no .debug and no
 # SHA256SUMS.asc asset is the pre-P417 set: nine lines in SHA256SUMS, no signature. Needs rel_fetch. The same
 # test is release_check.sh publish-ready's.

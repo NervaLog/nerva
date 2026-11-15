@@ -15,7 +15,7 @@ list, `.debug` files included; the sums themselves are now signed.
 
 - `repos-ready` signs. It already holds the key and the passphrase, and it has read the draft's
   assets twice (NRV-E1148) before it signs. No workflow, job or secret is added. A signature already
-  on the draft must verify against its sums (kept), or the run refuses (NRV-E1165): a signature is
+  on the draft must verify against its sums (kept), or the run refuses (NRV-E1168): a signature is
   never replaced.
 - The check is the pinned one for `Release.gpg` (the current or next key, RSA, SHA-512, class 00),
   against `packaging/keys/` alone. `repos-ready` makes it right after signing; the `publish` job

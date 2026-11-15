@@ -685,8 +685,8 @@ class Ready(Base):
         # the same lines in another order: every hash still matches, the signature does not
         self.sums_edit("v0.7.1", lambda ls: ls[::-1])
         rc, _, err = self.ready("v0.7.1")
-        self.assert_diag(rc, err, "NRV-E1165")
-        self.assertEqual(self.code(), "NRV-E1165")
+        self.assert_diag(rc, err, "NRV-E1168")
+        self.assertEqual(self.code(), "NRV-E1168")
         self.assertEqual(len(self.uploads()), 1)
 
     # ---- every file SHA256SUMS lists is hashed before it is signed (P417e) ---------------------
@@ -757,7 +757,7 @@ class Ready(Base):
                        check=True, capture_output=True, env=env)
         self.release("v0.7.1", extra_assets=[("SHA256SUMS.asc", (self.tmp / "sums.asc").read_bytes())])
         rc, _, err = self.ready("v0.7.1")
-        m = self.assert_diag(rc, err, "NRV-E1165", "does not verify")
+        m = self.assert_diag(rc, err, "NRV-E1168", "does not verify")
         self.assertIn("delete that asset", m.group(3))
         self.assertEqual(self.uploads(), [])
 
@@ -810,12 +810,12 @@ class Ready(Base):
     def test_sums_verify_refuses_an_unsigned_release_and_changed_sums(self):
         self.release("v0.7.1")
         rc, _, err = self.run_script("sums-verify", "v0.7.1")
-        self.assert_diag(rc, err, "NRV-E1165", "has no SHA256SUMS.asc")
+        self.assert_diag(rc, err, "NRV-E1168", "has no SHA256SUMS.asc")
         self.assertEqual(self.ready("v0.7.1")[0], 0)
         self.releases = json.loads((self.gh_dir / "releases.json").read_text())
         self.replace_asset("v0.7.1", "SHA256SUMS", self.asset_bytes("v0.7.1", "SHA256SUMS") + b"x\n")
         rc, _, err = self.run_script("sums-verify", "v0.7.1")
-        self.assert_diag(rc, err, "NRV-E1165", "does not verify")
+        self.assert_diag(rc, err, "NRV-E1168", "does not verify")
 
     def test_a_rebind_by_a_later_attempt_when_no_object_exists(self):
         self.release("v0.7.1")

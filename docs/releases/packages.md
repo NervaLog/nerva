@@ -1403,7 +1403,7 @@ the release's file, byte for byte. Every signature is checked again before uploa
 
 `SHA256SUMS.asc` (P417c): `ready`, after it has read the draft twice, signs the draft's `SHA256SUMS` with
 `current` (`gpg --detach-sign --armor`, SHA-512, the same passphrase handling as the manifest) and uploads the
-signature to the draft. A signature already there is checked against the sums and kept, or refused (NRV-E1165).
+signature to the draft. A signature already there is checked against the sums and kept, or refused (NRV-E1168).
 The `publish` job then runs `package_repos.sh sums-verify`, which needs no secret and checks it against
 `packaging/keys/` alone, and `release_check.sh publish-ready <tag> signed` requires the file.
 
@@ -1691,7 +1691,7 @@ the other release codes.
 |---|---|---|---|
 | NRV-E1139 | The package-repos environment is incomplete (a secret, a variable, a pinned tool), its secret is not the `current` subkey of the pinned primary or holds the primary's secret part (in the fallback: is not the `current` key), `packaging/keys/` does not hold exactly the listed keys, or `SOURCE_DATE_EPOCH` is set, or the refresh's `rpm_key` input is one it refuses, or is dispatched by anyone but `PACKAGE_REPOS_OWNER` ("Excluding the rpms of one key") | `package_repos.sh ready`, `publish`, `refresh` | release maintainer |
 | NRV-E1140 | The release's packages are missing, extra, or do not match `SHA256SUMS` | `package_repos.sh ready` | release maintainer |
-| NRV-E1165 | The release's `SHA256SUMS.asc` is missing or does not verify | `package_repos.sh ready`, `sums-verify` | release maintainer |
+| NRV-E1168 | The release's `SHA256SUMS.asc` is missing or does not verify | `package_repos.sh ready`, `sums-verify` | release maintainer |
 | NRV-E1141 | A package of the same name is already listed with other content (published packages are never replaced) | `package_repos.sh ready`, `publish` | release maintainer |
 | NRV-E1142 | The bucket does not match its manifest. Refused before any write: a listed object that is missing or changed, an unlisted object at a name the run must write, a candidate under `stable`, objects under `manifest/` of which none verifies, or the bucket over its bound. Noted, and the run ends red after it has finished: an unlisted object anywhere else under a locked prefix, an index file the run replaced, or a manifest object that does not verify | `package_repos.sh ready`, `publish`, `refresh`, `served` | the bucket token's holder (no crash or failed run of this pipeline causes it; overlap is NRV-E1147) |
 | NRV-E1143 | The bucket refused or failed an operation (a 412 and the pinned lock refusal excepted), a listing ran past 100 pages, or a locked object's overwrite was answered with anything but the pinned lock refusal | `r2.py` | release maintainer / Cloudflare |
