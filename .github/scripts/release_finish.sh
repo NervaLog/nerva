@@ -20,17 +20,28 @@
 #   release_finish.sh publish <tag> <commit>       NRV-E1138: publish the draft, check its tag
 #   release_finish.sh site-check <tag> <line>      NRV-E1132: the site's edit on a scratch clone, no write
 #   release_finish.sh site <tag> <date> <line>     NRV-E1136, E1132: the site's pull request;
-#                                                  prints its number. needs gh, git, GH_TOKEN, BOT_NAME
+#                                                  prints its number. needs gh, git, gpg, GH_TOKEN,
+#                                                  BOT_NAME. Run in a checkout of this repository: it
+#                                                  writes the two WKD files too, when <tag>'s commit is
+#                                                  an ancestor of main (P398)
 #   release_finish.sh site-wait <pr> <release|prerelease>   NRV-E1136: wait for the merge (a release)
 #                                                  or for the site check (a prerelease)
+#   release_finish.sh site-live <tag>              NRV-E1151, E1162: nerva.pro shows the release, and
+#                                                  serves its key by WKD; run in a checkout, needs
+#                                                  curl, git, gpg
 #
 # Secrets arrive in the environment only (GH_TOKEN). Git reads the token from there through a
 # credential helper that names the variable, never through a URL or an argument. Testing overrides:
 # TAP_URL, SITE_URL (the repositories' clone URLs), SITE_REPO (owner/name for gh), and
 # SITE_WAIT_SECONDS and SITE_POLL_SECONDS (at least 1); SITE_DEADLINE (epoch seconds) is the end of the
-# one wait the `site` and `site-wait` steps share.
+# one wait the `site` and `site-wait` steps share. For `site-live`: SITE_LIVE_URL (https://nerva.pro)
+# and SITE_LIVE_WAIT_SECONDS (900), polling every SITE_POLL_SECONDS.
 set -euo pipefail
 
+# The script's own path, absolute: site_clone and the tap steps cd into scratch clones, and $0 is
+# relative when the workflow runs .github/scripts/release_finish.sh (#464).
+here=$(cd "$(dirname "$0")" && pwd)
+self=$here/$(basename "$0")
 where=release-finish.yml
 tap_url=${TAP_URL:-https://github.com/NervaLog/homebrew-tap.git}
 site_repo=${SITE_REPO:-NervaLog/nervalog.github.io}
@@ -60,9 +71,21 @@ git_auth() {
 value_re='^[+-][[:space:]]*(url|version|sha256)[[:space:]]+"'
 
 tap_diff() {
-  local old=$1 new=$2 changed
-  # `diff` exits 1 when the files differ; only its lines matter.
-  changed=$(diff -U0 "$old" "$new" | grep -E '^[+-]' | grep -vE '^(\+\+\+|---) ' | grep -vE "$value_re" || true)
+  local old=$1 new=$2 changed raw rc=0 f
+  for f in "$old" "$new"; do
+    if [[ ! -f "$f" || ! -r "$f" ]]; then
+      refuse NRV-E1135 "cannot compare the formulas: $f is not a readable file" \
+        "the formula to check or to commit was not found at that path" \
+        "run the failed job again; the formula artifact must be downloaded before this step"
+    fi
+  done
+  # `diff` exits 1 when the files differ and 2 on trouble; only exit 2 is a failure.
+  raw=$(diff -U0 "$old" "$new") || rc=$?
+  if ((rc > 1)); then
+    refuse NRV-E1135 "cannot compare the formulas $old and $new" "diff exited with status $rc" \
+      "run the failed job again"
+  fi
+  changed=$(grep -E '^[+-]' <<< "$raw" | grep -vE '^(\+\+\+|---) ' | grep -vE "$value_re" || true)
   if [[ -n "$changed" ]]; then
     refuse NRV-E1135 "the new formula changes more than its url, version and sha256" \
       "the tap's Formula/nerva.rb differs from the generated one in other lines: $(head -n3 <<< "$changed" | tr '\n' ' ')" \
@@ -92,7 +115,14 @@ scrub() { tr '\n' ' ' < "$1" | sed -E 's#(https?://)[^/@ ]*@#\1#g'; }
 # write=yes commit it to its ref (main, or rc/<tag> for a prerelease) and push.
 tap_run() {
   local tag=$1 formula=$2 write=$3 ref old
-  ref=$("$0" tap-ref "$tag")
+  # The workflow passes the formula relative to its checkout; the cd below leaves it.
+  if [[ ! -f "$formula" ]]; then
+    refuse NRV-E1135 "the formula $formula does not exist" \
+      "the formula to check or to commit was not found at that path" \
+      "run the failed job again; the formula artifact must be downloaded before this step"
+  fi
+  [[ "$formula" == /* ]] || formula=$PWD/$formula
+  ref=$("$self" tap-ref "$tag")
   # work is global: the EXIT trap runs after this function has returned
   work=$(mktemp -d)
   trap 'rm -rf "$work"' EXIT
@@ -167,6 +197,39 @@ site_clone() {
       "check that the App is installed on $site_repo, and run the failed job again"
   fi
   cd "$1/site"
+}
+
+# The key by WKD (docs/releases/packages.md, "The key by WKD", P376, P398): the direct method's file
+# name is the z-base-32 of the SHA-1 of `nerva` (the user ID's address is nerva@nerva.pro), and the
+# file is the dearmored key file of this repository, byte for byte.
+wkd_dir=.well-known/openpgpkey
+wkd_hash=ndqm47zydhyqyzabecddtdk1q3bponab
+key_path=packaging/keys/nerva-release.asc
+
+# tag_key <code> <src> <tag> <out>: writes `gpg --dearmor` of the key file at <tag>, in the
+# checkout <src>, to <out>. Returns 1 when <tag> has no key file (v0.7.0); any other failure is
+# refused with <code>. A tag that is not in <src> yet (the checkout is older than the release) is
+# fetched from its origin.
+tag_key() {
+  local code=$1 src=$2 tag=$3 out=$4 home err
+  err=$(mktemp)
+  if ! git -C "$src" rev-parse -q --verify "refs/tags/$tag^{commit}" > /dev/null 2>&1 \
+    && ! git -C "$src" fetch --quiet --no-tags origin "+refs/tags/$tag:refs/tags/$tag" 2> "$err"; then
+    refuse "$code" "cannot read the tag $tag in this repository" "$(scrub "$err")" \
+      "run the failed job again"
+  fi
+  rm -f "$err"
+  if ! git -C "$src" cat-file -e "refs/tags/$tag:$key_path" 2> /dev/null; then
+    return 1
+  fi
+  home=$(mktemp -d)
+  # A fresh GNUPGHOME: `gpg --dearmor` needs no keyring, and must not touch the runner's.
+  if ! git -C "$src" show "refs/tags/$tag:$key_path" | GNUPGHOME=$home gpg --batch --quiet --dearmor > "$out" 2> "$home/err" \
+    || [[ ! -s "$out" ]]; then
+    refuse "$code" "the key file $key_path at $tag is not an armored key" "$(scrub "$home/err")" \
+      "the key file must be gpg --armor --export of the release key; fix it on main and release again"
+  fi
+  rm -rf "$home"
 }
 
 case "${1:-}" in
@@ -255,7 +318,7 @@ case "${1:-}" in
     sha=$(head -n1 "$shafile" | awk '{ print $1 }')
     url="https://github.com/NervaLog/nerva/releases/download/$tag/nerva-$tag-universal-macos.zip"
     sed -e "s#@URL@#$url#" -e "s#@VERSION@#${tag#v}#" -e "s#@SHA256@#$sha#" \
-      "$(dirname "$0")/../../packaging/homebrew/nerva.rb" > "$out"
+      "$here/../../packaging/homebrew/nerva.rb" > "$out"
     ;;
   latest-check)
     tag=${2:?usage: release_finish.sh latest-check <tag>}
@@ -293,7 +356,7 @@ case "${1:-}" in
     fi
     # A published release is where an earlier run stopped: carry on to the tag check.
     if [[ "$draft" == true ]]; then
-      "$0" latest-check "$tag"
+      "$self" latest-check "$tag"
       # Publishing a draft attaches it to an existing tag: a tag at another commit is refused first.
       work=$(mktemp -d)
       trap 'rm -rf "$work"' EXIT
@@ -340,7 +403,7 @@ case "${1:-}" in
     trap 'rm -rf "$work"' EXIT
     site_clone "$work"
     # The publication date is not known yet; today's stands in, and only the shape is checked.
-    python3 -I "$(dirname "$0")/site_release.py" index.html "${tag#v}" "$(date -u +%F)" "$line" >&2
+    python3 -I "$here/site_release.py" index.html "${tag#v}" "$(date -u +%F)" "$line" >&2
     echo "release_finish.sh: the site would take the entry for $tag"
     ;;
   site)
@@ -352,6 +415,7 @@ case "${1:-}" in
     branch="release/$tag"
     work=$(mktemp -d)
     trap 'rm -rf "$work"' EXIT
+    src=$PWD
     site_clone "$work"
     # A branch from an earlier run is continued, so its open pull request is reused.
     if git_auth ls-remote --exit-code --heads origin "$branch" > /dev/null 2>&1; then
@@ -360,9 +424,36 @@ case "${1:-}" in
     else
       git checkout --quiet -b "$branch"
     fi
-    python3 -I "$(dirname "$0")/site_release.py" index.html "$version" "$date" "$line" >&2
-    if ! git diff --quiet; then
-      git add index.html
+    python3 -I "$here/site_release.py" index.html "$version" "$date" "$line" >&2
+    # The WKD pair (P398): written when the tag's commit is an ancestor of main, so a release's and a
+    # main candidate's pull request carry this release's key; a candidate tagged on a branch leaves
+    # the files as the site's main has them (its pull request is never merged, and is checked
+    # against the older reference). A tag without a key file (v0.7.0) writes none.
+    if ! git -C "$src" fetch --quiet --no-tags origin '+refs/heads/main:refs/remotes/origin/main' 2> "$work/err"; then
+      refuse NRV-E1136 "cannot read main of this repository" "$(scrub "$work/err")" "run the failed job again"
+    fi
+    if tag_key NRV-E1136 "$src" "$tag" "$work/key.bin"; then have_key=yes; else have_key=; fi
+    ancestor=
+    if [[ -n "$have_key" ]]; then
+      rc=0
+      git -C "$src" merge-base --is-ancestor "refs/tags/$tag" refs/remotes/origin/main || rc=$?
+      case $rc in
+        0) ancestor=yes ;;
+        1) echo "release_finish.sh: $tag is not on main: the site's WKD files stay as they are" >&2 ;;
+        *) refuse NRV-E1136 "cannot tell whether $tag is on main" "git merge-base exited $rc" \
+             "run the failed job again" ;;
+      esac
+    else
+      echo "release_finish.sh: $tag has no $key_path: the site's WKD files stay as they are" >&2
+    fi
+    git add -- index.html
+    if [[ -n "$ancestor" ]]; then
+      mkdir -p "$wkd_dir/hu"
+      [[ -e "$wkd_dir/policy" ]] || : > "$wkd_dir/policy"
+      cp "$work/key.bin" "$wkd_dir/hu/$wkd_hash"
+      git add -- "$wkd_dir/policy" "$wkd_dir/hu/$wkd_hash"
+    fi
+    if ! git diff --cached --quiet; then
       git -c "user.name=$bot" -c "user.email=${BOT_EMAIL:?BOT_EMAIL is not set}" \
         commit --quiet -m "Release $tag"
       if ! git_auth push --quiet origin "HEAD:refs/heads/$branch" 2> "$work/err"; then
@@ -476,8 +567,59 @@ case "${1:-}" in
       "its required check has not passed, auto-merge is off on the site, or the ruleset blocks the merge" \
       "the release is already published; look at the pull request and merge it by hand"
     ;;
+  site-live)
+    tag=${2:?usage: release_finish.sh site-live <tag>}
+    if ! [[ "$tag" =~ $version_re && "$tag" != *-* ]]; then
+      echo "release_finish.sh: site-live takes a release v<VERSION>, not '$tag' (a candidate's site pull request is never merged, P364)" >&2
+      exit 2
+    fi
+    version=${tag#v}
+    live=${SITE_LIVE_URL:-https://nerva.pro}
+    live_wait=${SITE_LIVE_WAIT_SECONDS:-900}
+    if [[ ! "$poll_seconds" =~ ^[1-9][0-9]*$ || ! "$live_wait" =~ ^[0-9]+$ ]]; then
+      refuse NRV-E1151 "SITE_POLL_SECONDS '$poll_seconds' or SITE_LIVE_WAIT_SECONDS '$live_wait' is not a whole number of seconds (poll at least 1)" \
+        "the wait for the page needs a poll interval of at least a second" "unset them, or set whole numbers"
+    fi
+    work=$(mktemp -d)
+    trap 'rm -rf "$work"' EXIT
+    src=$PWD
+    deadline=$(($(date +%s) + live_wait))
+    # The page holds the RELEASES entry site_release.py wrote. A fetch that fails is "not yet".
+    while :; do
+      if curl -fsS --max-time 30 -H 'Cache-Control: no-cache' -o "$work/page" "$live/" 2> /dev/null \
+        && grep -qF "{v:\"$version\"" "$work/page"; then
+        break
+      fi
+      if (($(date +%s) >= deadline)); then
+        refuse NRV-E1151 "nerva.pro does not show $version $((live_wait / 60)) minutes after the site's pull request merged" \
+          "the release is public and its packages are unaffected; the nerva-site Worker's build on Cloudflare has not finished or failed (NRV-E1152 if the gate refused, NRV-E1164 if the pin is wrong)" \
+          "in the Cloudflare dashboard, open the nerva-site Worker's builds and read a failed build's log; retry the build of main there, or merge any site pull request to start a new one; then run site-verify again"
+      fi
+      sleep "$poll_seconds"
+    done
+    echo "release_finish.sh: $live shows $version"
+    # The WKD key is checked against this release's own key file (the reference is the newest tag on
+    # main, which a release is). No cache busting: users fetch it as it is served.
+    if tag_key NRV-E1162 "$src" "$tag" "$work/ref.bin"; then have_key=yes; else have_key=; fi
+    status=$(curl -sS --max-time 30 -o "$work/wkd" -w '%{http_code}' "$live/$wkd_dir/hu/$wkd_hash?l=nerva" 2> /dev/null) || status=000
+    if [[ -n "$have_key" ]]; then
+      if [[ "$status" != 200 ]] || ! cmp -s "$work/wkd" "$work/ref.bin"; then
+        refuse NRV-E1162 "nerva.pro's WKD key differs from packaging/keys at $tag (served status $status); users who compare the two channels will stop" \
+          "the file in the site repository is not the dearmored $key_path of this release, or the site has not deployed it" \
+          "open a site pull request that replaces $wkd_dir/hu/$wkd_hash with gpg --dearmor of $key_path at $tag, then run site-verify again; if nobody changed the key, treat it as a compromise of the site"
+      fi
+      echo "release_finish.sh: the WKD key at $live equals $key_path at $tag"
+    else
+      if [[ "$status" != 404 ]]; then
+        refuse NRV-E1162 "nerva.pro serves a WKD file (status $status) although $tag has no $key_path" \
+          "the reference key file does not exist at this tag, so no WKD file may be served (P398)" \
+          "remove $wkd_dir from the site repository with a pull request, then run site-verify again"
+      fi
+      echo "::notice::$tag has no $key_path: the WKD path answers 404, as it must (P398)"
+    fi
+    ;;
   *)
-    echo "usage: release_finish.sh ref <ref> <tag> | tap-ref <tag> | state <tag> | make-formula <tag> <sha-file> <out> | latest-check <tag> | tap-check <tag> <formula> | site-check <tag> <line> | fetch-sha <tag> <out> | formula <tag> <formula> <sha-file> | tap-diff <old> <new> | tap <tag> <formula> | publish <tag> <commit> | site <tag> <date> <line> | site-wait <pr> <release|prerelease>" >&2
+    echo "usage: release_finish.sh ref <ref> <tag> | tap-ref <tag> | state <tag> | make-formula <tag> <sha-file> <out> | latest-check <tag> | tap-check <tag> <formula> | site-check <tag> <line> | fetch-sha <tag> <out> | formula <tag> <formula> <sha-file> | tap-diff <old> <new> | tap <tag> <formula> | publish <tag> <commit> | site <tag> <date> <line> | site-wait <pr> <release|prerelease> | site-live <tag>" >&2
     exit 2
     ;;
 esac

@@ -5,7 +5,8 @@
 # reviewer and `main` as its only deployment branch.
 #
 # The owner approves every run; the environment's secrets reach only the "Create the signing
-# keychain" step, which hands them to mac_keychain.sh (slice A1) and nothing else. That script,
+# keychain" step, which hands them to mac_keychain.sh (slice A1) and nothing else. Apple's public intermediates
+# are fetched before it, in a step with no secret (mac_ca.sh, P455); the .p12 need not hold them. That script,
 # mac_zip_check.sh and release_check.sh are fetched from the workflow's own ref ($GITHUB_SHA, main for an approved run),
 # never from the draft's target. The target's `zig build` still runs with the keychain unlocked, so
 # release_check.sh mac-draft refuses a target that is not main, or main plus a change to VERSION and
@@ -22,6 +23,10 @@ on:
       tag:
         required: true
         type: string
+    outputs:
+      attempt:
+        description: 'The run attempt the owner approved (NRV-E1153: package publication must be the same attempt)'
+        value: ${{ jobs.sign.outputs.attempt }}
   workflow_dispatch:
     inputs:
       tag:
@@ -42,6 +47,8 @@ jobs:
     # Notarization usually takes minutes; Apple sometimes takes longer.
     timeout-minutes: 75
     environment: apple-signing
+    outputs:
+      attempt: ${{ github.run_attempt }}
     permissions:
       contents: write # gh release upload to the draft; GH_TOKEN goes only to the steps that need it
     env:
@@ -58,7 +65,7 @@ jobs:
           # prerelease could be any commit. Fetch both scripts from $GITHUB_SHA into $RUNNER_TEMP/wf;
           # the target is checked out after, and its copies of them are never run.
           mkdir "$RUNNER_TEMP/wf"
-          for f in release_check.sh mac_keychain.sh mac_zip_check.sh; do
+          for f in release_check.sh mac_ca.sh mac_keychain.sh mac_zip_check.sh; do
             gh api -H "Accept: application/vnd.github.raw" \
               "repos/$GITHUB_REPOSITORY/contents/.github/scripts/$f?ref=$GITHUB_SHA" \
               > "$RUNNER_TEMP/wf/$f"
@@ -75,6 +82,16 @@ jobs:
 
       - name: Install the pinned Zig (no cache)
         run: ./zig/download.sh
+
+      # Apple's public Developer ID intermediates, which the owner's .p12 does not hold (P455). A
+      # step of its own with no secret in its environment, so curl never runs beside one; system
+      # tools only; each file is checked against a SHA-256 pinned in mac_ca.sh (NRV-E1165).
+      - name: Apple's Developer ID intermediate certificates
+        env:
+          PATH: /usr/bin:/bin:/usr/sbin:/sbin
+        run: |
+          "$RUNNER_TEMP/wf/mac_ca.sh" fetch "$RUNNER_TEMP/apple-ca"
+          echo "APPLE_CA_DIR=$RUNNER_TEMP/apple-ca" >> "$GITHUB_ENV"
 
       - name: Create the signing keychain
         id: keychain
