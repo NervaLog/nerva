@@ -10,6 +10,7 @@ other code, and panicked with "checkpoint diverged" at the first checkpoint. Now
 - the cluster commits on replicas 0 and 1;
 - with replica 1 stopped nothing commits, since replica 2 does not count;
 - replica 1 back, it commits again, past the first checkpoint, and replica 2 never panics.
+Then `eviction.py`: a client of the newer release is evicted with NRV-E0609 (#356).
 """
 import hashlib
 import http.client
@@ -22,6 +23,8 @@ import subprocess
 import sys
 import tempfile
 import time
+
+import eviction
 
 # Replicas authenticate each other with a real cluster key, never the development key (P102).
 os.environ["NERVA_CLUSTER_KEY"] = os.urandom(32).hex()
@@ -191,6 +194,7 @@ def main():
               f"commits past the first checkpoint in {time.monotonic() - started:.0f} s)")
     finally:
         cluster.close()
+    eviction.run(nerva, nerva_other)  # a client of the newer release is evicted with a code (#356)
 
 
 if __name__ == "__main__":
