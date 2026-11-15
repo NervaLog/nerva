@@ -34,9 +34,19 @@ zip by its own `.sha256` file: [check a download first](#checking-a-download).
 ### Homebrew
 
 ```bash
+brew tap nervalog/tap
+brew trust nervalog/tap        # current Homebrew only; see below
 brew install nervalog/tap/nerva
 nerva version
 ```
+
+Current Homebrew refuses a formula from a tap you have not trusted: `brew install nervalog/tap/nerva`
+stops with `Refusing to load formula nervalog/tap/nerva from untrusted tap nervalog/tap`, and
+`brew trust nervalog/tap` (or `brew trust --formula nervalog/tap/nerva`, for the one formula) is the
+fix. A formula is code Homebrew runs, so read
+[`Formula/nerva.rb`](https://github.com/NervaLog/homebrew-tap/blob/main/Formula/nerva.rb), before you trust the tap; it is the
+formula described below. An older Homebrew has no `brew trust` and needs no such step: leave that line out
+(NRV-E1167 is the release check's version of this refusal).
 
 The tap is `NervaLog/homebrew-tap`, which exists once the first release is out; from then on
 `brew install nervalog/tap/nerva` installs the latest release from its `main`. A release candidate's
