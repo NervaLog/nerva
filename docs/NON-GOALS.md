@@ -17,7 +17,8 @@ which milestone in [docs/PRODUCTION.md](./PRODUCTION.md) may change it. The labe
   who may call in the process that owns the gateway.
 - **No encryption at rest.** Data files are checksummed, not encrypted. Use an encrypted volume.
 - **No retention yet.** Commit keys, history and view versions are kept forever, so disk use,
-  export and import grow with all history. R7 (Retention) is the milestone.
+  export and import grow with all history. R7 (Retention) will bound history and view
+  versions; commit keys and facts stay kept after it (P422).
 - **No rolling upgrades yet.** Replicas of different protocol releases (the `release` line of `nerva version`) ignore each
   other, so a release
   that changes the format upgrades by export and import with the cluster closed

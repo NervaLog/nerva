@@ -888,8 +888,8 @@ Nerva holds its first client's money on the R milestones' terms, in
 | R4 · Gateway | Beside its client: a gateway per client process on loopback, no ambiguous 503, metrics | **Delivered** 2026-11-06: `demo_r4` green on `main` ([run](https://github.com/NervaLog/nerva/actions/runs/42136037296/job/127624296815), [docs/demos/r4.md](./docs/demos/r4.md)) |
 | R5 · Recover | Replace a lost replica, and restore a backup, with the cluster open | **Delivered** 2026-11-05: `demo_r5` green on `main` ([run](https://github.com/NervaLog/nerva/actions/runs/41997293568/job/127143488126), [docs/demos/r5.md](./docs/demos/r5.md)) |
 | R6 · Upgrade | Rolling upgrades between releases with the same data format | Brief written ([docs/briefs/r6.md](./docs/briefs/r6.md)) |
-| R7 · Retention | Keys, history and view versions trimmed below a horizon | Not started |
-| R8 · Native client | The client library from the JVM over a C ABI: no gateway, no JSON, batched ops | Not started |
+| R7 · Retention | History and view versions trimmed below a horizon; bounded by the live set plus one horizon | Brief written ([docs/briefs/r7.md](./docs/briefs/r7.md)) |
+| R8 · Native client | The client library from the JVM over a C ABI: no gateway, no JSON, batched ops | Brief written ([docs/briefs/r8.md](./docs/briefs/r8.md)) |
 
 ## Roadmap
 
@@ -907,8 +907,8 @@ v0.7.1 to 1.0, is in [docs/ROADMAP.md](./docs/ROADMAP.md).
 5. **Snapshots and subscriptions** — reads as of op `N` ✅ (`get_history`, `row?as_of=`, views
    `as_of`); change cursors ✅ (`get_changes`); view snapshots.
 6. **Facts beside money** — commit keys, records with 128-bit ids and declared indexes, written
-   in the transaction that moves the money (P123, P123b, P123c). ✅ Index reads as of a past op,
-   and retention of keys and facts, are next.
+   in the transaction that moves the money (P123, P123b, P123c). ✅ Index reads as of a past op
+   are next; keys and facts are kept (P123, P422).
 7. **Object storage tiering**, external operators, effect sinks.
 
 ## License
