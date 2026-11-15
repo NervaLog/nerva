@@ -38,7 +38,7 @@ with the cases. If the block shows `NRV-B…`, report it with the command and it
 
 | You see | Code | Do |
 |---|---|---|
-| `--addresses: argument is required`, an unknown or repeated flag | NRV-E0001 | `nerva --help` lists every command and flag (`nerva <command> --help` is itself refused with this code, [#300](https://github.com/NervaLog/nerva/issues/300)) |
+| `--addresses: argument is required`, an unknown or repeated flag | NRV-E0001 | `nerva --help` lists every command and flag |
 | `--request-timeout must be 1000 to 60000 milliseconds`, any flag out of range | NRV-E0002 | The message names the bounds |
 | `--listen must be <ipv4>:<port> or [<ipv6>]:<port>` | NRV-E0003 | Give `host:port` |
 | `<path> exists` on `format`, `export`, `import` | NRV-E0004, NRV-E0005 | Give a new path; Nerva never overwrites a file |
