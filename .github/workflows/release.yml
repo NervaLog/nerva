@@ -115,10 +115,12 @@ jobs:
     needs: version
     uses: ./.github/workflows/ci.yml
     # ci.yml's `changes` job asks for pull-requests: read; a called workflow cannot hold more
-    # than its caller grants.
+    # than its caller grants. `issues: write` is for ci.yml's `alarm` job (P376), which a release's
+    # call skips (`repos-fresh` runs on pushes of CI itself); the grant is checked when the file loads.
     permissions:
       contents: read
       pull-requests: read
+      issues: write
 
   # The packaging tests on this very commit (docs/briefs/v0.7.1.md, demo row 6; #384): called, not
   # observed, so a later push to main cannot cancel it, a red run stops the draft, and its result is
@@ -269,12 +271,15 @@ jobs:
   # draft and stops there (it is finished by dispatching release-finish.yml from main with its tag);
   # the workflow's own `guard` and each environment's main-only deployment rule are the other guards.
   # A prerelease draft may target only main plus VERSION and CHANGELOG.md (release_check.sh
-  # mac-draft, P343). The workflow takes no inherited secrets.
+  # mac-draft, P343). It inherits this repository's secrets: a called workflow sees none, its jobs'
+  # environment secrets included, unless the caller passes them (P459).
   finish:
     needs: [version, release]
     if: github.ref == 'refs/heads/main'
     uses: ./.github/workflows/release-finish.yml
     permissions:
       contents: write
+      issues: write
+    secrets: inherit
     with:
       tag: ${{ needs.version.outputs.tag }}

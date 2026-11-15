@@ -9,9 +9,7 @@ is bumped at release); the release slice re-records them on the release commit.
 
 Use GitHub's private vulnerability reporting on `NervaLog/nerva`: the repository's Security tab,
 "Report a vulnerability". Say what you found, the release or commit, and how to reproduce it.
-Private reporting is being enabled and may not be on yet. If the Report a vulnerability button is
-not shown, open a public issue titled "Security contact request" with no details, and the
-maintainers will open a private channel. Put nothing about the vulnerability in a public issue.
+Put nothing about the vulnerability in a public issue.
 There is no SLA: this is an alpha with one maintainer.
 
 ## The model
