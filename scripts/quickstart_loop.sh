@@ -49,7 +49,7 @@ for line in \
   '"$NERVA" format --cluster=1 --replica=$i --replica-count=3 --development 1_$i.nerva' \
   '"$NERVA" start --addresses=3001,3002,3003 --development 1_$i.nerva > replica_$i.log 2>&1 &' \
   '"$NERVA" api --cluster=1 --addresses=3001,3002,3003 --listen=127.0.0.1:8080 > api.log 2>&1 &' \
-  'export NERVA_KEY=secret' \
+  'export NERVA_KEY=$(openssl rand -hex 32)' \
   'curl -s -H "X-Nerva-Key: $NERVA_KEY"'; do
   grep -qF -- "$line" "$QS" || { rmdir "$LOOP"; refuse "QUICKSTART.md changed: '$line' is gone; update this script"; }
 done
@@ -131,7 +131,7 @@ for r in $(seq 1 "$RUNS"); do
       keep_logs "$r"; died "run $r: replica $i did not start: $(first_error replica_$i.log)"
     fi
   done
-  export NERVA_KEY=secret
+  export NERVA_KEY=$(openssl rand -hex 32)
   t0=$(now)
   "$NERVA" api --cluster=1 --addresses=3001,3002,3003 --listen=127.0.0.1:8080 > api.log 2>&1 & api_pid=$!; pids+=($api_pid); names+=("gateway")
   while :; do

@@ -38,14 +38,15 @@ if [ -n "$ip" ]; then
     pids+=($!)
   done
   sleep 5
-  NERVA_KEY=probe nerva api --cluster=0 --addresses="$addrs" --listen=127.0.0.1:8080 > /data/api.log 2>&1 &
+  export NERVA_KEY=$(openssl rand -hex 32)
+  nerva api --cluster=0 --addresses="$addrs" --listen=127.0.0.1:8080 > /data/api.log 2>&1 &
   pids+=($!)
   sleep 3
   for i in 1 2 3 4 5; do
-    curl -sS -m 10 -H 'X-Nerva-Key: probe' -d '{"entries":[{"kind":"put","table":1,"id":"'$i'","value_hex":"c0ffee"}]}' http://127.0.0.1:8080/v1/commit; echo
+    curl -sS -m 10 -H "X-Nerva-Key: $NERVA_KEY" -d '{"entries":[{"kind":"put","table":1,"id":"'$i'","value_hex":"c0ffee"}]}' http://127.0.0.1:8080/v1/commit; echo
   done
   start=$(date +%s%N)
-  for i in $(seq 1 50); do curl -sS -m 10 -o /dev/null -H 'X-Nerva-Key: probe' -d '{"rows":[{"table":1,"id":"1"}]}' http://127.0.0.1:8080/v1/lookup; done
+  for i in $(seq 1 50); do curl -sS -m 10 -o /dev/null -H "X-Nerva-Key: $NERVA_KEY" -d '{"rows":[{"table":1,"id":"1"}]}' http://127.0.0.1:8080/v1/lookup; done
   echo "50 lookups via api: $(( ($(date +%s%N) - start) / 50000000 )) ms each (development config, informal)"
   kill "${pids[@]}" 2>/dev/null; wait "${pids[@]}" 2>/dev/null
   tail -3 /data/api.log

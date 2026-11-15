@@ -14,3 +14,5 @@ zig-out/
 
 # Python bytecode from tests/.
 __pycache__/
+
+.zig-global-cache/

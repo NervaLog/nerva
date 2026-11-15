@@ -1,7 +1,7 @@
 ---
 id: P469
 date: 2026-11-11
-area: Security
+area: "Milestone 3: positioned reads and the first views"
 ---
 
 # The gateway key has the cluster key's 32-byte minimum; the development key guards loopback only
@@ -12,7 +12,7 @@ than 32 bytes (`peer_auth.key_length_min`, the cluster key's own minimum), under
 `peer_auth.development_key` unless every address is loopback, under NRV-E0901; on loopback an
 explicit development key still works, as `--development` does.
 
-**Why.** The issues propose exactly these. 32 is already decided for the cluster key, and
+**Why.** The issues propose exactly these. 32 is already decided for the cluster key (P102), and
 `openssl rand -hex 32` (which every doc and example tells operators to run) gives 64. No new codes:
 both messages extend codes NRV-E0008 and NRV-E0901, which already exist. Nothing persisted or on the wire changes.
 

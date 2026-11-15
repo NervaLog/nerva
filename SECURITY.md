@@ -35,7 +35,7 @@ gateway's protection is that it listens on loopback only, beside its client; a n
 `--listen` is refused unless `--listen-remote` is given:
 
 ```
-$ NERVA_KEY=k nerva api --cluster=1 --addresses=3901 --listen=0.0.0.0:8982
+$ NERVA_KEY=$(openssl rand -hex 32) nerva api --cluster=1 --addresses=3901 --listen=0.0.0.0:8982
 error[NRV-E0009]: api: --listen=0.0.0.0:8982 is not loopback; the gateway speaks plain HTTP
 ```
 
