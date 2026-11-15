@@ -58,6 +58,7 @@ comptime {
     _ = @import("nerva/release_eviction.zig");
     _ = @import("nerva/release_peers.zig");
     _ = @import("nerva/state_machine_tests.zig");
+    _ = @import("nerva/statsd_unroutable.zig");
     _ = @import("nerva/timings.zig");
     _ = @import("nerva/trace_file.zig");
     _ = @import("nerva/view/declared.zig");
@@ -75,6 +76,7 @@ comptime {
     _ = @import("testing/table.zig");
     _ = @import("trace.zig");
     _ = @import("trace/event.zig");
+    _ = @import("trace/statsd.zig");
     _ = @import("vsr/checksum.zig");
     _ = @import("vsr/checksum_benchmark.zig");
     _ = @import("vsr/clock.zig");
