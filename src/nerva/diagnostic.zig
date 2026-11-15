@@ -18,7 +18,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const assert = std.debug.assert;
-
 const release_eviction = @import("release_eviction.zig");
 
 pub const exit_operator: u8 = 1;
@@ -26,7 +25,7 @@ pub const exit_environment: u8 = 2;
 pub const exit_internal: u8 = 70;
 
 /// The longest block printed; a longer headline is cut.
-const block_size_max = 4096;
+pub const block_size_max = 4096;
 /// The longest reason captured from a log line (`note`).
 const reason_size_max = 512;
 
@@ -46,7 +45,7 @@ pub const table = [_]Entry{
     .{ .code = "NRV-E0005", .summary = "A data file already exists at `format`'s path", .exit = exit_operator },
     .{ .code = "NRV-E0006", .summary = "A data file is missing at `start`'s path", .exit = exit_operator },
     .{ .code = "NRV-E0007", .summary = "A replica, gateway or view server cannot listen", .exit = exit_operator },
-    .{ .code = "NRV-E0008", .summary = "`NERVA_KEY` is missing or invalid", .exit = exit_operator },
+    .{ .code = "NRV-E0008", .summary = "`NERVA_KEY` is missing, shorter than 32 bytes, or invalid", .exit = exit_operator },
     .{ .code = "NRV-E0009", .summary = "`--listen` is not loopback and `--listen-remote` was not given", .exit = exit_operator },
     .{ .code = "NRV-E0010", .summary = "A replica or gateway cannot send its metrics to `--statsd`", .exit = exit_operator },
     .{ .code = "NRV-E0604", .summary = "A gateway or view server could not reach the cluster", .exit = exit_operator },
@@ -66,6 +65,13 @@ pub const table = [_]Entry{
     .{ .code = "NRV-E0715", .summary = "An earlier `nerva recover` did not finish", .exit = exit_operator },
     .{ .code = "NRV-E0716", .summary = "`nerva recover`'s session was evicted before it finished", .exit = exit_operator },
     .{ .code = "NRV-E0717", .summary = "A test build with commit-key deduplication off was started without `--development`", .exit = exit_operator },
+    .{ .code = "NRV-E0718", .summary = "The data file's cluster has upgraded to a release this binary does not run: a rollback after the switch", .exit = exit_operator },
+    .{ .code = "NRV-E0719", .summary = "The binary's bundled release is damaged, or the bundle cannot be read", .exit = exit_operator },
+    .{ .code = "NRV-E0720", .summary = "The kernel refuses to execute from memory (`vm.memfd_noexec` is not 0): this replica could not switch release", .exit = exit_operator },
+    .{ .code = "NRV-E0724", .summary = "`nerva recover` finished the data file but could not move it to its name", .exit = exit_operator },
+    .{ .code = "NRV-E0725", .summary = "A past release cannot be bundled: its release, format digest or `release_client_min` does not fit this build, or it does not run here", .exit = exit_operator },
+    .{ .code = "NRV-E0726", .summary = "The binary could not be read to look for its bundle of releases", .exit = exit_operator },
+    .{ .code = "NRV-E0727", .summary = "`nerva_pack` did not read an input in full: the file changed while it was read, or its size is not its length", .exit = exit_operator },
     .{ .code = "NRV-E0801", .summary = "The cluster did not answer the export", .exit = exit_operator },
     .{ .code = "NRV-E0802", .summary = "`--as-of` is past the latest op", .exit = exit_operator },
     .{ .code = "NRV-E0803", .summary = "The export would be refused by `nerva import`", .exit = exit_operator },
@@ -76,7 +82,8 @@ pub const table = [_]Entry{
     .{ .code = "NRV-E0808", .summary = "A backup's manifest is missing, malformed, too large or of an unknown version", .exit = exit_operator },
     .{ .code = "NRV-E0809", .summary = "A backup does not match its manifest: size, SHA-256, op, version, a view hash or a ledger total", .exit = exit_operator },
     .{ .code = "NRV-E0810", .summary = "A file `export` or `import` was given cannot be opened, read or written", .exit = exit_operator },
-    .{ .code = "NRV-E0901", .summary = "`NERVA_CLUSTER_KEY` is missing, short, or wrongly paired with `_NEXT`", .exit = exit_operator },
+    .{ .code = "NRV-E0812", .summary = "A release build was given an export from a test build with commit-key deduplication off", .exit = exit_operator },
+    .{ .code = "NRV-E0901", .summary = "`NERVA_CLUSTER_KEY` is missing, short, the public development key off loopback, or wrongly paired with `_NEXT`", .exit = exit_operator },
     .{ .code = "NRV-B0004", .summary = "A `nerva` command hit an error it did not expect", .exit = exit_internal },
 };
 
@@ -354,8 +361,28 @@ pub fn fail(
     print_and_exit(stream.getWritten(), comptime entry(code).exit);
 }
 
+/// If the client was evicted because of its release (`release_eviction.record`), prints
+/// NRV-E0609 (too new) or NRV-E0610 (below `release_client_min`) and exits; otherwise returns.
+pub fn fail_release_eviction() void {
+    const eviction = release_eviction.take() orelse return;
+    if (eviction.too_high()) fail(
+        "NRV-E0609",
+        "{s}: the cluster runs release {}; this client, release {}, is newer, so it was evicted",
+        .{ command, eviction.cluster, eviction.client },
+        "move the cluster to release {} first, or run this command at release {}",
+        .{ eviction.client, eviction.cluster },
+    ) else fail(
+        "NRV-E0610",
+        "{s}: the cluster runs release {}; this client, release {}, is below its release_client_min, so it was evicted",
+        .{ command, eviction.cluster, eviction.client },
+        "upgrade this client to at least the cluster's release_client_min (`nerva version` on a replica's binary prints it)",
+        .{},
+    );
+}
+
 /// An error a command did not expect: `bug[NRV-B0004]`, the name only under `--log-debug`.
 pub fn unexpected(err: anyerror) noreturn {
+    if (err == error.Evicted) fail_release_eviction();
     var buffer: [block_size_max]u8 = undefined;
     var stream = std.io.fixedBufferStream(&buffer);
     const writer = stream.writer();
@@ -374,11 +401,6 @@ pub fn unexpected(err: anyerror) noreturn {
 /// A file the command was given failed: the code follows the error, never its name.
 pub fn fail_file(path: []const u8, err: anyerror) noreturn {
     switch (err) {
-        // The session of a command that also writes a file, evicted for its release (#222).
-        error.Evicted => {
-            fail_if_release_evicted();
-            unexpected(err);
-        },
         error.NoSpaceLeft => fail(
             "NRV-E0706",
             "{s}: no space left writing {s}",
@@ -426,57 +448,9 @@ fn file_reason(err: anyerror) []const u8 {
     };
 }
 
-/// The two release evictions' wording, shared by `fail_if_release_evicted` and its test.
-const release_high_headline = "{s}: this is release {s} and the cluster runs release {s}: " ++
-    "it evicted this client";
-const release_high_fix = "run this command from a build of the cluster's release, {s}; a " ++
-    "build with commit keys off (-Dtest-commit-keys=off) runs only against a cluster of its " ++
-    "own kind";
-const release_low_headline = "{s}: this is release {s}, below the minimum the cluster's " ++
-    "release {s} accepts: it evicted this client";
-const release_low_fix = "upgrade this command to a newer release (the cluster's release is " ++
-    "{s}; it accepts no client below its `release_client_min`)";
-
-/// Renders `refusal` for `command` as its NRV-E0609 or NRV-E0610 block; returns the exit status.
-fn render_release_refusal(
-    writer: anytype,
-    refusal: release_eviction.Refusal,
-) !u8 {
-    switch (refusal.kind) {
-        .too_high => {
-            try render(writer, "NRV-E0609", release_high_headline, .{
-                command, refusal.client(), refusal.cluster(),
-            }, release_high_fix, .{refusal.cluster()});
-            return comptime entry("NRV-E0609").exit;
-        },
-        .too_low => {
-            try render(writer, "NRV-E0610", release_low_headline, .{
-                command, refusal.client(), refusal.cluster(),
-            }, release_low_fix, .{refusal.cluster()});
-            return comptime entry("NRV-E0610").exit;
-        },
-    }
-}
-
-/// When the last eviction a client received was for its release (`release_eviction.zig`), exits
-/// with NRV-E0609 or NRV-E0610 naming both releases; otherwise returns and the caller reports
-/// the eviction as it does any other.
-pub fn fail_if_release_evicted() void {
-    const refusal = release_eviction.taken() orelse return;
-    var buffer: [block_size_max]u8 = undefined;
-    var stream = std.io.fixedBufferStream(&buffer);
-    // A block that does not fit is cut, never dropped.
-    const status = render_release_refusal(stream.writer(), refusal) catch exit_operator;
-    print_and_exit(stream.getWritten(), status);
-}
-
 /// Any error that reached `main`: known environmental causes get their code, the rest are bugs.
 pub fn fail_error(err: anyerror) noreturn {
     switch (err) {
-        error.Evicted => {
-            fail_if_release_evicted();
-            unexpected(err);
-        },
         error.AddressInUse,
         error.AddressNotAvailable,
         error.AddressFamilyNotSupported,
@@ -639,33 +613,6 @@ test "diagnostic: rendering, one code per kind" {
         "error[NRV-E0706]: import: no space left\n" ++
             "  cause  The disk is full\n" ++
             "  fix    free space\n",
-    );
-}
-
-test "diagnostic: a release eviction renders with both releases" {
-    // The refusal an eviction of this reason is, as the eviction callback builds it (`record`
-    // also logs, which a test cannot allow).
-    const vsr = @import("../vsr.zig");
-    const refusal = release_eviction.refusal_of(
-        .client_release_too_low,
-        vsr.Release.from(.{ .major = 0, .minor = 0, .patch = 3 }),
-        vsr.Release.from(.{ .major = 0, .minor = 0, .patch = 6 }),
-    ).?;
-    const command_before = command;
-    defer command = command_before;
-    command = "export";
-    var buffer: [block_size_max]u8 = undefined;
-    var stream = std.io.fixedBufferStream(&buffer);
-    const status = try render_release_refusal(stream.writer(), refusal);
-    try testing.expectEqual(exit_operator, status);
-    try testing.expectEqualStrings(
-        "error[NRV-E0610]: export: this is release 0.0.3, below the minimum the cluster's " ++
-            "release 0.0.6 accepts: it evicted this client\n" ++
-            "  cause  The client's release is below the cluster's `release_client_min`; it was " ++
-            "evicted (`client_release_too_low`)\n" ++
-            "  fix    upgrade this command to a newer release (the cluster's release is 0.0.6; " ++
-            "it accepts no client below its `release_client_min`)\n",
-        stream.getWritten(),
     );
 }
 

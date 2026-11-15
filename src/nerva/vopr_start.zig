@@ -54,7 +54,7 @@ pub fn build(buffer: *[bytes_max]u8, seed: u64) Built {
 
     var stream = std.io.fixedBufferStream(buffer);
     var writer = export_file.WriterType(@TypeOf(stream).Writer)
-        .init(stream.writer(), version) catch unreachable;
+        .init(stream.writer(), version, 0) catch unreachable;
     writer.write(&.{ .summary = .{
         .as_of = as_of,
         .change_count = 0,

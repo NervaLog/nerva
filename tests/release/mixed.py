@@ -10,6 +10,7 @@ other code, and panicked with "checkpoint diverged" at the first checkpoint. Now
 - the cluster commits on replicas 0 and 1;
 - with replica 1 stopped nothing commits, since replica 2 does not count;
 - replica 1 back, it commits again, past the first checkpoint, and replica 2 never panics.
+Then `eviction.py`: a client of the newer release is evicted with NRV-E0609 (#356).
 """
 import hashlib
 import http.client
@@ -23,10 +24,12 @@ import sys
 import tempfile
 import time
 
+import eviction
+
 # Replicas authenticate each other with a real cluster key, never the development key (P102).
 os.environ["NERVA_CLUSTER_KEY"] = os.urandom(32).hex()
 
-KEY = "release-test-key"
+KEY = "release-test-key-0123456789abcdef0123456789"
 CHECKPOINT_OPS = 1000  # Past the first checkpoint (op 960 in the production config).
 
 
@@ -56,8 +59,9 @@ def commit(port, id, timeout=60):
 
 
 class Cluster:
-    def __init__(self, binaries):
+    def __init__(self, binaries, gateway_binary=None):
         self.binaries = binaries
+        self.gateway_binary = gateway_binary or binaries[0]
         self.tmp = tempfile.mkdtemp(prefix="nerva-release-")
         self.addresses = ",".join(str(port) for port in free_ports(len(binaries)))
         self.replicas = [None] * len(binaries)
@@ -111,7 +115,7 @@ class Cluster:
         """A `nerva api` of the first release; returns its port once it has registered."""
         self.wait_listening()
         process = subprocess.Popen(
-            [self.binaries[0], "api", "--cluster=0", f"--addresses={self.addresses}",
+            [self.gateway_binary, "api", "--cluster=0", f"--addresses={self.addresses}",
              "--listen=127.0.0.1:0"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL, env={**os.environ, "NERVA_KEY": KEY}, text=True)
         self.gateways.append(process)
@@ -131,27 +135,70 @@ def wait_for(condition, seconds, what):
         time.sleep(0.1)
 
 
-def refuses_other_release(nerva, cluster):
-    """#95: `nerva start` on a data file of another release is refused with NRV-E0701, and the
-    file is not touched (it used to panic with `multiversion unsupported`)."""
+def refuses_other_release(nerva, nerva_other, cluster):
+    """#95: `nerva start` on a data file of another release is refused, and the file is not
+    touched (it used to panic with `multiversion unsupported`). A file above every release the
+    binary runs is NRV-E0718 (the cluster has upgraded past it, P259); one below, NRV-E0701."""
     cluster.stop(2)
-    copy = os.path.join(cluster.tmp, "other-release.nerva")
-    shutil.copy(cluster.data_file(2), copy)
+    cluster.stop(0)
 
-    def digest():
-        with open(copy, "rb") as f:
-            return hashlib.sha256(f.read()).hexdigest()
+    def refused(binary, source, code, release):
+        copy = os.path.join(cluster.tmp, f"other-release-{code}.nerva")
+        shutil.copy(source, copy)
 
-    before = digest()
-    result = subprocess.run(
-        [nerva, "start", f"--addresses={cluster.addresses}", "--development", copy],
-        capture_output=True, text=True, timeout=60)
-    first = result.stderr.splitlines()[0] if result.stderr else ""
-    assert result.returncode == 1, (result.returncode, result.stderr[-2000:])
-    assert first.startswith("error[NRV-E0701]: start: "), result.stderr[-2000:]
-    assert "release 0.0.200" in first, first
-    assert "panic" not in result.stderr and "multiversion" not in result.stderr, result.stderr
-    assert digest() == before, "the data file changed"
+        def digest():
+            with open(copy, "rb") as f:
+                return hashlib.sha256(f.read()).hexdigest()
+
+        before = digest()
+        result = subprocess.run(
+            [binary, "start", f"--addresses={cluster.addresses}", "--development", copy],
+            capture_output=True, text=True, timeout=60)
+        first = result.stderr.splitlines()[0] if result.stderr else ""
+        assert result.returncode == 1, (result.returncode, result.stderr[-2000:])
+        assert first.startswith(f"error[NRV-{code}]: start: "), result.stderr[-2000:]
+        assert f"release {release}" in first, first  # the file's release
+        assert "panic" not in result.stderr and "multiversion" not in result.stderr, result.stderr
+        assert digest() == before, "the data file changed"
+        if code == "E0701":  # unbundled binary: the export and import hint, never recover
+            assert "upgrade by export and import" in result.stderr, result.stderr[-2000:]
+            assert "nerva recover" not in result.stderr, result.stderr[-2000:]
+
+    # Written by 0.0.200, started by this binary: the cluster is past it.
+    refused(nerva, cluster.data_file(2), "E0718", "0.0.200")
+    # Written by this binary, started by 0.0.200: another release, below it.
+    first = subprocess.run([nerva, "version"], capture_output=True, text=True).stdout
+    release_this = first.split("Nerva version ")[1].split()[0].split("+")[0]
+    refused(nerva_other, cluster.data_file(0), "E0701", release_this)
+
+
+def restarts_beside_other_primary(nerva, nerva_other):
+    """#358, a no-regression smoke test: replica 0 (the first view's primary) runs the other
+    release, replicas 1 and 2 run `nerva`, and each round restarts one of them beside it. Replicas
+    1 and 2 form the cluster without the primary; each round must leave it committing, with no
+    panic or divergence on any replica. It does not test #358's rule: the restarted replica drops
+    the other-release primary's view-0 prepares as an older view whichever rule `admits` applies
+    (P412); the `release_peers` unit tests cover the rule."""
+    cluster = Cluster([nerva_other, nerva, nerva], gateway_binary=nerva)
+    try:
+        port = cluster.gateway()
+        assert commit(port, 5000, timeout=90) == 200
+        for round in range(3):
+            victim = 1 + round % 2
+            cluster.stop(victim)
+            cluster.start(victim)
+            cluster.wait_listening()
+            port = cluster.gateway()
+            status = commit(port, 5100 + round, timeout=90)
+            assert status == 200, f"round {round}: commit answered {status}"
+            for index, replica in enumerate(cluster.replicas):
+                assert replica.poll() is None, f"replica {index} exited: " \
+                    f"{cluster.log(index)[-2000:]}"
+                log = cluster.log(index)
+                assert "panic" not in log and "checkpoint diverged" not in log, log[-2000:]
+        print("mixed releases: PASSED (replicas restarting beside an other-release primary)")
+    finally:
+        cluster.close()
 
 
 def main():
@@ -163,9 +210,10 @@ def main():
         assert statuses == [200] * 20, statuses
 
         # Each side says it ignores the other.
-        wait_for(lambda: "replica 2 runs release 0.0.200" in cluster.log(0), 10, "replica 0's log")
-        wait_for(lambda: "replica 0 runs release " in cluster.log(2) and
-                 "replica 1 runs release " in cluster.log(2), 10, "replica 2's log")
+        wait_for(lambda: "NRV-W0702 replica 2 runs release 0.0.200" in cluster.log(0), 10,
+                 "replica 0's log")
+        wait_for(lambda: "NRV-W0702 replica 0 runs release " in cluster.log(2) and
+                 "NRV-W0702 replica 1 runs release " in cluster.log(2), 10, "replica 2's log")
 
         # Replica 2 does not count toward a quorum: without replica 1, nothing commits.
         cluster.stop(1)
@@ -186,11 +234,13 @@ def main():
         for index, replica in enumerate(cluster.replicas):
             assert replica.poll() is None, f"replica {index} exited: {cluster.log(index)[-2000:]}"
             assert "panic" not in cluster.log(index), cluster.log(index)[-2000:]
-        refuses_other_release(nerva, cluster)
+        refuses_other_release(nerva, nerva_other, cluster)
         print(f"mixed releases: PASSED (replica 2 on another release ignored; {CHECKPOINT_OPS} "
               f"commits past the first checkpoint in {time.monotonic() - started:.0f} s)")
     finally:
         cluster.close()
+    restarts_beside_other_primary(nerva, nerva_other)
+    eviction.run(nerva, nerva_other)  # a client of the newer release is evicted with a code (#356)
 
 
 if __name__ == "__main__":

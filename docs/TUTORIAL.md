@@ -184,7 +184,7 @@ without a key.
 ### Start the JSON gateway
 
 ```bash
-export NERVA_KEY=secret
+export NERVA_KEY=$(openssl rand -hex 32)
 $NERVA api --cluster=1 --addresses=3001 --listen=127.0.0.1:8080 > api.log 2>&1 &
 
 curl http://127.0.0.1:8080/healthz
@@ -197,7 +197,7 @@ one in `NERVA_KEY_NEXT` as well (it then accepts either), move clients to it, an
 with it as `NERVA_KEY` alone. Define a short helper for the rest of the tutorial:
 
 ```bash
-n() { curl -s -H 'X-Nerva-Key: secret' "$@"; echo; }
+n() { curl -s -H "X-Nerva-Key: $NERVA_KEY" "$@"; echo; }
 A=http://127.0.0.1:8080
 ```
 
@@ -243,7 +243,7 @@ cannot join the cluster, pose as a replica or vote. Clients and gateways don't n
 
 Every replica of a cluster must run the same release (the part of `nerva version` before the
 `+`). A replica ignores peers that run another release and says so in its log (`replica 2 runs
-release …, this replica runs 0.0.6: ignoring it (a cluster must run one release)`). Ignored
+release …, this replica runs 0.0.6 (up to 0.0.6): ignoring it`, code NRV-W0702). Ignored
 peers count toward nobody's quorum, so a cluster with mixed releases may stop committing. A
 v0.4.0 replica can't even take part in the v0.5.0 handshake: when a v0.5.0 replica dials it, it
 exits with status 7.

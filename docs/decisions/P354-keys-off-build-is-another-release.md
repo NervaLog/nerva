@@ -23,20 +23,17 @@ cluster with release replicas would diverge on the first resent key. Nothing sto
 - **Replicas:** they already ignore peers of another release (N61), so a mixed cluster does not
   count the other side toward any quorum, and logs at error level `replica N runs release 0.0.6,
   this replica runs 0.0.207: ignoring it (a cluster must run one release)`. Each side's data file
-  is refused by the other with NRV-E0701.
+  is refused by the other: a keys-off build's file by a release build with NRV-E0718 (its release is above the binary's), a release file by the keys-off build with NRV-E0701.
 - **Clients:** a client's release is its build's, so the keys-off build's own clients (`nerva api`,
   `view`, `export`, `backup`, `recover`) are evicted by a release cluster with
-  `client_release_too_high`. That is a new failure path and it has a code: NRV-E0609 (and
-  NRV-E0610 for `client_release_too_low`), emitted by `src/nerva/release_eviction.zig` and
-  `diagnostic.zig`. The eviction callbacks of `client.zig` and `recover.zig` log it with both
-  releases; a command ends `error[NRV-E0609]`, exit 1, instead of `bug[NRV-B0004]` or NRV-E0716.
-  A gateway already running logs the line and answers as before (its `/healthz` and retry are R6
-  slice 2). The same fix covers release builds: a newer client against an older cluster, or one
-  below `release_client_min`, ended `bug[NRV-B0004]` before (#356, fixed here). Release clients reach a keys-off
-  cluster, since their release is lower; a release gateway on a mixed cluster therefore gets
-  keys-off semantics from the keys-off majority, which does not diverge.
+  `client_release_too_high`. The coded refusal for that (NRV-E0609, and NRV-E0610 for
+  `client_release_too_low`) is #430's (`src/nerva/release_eviction.zig`, `worklog/430.md`; #356), which merged
+  while this pull request was held. This pull request first carried its own version of it and
+  dropped it for #430's; it adds no eviction code. Release clients reach a keys-off cluster, since
+  their release is lower; a release gateway on a mixed cluster therefore gets keys-off semantics
+  from the keys-off majority, which does not diverge.
 - **Not guarded:** `nerva import` does not compare releases, so a keys-off export can be imported
-  into a release cluster. NRV-E0701's fix says never to (it names the keys-off exception); making
+  into a release cluster. NRV-E0701's row in `docs/ERRORS.md` says never to (it names the keys-off exception); making
   `import` refuse it needs the export to say it came from a keys-off cluster, which is a format
   question (#357).
 - **Why this way:** no wire or on-disk format changes, nothing in the state machine or the
@@ -50,6 +47,6 @@ cluster with release replicas would diverge on the first resent key. Nothing sto
   beside a release replica, and `release_peers.admits` admits a prepare whose maker has not yet
   announced since this replica started (#358).
 - **Tests:** `tests/errors/commands.py` checks the two builds' releases differ, that each refuses
-  the other's data file with NRV-E0701 and leaves it unchanged, and that the keys-off build's
-  `export`, `api` and `view` against a release cluster end NRV-E0609. NRV-E0610 has unit tests
-  (`release_eviction.zig`, `diagnostic.zig`) only.
+  the other's data file (NRV-E0718, NRV-E0701) and leaves it unchanged, and that the keys-off build's
+  `export`, `api` and `view` against a release cluster end NRV-E0609, as #430 words it. NRV-E0610 is
+  #430's unit tests only.

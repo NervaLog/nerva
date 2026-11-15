@@ -38,7 +38,7 @@ with the cases. If the block shows `NRV-B…`, report it with the command and it
 
 | You see | Code | Do |
 |---|---|---|
-| `--addresses: argument is required`, an unknown or repeated flag | NRV-E0001 | `nerva --help` lists every command and flag (`nerva <command> --help` is itself refused with this code, [#300](https://github.com/NervaLog/nerva/issues/300)) |
+| `--addresses: argument is required`, an unknown or repeated flag | NRV-E0001 | `nerva --help` lists every command and flag |
 | `--request-timeout must be 1000 to 60000 milliseconds`, any flag out of range | NRV-E0002 | The message names the bounds |
 | `--listen must be <ipv4>:<port> or [<ipv6>]:<port>` | NRV-E0003 | Give `host:port` |
 | `<path> exists` on `format`, `export`, `import` | NRV-E0004, NRV-E0005 | Give a new path; Nerva never overwrites a file |
@@ -150,7 +150,7 @@ Sections: [01xx](ERRORS.md#01xx--the-gateway-transport-keys-routes-requests),
 
 ```
 error[NRV-E0008]: api: set NERVA_KEY
-  cause  `NERVA_KEY` is missing or invalid
+  cause  `NERVA_KEY` is missing, shorter than 32 bytes, or invalid
   fix    set NERVA_KEY; during a rotation NERVA_KEY_NEXT differs from it
 ```
 
@@ -198,11 +198,11 @@ status says which:
 | Exit | Condition | Code | Notes |
 |---|---|---|---|
 | 1 | A flag or file refusal before it opens anything | NRV-E0001 to E0010, E0701 to E0703, E0710 | See [the next section](#a-replica-will-not-start-or-will-not-join) |
-| 2 | The disk is full: `write failed: no space left on device` | NRV-E0706 | Free space or grow the volume. Not run |
-| 3 | The manifest node pool is exhausted | none yet | Its message names a flag, `--memory-lsm-manifest`, that `nerva start` does not have ([#304](https://github.com/NervaLog/nerva/issues/304)). Not run |
+| 2 | The disk is full: `NRV-E0706: write failed: no space left on device` | NRV-E0706 | Free space or grow the volume. Not run |
+| 3 | The manifest node pool is exhausted | NRV-E0721 | The cluster has reached a limit of this build; Nerva has no flag to raise it. Report it with the replica's log and the data file's size (#334); do not delete data files. Not run |
 | 4 | The data file is over its size limit | NRV-E0707 | The limit is the build's; Nerva has no flag to raise it. Not run |
 | 5 | The next checkpoint would put the data file over its limit | NRV-E0707 | As exit 4. Not run |
-| 6 | The forest's table count would exceed its limit | none yet | The message tells you to contact "the team"; report it ([#304](https://github.com/NervaLog/nerva/issues/304)). Not run |
+| 6 | The forest's table count exceeds its limit | NRV-E0722 | The cluster has reached a limit of this build; Nerva has no flag to raise it. Report it with the replica's log and the counts the message prints (#334); do not delete data files. Not run |
 | 7 | `unknown VSR command, crashing for safety` | NRV-B0003 | A bug: report it. Not run |
 | 8 | `origin_mismatch`: this replica was imported from another export than its peers | NRV-E0711 | In a running cluster, `nerva recover` this replica with `--origin=` the export its peers announce (never import it alone again). When the whole cluster is being restored with the cluster closed, import every replica from the same export. Not run |
 
@@ -229,7 +229,7 @@ Sections: [07xx · Replicas and data files](ERRORS.md#07xx--replicas-and-data-fi
 Refusals before the replica opens its data file, each exit 1 unless noted:
 
 ```
-error[NRV-E0703]: start: another process holds data/0_0.nerva
+error[NRV-E0703]: start: another process holds data/0_0.nerva (pid 2145)
   cause  Another process holds the data file
   fix    stop the other replica that uses this data file
 ```
@@ -257,7 +257,7 @@ Not run, quoted from ERRORS.md:
 
 | You see | Code | Do |
 |---|---|---|
-| `start: <path> was written by release X, and this is release Y` | NRV-E0701 | Upgrade by export and import (README, [Upgrading a cluster](../README.md#upgrading-a-cluster)) |
+| `start: <path> was written by release X, and this binary runs Y and bundles Z` | NRV-E0701 | Upgrade by export and import (README, [Upgrading a cluster](../README.md#upgrading-a-cluster)). A binary that bundles a past release, given a file below all of them, says instead that the replica fell behind or the cluster skipped a release: start the binary of the release that follows the file's and step one release at a time, `nerva recover` the replica (README, "Replacing a lost replica"), or export and import the cluster |
 | `start: <path> has no usable superblock (…)` | NRV-E0702 | Check the path. If the file is damaged: a replica of a running cluster is replaced with `nerva recover`; a lone replica or a closed cluster is restored from a backup (every replica, from the same one) |
 | `start: all --addresses must be provided` | NRV-E0710 | Give every replica's address, in replica order |
 | `start: the file system of <path> does not support direct IO`, exit 2 | NRV-E0704 | Put the data file on ext4 or XFS (`--development` allows it) |
@@ -268,8 +268,8 @@ Look at its log:
 
 - A peer proved a different cluster key: NRV-E0902, logged, the peer is ignored. Every replica
   needs the same `NERVA_CLUSTER_KEY`. Not run.
-- `replica N runs release X, this replica runs Y: ignoring it`: a peer on a release this binary does
-  not run. Start every replica on the same release. Not run.
+- `NRV-W0702 replica N runs release X, this replica runs Y (up to Z): ignoring it`: a peer on a
+  release this binary neither runs nor bundles. Start every replica on the same release. Not run.
 - Exit 8, NRV-E0711 (above): the replica was imported from another export than its peers.
 - Fewer than a majority of the replicas run, so no gateway gets a session: NRV-E0604 on the gateway.
   Start the others. To bring back a lost replica, see README,
