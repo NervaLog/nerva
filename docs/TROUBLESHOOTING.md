@@ -229,7 +229,7 @@ Sections: [07xx · Replicas and data files](ERRORS.md#07xx--replicas-and-data-fi
 Refusals before the replica opens its data file, each exit 1 unless noted:
 
 ```
-error[NRV-E0703]: start: another process holds data/0_0.nerva
+error[NRV-E0703]: start: another process holds data/0_0.nerva (pid 2145)
   cause  Another process holds the data file
   fix    stop the other replica that uses this data file
 ```
