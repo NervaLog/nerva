@@ -1815,8 +1815,10 @@ pub fn ReplicaType(
                     self.on_release_announced(announcement.replica, announcement.release);
                     self.on_origin_announced(announcement.replica, &announcement.origin);
                 }
+                const releases_run = self.multiversion.releases_bundled();
                 if (!release_peers.admits(
                     self.release,
+                    releases_run.slice(),
                     self.release_client_min,
                     &self.superblock.working.vsr_state.origin,
                     self.replica,
@@ -3698,15 +3700,17 @@ pub fn ReplicaType(
             assert(self.release_peers_strict);
             if (peer == self.replica or peer >= self.node_count) return;
             const known = self.peer_releases[peer];
-            if (release.value != self.release.value and
+            const releases_run = self.multiversion.releases_bundled();
+            if (!release_peers.runs(releases_run.slice(), release) and
                 (known == null or known.?.value != release.value))
             {
-                log.err("{}: replica {} runs release {}, this replica runs {}: ignoring it " ++
-                    "(a cluster must run one release)", .{
+                log.warn("{}: NRV-W0702 replica {} runs release {}, this replica runs {} (up to " ++
+                    "{}): ignoring it", .{
                     self.log_prefix(),
                     peer,
                     release,
                     self.release,
+                    releases_run.last(),
                 });
             }
             self.peer_releases[peer] = release;

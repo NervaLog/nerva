@@ -53,6 +53,7 @@ comptime {
     _ = @import("nerva/peer_auth.zig");
     _ = @import("nerva/preflight.zig");
     _ = @import("nerva/recover.zig");
+    _ = @import("nerva/release_eviction.zig");
     _ = @import("nerva/release_peers.zig");
     _ = @import("nerva/state_machine_tests.zig");
     _ = @import("nerva/timings.zig");
@@ -63,6 +64,7 @@ comptime {
     _ = @import("nerva/views.zig");
     _ = @import("nerva/vopr_start.zig");
     _ = @import("nerva/wire_code.zig");
+    _ = @import("nerva_main.zig");
     _ = @import("queue.zig");
     _ = @import("stack.zig");
     _ = @import("testing/exhaustigen.zig");

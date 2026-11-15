@@ -50,10 +50,47 @@ pub const Refusal = union(enum) {
     missing,
     not_a_file,
     damaged: []const u8,
-    other_release: vsr.Release,
+    /// The checkpoint's release is neither one this binary runs nor above all of them.
+    other_release: ReleaseRefusal,
+    /// The checkpoint's release is above every release this binary runs: the cluster upgraded
+    /// past it (a rollback after the switch, NRV-E0718).
+    cluster_upgraded: ReleaseRefusal,
     locked,
     direct_io_unsupported,
+    /// `vm.memfd_noexec` is not 0: this replica could not switch release (NRV-E0720).
+    memfd_noexec,
 };
+
+/// A data file's release against the releases this binary runs (`releases_run`, the
+/// multiversion's `releases_bundled()`, ordered, the binary's own release among them).
+pub const ReleaseRefusal = struct {
+    file: vsr.Release,
+    releases_run: []const vsr.Release,
+};
+
+/// The releases a binary bundles, for a message: those it runs other than its own, or "none".
+const Bundled = struct {
+    releases_run: []const vsr.Release,
+
+    pub fn format(
+        bundled: Bundled,
+        comptime _: []const u8,
+        _: std.fmt.FormatOptions,
+        writer: anytype,
+    ) !void {
+        var count: usize = 0;
+        for (bundled.releases_run) |release| {
+            if (release.value == constants.config.process.release.value) continue;
+            if (count > 0) try writer.writeAll(", ");
+            try writer.print("{}", .{release});
+            count += 1;
+        }
+        if (count == 0) try writer.writeAll("none");
+    }
+};
+
+/// Where the kernel says whether a process may execute from memory (Linux 6.3 and later).
+pub const memfd_noexec_path = "/proc/sys/vm/memfd_noexec";
 
 /// The version in a `uname` release string such as `6.8.0-45-generic`, or null if it has none.
 pub fn kernel_version_parse(release: []const u8) ?Version {
@@ -95,7 +132,10 @@ pub fn open_check(
     gpa: std.mem.Allocator,
     path: []const u8,
     direct_io: DirectIO,
+    releases_run: []const vsr.Release,
 ) !?Refusal {
+    assert(releases_run.len > 0);
+
     if (builtin.os.tag != .linux) return null;
 
     const fd = posix.open(path, .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0) catch |err| switch (err) {
@@ -108,7 +148,7 @@ pub fn open_check(
     if (!posix.S.ISREG(stat.mode) and !posix.S.ISBLK(stat.mode)) return .not_a_file;
 
     if (!try lock_free(fd)) return .locked;
-    if (try superblock_refusal(gpa, fd)) |refusal| return refusal;
+    if (try superblock_refusal(gpa, fd, releases_run)) |refusal| return refusal;
     if (direct_io == .required and posix.S.ISREG(stat.mode) and
         !try direct_io_supported(path, fd)) return .direct_io_unsupported;
     return null;
@@ -130,7 +170,11 @@ fn lock_free(fd: posix.fd_t) !bool {
     return false;
 }
 
-fn superblock_refusal(gpa: std.mem.Allocator, fd: posix.fd_t) !?Refusal {
+fn superblock_refusal(
+    gpa: std.mem.Allocator,
+    fd: posix.fd_t,
+    releases_run: []const vsr.Release,
+) !?Refusal {
     const copies = try gpa.create([constants.superblock_copies]SuperBlockHeader);
     defer gpa.destroy(copies);
     for (copies, 0..) |*copy, index| {
@@ -146,8 +190,37 @@ fn superblock_refusal(gpa: std.mem.Allocator, fd: posix.fd_t) !?Refusal {
     const header = quorum.header;
     if (header.version != superblock.SuperBlockVersion) return .{ .damaged = "IncompatibleVersion" };
     const release = header.vsr_state.checkpoint.release;
-    if (release.value != constants.config.process.release.value) return .{ .other_release = release };
-    return null;
+    return release_refusal(release, releases_run);
+}
+
+/// The refusal for a checkpoint of `release`, or null when this binary runs it (itself, or a
+/// bundled release it re-executes as). Above every release it runs: the cluster has upgraded
+/// past this binary. Otherwise: another release, which only an export and import moves.
+pub fn release_refusal(release: vsr.Release, releases_run: []const vsr.Release) ?Refusal {
+    assert(releases_run.len > 0);
+    for (releases_run) |release_run| {
+        if (release_run.value == release.value) return null;
+    }
+    const refusal: ReleaseRefusal = .{ .file = release, .releases_run = releases_run };
+    if (release.value > releases_run[releases_run.len - 1].value) {
+        return .{ .cluster_upgraded = refusal };
+    }
+    return .{ .other_release = refusal };
+}
+
+/// Whether the kernel forbids executing from memory: `vm.memfd_noexec` is anything but 0. The
+/// vendored `memfd_create` passes only `MFD_CLOEXEC`, so with 1 the kernel seals the `memfd`
+/// non-executable ("without MFD_EXEC nor MFD_NOEXEC_SEAL acts like MFD_NOEXEC_SEAL", kernel
+/// `vm.memfd_noexec`), and with 2 it seals it (6.6 on) or fails the create (6.3 to 6.5): either
+/// way `execveat` gets `EACCES` at the switch. Absent (a kernel before 6.3) or unreadable is not
+/// a refusal.
+pub fn memfd_noexec_refused(path: []const u8) bool {
+    const file = std.fs.openFileAbsolute(path, .{}) catch return false;
+    defer file.close();
+    var buffer: [16]u8 = undefined;
+    const count = file.read(&buffer) catch return false;
+    const text = std.mem.trim(u8, buffer[0..count], " \n");
+    return text.len > 0 and !std.mem.eql(u8, text, "0");
 }
 
 /// As the vendored open decides it, but on the file itself: `O_DIRECT` is refused with
@@ -180,6 +253,25 @@ fn direct_io_supported(path: []const u8, fd: posix.fd_t) !bool {
     }
 }
 
+/// The fix for NRV-E0701. Below every release of a binary that bundles another one, the cluster
+/// rolled on without this replica and the fix is for this replica alone. Otherwise (a single
+/// release binary, or a file between releases) it is the export and import upgrade.
+fn other_release_hint(mismatch: ReleaseRefusal, buffer: []u8) []const u8 {
+    const bundles_other = mismatch.releases_run.len > 1;
+    const behind = bundles_other and mismatch.file.value < mismatch.releases_run[0].value;
+    if (!behind) return "upgrade by export and import (README, \"Upgrading a cluster\")";
+    // The whole cluster may have skipped a release (this file's vR, this binary's vR+2): then
+    // `nerva recover` cannot help, and the cheap fix is to step through the releases between.
+    return std.fmt.bufPrint(
+        buffer,
+        "this replica fell behind the cluster's releases, or the cluster skipped one: " ++
+            "start the binary of the release that follows {} and upgrade one release at a " ++
+            "time, replace this replica with nerva recover (README, \"Replacing a lost " ++
+            "replica\"), or upgrade the whole cluster by export and import",
+        .{mismatch.file},
+    ) catch unreachable;
+}
+
 /// Refuses with the code for `refusal`; never returns.
 pub fn refuse(path: []const u8, refusal: Refusal) noreturn {
     switch (refusal) {
@@ -204,11 +296,43 @@ pub fn refuse(path: []const u8, refusal: Refusal) noreturn {
             "check the path; restore the replica from a backup, or replace it",
             .{},
         ),
-        .other_release => |release| diagnostic.fail(
-            "NRV-E0701",
-            "{s}: {s} was written by release {}, and this is release {}",
-            .{ diagnostic.command, path, release, constants.config.process.release },
-            "upgrade by export and import (README, \"Upgrading a cluster\"); nothing was changed",
+        .other_release => |mismatch| {
+            var hint_buffer: [512]u8 = undefined;
+            diagnostic.fail(
+                "NRV-E0701",
+                "{s}: {s} was written by release {}, and this binary runs {} and bundles {}",
+                .{
+                    diagnostic.command,
+                    path,
+                    mismatch.file,
+                    constants.config.process.release,
+                    Bundled{ .releases_run = mismatch.releases_run },
+                },
+                "{s}; nothing was changed",
+                .{other_release_hint(mismatch, &hint_buffer)},
+            );
+        },
+        .cluster_upgraded => |mismatch| diagnostic.fail(
+            "NRV-E0718",
+            "{s}: {s} belongs to a cluster that runs release {}, and this binary runs {} and " ++
+                "bundles {}",
+            .{
+                diagnostic.command,
+                path,
+                mismatch.file,
+                constants.config.process.release,
+                Bundled{ .releases_run = mismatch.releases_run },
+            },
+            "start the binary of release {}, or roll forward with a revert release " ++
+                "(README, \"Upgrading a cluster\"); nothing was changed",
+            .{mismatch.file},
+        ),
+        .memfd_noexec => diagnostic.fail(
+            "NRV-E0720",
+            "{s}: vm.memfd_noexec is not 0: this replica could not switch release",
+            .{diagnostic.command},
+            "set vm.memfd_noexec to 0, or upgrade this cluster by export and import; " ++
+                "nothing was changed",
             .{},
         ),
         .locked => diagnostic.fail(
@@ -228,13 +352,31 @@ pub fn refuse(path: []const u8, refusal: Refusal) noreturn {
     }
 }
 
+/// Refuses (NRV-E0720) when the kernel forbids executing from memory; `nerva start` calls it only
+/// for a binary that bundles another release, since only then can the replica switch (R6, P259),
+/// and before the `memfd` is created. The path is a parameter so that a test build can name
+/// another one.
+pub fn memfd_check(path: []const u8, memfd_noexec_file: []const u8) void {
+    if (memfd_noexec_refused(memfd_noexec_file)) refuse(path, .memfd_noexec);
+}
+
 /// The pre-flight of `nerva start`: refuses or returns.
-pub fn start(gpa: std.mem.Allocator, path: []const u8, direct_io: DirectIO) void {
-    const refusal = open_check(gpa, path, direct_io) catch |err| diagnostic.fail_file(path, err);
+///
+/// `releases_run` is every release this binary can run (its multiversion's `releases_bundled()`).
+pub fn start(
+    gpa: std.mem.Allocator,
+    path: []const u8,
+    direct_io: DirectIO,
+    releases_run: []const vsr.Release,
+) void {
+    const refusal = open_check(gpa, path, direct_io, releases_run) catch |err|
+        diagnostic.fail_file(path, err);
     if (refusal) |reason| refuse(path, reason);
 }
 
 const testing = std.testing;
+
+const releases_single = [_]vsr.Release{constants.config.process.release};
 
 test "preflight: kernel versions" {
     try testing.expectEqual(Version{ .major = 6, .minor = 8 }, kernel_version_parse("6.8.0-45-generic").?);
@@ -257,7 +399,7 @@ test "preflight: a missing file, a directory, zeros, a short file" {
 
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const missing = try std.fmt.bufPrint(&path_buffer, "{s}/missing", .{dir});
-    try testing.expect((try open_check(gpa, missing, .disabled)).? == .missing);
+    try testing.expect((try open_check(gpa, missing, .disabled, &releases_single)).? == .missing);
 
     const zeros = try std.fmt.bufPrint(&path_buffer, "{s}/zeros", .{dir});
     {
@@ -265,7 +407,7 @@ test "preflight: a missing file, a directory, zeros, a short file" {
         defer file.close();
         try file.setEndPos(superblock.superblock_zone_size);
     }
-    try testing.expect((try open_check(gpa, zeros, .disabled)).? == .damaged);
+    try testing.expect((try open_check(gpa, zeros, .disabled, &releases_single)).? == .damaged);
 
     const short = try std.fmt.bufPrint(&path_buffer, "{s}/short", .{dir});
     {
@@ -273,11 +415,11 @@ test "preflight: a missing file, a directory, zeros, a short file" {
         defer file.close();
         try file.writeAll("not a data file");
     }
-    try testing.expect((try open_check(gpa, short, .disabled)).? == .damaged);
+    try testing.expect((try open_check(gpa, short, .disabled, &releases_single)).? == .damaged);
 
     const empty = try std.fmt.bufPrint(&path_buffer, "{s}/empty", .{dir});
     (try std.fs.createFileAbsolute(empty, .{})).close();
-    try testing.expect((try open_check(gpa, empty, .disabled)).? == .damaged);
+    try testing.expect((try open_check(gpa, empty, .disabled, &releases_single)).? == .damaged);
 }
 
 test "preflight: a held lock" {
@@ -291,10 +433,10 @@ test "preflight: a held lock" {
     const file = try std.fs.createFileAbsolute(path, .{});
     defer file.close();
     try posix.flock(file.handle, posix.LOCK.EX | posix.LOCK.NB);
-    try testing.expect((try open_check(testing.allocator, path, .disabled)).? == .locked);
+    try testing.expect((try open_check(testing.allocator, path, .disabled, &releases_single)).? == .locked);
     try posix.flock(file.handle, posix.LOCK.UN);
     // Free: the next check goes on to the superblock, which an empty file lacks.
-    try testing.expect((try open_check(testing.allocator, path, .disabled)).? == .damaged);
+    try testing.expect((try open_check(testing.allocator, path, .disabled, &releases_single)).? == .damaged);
 }
 
 test "preflight: a lock released within the wait is not refused" {
@@ -318,16 +460,76 @@ test "preflight: a lock released within the wait is not refused" {
     }.run, .{file.handle});
     defer releaser.join();
     // Free by then: the check goes on to the superblock, which an empty file lacks.
-    try testing.expect((try open_check(testing.allocator, path, .disabled)).? == .damaged);
+    try testing.expect((try open_check(testing.allocator, path, .disabled, &releases_single)).? == .damaged);
+}
+
+test "preflight: the NRV-E0701 hint offers recover only to a binary that bundles a release" {
+    const this = constants.config.process.release;
+    assert(this.value > 2);
+    const below: vsr.Release = .{ .value = this.value - 1 };
+    const old: vsr.Release = .{ .value = this.value - 2 };
+    const single = [_]vsr.Release{this};
+    const bundle = [_]vsr.Release{ below, this };
+    // Bundled: a file below every release is a replica that fell behind.
+    var buffer: [512]u8 = undefined;
+    const bundled = other_release_hint(.{ .file = old, .releases_run = &bundle }, &buffer);
+    try testing.expect(std.mem.indexOf(u8, bundled, "nerva recover") != null);
+    // It names the release to step from, for a cluster that skipped one.
+    try testing.expect(std.mem.indexOf(u8, bundled, "that follows") != null);
+    // Unbundled: the export and import mistake, with no recover hint.
+    var buffer_unbundled: [512]u8 = undefined;
+    const unbundled = other_release_hint(.{ .file = below, .releases_run = &single }, &buffer_unbundled);
+    try testing.expect(std.mem.indexOf(u8, unbundled, "nerva recover") == null);
+    try testing.expect(std.mem.indexOf(u8, unbundled, "export and import") != null);
 }
 
 test "preflight: every refusal has a registered code and a message" {
     // Rendering must not trip an assertion; `refuse` exits, so render through the table.
-    inline for (.{ "NRV-E0006", "NRV-E0701", "NRV-E0702", "NRV-E0703", "NRV-E0704", "NRV-E0705" }) |code| {
+    inline for (.{ "NRV-E0006", "NRV-E0701", "NRV-E0702", "NRV-E0703", "NRV-E0704", "NRV-E0705", "NRV-E0718", "NRV-E0719", "NRV-E0720", "NRV-E0726" }) |code| {
         var found = false;
         for (diagnostic.table) |candidate| {
             if (std.mem.eql(u8, candidate.code, code)) found = true;
         }
         try testing.expect(found);
+    }
+}
+
+test "preflight: a checkpoint's release against the releases this binary runs" {
+    const this = constants.config.process.release;
+    // Releases are numbers: those around this one, in whatever build runs the test.
+    assert(this.value > 1 and this.value < std.math.maxInt(u32) - 3);
+    const below: vsr.Release = .{ .value = this.value - 1 };
+    const above: vsr.Release = .{ .value = this.value + 1 };
+    const above_more: vsr.Release = .{ .value = this.value + 2 };
+
+    // One release: its own is run; any other is refused, above it as a cluster that moved on.
+    const single = [_]vsr.Release{this};
+    try testing.expect(release_refusal(this, &single) == null);
+    try testing.expect(release_refusal(below, &single).? == .other_release);
+    try testing.expect(release_refusal(above, &single).? == .cluster_upgraded);
+
+    // A bundle: every release in it is run; below its last is another release (the data file of
+    // a release this binary does not bundle); above the last is the cluster having upgraded
+    // past this binary.
+    const bundle = [_]vsr.Release{ this, above_more };
+    for (bundle) |release| try testing.expect(release_refusal(release, &bundle) == null);
+    try testing.expect(release_refusal(below, &bundle).? == .other_release);
+    try testing.expect(release_refusal(above, &bundle).? == .other_release);
+    const beyond: vsr.Release = .{ .value = above_more.value + 1 };
+    try testing.expect(release_refusal(beyond, &bundle).? == .cluster_upgraded);
+}
+
+test "preflight: vm.memfd_noexec other than 0 is refused, 0 and absent are not" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = try tmp.dir.realpath(".", &buffer);
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, "{s}/memfd_noexec", .{dir});
+
+    try testing.expect(!memfd_noexec_refused(path));
+    inline for (.{ .{ "0\n", false }, .{ "1\n", true }, .{ "2\n", true } }) |case| {
+        try tmp.dir.writeFile(.{ .sub_path = "memfd_noexec", .data = case[0] });
+        try testing.expectEqual(case[1], memfd_noexec_refused(path));
     }
 }
