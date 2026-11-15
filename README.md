@@ -226,7 +226,8 @@ A gateway serves plain HTTP on loopback, one `nerva api` per client process. Sta
 the process it serves, with every replica's address, and give that process its own `NERVA_KEY`:
 
 ```bash
-NERVA_KEY=$(openssl rand -hex 32) nerva api --cluster=1 --addresses=10.0.0.1:3001,10.0.0.2:3001,10.0.0.3:3001 \
+export NERVA_KEY=$(openssl rand -hex 32)   # once; the client sends the same value
+nerva api --cluster=1 --addresses=10.0.0.1:3001,10.0.0.2:3001,10.0.0.3:3001 \
     --listen=127.0.0.1:8080
 ```
 

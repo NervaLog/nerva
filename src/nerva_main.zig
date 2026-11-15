@@ -968,7 +968,7 @@ fn gateway_keys(comptime command: []const u8) http_connection.Keys {
             "NRV-E0008",
             command ++ ": {s}",
             .{reason},
-            "set NERVA_KEY; during a rotation NERVA_KEY_NEXT differs from it",
+            "set NERVA_KEY (at least 32 bytes); during a rotation NERVA_KEY_NEXT differs from it",
             .{},
         );
     }

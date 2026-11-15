@@ -2,7 +2,7 @@
 # Runs the one-machine half of docs/QUICKSTART.md in a loop (#305) and reports,
 # per run, the time from the gateway's start to its `listening` line.
 # Usage: scripts/quickstart_loop.sh <nerva-binary> [runs=30] [workdir=${TMPDIR:-/tmp}/quickstart_loop] [slow_s=15]
-# Needs bash, curl, awk and perl (all present on Linux and macOS). The clock has millisecond
+# Needs bash, curl, awk, perl and openssl (all present on Linux and macOS). The clock has millisecond
 # resolution and the wait for `listening` polls every 0.1 s, so a time can be late by ~0.15 s.
 # Each invocation works in its own fresh <workdir>/loop.XXXXXX/ (it never touches anything else
 # in workdir). A run slower than slow_s, or whose healthz is not ready, or in which a replica or

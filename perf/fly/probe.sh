@@ -38,7 +38,8 @@ if [ -n "$ip" ]; then
     pids+=($!)
   done
   sleep 5
-  export NERVA_KEY=$(openssl rand -hex 32)
+  NERVA_KEY=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d " \n")   # the image has no openssl
+  export NERVA_KEY
   nerva api --cluster=0 --addresses="$addrs" --listen=127.0.0.1:8080 > /data/api.log 2>&1 &
   pids+=($!)
   sleep 3
