@@ -574,6 +574,54 @@ class Finish(unittest.TestCase):
         self.assertEqual(bad.returncode, 1)
         self.assertIn("error[NRV-E1132]: site_release.py: ", bad.stderr)
 
+    def test_site_check_runs_by_the_relative_path_the_workflow_uses(self):
+        # #464: release-finish.yml runs .github/scripts/release_finish.sh from the checkout's root,
+        # and site_clone cds into a scratch clone before the script finds site_release.py.
+        url, _ = self.bare("site", {"index.html": PAGE})
+        result = subprocess.run([".github/scripts/release_finish.sh", "site-check", "v0.7.1", "A line."],
+                                capture_output=True, text=True, cwd=ROOT, env=dict(self.env, SITE_URL=url))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("the site would take the entry for v0.7.1", result.stdout + result.stderr)
+
+    def relative_run(self, step, tag, url):
+        """The workflow's call: the script by its relative path, the formula as formula/nerva.rb."""
+        work = self.dir / "checkout"
+        (work / ".github" / "scripts").mkdir(parents=True, exist_ok=True)
+        link = work / ".github" / "scripts" / "release_finish.sh"
+        if not link.exists():
+            link.symlink_to(SCRIPT)
+        (work / "formula").mkdir(exist_ok=True)
+        (work / "formula" / "nerva.rb").write_text(FORMULA)
+        return subprocess.run([".github/scripts/release_finish.sh", step, tag, "formula/nerva.rb"],
+                              capture_output=True, text=True, cwd=work, env=dict(self.env, TAP_URL=url))
+
+    def test_tap_check_and_tap_run_by_the_relative_paths_the_workflow_uses(self):
+        # The tap steps cd into the tap clone; the formula path must survive it.
+        old = FORMULA.replace("0.7.1", "0.7.0").replace(SHA, "c" * 64)
+        url, bare = self.bare("tap", {"Formula/nerva.rb": old})
+        check = self.relative_run("tap-check", "v0.7.1", url)
+        self.assertEqual(check.returncode, 0, check.stderr)
+        self.assertEqual(git("rev-list", "--count", "main", cwd=bare).strip(), "1")
+        wrote = self.relative_run("tap", "v0.7.1", url)
+        self.assertEqual(wrote.returncode, 0, wrote.stderr)
+        self.assertEqual(git("show", "main:Formula/nerva.rb", cwd=bare), FORMULA)
+
+    def test_tap_check_by_the_relative_path_refuses_a_tap_that_differs_elsewhere(self):
+        url, _ = self.bare("tap", {"Formula/nerva.rb": FORMULA.replace('"Research database"', '"X"')})
+        self.refused(self.relative_run("tap-check", "v0.7.1", url), "NRV-E1135", "more than")
+
+    def test_a_missing_formula_is_refused_not_passed(self):
+        url, _ = self.bare("tap", {"Formula/nerva.rb": FORMULA})
+        for step in ("tap-check", "tap"):
+            result = self.run_script(step, "v0.7.1", "no/such/nerva.rb", TAP_URL=url)
+            self.refused(result, "NRV-E1135", "does not exist")
+
+    def test_tap_diff_refuses_a_missing_file(self):
+        f, _ = self.formula()
+        gone = str(self.dir / "gone.rb")
+        self.refused(self.run_script("tap-diff", f, gone), "NRV-E1135", "not a readable file")
+        self.refused(self.run_script("tap-diff", gone, f), "NRV-E1135", "not a readable file")
+
     def test_a_site_edit_that_is_refused_pushes_nothing(self):
         url, bare = self.bare("site", {"index.html": PAGE})
         result = self.run_script("site", "v0.6.0", "2026-11-13", "A line.", SITE_URL=url)
@@ -777,9 +825,28 @@ class Workflow(unittest.TestCase):
             if m and not m.group(1).startswith("./"):
                 self.assertRegex(m.group(1), r"@[0-9a-f]{40}$", line)
 
-    def test_no_pull_request_target_and_no_secrets_inherit(self):
+    def test_no_pull_request_target(self):
         self.assertNotIn("pull_request_target", self.text)
-        self.assertNotIn("secrets: inherit", self.text)
+
+    def test_secrets_are_inherited_only_by_the_signing_call_and_by_release_yml(self):
+        # A called workflow sees no secret, its environment's included, unless the caller passes
+        # it: without these two, v0.7.1's signing saw every APPLE_* secret empty (NRV-E1121).
+        # Only the key itself counts, never a comment that mentions it.
+        key = re.compile(r"(?m)^    secrets: inherit$")
+        jobs = self.text.split("\njobs:\n")[1]
+        inheriting = [
+            name
+            for name in re.findall(r"(?m)^  ([a-z-]+):$", jobs)
+            if key.search(re.split(r"\n  [a-z-]+:\n", jobs.split(f"\n  {name}:\n")[1])[0])
+        ]
+        self.assertEqual(inheriting, ["mac"])
+        self.assertEqual(len(key.findall(self.text)), 1)
+        release = (WORKFLOW.parent / "release.yml").read_text()
+        finish = release.split("\n  finish:\n")[1]
+        finish = re.split(r"\n  [a-z-]+:\n", finish)[0]
+        self.assertIn("uses: ./.github/workflows/release-finish.yml", finish)
+        self.assertRegex(finish, key)
+        self.assertEqual(len(key.findall(release)), 1)
 
     def test_every_job_declares_its_permissions(self):
         jobs = self.text.split("\njobs:\n")[1]

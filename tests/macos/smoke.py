@@ -9,7 +9,7 @@ and holds no secret. Eight steps, one line each; the last line is `macos-smoke: 
 
  0  the host: `--arch` must be the machine's own architecture, not run under Rosetta, so the
     slice of a universal binary that runs is the one named
- 1  `codesign -dv` is recorded and must show `--expect-signature` (`any` records only)
+ 1  `codesign -dv --verbose=2` is recorded and must show `--expect-signature` (`any` records only)
  2  `nerva version`
  3  format three replicas with `--development` in a temporary directory and start them
  4  `nerva api --statsd=127.0.0.1:<port>` against a UDP listener of this script
@@ -98,7 +98,11 @@ def step_1_codesign(nerva, arch, expect):
     if sys.platform != "darwin":
         say("codesign: skipped, not macOS")
         return
-    result = subprocess.run(["codesign", "-dv", nerva], capture_output=True, text=True)
+    # `codesign -dv` prints the `Authority=` lines only from --verbose=2: without it a Developer ID
+    # signature reads as unrecognised (v0.7.1's first mac-verify run).
+    result = subprocess.run(
+        ["codesign", "-dv", "--verbose=2", nerva], capture_output=True, text=True
+    )
     shown = result.stderr.strip().replace("\n", " | ")
     if "Authority=Developer ID Application" in result.stderr:
         found = "developer-id"
@@ -110,7 +114,7 @@ def step_1_codesign(nerva, arch, expect):
         found = "unrecognised"
     assert expect == "any" or found == expect, f"expected {expect}, found {found}: {shown}"
     say(f"codesign: {found}, expected {expect} ({arch})")
-    print(f"  codesign -dv: {shown}", flush=True)
+    print(f"  codesign -dv --verbose=2: {shown}", flush=True)
 
 
 def step_2_version(nerva):
