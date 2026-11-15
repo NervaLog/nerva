@@ -66,7 +66,9 @@ A session never approves a deployment (an environment's required review); only t
 `main` commit that is sim-clean (once R2's fleet runs: 24 hours of the fleet on that commit and no
 open `sim-fleet` issue against it), Jepsen-clean (once R1's nightly runs: the suite passes on that
 commit), and reviewed adversarially by **two** independent reviewers, as below. The release PR
-quotes the fleet's tracker line, the Jepsen result and both verdicts. **Code pinned** (owner,
+quotes the fleet's tracker line, the Jepsen result, both verdicts and the rehearsal's
+`release-finish.yml` run on a prerelease of that version (or the owner's written waiver naming the
+jobs never run; P474). **Code pinned** (owner,
 2026-11-12; P374): choosing a candidate means writing its full SHA to `release/candidate` on `main`
 (one line). The release check (`release_check.sh candidate`, NRV-E1158, in `release.yml`'s
 `version` job and `release-finish.yml`'s `publish` job) refuses a `VERSION` commit that is not that
@@ -277,11 +279,17 @@ work done.
 - **Keep noisy output out of context.** Redirect `zig build`, VOPR and test output to a file and
   read only the failing lines.
 - **Check a brief's premises** (what is merged, with `git log`) before handing it to an agent
-  (P250).
+  (P250). A review brief names the SHA it reviews, read from GitHub when written; the reviewer
+  checks it against the live head first (P474).
+- **A watcher waits for check runs** to exist on the head before it reports "no pending checks"
+  (P474).
+- **Held pull requests merge one at a time,** and each later review brief names what merged since
+  its last review and the files they share (P474).
 - **Scratch outside the tree.** Downloads, builds of third-party code and scratch files go in the
   session scratchpad, never in the repository (P250).
 - **One worktree per agent.** Agents that run at once never share a checkout: each works in its
-  own `git worktree` with its own `ZIG_GLOBAL_CACHE_DIR`, and adds files by path, never
+  own `git worktree` with its own `ZIG_GLOBAL_CACHE_DIR` in the session scratchpad, outside every
+  worktree (P474), and adds files by path, never
   `git add -A` (P250).
 - **Delegate lookups** (searching the vendored TigerBeetle code, the Zig std) to a read-only agent
   and keep only the answer.
@@ -322,7 +330,7 @@ work done.
 ## Disk (adopted from Zigbox, P147)
 
 - A session's disk is a fixed allowance. `test:integration` needs about 3.5 GiB. Give each
-  parallel worktree its own `ZIG_GLOBAL_CACHE_DIR`, and never delete another worktree's cache.
+  parallel worktree its own `ZIG_GLOBAL_CACHE_DIR`, outside the worktree (P474), and never delete another worktree's cache.
 - A killed build can leave `.zig-cache` half written, which then fails with `FileNotFound`;
   `rm -rf .zig-cache` fixes it.
 

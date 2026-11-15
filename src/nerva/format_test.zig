@@ -1433,7 +1433,7 @@ test "format: persisted derivations" {
 test "format: the export file" {
     var out = std.ArrayList(u8).init(testing.allocator);
     defer out.deinit();
-    var writer = try export_file.WriterType(std.ArrayList(u8).Writer).init(out.writer(), 1);
+    var writer = try export_file.WriterType(std.ArrayList(u8).Writer).init(out.writer(), 1, 0);
 
     var value: [nerva.value_size]u8 = @splat(0);
     value[0] = 0xaa;
