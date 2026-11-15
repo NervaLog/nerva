@@ -520,6 +520,35 @@ behind one gateway gets (P132). `--rate=0` (default) is a closed loop; `--rate=<
 latencies count from each request's due time. Use `-Drelease` so the `nerva` it starts is a
 release build.
 
+`--timeline=<file>` writes one JSON line a second, shaped like this:
+`{"t_us":…,"count":…,"p50_us":…,"p99_us":…,"max_us":…,"errors":…,"buckets":[[i,n],…]}`.
+`t_us` is wall-clock (`CLOCK_REALTIME`) µs at the second's start, so it can be compared with log
+lines stamped by the clock; latencies are still timed with the monotonic clock. An operation
+belongs to the second in which it ended; one that began before the end of the run and ended after
+it is in no second and no number, and is counted as `"late_operations"` in the summary JSON (P414).
+`buckets` lists the second's non-zero latency-histogram
+buckets as (index, count), so any set of seconds can be merged into one histogram (bucket i < 16
+holds exactly i µs; above that each power of two is split into 16 equal buckets). There is always
+one line per second of `--warmup` + `--seconds`, empty seconds included. `--warmup=<s>` (default 0)
+runs the first s seconds as usual, but leaves their operations out of the summary JSON (counts,
+throughput and percentiles); their timeline lines carry `"warmup":true`. `--warmup` + `--seconds`
+is at most 3600, and the summary JSON gains `"warmup"` and `"late_operations"` members.
+`--timeline`, `--gateway-pid-file` and `--output` are all opened before anything starts, so a bad
+path is refused at once with NRV-E0728. They are created or truncated as `main`'s `--output` is, but
+before the run, not after it (P414d): a run that fails now leaves an existing `--output` empty,
+where `main` left it as it was. There is no temporary file and no rename: a failed run leaves a
+truncated or short file, and two flags that name one file overwrite each other. The
+timeline and the summary are written when the run ends, and a write that fails prints the same line
+after the cluster and the gateway it started are torn down. The PID file is truncated before the run, written when the
+gateway spawns and, if it is a regular file, removed when the gateway stops (a device such as
+`/dev/null` is never removed); a run that fails before the spawn leaves it empty. A value out of range (`--clients`, `--batch`, `--keys`, `--hot`, `--warmup` plus
+`--seconds`, `--local`'s client limit) is NRV-E0002. For the `botpike` workload only
+(refused for the others): `--gateway-statsd=<host:port>` (checked before anything starts, NRV-E0736)
+passes `--statsd` to the gateway it starts, `--gateway-pid-file=<file>` writes the gateway's PID there right after it spawns, and
+`--gateway-stderr=inherit|ignore` (default `ignore`) passes the gateway's stderr through to
+`bench-load`'s own stderr. A PID file outlives a `bench-load` that a signal killed: a reader checks
+that `/proc/<pid>/cmdline` is `nerva api`.
+
 ### Nightly performance
 
 `.github/workflows/perf-nightly.yml` runs every night at 06:47 UTC (and by hand, with any
