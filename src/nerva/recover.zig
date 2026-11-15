@@ -67,7 +67,8 @@ pub const Summary = struct {
 /// Formats `options.path` as replica `options.replica` of the running cluster, or exits with a
 /// coded diagnostic. Leaves nothing but `options.path` behind, and not even that on a failure.
 pub fn run(gpa: std.mem.Allocator, options: Options) void {
-    const summary = attempt(gpa, options) catch |err| switch (err) {
+    var link_cause: anyerror = undefined;
+    const summary = attempt(gpa, options, &link_cause) catch |err| switch (err) {
         error.Timeout => diag.fail(
             "NRV-E0712",
             "recover: the cluster did not commit recover's requests within {} seconds",
@@ -78,17 +79,10 @@ pub fn run(gpa: std.mem.Allocator, options: Options) void {
                 "ignored by every replica and looks the same",
             .{},
         ),
-        error.PathAlreadyExists,
-        error.NotSameFileSystem,
-        error.DiskQuota,
-        error.LinkQuotaExceeded,
-        error.SymLinkLoop,
-        error.FileSystem,
-        error.SystemResources,
-        => diag.fail(
+        error.LinkRefused => diag.fail(
             "NRV-E0724",
             "recover: cannot move {s}.recovering to {s}: {s}",
-            .{ options.path, options.path, link_reason(err) },
+            .{ options.path, options.path, link_reason(link_cause) },
             "check the directory of {s}, then run nerva recover again; nothing was left behind",
             .{options.path},
         ),
@@ -127,7 +121,33 @@ fn link_reason(err: anyerror) []const u8 {
     };
 }
 
-fn attempt(gpa: std.mem.Allocator, options: Options) !Summary {
+/// Moves the finished data file to its name with `linkat`. The refusals E0724 names are
+/// `LinkRefused`, with the cause in `cause`; any other `linkat` error (a permission or a missing
+/// directory) is returned as it is, for `diag.fail_file`. Nothing here exits, so the caller's
+/// cleanup runs and removes `from`.
+fn link_into_place(
+    dir: std.posix.fd_t,
+    from: []const u8,
+    to: []const u8,
+    cause: *anyerror,
+) !void {
+    std.posix.linkat(dir, from, dir, to, 0) catch |err| switch (err) {
+        error.PathAlreadyExists,
+        error.NotSameFileSystem,
+        error.DiskQuota,
+        error.LinkQuotaExceeded,
+        error.SymLinkLoop,
+        error.FileSystem,
+        error.SystemResources,
+        => {
+            cause.* = err;
+            return error.LinkRefused;
+        },
+        else => return err,
+    };
+}
+
+fn attempt(gpa: std.mem.Allocator, options: Options, link_cause: *anyerror) !Summary {
     assert(options.replica_count >= replica_count_min);
     assert(options.replica < options.replica_count);
     assert(options.addresses.len == options.replica_count);
@@ -187,8 +207,7 @@ fn attempt(gpa: std.mem.Allocator, options: Options) !Summary {
     storage_open = false;
 
     // Every write is on disk: the data file is complete, and takes its name (as import does).
-    const cwd = std.posix.AT.FDCWD;
-    try std.posix.linkat(cwd, recovering, cwd, options.path, 0);
+    try link_into_place(std.posix.AT.FDCWD, recovering, options.path, link_cause);
     try std.fs.cwd().deleteFile(recovering);
     try directory_sync(options.path);
     return .{ .view = view };
@@ -404,17 +423,40 @@ test origin_parse {
     }
 }
 
-test "link_reason names what a refused linkat says" {
+test "link_into_place refuses an existing path as LinkRefused and leaves it untouched" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "a", .data = "" });
-    try tmp.dir.writeFile(.{ .sub_path = "b", .data = "" });
+    try tmp.dir.writeFile(.{ .sub_path = "x.recovering", .data = "new" });
+    try tmp.dir.writeFile(.{ .sub_path = "x", .data = "old" });
 
     // The one a real operator meets: the path appeared while recover ran.
-    const err = std.posix.linkat(tmp.dir.fd, "a", tmp.dir.fd, "b", 0);
-    try std.testing.expectError(error.PathAlreadyExists, err);
-    try std.testing.expectEqualStrings("the path now exists", link_reason(error.PathAlreadyExists));
+    var cause: anyerror = undefined;
+    try std.testing.expectError(
+        error.LinkRefused,
+        link_into_place(tmp.dir.fd, "x.recovering", "x", &cause),
+    );
+    try std.testing.expectEqual(error.PathAlreadyExists, cause);
+    try std.testing.expectEqualStrings("the path now exists", link_reason(cause));
+    var buffer: [8]u8 = undefined;
+    try std.testing.expectEqualStrings("old", try tmp.dir.readFile("x", &buffer));
+    // The caller's errdefer (not this function) removes `.recovering`: it is still here.
+    try tmp.dir.access("x.recovering", .{});
+}
+
+test "link_into_place returns any other linkat error as it is, not as LinkRefused" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cause: anyerror = undefined;
+    // `from` does not exist: a missing file is not one of E0724's refusals (it is E0810's).
+    try std.testing.expectError(
+        error.FileNotFound,
+        link_into_place(tmp.dir.fd, "missing.recovering", "missing", &cause),
+    );
+}
+
+test "link_reason names every refusal E0724 lists" {
     for ([_]anyerror{
+        error.PathAlreadyExists,
         error.NotSameFileSystem,
         error.DiskQuota,
         error.LinkQuotaExceeded,
