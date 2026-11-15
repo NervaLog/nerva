@@ -591,15 +591,29 @@ def test_restart_policy(tmp):
         since = time.strftime("%Y-%m-%d %H:%M:%S")
         assert systemctl("start", unit).returncode == 0
         wait("the start limit stops the unit", lambda: show(unit, "ActiveState")["ActiveState"] == "failed")
-        # systemd 255 leaves Result=exit-code here (the refused start is logged, not recorded as
-        # start-limit-hit), so the outcome is read from the states, the counts and the journal.
-        state = show(unit, "ActiveState", "SubState", "ExecMainStatus", "NRestarts")
-        assert state["SubState"] == "failed" and state["ExecMainStatus"] == "1", state
-        log = sh(["journalctl", "-u", unit, "--since", since, "--no-pager", "-o", "cat"]).stdout
-        # StartLimitBurst=20 allows 20 starts (the first and 19 restarts); the 20th restart job's
-        # start is refused.
-        assert log.count("Started nerva@9.service") == 20, log[-2000:]
-        assert "Start request repeated too quickly" in log, log[-2000:]
+        # systemd's own state is the hard assertion: the journal can lose a line (PID 1's write to
+        # journald can time out and go to kmsg, without its unit), so its counts are diagnostics.
+        state = show(unit, "ActiveState", "SubState", "Result", "ExecMainStatus", "NRestarts")
+
+        def journal():
+            sh(["journalctl", "--sync"])
+            unit_log = sh(["journalctl", "-u", unit, "--since", since, "--no-pager", "-o", "cat"]).stdout
+            kernel = [l for l in sh(["journalctl", "-k", "--since", since, "--no-pager"]).stdout.splitlines()
+                      if "nerva@9" in l]
+            return unit_log, kernel
+
+        log, kernel = journal()
+        counts = {"Starting": log.count("Starting nerva@9.service"),
+                  "Started": log.count("Started nerva@9.service"),
+                  "exited": log.count("Main process exited, code=exited, status=1/FAILURE"),
+                  "Failed to start": log.count("Failed to start nerva@9.service"),
+                  "refused": log.count("Start request repeated too quickly")}
+        report = f"{state}\n{counts}\n--- journal -u {unit}\n{log}\n--- kernel log lines\n" + "\n".join(kernel)
+        # StartLimitBurst=20 allows 20 starts (the first and 19 restarts); the 20th restart job is
+        # counted (restart counter 20) and its start is refused. systemd 255 leaves
+        # Result=exit-code (not start-limit-hit) here, so Result is only reported.
+        assert state["ActiveState"] == "failed" and state["SubState"] == "failed", report
+        assert state["ExecMainStatus"] == "1" and state["NRestarts"] == "20", report
         time.sleep(2)  # with RestartSec=100ms, a unit still restarting would have moved by now
         again = show(unit, "ActiveState", "NRestarts")
         assert again["ActiveState"] == "failed" and again["NRestarts"] == state["NRestarts"], (state, again)

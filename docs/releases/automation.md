@@ -63,6 +63,10 @@ the graph with a required reviewer. `release-publish` has none, so `publish` sta
 `mac-verify` is green. If any Mac check fails, nothing is published, and the draft stays as it
 was.
 
+A release published by hand (the fallback when `release-finish.yml` is not used) has no such gate:
+`mac-verify.yml` then runs only on `release: published`, after the zip is public. Before publishing a
+draft by hand, dispatch `mac-verify.yml` with the draft's tag and publish only when it is green.
+
 ## Workflows and jobs
 
 Existing files keep their names. `mac_keychain.sh`, `mac_zip_check.sh`, `release_check.sh` and
@@ -216,13 +220,12 @@ newest first and `SITE.version` equals `RELEASES[0].v`. Its job name, `site-chec
 required status check of the ruleset in the setup guide. Without a required check, auto-merge has
 nothing to wait for, and today the repository allows no auto-merge at all.
 
-### `apt` and `dnf` repositories (v0.7.2): the hook
+### `apt` and `dnf` repositories: see packages.md
 
-The repositories come in v0.7.2, through a Cloudflare Worker (NEXT on the site). They join this
-graph as one more job of `release-finish.yml`, `repos`. It runs after `publish`, `needs: publish`,
-in its own environment that holds the signing key and the Worker's token. It must be idempotent
-for a re-run, and `verify` then also waits for it. Its design is v0.7.2's. This spec only keeps
-`publish` free of anything that job will need.
+The repositories come in v0.7.1, as the jobs `repos-ready`, `repos`, `repos-verify` and
+`site-verify` of `release-finish.yml`, with a weekly refresh. Their design, the hook, the
+environment `package-repos` and the setup are in [packages.md](./packages.md). This section
+stood for them before that document; it no longer holds a design.
 
 ## Conflicts with the current workflows and documents
 
