@@ -173,11 +173,12 @@ def refuses_other_release(nerva, nerva_other, cluster):
 
 
 def restarts_beside_other_primary(nerva, nerva_other):
-    """#358: replica 0 (the first view's primary) runs the other release, replicas 1 and 2 run
-    `nerva`. A replica that restarts beside it hears the primary's prepares before its first ping
-    and pong; it must not handle them (a prepare received from its maker counts only once that
-    connection has announced the release). Replicas 1 and 2 form the cluster without the primary;
-    each restart round must leave it committing, with no panic or divergence on any replica."""
+    """#358, a no-regression smoke test: replica 0 (the first view's primary) runs the other
+    release, replicas 1 and 2 run `nerva`, and each round restarts one of them beside it. Replicas
+    1 and 2 form the cluster without the primary; each round must leave it committing, with no
+    panic or divergence on any replica. It does not test #358's rule: the restarted replica drops
+    the other-release primary's view-0 prepares as an older view whichever rule `admits` applies
+    (P412); the `release_peers` unit tests cover the rule."""
     cluster = Cluster([nerva_other, nerva, nerva], gateway_binary=nerva)
     try:
         port = cluster.gateway()

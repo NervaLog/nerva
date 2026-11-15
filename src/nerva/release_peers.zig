@@ -93,10 +93,10 @@ pub fn admits(
             // none can hear from it again (P90).
             if (prepare.replica == replica) return true;
             if (prepare.replica >= peer_origins.len) return false;
-            // Received directly from its maker: the connection must have announced a release this
-            // process runs and this replica's origin, as for any other message of a peer (#358). Without
-            // it, a replica of another release that sends prepares before its first ping is heard
-            // would have them handled.
+            // Received directly from its maker: the connection must have announced a release
+            // this process runs and this replica's origin, as for any other message of a peer
+            // (#358). Without it, a replica of another release that sends prepares before its
+            // first ping is heard would have them handled.
             if (sender) |from| if (from == prepare.replica) {
                 const connection_release = peer_releases[from] orelse return false;
                 const connection_origin = peer_origins[from] orelse return false;

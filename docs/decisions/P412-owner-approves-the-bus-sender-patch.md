@@ -1,21 +1,21 @@
 ---
 id: P412
-date: 2026-11-13
+date: 2026-11-15
 area: Releases
 amends: N61
 ---
 
 # The owner approves telling the replica which connection delivered a message (#358)
 
-**Decision.** The owner approved, on 2026-11-13, patching vendored `src/vsr/replica.zig`,
-`src/message_bus.zig`, `src/testing/cluster/message_bus.zig` and `src/vsr/client.zig` so that the
-replica learns which replica's connection delivered a message, and `release_peers.admits` requires
-that connection's announcement for a prepare received directly from its maker. What this change
-patches: `message_bus.zig` (a field `recv_from`, set around each `on_messages_callback` from the
-connection's peer), `testing/cluster/message_bus.zig` (the same field, always null: the simulated
-network's buffer holds messages of several senders), `replica.zig` (passes `recv_from` to
-`admits`). `client.zig` needed no change: the field is read only by the replica, so the approved
-patch to it is not taken.
+**Decision.** The owner approved in writing, in session on 2026-11-15 (recorded on #412 as
+comment 6890394636), the vendored patches to `src/message_bus.zig`, `src/testing/cluster/message_bus.zig`
+and `src/vsr/replica.zig` that let the replica learn which replica's connection delivered a message,
+so that `release_peers.admits` requires that connection's announcement for a prepare received
+directly from its maker. What this change patches: `message_bus.zig` (a field `recv_from`, set
+around each `on_messages_callback` from the connection's peer), `testing/cluster/message_bus.zig`
+(the same field, always null: the simulated network's buffer holds messages of several senders),
+`replica.zig` (passes `recv_from` to `admits`). `src/vsr/client.zig` is not patched: the field is
+read only by the replica.
 
 **Reason.** N61 admitted a prepare whose maker had not announced since this replica started, so a
 replica of another release (or the keys-off build, P354) whose prepares arrive before its first
