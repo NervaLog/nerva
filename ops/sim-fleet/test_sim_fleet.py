@@ -1719,7 +1719,7 @@ class FailedBuild(unittest.TestCase):
              f'STATE="{state}"; built={v1}; broken=""; cd "{repo}"; SIM_FLEET_BRANCH=main; '
              f'SIM_FLEET_GIT_TIMEOUT=60; SIM_FLEET_BUILD_TIMEOUT=60; '
              f'SIM_FLEET_REPO_DIR="{repo}"; RUN_ARGS=(a); RUN_SH_SUM=0; ORIG_ENV=(); '
-             f'git() {{ if [[ "$1" == checkout && "$4" == "{v1}" ]]; then '
+             f'git() {{ if [[ "$1" == checkout && "${{@: -1}}" == "{v1}" ]]; then '
              f'echo "BROKEN-ON-DISK=$(cat "{state}/broken")"; fi; command git "$@"; }}; '
              f'git checkout -q --detach {v1}; git remote set-url origin "{remote}"; '
              f'follow_main; echo NOT-REACHED'],
@@ -1729,6 +1729,248 @@ class FailedBuild(unittest.TestCase):
         self.assertIn(f"BUILT-RUN-SH marker={v1}", out.stdout, out.stderr)
         self.assertNotIn("UNBUILT-RUN-SH", out.stdout)
         self.assertNotIn("NOT-REACHED", out.stdout)
+
+    def test_a_restart_on_the_unbuilt_head_goes_back_to_the_built_commit(self):
+        # The loop died after writing `broken` and before the checkout back: the restart finds
+        # head == broken, HEAD on the unbuilt head, and must still hand over to the built run.sh.
+        d = tempfile.mkdtemp()
+        self.addCleanup(subprocess.run, ["rm", "-rf", d])
+        remote, repo, state = (os.path.join(d, n) for n in ("remote", "repo", "state"))
+        os.makedirs(os.path.join(remote, "ops", "sim-fleet"))
+        self.git(remote, "init", "-q", "-b", "main")
+        run_sh = Path(remote, "ops", "sim-fleet", "run.sh")
+        run_sh.write_text('#!/usr/bin/env bash\necho "BUILT-RUN-SH marker=${SIM_FLEET_REEXEC:-}"\n')
+        self.git(remote, "add", "-A")
+        self.git(remote, "commit", "-q", "-m", "v1")
+        v1 = self.git(remote, "rev-parse", "HEAD")
+        subprocess.run(["git", "clone", "-q", remote, repo], check=True)
+        run_sh.write_text('#!/usr/bin/env bash\necho "UNBUILT-RUN-SH"\n')
+        self.git(remote, "commit", "-q", "-a", "-m", "v2")
+        v2 = self.git(remote, "rev-parse", "HEAD")
+        os.makedirs(state)
+        out = subprocess.run(
+            ["bash", "-c", f'source "{HERE}/run.sh"; log() {{ echo "$*" >&2; }}; '
+             f'build_into() {{ return 1; }}; export -f build_into; prune_cache() {{ :; }}; '
+             f'STATE="{state}"; built={v1}; broken={v2}; cd "{repo}"; SIM_FLEET_BRANCH=main; '
+             f'SIM_FLEET_GIT_TIMEOUT=60; SIM_FLEET_BUILD_TIMEOUT=60; '
+             f'SIM_FLEET_REPO_DIR="{repo}"; RUN_ARGS=(a); RUN_SH_SUM=0; ORIG_ENV=(); '
+             f'git remote set-url origin "{remote}"; git fetch -q origin main; '
+             f'git checkout -q --detach {v2}; '
+             f'follow_main; echo "NOT-REACHED"'],
+            env={"PATH": os.environ["PATH"], "HOME": d}, capture_output=True, text=True,
+            timeout=60)
+        self.assertIn(f"BUILT-RUN-SH marker={v1}", out.stdout, out.stderr)
+        self.assertNotIn("UNBUILT-RUN-SH", out.stdout)
+        self.assertNotIn("NOT-REACHED", out.stdout)
+
+    def _restore_case(self, set_remote_url, built_is_head):
+        """HEAD is on the unbuilt v2 (a restart during its build); returns follow_main's output."""
+        d = tempfile.mkdtemp()
+        self.addCleanup(subprocess.run, ["rm", "-rf", d])
+        remote, repo, state = (os.path.join(d, n) for n in ("remote", "repo", "state"))
+        os.makedirs(os.path.join(remote, "ops", "sim-fleet"))
+        self.git(remote, "init", "-q", "-b", "main")
+        run_sh = Path(remote, "ops", "sim-fleet", "run.sh")
+        run_sh.write_text('#!/usr/bin/env bash\necho "BUILT-RUN-SH marker=${SIM_FLEET_REEXEC:-}"\n')
+        self.git(remote, "add", "-A")
+        self.git(remote, "commit", "-q", "-m", "v1")
+        v1 = self.git(remote, "rev-parse", "HEAD")
+        subprocess.run(["git", "clone", "-q", remote, repo], check=True)
+        run_sh.write_text('#!/usr/bin/env bash\necho "UNBUILT-RUN-SH"\n')
+        self.git(remote, "commit", "-q", "-a", "-m", "v2")
+        v2 = self.git(remote, "rev-parse", "HEAD")
+        self.git(repo, "fetch", "-q", "origin", "main")
+        if built_is_head:  # main was reverted to the built commit
+            self.git(remote, "reset", "-q", "--hard", v1)
+        os.makedirs(state)
+        url = remote if set_remote_url else os.path.join(d, "gone")
+        return subprocess.run(
+            ["bash", "-c", f'source "{HERE}/run.sh"; log() {{ echo "$*" >&2; }}; '
+             f'STATE="{state}"; built={v1}; broken=""; cd "{repo}"; SIM_FLEET_BRANCH=main; '
+             f'SIM_FLEET_GIT_TIMEOUT=60; SIM_FLEET_REPO_DIR="{repo}"; RUN_ARGS=(a); '
+             f'RUN_SH_SUM=0; ORIG_ENV=(); git checkout -q --detach {v2}; '
+             f'git remote set-url origin "{url}"; follow_main; echo NOT-REACHED'],
+            env={"PATH": os.environ["PATH"], "HOME": d}, capture_output=True, text=True,
+            timeout=60)
+
+    def test_a_failed_fetch_still_hands_over_to_the_built_run_sh(self):
+        out = self._restore_case(set_remote_url=False, built_is_head=False)
+        self.assertIn("BUILT-RUN-SH", out.stdout, out.stderr)
+        self.assertNotIn("UNBUILT-RUN-SH", out.stdout)
+
+    def test_a_main_reverted_to_the_built_commit_hands_over_to_the_built_run_sh(self):
+        out = self._restore_case(set_remote_url=True, built_is_head=True)
+        self.assertIn("BUILT-RUN-SH", out.stdout, out.stderr)
+        self.assertNotIn("UNBUILT-RUN-SH", out.stdout)
+
+    def _checkout_fails(self, lock, built_known, on_unbuilt):
+        """follow_main under set -e when `git checkout` fails: returns, with one coded line."""
+        d = tempfile.mkdtemp()
+        self.addCleanup(subprocess.run, ["rm", "-rf", d])
+        remote, repo, state = (os.path.join(d, n) for n in ("remote", "repo", "state"))
+        os.makedirs(remote)
+        self.git(remote, "init", "-q", "-b", "main")
+        Path(remote, "f").write_text("v1")
+        self.git(remote, "add", "f")
+        self.git(remote, "commit", "-q", "-m", "v1")
+        v1 = self.git(remote, "rev-parse", "HEAD")
+        subprocess.run(["git", "clone", "-q", remote, repo], check=True)
+        Path(remote, "f").write_text("v2")
+        self.git(remote, "commit", "-q", "-a", "-m", "v2")
+        v2 = self.git(remote, "rev-parse", "HEAD")
+        self.git(repo, "fetch", "-q", "origin", "main")
+        os.makedirs(state)
+        built = v1 if built_known else "0123456789abcdef0123456789abcdef01234567"
+        start = v2 if on_unbuilt else v1
+        script = (f'source "{HERE}/run.sh"; log() {{ echo "$*" >&2; }}; '
+                  f'build_into() {{ return 1; }}; export -f build_into; prune_cache() {{ :; }}; '
+                  f'STATE="{state}"; built={built}; broken={v2 if on_unbuilt else ""}; '
+                  f'cd "{repo}"; SIM_FLEET_BRANCH=main; SIM_FLEET_GIT_TIMEOUT=60; '
+                  f'SIM_FLEET_BUILD_TIMEOUT=60; SIM_FLEET_REPO_DIR="{repo}"; RUN_ARGS=(a); '
+                  f'RUN_SH_SUM=0; ORIG_ENV=(); git checkout -q --detach {start}; ')
+        if lock:
+            script += 'touch .git/index.lock; '
+        out = subprocess.run(["bash", "-c", script + 'follow_main; echo "RETURNED rc=$?"'],
+                             env={"PATH": os.environ["PATH"], "HOME": d}, capture_output=True,
+                             text=True, timeout=60)
+        self.assertIn("RETURNED rc=0", out.stdout, out.stderr)
+        self.assertEqual(out.stderr.count("NRV-E0731"), 1, out.stderr)
+        self.assertIn("error[NRV-E0731]: cannot check out", out.stderr)
+        self.assertNotIn("\nfatal:", out.stderr)
+
+    def test_a_stale_index_lock_does_not_end_the_loop_restoring_the_built_commit(self):
+        self._checkout_fails(lock=True, built_known=True, on_unbuilt=True)
+
+    def test_a_stale_index_lock_does_not_end_the_loop_checking_out_a_new_head(self):
+        self._checkout_fails(lock=True, built_known=True, on_unbuilt=False)
+
+    def test_an_unknown_built_commit_does_not_end_the_loop(self):
+        self._checkout_fails(lock=False, built_known=False, on_unbuilt=True)
+
+    def _dirty_case(self, dirty_after, status_fails=False):
+        """A new head to check out; the tree is dirty before it, or git leaves it dirty (#439)."""
+        d = tempfile.mkdtemp()
+        self.addCleanup(subprocess.run, ["rm", "-rf", d])
+        remote, repo, state = (os.path.join(d, n) for n in ("remote", "repo", "state"))
+        os.makedirs(remote)
+        self.git(remote, "init", "-q", "-b", "main")
+        Path(remote, "f").write_text("v1")
+        self.git(remote, "add", "f")
+        self.git(remote, "commit", "-q", "-m", "v1")
+        v1 = self.git(remote, "rev-parse", "HEAD")
+        subprocess.run(["git", "clone", "-q", remote, repo], check=True)
+        Path(remote, "f").write_text("v2")
+        self.git(remote, "commit", "-q", "-a", "-m", "v2")
+        os.makedirs(state)
+        # build_into records what the tree held when it was built.
+        script = (f'source "{HERE}/run.sh"; log() {{ echo "$*" >&2; }}; '
+                  f'build_into() {{ cp f "{state}/tree-built"; return 0; }}; '
+                  f'prune_cache() {{ :; }}; STATE="{state}"; built={v1}; broken=; '
+                  f'cd "{repo}"; SIM_FLEET_BRANCH=main; SIM_FLEET_GIT_TIMEOUT=60; '
+                  f'SIM_FLEET_BUILD_TIMEOUT=60; SIM_FLEET_REPO_DIR="{repo}"; RUN_ARGS=(a); '
+                  f'RUN_SH_SUM=0; ORIG_ENV=(); ')
+        if status_fails:
+            # A corrupt index: `git status` exits 128 with nothing on stdout, so it must read as
+            # dirty, not as clean.
+            script += ('git() { if [[ "$1" == status ]]; then return 128; fi; '
+                       'command git "$@"; }; ')
+        elif dirty_after:
+            # git exits 0 but a file was not written (a full disk).
+            script += ('git() { command git "$@"; local rc=$?; '
+                       'if [[ "$1" == checkout ]]; then echo torn > f; fi; return $rc; }; ')
+        else:
+            script += 'echo torn > f; '
+        return subprocess.run(["bash", "-c", script + 'follow_main; echo "RC=$?"'],
+                              env={"PATH": os.environ["PATH"], "HOME": d}, capture_output=True,
+                              text=True, timeout=60), repo
+
+    def test_a_dirty_tree_is_forced_clean_by_the_next_checkout(self):
+        out, repo = self._dirty_case(dirty_after=False)
+        tree_built = Path(os.path.dirname(repo), "state", "tree-built")
+        self.assertEqual(tree_built.read_text(), "v2", out.stderr)
+        self.assertNotIn("NRV-E0731", out.stderr)
+
+    def test_a_checkout_that_leaves_the_tree_dirty_is_not_built(self):
+        out, repo = self._dirty_case(dirty_after=True)
+        self.assertIn("RC=0", out.stdout, out.stderr)
+        tree_built = Path(os.path.dirname(repo), "state", "tree-built")
+        self.assertFalse(tree_built.exists(), out.stderr)
+        # The new head's checkout, then the restore of the built commit, both torn by the wrapper.
+        self.assertEqual(out.stderr.count("NRV-E0731"), 2, out.stderr)
+        self.assertIn("tree is not clean", out.stderr)
+        # HEAD is back on the built commit, not left on the unbuilt head.
+        self.assertEqual(self.git(repo, "rev-parse", "HEAD"),
+                         self.git(repo, "rev-parse", "origin/main~1"), out.stderr)
+
+    def test_a_git_status_that_fails_reads_as_dirty_and_is_not_built(self):
+        out, repo = self._dirty_case(dirty_after=False, status_fails=True)
+        self.assertIn("RC=0", out.stdout, out.stderr)
+        self.assertFalse(Path(os.path.dirname(repo), "state", "tree-built").exists(), out.stderr)
+        self.assertIn("NRV-E0731", out.stderr)
+
+    def test_a_torn_restore_is_forced_again_and_not_exec_d_until_clean(self):
+        """Round 1 tears run.sh on the restore checkout; round 2 must heal it, not exec it."""
+        d = tempfile.mkdtemp()
+        self.addCleanup(subprocess.run, ["rm", "-rf", d])
+        remote, repo, state = (os.path.join(d, n) for n in ("remote", "repo", "state"))
+        os.makedirs(os.path.join(remote, "ops", "sim-fleet"))
+        self.git(remote, "init", "-q", "-b", "main")
+        run_sh = Path(remote, "ops", "sim-fleet", "run.sh")
+        run_sh.write_text('#!/usr/bin/env bash\necho "BUILT-RUN-SH"\n')
+        self.git(remote, "add", "-A")
+        self.git(remote, "commit", "-q", "-m", "v1")
+        v1 = self.git(remote, "rev-parse", "HEAD")
+        subprocess.run(["git", "clone", "-q", remote, repo], check=True)
+        run_sh.write_text('#!/usr/bin/env bash\necho "UNBUILT-RUN-SH"\n')
+        self.git(remote, "commit", "-q", "-a", "-m", "v2")
+        v2 = self.git(remote, "rev-parse", "HEAD")
+        self.git(repo, "fetch", "-q", "origin", "main")
+        os.makedirs(state)
+        out = subprocess.run(
+            ["bash", "-c", f'source "{HERE}/run.sh"; log() {{ echo "$*" >&2; }}; '
+             f'prune_cache() {{ :; }}; STATE="{state}"; built={v1}; broken={v2}; cd "{repo}"; '
+             f'SIM_FLEET_BRANCH=main; SIM_FLEET_GIT_TIMEOUT=60; SIM_FLEET_REPO_DIR="{repo}"; '
+             f'SIM_FLEET_BROKEN_RETRIES=3; SIM_FLEET_BROKEN_RETRY_SECONDS=7200; broken_tries=0; '
+             f'RUN_ARGS=(a); RUN_SH_SUM=0; ORIG_ENV=(); git checkout -q --detach {v2}; '
+             # git exits 0 but writes run.sh short, in round 1 only (a full disk).
+             f'tear=1; git() {{ command git "$@"; local rc=$?; if [[ "$1" == checkout && '
+             f'$tear == 1 ]]; then echo "echo TORN-RUN-SH" > ops/sim-fleet/run.sh; fi; '
+             f'return $rc; }}; '
+             f'follow_main; echo "ROUND1 head=$(git rev-parse HEAD) '
+             f'dirty=$(git status --porcelain -uno)"; tear=0; follow_main; echo NOT-REACHED'],
+            env={"PATH": os.environ["PATH"], "HOME": d}, capture_output=True, text=True,
+            timeout=60)
+        self.assertIn("ROUND1", out.stdout, out.stderr)
+        self.assertIn("dirty= M ops/sim-fleet/run.sh", out.stdout, out.stderr)
+        self.assertNotIn("TORN-RUN-SH", out.stdout)
+        self.assertIn("BUILT-RUN-SH", out.stdout, out.stderr)
+        self.assertNotIn("NOT-REACHED", out.stdout)
+
+    def test_a_restart_already_on_the_built_commit_stays_put(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(subprocess.run, ["rm", "-rf", d])
+        remote, repo, state = (os.path.join(d, n) for n in ("remote", "repo", "state"))
+        os.makedirs(remote)
+        self.git(remote, "init", "-q", "-b", "main")
+        Path(remote, "f").write_text("v1")
+        self.git(remote, "add", "f")
+        self.git(remote, "commit", "-q", "-m", "v1")
+        v1 = self.git(remote, "rev-parse", "HEAD")
+        subprocess.run(["git", "clone", "-q", remote, repo], check=True)
+        Path(remote, "f").write_text("v2")
+        self.git(remote, "commit", "-q", "-a", "-m", "v2")
+        v2 = self.git(remote, "rev-parse", "HEAD")
+        os.makedirs(state)
+        out = subprocess.run(
+            ["bash", "-c", f'source "{HERE}/run.sh"; log() {{ echo "$*" >&2; }}; '
+             f'STATE="{state}"; built={v1}; broken={v2}; cd "{repo}"; SIM_FLEET_BRANCH=main; '
+             f'SIM_FLEET_GIT_TIMEOUT=60; SIM_FLEET_REPO_DIR="{repo}"; '
+             f'git remote set-url origin "{remote}"; git checkout -q --detach {v1}; '
+             f'follow_main; echo "HEAD=$(git rev-parse HEAD)"'],
+            env={"PATH": os.environ["PATH"], "HOME": d}, capture_output=True, text=True,
+            timeout=60)
+        self.assertIn(f"HEAD={v1}", out.stdout, out.stderr)
+        self.assertNotIn("restoring", out.stderr)
 
 
 class AlarmRoundsSetting(unittest.TestCase):
@@ -1746,7 +1988,8 @@ class AlarmRoundsSetting(unittest.TestCase):
         for bad in ("0", "abc", "1000000", "-1"):
             out = self.check(bad)
             self.assertEqual(out.returncode, 2, (bad, out.stdout + out.stderr))
-            self.assertIn("SIM_FLEET_ALARM_ROUNDS must be a positive whole number", out.stdout + out.stderr)
+            self.assertIn("SIM_FLEET_ALARM_ROUNDS must be a positive whole number",
+                          out.stdout + out.stderr)
 
     def test_the_largest_value_passes_this_check(self):
         # It stops later (no token), not at the alarm setting.
@@ -1859,6 +2102,180 @@ class Rotation(unittest.TestCase):
             else:
                 want.append(kind)
         self.assertEqual(both, want)
+
+
+class BrokenRetry(unittest.TestCase):
+    """A commit whose build failed is retried after a bound, a bounded number of times (#289)."""
+
+    def setUp(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(subprocess.run, ["rm", "-rf", d])
+        self.d = d
+        self.remote, self.repo, self.state = (os.path.join(d, n)
+                                              for n in ("remote", "repo", "state"))
+        os.makedirs(self.remote)
+        os.makedirs(self.state)
+        self.git(self.remote, "init", "-q", "-b", "main")
+        Path(self.remote, "f").write_text("v1")
+        self.git(self.remote, "add", "f")
+        self.git(self.remote, "commit", "-q", "-m", "v1")
+        self.v1 = self.git(self.remote, "rev-parse", "HEAD")
+        subprocess.run(["git", "clone", "-q", self.remote, self.repo], check=True)
+        Path(self.remote, "f").write_text("v2")
+        self.git(self.remote, "commit", "-q", "-a", "-m", "v2")
+        self.v2 = self.git(self.remote, "rev-parse", "HEAD")
+
+    def git(self, cwd, *args):
+        return subprocess.run(["git", "-C", cwd, "-c", "user.name=t", "-c", "user.email=t@t",
+                               *args], capture_output=True, text=True, check=True).stdout.strip()
+
+    def rounds(self, n, builds_ok=False, retries=2, seconds=0, kill=False, no_checkout=False):
+        """Runs follow_main n times (a fresh shell each, as a restart); one line per round."""
+        lines = []
+        for _ in range(n):
+            broken = Path(self.state, "broken")
+            built = Path(self.state, "built")
+            ok = "return 0" if builds_ok else "return 1"
+            if kill:  # The loop dies (SIGKILL, as a restart or the OOM killer) mid-build.
+                ok = 'kill -9 "$MAIN"; sleep 30'
+            out = subprocess.run(
+                ["bash", "-c", f'source "{HERE}/run.sh"; log() {{ echo "$*" >&2; }}; '
+                 f'build_into() {{ echo x >>"{self.d}/builds"; {ok}; }}; '
+                 f'export -f build_into; export d="{self.d}" MAIN=$$; prune_cache() {{ :; }}; '
+                 f'STATE="{self.state}"; cd "{self.repo}"; SIM_FLEET_BRANCH=main; '
+                 f'SIM_FLEET_GIT_TIMEOUT=60; SIM_FLEET_BUILD_TIMEOUT=60; '
+                 f'SIM_FLEET_BROKEN_RETRIES={retries}; SIM_FLEET_BROKEN_RETRY_SECONDS={seconds}; '
+                 f'SIM_FLEET_REPO_DIR="{self.repo}"; RUN_ARGS=(a); RUN_SH_SUM=0; ORIG_ENV=(); '
+                 f'built=$(cat "{built}" 2>/dev/null || echo {self.v1}); '
+                 f'broken=$(cat "{broken}" 2>/dev/null || true); broken_tries=0; '
+                 f'git checkout -q --detach "$built"; git remote set-url origin "{self.remote}"; '
+                 f'{"checkout_commit() { return 1; }; " if no_checkout else ""}'
+                 f'follow_main; echo "built=$built broken=$broken"'],
+                env={"PATH": os.environ["PATH"], "HOME": self.d}, capture_output=True,
+                text=True, timeout=60)
+            lines.append(out)
+        return lines
+
+    def builds(self):
+        p = Path(self.d, "builds")
+        return len(p.read_text().split()) if p.exists() else 0
+
+    def test_a_broken_commit_is_retried_up_to_the_bound_then_left(self):
+        self.rounds(6)
+        # One build, then two retries, and no more: the bound is retries + 1 builds.
+        self.assertEqual(self.builds(), 3)
+        self.assertTrue(Path(self.state, "broken-tries").read_text().startswith(
+            f"{self.v2} 3 "))
+
+    def test_a_retry_killed_midway_still_counts(self):
+        self.rounds(1)  # The first build fails: v2 is broken.
+        for _ in range(6):  # Six boots, each killed during its retry build.
+            self.rounds(1, kill=True)
+        # One build, then retries 2 and 3 (killed), and no more: retries + 1 builds in all.
+        self.assertEqual(self.builds(), 3)
+        self.assertTrue(Path(self.state, "broken-tries").read_text().startswith(f"{self.v2} 3 "))
+        out = self.rounds(1)[0]
+        self.assertNotIn("retrying", out.stderr)
+        self.assertEqual(self.builds(), 3)
+
+    def test_a_failed_checkout_does_not_use_up_a_retry(self):
+        self.rounds(1)  # The first build fails: v2 is broken.
+        self.rounds(5, no_checkout=True)  # Retries are due, but no checkout succeeds.
+        self.assertEqual(self.builds(), 1)
+        self.assertTrue(Path(self.state, "broken-tries").read_text().startswith(f"{self.v2} 1 "))
+        self.rounds(6)  # The checkout is fixed: both retries still run.
+        self.assertEqual(self.builds(), 3)
+        self.assertTrue(Path(self.state, "broken-tries").read_text().startswith(f"{self.v2} 3 "))
+
+    def test_each_retry_keeps_its_own_build_log(self):
+        self.rounds(6)
+        logs = sorted(p.name for p in Path(self.state).glob("build.log*"))
+        self.assertEqual(logs, ["build.log", "build.log.2", "build.log.3"])
+
+    def test_a_new_head_removes_the_earlier_heads_retry_logs(self):
+        self.rounds(6)
+        Path(self.remote, "f").write_text("v3")
+        self.git(self.remote, "commit", "-q", "-a", "-m", "v3")
+        self.rounds(1)
+        logs = sorted(p.name for p in Path(self.state).glob("build.log*"))
+        self.assertEqual(logs, ["build.log"])
+
+    def test_a_broken_commit_is_not_retried_before_the_wait_is_over(self):
+        self.rounds(4, seconds=3600)
+        self.assertEqual(self.builds(), 1)
+
+    def test_a_retry_that_builds_is_recorded_and_clears_the_attempts(self):
+        self.rounds(1)
+        out = self.rounds(1, builds_ok=True)[0]
+        self.assertIn("retrying the build", out.stderr)
+        self.assertIn(f"built={self.v2}", out.stdout, out.stderr)
+        self.assertFalse(Path(self.state, "broken-tries").exists())
+
+    def test_a_missing_attempts_file_is_rewritten_not_retried_in_a_loop(self):
+        self.rounds(1)
+        Path(self.state, "broken-tries").unlink()
+        self.rounds(1, seconds=3600)
+        self.assertEqual(self.builds(), 1)
+        self.assertTrue(Path(self.state, "broken-tries").read_text().startswith(f"{self.v2} 1 "))
+
+    def test_a_new_head_starts_its_own_count(self):
+        self.rounds(6)
+        Path(self.remote, "f").write_text("v3")
+        self.git(self.remote, "commit", "-q", "-a", "-m", "v3")
+        v3 = self.git(self.remote, "rev-parse", "HEAD")
+        self.rounds(1)
+        self.assertEqual(self.builds(), 4)
+        self.assertTrue(Path(self.state, "broken-tries").read_text().startswith(f"{v3} 1 "))
+
+
+class BrokenRetrySettings(unittest.TestCase):
+    """The retry bound and wait are non-negative whole numbers."""
+
+    def run_sh(self, **env):
+        home = tempfile.mkdtemp()
+        self.addCleanup(subprocess.run, ["rm", "-rf", home])
+        return subprocess.run(["bash", f"{HERE}/run.sh"],
+                              env={"PATH": os.environ["PATH"], "SIM_FLEET_HOME": home, **env},
+                              capture_output=True, text=True, timeout=30)
+
+    def test_text_and_negatives_are_refused(self):
+        for var in ("SIM_FLEET_BROKEN_RETRIES", "SIM_FLEET_BROKEN_RETRY_SECONDS"):
+            for bad in ("three", "-1"):
+                out = self.run_sh(**{var: bad})
+                self.assertEqual(out.returncode, 2, (var, bad, out.stdout + out.stderr))
+                self.assertIn(f"error[NRV-E0740]: {var} must be a non-negative whole number",
+                              out.stdout + out.stderr)
+
+    def test_the_six_digit_limit(self):
+        for var in ("SIM_FLEET_BROKEN_RETRIES", "SIM_FLEET_BROKEN_RETRY_SECONDS"):
+            out = self.run_sh(**{var: "999999"})
+            self.assertNotIn("NRV-E0740", out.stdout + out.stderr, var)
+            out = self.run_sh(**{var: "1000000"})
+            self.assertEqual(out.returncode, 2, (var, out.stdout + out.stderr))
+            self.assertIn(f"error[NRV-E0740]: {var} must be", out.stdout + out.stderr)
+
+    def test_leading_zeros_are_decimal_not_octal(self):
+        for bad in ("08", "0900", "07200"):
+            for var in ("SIM_FLEET_BROKEN_RETRIES", "SIM_FLEET_BROKEN_RETRY_SECONDS"):
+                out = self.run_sh(**{var: bad})
+                self.assertNotIn("NRV-E0740", out.stdout + out.stderr, (var, bad))
+                self.assertNotIn("value too great", out.stdout + out.stderr, (var, bad))
+                self.assertIn("no token", out.stdout + out.stderr, (var, bad))
+
+    def test_leading_zeros_are_normalised_in_the_script(self):
+        script = (f'source <(sed -n "/^for v in SIM_FLEET_BROKEN_RETRIES/,/^done/p" '
+                  f'<(sed "s/^ *//" {HERE}/run.sh)); '
+                  f'echo "$SIM_FLEET_BROKEN_RETRIES $SIM_FLEET_BROKEN_RETRY_SECONDS"')
+        out = subprocess.run(["bash", "-c", "log(){ echo \"$*\"; }; " + script],
+                             env={"PATH": os.environ["PATH"], "SIM_FLEET_BROKEN_RETRIES": "08",
+                                  "SIM_FLEET_BROKEN_RETRY_SECONDS": "07200"},
+                             capture_output=True, text=True, timeout=30)
+        self.assertEqual(out.stdout.strip(), "8 7200", out.stdout + out.stderr)
+
+    def test_zero_passes_this_check(self):
+        out = self.run_sh(SIM_FLEET_BROKEN_RETRIES="0", SIM_FLEET_BROKEN_RETRY_SECONDS="0")
+        self.assertNotIn("must be a non-negative", out.stdout + out.stderr)
+        self.assertIn("no token", out.stdout + out.stderr)
 
 
 if __name__ == "__main__":

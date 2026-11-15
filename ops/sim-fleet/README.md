@@ -19,7 +19,16 @@ takes `flock` on `state/lock`) loops over rounds:
    deadline for all of it; `./zig/download.sh` first, so a toolchain bump is followed). Only a
    build that succeeded becomes the one in use (`state/built`); a tip that does not build is
    recorded in `state/broken`, logged once, and the last good build keeps running. Both survive a
-   restart, so a restart neither rebuilds a good commit nor retries a bad one.
+   restart, so a restart does not rebuild a good commit. A commit that failed to build is built
+   again once `SIM_FLEET_BROKEN_RETRY_SECONDS` (7200) have passed since its last start or failure, at most
+   `SIM_FLEET_BROKEN_RETRIES` (3) times (four builds in all), so one transient failure (a network
+   blip while the toolchain downloads) does not leave a candidate unsoaked; each retry keeps its log
+   (`state/build.log.<attempt>`) and logs `retrying the build of <sha>`. The count is
+   `state/broken-tries` (`<sha> <builds started> <epoch of the last start or failure>`, written
+   after a retry's checkout and before it builds: a failed checkout costs no attempt, a build killed midway counts); a new main commit starts its own
+   count, and a build that succeeds deletes the file. A restart does not reset it. To clear it by
+   hand (a commit out of attempts, or a cause fixed on the host), as `simfleet`: `rm state/broken
+   state/broken-tries`, then `systemctl restart sim-fleet`; the next round builds the tip at once.
 2. **Workers**, one core and about 4 GB of RAM each, `SIM_FLEET_WORKERS` of them (default: the
    smaller of every core but one, which is left for git, builds and the reporter, and
    `memory / SIM_FLEET_SEED_MEMORY_MB`, at least 1; memory is MemTotal minus
@@ -93,6 +102,9 @@ one.
   is over; the rounds in between are counted, and their failures are reported when they recur.
   A tracking issue that refuses the totals is retried each round. A request never follows a
   redirect, so the token never goes to another host.
+- The state file's `version` stays 1 while its schema only grows optional fields (a reader gives
+  each a default, so a file an older reporter wrote still loads); a field that is required,
+  renamed, retyped or dropped needs a new `version` and a migration in the same commit (#289).
 - Filed fingerprints are in `/var/lib/sim-fleet/state/state.json`. If that file is missing, the
   issue markers rebuild it (the latest 500 issues labelled `sim-fleet`) before anything is filed;
   until they can be read, rounds are still counted and nothing is filed. A state file that exists
@@ -210,13 +222,26 @@ empty.
 **Redeploying** (a change to `ops/sim-fleet/`): the reporter is the copy built with each commit,
 and a running `run.sh` hands over to the `run.sh` of each commit it builds (#424, P429): when that
 file's checksum differs from the one it loaded, it logs `run.sh of <sha> differs from the one
-running; re-executing it` and `exec`s it with the same arguments and the environment the unit gave it (not the defaults the old
-`run.sh` filled in), once per built
-commit (`SIM_FLEET_REEXEC` names the commit, so the new one does not exec again). A `run.sh` that fails `bash -n` is not exec'd (one `NRV-E0730` line). A build that fails puts the
-checkout back on the built commit and hands over to that commit's `run.sh` if the running one differs, so after a failed build a restart never starts an unbuilt `run.sh` (#432). A restart *during* a build still starts the checkout's, the unbuilt head's; that `run.sh` hands over at the end of the build, failed or not. A restart
-also picks up the checkout's `run.sh`: the fleet running before this change has no re-exec, so
-restart it once after the merge for it to take effect at once. A fleet pinned (`SIM_FLEET_BRANCH`) to a commit older than
-this change still runs that commit's `run.sh`: restart the unit after a re-pin.
+running; re-executing it` and `exec`s it with the same arguments and the environment the unit
+gave it (not the defaults the old `run.sh` filled in), once per built commit (`SIM_FLEET_REEXEC`
+names the commit, so the new one does not exec again). A `run.sh` that fails `bash -n` is not
+exec'd (one `NRV-E0730` line). A build that fails puts the checkout back on the built commit and
+hands over to that commit's `run.sh` if the running one differs, so after a failed build a
+restart never starts an unbuilt `run.sh` (#432). A restart that finds the checkout still on the
+unbuilt head (the loop died between recording the failure and the checkout) puts it back and
+hands over the same way, as does a round whose fetch fails or whose main is back at the built
+commit. A restart *during* a build still starts the checkout's, the unbuilt head's; that
+`run.sh` hands over at the end of the build, or at the next round if the build was cut short.
+A checkout that fails (a stale `.git/index.lock`, an unknown commit, a tree left dirty by a full
+disk) logs `error[NRV-E0731]` at most twice per round and the loop keeps testing the
+built commit; the checkout is forced, a tree that is not clean afterwards is never built (#439),
+and every round forces the built commit's checkout again until the tree is clean. Only the journal
+shows E0731: it raises no alarm. For an unknown
+built commit, `git -C <checkout> fetch origin <built commit>` or wait for main's next commit;
+do not delete `state/built`. A restart also picks up the
+checkout's `run.sh`: the fleet running before this change has no re-exec, so restart it once
+after the merge for it to take effect at once. A fleet pinned (`SIM_FLEET_BRANCH`) to a commit
+older than this change still runs that commit's `run.sh`: restart the unit after a re-pin.
 After a change to the unit or `setup.sh`, as root: `sh /var/lib/sim-fleet/nerva/ops/
 sim-fleet/setup.sh && systemctl restart sim-fleet`.
 
@@ -312,9 +337,10 @@ after the first build; the log says `settling round ... left by a stop or a
 crash`). Read `soak` for the old candidate only after that line, and for the new one only after
 its first round ends.
 
-**The candidate must contain this loop.** `run.sh` runs from the checkout it builds (a running one re-execs the `run.sh` of each commit it
-builds, P429), and the reporter is copied from the commit it built, so pinning the fleet to a commit
-runs that commit's `run.sh` and `sim_fleet.py`. The guarantees above (#370, #387, P382) hold only for a candidate
+**The candidate must contain this loop.** `run.sh` runs from the checkout it builds (a running
+one re-execs the `run.sh` of each commit it builds, P429), and the reporter is copied from the
+commit it built, so pinning the fleet to a commit runs that commit's `run.sh` and `sim_fleet.py`.
+The guarantees above (#370, #387, P382) hold only for a candidate
 that contains #382. An older candidate runs the old loop: its reporter refuses `ingest
 --round-id` and `refuse`, the new `run.sh` exits 1, systemd restarts the checkout's old `run.sh`,
 and that deletes the round in flight uncounted. Pin a candidate that contains #382; one whose
