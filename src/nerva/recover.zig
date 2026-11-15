@@ -68,14 +68,24 @@ pub const Summary = struct {
 /// Formats `options.path` as replica `options.replica` of the running cluster, or exits with a
 /// coded diagnostic. Leaves nothing but `options.path` behind, and not even that on a failure.
 pub fn run(gpa: std.mem.Allocator, options: Options) void {
-    const summary = attempt(gpa, options) catch |err| switch (err) {
+    var link_cause: anyerror = undefined;
+    const summary = attempt(gpa, options, &link_cause) catch |err| switch (err) {
         error.Timeout => diag.fail(
             "NRV-E0712",
             "recover: the cluster did not commit recover's requests within {} seconds",
             .{@divFloor(recover_timeout.ns, std.time.ns_per_s)},
             "bring back enough of the other replicas, then run nerva recover again; " ++
-                "with fewer, restore from a backup",
+                "with fewer, restore from a backup; if they are all running, check that " ++
+                "--cluster is the id of the running cluster, because a wrong one is " ++
+                "ignored by every replica and looks the same",
             .{},
+        ),
+        error.LinkRefused => diag.fail(
+            "NRV-E0724",
+            "recover: cannot move {s}.recovering to {s}: {s}",
+            .{ options.path, options.path, link_reason(link_cause) },
+            "check the directory of {s}, then run nerva recover again; nothing was left behind",
+            .{options.path},
         ),
         error.Evicted => {
             // Evicted for its release: NRV-E0609/E0610, not "too many sessions".
@@ -102,7 +112,47 @@ pub fn run(gpa: std.mem.Allocator, options: Options) void {
         "with one index void the cluster's guarantees", .{options.replica});
 }
 
-fn attempt(gpa: std.mem.Allocator, options: Options) !Summary {
+/// What the operator reads for a `linkat` failure that moves the finished data file into place.
+fn link_reason(err: anyerror) []const u8 {
+    return switch (err) {
+        error.PathAlreadyExists => "the path now exists",
+        error.NotSameFileSystem => "the two names are on different file systems",
+        error.DiskQuota => "the disk quota is exhausted",
+        error.LinkQuotaExceeded => "the file system allows no more links to the file",
+        error.SymLinkLoop => "the path has too many symbolic links",
+        error.FileSystem => "the file system reported an error",
+        error.SystemResources => "the kernel is out of memory",
+        else => unreachable,
+    };
+}
+
+/// Moves the finished data file to its name with `linkat`. The refusals E0724 names are
+/// `LinkRefused`, with the cause in `cause`; any other `linkat` error (a permission or a missing
+/// directory) is returned as it is, for `diag.fail_file`. Nothing here exits, so the caller's
+/// cleanup runs and removes `from`.
+fn link_into_place(
+    dir: std.posix.fd_t,
+    from: []const u8,
+    to: []const u8,
+    cause: *anyerror,
+) !void {
+    std.posix.linkat(dir, from, dir, to, 0) catch |err| switch (err) {
+        error.PathAlreadyExists,
+        error.NotSameFileSystem,
+        error.DiskQuota,
+        error.LinkQuotaExceeded,
+        error.SymLinkLoop,
+        error.FileSystem,
+        error.SystemResources,
+        => {
+            cause.* = err;
+            return error.LinkRefused;
+        },
+        else => return err,
+    };
+}
+
+fn attempt(gpa: std.mem.Allocator, options: Options, link_cause: *anyerror) !Summary {
     assert(options.replica_count >= replica_count_min);
     assert(options.replica < options.replica_count);
     assert(options.addresses.len == options.replica_count);
@@ -162,8 +212,7 @@ fn attempt(gpa: std.mem.Allocator, options: Options) !Summary {
     storage_open = false;
 
     // Every write is on disk: the data file is complete, and takes its name (as import does).
-    const cwd = std.posix.AT.FDCWD;
-    try std.posix.linkat(cwd, recovering, cwd, options.path, 0);
+    try link_into_place(std.posix.AT.FDCWD, recovering, options.path, link_cause);
     try std.fs.cwd().deleteFile(recovering);
     try directory_sync(options.path);
     return .{ .view = view };
@@ -382,6 +431,49 @@ test origin_parse {
     }) |text| {
         try std.testing.expectError(error.Invalid, origin_parse(text));
     }
+}
+
+test "link_into_place refuses an existing path as LinkRefused and leaves it untouched" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "x.recovering", .data = "new" });
+    try tmp.dir.writeFile(.{ .sub_path = "x", .data = "old" });
+
+    // The one a real operator meets: the path appeared while recover ran.
+    var cause: anyerror = undefined;
+    try std.testing.expectError(
+        error.LinkRefused,
+        link_into_place(tmp.dir.fd, "x.recovering", "x", &cause),
+    );
+    try std.testing.expectEqual(error.PathAlreadyExists, cause);
+    try std.testing.expectEqualStrings("the path now exists", link_reason(cause));
+    var buffer: [8]u8 = undefined;
+    try std.testing.expectEqualStrings("old", try tmp.dir.readFile("x", &buffer));
+    // The caller's errdefer (not this function) removes `.recovering`: it is still here.
+    try tmp.dir.access("x.recovering", .{});
+}
+
+test "link_into_place returns any other linkat error as it is, not as LinkRefused" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cause: anyerror = undefined;
+    // `from` does not exist: a missing file is not one of E0724's refusals (it is E0810's).
+    try std.testing.expectError(
+        error.FileNotFound,
+        link_into_place(tmp.dir.fd, "missing.recovering", "missing", &cause),
+    );
+}
+
+test "link_reason names every refusal E0724 lists" {
+    for ([_]anyerror{
+        error.PathAlreadyExists,
+        error.NotSameFileSystem,
+        error.DiskQuota,
+        error.LinkQuotaExceeded,
+        error.SymLinkLoop,
+        error.FileSystem,
+        error.SystemResources,
+    }) |e| try std.testing.expect(link_reason(e).len > 0);
 }
 
 fn flags_test(replica: u8, replica_count: u8, address_count: u8, origin: []const u8) Flags {
