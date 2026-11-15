@@ -31,7 +31,7 @@ import tempfile
 import time
 import traceback
 
-KEY = "macos-smoke-key"
+KEY = "macos-smoke-key-0123456789abcdef0123456789"
 REPLICAS = 3
 STATSD_SECONDS = 25
 step_number = 0

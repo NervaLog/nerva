@@ -18,7 +18,7 @@ import sys
 import tempfile
 import time
 
-KEY = "ipv6-test-key"
+KEY = "ipv6-test-key-0123456789abcdef0123456789"
 
 
 def ipv6_missing():
