@@ -34,7 +34,7 @@ import time
 # Replicas authenticate each other with a real cluster key, never the development key (P102).
 os.environ["NERVA_CLUSTER_KEY"] = os.urandom(32).hex()
 
-KEY = "recover-test-key"
+KEY = "recover-test-key-0123456789abcdef0123456789"
 TABLE = 3
 RECOVER_TIMEOUT_SECONDS = 60  # `recover_timeout` in src/nerva/recover.zig.
 

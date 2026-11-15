@@ -41,7 +41,7 @@ const body_size_max = 16 * 1024;
 const reply_size_max = 16 * 1024;
 const funding_body_size_max = 128 * 1024;
 const io_timeout_s = 30;
-const key_header = "bench-botpike-key";
+const key_header = "bench-botpike-key-0123456789abcdef";
 
 pub const Params = struct {
     /// The gateway to send to.

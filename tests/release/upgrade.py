@@ -40,7 +40,7 @@ import time
 # Replicas authenticate each other with a real cluster key, never the development key (P102).
 os.environ["NERVA_CLUSTER_KEY"] = os.urandom(32).hex()
 
-KEY = "upgrade-test-key"
+KEY = "upgrade-test-key-0123456789abcdef0123456789"
 SEATS = 5        # A layout; the early view and the late view.
 COUNTERS = 6     # No layout: raw values and adds.
 ACCOUNTS = 40    # The ledger: available and held, floored at zero.

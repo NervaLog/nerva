@@ -17,9 +17,9 @@ milestone only when that milestone's demo is green in CI.*
 | --- | --- | --- |
 | v0.6.0 | Facts beside money | Released: commit keys, records, declared indexes (G1) |
 | v0.7.0 | Production gate, part one | Released: R4 Gateway and R5 Recover delivered |
-| v0.7.1 | Alpha | Being released: soak, Jepsen, packages and docs for a first outside user |
+| v0.7.1 | Alpha | Released 2026-11-15: packages and docs for a first outside user; shipped before the full soak by the owner's waiver (P451) |
 
-## v0.7.1 · Alpha (in release)
+## v0.7.1 · Alpha (released 2026-11-15)
 
 For someone who is not us to install Nerva, run it and trust what it says.
 

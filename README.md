@@ -226,7 +226,8 @@ A gateway serves plain HTTP on loopback, one `nerva api` per client process. Sta
 the process it serves, with every replica's address, and give that process its own `NERVA_KEY`:
 
 ```bash
-NERVA_KEY=secret nerva api --cluster=1 --addresses=10.0.0.1:3001,10.0.0.2:3001,10.0.0.3:3001 \
+export NERVA_KEY=$(openssl rand -hex 32)   # once; the client sends the same value
+nerva api --cluster=1 --addresses=10.0.0.1:3001,10.0.0.2:3001,10.0.0.3:3001 \
     --listen=127.0.0.1:8080
 ```
 
@@ -302,7 +303,9 @@ nerva start --addresses=3001,3002,3003 0_0.nerva   # and 0_1, 0_2
 - A view declared only through the Zig client, with no catalog document, cannot be imported:
   `import` refuses it. Declare views through `nerva api`.
 - **Format versions.** An export of a cluster with records or indexes is version 2 (P123b);
-  any other is version 1, which every release since v0.4.0 reads. A release reads both. From
+  any other is version 1, which every release since v0.4.0 reads. A release reads both. The header's reserved word is a flags word (P426): a release writes 0, so its exports read
+  in every release; an export from a keys-off test build sets bit 0, which a release refuses by
+  name (NRV-E0812) and an earlier release as corrupt (NRV-E0804). From
   v0.5.0 to v0.6.0, rows in tables from `2147483648` up must move below it first: those tables
   now hold records, and `import` refuses such rows by name (P123e).
 - **Memory.** v0.6.0's replica takes about 0.5 GiB more than v0.5.0's (3.0 GB at startup with
@@ -555,9 +558,10 @@ python3 perf/nightly/test_file_issue.py   # its tests, offline (CI runs them)
 `nerva api` serves the core operations as JSON over HTTP, for any language:
 
 ```bash
-NERVA_KEY=secret ./zig-out/bin/nerva api --cluster=1 --addresses=3001,3002,3003 \
+export NERVA_KEY=$(openssl rand -hex 32)
+./zig-out/bin/nerva api --cluster=1 --addresses=3001,3002,3003 \
     --listen=127.0.0.1:8080
-curl -H 'X-Nerva-Key: secret' -d '{"entries":[{"kind":"put","table":1,"id":"5","value_hex":"c0ffee"}]}' \
+curl -H "X-Nerva-Key: $NERVA_KEY" -d '{"entries":[{"kind":"put","table":1,"id":"5","value_hex":"c0ffee"}]}' \
     http://127.0.0.1:8080/v1/commit        # {"status":"committed","op":"42"}
 ```
 
@@ -593,17 +597,17 @@ read them from the log; one that another gateway extended is never used for an a
 get wrong (`api.zig`, "Layouts").
 
 ```bash
-curl -X PUT -H 'X-Nerva-Key: secret' http://127.0.0.1:8080/v1/tables/2147483649 -d '{"name":"executions",
+curl -X PUT -H "X-Nerva-Key: $NERVA_KEY" http://127.0.0.1:8080/v1/tables/2147483649 -d '{"name":"executions",
   "fields":[{"name":"agent","type":"bytes","size":16},{"name":"status","type":"u8"},
             {"name":"created","type":"u64"},{"name":"amount","type":"u64"}]}'
 # A balance (row) and the fact of its move (record) in one transaction:
-curl -H 'X-Nerva-Key: secret' http://127.0.0.1:8080/v1/commit -d '{"key":"<32 hex digits>","entries":[
+curl -H "X-Nerva-Key: $NERVA_KEY" http://127.0.0.1:8080/v1/commit -d '{"key":"<32 hex digits>","entries":[
   {"kind":"add","table":7,"id":"1","field":"available","delta":"-30","min":"0"},
   {"kind":"put","table":2147483649,"id":"0190f1c2a7e47b3c9d2e5f6a7b8c9d0e",
    "fields":{"agent":"…","status":1,"created":"1760600000","amount":"30"}}]}'
-curl -X PUT -H 'X-Nerva-Key: secret' http://127.0.0.1:8080/v1/indexes/reserved -d '{"table":2147483649,
+curl -X PUT -H "X-Nerva-Key: $NERVA_KEY" http://127.0.0.1:8080/v1/indexes/reserved -d '{"table":2147483649,
   "order":"created","where":[{"field":"status","op":"eq","value":1}]}'
-curl -H 'X-Nerva-Key: secret' http://127.0.0.1:8080/v1/indexes/reserved/scan -d '{"max":"1760599000","limit":100}'
+curl -H "X-Nerva-Key: $NERVA_KEY" http://127.0.0.1:8080/v1/indexes/reserved/scan -d '{"max":"1760599000","limit":100}'
 ```
 
 Both gateways (`nerva api`, `nerva view`) execute one cluster request at a time but read up to 16
@@ -695,18 +699,18 @@ client cannot create or destroy value, overdraw a floored field, or overwrite a 
 it builds its requests: the cluster refuses the transaction.
 
 ```bash
-curl -X PUT -H 'X-Nerva-Key: secret' http://127.0.0.1:8080/v1/tables/7 -d '{"name": "accounts",
+curl -X PUT -H "X-Nerva-Key: $NERVA_KEY" http://127.0.0.1:8080/v1/tables/7 -d '{"name": "accounts",
   "fields": [{"name": "available", "type": "i64"}, {"name": "held", "type": "i64"}]}'
-curl -X PUT -H 'X-Nerva-Key: secret' http://127.0.0.1:8080/v1/tables/8 -d '{"name": "sources",
+curl -X PUT -H "X-Nerva-Key: $NERVA_KEY" http://127.0.0.1:8080/v1/tables/8 -d '{"name": "sources",
   "fields": [{"name": "balance", "type": "i64"}]}'
-curl -X PUT -H 'X-Nerva-Key: secret' http://127.0.0.1:8080/v1/ledgers/1 -d '{"fields": [
+curl -X PUT -H "X-Nerva-Key: $NERVA_KEY" http://127.0.0.1:8080/v1/ledgers/1 -d '{"fields": [
   {"table": 7, "field": "available", "floor": "0"}, {"table": 7, "field": "held", "floor": "0"},
   {"table": 8, "field": "balance", "floor": null}]}'
 # {"ledger":1,"declared":"created","op":"57"}
 
 # Reserve up to 30: the first half (pair) may clamp at its floor; its partner, the next entry,
 # names it in delta_from and moves exactly what it took.
-curl -H 'X-Nerva-Key: secret' http://127.0.0.1:8080/v1/commit -d '{"entries": [
+curl -H "X-Nerva-Key: $NERVA_KEY" http://127.0.0.1:8080/v1/commit -d '{"entries": [
   {"kind": "add", "table": 7, "id": "1", "field": "available", "delta": "-30", "pair": true,
    "clamp": true},
   {"kind": "add", "table": 7, "id": "1", "field": "held", "delta_from": 0}]}'
@@ -744,10 +748,10 @@ A view is a declaration in the log, not code. Declare a table's layout, then a v
 through `nerva api`, and read it there, latest or as of any op since it was declared:
 
 ```bash
-curl -X PUT -H 'X-Nerva-Key: secret' http://127.0.0.1:8080/v1/views/revenue -d '{
+curl -X PUT -H "X-Nerva-Key: $NERVA_KEY" http://127.0.0.1:8080/v1/views/revenue -d '{
   "table": 5, "where": [{"field": "sold", "op": "eq", "value": true}],
   "group_by": ["section"], "aggregates": [{"fn": "count"}, {"fn": "sum", "field": "price"}]}'
-curl -H 'X-Nerva-Key: secret' 'http://127.0.0.1:8080/v1/views/revenue?as_of=1234'
+curl -H "X-Nerva-Key: $NERVA_KEY" 'http://127.0.0.1:8080/v1/views/revenue?as_of=1234'
 # {"view":"revenue","op":"1234","hash":"…","view_hash":"…","declared_op":"812",
 #  "groups":[{"section":1,"count":"12","sum_price":"5400"},…]}
 ```

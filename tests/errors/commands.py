@@ -5,8 +5,10 @@ Usage: commands.py <nerva> [<nerva built with -Dtest-commit-keys=off>]
 
 For each code a command emits (docs/ERRORS.md, 00xx, 06xx, 08xx, 09xx), triggers it and checks
 the first line (`error[NRV-…]: …`), the `cause` and `fix` lines, the exit status, and that no
-stack trace and no raw Zig error name (`error.Name`) is printed. NRV-E0701 is in `tests/release/mixed.py` (it needs a binary of another release), NRV-E0704
-and E0705 need a file system without direct IO and a kernel older than 5.11, so only unit tests of
+stack trace and no raw Zig error name (`error.Name`) is printed. NRV-E0701 and E0718 are here for the keys-off build's file and, for two real releases, in
+`tests/release/mixed.py` (it needs a binary of another release), NRV-E0609 for the keys-off
+build's clients against a release cluster (E0610 has a unit test only: no build here runs below
+`release_client_min`), NRV-E0704 and E0705 need a file system without direct IO and a kernel older than 5.11, so only unit tests of
 `src/nerva/preflight.zig` cover their parts. Codes that need a failing disk
 or an export whose checks fail (NRV-E0706, E0708, E0803, E0807) are covered by unit tests of
 `src/nerva/diagnostic.zig` only.
@@ -21,11 +23,12 @@ import subprocess
 import sys
 import tempfile
 import time
+import zlib
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "api"))
 from api import Cluster  # noqa: E402
 
-KEY = "errors-test-key"
+KEY = "errors-test-key-0123456789abcdef0123456789"
 # `start --statsd=<unsendable>` (#198, P427): the NRV-W0733 line lands about 20 s after open (two
 # 10 s emits), so wait up to this long for it, then stay up this long (two more emits) to count.
 STATSD_WARN_DEADLINE_S = 90
@@ -132,6 +135,10 @@ def main():
                       "NRV-E0009", 1, "is not loopback", env={"NERVA_KEY": KEY})
             check(f"{command} key", [command, "--cluster=0", "--addresses=127.0.0.1:1",
                                      "--listen=127.0.0.1:0"], "NRV-E0008", 1, "NERVA_KEY")
+            # #335: a gateway key shorter than 32 bytes is refused.
+            check(f"{command} short key", [command, "--cluster=0", "--addresses=127.0.0.1:1",
+                                           "--listen=127.0.0.1:0"], "NRV-E0008", 1,
+                  "shorter than 32 bytes", env={"NERVA_KEY": "short"})
         # The vendored flag parser's own failures (stdx/flags.zig `fatal`, through the hook).
         check("unknown subcommand", ["frobnicate"], "NRV-E0001", 1, "unknown subcommand")
         check("no subcommand", [], "NRV-E0001", 1, "subcommand required")
@@ -145,12 +152,36 @@ def main():
                                         data + ".z"], "NRV-E0001", 1, "--cluster")
         check("unexpected positional", ["version", "extra"], "NRV-E0001", 1, "extra")
         check("unknown version flag", ["version", "--bogus"], "NRV-E0001", 1, "--bogus")
+        # #300: the fix line of a flag refusal names a command that works. `nerva --help` is the
+        # only help there is; `nerva <command> --help` is refused, so no hint may name it.
+        hint = "run nerva --help, which lists every command and the flags it takes"
+        for label, argv, fix_line in (
+                ("E0001", ["format", "--bogus=1"], "  fix    " + hint),
+                ("E0002", ["api", "--cluster=0", "--addresses=127.0.0.1:1",
+                           "--listen=127.0.0.1:0", "--request-timeout=1"],
+                 "  fix    the message names the bound; " + hint)):
+            refused = run(nerva, argv, {"NERVA_KEY": KEY})
+            fix = [line for line in refused.stderr.splitlines() if line.startswith("  fix    ")]
+            assert fix == [fix_line], (label, refused.stderr)
+        # The premise (P338): per-command help does not exist. The day it does, this fails and
+        # points at the hint.
+        check("command help refused", ["start", "--help"], "NRV-E0001", 1, "--help")
+        helped = run(nerva, ["--help"])
+        assert helped.returncode == 0, helped.stderr
+        for command in ("format", "start", "view", "api", "export", "import", "backup",
+                        "restore", "recover", "version"):
+            assert f"nerva {command} " in helped.stdout, command
         check("as-of", ["export", "--cluster=0", "--addresses=127.0.0.1:1", "--as-of=0",
                         "--output=" + os.path.join(tmp, "x")], "NRV-E0001", 1, "--as-of")
         check("addresses", ["start", "--addresses=127.0.0.1:1,127.0.0.1:2", "--development",
                             data], "NRV-E0710", 1, "--addresses")
         check("cluster key", ["start", "--addresses=10.0.0.1:1,10.0.0.2:2,10.0.0.3:3", data],
               "NRV-E0901", 1, "NERVA_CLUSTER_KEY")
+        # #336: the published development key, set explicitly, is refused off loopback.
+        check("development key off loopback",
+              ["start", "--addresses=10.0.0.1:1,10.0.0.2:2,10.0.0.3:3", data],
+              "NRV-E0901", 1, "is the public development key",
+              env={"NERVA_CLUSTER_KEY": "nerva-development-cluster-key-public-do-not-use"})
         trace = os.path.join(tmp, "trace")
         open(trace, "w").close()
         check("trace exists", ["start", "--addresses=127.0.0.1:1,127.0.0.1:2,127.0.0.1:3",
@@ -279,8 +310,91 @@ def main():
         before = sha(data)
         with open(data, "rb") as holder:
             fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            check("start locked file", start + [data], "NRV-E0703", 1, "another process holds")
+            # The pid is named where /proc/locks names this file as os.stat does; on a file
+            # system that differs (btrfs subvolumes, overlayfs) it is not, and the refusal is
+            # the same without it.
+            info = os.fstat(holder.fileno())
+            key = f"{os.major(info.st_dev):02x}:{os.minor(info.st_dev):02x}:{info.st_ino} "
+            try:
+                with open("/proc/locks") as table:
+                    named = any(key in line for line in table)
+            except OSError:
+                named = False
+            check("start locked file", start + [data], "NRV-E0703", 1,
+                  f"another process holds {data}" + (f" (pid {os.getpid()})" if named else ""))
         assert sha(data) == before
+
+        # A binary with multiversion sections that hold no bundle: NRV-E0719, not a replica
+        # that runs as one release (P415). Needs objcopy; E0726 and the size bound are
+        # unit-tested on `bundle_present` (src/nerva_main.zig), which a test as root can reach.
+        # Only the two cases that run the release build need vm.memfd_noexec to be 0 (the
+        # kernel check, NRV-E0720, comes first); the E0720 cases name their own sysctl file.
+        objcopy = shutil.which("objcopy")
+        try:
+            with open("/proc/sys/vm/memfd_noexec") as f:
+                memfd_noexec = f.read().strip()
+        except OSError:
+            memfd_noexec = "0"  # No such sysctl (kernel before 6.3): nothing refuses.
+        if not objcopy:
+            print("SKIP damaged-bundle cases (NRV-E0719, NRV-E0720): objcopy is not installed")
+        else:
+            junk = os.path.join(tmp, "junk-section")
+            with open(junk, "wb") as f:
+                f.write(b"not a bundle" * 100)
+            damaged_bundle = os.path.join(tmp, "nerva-damaged-bundle")
+            subprocess.run([objcopy, "--add-section", f".tb_mvb={junk}",
+                            "--add-section", f".tb_mvh={junk}", nerva, damaged_bundle],
+                           check=True)
+            os.chmod(damaged_bundle, 0o755)
+            # One section of the two only: `parse_elf` finds no bundle, but the names are still
+            # there. `version` calls that damaged, and `start` must too, never run it as one
+            # release (P417). Built from a stripped copy: objcopy writes `.symtab`, `.strtab`
+            # and `.shstrtab` after an added section, and on the unstripped binary `parse_elf`
+            # fails on that layout before it looks for the bundle, so the check would pass
+            # without `damaged_when_unbundled`.
+            stripped = os.path.join(tmp, "nerva-stripped")
+            subprocess.run([objcopy, "--strip-all", nerva, stripped], check=True)
+            half_bundle = os.path.join(tmp, "nerva-half-bundle")
+            subprocess.run([objcopy, "--add-section", f".tb_mvb={junk}", stripped, half_bundle],
+                           check=True)
+            os.chmod(half_bundle, 0o755)
+            check("version with half a bundle", ["version"], "NRV-E0719", 1,
+                  "bundled release is damaged", nerva=half_bundle)
+            # `start` reads the bundle before the kernel check, so half a bundle is NRV-E0719
+            # whatever the sysctl says.
+            check("start with half a bundle", start + [data], "NRV-E0719", 1,
+                  "bundle of releases cannot be read", nerva=half_bundle)
+            assert sha(data) == before
+            if memfd_noexec == "0":
+                check("start with a damaged bundle", start + [data], "NRV-E0719", 1,
+                      "bundle of releases cannot be read", nerva=damaged_bundle)
+                assert sha(data) == before
+            else:
+                print(f"SKIP damaged bundle (NRV-E0719): vm.memfd_noexec is {memfd_noexec}, "
+                      f"and the host's kernel check (NRV-E0720) comes first")
+            # NRV-E0720 before the bundle is opened, in the test build only, where the sysctl
+            # path can be named; a release build ignores the variable.
+            refused = os.path.join(tmp, "memfd_noexec")
+            with open(refused, "w") as f:
+                f.write("2\n")
+            damaged_off = os.path.join(tmp, "nerva-damaged-bundle-off")
+            subprocess.run([objcopy, "--add-section", f".tb_mvb={junk}",
+                            "--add-section", f".tb_mvh={junk}", nerva_off, damaged_off],
+                           check=True)
+            os.chmod(damaged_off, 0o755)
+            env_noexec = {"NERVA_MEMFD_NOEXEC_PATH": refused}
+            check("start with memfd_noexec 2", start + [data], "NRV-E0720", 1,
+                  "vm.memfd_noexec is not 0", env=env_noexec, nerva=damaged_off)
+            with open(refused, "w") as f:
+                f.write("1\n")
+            check("start with memfd_noexec 1", start + [data], "NRV-E0720", 1,
+                  "vm.memfd_noexec is not 0", env=env_noexec, nerva=damaged_off)
+            # These two do not depend on the host: the sysctl path is the test's own file.
+            if memfd_noexec == "0":
+                check("release build ignores the sysctl override", start + [data], "NRV-E0719",
+                      1, "bundle of releases cannot be read", env=env_noexec,
+                      nerva=damaged_bundle)
+            assert sha(data) == before
 
         # The test build with commit-key deduplication off (R1): E0717 without --development,
         # W0701 before the data file is opened with it, `+keys-off` in `version`; a release
@@ -290,6 +404,30 @@ def main():
         version_off = run(nerva_off, ["version"])
         assert version_off.returncode == 0 and \
             version_off.stdout.splitlines()[0].endswith("+keys-off"), version_off.stdout
+        # It runs another release than a release build (#222), so a release build refuses its
+        # data file (NRV-E0718: the file's release is above its own), and the other way round
+        # (NRV-E0701: below), with the releases named. That replicas of two
+        # releases ignore each other (N61) is `tests/release/mixed.py`'s and
+        # `src/nerva/release_peers.zig`'s: no run here has a keys-off and a release replica
+        # in one cluster.
+        release_line = [l for l in version.stdout.splitlines() if l.startswith("release ")][0]
+        release_line_off = [l for l in version_off.stdout.splitlines()
+                            if l.startswith("release ")][0]
+        assert release_line != release_line_off, (release_line, release_line_off)
+        release_text, release_text_off = release_line[8:], release_line_off[8:]
+        data_off = os.path.join(tmp, "keys-off.nerva")
+        assert run(nerva_off, fmt + [data_off]).returncode == 0
+        digest_off = sha(data_off)
+        digest = sha(data)
+        check("start a keys-off file with a release build", start + [data_off],
+              "NRV-E0718", 1, f"belongs to a cluster that runs release {release_text_off}, and this "
+              f"binary runs {release_text} and bundles none")
+        check("start a release file with a keys-off build", start + [data], "NRV-E0701",
+              1, f"was written by release {release_text}, and this binary runs "
+              f"{release_text_off} and bundles none", nerva=nerva_off)
+        assert sha(data_off) == digest_off
+        assert sha(data) == digest
+        os.remove(data_off)
         verbose_off = run(nerva_off, ["version", "--verbose"])
         assert verbose_off.stdout.splitlines()[-1] == "commit_keys off", verbose_off.stdout
         # `version`'s text (R6): the first line is the one the release workflow reads; then what
@@ -364,6 +502,19 @@ def main():
             first = run(nerva, export + ["--output=" + out])
             assert first.returncode == 0, first.stderr[-2000:]
             check("export exists", export + ["--output=" + out], "NRV-E0004", 1, "exists")
+            # The keys-off build's own clients run its release, above this cluster's: the
+            # replica evicts them (`client_release_too_high`), a refusal with its own code (#356, #222).
+            too_new = f"the cluster runs release {release_text}; this client, release " \
+                f"{release_text_off}, is newer, so it was evicted"
+            check("export from a newer release", export + ["--output=" + os.path.join(tmp, "n")],
+                  "NRV-E0609", 1, too_new, nerva=nerva_off)
+            assert not os.path.exists(os.path.join(tmp, "n"))
+            for command in ("api", "view"):
+                check(f"{command} from a newer release",
+                      [command, "--cluster=0", f"--addresses={cluster.address}",
+                       "--listen=127.0.0.1:0"], "NRV-E0609", 1, too_new,
+                      env={"NERVA_KEY": KEY}, nerva=nerva_off)
+            seen.append("NRV-E0609")
             check("export as-of ahead", export + ["--as-of=99999999",
                                                   "--output=" + os.path.join(tmp, "f")],
                   "NRV-E0802", 1, "--as-of")
@@ -380,6 +531,52 @@ def main():
             check("import future version",
                   imp + ["--input=" + future, os.path.join(tmp, "g.nerva")],
                   "NRV-E0805", 1, "version")
+            # A keys-off export (P426): flag bit 0 at byte 12. The end record (the last 44 bytes:
+            # size, kind, the SHA-256 of every byte before it, the CRC-32 of those) is rebuilt, so
+            # only the flag is refused. A release build names it (E0812); an unknown bit is corrupt.
+            with open(out, "rb") as f:
+                real = f.read()
+
+            def with_flags(flags):
+                body = bytearray(real[:-44])
+                body[12:16] = flags.to_bytes(4, "little")
+                end = real[-44:-36] + hashlib.sha256(body).digest()
+                return bytes(body) + end + zlib.crc32(end).to_bytes(4, "little")
+            assert with_flags(0) == real, "the end record is not rebuilt as assumed"
+            for name, flags, code, text in (("keys off", 1, "NRV-E0812", "deduplication off"),
+                                            ("unknown flag", 2, "NRV-E0804", "flag")):
+                flagged = os.path.join(tmp, f"{flags}.export")
+                with open(flagged, "wb") as f:
+                    f.write(with_flags(flags))
+                target = os.path.join(tmp, f"{flags}.nerva")
+                check("import " + name, imp + ["--input=" + flagged, target], code, 1, text)
+                assert not os.path.exists(target)
+            # The write path, from real exports (P426): a release `export` writes flags 0, a
+            # keys-off `export` writes bit 0; a release import refuses the latter from the real
+            # file, leaving nothing behind, and a keys-off import accepts it. The bit marks the
+            # exporting build, not the cluster, so a release export of a keys-off cluster is 0.
+            # The keys-off export is of a keys-off cluster: a keys-off client does not reach a
+            # release cluster once its release is refused (#354), so this holds with and without it.
+            assert real[12:16] == bytes(4), real[12:16]
+            off_out = os.path.join(tmp, "off.export")
+            cluster_off = Cluster(nerva_off)
+            try:
+                export_off = ["export", "--cluster=0", f"--addresses={cluster_off.address}"]
+                made = run(nerva_off, export_off + ["--output=" + off_out])
+            finally:
+                cluster_off.close()
+            assert made.returncode == 0, made.stderr[-2000:]
+            with open(off_out, "rb") as f:
+                off_bytes = f.read()
+            assert off_bytes[12:16] == b"\x01\x00\x00\x00", off_bytes[12:16]
+            off_target = os.path.join(tmp, "off.nerva")
+            check("import real keys-off export", imp + ["--input=" + off_out, off_target],
+                  "NRV-E0812", 1, "deduplication off")
+            assert not os.path.exists(off_target)
+            assert not os.path.exists(off_target + ".importing")
+            accepted = run(nerva_off, imp + ["--input=" + off_out, off_target])
+            assert accepted.returncode == 0, accepted.stderr[-2000:]
+            assert os.path.exists(off_target)
             # A port that is taken.
             with socket.socket() as taken:
                 taken.bind(("127.0.0.1", 0))
