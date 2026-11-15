@@ -154,6 +154,10 @@ jobs:
         if: needs.changes.outputs.code != 'false'
         run: .github/scripts/docs_only_test.sh
 
+      - name: Quickstart loop script (its refusals, NRV-E0741 and NRV-E0742)
+        if: needs.changes.outputs.code != 'false'
+        run: scripts/quickstart_loop_test.sh
+
       # The package repositories' tools, pinned to what ubuntu-24.04 offers and asserted, so a
       # runner-image change fails here (NRV-E1139) and does not silently change the bytes
       # (docs/releases/packages.md, "Tools on the runner, pinned"). gpg is the image's 2.4.
@@ -173,7 +177,7 @@ jobs:
           tool_is rpmsign "RPM version 4.18.2"
           gpg --version | head -n1 | grep -q 'gpg (GnuPG) 2\.4\.' || { echo "error[NRV-E1139]: ci.yml: gpg is not 2.4" >&2; exit 1; }
 
-      - name: Release scripts (the bill of materials, N63; the refusals, NRV-E1112 to E1117, E1130 to E1138)
+      - name: Release scripts (the bill of materials, N63; the refusals, NRV-E1112 to E1117, E1130 to E1138, E1152, E1164)
         if: needs.changes.outputs.code != 'false'
         run: |
           python3 .github/scripts/test_sbom.py
@@ -183,6 +187,8 @@ jobs:
           python3 -I .github/scripts/test_release_finish.py
           python3 -I .github/scripts/test_r2.py
           python3 -I .github/scripts/test_package_repos.py
+          python3 -I .github/scripts/test_site_build.py
+          python3 -I .github/scripts/test_repos_alarm.py
 
       - name: Nightly perf scripts (the comparison, its issues)
         if: needs.changes.outputs.code != 'false'
@@ -561,6 +567,17 @@ jobs:
         with:
           persist-credentials: false
 
+      # Apple's real public intermediates, as mac-sign.yml fetches them (mac_ca.sh, P455): the
+      # download and the pinned SHA-256 values run here, and `create` imports them below.
+      - name: Apple's Developer ID intermediates are fetched and checked
+        if: needs.changes.outputs.code != 'false'
+        run: |
+          set -eu
+          # As mac-sign.yml: macOS's own tools (LibreSSL's openssl), not Homebrew's.
+          export PATH=/usr/bin:/bin:/usr/sbin:/sbin
+          .github/scripts/mac_ca.sh fetch "$RUNNER_TEMP/apple-ca"
+          echo "APPLE_CA_DIR=$RUNNER_TEMP/apple-ca" >> "$GITHUB_ENV"
+
       - name: An empty secret is refused, and nothing is made
         if: needs.changes.outputs.code != 'false'
         run: |
@@ -612,12 +629,16 @@ jobs:
             local re=$1; shift
             if "$@" 2> "$RUNNER_TEMP/refused.txt"; then echo "::error::accepted: $re"; exit 1; fi
             cat "$RUNNER_TEMP/refused.txt"
-            grep -Eq "^error\[NRV-E1121\]: mac_keychain.sh: ($re)" "$RUNNER_TEMP/refused.txt"
+            grep -Eq "^error\[NRV-E11(21|66)\]: mac_keychain.sh: ($re)" "$RUNNER_TEMP/refused.txt"
             grep -q '^  cause  ' "$RUNNER_TEMP/refused.txt"
             grep -q '^  fix    ' "$RUNNER_TEMP/refused.txt"
             test ! -e "$RUNNER_TEMP/nerva-id.p12" && test ! -e "$RUNNER_TEMP/nerva-notary.p8"
             .github/scripts/mac_keychain.sh destroy
           }
+          # No intermediates directory: NRV-E1166, before anything is touched (a missing file is test_mac_sign.py's).
+          APPLE_CA_DIR=$RUNNER_TEMP/nowhere APPLE_DEVELOPER_ID_P12=$good APPLE_DEVELOPER_ID_P12_PASSWORD=$p12pw \
+            expect 'Apple.s intermediate DeveloperIDG2CA.cer is not in APPLE_CA_DIR' \
+            .github/scripts/mac_keychain.sh create --skip-notary
           # Not base64 at all (a lenient decoder that accepts it lands on the import refusal).
           APPLE_DEVELOPER_ID_P12='!!! not base64 !!!' APPLE_DEVELOPER_ID_P12_PASSWORD=x \
             expect 'the signing secret APPLE_DEVELOPER_ID_P12 is not base64|the keychain could not import' \
@@ -641,10 +662,28 @@ jobs:
             .github/scripts/mac_keychain.sh create
           test ! -e "$kc"
 
+          # A .p12 packed under the old checklist already holds the G2 intermediate: the identity
+          # import puts it in the keychain, and `create` must skip it, not import it twice
+          # (errSecDuplicateItem). Real `security`, so `find-certificate -Z`'s format is checked.
+          /usr/bin/openssl x509 -inform der -in "$APPLE_CA_DIR/DeveloperIDG2CA.cer" -out "$RUNNER_TEMP/g2.pem"
+          /usr/bin/openssl pkcs12 -export -inkey "$RUNNER_TEMP/test.key" -in "$RUNNER_TEMP/test.crt" \
+            -certfile "$RUNNER_TEMP/g2.pem" -name "Nerva CI Test Signing" -passout "pass:$p12pw" \
+            -out "$RUNNER_TEMP/test-g2.p12"
+          APPLE_DEVELOPER_ID_P12=$(base64 < "$RUNNER_TEMP/test-g2.p12") \
+          APPLE_DEVELOPER_ID_P12_PASSWORD=$p12pw \
+            .github/scripts/mac_keychain.sh create --skip-notary
+          test "$(security find-certificate -a -c "Developer ID Certification Authority" "$kc" | grep -c '"labl"')" = 2
+          .github/scripts/mac_keychain.sh destroy
+          rm -f "$RUNNER_TEMP/g2.pem" "$RUNNER_TEMP/test-g2.p12"
+          test ! -e "$kc"
+
           APPLE_DEVELOPER_ID_P12=$good \
           APPLE_DEVELOPER_ID_P12_PASSWORD=$p12pw \
             .github/scripts/mac_keychain.sh create --skip-notary
           rm -f "$RUNNER_TEMP/test.key" "$RUNNER_TEMP/test.crt" "$RUNNER_TEMP/test.p12"
+
+          # Apple's two intermediates were imported beside the identity.
+          test "$(security find-certificate -a -c "Developer ID Certification Authority" "$kc" | grep -c '"labl"')" = 2
 
           # The keychain exists, is the default and heads the search list.
           test -f "$kc"
@@ -1068,3 +1107,55 @@ jobs:
         if: needs.changes.outputs.code != 'false'
         with:
           name: vopr_main
+
+  # The repositories' freshness, on every push to main: stable's InRelease must have at least 10 days
+  # of `Valid-Until` left (NRV-E1150; docs/releases/packages.md, "The 60-day rule"). Never on a pull
+  # request, not a required check, and not in release.yml's call of this file (`github.workflow` is
+  # then `Release`): a Cloudflare outage blocks neither. Until the rehearsal has written the bucket
+  # it does not run (REPOS_LIVE).
+  repos-fresh:
+    if: ${{ github.event_name == 'push' && github.workflow == 'CI' && vars.REPOS_LIVE == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      code: ${{ steps.fresh.outputs.code }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+
+      - name: Repository freshness (Valid-Until at least 10 days ahead)
+        id: fresh
+        env:
+          # A repository variable, not the environment's: this job has no environment (P404).
+          PACKAGES_BASE_URL: ${{ vars.PACKAGES_BASE_URL }}
+        run: |
+          set -euo pipefail
+          .github/scripts/package_repos.sh fresh
+
+  # `issues: write` and nothing else; no environment, no secret; it never changes the run's verdict.
+  # Only for `failure`: a superseded run of this workflow on main is cancelled, never alarmed.
+  alarm:
+    needs: repos-fresh
+    if: ${{ always() && contains(needs.*.result, 'failure') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    continue-on-error: true
+    permissions:
+      issues: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+
+      - name: File the alarm
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PACKAGE_REPOS_OWNER: ${{ vars.PACKAGE_REPOS_OWNER }}
+          CODE: ${{ needs.repos-fresh.outputs.code }}
+        run: |
+          set -euo pipefail
+          url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          .github/scripts/repos_alarm.sh ci.yml repos-fresh "${CODE:-unknown}" "$url"
