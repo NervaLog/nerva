@@ -20,6 +20,8 @@ pub const message_bus = @import("message_bus.zig");
 pub const message_pool = @import("message_pool.zig");
 pub const nerva = @import("nerva.zig");
 pub const state_machine = @import("nerva/state_machine.zig");
+/// Nerva: the coded text of three fatal exits (NRV-E0706, E0721, E0722).
+pub const fatal_messages = @import("nerva/fatal_messages.zig");
 pub const storage = @import("storage.zig");
 pub const trace = @import("trace.zig");
 pub const stdx = @import("stdx");
