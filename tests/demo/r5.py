@@ -42,7 +42,7 @@ import traceback
 # Replicas authenticate each other with a real cluster key, never the development key (P102).
 os.environ["NERVA_CLUSTER_KEY"] = os.urandom(32).hex()
 
-KEY = "demo-r5-key"
+KEY = "demo-r5-key-0123456789abcdef0123456789"
 SEATS, ACCOUNTS, SOURCES = 5, 40, 41
 SEATS_LAYOUT = {"name": "seats", "fields": [{"name": "section", "type": "u8"},
                                             {"name": "price", "type": "u64"},
