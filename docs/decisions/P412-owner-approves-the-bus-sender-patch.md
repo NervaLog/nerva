@@ -1,0 +1,40 @@
+---
+id: P412
+date: 2026-11-15
+area: Releases
+amends: N61
+---
+
+# The owner approves telling the replica which connection delivered a message (#358)
+
+**Decision.** The owner approved in writing, in session on 2026-11-15 (recorded on #412 as
+comment 6890394636), the vendored patches to `src/message_bus.zig`, `src/testing/cluster/message_bus.zig`
+and `src/vsr/replica.zig` that let the replica learn which replica's connection delivered a message,
+so that `release_peers.admits` requires that connection's announcement for a prepare received
+directly from its maker. What this change patches: `message_bus.zig` (a field `recv_from`, set
+around each `on_messages_callback` from the connection's peer), `testing/cluster/message_bus.zig`
+(the same field, always null: the simulated network's buffer holds messages of several senders),
+`replica.zig` (passes `recv_from` to `admits`). `src/vsr/client.zig` is not patched: the field is
+read only by the replica.
+
+**Reason.** N61 admitted a prepare whose maker had not announced since this replica started, so a
+replica of another release (or the keys-off build, P354) whose prepares arrive before its first
+ping was handled for about a ping interval. The bus did not pass the sender, so a directly
+received prepare could not be told from a relayed or repaired one (#358).
+
+**Rule.** A prepare whose connection is the maker's own is admitted only when that peer's last
+announcement (`peer_releases`, cleared by the first tick that sees the peer disconnected) is a
+release this process runs (one of its bundle, R6) and this replica's origin. A relayed or repaired prepare, or one on a connection
+whose peer is not yet known, keeps N61's and P90's rule (its maker's last announcement, admitted if
+none), so a dead primary's prepares are still repaired.
+
+**Cost.** A connection not yet identified as a replica's (its first message was a prepare) still
+gets the lenient rule. With cluster keys, which `nerva start` requires (P102), the handshake sets the
+peer before any replica message is delivered, so only keys-off and test builds have that case. A
+maker that reconnects within one tick keeps its previous announcement until it pings, as for every
+other peer message. The VOPR does not exercise the new rule (the simulated bus never names a
+sender), and nothing tests the bus wiring itself (`recv_from` set in `recv_buffer_consume`). The
+`release_peers` unit tests cover the rule, including a bundle. `tests/release/mixed.py` (replicas
+restarting beside an other-release primary) is a no-regression smoke test, not a test of the rule:
+the restarted replicas drop the other-release primary's view-0 prepares as an older view whichever
+rule `admits` applies.

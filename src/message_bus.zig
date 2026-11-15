@@ -51,6 +51,11 @@ pub fn MessageBusType(comptime IO: type) type {
         /// The callback to be called when a message is received.
         on_messages_callback: *const fn (message_bus: *MessageBus, buffer: *MessageBuffer) void,
 
+        /// The replica whose connection delivers the messages `on_messages_callback` is now
+        /// consuming, or null if that connection's peer is not (yet) known to be a replica.
+        /// Nerva (#358): set before each callback, for `release_peers.admits`.
+        recv_from: ?u8 = null,
+
         /// SendQueue storage shared by all connections.
         send_queue_buffer: []*Message,
         /// This slice is allocated with a fixed size in the init function and never reallocated.
@@ -981,6 +986,11 @@ pub fn MessageBusType(comptime IO: type) type {
             assert(connection.recv_buffer != null);
 
             if (connection.recv_buffer.?.has_message()) {
+                bus.recv_from = switch (connection.peer) {
+                    .replica => |peer| peer,
+                    else => null,
+                };
+                defer bus.recv_from = null;
                 bus.on_messages_callback(bus, &connection.recv_buffer.?);
             }
 
