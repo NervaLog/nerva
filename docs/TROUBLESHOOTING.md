@@ -257,7 +257,7 @@ Not run, quoted from ERRORS.md:
 
 | You see | Code | Do |
 |---|---|---|
-| `start: <path> was written by release X, and this is release Y` | NRV-E0701 | Upgrade by export and import (README, [Upgrading a cluster](../README.md#upgrading-a-cluster)) |
+| `start: <path> was written by release X, and this binary runs Y and bundles Z` | NRV-E0701 | Upgrade by export and import (README, [Upgrading a cluster](../README.md#upgrading-a-cluster)). A binary that bundles a past release, given a file below all of them, says instead that the replica fell behind or the cluster skipped a release: start the binary of the release that follows the file's and step one release at a time, `nerva recover` the replica (README, "Replacing a lost replica"), or export and import the cluster |
 | `start: <path> has no usable superblock (…)` | NRV-E0702 | Check the path. If the file is damaged: a replica of a running cluster is replaced with `nerva recover`; a lone replica or a closed cluster is restored from a backup (every replica, from the same one) |
 | `start: all --addresses must be provided` | NRV-E0710 | Give every replica's address, in replica order |
 | `start: the file system of <path> does not support direct IO`, exit 2 | NRV-E0704 | Put the data file on ext4 or XFS (`--development` allows it) |
@@ -268,8 +268,8 @@ Look at its log:
 
 - A peer proved a different cluster key: NRV-E0902, logged, the peer is ignored. Every replica
   needs the same `NERVA_CLUSTER_KEY`. Not run.
-- `replica N runs release X, this replica runs Y: ignoring it`: a peer on a release this binary does
-  not run. Start every replica on the same release. Not run.
+- `NRV-W0702 replica N runs release X, this replica runs Y (up to Z): ignoring it`: a peer on a
+  release this binary neither runs nor bundles. Start every replica on the same release. Not run.
 - Exit 8, NRV-E0711 (above): the replica was imported from another export than its peers.
 - Fewer than a majority of the replicas run, so no gateway gets a session: NRV-E0604 on the gateway.
   Start the others. To bring back a lost replica, see README,
