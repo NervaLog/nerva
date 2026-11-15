@@ -1,0 +1,92 @@
+# The key-model test (docs/releases/packages.md, slice K, P376 point 1): a certify-only primary with
+# signing subkeys signs small apt and dnf repositories, and tests/packaging/subkeys.py installs from
+# them on every distribution in scope, on amd64 and arm64, through a rotation, an expired subkey,
+# a revoked subkey and a signature by the primary. The keys are made in the run and thrown away.
+#
+# It is not part of packages.yml and not a required check: it runs on a pull request that changes
+# the test or this file, by hand (workflow_dispatch) and weekly. The result decides the key model: the
+# pull request's decision (docs/decisions/) says which branch setup step 4 takes.
+name: Key model
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'tests/packaging/subkeys.py'
+      - '.github/workflows/key-model.yml'
+  workflow_dispatch:
+  # Weekly. The images are pinned by digest, so what moves is dnf5 (upgraded live in the Fedora cells)
+  # and the runner image's rpm, gpg and sqv (versions are printed in each log). A finding that stops
+  # being true is red (XPASS), a cell that is no longer reported is red (MISSING), and a red scheduled
+  # run opens or comments on one issue (job `alarm`, below). 16 jobs of at most 30 minutes, no secrets.
+  schedule:
+    - cron: '17 5 * * 1'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: key-model-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  cells:
+    name: ${{ matrix.image }} ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+        image: [host, 'debian:12', 'debian:13', 'ubuntu:22.04', 'ubuntu:24.04', 'rockylinux:9', 'fedora:43', 'fedora:44']
+        include:
+          - runner: ubuntu-24.04
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+
+      # The tools that make the repositories on the runner: apt-ftparchive, dpkg-deb, createrepo_c,
+      # rpmbuild and rpmsign (rpm 4.18 here, the "runner's rpm"), gpg, and gpgv and sqv for the host cells.
+      - name: Install the tools
+        run: |
+          set -eu
+          sudo apt-get -o Acquire::Retries=5 update -qq
+          sudo apt-get -o Acquire::Retries=5 install -y -qq apt-utils createrepo-c rpm sqv gnupg gpgv
+          for t in gpg rpm createrepo_c apt-ftparchive sqv; do echo "$t: $("$t" --version 2>&1 | head -n1)"; done
+
+      - name: Run the cells (tests/packaging/subkeys.py)
+        run: |
+          set -eu
+          if [ "${{ matrix.image }}" = host ]; then
+            python3 -I tests/packaging/subkeys.py --host
+          else
+            python3 -I tests/packaging/subkeys.py --image "${{ matrix.image }}"
+          fi
+
+  # A red scheduled run reaches nobody on its own (GitHub notifies only whoever last edited the cron
+  # line). This job opens one issue, or comments on it if it is already open. It has `issues: write`
+  # and the workflow's GITHUB_TOKEN only; it checks out nothing and runs no repository code.
+  alarm:
+    name: Alarm
+    needs: cells
+    if: failure() && github.event_name == 'schedule'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Open or update the key-model issue
+        run: |
+          set -eu
+          title='key-model: the weekly run is red'
+          body="The weekly key-model run failed: $RUN_URL. A finding recorded in P392 stopped being true (XPASS), a cell is no longer reported (MISSING), or an unexpected FAIL appeared. Read the cells job logs, then revisit docs/decisions/P392-rpm-does-not-follow-a-subkey-rotation.md."
+          n=$(gh issue list --state open --search "\"$title\" in:title" --json number --jq '.[0].number // empty')
+          if [ -n "$n" ]; then gh issue comment "$n" --body "$body"; else gh issue create --title "$title" --body "$body"; fi

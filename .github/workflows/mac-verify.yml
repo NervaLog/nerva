@@ -26,6 +26,10 @@
 # the formula, the brew step's error says where it comes from: mac-sign.yml's run uploads it as the
 # `homebrew-formula` artifact (`gh run download <run> -n homebrew-formula`).
 #
+# Step 5 trusts the tap first where this brew has `brew trust` (current Homebrew refuses a formula
+# from an untrusted tap; older brew has no such command), and a brew that cannot read the formula
+# fails at once with NRV-E1167, not as a version mismatch.
+#
 # `brew: 'no'` (release-finish.yml, for a release that was already published when it started) skips
 # step 5 too, since the tap has not been written yet: steps 1 to 4 then check the published zip
 # before the formula reaches the tap's main.
@@ -211,12 +215,30 @@ jobs:
           attempts=1
           if [ "$EVENT" = release ]; then attempts=10; fi
           brew tap nervalog/tap
+          # Current Homebrew refuses a formula from a tap that is not trusted (#466). Older brew has
+          # no `trust` command and loads any tap, so trust only where the command exists.
+          if brew trust --help > /dev/null 2>&1; then
+            brew trust nervalog/tap || {
+              echo "::error::error[NRV-E1167]: mac-verify.yml: brew trust nervalog/tap failed: fix: read brew's message above, trust the tap by hand as docs/INSTALL.md says, and re-run"
+              exit 1
+            }
+          fi
           tap=$(brew --repository nervalog/tap)
           for attempt in $(seq 1 "$attempts"); do
             # TAP_REF: main for a release, rc/v<VERSION> for a prerelease (release-finish.yml).
             git -C "$tap" fetch --quiet origin "$TAP_REF"
             git -C "$tap" checkout --quiet --detach FETCH_HEAD
-            stable=$(brew info --json=v2 nervalog/tap/nerva | jq -r '.formulae[0].versions.stable')
+            # A brew that cannot read the formula is not a formula at another version: it is not
+            # retried, and its own words are the error (NRV-E1167).
+            if ! info=$(brew info --json=v2 nervalog/tap/nerva 2> brew-info.err); then
+              echo "::error::error[NRV-E1167]: mac-verify.yml: brew could not read nervalog/tap/nerva: $(tr '\n' ' ' < brew-info.err): fix: if brew says the tap is untrusted, run brew trust nervalog/tap; if it names a syntax or load error, the formula in the tap is broken"
+              exit 1
+            fi
+            stable=$(printf '%s' "$info" | jq -r '.formulae[0].versions.stable // empty')
+            if [ -z "$stable" ]; then
+              echo "::error::error[NRV-E1167]: mac-verify.yml: brew read nervalog/tap/nerva but it names no stable version: fix: the formula's version line is missing or unreadable"
+              exit 1
+            fi
             if [ "$stable" = "$version" ]; then break; fi
             echo "the tap has nerva $stable, not $version (attempt $attempt of $attempts)"
             if [ "$attempt" = "$attempts" ]; then

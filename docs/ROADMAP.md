@@ -63,8 +63,9 @@ production gate (R1 to R5) is meant to close.
 
 Disk, export and import stop growing with all of history.
 
-- **R7 · Retention:** a declared horizon for commit keys, row history and view versions. An
-  expired key answers `key_expired`, and a read before the horizon answers `before_horizon`.
+- **R7 · Retention:** a declared horizon for row and record history and view and group
+  versions; a read before the horizon answers `before_horizon`. Commit keys and facts stay kept
+  (P123); their retention is cut from R7 (P422).
 - **Engine gaps named in GOALS-1.0:** index reads as of a past op, and `group_by` on `bytes`
   fields.
 - **View snapshots** (README roadmap item 5).
