@@ -398,6 +398,13 @@ pub const Command = union(enum) {
     };
 };
 
+/// What a flag refusal tells the operator to run (#300). Only `nerva --help` exists: the vendored
+/// parser answers `-h`/`--help` for the top level alone, and refuses `nerva <command> --help` as
+/// an unexpected argument, so no hint may send anyone there.
+pub const help_hint = "run nerva --help, which lists every command and the flags it takes";
+/// NRV-E0002's fix line: the message already names the bound (docs/ERRORS.md), then the help.
+pub const range_hint = "the message names the bound; " ++ help_hint;
+
 /// The vendored flag parser's failures (unknown or repeated flag, missing or malformed value,
 /// unexpected argument) as NRV-E0001, through `stdx.Flags.fatal_hook`.
 fn flag_fatal(message: []const u8) noreturn {
@@ -405,7 +412,7 @@ fn flag_fatal(message: []const u8) noreturn {
         "NRV-E0001",
         "{s}",
         .{message},
-        "run nerva --help, or nerva <command> --help, for the flags it takes",
+        help_hint,
         .{},
     );
 }
@@ -534,7 +541,7 @@ fn flag_range(comptime command: []const u8, err: Error) noreturn {
         "NRV-E0002",
         command ++ ": {s}",
         .{error_message(err)},
-        "nerva " ++ command ++ " --help names every flag and its bounds",
+        range_hint,
         .{},
     );
 }
@@ -566,6 +573,26 @@ pub fn listen_is_loopback(address: std.net.Address) bool {
 }
 
 const loopback_ipv6 = [_]u8{0} ** 15 ++ [_]u8{1};
+
+// The call sites pass `help_hint` and `range_hint` to `diag.fail`, which exits the process, so
+// only `tests/errors/commands.py` (test:integration) catches a call site that bypasses them. This
+// test renders the blocks the hints produce.
+test "the flag refusals' rendered fix lines name only a command that exists (#300)" {
+    var buffer: [diag.block_size_max]u8 = undefined;
+    inline for (.{
+        .{ "NRV-E0001", help_hint },
+        .{ "NRV-E0002", range_hint },
+    }) |case| {
+        var stream = std.io.fixedBufferStream(&buffer);
+        try diag.render(stream.writer(), case[0], "format: {s}", .{"x"}, case[1], .{});
+        const block = stream.getWritten();
+        // `nerva <command> --help` is refused by the flag parser, so a hint must not name it.
+        try std.testing.expect(std.mem.indexOf(u8, block, "<command>") == null);
+        try std.testing.expect(std.mem.indexOf(u8, block, "nerva --help") != null);
+    }
+    // The command the hint names is the one the usage text documents.
+    try std.testing.expect(std.mem.indexOf(u8, CLIArgs.help, "nerva [-h | --help]") != null);
+}
 
 test listen_is_loopback {
     const accepted = [_][]const u8{
@@ -800,6 +827,13 @@ const StartArgs = struct {
 /// passes the value explicitly, so the shipped default is visible here (P136).
 const commit_stall_probability_default = stdx.PRNG.ratio(2, 5);
 
+/// A `--development` replica queues no requests beyond its prepare pipeline, but it still takes
+/// this many extra client connections. Each gateway is a client on every replica, so with 0 a
+/// cluster of ten gateways (Jepsen's `--gateways 2` on 5 nodes) had its last connections closed
+/// (#231). It stays far below the production limit, and within the build's request queue (the
+/// test configuration's is smaller).
+const development_pipeline_requests_limit: u32 = @min(8, constants.pipeline_request_queue_max);
+
 const cache_rows_multiple = StateMachine.cache_entries_rows_multiple;
 const cache_rows_size_multiple = cache_rows_multiple * @sizeOf(nerva.Row);
 
@@ -862,7 +896,7 @@ fn start_resolve(start: StartArgs) Error!Command.Start {
         .cache_rows_count = cache_rows_count,
         .storage_size_limit = constants.storage_size_limit_default,
         .pipeline_requests_limit = if (start.development)
-            0
+            development_pipeline_requests_limit
         else
             stdx.div_ceil(constants.clients_max, 2) - constants.pipeline_prepare_queue_max,
         .request_size_limit = constants.message_size_max,
@@ -980,7 +1014,14 @@ test start_resolve {
         @divExact(cache_grid_size_min, constants.block_size),
         development.cache_grid_blocks,
     );
-    try std.testing.expectEqual(@as(u32, 0), development.pipeline_requests_limit);
+    // #231: a development replica takes client slots beyond its prepare pipeline. With the
+    // production configuration that is room for ten gateways (two on each of five nodes).
+    try std.testing.expectEqual(development_pipeline_requests_limit, development.pipeline_requests_limit);
+    try std.testing.expect(development.pipeline_requests_limit > 0);
+    if (constants.clients_max >= 64) {
+        try std.testing.expect(constants.pipeline_prepare_queue_max +
+            development.pipeline_requests_limit >= 10);
+    }
     try std.testing.expectEqual(constants.message_size_max, development.request_size_limit);
     try std.testing.expect(development.statsd == null);
     try std.testing.expect(development.trace == null);

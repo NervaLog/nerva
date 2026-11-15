@@ -35,11 +35,13 @@ gateway's protection is that it listens on loopback only, beside its client; a n
 `--listen` is refused unless `--listen-remote` is given:
 
 ```
-$ NERVA_KEY=k nerva api --cluster=1 --addresses=3901 --listen=0.0.0.0:8982
+$ NERVA_KEY=$(openssl rand -hex 32) nerva api --cluster=1 --addresses=3901 --listen=0.0.0.0:8982
 error[NRV-E0009]: api: --listen=0.0.0.0:8982 is not loopback; the gateway speaks plain HTTP
 ```
 
-A gateway without `NERVA_KEY` does not start (`error[NRV-E0008]: api: set NERVA_KEY`).
+A gateway without `NERVA_KEY`, with one shorter than 32 bytes, or with one a header cannot carry
+(leading or trailing space or tab, a control byte), does not start (`NRV-E0008`;
+`error[NRV-E0008]: api: set NERVA_KEY` for a missing key). Make a key with `openssl rand -hex 32`.
 Rotation, without downtime, is in [README, Limits](./README.md#limits) ("To rotate a gateway
 key").
 

@@ -13,7 +13,8 @@
 //! the client whose request it holds (`replica.zig` copies the request's), any from
 //! `release_client_min` up, and names the primary that made it (`replica`), though any replica
 //! may relay or repair it: it is admitted with a client release this replica accepts, unless its
-//! maker last announced another release.
+//! maker last announced another release. A prepare received directly from its maker needs that
+//! connection's announcement, as any other message of a peer does (#358, P412).
 //!
 //! The same gate keeps apart replicas imported from different exports (P90, #81): a ping or pong
 //! also announces its sender's origin (`VSRState.origin`, the export's SHA-256, or zero for a
@@ -34,24 +35,44 @@ const vsr = @import("../vsr.zig");
 const constants = @import("../constants.zig");
 const Header = vsr.Header;
 
+/// Whether `release` is one this process can run: the release it runs, or one it bundles (R6,
+/// P259). `releases_run` is the multiversion's `releases_bundled()`.
+pub fn runs(releases_run: []const vsr.Release, release: vsr.Release) bool {
+    for (releases_run) |release_run| {
+        if (release_run.value == release.value) return true;
+    }
+    return false;
+}
+
 /// Whether a replica running `release` (accepting clients from `release_client_min`), as replica
 /// `replica`, imported from `origin`, should handle a message with `header`, given each peer's
 /// announced release on its current connection (`peer_releases`, null if none yet), and the
 /// release and origin it last announced on any (`peer_releases_last`, `peer_origins`, null if
-/// never). A ping or pong is checked after its own announcement has been recorded.
+/// never). `sender` is the replica whose connection delivered the message, if the bus knows it
+/// (null: a connection not yet identified, or a bus that does not say). A ping or pong is checked
+/// after its own announcement has been recorded.
+///
+/// `releases_run` is every release this process can run, `release` included, in increasing order
+/// (a single-release binary: just `release`). A peer and a prepare's maker count when the release
+/// they announce is one of them, and a block when the release that wrote it is at or below the
+/// newest (R6, P259; amends N61).
 pub fn admits(
     release: vsr.Release,
+    releases_run: []const vsr.Release,
     release_client_min: vsr.Release,
     origin: *const [32]u8,
     replica: u8,
     peer_releases: []const ?vsr.Release,
     peer_releases_last: []const ?vsr.Release,
     peer_origins: []const ?[32]u8,
+    sender: ?u8,
     header: *const Header,
 ) bool {
     assert(release.value != 0);
     assert(release_client_min.value != 0);
     assert(release_client_min.value <= release.value);
+    assert(releases_run.len > 0);
+    assert(runs(releases_run, release));
     assert(peer_releases.len == constants.members_max);
     assert(peer_releases_last.len == constants.members_max);
     assert(peer_origins.len == constants.members_max);
@@ -64,7 +85,7 @@ pub fn admits(
         .prepare => |prepare| {
             if (prepare.release.value == 0) return true;
             if (prepare.release.value < release_client_min.value or
-                prepare.release.value > release.value) return false;
+                prepare.release.value > releases_run[releases_run.len - 1].value) return false;
             // Relayed or repaired by any replica: refused once its maker is known to run another
             // release, or to be of another export. A maker not heard from since this replica
             // started is admitted, whatever accepted client release the prepare carries: after a
@@ -72,15 +93,30 @@ pub fn admits(
             // none can hear from it again (P90).
             if (prepare.replica == replica) return true;
             if (prepare.replica >= peer_origins.len) return false;
+            // Received directly from its maker: the connection must have announced a release
+            // this process runs and this replica's origin, as for any other message of a peer
+            // (#358). Without it, a replica of another release that sends prepares before its
+            // first ping is heard would have them handled.
+            if (sender) |from| if (from == prepare.replica) {
+                const connection_release = peer_releases[from] orelse return false;
+                const connection_origin = peer_origins[from] orelse return false;
+                return runs(releases_run, connection_release) and
+                    std.mem.eql(u8, &connection_origin, origin);
+            };
             if (peer_releases_last[prepare.replica]) |maker_release| {
-                if (maker_release.value != release.value) return false;
+                if (!runs(releases_run, maker_release)) return false;
             }
             if (peer_origins[prepare.replica]) |maker_origin| {
                 if (!std.mem.eql(u8, &maker_origin, origin)) return false;
             }
             return true;
         },
-        .block => |block| return block.release.value == release.value,
+        // A block names the release that wrote it, and stays in the grid for as long as
+        // compaction leaves it: after two rolling upgrades a peer's live blocks come from a
+        // release this binary no longer bundles. The format digest (P259c) makes every release
+        // at or below the newest one this process runs readable; only a newer one is not (P415b).
+        .block => |block| return block.release.value != 0 and
+            block.release.value <= releases_run[releases_run.len - 1].value,
         else => {},
     }
     switch (header.peer_type()) {
@@ -89,7 +125,7 @@ pub fn admits(
             if (peer >= peer_releases.len) return false;
             const peer_release = peer_releases[peer] orelse return false;
             const peer_origin = peer_origins[peer] orelse return false;
-            return peer_release.value == release.value and std.mem.eql(u8, &peer_origin, origin);
+            return runs(releases_run, peer_release) and std.mem.eql(u8, &peer_origin, origin);
         },
         .unknown, .client, .client_likely => return true,
     }
@@ -174,6 +210,11 @@ const release_other = vsr.Release.from(.{ .major = 0, .minor = 0, .patch = 2 });
 /// This replica accepts clients from `release_other` on.
 const release_client_min_this = release_other;
 const release_newer = vsr.Release.from(.{ .major = 0, .minor = 0, .patch = 4 });
+const release_third = vsr.Release.from(.{ .major = 0, .minor = 0, .patch = 5 });
+/// A binary that runs only its own release (the only case before R6).
+const releases_single = [_]vsr.Release{release_this};
+/// A binary that runs `release_this` and bundles `release_newer` (R6).
+const releases_pair = [_]vsr.Release{ release_this, release_newer };
 const origin_this: [32]u8 = @splat(0xaa);
 const origin_other: [32]u8 = @splat(0xbb);
 
@@ -181,6 +222,9 @@ const TestPeers = struct {
     releases: [constants.members_max]?vsr.Release,
     releases_last: [constants.members_max]?vsr.Release,
     origins: [constants.members_max]?[32]u8,
+    /// The replica whose connection delivered the message, if known.
+    sender: ?u8 = null,
+    releases_run: []const vsr.Release = &releases_single,
 
     /// Replica 1 is of this release and origin, 2 of another release, 3 has announced nothing,
     /// 4 is of this release and another origin.
@@ -203,12 +247,14 @@ const TestPeers = struct {
     fn admits(peers: *const TestPeers, header: *const Header) bool {
         return release_peers_admits(
             release_this,
+            peers.releases_run,
             release_client_min_this,
             &origin_this,
             0,
             &peers.releases,
             &peers.releases_last,
             &peers.origins,
+            peers.sender,
             header,
         );
     }
@@ -305,7 +351,9 @@ test "release_peers: a prepare is refused for its client's release, or its maker
     var block: Header.Block = std.mem.zeroInit(Header.Block, .{ .command = .block });
     block.release = release_this;
     try testing.expect(peers.admits(block.frame_const()));
-    block.release = release_other;
+    block.release = release_other; // Written by an older release: still in the grid.
+    try testing.expect(peers.admits(block.frame_const()));
+    block.release = release_newer; // Written by a release this process does not run.
     try testing.expect(!peers.admits(block.frame_const()));
 }
 
@@ -355,4 +403,125 @@ test "release_peers: a replica stops when peers of other exports leave it no quo
     // A formatted replica (origin zero) and an imported one disagree.
     const zero: [32]u8 = @splat(0);
     try testing.expect(origin_refused(3, 0, &zero, &origins));
+}
+
+test "release_peers: a prepare received from its maker needs the connection's announcement" {
+    var peers: TestPeers = .init();
+    var prepare: Header.Prepare =
+        std.mem.zeroInit(Header.Prepare, .{ .command = .prepare, .release = release_this });
+    // Replica 3 has announced nothing since this replica started, and none before.
+    prepare.replica = 3;
+    try testing.expect(peers.admits(prepare.frame_const())); // Relayed or repaired: admitted (P90).
+    peers.sender = 1; // Relayed by replica 1.
+    try testing.expect(peers.admits(prepare.frame_const()));
+    peers.sender = 3; // Directly from its maker, which has not announced on this connection.
+    try testing.expect(!peers.admits(prepare.frame_const()));
+    peers.releases[3] = release_other;
+    peers.origins[3] = origin_this;
+    try testing.expect(!peers.admits(prepare.frame_const()));
+    peers.releases[3] = release_this;
+    try testing.expect(peers.admits(prepare.frame_const()));
+    peers.origins[3] = origin_other;
+    try testing.expect(!peers.admits(prepare.frame_const()));
+    // A replica of this release that has announced on its connection is unaffected.
+    prepare.replica = 1;
+    peers.sender = 1;
+    try testing.expect(peers.admits(prepare.frame_const()));
+    // This replica's own prepares and root prepares pass whoever sends them.
+    prepare.replica = 0;
+    try testing.expect(peers.admits(prepare.frame_const()));
+    prepare.release = .{ .value = 0 };
+    prepare.replica = 3;
+    peers.sender = 3;
+    try testing.expect(peers.admits(prepare.frame_const()));
+}
+
+test "release_peers: a bundle of two releases admits peers, prepares and blocks of both" {
+    var peers: TestPeers = .init();
+    peers.releases_run = &releases_pair;
+    // Replica 2 announced `release_other`, below the bundle: refused, as with one release.
+    // Replicas 3 and 5 announce the bundled release and a third one.
+    peers.releases[3] = release_newer;
+    peers.origins[3] = origin_this;
+    peers.releases[5] = release_third;
+    peers.origins[5] = origin_this;
+    peers.releases_last = peers.releases;
+
+    inline for (.{ .commit, .prepare_ok, .view, .headers, .exit_view }) |command| {
+        const Command = Header.Type(command);
+        var header: Command = std.mem.zeroInit(Command, .{ .command = command });
+        header.replica = 1; // This release.
+        try testing.expect(peers.admits(header.frame_const()));
+        header.replica = 3; // The bundled release.
+        try testing.expect(peers.admits(header.frame_const()));
+        header.replica = 2; // A release this binary neither runs nor bundles.
+        try testing.expect(!peers.admits(header.frame_const()));
+        header.replica = 5; // Another.
+        try testing.expect(!peers.admits(header.frame_const()));
+    }
+    // With one release the same peer is refused: the amendment of N61 is what admits it.
+    var peers_single = peers;
+    peers_single.releases_run = &releases_single;
+    var commit: Header.Commit = std.mem.zeroInit(Header.Commit, .{ .command = .commit });
+    commit.replica = 3;
+    try testing.expect(peers.admits(commit.frame_const()));
+    try testing.expect(!peers_single.admits(commit.frame_const()));
+
+    // A prepare, by its client's release and by its maker's.
+    var prepare: Header.Prepare =
+        std.mem.zeroInit(Header.Prepare, .{ .command = .prepare, .replica = 1 });
+    for ([_]vsr.Release{ release_other, release_this, release_newer }) |release_client| {
+        prepare.release = release_client;
+        prepare.replica = 1;
+        try testing.expect(peers.admits(prepare.frame_const()));
+        prepare.replica = 3; // Made by a replica of the bundled release.
+        try testing.expect(peers.admits(prepare.frame_const()));
+        prepare.replica = 5; // Made by a replica of a third.
+        try testing.expect(!peers.admits(prepare.frame_const()));
+        prepare.replica = 2; // Made by a replica of a release below the bundle.
+        try testing.expect(!peers.admits(prepare.frame_const()));
+    }
+    prepare.replica = 1;
+    prepare.release = release_third; // A client newer than anything this process runs.
+    try testing.expect(!peers.admits(prepare.frame_const()));
+    prepare.release = release_newer; // The same client with one release is refused.
+    try testing.expect(!peers_single.admits(prepare.frame_const()));
+
+    // Received directly from its maker, the connection must have announced a release this
+    // process runs: any of the bundle, not only the one this replica started as (#358, R6).
+    prepare.release = release_this;
+    prepare.replica = 3;
+    peers.sender = 3; // Announced `release_newer`, bundled.
+    try testing.expect(peers.admits(prepare.frame_const()));
+    prepare.replica = 5;
+    peers.sender = 5; // Announced `release_third`, not bundled.
+    try testing.expect(!peers.admits(prepare.frame_const()));
+    peers.sender = null;
+
+    // A block, by the release it was made in.
+    var block: Header.Block = std.mem.zeroInit(Header.Block, .{ .command = .block });
+    for ([_]vsr.Release{ release_this, release_newer }) |release_block| {
+        block.release = release_block;
+        try testing.expect(peers.admits(block.frame_const()));
+    }
+    // Two rolling upgrades on: a block written at `release_other`, below the bundle, is admitted
+    // (a lagging replica must finish grid repair), and so is one of a release before it.
+    block.release = release_other;
+    try testing.expect(peers.admits(block.frame_const()));
+    block.release = vsr.Release.from(.{ .major = 0, .minor = 0, .patch = 1 });
+    try testing.expect(peers.admits(block.frame_const()));
+    // A block of a release newer than any this process runs is refused, and release 0 is none.
+    block.release = release_third;
+    try testing.expect(!peers.admits(block.frame_const()));
+    block.release = vsr.Release.zero;
+    try testing.expect(!peers.admits(block.frame_const()));
+    block.release = release_newer;
+    try testing.expect(!peers_single.admits(block.frame_const()));
+}
+
+test "release_peers: runs" {
+    try testing.expect(runs(&releases_pair, release_this));
+    try testing.expect(runs(&releases_pair, release_newer));
+    try testing.expect(!runs(&releases_pair, release_other));
+    try testing.expect(!runs(&releases_single, release_newer));
 }
