@@ -669,6 +669,26 @@ jobs:
           /usr/bin/openssl pkcs12 -export -inkey "$RUNNER_TEMP/test.key" -in "$RUNNER_TEMP/test.crt" \
             -certfile "$RUNNER_TEMP/g2.pem" -name "Nerva CI Test Signing" -passout "pass:$p12pw" \
             -out "$RUNNER_TEMP/test-g2.p12"
+          # The premise, proved before `create` runs: the .p12 really carries G2, and a keychain that
+          # already holds G2 refuses a second import of it. Without this the case would also pass if
+          # `-certfile` were ignored (`create` would import G2 itself and the count would still be 2).
+          # A scratch keychain, off the search list and not the default; it is deleted at once.
+          scratch="$RUNNER_TEMP/nerva-scratch.keychain-db"
+          g2sha=$(/usr/bin/openssl x509 -inform der -in "$APPLE_CA_DIR/DeveloperIDG2CA.cer" -noout -fingerprint -sha1 \
+            | sed 's/^.*=//; s/://g' | tr 'a-f' 'A-F')
+          test "${#g2sha}" = 40
+          security create-keychain -p "$p12pw" "$scratch"
+          security import "$RUNNER_TEMP/test-g2.p12" -k "$scratch" -P "$p12pw" -T /usr/bin/codesign
+          security find-certificate -c "Developer ID Certification Authority" -Z "$scratch" > "$RUNNER_TEMP/scratch-find.txt"
+          grep -q "^SHA-1 hash: $g2sha\$" "$RUNNER_TEMP/scratch-find.txt"
+          if security import "$APPLE_CA_DIR/DeveloperIDG2CA.cer" -k "$scratch" 2> "$RUNNER_TEMP/scratch-dup.txt"; then
+            echo "::error::a second import of G2 was accepted, so the duplicate case proves nothing"; exit 1
+          fi
+          cat "$RUNNER_TEMP/scratch-dup.txt"
+          grep -qi 'already exists' "$RUNNER_TEMP/scratch-dup.txt"
+          security delete-keychain "$scratch"
+          rm -f "$RUNNER_TEMP/scratch-find.txt" "$RUNNER_TEMP/scratch-dup.txt"
+          test ! -e "$scratch"
           APPLE_DEVELOPER_ID_P12=$(base64 < "$RUNNER_TEMP/test-g2.p12") \
           APPLE_DEVELOPER_ID_P12_PASSWORD=$p12pw \
             .github/scripts/mac_keychain.sh create --skip-notary
