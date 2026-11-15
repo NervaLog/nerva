@@ -211,6 +211,15 @@ fn sections_find(bytes: []align(8) const u8) !?Offsets {
     };
 }
 
+/// For a binary `multiversion.parse_elf` found no sections in: whether it still shows what `pack`
+/// wrote (`bundle_traces`), or cannot be checked for it. Such a binary is damaged, not unbundled
+/// (NRV-E0719); `start` asks it, so that it agrees with `verify`, which `version` uses.
+pub fn damaged_when_unbundled(bytes: []align(8) const u8) bool {
+    const ehdr = ehdr_read(bytes) catch return true;
+    if (ehdr.e_ident[elf.EI_VERSION] != 1) return true;
+    return bundle_traces(bytes, ehdr) catch true;
+}
+
 /// Whether `bytes` is, or was, a binary `pack` wrote: its tail resembles `trailer` (at least half
 /// of its bytes match, so that one changed byte still shows it), or its section name table has
 /// either section's name.
@@ -692,4 +701,45 @@ test "bundle: a file that is not an ELF executable is refused" {
         .debug = false,
         .size_max = 1 << 20,
     }));
+}
+
+test "bundle: start and version agree on a binary whose sections are not found" {
+    const input = try elf_make(testing.allocator, "current release code");
+    defer testing.allocator.free(input);
+    const past_bytes = try elf_make(testing.allocator, "past release code");
+    defer testing.allocator.free(past_bytes);
+    const packed_bytes = try pack(
+        testing.allocator,
+        input,
+        facts_make("0.0.206", "0.0.4", 'a'),
+        .{ .facts = facts_make("0.0.6", "0.0.4", 'a'), .bytes = past_bytes },
+        .{ .debug = false, .size_max = 1 << 20 },
+    );
+    defer testing.allocator.free(packed_bytes);
+
+    // An undamaged, unbundled binary is not damaged: `start` runs it as one release.
+    const plain = try testing.allocator.alignedAlloc(u8, 8, input.len);
+    defer testing.allocator.free(plain);
+    @memcpy(plain, input);
+    try testing.expect(!damaged_when_unbundled(plain));
+
+    // Whatever one changed byte does to a packed binary, `start` (`parse_elf` finds nothing, so
+    // `damaged_when_unbundled`) and `version` (`verify`) say the same: never "unbundled" for
+    // `start` and "damaged" for `version`.
+    const buffer = try testing.allocator.alignedAlloc(u8, 8, packed_bytes.len);
+    defer testing.allocator.free(buffer);
+    var not_found: usize = 0;
+    for (0..packed_bytes.len) |index| {
+        @memcpy(buffer, packed_bytes);
+        buffer[index] ^= 1;
+        if (multiversion.parse_elf(buffer)) |_| continue else |err| {
+            if (err != error.MultiversionHeaderOrBodyNotFound) continue;
+        }
+        not_found += 1;
+        testing.expect(damaged_when_unbundled(buffer)) catch |err| {
+            std.debug.print("byte {} changed: start would run it as one release\n", .{index});
+            return err;
+        };
+    }
+    try testing.expect(not_found > 0);
 }
