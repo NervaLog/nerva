@@ -643,16 +643,13 @@ pub fn ImporterType(comptime Storage: type) type {
                                 );
                             }
                             if (view) |declared| {
-                                restore.view_restore(op, declared) catch |err|
-                                    return restore.refused_or_changed(reader, err);
+                                try restore.view_restore(op, declared);
                                 view_index += 1;
                             } else if (ledger) |declared| {
-                                restore.ledger_restore(op, &declared.definition) catch |err|
-                                    return restore.refused_or_changed(reader, err);
+                                try restore.ledger_restore(op, &declared.definition);
                                 ledger_index += 1;
                             } else {
-                                restore.index_restore(op, index.?) catch |err|
-                                    return restore.refused_or_changed(reader, err);
+                                try restore.index_restore(op, index.?);
                                 index_index += 1;
                             }
                             ops_restored += 1;
@@ -687,13 +684,9 @@ pub fn ImporterType(comptime Storage: type) type {
                                 changes_done = pending == null;
                             }
                             if (records) {
-                                restore.changes_restore_wide(
-                                    op,
-                                    restore.changes_wide[0..count],
-                                ) catch |err| return restore.refused_or_changed(reader, err);
+                                try restore.changes_restore_wide(op, restore.changes_wide[0..count]);
                             } else {
-                                restore.changes_restore(op, restore.changes[0..count]) catch |err|
-                                    return restore.refused_or_changed(reader, err);
+                                try restore.changes_restore(op, restore.changes[0..count]);
                             }
                             ops_restored += 1;
                         }
@@ -857,22 +850,6 @@ pub fn ImporterType(comptime Storage: type) type {
                 return export_file.corrupt(reason);
             }
 
-            /// A refusal by the state machine of what pass 2 read (P476c). Pass 1 never ran the
-            /// state machine, so the refusal is the export's own only when the export read again
-            /// is pass 1's; if not, the file changed. Any other error is its own.
-            fn refused_or_changed(
-                restore: *const Restore,
-                reader: anytype,
-                err: anyerror,
-            ) anyerror {
-                if (err != error.Refused) return err;
-                if (reader.state == .records) while (try restore.reader_next(reader)) |_| {};
-                if (!std.mem.eql(u8, &reader.digest, &restore.plan.origin)) {
-                    return restore.changed_log("another SHA-256 than pass 1's");
-                }
-                return error.Refused;
-            }
-
             fn change_from_record(record: *const export_file.Change) nerva.Change {
                 return .{
                     .id = record.id,
@@ -901,9 +878,7 @@ pub fn ImporterType(comptime Storage: type) type {
                 );
                 Wait.run(restore.storage);
                 state_machine.restore_changes(op, changes, &restore.timestamp_next) catch |err| {
-                    if (!builtin.is_test) {
-                        log.err("op {}: {} changes: {s}", .{ op, changes.len, @errorName(err) });
-                    }
+                    log.err("op {}: {} changes: {s}", .{ op, changes.len, @errorName(err) });
                     return error.Refused;
                 };
             }
@@ -924,9 +899,7 @@ pub fn ImporterType(comptime Storage: type) type {
                 );
                 Wait.run(restore.storage);
                 state_machine.restore_changes_wide(op, changes, &restore.timestamp_next) catch |err| {
-                    if (!builtin.is_test) {
-                        log.err("op {}: {} changes: {s}", .{ op, changes.len, @errorName(err) });
-                    }
+                    log.err("op {}: {} changes: {s}", .{ op, changes.len, @errorName(err) });
                     return error.Refused;
                 };
             }
@@ -1521,18 +1494,6 @@ fn export_test_history(buffer: []u8, id: u64) []const u8 {
 /// An export of `ops` ops on row `id` of `table`: op 1 puts it, op 2 deletes it, op 3 puts it
 /// again, and so on.
 fn export_test_ops(buffer: []u8, id: u64, table: u32, ops: u64) []const u8 {
-    return export_test_rows(buffer, id, id, table, ops);
-}
-
-/// `export_test_ops` whose deletes name row `delete_id`: another than the one put, they delete
-/// a row that is not live, which the state machine refuses (`HistoryInvalid`).
-fn export_test_rows(
-    buffer: []u8,
-    id: u64,
-    delete_id: u64,
-    table: u32,
-    ops: u64,
-) []const u8 {
     var stream = std.io.fixedBufferStream(buffer);
     var writer = export_file.WriterType(@TypeOf(stream).Writer)
         .init(stream.writer(), 2, 0) catch unreachable;
@@ -1543,7 +1504,7 @@ fn export_test_rows(
         const put = op % 2 == 1;
         writer.write(&.{ .change = .{
             .table = table,
-            .id = if (put) id else delete_id,
+            .id = id,
             .op = op,
             .timestamp = timestamp + op,
             .kind = if (put) .put else .delete,
@@ -1685,39 +1646,6 @@ test "import: pass 2 refuses rows pass 1 would refuse, and more ops than pass 1 
             import_test_run(&plan_file, .{ .file = file }),
         );
     }
-}
-
-test "import: a state-machine refusal in pass 2 is the export's, or a changed file's" {
-    var buffer_a: [1024]u8 = undefined;
-    var buffer_b: [1024]u8 = undefined;
-    const a = export_test_rows(&buffer_a, 1, 1, 1, 2);
-    // The same two ops and counts, but op 2 deletes row 9, which is not live.
-    const b = export_test_rows(&buffer_b, 1, 9, 1, 2);
-
-    var arena_instance = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_instance.deinit();
-    const arena = arena_instance.allocator();
-    const plan_a = try plan_bytes(arena, a);
-    const plan_b = try plan_bytes(arena, b);
-    try std.testing.expectEqual(plan_a.summary, plan_b.summary);
-
-    // Pass 1 does not run the state machine, so it accepts b. Read again as b, the export
-    // is refused as it is: its own fault.
-    try std.testing.expectError(error.Refused, import_test_run(&plan_b, .{ .bytes = b }));
-    // Read again as b where pass 1 read a, the file changed: the refusal is not the export's.
-    try std.testing.expectError(error.ExportChanged, import_test_run(&plan_a, .{ .bytes = b }));
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "rewritten", .data = a });
-    const file = try tmp.dir.openFile("rewritten", .{});
-    defer file.close();
-    const plan_file = try plan(arena, file);
-    try tmp.dir.writeFile(.{ .sub_path = "rewritten", .data = b });
-    try std.testing.expectError(
-        error.ExportChanged,
-        import_test_run(&plan_file, .{ .file = file }),
-    );
 }
 
 test "import: an input that is not a regular file is refused before pass 1 (NRV-E0810)" {
