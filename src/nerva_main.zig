@@ -405,10 +405,15 @@ fn import_run(
     // The manifest first: a backup is compared with a record it did not carry.
     var manifest: backup.Manifest = undefined;
     if (manifest_path) |path| manifest_read(command, path, &manifest);
+    // One descriptor for both passes: the path is opened once, so that pass 2 reads the file
+    // pass 1 checked, not one renamed over it since (and pass 2 compares the SHA-256s).
+    const input = std.fs.cwd().openFile(args.input, .{}) catch |err|
+        import_failed(command, args.input, args.path, err);
+    defer input.close();
     // Pass 1, before the data file exists: the whole export is checked.
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
-    const plan = import_.plan(arena.allocator(), args.input) catch |err|
+    const plan = import_.plan(arena.allocator(), input) catch |err|
         import_failed(command, args.input, args.path, err);
     if (commit_keys_deduplicate and plan.flags & export_file.flag_keys_off != 0) {
         diagnostic.fail(
@@ -420,9 +425,9 @@ fn import_run(
             .{},
         );
     }
-    if (manifest_path) |path| manifest_compare(command, args, path, &manifest, &plan);
+    if (manifest_path) |path| manifest_compare(command, args, input, path, &manifest, &plan);
     // Pass 2. Any failure removes the data file, which the import created.
-    command_import(gpa, args, path_importing, &plan) catch |err| {
+    command_import(gpa, args, input, path_importing, &plan) catch |err| {
         std.fs.cwd().deleteFile(path_importing) catch {};
         import_failed(command, args.input, path_importing, err);
     };
@@ -486,11 +491,13 @@ fn manifest_read(comptime command: []const u8, path: []const u8, manifest: *back
 fn manifest_compare(
     comptime command: []const u8,
     args: *const cli.Command.Import,
+    input: std.fs.File,
     manifest_path: []const u8,
     manifest: *const backup.Manifest,
     plan: *const import_.Plan,
 ) void {
-    const stat = std.fs.cwd().statFile(args.input) catch |err|
+    // The file pass 1 read, not the path's.
+    const stat = input.stat() catch |err|
         diagnostic.fail_file(args.input, err);
     const actual = backup.from_plan(plan, manifest.release_slice(), manifest.cluster, stat.size);
     var difference_buffer: [512]u8 = undefined;
@@ -526,7 +533,12 @@ fn command_backup(gpa: std.mem.Allocator, args: *const cli.Command.Backup) void 
     // A backup that `restore` would refuse is refused now.
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
-    const plan = import_.plan(arena.allocator(), args.output) catch |err| {
+    const output = std.fs.cwd().openFile(args.output, .{}) catch |err| {
+        std.fs.cwd().deleteFile(args.output) catch {};
+        diagnostic.fail_file(args.output, err);
+    };
+    defer output.close();
+    const plan = import_.plan(arena.allocator(), output) catch |err| {
         std.fs.cwd().deleteFile(args.output) catch {};
         backup_unreadable(args.output, err);
     };
@@ -645,6 +657,15 @@ fn import_failed(
             "read the log lines above; nothing was named {s}",
             .{output},
         ),
+        error.ExportChanged => diagnostic.fail(
+            "NRV-E0813",
+            command ++ ": {s} changed while it was read: the second pass read another export " ++
+                "than the first",
+            .{input},
+            "let nothing write or replace {s} during the {s}, then {s} again; nothing was " ++
+                "named {s}",
+            .{ input, command, command, output },
+        ),
         error.FileNotFound,
         error.AccessDenied,
         error.PermissionDenied,
@@ -666,6 +687,7 @@ fn directory_sync(path: []const u8) !void {
 fn command_import(
     gpa: std.mem.Allocator,
     args: *const cli.Command.Import,
+    input: std.fs.File,
     path: []const u8,
     plan: *const import_.Plan,
 ) !void {
@@ -700,7 +722,7 @@ fn command_import(
     try import_.ImporterType(Storage).run(gpa, time, &tracer, &storage, .{
         .cluster = args.cluster,
         .release = config.process.release,
-        .input = args.input,
+        .input = .{ .file = input },
     }, plan);
     // Import cannot see the cluster, so it says what it needs (P90): a replica imported alone
     // into a cluster that ran on has forgotten the prepares the replica it replaces acknowledged.

@@ -101,8 +101,7 @@ pub fn import_storage(
     try import_.ImporterType(Storage).run(allocator, time.interface(), &tracer, storage, .{
         .cluster = cluster_id,
         .release = release,
-        .input = "",
-        .bytes = built.bytes,
+        .input = .{ .bytes = built.bytes },
         .storage_size_limit = storage_size_limit,
     }, &plan);
 }
