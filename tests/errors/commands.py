@@ -533,10 +533,12 @@ def main():
                   "NRV-E0805", 1, "version")
             # Two imports of one path at once (P489): exactly one succeeds, and the other is
             # refused cleanly (E0806 or E0814 when it met the winner's `.importing`, E0004 or
-            # E0814 when the winner had finished) without removing the winner's file. The window
-            # is narrow, so a few rounds; the unit test in `nerva_main.zig` forces it.
+            # E0814 when the winner had finished) without removing the winner's file. Both pass
+            # the existence checks, then pass 1 reads the whole export, so they usually meet at
+            # the exclusive create. Each round's data file is about 1.1 GiB: it is removed.
+            race_refusals = set()
             environment = {k: v for k, v in os.environ.items() if not k.startswith("NERVA_")}
-            for round_number in range(4):
+            for round_number in range(2):
                 target = os.path.join(tmp, f"race{round_number}.nerva")
                 racers = [subprocess.Popen([nerva] + imp + ["--input=" + out, target],
                                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -546,10 +548,17 @@ def main():
                 assert sorted(codes) == [0, 1], (codes, errors)
                 refusal = errors[codes.index(1)]
                 assert re.search(r"error\[NRV-E(0806|0814|0004)\]", refusal), refusal
-                assert os.path.getsize(target) > 0
+                race_refusals.add(re.search(r"NRV-E\d{4}", refusal).group(0))
+                # A whole data file: the size of one imported by itself.
+                if round_number == 0:
+                    whole = os.path.getsize(target)
+                assert os.path.getsize(target) == whole, "the winner's file is not whole"
                 assert not os.path.exists(target + ".importing"), "a staging file was left"
                 check("import concurrent: the winner's file is whole",
                       imp + ["--input=" + out, target], "NRV-E0004", 1, "exists")
+                os.remove(target)
+            assert race_refusals, race_refusals
+            seen.extend(sorted(race_refusals & {"NRV-E0814"}))
             # A keys-off export (P426): flag bit 0 at byte 12. The end record (the last 44 bytes:
             # size, kind, the SHA-256 of every byte before it, the CRC-32 of those) is rebuilt, so
             # only the flag is refused. A release build names it (E0812); an unknown bit is corrupt.

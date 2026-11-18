@@ -432,6 +432,14 @@ fn import_run(
     var created = false;
     command_import(gpa, args, &created, path_importing, &plan) catch |err| {
         staging_remove(created, path_importing);
+        // `Storage.init` can fail after its create (the allocation: no space), and then
+        // `created` is still false: the file may be this one's and is left (P489).
+        if (!created and err != error.PathAlreadyExists) {
+            log.warn("{s} may be left behind by this failed {s}; remove it if no import of " ++
+                "this path is running, or the next {s} stops at it", .{
+                path_importing, command, command,
+            });
+        }
         import_failed(command, args.input, path_importing, err);
     };
     // Every write is on disk: the data file is complete, and takes its name.
@@ -439,8 +447,15 @@ fn import_run(
     std.posix.linkat(cwd, path_importing, cwd, args.path, 0) catch |err| {
         std.fs.cwd().deleteFile(path_importing) catch {};
         switch (err) {
-            // Another import finished first, after this one's check above.
-            error.PathAlreadyExists => import_failed(command, args.input, path_importing, err),
+            // Something took `args.path` after this one's check above: another import that
+            // finished first, or a file of any other kind. This one's staging file is gone.
+            error.PathAlreadyExists => diagnostic.fail(
+                "NRV-E0004",
+                command ++ ": {s} appeared while this {s} ran",
+                .{ args.path, command },
+                "give a new path: nerva never overwrites a data file; nothing was named {s}",
+                .{args.path},
+            ),
             else => diagnostic.fail_file(args.path, err),
         }
     };
@@ -657,15 +672,15 @@ fn import_failed(
             "read the log lines above; nothing was named {s}",
             .{output},
         ),
-        // Another import of the same path created `output` or took the name first. It is that
-        // import's file: this one touched nothing (P489).
+        // Another import or restore of the same path created `output` first. It is that
+        // process's file: this one touched nothing (P489).
         error.PathAlreadyExists => diagnostic.fail(
             "NRV-E0814",
-            command ++ ": another {s} is writing or has written this data file: {s}",
-            .{ command, output },
-            "let it finish, or remove {s} if no {s} is running, then {s} again; nothing of " ++
-                "this one was written",
-            .{ output, command, command },
+            command ++ ": another import or restore is writing {s}",
+            .{output},
+            "let it finish, or remove {s} if no import or restore is running, then {s} " ++
+                "again; nothing of this one was written",
+            .{ output, command },
         ),
         error.FileNotFound,
         error.AccessDenied,
@@ -1302,7 +1317,7 @@ test "import: an exclusive create that loses touches nothing (P489)" {
         .path = "d.nerva",
     };
     // The create fails before the plan is read.
-    const plan: import_.Plan = undefined;
+    const plan = std.mem.zeroes(import_.Plan);
     var created = false;
     try testing.expectError(
         error.PathAlreadyExists,
