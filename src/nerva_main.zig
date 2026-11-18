@@ -51,6 +51,12 @@ const MiB = stdx.MiB;
 /// commit again. Set by `build.zig` for this binary alone; the state machine's default is true.
 const commit_keys_deduplicate = @import("nerva_options").commit_keys_deduplicate;
 const release_version = @import("nerva_options").version;
+/// Whether `start` opens the binary's own bundle and offers the releases it holds (P490): true in
+/// every build but `test:release`'s `nerva_past_single` (`build.zig`: the `multiversion_start`
+/// build parameter, with no `-D` option), which runs as `single_release`, as v0.7.1 did.
+/// `version --verbose` states the capability by this same constant, so that what a packer reads
+/// from a past binary is what `command_start` does.
+const multiversion_start = @import("nerva_options").multiversion_start;
 
 /// The runtime maximum log level: `.info`, or `.debug` with `--log-debug`.
 pub var log_level_runtime: std.log.Level = .info;
@@ -188,10 +194,13 @@ fn run() !void {
             var multiversion_bundled = false;
             var multiversion: Multiversion = Multiversion.single_release(config.process.release);
             if (tag == .start) {
-                exe_path = mv.self_exe_path(gpa) catch bundle_unreadable("its path is unknown");
-                multiversion_bundled =
-                    bundle_open(gpa, &io, &multiversion_os, exe_path.?, args.path);
-                if (multiversion_bundled) multiversion = multiversion_os.multiversion();
+                if (multiversion_start) {
+                    exe_path = mv.self_exe_path(gpa) catch
+                        bundle_unreadable("its path is unknown");
+                    multiversion_bundled =
+                        bundle_open(gpa, &io, &multiversion_os, exe_path.?, args.path);
+                    if (multiversion_bundled) multiversion = multiversion_os.multiversion();
+                }
                 const releases_run = multiversion.releases_bundled();
                 preflight.start(gpa, args.path, if (!constants.direct_io)
                     .disabled
@@ -1148,6 +1157,12 @@ fn version_write(writer: anytype, verbose: bool) !void {
     // Last, so that the lines before it keep their places. release.yml refuses a binary without
     // `commit_keys deduplicate` (#271): the test build `-Dtest-commit-keys=off` is never shipped.
     try writer.print("commit_keys {s}\n", .{if (commit_keys_deduplicate) "deduplicate" else "off"});
+    // Then, last again (P490): what `bundle.refusal` reads of a past release. Absent from v0.7.1
+    // and earlier, from `test:release`'s `nerva_past_single` (`multiversion_start` false), and
+    // from non-Linux builds, whose `start` never opens a bundle (`bundle_present`).
+    if (multiversion_start and builtin.target.os.tag == .linux) {
+        try writer.print("{s}\n", .{bundle.Facts.capability_line});
+    }
 }
 
 fn command_view(gpa: std.mem.Allocator, args: *const cli.Command.View) !void {
