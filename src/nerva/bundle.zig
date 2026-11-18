@@ -80,9 +80,9 @@ pub const Facts = struct {
     /// from a bundle, opens the outer binary's bundle and offers its releases (P490).
     offers_from_binary: bool,
 
-    /// The last line of `version --verbose` (P490): written by `version_write` exactly when `start`
-    /// opens a `MultiversionOS` on the binary's own path (`nerva_main.multiversion_start`, on Linux: no
-    /// other target switches release).
+    /// The last line of `version --verbose` (P490): written by `version_write` exactly when
+    /// `start` opens a `MultiversionOS` on the binary's own path (`nerva_main.multiversion_start`,
+    /// on Linux: no other target switches release).
     pub const capability_line = "multiversion offers_from_binary";
 
     pub const ParseError = error{
@@ -560,8 +560,10 @@ test "bundle: Facts parses what nerva version --verbose prints" {
     // v0.7.1 and v0.7.0 print no such line; a different word is not the capability either.
     const without = text[0 .. text.len - Facts.capability_line.len - 1];
     try testing.expect(!(try Facts.parse(without)).offers_from_binary);
-    try testing.expect(!(try Facts.parse(without ++ "multiversion single_release\n")).offers_from_binary);
-    try testing.expect(!(try Facts.parse(without ++ "multiversion offers_from_binary extra\n")).offers_from_binary);
+    const single_line = try Facts.parse(without ++ "multiversion single_release\n");
+    try testing.expect(!single_line.offers_from_binary);
+    const extra_word = try Facts.parse(without ++ "multiversion offers_from_binary extra\n");
+    try testing.expect(!extra_word.offers_from_binary);
     try testing.expect(facts.release.value == (try Release.parse("0.0.6")).value);
     try testing.expect(facts.release_client_min.value == (try Release.parse("0.0.4")).value);
     try testing.expectEqualStrings("ab" ** 32, &facts.format);
@@ -606,7 +608,10 @@ test "bundle: a past release is refused unless it is lower, of one format, and k
     single.offers_from_binary = false;
     try testing.expectEqual(@as(?Refusal, .not_multiversion), refusal(current, single));
     // The older reasons come first.
-    try testing.expectEqual(@as(?Refusal, .format_differs), refusal(facts_make("0.0.206", "0.0.4", 'b'), single));
+    try testing.expectEqual(
+        @as(?Refusal, .format_differs),
+        refusal(facts_make("0.0.206", "0.0.4", 'b'), single),
+    );
     // At the bound: client_min equal to the past release is accepted.
     try testing.expectEqual(
         @as(?Refusal, null),
