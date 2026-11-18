@@ -8,7 +8,8 @@
 //! release's executable, packed or not) bundled, in the layout `bundle.zig` describes. The facts
 //! of both come from `<exe> version --verbose`, so each must run here: a pack is native. It refuses
 //! (NRV-E0725, nothing written) a past release that is not lower, of another format digest, or
-//! whose clients this release would refuse, and a result over the size limit (NRV-E0719).
+//! whose clients this release would refuse (NRV-E0725), one that does not state `multiversion
+//! offers_from_binary` (NRV-E0728), and a result over the size limit (NRV-E0719).
 //! It is a build tool: `zig build` runs it, and `tests/release/bundle.py` runs it on stubs.
 
 const std = @import("std");
@@ -62,15 +63,25 @@ pub fn main() !void {
     const past_loaded = file_read(allocator, past_path.?);
     const current_facts = facts_read(allocator, input.?);
     const past_facts = facts_read(allocator, past_path.?);
-    if (bundle.refusal(current_facts, past_facts)) |refusal| {
-        diagnostic.fail(
+    if (bundle.refusal(current_facts, past_facts)) |refusal| switch (refusal) {
+        // Its own code: the cure differs, a past release that can be bundled has to be built
+        // (P<pr>, #484).
+        .not_multiversion => diagnostic.fail(
+            "NRV-E0728",
+            "pack: {s} cannot be bundled: {s}",
+            .{ past_path.?, refusal.text() },
+            "bundle a release that states it (v0.7.2 or later), or upgrade by export and import " ++
+                "(README, \"Upgrading a cluster\")",
+            .{},
+        ),
+        else => diagnostic.fail(
             "NRV-E0725",
             "pack: {s} cannot be bundled: {s}",
             .{ past_path.?, refusal.text() },
             "build with the previous release's `nerva` of the same format (README, \"Upgrading a cluster\")",
             .{},
-        );
-    }
+        ),
+    };
 
     const past_bytes = (bundle.strip(allocator, past_loaded) catch |err| switch (err) {
         error.OutOfMemory => diagnostic.unexpected(err),
