@@ -180,11 +180,17 @@ fn run() !void {
 
             // `start` runs every release its binary bundles (R6, P259): found before the data
             // file is checked, since the file's release is judged against them.
+            // `MultiversionOS` borrows the binary's path and reads it for as long as it runs (it
+            // polls the binary, and re-executes it), so the path is freed only after it (#477).
+            var exe_path: ?[:0]const u8 = null;
+            defer if (exe_path) |path| gpa.free(path);
             var multiversion_os: MultiversionOS = undefined;
             var multiversion_bundled = false;
             var multiversion: Multiversion = Multiversion.single_release(config.process.release);
             if (tag == .start) {
-                multiversion_bundled = bundle_open(gpa, &io, &multiversion_os, args.path);
+                exe_path = mv.self_exe_path(gpa) catch bundle_unreadable("its path is unknown");
+                multiversion_bundled =
+                    bundle_open(gpa, &io, &multiversion_os, exe_path.?, args.path);
                 if (multiversion_bundled) multiversion = multiversion_os.multiversion();
                 const releases_run = multiversion.releases_bundled();
                 preflight.start(gpa, args.path, if (!constants.direct_io)
@@ -910,11 +916,11 @@ fn bundle_open(
     gpa: std.mem.Allocator,
     io: *IO,
     multiversion_os: *MultiversionOS,
+    /// Borrowed by `multiversion_os` for as long as it runs: the caller frees it after
+    /// `MultiversionOS.deinit`, never before.
+    exe_path: [:0]const u8,
     data_path: []const u8,
 ) bool {
-    const exe_path = mv.self_exe_path(gpa) catch bundle_unreadable("its path is unknown");
-    defer gpa.free(exe_path);
-
     const present = bundle_present(gpa, exe_path) catch |err| switch (err) {
         error.BinaryTooLarge => bundle_fail("the binary is larger than a bundle-carrying binary can be"),
         error.BundleDamaged => bundle_fail(bundle_cause(error.BundleDamaged)),

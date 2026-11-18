@@ -591,6 +591,25 @@ pub fn build(b: *std.Build) !void {
     pack_next.addArg("--output");
     const nerva_next = pack_next.addOutputFileArg("nerva_next");
     if (mode == .Debug) pack_next.addArg("--debug");
+    // `bundle.py`'s replacement for a running `nerva_next`: the same next release, bundling the
+    // other release instead, so a replica that polls its binary sees a release it did not offer
+    // (#477).
+    const nerva_other_stripped = nerva_executable(b, .{
+        .stdx_module = stdx_module,
+        .vsr_options = vsr_options_other,
+        .target = target,
+        .mode = mode,
+        .version = options.version,
+        .strip = true,
+    });
+    const pack_next_other = b.addRunArtifact(nerva_pack);
+    pack_next_other.addArg("--input");
+    pack_next_other.addFileArg(nerva_next_unpacked.getEmittedBin());
+    pack_next_other.addArg("--past");
+    pack_next_other.addFileArg(nerva_other_stripped.getEmittedBin());
+    pack_next_other.addArg("--output");
+    const nerva_next_other = pack_next_other.addOutputFileArg("nerva_next_other");
+    if (mode == .Debug) pack_next_other.addArg("--debug");
 
     // Then an upgrade: an export from `nerva`, imported by the other release (N80), without
     // records (export version 1) and with them (version 2, P123b); then replicas imported from
@@ -612,9 +631,11 @@ pub fn build(b: *std.Build) !void {
         });
         run_release_test.addFileArg(nerva.getEmittedBin());
         if (std.mem.eql(u8, script, "bundle.py")) {
-            // The packed next release, then the packer, to try its refusals.
+            // The packed next release, then the packer, to try its refusals, then the next
+            // release bundling another past one, to replace a running binary with.
             run_release_test.addFileArg(nerva_next);
             run_release_test.addFileArg(nerva_pack.getEmittedBin());
+            run_release_test.addFileArg(nerva_next_other);
         } else {
             const nerva_second = if (std.mem.eql(u8, script, "origins.py"))
                 nerva_client_min
