@@ -428,7 +428,7 @@ fn import_run(
     }
     if (manifest_path) |path| manifest_compare(command, args, path, &manifest, &plan);
     // Pass 2. A failure removes the data file only if this invocation created it: the
-    // exclusive create can lose to another import of the same path, whose file it is (P479).
+    // exclusive create can lose to another import of the same path, whose file it is (P489).
     var created = false;
     command_import(gpa, args, &created, path_importing, &plan) catch |err| {
         staging_remove(created, path_importing);
@@ -658,7 +658,7 @@ fn import_failed(
             .{output},
         ),
         // Another import of the same path created `output` or took the name first. It is that
-        // import's file: this one touched nothing (P479).
+        // import's file: this one touched nothing (P489).
         error.PathAlreadyExists => diagnostic.fail(
             "NRV-E0814",
             command ++ ": another {s} is writing or has written this data file: {s}",
@@ -684,7 +684,7 @@ fn directory_sync(path: []const u8) !void {
     try std.posix.fsync(fd);
 }
 
-/// Removes the data file a failed pass 2 leaves, if this invocation created it (P479).
+/// Removes the data file a failed pass 2 leaves, if this invocation created it (P489).
 fn staging_remove(created: bool, path: []const u8) void {
     if (created) std.fs.cwd().deleteFile(path) catch {};
 }
@@ -1279,7 +1279,7 @@ test "bundle_present: unreadable, too large, out of memory, unbundled" {
     try testing.expect(!(try bundle_present(testing.allocator, "/proc/self/exe")));
 }
 
-test "import: an exclusive create that loses touches nothing (P479)" {
+test "import: an exclusive create that loses touches nothing (P489)" {
     if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     const testing = std.testing;
     var tmp = testing.tmpDir(.{});

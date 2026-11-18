@@ -531,7 +531,7 @@ def main():
             check("import future version",
                   imp + ["--input=" + future, os.path.join(tmp, "g.nerva")],
                   "NRV-E0805", 1, "version")
-            # Two imports of one path at once (P479): exactly one succeeds, and the other is
+            # Two imports of one path at once (P489): exactly one succeeds, and the other is
             # refused cleanly (E0806 or E0814 when it met the winner's `.importing`, E0004 or
             # E0814 when the winner had finished) without removing the winner's file. The window
             # is narrow, so a few rounds; the unit test in `nerva_main.zig` forces it.
