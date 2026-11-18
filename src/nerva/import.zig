@@ -7,6 +7,7 @@
 //! 1. `plan`, before any data file exists: the whole export is checked (CRCs, order, the
 //!    SHA-256), and each view's definition is rebuilt from its catalog document with this
 //!    release's `catalog` code.
+//!    Its SHA-256 is the new data file's origin (P90).
 //! 2. `ImporterType.run`, on a newly formatted data file: the state machine, on real storage,
 //!    restores every op up to the export's op, at its number (changes with their timestamps;
 //!    views and ledgers at their declarations), with a compaction beat after every op and a
@@ -15,10 +16,15 @@
 //!    prepare of op C and empty pulses up to the op that makes C durable, so that replicas start
 //!    from C and repair nothing before it. Then the checks run against the restored forest.
 //!
+//! Both passes read one open file (`Input.file`), never the path twice, and pass 2 refuses an
+//! export whose SHA-256 is not pass 1's (`error.ExportChanged`): a file replaced or rewritten
+//! between the passes would otherwise restore another history under pass 1's origin.
+//!
 //! Timestamps: changes keep theirs (feed cursors stay valid); views, ledgers and versions take
 //! the importer's own counter, which starts past the export's last timestamp.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const assert = std.debug.assert;
 const log = std.log.scoped(.import_);
 
@@ -54,6 +60,8 @@ pub const Error = error{
     Refused,
     /// The restored state differs from the export's checks.
     ChecksFailed,
+    /// Pass 2 read an export whose SHA-256 is not pass 1's: the file changed between the passes.
+    ExportChanged,
 };
 
 pub const PlanView = struct {
@@ -102,11 +110,14 @@ pub const Plan = struct {
 
 pub const CatalogRows = std.AutoHashMapUnmanaged(u64, [nerva.value_size]u8);
 
-/// Pass 1: reads and checks the whole export, and rebuilds the views' definitions. Allocates
-/// the plan's table checks from `arena`.
-pub fn plan(arena: std.mem.Allocator, path: []const u8) !Plan {
-    const file = try std.fs.cwd().openFile(path, .{});
-    defer file.close();
+/// Pass 1: reads and checks the whole export in `file`, from its start, and rebuilds the views'
+/// definitions. Refuses a file that is not a regular file (`error.NotRegularFile`): both passes read
+/// it. Allocates the plan's table checks from `arena`. The caller keeps `file` open for
+/// pass 2 (`Input.file`), which reads it again: a path opened twice could name another file.
+pub fn plan(arena: std.mem.Allocator, file: std.fs.File) !Plan {
+    // Pass 2 seeks back to the start: a pipe or a device cannot.
+    if ((try file.stat()).kind != .file) return error.NotRegularFile;
+    try file.seekTo(0);
     var buffered = std.io.bufferedReader(file.reader());
     var reader = try export_file.ReaderType(@TypeOf(buffered).Reader).init(buffered.reader());
     return plan_read(arena, &reader);
@@ -369,13 +380,18 @@ fn document_read(
     return decoded.value;
 }
 
+/// The export pass 2 reads again: the one pass 1 read.
+pub const Input = union(enum) {
+    /// The file `plan` read, still open: read again from its start.
+    file: std.fs.File,
+    /// The export itself, in memory (the VOPR's imported start, P159).
+    bytes: []const u8,
+};
+
 pub const Options = struct {
     cluster: u128,
     release: vsr.Release,
-    /// The export, read again (pass 2): a path, unless `bytes` is set.
-    input: []const u8,
-    /// The export itself, in memory, read instead of `input` (the VOPR's imported start, P159).
-    bytes: ?[]const u8 = null,
+    input: Input,
     /// The data file's size limit, as the replica that starts from it takes it.
     storage_size_limit: u64 = constants.storage_size_limit_default,
 };
@@ -549,18 +565,23 @@ pub fn ImporterType(comptime Storage: type) type {
                     trigger_final,
                 });
 
-                if (restore.options.bytes) |bytes| {
-                    var stream = std.io.fixedBufferStream(bytes);
-                    var reader = try export_file.ReaderType(@TypeOf(stream).Reader)
-                        .init(stream.reader());
-                    return restore.ops_read(gpa, &reader, trigger_final, checkpoint_final);
+                switch (restore.options.input) {
+                    .bytes => |bytes| {
+                        var stream = std.io.fixedBufferStream(bytes);
+                        var reader = export_file.ReaderType(@TypeOf(stream).Reader)
+                            .init(stream.reader()) catch |err| return changed(err);
+                        return restore.ops_read(gpa, &reader, trigger_final, checkpoint_final);
+                    },
+                    .file => |file| {
+                        // The descriptor pass 1 read, never the path again: a file renamed over
+                        // the path since is not read.
+                        try file.seekTo(0);
+                        var buffered = std.io.bufferedReader(file.reader());
+                        var reader = export_file.ReaderType(@TypeOf(buffered).Reader)
+                            .init(buffered.reader()) catch |err| return changed(err);
+                        return restore.ops_read(gpa, &reader, trigger_final, checkpoint_final);
+                    },
                 }
-                const file = try std.fs.cwd().openFile(restore.options.input, .{});
-                defer file.close();
-                var buffered = std.io.bufferedReader(file.reader());
-                var reader = try export_file.ReaderType(@TypeOf(buffered).Reader)
-                    .init(buffered.reader());
-                return restore.ops_read(gpa, &reader, trigger_final, checkpoint_final);
             }
 
             /// `ops` over the export `reader` reads.
@@ -586,7 +607,7 @@ pub fn ImporterType(comptime Storage: type) type {
                 while (op <= trigger_final) : (op += 1) {
                     if (op <= as_of) {
                         if (pending == null and !changes_done) {
-                            pending = try change_next(reader);
+                            pending = try restore.change_next(reader);
                             changes_done = pending == null;
                         }
                         const change_op = if (pending) |change| change.op() else null;
@@ -606,12 +627,20 @@ pub fn ImporterType(comptime Storage: type) type {
                         else
                             null;
                         if (change_op != null and change_op.? < op) {
-                            return export_file.corrupt("changes are out of op order");
+                            return restore.corrupt_or_changed(
+                                reader,
+                                "changes are out of op order",
+                            );
                         }
                         if (view != null or ledger != null or index != null) {
                             if (change_op == op) {
-                                log.err("op {} both declares and changes rows", .{op});
-                                return export_file.corrupt("an op both declares and writes");
+                                if (!builtin.is_test) {
+                                    log.err("op {} both declares and changes rows", .{op});
+                                }
+                                return restore.corrupt_or_changed(
+                                    reader,
+                                    "an op both declares and writes",
+                                );
                             }
                             if (view) |declared| {
                                 try restore.view_restore(op, declared);
@@ -633,7 +662,10 @@ pub fn ImporterType(comptime Storage: type) type {
                                 if (change.op() != op) break;
                                 // Checked by pass 1, unless the file changed since.
                                 if (count == restore.changes.len) {
-                                    return export_file.corrupt("an op has too many changes");
+                                    return restore.corrupt_or_changed(
+                                        reader,
+                                        "an op has too many changes",
+                                    );
                                 }
                                 switch (change) {
                                     .row => |*row| restore.changes[count] = change_from_record(row),
@@ -642,10 +674,13 @@ pub fn ImporterType(comptime Storage: type) type {
                                 if (count < restore.changes_wide.len) {
                                     restore.changes_wide[count] = change.wide();
                                 } else if (records) {
-                                    return export_file.corrupt("an op has too many changes");
+                                    return restore.corrupt_or_changed(
+                                        reader,
+                                        "an op has too many changes",
+                                    );
                                 }
                                 count += 1;
-                                pending = try change_next(reader);
+                                pending = try restore.change_next(reader);
                                 changes_done = pending == null;
                             }
                             if (records) {
@@ -683,14 +718,29 @@ pub fn ImporterType(comptime Storage: type) type {
                 if (pending != null or view_index != views.len or ledger_index != ledgers_.len or
                     index_index != indexes_.len)
                 {
-                    return export_file.corrupt("records past the export's op");
+                    return restore.corrupt_or_changed(reader, "records past the export's op");
                 }
                 // The rest of the export, read again: its SHA-256 must still match (the file
                 // may have changed since pass 1).
-                if (!changes_done) {
-                    assert(try change_next(reader) == null);
+                if (!changes_done and try restore.change_next(reader) != null) {
+                    return restore.corrupt_or_changed(reader, "records past the export's op");
                 }
-                while (try reader.next()) |_| {}
+                while (try restore.reader_next(reader)) |_| {}
+                // The reader returns null only once its own SHA-256 checked. It must be pass 1's
+                // too: the data file records pass 1's as its origin (P90), and another valid
+                // export (the file rewritten between the passes) can end in the same rows and
+                // pass the checks with another history.
+                if (!std.mem.eql(u8, &reader.digest, &restore.plan.origin)) {
+                    // The test runner fails a test that logs an error, and a test reaches this
+                    // on purpose.
+                    if (!builtin.is_test) {
+                        log.err("the export read again ends in SHA-256 {s}; pass 1 read {s}", .{
+                            std.fmt.fmtSliceHexLower(&reader.digest),
+                            std.fmt.fmtSliceHexLower(&restore.plan.origin),
+                        });
+                    }
+                    return error.ExportChanged;
+                }
             }
 
             /// A change of a row or of a record.
@@ -729,15 +779,75 @@ pub fn ImporterType(comptime Storage: type) type {
                 }
             };
 
-            /// The next change, or null once the changes' section has ended.
-            fn change_next(reader: anytype) !?Pending {
+            /// The next change, or null once the changes' section has ended. A change pass 1
+            /// would have refused, or one more than its summary counts, means the file changed
+            /// since pass 1: refused here, before it reaches the state machine, which asserts what
+            /// pass 1 checked.
+            fn change_next(restore: *const Restore, reader: anytype) !?Pending {
                 if (reader.section > 1) return null; // The changes' section (`RecordKind`).
-                const record = try reader.next() orelse return null;
-                return switch (record) {
+                const record = try restore.reader_next(reader) orelse return null;
+                const pending: Pending = switch (record) {
                     .change => |change| .{ .row = change },
                     .record_change => |change| .{ .record = change },
-                    else => null,
+                    else => return null,
                 };
+                const summary = &restore.plan.summary;
+                if (reader.change_count > summary.change_count or
+                    reader.record_change_count > summary.record_change_count)
+                {
+                    return restore.changed_log("more changes than pass 1 read");
+                }
+                switch (pending) {
+                    .row => |*row| {
+                        if (table_refused(row.table, null)) {
+                            return restore.changed_log("a row in a table that holds records");
+                        }
+                        if (row.timestamp > timestamp_restore_max) {
+                            return restore.changed_log("a timestamp pass 1 would refuse");
+                        }
+                    },
+                    .record => |*record_change| {
+                        if (record_change.timestamp > timestamp_restore_max) {
+                            return restore.changed_log("a timestamp pass 1 would refuse");
+                        }
+                    },
+                }
+                return pending;
+            }
+
+            /// `reader.next`, pass 2's: pass 1 read the whole export without a fault, so a fault
+            /// in it now is a change (a read that fails stays its own error).
+            fn reader_next(_: *const Restore, reader: anytype) !?export_file.Record {
+                return reader.next() catch |err| return changed(err);
+            }
+
+            /// A fault the reader found in pass 2 (`Corrupt`, an unsupported version: pass 1
+            /// found none) is `ExportChanged`; any other error is its own.
+            fn changed(err: anyerror) anyerror {
+                return switch (err) {
+                    error.Corrupt, error.VersionUnsupported => error.ExportChanged,
+                    else => err,
+                };
+            }
+
+            fn changed_log(_: *const Restore, what: []const u8) error{ExportChanged} {
+                if (!builtin.is_test) log.err("the export read again holds {s}", .{what});
+                return error.ExportChanged;
+            }
+
+            /// A fault in the export that pass 1 did not look for (order, ops past the export's,
+            /// too many changes in an op). It is the export's own when the export read again is
+            /// pass 1's, byte for byte; if not, the file changed. Reads the rest to tell.
+            fn corrupt_or_changed(
+                restore: *const Restore,
+                reader: anytype,
+                reason: []const u8,
+            ) anyerror {
+                if (reader.state == .records) while (try restore.reader_next(reader)) |_| {};
+                if (!std.mem.eql(u8, &reader.digest, &restore.plan.origin)) {
+                    return restore.changed_log("another SHA-256 than pass 1's");
+                }
+                return export_file.corrupt(reason);
             }
 
             fn change_from_record(record: *const export_file.Change) nerva.Change {
@@ -1373,4 +1483,176 @@ test "import: rows and views of tables that now hold records are refused (#126)"
     try std.testing.expect(!table_refused(1, 1));
     try std.testing.expect(table_refused(nerva.record_tables_min + 1, 1));
     try std.testing.expect(!table_refused(nerva.record_tables_min + 1, 2));
+}
+
+/// An export of two ops: op 1 puts row `id` of table 1, op 2 deletes it. Every `id` ends in the
+/// same rows (none) and passes the same checks, with another history and another SHA-256.
+fn export_test_history(buffer: []u8, id: u64) []const u8 {
+    return export_test_ops(buffer, id, 1, 2);
+}
+
+/// An export of `ops` ops on row `id` of `table`: op 1 puts it, op 2 deletes it, op 3 puts it
+/// again, and so on.
+fn export_test_ops(buffer: []u8, id: u64, table: u32, ops: u64) []const u8 {
+    var stream = std.io.fixedBufferStream(buffer);
+    var writer = export_file.WriterType(@TypeOf(stream).Writer)
+        .init(stream.writer(), 2, 0) catch unreachable;
+    const timestamp: u64 = 1 << 40;
+    var value: [nerva.value_size]u8 = @splat(0);
+    value[0] = 0x5a;
+    for (1..ops + 1) |op| {
+        const put = op % 2 == 1;
+        writer.write(&.{ .change = .{
+            .table = table,
+            .id = id,
+            .op = op,
+            .timestamp = timestamp + op,
+            .kind = if (put) .put else .delete,
+            .value = if (put) value else @splat(0),
+        } }) catch unreachable;
+    }
+    writer.write(&.{ .summary = .{
+        .as_of = ops,
+        .change_count = ops,
+        .view_count = 0,
+        .ledger_count = 0,
+        .table_count = 0,
+    } }) catch unreachable;
+    writer.finish() catch unreachable;
+    return buffer[0..stream.pos];
+}
+
+/// Pass 2 of `plan_` over `input`, into a newly formatted testing storage.
+fn import_test_run(plan_: *const Plan, input: Input) !void {
+    const Storage = @import("../testing/storage.zig").Storage;
+    const fixtures = @import("../testing/fixtures.zig");
+    const allocator = std.testing.allocator;
+    const size = 64 * stdx.MiB;
+
+    var storage = try fixtures.init_storage(allocator, .{
+        .size = size,
+        .iops_write_max = replica_format.writes_max,
+    });
+    defer storage.deinit(allocator);
+    try replica_format.format(Storage, allocator, &storage, .{
+        .cluster = 0,
+        .release = vsr.Release.minimum,
+        .replica = 0,
+        .replica_count = 1,
+        .view = null,
+        .origin = plan_.origin,
+    });
+    var time: stdx.TimeSim = .{
+        .resolution = 10 * std.time.ns_per_ms,
+        .offset_type = .linear,
+        .offset_coefficient_A = 0,
+        .offset_coefficient_B = 0,
+    };
+    var tracer = try vsr.trace.Tracer.init(allocator, time.interface(), .unknown, .{});
+    defer tracer.deinit(allocator);
+    try ImporterType(Storage).run(allocator, time.interface(), &tracer, &storage, .{
+        .cluster = 0,
+        .release = vsr.Release.minimum,
+        .input = input,
+        .storage_size_limit = size,
+    }, plan_);
+}
+
+test "import: pass 2 refuses an export other than pass 1's, same rows, another history (#475)" {
+    var buffer_a: [1024]u8 = undefined;
+    var buffer_b: [1024]u8 = undefined;
+    const a = export_test_history(&buffer_a, 1);
+    const b = export_test_history(&buffer_b, 2);
+    try std.testing.expect(!std.mem.eql(u8, a, b));
+
+    var arena_instance = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_instance.deinit();
+    const arena = arena_instance.allocator();
+    const plan_a = try plan_bytes(arena, a);
+    const plan_b = try plan_bytes(arena, b);
+    try std.testing.expect(!std.mem.eql(u8, &plan_a.origin, &plan_b.origin));
+    try std.testing.expectEqual(plan_a.summary, plan_b.summary);
+
+    // In memory (the VOPR's start): each export restores alone, and neither under the other's
+    // plan, although both pass every check.
+    try import_test_run(&plan_a, .{ .bytes = a });
+    try import_test_run(&plan_b, .{ .bytes = b });
+    try std.testing.expectError(error.ExportChanged, import_test_run(&plan_a, .{ .bytes = b }));
+    try std.testing.expectError(error.ExportChanged, import_test_run(&plan_b, .{ .bytes = a }));
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // A file renamed over the path between the passes is not read: pass 2 reads the
+    // descriptor pass 1 read.
+    {
+        try tmp.dir.writeFile(.{ .sub_path = "renamed", .data = a });
+        try tmp.dir.writeFile(.{ .sub_path = "renamed.next", .data = b });
+        const file = try tmp.dir.openFile("renamed", .{});
+        defer file.close();
+        const plan_file = try plan(arena, file);
+        try std.testing.expectEqualSlices(u8, &plan_a.origin, &plan_file.origin);
+        try tmp.dir.rename("renamed.next", "renamed");
+        try import_test_run(&plan_file, .{ .file = file });
+    }
+    // A file rewritten in place between the passes is read, and refused.
+    {
+        try tmp.dir.writeFile(.{ .sub_path = "rewritten", .data = a });
+        const file = try tmp.dir.openFile("rewritten", .{});
+        defer file.close();
+        const plan_file = try plan(arena, file);
+        try std.testing.expectEqualSlices(u8, &plan_a.origin, &plan_file.origin);
+        try tmp.dir.writeFile(.{ .sub_path = "rewritten", .data = b });
+        try std.testing.expectError(
+            error.ExportChanged,
+            import_test_run(&plan_file, .{ .file = file }),
+        );
+    }
+}
+
+test "import: pass 2 refuses rows pass 1 would refuse, and more ops than pass 1 saw (#475)" {
+    var buffer_a: [1024]u8 = undefined;
+    var buffer_rows: [1024]u8 = undefined;
+    var buffer_more: [1024]u8 = undefined;
+    const a = export_test_ops(&buffer_a, 1, 1, 2);
+    // The same two ops, on a table that holds records: pass 1 refuses it (#126; its test is
+    // above, and a refusal logs an error, which a test may not).
+    const rows = export_test_ops(&buffer_rows, 1, nerva.record_tables_min + 1, 2);
+    // The same two ops and one more.
+    const more = export_test_ops(&buffer_more, 1, 1, 3);
+
+    var arena_instance = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_instance.deinit();
+    const arena = arena_instance.allocator();
+    const plan_a = try plan_bytes(arena, a);
+    _ = try plan_bytes(arena, more);
+
+    // Each is refused as another export than pass 1's, before a row reaches the state machine
+    // (which asserts what pass 1 checked) and not as a corrupt export.
+    try std.testing.expectError(error.ExportChanged, import_test_run(&plan_a, .{ .bytes = rows }));
+    try std.testing.expectError(error.ExportChanged, import_test_run(&plan_a, .{ .bytes = more }));
+
+    // The same, from a file rewritten in place between the passes.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    inline for (.{ rows, more }) |next| {
+        try tmp.dir.writeFile(.{ .sub_path = "rewritten", .data = a });
+        const file = try tmp.dir.openFile("rewritten", .{});
+        defer file.close();
+        const plan_file = try plan(arena, file);
+        try tmp.dir.writeFile(.{ .sub_path = "rewritten", .data = next });
+        try std.testing.expectError(
+            error.ExportChanged,
+            import_test_run(&plan_file, .{ .file = file }),
+        );
+    }
+}
+
+test "import: an input that is not a regular file is refused before pass 1 (NRV-E0810)" {
+    var arena_instance = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_instance.deinit();
+    // A device cannot seek back for pass 2, as a pipe cannot.
+    const device = try std.fs.openFileAbsolute("/dev/null", .{});
+    defer device.close();
+    try std.testing.expectError(error.NotRegularFile, plan(arena_instance.allocator(), device));
 }

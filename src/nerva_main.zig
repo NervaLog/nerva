@@ -420,10 +420,15 @@ fn import_run(
     // The manifest first: a backup is compared with a record it did not carry.
     var manifest: backup.Manifest = undefined;
     if (manifest_path) |path| manifest_read(command, path, &manifest);
+    // One descriptor for both passes: the path is opened once, so that pass 2 reads the file
+    // pass 1 checked, not one renamed over it since (and pass 2 compares the SHA-256s).
+    const input = std.fs.cwd().openFile(args.input, .{}) catch |err|
+        import_failed(command, args.input, args.path, err);
+    defer input.close();
     // Pass 1, before the data file exists: the whole export is checked.
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
-    const plan = import_.plan(arena.allocator(), args.input) catch |err|
+    const plan = import_.plan(arena.allocator(), input) catch |err|
         import_failed(command, args.input, args.path, err);
     if (commit_keys_deduplicate and plan.flags & export_file.flag_keys_off != 0) {
         diagnostic.fail(
@@ -435,11 +440,11 @@ fn import_run(
             .{},
         );
     }
-    if (manifest_path) |path| manifest_compare(command, args, path, &manifest, &plan);
+    if (manifest_path) |path| manifest_compare(command, args, input, path, &manifest, &plan);
     // Pass 2. A failure removes the data file only if this invocation created it: the
     // exclusive create can lose to another import of the same path, whose file it is (P489).
     var created = false;
-    command_import(gpa, args, &created, path_importing, &plan) catch |err| {
+    command_import(gpa, args, input, &created, path_importing, &plan) catch |err| {
         staging_remove(created, path_importing);
         // `Storage.init` can fail after its create (the allocation: no space), and then
         // `created` is still false: the file may be this one's and is left (P489).
@@ -522,11 +527,13 @@ fn manifest_read(comptime command: []const u8, path: []const u8, manifest: *back
 fn manifest_compare(
     comptime command: []const u8,
     args: *const cli.Command.Import,
+    input: std.fs.File,
     manifest_path: []const u8,
     manifest: *const backup.Manifest,
     plan: *const import_.Plan,
 ) void {
-    const stat = std.fs.cwd().statFile(args.input) catch |err|
+    // The file pass 1 read, not the path's.
+    const stat = input.stat() catch |err|
         diagnostic.fail_file(args.input, err);
     const actual = backup.from_plan(plan, manifest.release_slice(), manifest.cluster, stat.size);
     var difference_buffer: [512]u8 = undefined;
@@ -562,11 +569,17 @@ fn command_backup(gpa: std.mem.Allocator, args: *const cli.Command.Backup) void 
     // A backup that `restore` would refuse is refused now.
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
-    const plan = import_.plan(arena.allocator(), args.output) catch |err| {
+    const output = std.fs.cwd().openFile(args.output, .{}) catch |err| {
+        std.fs.cwd().deleteFile(args.output) catch {};
+        diagnostic.fail_file(args.output, err);
+    };
+    defer output.close();
+    const plan = import_.plan(arena.allocator(), output) catch |err| {
         std.fs.cwd().deleteFile(args.output) catch {};
         backup_unreadable(args.output, err);
     };
-    const size = (std.fs.cwd().statFile(args.output) catch |err| {
+    // From the descriptor the SHA-256 was read through, not the path again.
+    const size = (output.stat() catch |err| {
         std.fs.cwd().deleteFile(args.output) catch {};
         diagnostic.fail_file(args.output, err);
     }).size;
@@ -681,6 +694,15 @@ fn import_failed(
             "read the log lines above; nothing was named {s}",
             .{output},
         ),
+        error.ExportChanged => diagnostic.fail(
+            "NRV-E0813",
+            command ++ ": {s} changed while it was read: the second pass read another export " ++
+                "than the first",
+            .{input},
+            "let nothing write or replace {s} during the {s}, then {s} again; nothing was " ++
+                "named {s}",
+            .{ input, command, command, output },
+        ),
         // Another import or restore of the same path created `output` first. It is that
         // process's file: this one touched nothing (P489).
         error.PathAlreadyExists => diagnostic.fail(
@@ -695,6 +717,7 @@ fn import_failed(
         error.AccessDenied,
         error.PermissionDenied,
         error.IsDir,
+        error.NotRegularFile,
         => diagnostic.fail_file(input, err),
         else => diagnostic.fail_file(output, err),
     }
@@ -719,6 +742,7 @@ fn staging_remove(created: bool, path: []const u8) void {
 fn command_import(
     gpa: std.mem.Allocator,
     args: *const cli.Command.Import,
+    input: std.fs.File,
     created: *bool,
     path: []const u8,
     plan: *const import_.Plan,
@@ -755,7 +779,7 @@ fn command_import(
     try import_.ImporterType(Storage).run(gpa, time, &tracer, &storage, .{
         .cluster = args.cluster,
         .release = config.process.release,
-        .input = args.input,
+        .input = .{ .file = input },
     }, plan);
     // Import cannot see the cluster, so it says what it needs (P90): a replica imported alone
     // into a cluster that ran on has forgotten the prepares the replica it replaces acknowledged.
@@ -1331,12 +1355,14 @@ test "import: an exclusive create that loses touches nothing (P489)" {
         .log_debug = false,
         .path = "d.nerva",
     };
-    // The create fails before the plan is read.
+    // The create fails before the plan or the input is read.
     const plan = std.mem.zeroes(import_.Plan);
+    const input = try tmp.dir.createFile("unused", .{});
+    defer input.close();
     var created = false;
     try testing.expectError(
         error.PathAlreadyExists,
-        command_import(testing.allocator, &args, &created, path, &plan),
+        command_import(testing.allocator, &args, input, &created, path, &plan),
     );
     try testing.expect(!created);
 

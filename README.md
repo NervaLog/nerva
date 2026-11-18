@@ -402,7 +402,9 @@ ledger's check with the manifest, and refuses with `NRV-E0809` naming the first 
 (`NRV-E0808` when the manifest is missing, malformed or of another version; `NRV-E0804` when the
 backup itself is damaged). The manifest is a record kept apart so that a damaged or swapped
 backup is caught by something it did not carry; it holds no checksum of its own. Then it restores
-as `import` does: the data file is named only once its state equals the checks.
+as `import` does: the data file is named only once its state equals the checks. Both passes
+read the file opened once, and the second must end in the first's SHA-256, or the restore (or
+import) is refused with `NRV-E0813`: let nothing write the backup while it runs (P476).
 
 - **Restore every replica from the same backup, with the cluster closed**, then start them. A
   replica of a running cluster is never restored alone (P90): use `recover`.
