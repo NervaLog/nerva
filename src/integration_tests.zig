@@ -7,6 +7,7 @@
 //! but the client must share the production configuration of the `nerva` binary it talks to.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const assert = std.debug.assert;
 const testing = std.testing;
 
@@ -96,18 +97,19 @@ const Cluster = struct {
         );
         errdefer gpa.free(addresses_flag);
 
-        var statsd = try StatsdListener.init();
-        errdefer statsd.deinit();
-
         cluster.* = .{
             .gpa = gpa,
             .tmp_path = tmp_path,
             .addresses_flag = addresses_flag,
             .addresses = undefined,
             .processes = @splat(null),
-            .statsd = statsd,
+            .statsd = try StatsdListener.init(),
             .environments = undefined,
         };
+        errdefer cluster.statsd.deinit();
+        // Before any replica, so that a failure to spawn it leaves nothing running. `cluster` is
+        // on the heap, so the listener does not move.
+        try cluster.statsd.start();
         for (&cluster.environments, 0..) |*environment, index| {
             errdefer for (cluster.environments[0..index]) |*done| done.deinit();
             environment.* = try std.process.getEnvMap(gpa);
@@ -120,8 +122,6 @@ const Cluster = struct {
 
         for (0..replica_count) |replica| try cluster.format(@intCast(replica));
         for (0..replica_count) |replica| try cluster.start(@intCast(replica));
-        // Last, so that nothing after it can fail while the thread runs; `cluster` is on the heap.
-        try cluster.statsd.start();
         return cluster;
     }
 
@@ -292,27 +292,49 @@ const Cluster = struct {
     }
 };
 
-/// A UDP socket that collects statsd packets from the replicas. A thread drains it from the
-/// moment the cluster starts, so no packet waits in the socket's receive buffer, which holds
-/// about 90 of them and drops the rest (#482: a replica's first emit, ten seconds after it
-/// starts, is over 100 packets from three replicas, and the round trips come last).
+/// A UDP socket that collects statsd packets from the replicas. A thread drains it from before
+/// the first replica starts, into a buffer of its own, and the socket's receive buffer is
+/// raised, so that a burst does not outrun the reader. A replica's emit is 53 to 55 packets
+/// of about 1.3 KiB, sent back to back, with the round trips second to last. The first emits
+/// of replicas that started together coincide (#482: r0 and r1 started 2 ms apart), and
+/// the default buffer holds about 93 packets, fewer than two emits. A packet that finds it
+/// full is lost, and the replicas reset their aggregates at each emit, so the next emit has
+/// no round trips unless a request came between.
 const StatsdListener = struct {
     socket: std.posix.socket_t,
     port: u16,
     /// Every packet received so far, each followed by a newline.
     received: []u8,
-    /// Guards `received_len` and `received_full`, and the bytes of `received` below `received_len`.
+    /// Guards `received_len`, `received_full`, `receive_error`, `dropped`, `packets` and the bytes
+    /// of `received` below `received_len`, which are never written again.
     mutex: std.Thread.Mutex = .{},
     received_len: usize = 0,
     /// A packet did not fit in `received`: later ones are dropped.
     received_full: bool = false,
+    /// The receive that ended the thread.
+    receive_error: ?anyerror = null,
+    /// The kernel's count of packets it dropped because the socket's buffer was full
+    /// (`SO_RXQ_OVFL`, Linux only; 0 elsewhere), as of the last packet received.
+    dropped: u32 = 0,
+    packets: u32 = 0,
     stopping: std.atomic.Value(bool) = .init(false),
     thread: ?std.Thread = null,
 
     /// Replicas emit metrics every 10 s; allow for one full interval plus slack.
     const wait_max = stdx.Duration.seconds(15);
-    /// Enough for a cluster's emits over many minutes (about 40 KiB every 10 s).
+    /// About 215 KiB for the three replicas' first emit and 144 KiB for each later one, so
+    /// this holds minutes of them. It is a harness bound with no test: a test that overran it
+    /// would only show `received_full`.
     const received_max = 8 * stdx.MiB;
+    /// The most packets one replica emits at once (53 and 55 seen), with one to spare.
+    const emit_packets_max = 56;
+    /// What a small packet costs in the receive buffer, with the kernel's per-packet overhead.
+    const packet_cost_max = 2304;
+    /// Requested size of the socket's receive buffer, `net.core.rmem_default`. Linux doubles it
+    /// for its own bookkeeping, and an unprivileged process may ask for up to `rmem_max`.
+    const receive_buffer_requested: u32 = 212992;
+    /// What the receive buffer must hold: every replica's emit at once.
+    const receive_buffer_min: u32 = replica_count * emit_packets_max * packet_cost_max;
 
     fn init() !StatsdListener {
         const socket = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.DGRAM, 0);
@@ -331,6 +353,41 @@ const StatsdListener = struct {
             std.posix.SO.RCVTIMEO,
             std.mem.asBytes(&receive_timeout),
         );
+        try std.posix.setsockopt(
+            socket,
+            std.posix.SOL.SOCKET,
+            std.posix.SO.RCVBUF,
+            std.mem.asBytes(&receive_buffer_requested),
+        );
+        if (builtin.os.tag == .linux) {
+            const on: u32 = 1;
+            try std.posix.setsockopt(
+                socket,
+                std.posix.SOL.SOCKET,
+                std.posix.SO.RXQ_OVFL,
+                std.mem.asBytes(&on),
+            );
+            var actual: u32 = 0;
+            // Not `std.posix.getsockopt`, which passes the kernel an uninitialized length.
+            var length: std.posix.socklen_t = @sizeOf(u32);
+            const result = std.os.linux.getsockopt(
+                socket,
+                std.posix.SOL.SOCKET,
+                std.posix.SO.RCVBUF,
+                std.mem.asBytes(&actual),
+                &length,
+            );
+            if (std.posix.errno(result) != .SUCCESS) return error.StatsdReceiveBufferUnknown;
+            assert(length == @sizeOf(u32));
+            if (actual < receive_buffer_min) {
+                std.debug.print(
+                    "statsd: receive buffer is {} bytes, below the {} needed " ++
+                        "(net.core.rmem_max too low?)\n",
+                    .{ actual, receive_buffer_min },
+                );
+                return error.StatsdReceiveBufferTooSmall;
+            }
+        }
         const received = try gpa.alloc(u8, received_max);
         return .{ .socket = socket, .port = address.getPort(), .received = received };
     }
@@ -349,18 +406,57 @@ const StatsdListener = struct {
         listener.* = undefined;
     }
 
+    /// Receives one packet into `packet`, and returns its size. On Linux it also reads the
+    /// kernel's drop count from the packet's control message.
+    fn receive(listener: *StatsdListener, packet: []u8) !struct { size: usize, dropped: ?u32 } {
+        if (builtin.os.tag != .linux) {
+            const size = try std.posix.recv(listener.socket, packet, 0);
+            return .{ .size = size, .dropped = null };
+        }
+        var iov: std.posix.iovec = .{ .base = packet.ptr, .len = packet.len };
+        var control: [64]u8 align(@alignOf(usize)) = undefined;
+        var message: std.os.linux.msghdr = std.mem.zeroes(std.os.linux.msghdr);
+        message.iov = @ptrCast(&iov);
+        message.iovlen = 1;
+        message.control = &control;
+        message.controllen = control.len;
+        const result = std.os.linux.recvmsg(listener.socket, &message, 0);
+        switch (std.posix.errno(result)) {
+            .SUCCESS => {},
+            .AGAIN, .INTR => return error.WouldBlock,
+            else => |errno| return std.posix.unexpectedErrno(errno),
+        }
+        // One control message: `cmsghdr` (length, level, type) and the u32 count after it.
+        const header_size = 2 * @sizeOf(usize);
+        const endian = builtin.cpu.arch.endian();
+        var dropped: ?u32 = null;
+        if (message.controllen >= header_size + @sizeOf(u32)) {
+            const level = std.mem.readInt(i32, control[@sizeOf(usize)..][0..4], endian);
+            const kind = std.mem.readInt(i32, control[@sizeOf(usize) + 4 ..][0..4], endian);
+            if (level == std.posix.SOL.SOCKET and kind == std.posix.SO.RXQ_OVFL) {
+                dropped = std.mem.readInt(u32, control[header_size..][0..4], endian);
+            }
+        }
+        return .{ .size = result, .dropped = dropped };
+    }
+
     fn collect(listener: *StatsdListener) void {
         var packet: [2048]u8 = undefined;
         while (!listener.stopping.load(.acquire)) {
-            const size = std.posix.recv(listener.socket, &packet, 0) catch |err| switch (err) {
+            const received = listener.receive(&packet) catch |err| switch (err) {
                 error.WouldBlock => continue,
                 else => {
-                    std.debug.print("statsd: recv failed: {}\n", .{err});
+                    listener.mutex.lock();
+                    defer listener.mutex.unlock();
+                    listener.receive_error = err;
                     return;
                 },
             };
+            const size = received.size;
             listener.mutex.lock();
             defer listener.mutex.unlock();
+            listener.packets += 1;
+            if (received.dropped) |dropped| listener.dropped = dropped;
             if (listener.received_len + size + 1 > listener.received.len) {
                 listener.received_full = true;
                 continue;
@@ -376,23 +472,36 @@ const StatsdListener = struct {
         }
     }
 
-    /// Waits until every needle has appeared in some received packet.
+    /// Waits until every needle has appeared in some received packet. It does not send
+    /// requests: a replica resets its aggregates at each emit, so a lost emit would have to be
+    /// made up by new requests, and the check stays the same without them.
     fn expect_metrics(listener: *StatsdListener, needles: []const []const u8) !void {
         assert(needles.len > 0);
         assert(needles.len <= 8);
         assert(listener.thread != null);
         var found: [8]bool = @splat(false);
+        // Bytes below `scanned` were searched already. Every packet ends in a newline that no
+        // needle contains, so `scanned` is always at a packet start, and no needle spans two.
+        var scanned: usize = 0;
         var timer = try std.time.Timer.start();
         while (true) {
-            {
-                listener.mutex.lock();
-                defer listener.mutex.unlock();
-                const text = listener.received[0..listener.received_len];
-                for (needles, found[0..needles.len]) |needle, *seen| {
-                    if (std.mem.indexOf(u8, text, needle) != null) seen.* = true;
-                }
+            listener.mutex.lock();
+            const length = listener.received_len;
+            const receive_error = listener.receive_error;
+            listener.mutex.unlock();
+            // Outside the lock, so that the collector never waits for a scan.
+            const text = listener.received[scanned..length];
+            for (needles, found[0..needles.len]) |needle, *seen| {
+                if (std.mem.indexOf(u8, text, needle) != null) seen.* = true;
             }
+            scanned = length;
             if (std.mem.allEqual(bool, found[0..needles.len], true)) return;
+            if (receive_error) |err| {
+                std.debug.print("statsd: the listener could not receive: {s}\n", .{
+                    @errorName(err),
+                });
+                return error.StatsdReceiveFailed;
+            }
             if (timer.read() >= wait_max.ns) break;
             std.time.sleep(50 * std.time.ns_per_ms);
         }
@@ -401,6 +510,10 @@ const StatsdListener = struct {
         }
         listener.mutex.lock();
         defer listener.mutex.unlock();
+        std.debug.print(
+            "statsd: received {} packets ({} bytes), the kernel dropped {}\n",
+            .{ listener.packets, listener.received_len, listener.dropped },
+        );
         if (listener.received_full) std.debug.print("statsd: the packet buffer filled\n", .{});
         return error.StatsdMetricsMissing;
     }
