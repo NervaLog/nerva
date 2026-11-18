@@ -258,11 +258,12 @@ case "${1:-}" in
     name="nerva-$tag-universal-macos.zip.sha256"
     # The draft's assets are found through the releases list (a draft has no tag to look up).
     if ! id=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases" \
-      --jq ".[] | select(.tag_name == \"$tag\") | .assets[] | select(.name == \"$name\") | .id" | head -n1); then
+      --jq ".[] | select(.tag_name == \"$tag\") | .assets[] | select(.name == \"$name\") | .id"); then
       refuse NRV-E1134 "cannot list the releases of $GITHUB_REPOSITORY" \
         "GitHub did not answer, so the formula's hash has nothing to be checked against" \
         "run the failed job again"
     fi
+    id=${id%%$'\n'*} # first line only: captured, not piped to head, which SIGPIPEs under pipefail (#483)
     if [[ -z "$id" ]]; then
       refuse NRV-E1134 "the release $tag has no $name" \
         "mac-sign.yml's upload is missing, so the formula's hash has nothing to be checked against" \
@@ -303,11 +304,12 @@ case "${1:-}" in
   state)
     tag=${2:?usage: release_finish.sh state <tag>}
     if ! draft=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases" \
-      --jq ".[] | select(.tag_name == \"$tag\") | .draft" | head -n1); then
+      --jq ".[] | select(.tag_name == \"$tag\") | .draft"); then
       refuse NRV-E1137 "cannot list the releases of $GITHUB_REPOSITORY" \
         "GitHub did not answer, so it is not known whether $tag is a draft or published" \
         "run the failed job again"
     fi
+    draft=${draft%%$'\n'*} # first line only: captured, not piped to head, which SIGPIPEs under pipefail (#483)
     # No release at all is left to mac-sign.yml and publish-ready, which refuse it with a code.
     if [[ "$draft" == false ]]; then echo published; else echo draft; fi
     ;;
@@ -349,11 +351,12 @@ case "${1:-}" in
     tag=${2:?usage: release_finish.sh publish <tag> <commit>}
     commit=${3:?usage: release_finish.sh publish <tag> <commit>}
     if ! draft=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases" \
-      --jq ".[] | select(.tag_name == \"$tag\") | .draft" | head -n1); then
+      --jq ".[] | select(.tag_name == \"$tag\") | .draft"); then
       refuse NRV-E1138 "cannot list the releases of $GITHUB_REPOSITORY" \
         "GitHub did not answer, so it is not known whether $tag is still a draft" \
         "run the failed job again; nothing was published"
     fi
+    draft=${draft%%$'\n'*} # first line only: captured, not piped to head, which SIGPIPEs under pipefail (#483)
     # A published release is where an earlier run stopped: carry on to the tag check.
     if [[ "$draft" == true ]]; then
       "$self" latest-check "$tag"

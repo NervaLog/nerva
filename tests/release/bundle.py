@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """A binary that carries the release before it (R6 slice 3, P259d, P417).
 
-Usage: bundle.py <nerva> <nerva_next> <nerva_pack> <nerva_next_other>
+Usage: bundle.py <nerva> <nerva_next> <nerva_pack> <nerva_next_other> <nerva_past_single>
 
 `nerva_next` is this code under the next test release, packed with a build of `nerva` (the past
 release). Checks, without a cluster:
@@ -12,6 +12,13 @@ release). Checks, without a cluster:
   as "bundles none";
 - the packer refuses, with NRV-E0725 and no output, a past release that is not lower, of another
   format digest, or whose clients the next release would refuse;
+- the packer refuses, with NRV-E0728 and no output, a past release that does not state
+  `multiversion offers_from_binary` (v0.7.1 and v0.7.0 do not): a stub, and `nerva_past_single`,
+  this code built without the capability (its `start` runs as one release; there is no command-line
+  option for that build, so no release can be one) (P490, #484);
+- a replica started from `nerva_next` on the data file of the past release switches to the past
+  release, which offers the next one: the one-replica cluster prepares the upgrade and the replica
+  executes the next release (P490, #484);
 - the packer refuses an input it cannot read in full (NRV-E0727) or an output it cannot write
   (NRV-E0810), with a code and no error name;
 - the packer refuses a result over its size limit with NRV-E0719, and writes it at the limit;
@@ -23,7 +30,7 @@ release). Checks, without a cluster:
 - `nerva_next start --trace` on `nerva`'s data file switches down to it at open, then up again at
   the upgrade, and keeps running and tracing: each process after a transition writes its own
   segment, `<path>.1` then `<path>.2`, and the one before it wrote out its spans (#479, P480).
-`nerva_next start` on N's data file (the switch) is not here: it needs slice 2's multiversion `start` (#415), so it belongs to slice 5's `rolling.py`, or to this file once #415 is merged (recorded in docs/demos/r6.md).
+The rolling upgrade of a cluster is slice 5's `rolling.py`.
 """
 import os
 import re
@@ -56,16 +63,21 @@ def stub(path, text):
     os.chmod(path, 0o755)
 
 
-def facts_text(release, client_min, fmt, commit):
+CAPABILITY = "multiversion offers_from_binary"
+
+
+def facts_text(release, client_min, fmt, commit, capable=True):
     return (f"Nerva version 0.0.0\nrelease {release}\nrelease_client_min {client_min}\n"
-            f"format {fmt}\nbundles none\nversion 0.0.0\ncommit {commit}\n")
+            f"format {fmt}\nbundles none\nversion 0.0.0\ncommit {commit}\n"
+            + (CAPABILITY + "\n" if capable else ""))
 
 
 def main():
-    nerva, nerva_next, nerva_pack, nerva_next_other = sys.argv[1:5]
+    nerva, nerva_next, nerva_pack, nerva_next_other, nerva_past_single = sys.argv[1:6]
     work = tempfile.mkdtemp(prefix="nerva-bundle-")
     try:
-        check(nerva, nerva_next, nerva_pack, work)
+        check(nerva, nerva_next, nerva_pack, work, nerva_past_single)
+        switch(nerva, nerva_next, work)
         poll(nerva_next, nerva_next_other, work)
         trace_across_switches(nerva, nerva_next, work)
         trace_interrupted(nerva, nerva_next, work)
@@ -81,13 +93,20 @@ def past_stub_ok(work, base):
     return path
 
 
-def check(nerva, nerva_next, nerva_pack, work):
+def check(nerva, nerva_next, nerva_pack, work, nerva_past_single):
     past = facts(nerva)
     next_ = facts(nerva_next)
     assert past["format"] == next_["format"], "the pair differs in format: not a rolling pair"
 
+    # The capability a past release must state: both pair members do, the build without it does
+    # not (and is otherwise the same release and format, so only the capability is refused).
+    assert past["multiversion"] == next_["multiversion"] == "offers_from_binary", (past, next_)
+    single = facts(nerva_past_single)
+    assert "multiversion" not in single, single
+    assert (single["release"], single["format"]) == (past["release"], past["format"]), single
     # `version` lists both releases.
     out = run([nerva, "version", "--verbose"]).stdout
+    assert out.endswith(CAPABILITY + "\n"), out  # Appended last: the lines before it keep places.
     assert "\nbundles none\n" in out, out
     out = run([nerva_next, "version", "--verbose"]).stdout
     assert f"\nbundles {past['release']}\n" in out, out
@@ -145,6 +164,19 @@ def check(nerva, nerva_next, nerva_pack, work):
         assert "NRV-E0725" in result.stderr, (name, result.stderr)
         assert not os.path.exists(output), name
 
+    # A past release that does not state the capability is refused with its own code and nothing is
+    # written: a stub as v0.7.1 reports itself (with the same format, so the older checks pass),
+    # and a real build of this code without the capability.
+    for name, past_exe in [("stub without the line", None), ("build without it", nerva_past_single)]:
+        if past_exe is None:
+            past_exe = os.path.join(work, "past_stub")
+            stub(past_exe, facts_text(base[0], base[1], base[2], base[3], capable=False))
+        output = os.path.join(work, "refused")
+        result = run([nerva_pack, "--input", nerva_next, "--past", past_exe, "--output", output])
+        assert result.returncode == 1, (name, result.returncode, result.stderr)
+        assert "NRV-E0728" in result.stderr and CAPABILITY in result.stderr, (name, result.stderr)
+        assert "error." not in result.stderr and not os.path.exists(output), (name, result.stderr)
+
     # A file the packer cannot read in full (a `/sys` file's size is not its length), and one it
     # cannot write, are refused with a code, never with an error name.
     if os.path.exists("/sys/kernel/mm/transparent_hugepage/enabled"):
@@ -171,6 +203,48 @@ def check(nerva, nerva_next, nerva_pack, work):
     assert not os.path.exists(packed)
     result = run(pack + ["--size-max", str(exact)])
     assert result.returncode == 0 and os.path.getsize(packed) == exact, result.stderr
+
+
+def switch(nerva, nerva_next, work):
+    """`nerva_next` started on the data file the past release wrote runs as the past release (it
+    re-executes it from the bundle), and that process offers the next release: the one replica
+    is the whole cluster, so the upgrade quorum is met, the primary prepares the upgrade, and the
+    replica executes the next release. A past binary that advertised only itself would stay at
+    the past release forever (#484)."""
+    past = facts(nerva)["release"]
+    next_ = facts(nerva_next)["release"]
+    exe = os.path.join(work, "nerva_switch")
+    shutil.copy(nerva_next, exe)
+    os.chmod(exe, 0o755)
+    data = os.path.join(work, "switch.nerva")
+    result = run([nerva, "format", "--cluster=0", "--replica=0", "--replica-count=1",
+                  "--development", data])
+    assert result.returncode == 0, result.stderr
+
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    log_path = os.path.join(work, "switch.log")
+    with open(log_path, "w") as log_file:
+        replica = subprocess.Popen([exe, "start", f"--addresses={port}", "--development", data],
+                                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                   stderr=log_file)
+    try:
+        # In this order: the switch down to the past release (the data file is its), that release
+        # offering the next one to its cluster, and the switch up.
+        steps = (f"release_transition: release={next_}..{past} (reason=open)",
+                 f"on_upgrade_timeout: upgrading from release={past}..{next_}",
+                 f"release_transition: release={past}..{next_} (reason=commit_dispatch)")
+        for text in steps:
+            log = log_wait(log_path, replica, text, 90)
+        positions = [log.index(text) for text in steps]
+        assert positions == sorted(positions), (positions, log)
+        assert log.count("executing") >= 2 and POLL_ERROR not in log, log
+        print(f"bundle: a replica of {next_} on {past}'s data file runs {past}, which offers "
+              f"{next_}, and the replica upgrades to it")
+    finally:
+        replica.kill()
+        replica.wait()
 
 
 POLL_ERROR = "binary does not contain valid multiversion data"

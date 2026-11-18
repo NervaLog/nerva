@@ -132,7 +132,9 @@ message and the superblock's wire and data formats, and equal tree ids, cluster 
 field means is covered only by `format_epoch`; P269b, P269c, P269d) and the past releases the binary bundles (none yet). The last line, `version 0.6.0`,
 is the release as people name it (the one on GitHub and in `brew`); the first line's `0.0.6` is the
 protocol release, a different number. `nerva version --verbose` adds what the digest is made of
-and the commit.
+and the commit, and ends with `multiversion offers_from_binary` when the binary, run as a past
+release inside another one, offers the releases that binary bundles (a packer refuses a past
+release without it, NRV-E0728; v0.7.1 and earlier lack it).
 
 The version is `<protocol release>+<commit>`: `0.0.6` is the protocol release of v0.6.0. It
 decides which replicas, data files and clients work together (see "One release per cluster"

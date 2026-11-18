@@ -76,6 +76,14 @@ pub const Facts = struct {
     /// 64 lower-case hex digits: `format_digest`.
     format: [64]u8,
     git_commit: [20]u8,
+    /// The line `multiversion offers_from_binary` was present: this binary, run as a past release
+    /// from a bundle, opens the outer binary's bundle and offers its releases (P490).
+    offers_from_binary: bool,
+
+    /// The last line of `version --verbose` (P490): written by `version_write` exactly when
+    /// `start` opens a `MultiversionOS` on the binary's own path (`nerva_main.multiversion_start`,
+    /// on Linux: no other target switches release).
+    pub const capability_line = "multiversion offers_from_binary";
 
     pub const ParseError = error{
         /// A line of `release`, `release_client_min`, `format` or `commit` is missing or
@@ -88,6 +96,7 @@ pub const Facts = struct {
         var release_client_min: ?Release = null;
         var format: ?[64]u8 = null;
         var git_commit: ?[20]u8 = null;
+        var offers_from_binary = false;
 
         var lines = mem.tokenizeScalar(u8, text, '\n');
         while (lines.next()) |line| {
@@ -95,7 +104,10 @@ pub const Facts = struct {
             const key = words.next() orelse continue;
             const value = words.next() orelse continue;
             if (words.next() != null) continue;
-            if (mem.eql(u8, key, "release")) {
+            if (mem.eql(u8, key, "multiversion")) {
+                // Only the exact line counts: an unknown word is not a capability.
+                offers_from_binary = mem.eql(u8, line, capability_line);
+            } else if (mem.eql(u8, key, "release")) {
                 release = Release.parse(value) catch return error.FactsMissing;
             } else if (mem.eql(u8, key, "release_client_min")) {
                 release_client_min = Release.parse(value) catch return error.FactsMissing;
@@ -121,6 +133,7 @@ pub const Facts = struct {
             .release_client_min = release_client_min orelse return error.FactsMissing,
             .format = format orelse return error.FactsMissing,
             .git_commit = git_commit orelse return error.FactsMissing,
+            .offers_from_binary = offers_from_binary,
         };
     }
 };
@@ -134,6 +147,9 @@ pub const Refusal = enum {
     /// This release's `release_client_min` is above the past release: the clients of the past
     /// release would be refused after the switch.
     client_min_above_past,
+    /// It does not say it offers releases from its binary (NRV-E0728): run as the past release,
+    /// it would advertise only itself, and the cluster would never reach `quorum_upgrade`.
+    not_multiversion,
 
     pub fn text(refusal_: Refusal) []const u8 {
         return switch (refusal_) {
@@ -142,6 +158,9 @@ pub const Refusal = enum {
                 "a rolling upgrade needs equal formats, use export and import",
             .client_min_above_past => "this build's release_client_min is above its release: " ++
                 "its clients would be refused after the switch",
+            .not_multiversion => "it does not state `" ++ Facts.capability_line ++
+                "` under `version --verbose`: run as the past release it would offer only " ++
+                "itself, and the cluster would never upgrade",
         };
     }
 };
@@ -150,6 +169,7 @@ pub fn refusal(current: Facts, past: Facts) ?Refusal {
     if (past.release.value >= current.release.value) return .release_not_lower;
     if (!mem.eql(u8, &past.format, &current.format)) return .format_differs;
     if (current.release_client_min.value > past.release.value) return .client_min_above_past;
+    if (!past.offers_from_binary) return .not_multiversion;
     return null;
 }
 
@@ -519,6 +539,7 @@ fn facts_make(release: []const u8, client_min: []const u8, format_digit: u8) Fac
         .release_client_min = Release.parse(client_min) catch unreachable,
         .format = @splat(format_digit),
         .git_commit = @splat(0xab),
+        .offers_from_binary = true,
     };
 }
 
@@ -532,8 +553,17 @@ test "bundle: Facts parses what nerva version --verbose prints" {
         "version 0.7.1\n" ++
         "format_epoch 1\n" ++
         "commit " ++ "01" ** 20 ++ "\n" ++
-        "commit_keys deduplicate\n";
+        "commit_keys deduplicate\n" ++
+        Facts.capability_line ++ "\n";
     const facts = try Facts.parse(text);
+    try testing.expect(facts.offers_from_binary);
+    // v0.7.1 and v0.7.0 print no such line; a different word is not the capability either.
+    const without = text[0 .. text.len - Facts.capability_line.len - 1];
+    try testing.expect(!(try Facts.parse(without)).offers_from_binary);
+    const single_line = try Facts.parse(without ++ "multiversion single_release\n");
+    try testing.expect(!single_line.offers_from_binary);
+    const extra_word = try Facts.parse(without ++ "multiversion offers_from_binary extra\n");
+    try testing.expect(!extra_word.offers_from_binary);
     try testing.expect(facts.release.value == (try Release.parse("0.0.6")).value);
     try testing.expect(facts.release_client_min.value == (try Release.parse("0.0.4")).value);
     try testing.expectEqualStrings("ab" ** 32, &facts.format);
@@ -572,6 +602,15 @@ test "bundle: a past release is refused unless it is lower, of one format, and k
     try testing.expectEqual(
         @as(?Refusal, .client_min_above_past),
         refusal(strict, facts_make("0.0.6", "0.0.4", 'a')),
+    );
+    // A past release that does not state the capability (v0.7.1) is refused, whatever else fits.
+    var single = facts_make("0.0.6", "0.0.4", 'a');
+    single.offers_from_binary = false;
+    try testing.expectEqual(@as(?Refusal, .not_multiversion), refusal(current, single));
+    // The older reasons come first.
+    try testing.expectEqual(
+        @as(?Refusal, .format_differs),
+        refusal(facts_make("0.0.206", "0.0.4", 'b'), single),
     );
     // At the bound: client_min equal to the past release is accepted.
     try testing.expectEqual(

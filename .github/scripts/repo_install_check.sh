@@ -52,7 +52,8 @@ step() { local what=$1; shift; "$@" >"$log" 2>&1 || check_failed "$what"; }
 fingerprint_of() { gpg --batch --show-keys --with-colons "$1" 2>/dev/null | awk -F: '$1=="pub"{p=1;next} $1=="fpr"&&p{print $10;p=0}'; }
 check_key() {
   local f=$1
-  fingerprint_of "$f" | grep -qx "$fpr" || check_failed "the key at $KEY_URL does not have the fingerprint $fpr"
+  local found
+  found=$(fingerprint_of "$f") && grep -qx "$fpr" <<< "$found" || check_failed "the key at $KEY_URL does not have the fingerprint $fpr"
 }
 
 # ---- apt ---------------------------------------------------------------------------------------
@@ -90,7 +91,9 @@ apt_not_stable() {
   CHANNEL=stable apt_config >/dev/null 2>&1 || check_failed "writing the stable sources file"
   step "apt-get update with stable configured" $SUDO apt-get update
   # Only what the configured sources list: an empty dpkg status keeps the installed candidate out.
-  if apt-cache -o Dir::State::status=/dev/null madison nerva 2>&1 | grep -qF "$APT_VER"; then
+  local listed
+  listed=$(apt-cache -o Dir::State::status=/dev/null madison nerva 2>&1) || true
+  if grep -qF "$APT_VER" <<< "$listed"; then
     check_failed "stable lists the candidate $APT_VER"
   fi
 }
@@ -134,7 +137,9 @@ dnf_not_stable() {
   # The output, never the exit status: on an empty channel `dnf list` exits 1 with
   # "No matching packages to list", which is the right answer here.
   # --available --repo: only what the repository lists, never the installed package.
-  if dnf list --available --showduplicates --repo nerva nerva 2>&1 | grep -qF "$RPM_VER"; then
+  local listed
+  listed=$(dnf list --available --showduplicates --repo nerva nerva 2>&1) || true
+  if grep -qF "$RPM_VER" <<< "$listed"; then
     check_failed "stable lists the candidate $RPM_VER"
   fi
 }

@@ -72,6 +72,7 @@ pub const table = [_]Entry{
     .{ .code = "NRV-E0725", .summary = "A past release cannot be bundled: its release, format digest or `release_client_min` does not fit this build, or it does not run here", .exit = exit_operator },
     .{ .code = "NRV-E0726", .summary = "The binary could not be read to look for its bundle of releases", .exit = exit_operator },
     .{ .code = "NRV-E0727", .summary = "`nerva_pack` did not read an input in full: the file changed while it was read, or its size is not its length", .exit = exit_operator },
+    .{ .code = "NRV-E0728", .summary = "A past release cannot be bundled: it does not state that it offers the releases its binary bundles", .exit = exit_operator },
     .{ .code = "NRV-E0801", .summary = "The cluster did not answer the export", .exit = exit_operator },
     .{ .code = "NRV-E0802", .summary = "`--as-of` is past the latest op", .exit = exit_operator },
     .{ .code = "NRV-E0803", .summary = "The export would be refused by `nerva import`", .exit = exit_operator },
@@ -83,6 +84,7 @@ pub const table = [_]Entry{
     .{ .code = "NRV-E0809", .summary = "A backup does not match its manifest: size, SHA-256, op, version, a view hash or a ledger total", .exit = exit_operator },
     .{ .code = "NRV-E0810", .summary = "A file `export` or `import` was given cannot be opened, read or written", .exit = exit_operator },
     .{ .code = "NRV-E0812", .summary = "A release build was given an export from a test build with commit-key deduplication off", .exit = exit_operator },
+    .{ .code = "NRV-E0814", .summary = "Another import or restore won the exclusive create of the staging file", .exit = exit_operator },
     .{ .code = "NRV-E0901", .summary = "`NERVA_CLUSTER_KEY` is missing, short, the public development key off loopback, or wrongly paired with `_NEXT`", .exit = exit_operator },
     .{ .code = "NRV-B0004", .summary = "A `nerva` command hit an error it did not expect", .exit = exit_internal },
 };
