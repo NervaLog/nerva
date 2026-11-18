@@ -427,16 +427,37 @@ fn import_run(
         );
     }
     if (manifest_path) |path| manifest_compare(command, args, path, &manifest, &plan);
-    // Pass 2. Any failure removes the data file, which the import created.
-    command_import(gpa, args, path_importing, &plan) catch |err| {
-        std.fs.cwd().deleteFile(path_importing) catch {};
+    // Pass 2. A failure removes the data file only if this invocation created it: the
+    // exclusive create can lose to another import of the same path, whose file it is (P489).
+    var created = false;
+    command_import(gpa, args, &created, path_importing, &plan) catch |err| {
+        staging_remove(created, path_importing);
+        // `Storage.init` can fail after its create (the allocation: no space), and then
+        // `created` is still false: the file may be this one's and is left (P489).
+        if (!created and err != error.PathAlreadyExists) {
+            log.warn("{s} may be left behind by this failed {s}; remove it if no import of " ++
+                "this path is running, or the next {s} stops at it", .{
+                path_importing, command, command,
+            });
+        }
         import_failed(command, args.input, path_importing, err);
     };
     // Every write is on disk: the data file is complete, and takes its name.
     const cwd = std.posix.AT.FDCWD;
     std.posix.linkat(cwd, path_importing, cwd, args.path, 0) catch |err| {
         std.fs.cwd().deleteFile(path_importing) catch {};
-        diagnostic.fail_file(args.path, err);
+        switch (err) {
+            // Something took `args.path` after this one's check above: another import that
+            // finished first, or a file of any other kind. This one's staging file is gone.
+            error.PathAlreadyExists => diagnostic.fail(
+                "NRV-E0004",
+                command ++ ": {s} appeared while this {s} ran",
+                .{ args.path, command },
+                "give a new path: nerva never overwrites a data file; nothing was named {s}",
+                .{args.path},
+            ),
+            else => diagnostic.fail_file(args.path, err),
+        }
     };
     std.fs.cwd().deleteFile(path_importing) catch |err| {
         diagnostic.fail_file(path_importing, err);
@@ -651,6 +672,16 @@ fn import_failed(
             "read the log lines above; nothing was named {s}",
             .{output},
         ),
+        // Another import or restore of the same path created `output` first. It is that
+        // process's file: this one touched nothing (P489).
+        error.PathAlreadyExists => diagnostic.fail(
+            "NRV-E0814",
+            command ++ ": another import or restore is writing {s}",
+            .{output},
+            "let it finish, or remove {s} if no import or restore is running, then {s} " ++
+                "again; nothing of this one was written",
+            .{ output, command },
+        ),
         error.FileNotFound,
         error.AccessDenied,
         error.PermissionDenied,
@@ -668,10 +699,18 @@ fn directory_sync(path: []const u8) !void {
     try std.posix.fsync(fd);
 }
 
-/// Formats the data file at `path`, then restores the export into it (N80).
+/// Removes the data file a failed pass 2 leaves, if this invocation created it (P489).
+fn staging_remove(created: bool, path: []const u8) void {
+    if (created) std.fs.cwd().deleteFile(path) catch {};
+}
+
+/// Formats the data file at `path`, then restores the export into it (N80). `created` is set
+/// once this call has created the file, the exclusive create having won, and only then is the
+/// file this call's to remove. A create that lost (`error.PathAlreadyExists`) touches nothing.
 fn command_import(
     gpa: std.mem.Allocator,
     args: *const cli.Command.Import,
+    created: *bool,
     path: []const u8,
     plan: *const import_.Plan,
 ) !void {
@@ -694,6 +733,7 @@ fn command_import(
             .direct_io_required,
     });
     defer storage.deinit();
+    created.* = true;
 
     try vsr.format(Storage, gpa, &storage, .{
         .cluster = args.cluster,
@@ -1252,4 +1292,42 @@ test "bundle_present: unreadable, too large, out of memory, unbundled" {
 
     // This test binary has no multiversion sections.
     try testing.expect(!(try bundle_present(testing.allocator, "/proc/self/exe")));
+}
+
+test "import: an exclusive create that loses touches nothing (P489)" {
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = try tmp.dir.realpath(".", &dir_buffer);
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, "{s}/d.nerva.importing", .{dir});
+
+    // The other import: it passed the same existence check, then won the exclusive create.
+    try tmp.dir.writeFile(.{ .sub_path = "d.nerva.importing", .data = "the winner's file" });
+
+    const args: cli.Command.Import = .{
+        .cluster = 0,
+        .replica = 0,
+        .replica_count = 1,
+        .input = "unused",
+        .development = true,
+        .log_debug = false,
+        .path = "d.nerva",
+    };
+    // The create fails before the plan is read.
+    const plan = std.mem.zeroes(import_.Plan);
+    var created = false;
+    try testing.expectError(
+        error.PathAlreadyExists,
+        command_import(testing.allocator, &args, &created, path, &plan),
+    );
+    try testing.expect(!created);
+
+    // What `import_run` does with that: nothing is removed, and the file is the winner's.
+    staging_remove(created, path);
+    var contents: [64]u8 = undefined;
+    const kept = try tmp.dir.readFile("d.nerva.importing", &contents);
+    try testing.expectEqualStrings("the winner's file", kept);
 }
