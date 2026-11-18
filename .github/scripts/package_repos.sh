@@ -137,7 +137,8 @@ need_tools() {
     esac
   done
   if [[ " $* " == *" gpg "* ]]; then
-    gpg --version | head -n1 | grep -q ' 2\.4\.' ||
+    # Captured once: `gpg --version | head -n1` under pipefail can fail on SIGPIPE (#483).
+    gpg_version=$(gpg --version) && [[ ${gpg_version%%$'\n'*} == *" 2.4."* ]] ||
       e1139 "gpg is not 2.4.x" "the signing commands are pinned to gpg 2.4"
   fi
 }
@@ -917,7 +918,7 @@ sign_rpm() { # <file>: rpmsign in place, then the NEVRA and payload digest check
   [ -n "$before" ] && [ "$before" = "$after" ] ||
     refuse NRV-E1144 "the signed $(basename "$f") differs from the release's file in NEVRA or payload" "before: $before; after: $after" \
       "Check the signing key and the package's NEVRA and payload against the release's file, then run again"
-  rpm -qp --qf '%{RSAHEADER:pgpsig}' "$f" 2>/dev/null | grep -qi "${FP_CURRENT: -16}" ||
+  rpm_sig=$(rpm -qp --qf '%{RSAHEADER:pgpsig}' "$f" 2>/dev/null) && grep -qi "${FP_CURRENT: -16}" <<< "$rpm_sig" ||
     refuse NRV-E1144 "the signed $(basename "$f") carries no signature by the current key" "rpmsign did not sign it" \
       "Check the signing key and the package's NEVRA and payload against the release's file, then run again"
 }

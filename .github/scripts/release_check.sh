@@ -130,8 +130,10 @@ case "${1:-}" in
         "build from the commit whose VERSION is $version (build.zig reads VERSION)"
     fi
     # The keys-off build says so on its first line, whatever else it prints (#271).
-    if "$nerva" version 2> /dev/null | grep -q '+keys-off' ||
-      ! "$nerva" version --verbose 2> /dev/null | grep -qx 'commit_keys deduplicate'; then
+    # Each output is captured once and matched as text: `cmd | grep -q` under pipefail turns a
+    # match into a failure when grep exits early and the producer dies of SIGPIPE (#483).
+    if ! plain=$("$nerva" version 2> /dev/null) || ! verbose=$("$nerva" version --verbose 2> /dev/null) ||
+      grep -q '+keys-off' <<< "$plain" || ! grep -qx 'commit_keys deduplicate' <<< "$verbose"; then
       refuse NRV-E1113 "the built nerva is not the commit-key deduplication build" \
         "'nerva version --verbose' has no 'commit_keys deduplicate' line, or 'nerva version' carries '+keys-off': this is the test build -Dtest-commit-keys=off (#271), or an older nerva" \
         "build the release without -Dtest-commit-keys=off"

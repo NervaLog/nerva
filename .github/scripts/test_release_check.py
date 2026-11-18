@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / ".github/scripts/release_check.sh"
 
 
-def fake_nerva(directory, version, keys="deduplicate", suffix=""):
+def fake_nerva(directory, version, keys="deduplicate", suffix="", padding=0):
     path = Path(directory) / "nerva"
     path.write_text(f"""#!/bin/sh
 echo "Nerva version 0.0.6+abcdef0{suffix}"
@@ -25,6 +25,10 @@ if [ "${{1:-}}" = version ] && [ "${{2:-}}" = --verbose ]; then
   echo "commit abcdef0"
   [ -n "{keys}" ] && echo "commit_keys {keys}"
 fi
+# Output well past a pipe's buffer (64 KiB) after the lines the check reads: a reader that stops
+# at its match leaves this writer to die of SIGPIPE every time (#483).
+i=0
+while [ "$i" -lt {padding} ]; do echo "padding padding padding padding padding padding padding"; i=$((i + 1)); done
 exit 0
 """)
     path.chmod(0o755)
@@ -86,6 +90,23 @@ class ReleaseCheck(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             result = run("binary", fake_nerva(d, "0.7.1", suffix="+keys-off"), "0.7.1")
             self.refused(result, "NRV-E1113", "not the commit-key deduplication build")
+
+    def test_binary_with_the_keys_off_suffix_and_output_after_it(self):
+        # #483: grep -q stopped at '+keys-off' and the writer, still writing, died of SIGPIPE; under
+        # pipefail the match counted as none. 20000 lines are 1 MB, so the old pipeline failed on
+        # every run. The control: the same output without the suffix passes.
+        with tempfile.TemporaryDirectory() as d:
+            result = run("binary", fake_nerva(d, "0.7.1", suffix="+keys-off", padding=20000), "0.7.1")
+            self.refused(result, "NRV-E1113", "not the commit-key deduplication build")
+            result = run("binary", fake_nerva(d, "0.7.1", padding=20000), "0.7.1")
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_binary_whose_version_command_fails(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "nerva"
+            path.write_text('#!/bin/sh\necho "version 0.7.1"\n[ "${2:-}" = --verbose ] && { echo "commit_keys deduplicate"; exit 3; }\nexit 0\n')
+            path.chmod(0o755)
+            self.refused(run("binary", str(path), "0.7.1"), "NRV-E1113", "not the commit-key deduplication build")
 
     def test_binary_that_does_not_run(self):
         result = run("binary", "/nonexistent/nerva", "0.7.1")
