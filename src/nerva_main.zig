@@ -210,26 +210,23 @@ fn run() !void {
             // truncated (#29). A `start` that a release transition re-executed, with the same
             // arguments, writes the next segment beside it instead (`<path>.1`, P480).
             var trace_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+            const reexecuted = tag == .start and start_reexecuted();
             const trace: ?TraceCreated = if (tag == .start and args.trace != null)
                 trace_create(
                     std.fs.cwd(),
                     args.trace.?,
-                    start_reexecuted(exe_path.?),
+                    reexecuted,
                     trace_segments_max,
                     &trace_path_buffer,
-                ) catch |err| switch (err) {
+                ) catch |err| if (reexecuted)
+                    // Tracing never stops the replica (N71), least of all in the middle of an
+                    // upgrade: warn and run untraced (P480b).
+                    trace_unavailable(args.trace.?, err)
+                else switch (err) {
                     error.PathAlreadyExists => diagnostic.fail(
                         "NRV-E0004",
                         "start: --trace {s} exists",
                         .{args.trace.?},
-                        "give a new path: nerva never overwrites a file",
-                        .{},
-                    ),
-                    error.SegmentsExhausted => diagnostic.fail(
-                        "NRV-E0004",
-                        "start: --trace {s}.1 to {s}.{d} exist, so a re-executed start has " ++
-                            "no segment to write",
-                        .{ args.trace.?, args.trace.?, trace_segments_max },
                         "give a new path: nerva never overwrites a file",
                         .{},
                     ),
@@ -239,17 +236,18 @@ fn run() !void {
                 null;
             const trace_file: ?std.fs.File = if (trace) |created| created.file else null;
             defer if (trace_file) |file| file.close();
+            // Every coded exit from here on (through `diagnostic`) removes the file, or the next
+            // start is refused with NRV-E0004 on it (#197). So does a panic (`panic` above) and
+            // SIGINT or SIGTERM (P208). Not removed: vendored `vsr.fatal` exits (NRV-E0707, say;
+            // #206). `command_start` clears this once `replica.open` has returned.
+            if (trace) |created| diagnostic.cleanup_register(created.path, created.file);
+            // After the registration: an interrupt that follows this line removes the segment.
             if (trace) |created| if (created.segment > 0) {
                 log.info("tracing to {s}: segment {d}, after a release transition", .{
                     created.path,
                     created.segment,
                 });
             };
-            // Every coded exit from here on (through `diagnostic`) removes the file, or the next
-            // start is refused with NRV-E0004 on it (#197). So does a panic (`panic` above) and
-            // SIGINT or SIGTERM (P208). Not removed: vendored `vsr.fatal` exits (NRV-E0707, say;
-            // #206). `command_start` clears this once `replica.open` has returned.
-            if (trace) |created| diagnostic.cleanup_register(created.path, created.file);
             var trace_file_writer: ?std.fs.File.Writer =
                 if (trace_file) |file| file.writer() else null;
             // Buffered, bounded, and never failing: a trace write error must not panic the
@@ -260,7 +258,8 @@ fn run() !void {
                 null;
             defer if (trace_writer) |*writer| writer.flush();
             // A release transition re-executes the binary, which drops what is buffered: the
-            // replica's `release_execute` writes it out first (P480).
+            // replica's `release_execute` writes it out first, or removes the file when the
+            // transition comes while the start is still opening (P480, P480b).
             var multiversion_traced: ?MultiversionTraced = if (multiversion_bundled and
                 trace_writer != null)
                 .{ .inner = multiversion, .trace = &trace_writer.? }
@@ -970,13 +969,40 @@ fn trace_create(
     return error.SegmentsExhausted;
 }
 
+/// What `MultiversionOS` names the binary it re-executes from: the bundle's memfd on Linux
+/// (`/memfd:<name> (deleted)`), a temporary file on macOS. It is the prefix of the vendored
+/// `multiversion_uuid`, which is private to `multiversion.zig`; `self_exe_path` tests for the same
+/// uuid, so a process is re-executed here exactly when it is there.
+const reexecuted_marker = "tigerbeetle-multiversion-";
+
 /// Whether this process is a `start` that `MultiversionOS` re-executed at a release transition:
-/// it runs from the bundle's memfd (or temporary file), so the binary's real path, which
-/// `self_exe_path` reads from `argv[0]` then, is not the path the kernel gives for it.
-fn start_reexecuted(exe_path: [:0]const u8) bool {
+/// the kernel's path for it carries the marker (P480).
+fn start_reexecuted() bool {
     var buffer: [std.fs.max_path_bytes]u8 = undefined;
     const native = std.fs.selfExePath(&buffer) catch return false;
-    return !std.mem.eql(u8, native, exe_path);
+    return path_reexecuted(native);
+}
+
+fn path_reexecuted(native: []const u8) bool {
+    return std.mem.indexOf(u8, native, reexecuted_marker) != null;
+}
+
+/// A re-executed `start` that cannot create its trace segment: one warning, and no trace (P480b).
+fn trace_unavailable(path: []const u8, err: anyerror) ?TraceCreated {
+    log.warn("NRV-W0012 start: tracing stopped after a release transition: cannot create " ++
+        "{s}.n: {s}; the replica runs on untraced", .{ path, trace_unavailable_reason(err) });
+    return null;
+}
+
+fn trace_unavailable_reason(err: anyerror) []const u8 {
+    return switch (err) {
+        error.SegmentsExhausted => "every segment .1 to .1024 exists",
+        error.NameTooLong => "the path is too long for a segment's name",
+        error.FileNotFound, error.NotDir => "its directory is gone",
+        error.AccessDenied, error.PermissionDenied, error.ReadOnlyFileSystem => "not permitted",
+        error.NoSpaceLeft, error.DiskQuota => "the disk is full",
+        else => "the system refused",
+    };
 }
 
 /// The replica's `Multiversion` for `start --trace` on a bundled binary: `release_execute` writes
@@ -1003,7 +1029,11 @@ const MultiversionTraced = struct {
 
     fn release_execute(context: *anyopaque, release: vsr.Release) void {
         const traced = from(context);
-        traced.trace.flush();
+        // A transition while the start is still opening (down to the data file's release): the
+        // process after it carries on the start, so this one's file, which holds no spans worth
+        // keeping, goes now, as it would if the start failed (#197, P208). Otherwise the spans are
+        // written out (P480, P480b).
+        if (!diagnostic.cleanup_now()) traced.trace.flush();
         traced.inner.release_execute(release);
     }
 
@@ -1412,12 +1442,35 @@ test "trace_create: a first start never opens an existing file; a re-executed on
     );
 }
 
-test "start_reexecuted: a process run from its own path was not re-executed" {
+test "path_reexecuted: only the bundle's own re-execution path is re-executed" {
+    try std.testing.expect(path_reexecuted("/memfd:" ++ reexecuted_marker ++
+        "1768a738-ef69-4605-8b5c-c6e63580e345 (deleted)"));
+    try std.testing.expect(path_reexecuted("/tmp/" ++ reexecuted_marker ++ "1768a738/nerva"));
+    try std.testing.expect(!path_reexecuted("/usr/bin/nerva"));
+    // A binary replaced on disk since the start began is still a first start.
+    try std.testing.expect(!path_reexecuted("/usr/bin/nerva (deleted)"));
+    try std.testing.expect(!start_reexecuted());
+}
+
+test "trace_unavailable: a re-executed start that cannot create a segment warns and has no trace" {
     var buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const native = try std.fs.selfExePath(&buffer);
-    buffer[native.len] = 0;
-    try std.testing.expect(!start_reexecuted(buffer[0..native.len :0]));
-    try std.testing.expect(start_reexecuted("/usr/bin/nerva-that-is-not-this-binary"));
+    try std.testing.expectEqual(@as(?TraceCreated, null), trace_unavailable("trace.json", error.SegmentsExhausted));
+    try std.testing.expectEqualStrings(
+        "every segment .1 to .1024 exists",
+        trace_unavailable_reason(error.SegmentsExhausted),
+    );
+    try std.testing.expectEqualStrings("its directory is gone", trace_unavailable_reason(error.FileNotFound));
+    try std.testing.expectEqualStrings("the system refused", trace_unavailable_reason(error.Unexpected));
+    // The failures that lead here are the ones `trace_create` gives.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try std.testing.expectError(
+        error.FileNotFound,
+        trace_create(tmp.dir, "gone/trace.json", true, 4, &buffer),
+    );
+    var long: [std.fs.max_path_bytes]u8 = undefined;
+    @memset(&long, 'a');
+    try std.testing.expectError(error.NameTooLong, trace_create(tmp.dir, long[0 .. long.len - 1], true, 4, &buffer));
 }
 
 test "MultiversionTraced: release_execute writes the buffered spans out first" {
@@ -1462,6 +1515,49 @@ test "MultiversionTraced: release_execute writes the buffered spans out first" {
     multiversion.release_execute(release);
     try testing.expectEqual(release.value, inner.executed.?.value);
     try testing.expectEqualStrings("[\nspan", sink.items[0..inner.written_before]);
+}
+
+test "MultiversionTraced: a transition during the open removes the registered file instead" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = try tmp.dir.realpath(".", &buffer);
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, "{s}/trace.json", .{dir});
+    const file = try std.fs.cwd().createFile(path, .{ .exclusive = true });
+    defer file.close();
+    diagnostic.cleanup_register(path, file);
+    defer diagnostic.cleanup_clear();
+
+    var writer = file.writer();
+    var trace = TraceFile.init(writer.any(), trace_file_size_max_test);
+    trace.writer().writeAll("[\n") catch unreachable;
+    const Inner = struct {
+        directory: std.fs.Dir,
+        existed: bool = true,
+        fn releases_bundled(_: *anyopaque) mv.ReleaseList {
+            return .empty;
+        }
+        fn release_execute(context: *anyopaque, _: vsr.Release) void {
+            const inner: *@This() = @ptrCast(@alignCast(context));
+            inner.existed = if (inner.directory.access("trace.json", .{})) true else |_| false;
+        }
+        fn tick(_: *anyopaque) void {}
+    };
+    var inner: Inner = .{ .directory = tmp.dir };
+    const vtable: Multiversion.VTable = .{
+        .releases_bundled = Inner.releases_bundled,
+        .release_execute = Inner.release_execute,
+        .tick = Inner.tick,
+    };
+    var traced: MultiversionTraced = .{
+        .inner = .{ .context = &inner, .vtable = &vtable },
+        .trace = &trace,
+    };
+    traced.multiversion().release_execute(vsr.Release.from(.{ .major = 0, .minor = 7, .patch = 0 }));
+    // Gone before the binary was re-executed; nothing written to it.
+    try testing.expect(!inner.existed);
 }
 
 const trace_file_size_max_test = 1024 * 1024;

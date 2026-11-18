@@ -68,6 +68,8 @@ def main():
         check(nerva, nerva_next, nerva_pack, work)
         poll(nerva_next, nerva_next_other, work)
         trace_across_switches(nerva, nerva_next, work)
+        trace_interrupted(nerva, nerva_next, work)
+        trace_untraced(nerva, nerva_next, work)
         print("bundle: ok")
     finally:
         shutil.rmtree(work, ignore_errors=True)
@@ -244,31 +246,105 @@ def trace_starts(path):
         return file.read(2) == b"[\n"
 
 
-def trace_across_switches(nerva, nerva_next, work):
-    """`start --trace` across both switches: down to the data file's release at open, then up to
-    the next release at the upgrade (#479)."""
-    past = facts(nerva)
-    next_ = facts(nerva_next)
-    directory = os.path.join(work, "trace")
+def trace_setup(nerva, nerva_next, work, name):
+    """A directory with `nerva_next` copied in and a data file formatted by `nerva`: the start
+    that follows switches down to `nerva`'s release at open."""
+    directory = os.path.join(work, name)
     os.mkdir(directory)
     exe = os.path.join(directory, "nerva")
     shutil.copy(nerva_next, exe)
     os.chmod(exe, 0o755)
     data = os.path.join(directory, "0.nerva")
-    trace = os.path.join(directory, "trace.json")
-    log_path = os.path.join(directory, "0.log")
     result = run([nerva, "format", "--cluster=0", "--replica=0", "--replica-count=1",
                   "--development", data])
     assert result.returncode == 0, result.stderr
+    return directory, exe, data
 
+
+def trace_start(exe, data, trace, log_path):
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         port = s.getsockname()[1]
     with open(log_path, "w") as log_file:
-        replica = subprocess.Popen([exe, "start", f"--addresses={port}", "--development",
-                                    f"--trace={trace}", data],
-                                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                   stderr=log_file)
+        return subprocess.Popen([exe, "start", f"--addresses={port}", "--development",
+                                 f"--trace={trace}", data],
+                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                stderr=log_file)
+
+
+def trace_files(directory):
+    return sorted(name for name in os.listdir(directory) if name.startswith("trace.json"))
+
+
+def trace_interrupted(nerva, nerva_next, work):
+    """A SIGTERM while the process after the switch down is still opening leaves no trace file
+    behind, the first process's included: the same command runs again (#197, P208, P480b)."""
+    directory, exe, data = trace_setup(nerva, nerva_next, work, "trace_interrupted")
+    trace = os.path.join(directory, "trace.json")
+    log_path = os.path.join(directory, "0.log")
+    for attempt in (1, 2):
+        replica = trace_start(exe, data, trace, log_path)
+        try:
+            log_wait(log_path, replica, f"tracing to {trace}.1: segment 1", 120)
+            replica.terminate()
+            replica.wait(timeout=60)
+        finally:
+            replica.kill()
+            replica.wait()
+        with open(log_path, errors="replace") as file:
+            log = file.read()
+        assert "NRV-E0004" not in log, (attempt, log)
+        assert trace_files(directory) == [], (attempt, trace_files(directory))
+    print("bundle: start --trace interrupted after its switch left no file, and started again")
+
+
+def trace_untraced(nerva, nerva_next, work):
+    """A re-executed start that cannot create a segment (every one of the 1024 exists) warns and
+    runs untraced, through the switch down and the switch up (P480b)."""
+    directory, exe, data = trace_setup(nerva, nerva_next, work, "trace_untraced")
+    trace = os.path.join(directory, "trace.json")
+    log_path = os.path.join(directory, "0.log")
+    for segment in range(1, 1025):
+        with open(f"{trace}.{segment}", "x"):
+            pass
+    past = facts(nerva)
+    next_ = facts(nerva_next)
+    replica = trace_start(exe, data, trace, log_path)
+    try:
+        up = f"release_transition: release={past['release']}..{next_['release']}"
+        log = log_wait(log_path, replica, up, 120)
+        deadline = time.monotonic() + 120
+        while log.split(up, 1)[1].count("listening on") == 0:
+            assert replica.poll() is None, log
+            assert time.monotonic() < deadline, log
+            time.sleep(0.1)
+            with open(log_path, errors="replace") as file:
+                log = file.read()
+        time.sleep(1)
+        assert replica.poll() is None, log
+        with open(log_path, errors="replace") as file:
+            log = file.read()
+        assert "NRV-E0004" not in log, log
+        assert log.count("NRV-W0012 start: tracing stopped") == 2, log
+        assert "every segment .1 to .1024 exists" in log, log
+        # Nothing was created or written: the segments the operator made are as they were.
+        assert trace_files(directory) == sorted(f"trace.json.{n}" for n in range(1, 1025))
+        assert all(os.path.getsize(f"{trace}.{n}") == 0 for n in range(1, 1025))
+        print("bundle: start --trace with no free segment warned twice and kept running")
+    finally:
+        replica.kill()
+        replica.wait()
+
+
+def trace_across_switches(nerva, nerva_next, work):
+    """`start --trace` across both switches: down to the data file's release at open, then up to
+    the next release at the upgrade (#479)."""
+    past = facts(nerva)
+    next_ = facts(nerva_next)
+    directory, exe, data = trace_setup(nerva, nerva_next, work, "trace")
+    trace = os.path.join(directory, "trace.json")
+    log_path = os.path.join(directory, "0.log")
+    replica = trace_start(exe, data, trace, log_path)
     try:
         down = f"release_transition: release={next_['release']}..{past['release']} (reason=open)"
         up = f"release_transition: release={past['release']}..{next_['release']}"
@@ -290,14 +366,13 @@ def trace_across_switches(nerva, nerva_next, work):
         assert f"tracing to {trace}.1: segment 1" in log, log
         assert f"tracing to {trace}.2: segment 2" in log, log
 
-        # Each process wrote out what it had buffered before it was re-executed: the first, which
-        # switched down while it opened, only the tracer's "[" (it ends no span before then), the
-        # second its spans. The third traces into its own segment, and nothing else was created.
+        # The first process switched down while it opened, so it removed its file (P480b): no
+        # `trace.json`. The second wrote out its spans before it was re-executed, and the third
+        # traces into its own segment. Nothing else was created.
         sizes = {name: os.path.getsize(os.path.join(directory, name))
-                 for name in sorted(os.listdir(directory)) if name.startswith("trace.json")}
-        assert list(sizes) == ["trace.json", "trace.json.1", "trace.json.2"], sizes
-        for name in ("trace.json", "trace.json.1"):
-            assert trace_starts(os.path.join(directory, name)), sizes
+                 for name in trace_files(directory)}
+        assert list(sizes) == ["trace.json.1", "trace.json.2"], sizes
+        assert trace_starts(os.path.join(directory, "trace.json.1")), sizes
         assert sizes["trace.json.1"] > 2, sizes
         # The third keeps tracing: its 64 KiB buffer fills and is written within seconds.
         deadline = time.monotonic() + 60
@@ -307,7 +382,7 @@ def trace_across_switches(nerva, nerva_next, work):
             time.sleep(0.5)
         assert trace_starts(trace + ".2")
         sizes["trace.json.2"] = os.path.getsize(trace + ".2")
-        print(f"bundle: start --trace switched down and up, and traced in three segments {sizes}")
+        print(f"bundle: start --trace switched down and up, and traced in two segments {sizes}")
     finally:
         replica.kill()
         replica.wait()

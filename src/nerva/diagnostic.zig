@@ -194,6 +194,16 @@ pub fn cleanup_clear() void {
     cleanup_signals_restore();
 }
 
+/// Removes the registered file now, as a failed start would, and un-registers it. Returns whether
+/// there was one. For a `start` about to be re-executed by a release transition before it has
+/// opened: its file is not the operator's yet (P480b).
+pub fn cleanup_now() bool {
+    if (cleanup_path_length == 0) return false;
+    cleanup_run();
+    cleanup_clear();
+    return true;
+}
+
 fn cleanup_signals_install() void {
     const action: std.posix.Sigaction = .{
         .handler = .{ .handler = cleanup_signal_handler },
@@ -519,6 +529,31 @@ test "cleanup removes the file it registered and only that file" {
     third.close();
     cleanup_clear();
     cleanup_run();
+    try tmp.dir.access("trace", .{});
+}
+
+test "cleanup_now removes the registered file once, and reports nothing to remove after" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = try tmp.dir.realpath(".", &buffer);
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, "{s}/trace", .{dir});
+
+    try testing.expect(!cleanup_now());
+    const file = try std.fs.cwd().createFile(path, .{ .exclusive = true });
+    cleanup_register(path, file);
+    file.close();
+    try testing.expect(cleanup_now());
+    try testing.expectError(error.FileNotFound, tmp.dir.access("trace", .{}));
+    try testing.expect(!cleanup_now());
+
+    // Cleared: the operator's file stays.
+    const kept = try std.fs.cwd().createFile(path, .{ .exclusive = true });
+    cleanup_register(path, kept);
+    kept.close();
+    cleanup_clear();
+    try testing.expect(!cleanup_now());
     try tmp.dir.access("trace", .{});
 }
 

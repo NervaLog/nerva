@@ -1318,7 +1318,9 @@ Three `nerva start` flags help when you run Nerva for real:
   overwrite your data file. Tracing stops, with `warning(trace_file): tracing stopped: …` in the
   log, at `--trace-size-max` (default `1GiB`) or if writing fails (a full disk, say); the
   replica runs on. A bundled binary re-executes itself when it switches release; the trace
-  continues in `<path>.1`, then `<path>.2`, one new file per switch.
+  continues in `<path>.1`, then `<path>.2`, one new file per switch (a start that switches
+  down at open leaves no `<path>`: its trace is `<path>.1`; one that cannot create a segment
+  warns `NRV-W0012` and runs untraced).
 - `--cache-grid=<size>` and `--cache-rows=<size>` size the block cache and the row cache (128
   bytes a row). The row cache defaults to its minimum, a few hundred rows.
 
