@@ -14,6 +14,13 @@ const IO = @import("../io.zig").IO;
 const Tracer = @import("../trace.zig");
 const fixtures = @import("../testing/fixtures.zig");
 
+/// The last `metrics_statsd_packets` gauge `emit_metrics` published.
+fn packets_published(tracer: *const Tracer) i65 {
+    const event: Tracer.EventMetric = .metrics_statsd_packets;
+    const metric = tracer.events_metric[event.slot()];
+    return metric.?.value;
+}
+
 fn tracer_udp(io: *IO, address: std.net.Address, time: stdx.Time) !Tracer {
     var tracer = try Tracer.init(std.testing.allocator, time, .unknown, .{
         .statsd_options = .{ .udp = .{
@@ -42,6 +49,9 @@ test "statsd: an address that cannot be sent to starts, warns once and drops" {
         // Warned at the second emit (the first one's failures are reported by the next), once.
         try std.testing.expectEqual(round >= 1, udp.send_failure_warned);
         try std.testing.expect(udp.send_failure_errno != .SUCCESS);
+        // Every send failed: no packet was sent, and the gauge says so.
+        try std.testing.expectEqual(@as(u64, 0), udp.send_sent_count);
+        try std.testing.expectEqual(@as(i65, 0), packets_published(&tracer));
     }
 }
 
@@ -69,6 +79,8 @@ test "statsd: a reachable collector still receives the packets" {
     try std.testing.expect(!tracer.statsd.implementation.udp.send_failure_warned);
     const udp = &tracer.statsd.implementation.udp;
     try std.testing.expectEqual(@as(u64, 0), udp.send_callback_error_count);
+    try std.testing.expectEqual(@as(u64, 1), udp.send_sent_count);
+    try std.testing.expectEqual(@as(i65, 1), packets_published(&tracer));
 
     var packet: [1500]u8 = undefined;
     // Loopback delivery can be deferred to ksoftirqd on a loaded host: wait, bounded.
@@ -115,6 +127,8 @@ test "statsd: a clean emit re-arms the warning" {
     tracer.gauge(.replica_commit_min, 3);
     tracer.emit_metrics();
     try std.testing.expect(udp.send_failure_warned);
+    // The window with the failures reports no packets; this one's packet was sent.
+    try std.testing.expectEqual(@as(i65, 1), packets_published(&tracer));
     tracer.gauge(.replica_commit_min, 4);
     tracer.emit_metrics();
     try std.testing.expect(!udp.send_failure_warned);
