@@ -81,7 +81,8 @@ pub const Facts = struct {
     offers_from_binary: bool,
 
     /// The last line of `version --verbose` (P490): written by `version_write` exactly when `start`
-    /// opens a `MultiversionOS` on the binary's own path (`nerva_main.multiversion_start`).
+    /// opens a `MultiversionOS` on the binary's own path (`nerva_main.multiversion_start`, on Linux: no
+    /// other target switches release).
     pub const capability_line = "multiversion offers_from_binary";
 
     pub const ParseError = error{

@@ -98,11 +98,9 @@ def check(nerva, nerva_next, nerva_pack, work, nerva_past_single):
     single = facts(nerva_past_single)
     assert "multiversion" not in single, single
     assert (single["release"], single["format"]) == (past["release"], past["format"]), single
-    out = run([nerva, "version", "--verbose"]).stdout
-    assert out.endswith(CAPABILITY + "\n"), out  # Appended last: the lines before it keep places.
-
     # `version` lists both releases.
     out = run([nerva, "version", "--verbose"]).stdout
+    assert out.endswith(CAPABILITY + "\n"), out  # Appended last: the lines before it keep places.
     assert "\nbundles none\n" in out, out
     out = run([nerva_next, "version", "--verbose"]).stdout
     assert f"\nbundles {past['release']}\n" in out, out
@@ -228,10 +226,13 @@ def switch(nerva, nerva_next, work):
     try:
         # In this order: the switch down to the past release (the data file is its), that release
         # offering the next one to its cluster, and the switch up.
-        for text in (f"release_transition: release={next_}..{past} (reason=open)",
-                     f"on_upgrade_timeout: upgrading from release={past}..{next_}",
-                     f"release_transition: release={past}..{next_} (reason=commit_dispatch)"):
+        steps = (f"release_transition: release={next_}..{past} (reason=open)",
+                 f"on_upgrade_timeout: upgrading from release={past}..{next_}",
+                 f"release_transition: release={past}..{next_} (reason=commit_dispatch)")
+        for text in steps:
             log = log_wait(log_path, replica, text, 90)
+        positions = [log.index(text) for text in steps]
+        assert positions == sorted(positions), (positions, log)
         assert log.count("executing") >= 2 and POLL_ERROR not in log, log
         print(f"bundle: a replica of {next_} on {past}'s data file runs {past}, which offers "
               f"{next_}, and the replica upgrades to it")

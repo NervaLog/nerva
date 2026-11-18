@@ -52,8 +52,8 @@ const MiB = stdx.MiB;
 const commit_keys_deduplicate = @import("nerva_options").commit_keys_deduplicate;
 const release_version = @import("nerva_options").version;
 /// Whether `start` opens the binary's own bundle and offers the releases it holds (P490): true in
-/// every build but the test build `-Dtest-multiversion=off`, which runs as `single_release`, as
-/// v0.7.1 did. `version --verbose` states the capability by this same constant, so that what a
+/// every build but `test:release`'s `nerva_past_single` (`build.zig`: the `multiversion_start`
+/// build parameter, with no `-D` option), which runs as `single_release`, as v0.7.1 did. `version --verbose` states the capability by this same constant, so that what a
 /// packer reads from a past binary is what `command_start` does.
 const multiversion_start = @import("nerva_options").multiversion_start;
 
@@ -1117,8 +1117,9 @@ fn version_write(writer: anytype, verbose: bool) !void {
     // `commit_keys deduplicate` (#271): the test build `-Dtest-commit-keys=off` is never shipped.
     try writer.print("commit_keys {s}\n", .{if (commit_keys_deduplicate) "deduplicate" else "off"});
     // Then, last again (P490): what `bundle.refusal` reads of a past release. Absent from v0.7.1
-    // and earlier, and from the test build `-Dtest-multiversion=off`.
-    if (multiversion_start) try writer.print("{s}\n", .{bundle.Facts.capability_line});
+    // and earlier, from `test:release`'s `nerva_past_single` (`multiversion_start` false), and
+    // from non-Linux builds, whose `start` never opens a bundle (`bundle_present`).
+    if (multiversion_start and builtin.target.os.tag == .linux) try writer.print("{s}\n", .{bundle.Facts.capability_line});
 }
 
 fn command_view(gpa: std.mem.Allocator, args: *const cli.Command.View) !void {

@@ -429,7 +429,11 @@ def main():
         assert sha(data) == digest
         os.remove(data_off)
         verbose_off = run(nerva_off, ["version", "--verbose"])
-        assert verbose_off.stdout.splitlines()[-1] == "commit_keys off", verbose_off.stdout
+        # `nerva_off` keeps `multiversion_start`, so on Linux the capability line (P490) follows.
+        off_lines = verbose_off.stdout.splitlines()
+        capability = ["multiversion offers_from_binary"] if sys.platform.startswith("linux") else []
+        assert off_lines[-1 - len(capability):] == ["commit_keys off"] + capability, \
+            verbose_off.stdout
         # `version`'s text (R6): the first line is the one the release workflow reads; then what
         # an upgrade compares. No binary bundles a past release yet (slice 3).
         for binary_run in (version, version_off):
@@ -448,9 +452,8 @@ def main():
         lines = verbose.stdout.splitlines()
         assert lines[:6] == version.stdout.splitlines(), verbose.stdout
         assert lines[6:8] == ["format_epoch 1", "superblock_version 2"], verbose.stdout
-        assert re.fullmatch(r"commit ([0-9a-f]{40}|none)", lines[8]) and len(lines) == 10, \
-            verbose.stdout
-        assert lines[9] == "commit_keys deduplicate", verbose.stdout
+        assert re.fullmatch(r"commit ([0-9a-f]{40}|none)", lines[8]), verbose.stdout
+        assert lines[9:] == ["commit_keys deduplicate"] + capability, verbose.stdout
         before = sha(data)
         check("start keys off without development",
               ["start", "--addresses=127.0.0.1:1,127.0.0.1:2,127.0.0.1:3", data],

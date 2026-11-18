@@ -36,7 +36,9 @@ appended last. No on-disk or wire format. No vendored file beyond UPSTREAM.md's 
 
 **Costs.** A line a binary prints does not prove the code at run time: a later change that
 removes the opening of the bundle from `start` while leaving `multiversion_start` true would pass
-the packer's check; `bundle.py`'s switch test fails it. A past release before v0.7.2 can no longer
-be bundled: its clusters upgrade by export and import (README, "Upgrading a cluster"). The first
+the packer's check; `bundle.py`'s switch test fails it. A past release that does not print the line (v0.7.1 and earlier
+among them) can no longer be bundled: its clusters upgrade by export and import (README,
+"Upgrading a cluster"; P259g: v0.7.x to v0.8 is that route, and the first rolling upgrade is vR to
+vR+1). The first
 release the packer accepts as a past release is the first that prints the line.
 `release.yml` does not yet require the line in a shipped binary.

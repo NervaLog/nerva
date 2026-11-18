@@ -70,8 +70,8 @@ pub fn main() !void {
             "NRV-E0728",
             "pack: {s} cannot be bundled: {s}",
             .{ past_path.?, refusal.text() },
-            "bundle a release that states it (v0.7.2 or later), or upgrade by export and import " ++
-                "(README, \"Upgrading a cluster\")",
+            "bundle a past release whose `version --verbose` states `multiversion offers_from_binary`, " ++
+                "or upgrade by export and import (README, \"Upgrading a cluster\")",
             .{},
         ),
         else => diagnostic.fail(
