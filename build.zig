@@ -584,7 +584,7 @@ pub fn build(b: *std.Build) !void {
         .strip = true,
     });
     // The past release as v0.7.1 was: `start` runs as one release and `version` does not state
-    // the capability (P<pr>). No command-line option builds it, so that no release can; the
+    // the capability (P490). No command-line option builds it, so that no release can; the
     // packer must refuse it, and `bundle.py` proves it does.
     const nerva_past_single = nerva_executable(b, .{
         .stdx_module = stdx_module,
@@ -761,7 +761,7 @@ fn nerva_executable(b: *std.Build, options: struct {
     mode: std.builtin.OptimizeMode,
     version: []const u8,
     commit_keys_deduplicate: bool = true,
-    /// False: `start` runs as one release and `version` does not state the capability (P<pr>).
+    /// False: `start` runs as one release and `version` does not state the capability (P490).
     multiversion_start: bool = true,
     /// No debug info: a ReleaseSafe pair is over `multiversion_binary_platform_size_max` with it
     /// (P417), so the test pair `nerva_next` bundles is stripped.

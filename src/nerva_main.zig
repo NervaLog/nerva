@@ -51,7 +51,7 @@ const MiB = stdx.MiB;
 /// commit again. Set by `build.zig` for this binary alone; the state machine's default is true.
 const commit_keys_deduplicate = @import("nerva_options").commit_keys_deduplicate;
 const release_version = @import("nerva_options").version;
-/// Whether `start` opens the binary's own bundle and offers the releases it holds (P<pr>): true in
+/// Whether `start` opens the binary's own bundle and offers the releases it holds (P490): true in
 /// every build but the test build `-Dtest-multiversion=off`, which runs as `single_release`, as
 /// v0.7.1 did. `version --verbose` states the capability by this same constant, so that what a
 /// packer reads from a past binary is what `command_start` does.
@@ -1116,7 +1116,7 @@ fn version_write(writer: anytype, verbose: bool) !void {
     // Last, so that the lines before it keep their places. release.yml refuses a binary without
     // `commit_keys deduplicate` (#271): the test build `-Dtest-commit-keys=off` is never shipped.
     try writer.print("commit_keys {s}\n", .{if (commit_keys_deduplicate) "deduplicate" else "off"});
-    // Then, last again (P<pr>): what `bundle.refusal` reads of a past release. Absent from v0.7.1
+    // Then, last again (P490): what `bundle.refusal` reads of a past release. Absent from v0.7.1
     // and earlier, and from the test build `-Dtest-multiversion=off`.
     if (multiversion_start) try writer.print("{s}\n", .{bundle.Facts.capability_line});
 }

@@ -15,10 +15,10 @@ release). Checks, without a cluster:
 - the packer refuses, with NRV-E0728 and no output, a past release that does not state
   `multiversion offers_from_binary` (v0.7.1 and v0.7.0 do not): a stub, and `nerva_past_single`,
   this code built without the capability (its `start` runs as one release; there is no command-line
-  option for that build, so no release can be one) (P<pr>, #484);
+  option for that build, so no release can be one) (P490, #484);
 - a replica started from `nerva_next` on the data file of the past release switches to the past
   release, which offers the next one: the one-replica cluster prepares the upgrade and the replica
-  executes the next release (P<pr>, #484);
+  executes the next release (P490, #484);
 - the packer refuses an input it cannot read in full (NRV-E0727) or an output it cannot write
   (NRV-E0810), with a code and no error name;
 - the packer refuses a result over its size limit with NRV-E0719, and writes it at the limit;

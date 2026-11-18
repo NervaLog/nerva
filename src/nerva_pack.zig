@@ -65,7 +65,7 @@ pub fn main() !void {
     const past_facts = facts_read(allocator, past_path.?);
     if (bundle.refusal(current_facts, past_facts)) |refusal| switch (refusal) {
         // Its own code: the cure differs, a past release that can be bundled has to be built
-        // (P<pr>, #484).
+        // (P490, #484).
         .not_multiversion => diagnostic.fail(
             "NRV-E0728",
             "pack: {s} cannot be bundled: {s}",

@@ -77,10 +77,10 @@ pub const Facts = struct {
     format: [64]u8,
     git_commit: [20]u8,
     /// The line `multiversion offers_from_binary` was present: this binary, run as a past release
-    /// from a bundle, opens the outer binary's bundle and offers its releases (P<pr>).
+    /// from a bundle, opens the outer binary's bundle and offers its releases (P490).
     offers_from_binary: bool,
 
-    /// The last line of `version --verbose` (P<pr>): written by `version_write` exactly when `start`
+    /// The last line of `version --verbose` (P490): written by `version_write` exactly when `start`
     /// opens a `MultiversionOS` on the binary's own path (`nerva_main.multiversion_start`).
     pub const capability_line = "multiversion offers_from_binary";
 
