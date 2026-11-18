@@ -43,7 +43,9 @@ Restore an equivalent once Nerva's forest has real grooves.
 `src/nerva_main.zig` (the `nerva` binary) is derived from TigerBeetle's `src/tigerbeetle/main.zig`,
 trimmed to `format`, `start` and `version` (Nerva has since added `api` and `view`); `src/nerva/cli.zig` follows the structure of
 `src/tigerbeetle/cli.zig`. They are Nerva's own files, not patches, but upstream fixes to those
-originals should be checked for relevance.
+originals should be checked for relevance. As upstream's `Command` does with `self_exe_path`,
+`start` owns the binary's path and frees it only after `MultiversionOS.deinit`, which borrows it
+to poll and re-execute the binary (#477).
 
 ## Local patches to vendored files
 

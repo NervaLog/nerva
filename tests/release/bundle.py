@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """A binary that carries the release before it (R6 slice 3, P259d, P417).
 
-Usage: bundle.py <nerva> <nerva_next> <nerva_pack>
+Usage: bundle.py <nerva> <nerva_next> <nerva_pack> <nerva_next_other>
 
 `nerva_next` is this code under the next test release, packed with a build of `nerva` (the past
 release). Checks, without a cluster:
@@ -16,16 +16,21 @@ release). Checks, without a cluster:
   (NRV-E0810), with a code and no error name;
 - the packer refuses a result over its size limit with NRV-E0719, and writes it at the limit;
 - the packed binary is under `multiversion_binary_platform_size_max` (64 MiB); the margin is
-  printed.
+  printed;
+- a replica started from `nerva_next` polls its binary without an error, and when the binary is
+  replaced by `nerva_next_other` (the same release, bundling another past one) it offers the
+  release it did not offer before (#477: the path it polled had been freed).
 `nerva_next start` on N's data file (the switch) is not here: it needs slice 2's multiversion `start` (#415), so it belongs to slice 5's `rolling.py`, or to this file once #415 is merged (recorded in docs/demos/r6.md).
 """
 import os
 import re
+import socket
 import shutil
 import stat
 import subprocess
 import sys
 import tempfile
+import time
 
 PLATFORM_SIZE_MAX = 64 * 1024 * 1024  # config.process.multiversion_binary_platform_size_max.
 SECTION_NAME = b".tb_mvb"
@@ -54,10 +59,12 @@ def facts_text(release, client_min, fmt, commit):
 
 
 def main():
-    nerva, nerva_next, nerva_pack = sys.argv[1:4]
+    nerva, nerva_next, nerva_pack, nerva_next_other = sys.argv[1:5]
     work = tempfile.mkdtemp(prefix="nerva-bundle-")
     try:
         check(nerva, nerva_next, nerva_pack, work)
+        poll(nerva_next, nerva_next_other, work)
+        print("bundle: ok")
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
@@ -158,7 +165,72 @@ def check(nerva, nerva_next, nerva_pack, work):
     assert not os.path.exists(packed)
     result = run(pack + ["--size-max", str(exact)])
     assert result.returncode == 0 and os.path.getsize(packed) == exact, result.stderr
-    print("bundle: ok")
+
+
+POLL_ERROR = "binary does not contain valid multiversion data"
+
+
+def log_wait(path, process, text, timeout):
+    """The log once it holds `text`; fails if the replica exits or `timeout` passes first."""
+    deadline = time.monotonic() + timeout
+    while True:
+        with open(path, errors="replace") as file:
+            log = file.read()
+        if text in log:
+            return log
+        assert process.poll() is None, f"the replica exited ({process.returncode}):\n{log}"
+        assert time.monotonic() < deadline, f"no {text!r} within {timeout} s:\n{log}"
+        time.sleep(0.1)
+
+
+def poll(nerva_next, nerva_next_other, work):
+    """A running replica polls its own binary every second (`multiversion_poll_interval`), and
+    offers what a replaced binary bundles (#477)."""
+    next_ = facts(nerva_next)
+    other = facts(nerva_next_other)
+    assert other["release"] == next_["release"], "the replacement must run the same release"
+    assert other["bundles"] != next_["bundles"], "the replacement must bundle another release"
+
+    exe = os.path.join(work, "nerva")
+    shutil.copy(nerva_next, exe)
+    os.chmod(exe, 0o755)
+    data = os.path.join(work, "0.nerva")
+    log_path = os.path.join(work, "0.log")
+    result = run([exe, "format", "--cluster=0", "--replica=0", "--replica-count=1",
+                  "--development", data])
+    assert result.returncode == 0, result.stderr
+
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    with open(log_path, "w") as log_file:
+        replica = subprocess.Popen([exe, "start", f"--addresses={port}", "--development", data],
+                                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                   stderr=log_file)
+    try:
+        log_wait(log_path, replica, "listening on", 120)
+        # Three polls, then nothing has failed.
+        time.sleep(3.5)
+        with open(log_path, errors="replace") as file:
+            log = file.read()
+        assert POLL_ERROR not in log, log
+        assert replica.poll() is None, log
+
+        # Replaced as an install does: written beside it, then renamed over it.
+        staged = exe + ".new"
+        shutil.copy(nerva_next_other, staged)
+        os.chmod(staged, 0o755)
+        os.replace(staged, exe)
+        releases = sorted([other["bundles"], other["release"]],
+                          key=lambda r: tuple(int(x) for x in r.split(".")))
+        offered = "releases_bundled new: { " + ", ".join(releases) + " }"
+        log = log_wait(log_path, replica, offered, 30)
+        assert "binary change detected" in log, log
+        assert POLL_ERROR not in log, log
+        print(f"bundle: a running replica offers {other['bundles']} once its binary bundles it")
+    finally:
+        replica.kill()
+        replica.wait()
 
 
 if __name__ == "__main__":
