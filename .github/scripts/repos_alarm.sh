@@ -59,7 +59,7 @@ if [ -n "$issue" ]; then
   prefix="\`$workflow\` / \`$job\` failed with \`$code\`:"
   seen=$(gh api "repos/$GITHUB_REPOSITORY/issues/$issue/comments?since=$since&per_page=100" \
     --jq ".[] | select(.created_at >= \"$since\" and .user.login == \"github-actions[bot]\") | .body" 2>"$err") || fail "reading the comments of issue #$issue failed"
-  if printf '%s\n' "$seen" | grep -qF -e "$prefix"; then
+  if grep -qF -e "$prefix" <<< "$seen"; then
     echo "::notice::the alarm for $workflow / $job / $code was commented in the last 24 hours; not repeated" >&2
     exit 0
   fi
