@@ -120,6 +120,8 @@ const Cluster = struct {
 
         for (0..replica_count) |replica| try cluster.format(@intCast(replica));
         for (0..replica_count) |replica| try cluster.start(@intCast(replica));
+        // Last, so that nothing after it can fail while the thread runs; `cluster` is on the heap.
+        try cluster.statsd.start();
         return cluster;
     }
 
@@ -290,13 +292,27 @@ const Cluster = struct {
     }
 };
 
-/// A UDP socket that collects statsd packets from a replica.
+/// A UDP socket that collects statsd packets from the replicas. A thread drains it from the
+/// moment the cluster starts, so no packet waits in the socket's receive buffer, which holds
+/// about 90 of them and drops the rest (#482: a replica's first emit, ten seconds after it
+/// starts, is over 100 packets from three replicas, and the round trips come last).
 const StatsdListener = struct {
     socket: std.posix.socket_t,
     port: u16,
+    /// Every packet received so far, each followed by a newline.
+    received: []u8,
+    /// Guards `received_len` and `received_full`, and the bytes of `received` below `received_len`.
+    mutex: std.Thread.Mutex = .{},
+    received_len: usize = 0,
+    /// A packet did not fit in `received`: later ones are dropped.
+    received_full: bool = false,
+    stopping: std.atomic.Value(bool) = .init(false),
+    thread: ?std.Thread = null,
 
     /// Replicas emit metrics every 10 s; allow for one full interval plus slack.
     const wait_max = stdx.Duration.seconds(15);
+    /// Enough for a cluster's emits over many minutes (about 40 KiB every 10 s).
+    const received_max = 8 * stdx.MiB;
 
     fn init() !StatsdListener {
         const socket = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.DGRAM, 0);
@@ -307,42 +323,85 @@ const StatsdListener = struct {
         var address_length = address.getOsSockLen();
         try std.posix.getsockname(socket, &address.any, &address_length);
 
-        // A receive wakes at least once a second, so the deadline below is checked.
-        const receive_timeout: std.posix.timeval = .{ .sec = 1, .usec = 0 };
+        // A receive wakes at least every 100 ms, so `stopping` is checked.
+        const receive_timeout: std.posix.timeval = .{ .sec = 0, .usec = 100_000 };
         try std.posix.setsockopt(
             socket,
             std.posix.SOL.SOCKET,
             std.posix.SO.RCVTIMEO,
             std.mem.asBytes(&receive_timeout),
         );
-        return .{ .socket = socket, .port = address.getPort() };
+        const received = try gpa.alloc(u8, received_max);
+        return .{ .socket = socket, .port = address.getPort(), .received = received };
+    }
+
+    /// Starts draining the socket. `listener` must not move afterwards.
+    fn start(listener: *StatsdListener) !void {
+        assert(listener.thread == null);
+        listener.thread = try std.Thread.spawn(.{}, collect, .{listener});
     }
 
     fn deinit(listener: *StatsdListener) void {
+        listener.stopping.store(true, .release);
+        if (listener.thread) |thread| thread.join();
         std.posix.close(listener.socket);
+        gpa.free(listener.received);
         listener.* = undefined;
+    }
+
+    fn collect(listener: *StatsdListener) void {
+        var packet: [2048]u8 = undefined;
+        while (!listener.stopping.load(.acquire)) {
+            const size = std.posix.recv(listener.socket, &packet, 0) catch |err| switch (err) {
+                error.WouldBlock => continue,
+                else => {
+                    std.debug.print("statsd: recv failed: {}\n", .{err});
+                    return;
+                },
+            };
+            listener.mutex.lock();
+            defer listener.mutex.unlock();
+            if (listener.received_len + size + 1 > listener.received.len) {
+                listener.received_full = true;
+                continue;
+            }
+            stdx.copy_disjoint(
+                .exact,
+                u8,
+                listener.received[listener.received_len..][0..size],
+                packet[0..size],
+            );
+            listener.received[listener.received_len + size] = '\n';
+            listener.received_len += size + 1;
+        }
     }
 
     /// Waits until every needle has appeared in some received packet.
     fn expect_metrics(listener: *StatsdListener, needles: []const []const u8) !void {
         assert(needles.len > 0);
         assert(needles.len <= 8);
+        assert(listener.thread != null);
         var found: [8]bool = @splat(false);
         var timer = try std.time.Timer.start();
-        var packet: [2048]u8 = undefined;
-        while (timer.read() < wait_max.ns) {
-            const size = std.posix.recv(listener.socket, &packet, 0) catch |err| switch (err) {
-                error.WouldBlock => continue,
-                else => return err,
-            };
-            for (needles, found[0..needles.len]) |needle, *seen| {
-                if (std.mem.indexOf(u8, packet[0..size], needle) != null) seen.* = true;
+        while (true) {
+            {
+                listener.mutex.lock();
+                defer listener.mutex.unlock();
+                const text = listener.received[0..listener.received_len];
+                for (needles, found[0..needles.len]) |needle, *seen| {
+                    if (std.mem.indexOf(u8, text, needle) != null) seen.* = true;
+                }
             }
             if (std.mem.allEqual(bool, found[0..needles.len], true)) return;
+            if (timer.read() >= wait_max.ns) break;
+            std.time.sleep(50 * std.time.ns_per_ms);
         }
         for (needles, found[0..needles.len]) |needle, seen| {
             if (!seen) std.debug.print("statsd: never received {s}\n", .{needle});
         }
+        listener.mutex.lock();
+        defer listener.mutex.unlock();
+        if (listener.received_full) std.debug.print("statsd: the packet buffer filled\n", .{});
         return error.StatsdMetricsMissing;
     }
 };
