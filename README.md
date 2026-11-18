@@ -437,7 +437,10 @@ statsd format with DogStatsD tags (`|#cluster:…,replica:N`). `--trace=<path>` 
 trace for [Perfetto](https://ui.perfetto.dev) or `chrome://tracing` to a new file (it refuses
 an existing one); tracing slows the replica, so use it to diagnose, not to time. The trace is
 written 64 KiB at a time and stops at `--trace-size-max` (default 1 GiB), or if writing it fails,
-with a warning in the log; the replica runs on (N71). A `--statsd` address this host cannot send to
+with a warning in the log; the replica runs on (N71). A bundled binary that switches release
+(down to the data file's at open, or up at an upgrade) re-executes itself: the process after
+each switch traces to the next new segment, `<path>.1`, `<path>.2` and so on, each its own
+trace with its own size limit, and the one before writes its spans out first (P480). A `--statsd` address this host cannot send to
 (no route, or a broadcast address) does not stop `start`: it warns, `NRV-W0733`, drops the
 metrics and runs on (P427). An address family the host has no socket for refuses the start with
 `error[NRV-E0010]`, before the replica's vendored open. The metrics most useful for performance work:

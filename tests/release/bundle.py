@@ -19,7 +19,10 @@ release). Checks, without a cluster:
   printed;
 - a replica started from `nerva_next` polls its binary without an error, and when the binary is
   replaced by `nerva_next_other` (the same release, bundling another past one) it offers the
-  release it did not offer before (#477: the path it polled had been freed).
+  release it did not offer before (#477: the path it polled had been freed);
+- `nerva_next start --trace` on `nerva`'s data file switches down to it at open, then up again at
+  the upgrade, and keeps running and tracing: each process after a transition writes its own
+  segment, `<path>.1` then `<path>.2`, and the one before it wrote out its spans (#479, P480).
 `nerva_next start` on N's data file (the switch) is not here: it needs slice 2's multiversion `start` (#415), so it belongs to slice 5's `rolling.py`, or to this file once #415 is merged (recorded in docs/demos/r6.md).
 """
 import os
@@ -64,6 +67,7 @@ def main():
     try:
         check(nerva, nerva_next, nerva_pack, work)
         poll(nerva_next, nerva_next_other, work)
+        trace_across_switches(nerva, nerva_next, work)
         print("bundle: ok")
     finally:
         shutil.rmtree(work, ignore_errors=True)
@@ -228,6 +232,82 @@ def poll(nerva_next, nerva_next_other, work):
         assert "binary change detected" in log, log
         assert POLL_ERROR not in log, log
         print(f"bundle: a running replica offers {other['bundles']} once its binary bundles it")
+    finally:
+        replica.kill()
+        replica.wait()
+
+
+
+def trace_starts(path):
+    """Whether `path` is a trace the tracer began: "[" and a line, then spans."""
+    with open(path, "rb") as file:
+        return file.read(2) == b"[\n"
+
+
+def trace_across_switches(nerva, nerva_next, work):
+    """`start --trace` across both switches: down to the data file's release at open, then up to
+    the next release at the upgrade (#479)."""
+    past = facts(nerva)
+    next_ = facts(nerva_next)
+    directory = os.path.join(work, "trace")
+    os.mkdir(directory)
+    exe = os.path.join(directory, "nerva")
+    shutil.copy(nerva_next, exe)
+    os.chmod(exe, 0o755)
+    data = os.path.join(directory, "0.nerva")
+    trace = os.path.join(directory, "trace.json")
+    log_path = os.path.join(directory, "0.log")
+    result = run([nerva, "format", "--cluster=0", "--replica=0", "--replica-count=1",
+                  "--development", data])
+    assert result.returncode == 0, result.stderr
+
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    with open(log_path, "w") as log_file:
+        replica = subprocess.Popen([exe, "start", f"--addresses={port}", "--development",
+                                    f"--trace={trace}", data],
+                                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                   stderr=log_file)
+    try:
+        down = f"release_transition: release={next_['release']}..{past['release']} (reason=open)"
+        up = f"release_transition: release={past['release']}..{next_['release']}"
+        log = log_wait(log_path, replica, down, 120)
+        log = log_wait(log_path, replica, up, 120)
+        # Listening again after the upgrade, then still running.
+        deadline = time.monotonic() + 120
+        while log.split(up, 1)[1].count("listening on") == 0:
+            assert replica.poll() is None, log
+            assert time.monotonic() < deadline, log
+            time.sleep(0.1)
+            with open(log_path, errors="replace") as file:
+                log = file.read()
+        time.sleep(2)
+        assert replica.poll() is None, log
+        with open(log_path, errors="replace") as file:
+            log = file.read()
+        assert "NRV-E0004" not in log, log
+        assert f"tracing to {trace}.1: segment 1" in log, log
+        assert f"tracing to {trace}.2: segment 2" in log, log
+
+        # Each process wrote out what it had buffered before it was re-executed: the first, which
+        # switched down while it opened, only the tracer's "[" (it ends no span before then), the
+        # second its spans. The third traces into its own segment, and nothing else was created.
+        sizes = {name: os.path.getsize(os.path.join(directory, name))
+                 for name in sorted(os.listdir(directory)) if name.startswith("trace.json")}
+        assert list(sizes) == ["trace.json", "trace.json.1", "trace.json.2"], sizes
+        for name in ("trace.json", "trace.json.1"):
+            assert trace_starts(os.path.join(directory, name)), sizes
+        assert sizes["trace.json.1"] > 2, sizes
+        # The third keeps tracing: its 64 KiB buffer fills and is written within seconds.
+        deadline = time.monotonic() + 60
+        while os.path.getsize(trace + ".2") <= 2:
+            assert replica.poll() is None
+            assert time.monotonic() < deadline, "the third process wrote no spans in 60 s"
+            time.sleep(0.5)
+        assert trace_starts(trace + ".2")
+        sizes["trace.json.2"] = os.path.getsize(trace + ".2")
+        print(f"bundle: start --trace switched down and up, and traced in three segments {sizes}")
     finally:
         replica.kill()
         replica.wait()
