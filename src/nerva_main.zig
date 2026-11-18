@@ -423,13 +423,13 @@ fn import_run(
     // One descriptor for both passes: the path is opened once, so that pass 2 reads the file
     // pass 1 checked, not one renamed over it since (and pass 2 compares the SHA-256s).
     const input = std.fs.cwd().openFile(args.input, .{}) catch |err|
-        import_failed(command, args.input, args.path, err);
+        import_failed(command, args.input, args.path, args.path, err);
     defer input.close();
     // Pass 1, before the data file exists: the whole export is checked.
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const plan = import_.plan(arena.allocator(), input) catch |err|
-        import_failed(command, args.input, args.path, err);
+        import_failed(command, args.input, args.path, args.path, err);
     if (commit_keys_deduplicate and plan.flags & export_file.flag_keys_off != 0) {
         diagnostic.fail(
             "NRV-E0812",
@@ -454,7 +454,7 @@ fn import_run(
                 path_importing, command, command,
             });
         }
-        import_failed(command, args.input, path_importing, err);
+        import_failed(command, args.input, path_importing, args.path, err);
     };
     // Every write is on disk: the data file is complete, and takes its name.
     const cwd = std.posix.AT.FDCWD;
@@ -670,6 +670,7 @@ fn import_failed(
     comptime command: []const u8,
     input: []const u8,
     output: []const u8,
+    path: []const u8,
     err: anyerror,
 ) noreturn {
     switch (err) {
@@ -701,7 +702,7 @@ fn import_failed(
             .{input},
             "let nothing write or replace {s} during the {s}, then {s} again; nothing was " ++
                 "named {s}",
-            .{ input, command, command, output },
+            .{ input, command, command, path },
         ),
         // Another import or restore of the same path created `output` first. It is that
         // process's file: this one touched nothing (P489).
