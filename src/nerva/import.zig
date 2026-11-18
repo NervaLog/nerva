@@ -111,9 +111,12 @@ pub const Plan = struct {
 pub const CatalogRows = std.AutoHashMapUnmanaged(u64, [nerva.value_size]u8);
 
 /// Pass 1: reads and checks the whole export in `file`, from its start, and rebuilds the views'
-/// definitions. Allocates the plan's table checks from `arena`. The caller keeps `file` open for
+/// definitions. Refuses a file that is not a regular file (`error.NotRegularFile`): both passes read
+/// it. Allocates the plan's table checks from `arena`. The caller keeps `file` open for
 /// pass 2 (`Input.file`), which reads it again: a path opened twice could name another file.
 pub fn plan(arena: std.mem.Allocator, file: std.fs.File) !Plan {
+    // Pass 2 seeks back to the start: a pipe or a device cannot.
+    if ((try file.stat()).kind != .file) return error.NotRegularFile;
     try file.seekTo(0);
     var buffered = std.io.bufferedReader(file.reader());
     var reader = try export_file.ReaderType(@TypeOf(buffered).Reader).init(buffered.reader());
@@ -565,8 +568,8 @@ pub fn ImporterType(comptime Storage: type) type {
                 switch (restore.options.input) {
                     .bytes => |bytes| {
                         var stream = std.io.fixedBufferStream(bytes);
-                        var reader = try export_file.ReaderType(@TypeOf(stream).Reader)
-                            .init(stream.reader());
+                        var reader = export_file.ReaderType(@TypeOf(stream).Reader)
+                            .init(stream.reader()) catch |err| return changed(err);
                         return restore.ops_read(gpa, &reader, trigger_final, checkpoint_final);
                     },
                     .file => |file| {
@@ -574,8 +577,8 @@ pub fn ImporterType(comptime Storage: type) type {
                         // the path since is not read.
                         try file.seekTo(0);
                         var buffered = std.io.bufferedReader(file.reader());
-                        var reader = try export_file.ReaderType(@TypeOf(buffered).Reader)
-                            .init(buffered.reader());
+                        var reader = export_file.ReaderType(@TypeOf(buffered).Reader)
+                            .init(buffered.reader()) catch |err| return changed(err);
                         return restore.ops_read(gpa, &reader, trigger_final, checkpoint_final);
                     },
                 }
@@ -604,7 +607,7 @@ pub fn ImporterType(comptime Storage: type) type {
                 while (op <= trigger_final) : (op += 1) {
                     if (op <= as_of) {
                         if (pending == null and !changes_done) {
-                            pending = try change_next(reader);
+                            pending = try restore.change_next(reader);
                             changes_done = pending == null;
                         }
                         const change_op = if (pending) |change| change.op() else null;
@@ -624,12 +627,20 @@ pub fn ImporterType(comptime Storage: type) type {
                         else
                             null;
                         if (change_op != null and change_op.? < op) {
-                            return export_file.corrupt("changes are out of op order");
+                            return restore.corrupt_or_changed(
+                                reader,
+                                "changes are out of op order",
+                            );
                         }
                         if (view != null or ledger != null or index != null) {
                             if (change_op == op) {
-                                log.err("op {} both declares and changes rows", .{op});
-                                return export_file.corrupt("an op both declares and writes");
+                                if (!builtin.is_test) {
+                                    log.err("op {} both declares and changes rows", .{op});
+                                }
+                                return restore.corrupt_or_changed(
+                                    reader,
+                                    "an op both declares and writes",
+                                );
                             }
                             if (view) |declared| {
                                 try restore.view_restore(op, declared);
@@ -651,7 +662,10 @@ pub fn ImporterType(comptime Storage: type) type {
                                 if (change.op() != op) break;
                                 // Checked by pass 1, unless the file changed since.
                                 if (count == restore.changes.len) {
-                                    return export_file.corrupt("an op has too many changes");
+                                    return restore.corrupt_or_changed(
+                                        reader,
+                                        "an op has too many changes",
+                                    );
                                 }
                                 switch (change) {
                                     .row => |*row| restore.changes[count] = change_from_record(row),
@@ -660,10 +674,13 @@ pub fn ImporterType(comptime Storage: type) type {
                                 if (count < restore.changes_wide.len) {
                                     restore.changes_wide[count] = change.wide();
                                 } else if (records) {
-                                    return export_file.corrupt("an op has too many changes");
+                                    return restore.corrupt_or_changed(
+                                        reader,
+                                        "an op has too many changes",
+                                    );
                                 }
                                 count += 1;
-                                pending = try change_next(reader);
+                                pending = try restore.change_next(reader);
                                 changes_done = pending == null;
                             }
                             if (records) {
@@ -701,14 +718,14 @@ pub fn ImporterType(comptime Storage: type) type {
                 if (pending != null or view_index != views.len or ledger_index != ledgers_.len or
                     index_index != indexes_.len)
                 {
-                    return export_file.corrupt("records past the export's op");
+                    return restore.corrupt_or_changed(reader, "records past the export's op");
                 }
                 // The rest of the export, read again: its SHA-256 must still match (the file
                 // may have changed since pass 1).
-                if (!changes_done) {
-                    assert(try change_next(reader) == null);
+                if (!changes_done and try restore.change_next(reader) != null) {
+                    return restore.corrupt_or_changed(reader, "records past the export's op");
                 }
-                while (try reader.next()) |_| {}
+                while (try restore.reader_next(reader)) |_| {}
                 // The reader returns null only once its own SHA-256 checked. It must be pass 1's
                 // too: the data file records pass 1's as its origin (P90), and another valid
                 // export (the file rewritten between the passes) can end in the same rows and
@@ -762,15 +779,75 @@ pub fn ImporterType(comptime Storage: type) type {
                 }
             };
 
-            /// The next change, or null once the changes' section has ended.
-            fn change_next(reader: anytype) !?Pending {
+            /// The next change, or null once the changes' section has ended. A change pass 1
+            /// would have refused, or one more than its summary counts, means the file changed
+            /// since pass 1: refused here, before it reaches the state machine, which asserts what
+            /// pass 1 checked.
+            fn change_next(restore: *const Restore, reader: anytype) !?Pending {
                 if (reader.section > 1) return null; // The changes' section (`RecordKind`).
-                const record = try reader.next() orelse return null;
-                return switch (record) {
+                const record = try restore.reader_next(reader) orelse return null;
+                const pending: Pending = switch (record) {
                     .change => |change| .{ .row = change },
                     .record_change => |change| .{ .record = change },
-                    else => null,
+                    else => return null,
                 };
+                const summary = &restore.plan.summary;
+                if (reader.change_count > summary.change_count or
+                    reader.record_change_count > summary.record_change_count)
+                {
+                    return restore.changed_log("more changes than pass 1 read");
+                }
+                switch (pending) {
+                    .row => |*row| {
+                        if (table_refused(row.table, null)) {
+                            return restore.changed_log("a row in a table that holds records");
+                        }
+                        if (row.timestamp > timestamp_restore_max) {
+                            return restore.changed_log("a timestamp pass 1 would refuse");
+                        }
+                    },
+                    .record => |*record_change| {
+                        if (record_change.timestamp > timestamp_restore_max) {
+                            return restore.changed_log("a timestamp pass 1 would refuse");
+                        }
+                    },
+                }
+                return pending;
+            }
+
+            /// `reader.next`, pass 2's: pass 1 read the whole export without a fault, so a fault
+            /// in it now is a change (a read that fails stays its own error).
+            fn reader_next(_: *const Restore, reader: anytype) !?export_file.Record {
+                return reader.next() catch |err| return changed(err);
+            }
+
+            /// A fault the reader found in pass 2 (`Corrupt`, an unsupported version: pass 1
+            /// found none) is `ExportChanged`; any other error is its own.
+            fn changed(err: anyerror) anyerror {
+                return switch (err) {
+                    error.Corrupt, error.VersionUnsupported => error.ExportChanged,
+                    else => err,
+                };
+            }
+
+            fn changed_log(_: *const Restore, what: []const u8) error{ExportChanged} {
+                if (!builtin.is_test) log.err("the export read again holds {s}", .{what});
+                return error.ExportChanged;
+            }
+
+            /// A fault in the export that pass 1 did not look for (order, ops past the export's,
+            /// too many changes in an op). It is the export's own when the export read again is
+            /// pass 1's, byte for byte; if not, the file changed. Reads the rest to tell.
+            fn corrupt_or_changed(
+                restore: *const Restore,
+                reader: anytype,
+                reason: []const u8,
+            ) anyerror {
+                if (reader.state == .records) while (try restore.reader_next(reader)) |_| {};
+                if (!std.mem.eql(u8, &reader.digest, &restore.plan.origin)) {
+                    return restore.changed_log("another SHA-256 than pass 1's");
+                }
+                return export_file.corrupt(reason);
             }
 
             fn change_from_record(record: *const export_file.Change) nerva.Change {
@@ -1411,31 +1488,32 @@ test "import: rows and views of tables that now hold records are refused (#126)"
 /// An export of two ops: op 1 puts row `id` of table 1, op 2 deletes it. Every `id` ends in the
 /// same rows (none) and passes the same checks, with another history and another SHA-256.
 fn export_test_history(buffer: []u8, id: u64) []const u8 {
+    return export_test_ops(buffer, id, 1, 2);
+}
+
+/// An export of `ops` ops on row `id` of `table`: op 1 puts it, op 2 deletes it, op 3 puts it
+/// again, and so on.
+fn export_test_ops(buffer: []u8, id: u64, table: u32, ops: u64) []const u8 {
     var stream = std.io.fixedBufferStream(buffer);
     var writer = export_file.WriterType(@TypeOf(stream).Writer)
         .init(stream.writer(), 2, 0) catch unreachable;
     const timestamp: u64 = 1 << 40;
     var value: [nerva.value_size]u8 = @splat(0);
     value[0] = 0x5a;
-    writer.write(&.{ .change = .{
-        .table = 1,
-        .id = id,
-        .op = 1,
-        .timestamp = timestamp,
-        .kind = .put,
-        .value = value,
-    } }) catch unreachable;
-    writer.write(&.{ .change = .{
-        .table = 1,
-        .id = id,
-        .op = 2,
-        .timestamp = timestamp + 1,
-        .kind = .delete,
-        .value = @splat(0),
-    } }) catch unreachable;
+    for (1..ops + 1) |op| {
+        const put = op % 2 == 1;
+        writer.write(&.{ .change = .{
+            .table = table,
+            .id = id,
+            .op = op,
+            .timestamp = timestamp + op,
+            .kind = if (put) .put else .delete,
+            .value = if (put) value else @splat(0),
+        } }) catch unreachable;
+    }
     writer.write(&.{ .summary = .{
-        .as_of = 2,
-        .change_count = 2,
+        .as_of = ops,
+        .change_count = ops,
         .view_count = 0,
         .ledger_count = 0,
         .table_count = 0,
@@ -1530,4 +1608,51 @@ test "import: pass 2 refuses an export other than pass 1's, same rows, another h
             import_test_run(&plan_file, .{ .file = file }),
         );
     }
+}
+
+test "import: pass 2 refuses rows pass 1 would refuse, and more ops than pass 1 saw (#475)" {
+    var buffer_a: [1024]u8 = undefined;
+    var buffer_rows: [1024]u8 = undefined;
+    var buffer_more: [1024]u8 = undefined;
+    const a = export_test_ops(&buffer_a, 1, 1, 2);
+    // The same two ops, on a table that holds records: pass 1 refuses it (#126; its test is
+    // above, and a refusal logs an error, which a test may not).
+    const rows = export_test_ops(&buffer_rows, 1, nerva.record_tables_min + 1, 2);
+    // The same two ops and one more.
+    const more = export_test_ops(&buffer_more, 1, 1, 3);
+
+    var arena_instance = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_instance.deinit();
+    const arena = arena_instance.allocator();
+    const plan_a = try plan_bytes(arena, a);
+    _ = try plan_bytes(arena, more);
+
+    // Each is refused as another export than pass 1's, before a row reaches the state machine
+    // (which asserts what pass 1 checked) and not as a corrupt export.
+    try std.testing.expectError(error.ExportChanged, import_test_run(&plan_a, .{ .bytes = rows }));
+    try std.testing.expectError(error.ExportChanged, import_test_run(&plan_a, .{ .bytes = more }));
+
+    // The same, from a file rewritten in place between the passes.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    inline for (.{ rows, more }) |next| {
+        try tmp.dir.writeFile(.{ .sub_path = "rewritten", .data = a });
+        const file = try tmp.dir.openFile("rewritten", .{});
+        defer file.close();
+        const plan_file = try plan(arena, file);
+        try tmp.dir.writeFile(.{ .sub_path = "rewritten", .data = next });
+        try std.testing.expectError(
+            error.ExportChanged,
+            import_test_run(&plan_file, .{ .file = file }),
+        );
+    }
+}
+
+test "import: an input that is not a regular file is refused before pass 1 (NRV-E0810)" {
+    var arena_instance = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_instance.deinit();
+    // A device cannot seek back for pass 2, as a pipe cannot.
+    const device = try std.fs.openFileAbsolute("/dev/null", .{});
+    defer device.close();
+    try std.testing.expectError(error.NotRegularFile, plan(arena_instance.allocator(), device));
 }

@@ -81,7 +81,7 @@ pub const table = [_]Entry{
     .{ .code = "NRV-E0807", .summary = "The imported data failed its checks", .exit = exit_operator },
     .{ .code = "NRV-E0808", .summary = "A backup's manifest is missing, malformed, too large or of an unknown version", .exit = exit_operator },
     .{ .code = "NRV-E0809", .summary = "A backup does not match its manifest: size, SHA-256, op, version, a view hash or a ledger total", .exit = exit_operator },
-    .{ .code = "NRV-E0810", .summary = "A file `export` or `import` was given cannot be opened, read or written", .exit = exit_operator },
+    .{ .code = "NRV-E0810", .summary = "A file `export` or `import` was given cannot be opened, read or written, or an import's input is not a regular file", .exit = exit_operator },
     .{ .code = "NRV-E0812", .summary = "A release build was given an export from a test build with commit-key deduplication off", .exit = exit_operator },
     .{ .code = "NRV-E0813", .summary = "The export changed between `import`'s two passes", .exit = exit_operator },
     .{ .code = "NRV-E0901", .summary = "`NERVA_CLUSTER_KEY` is missing, short, the public development key off loopback, or wrongly paired with `_NEXT`", .exit = exit_operator },
@@ -425,6 +425,7 @@ pub fn fail_file(path: []const u8, err: anyerror) noreturn {
         error.ReadOnlyFileSystem,
         error.FileTooBig,
         error.BadPathName,
+        error.NotRegularFile,
         => fail(
             "NRV-E0810",
             "{s}: cannot use {s}: {s}",
@@ -445,6 +446,7 @@ fn file_reason(err: anyerror) []const u8 {
         error.NameTooLong => "the path is too long",
         error.ReadOnlyFileSystem => "the file system is read-only",
         error.FileTooBig => "the file is too large",
+        error.NotRegularFile => "it is not a regular file (a pipe or a device): the export is read twice",
         else => "the path is not valid",
     };
 }

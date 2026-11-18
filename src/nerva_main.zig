@@ -542,7 +542,8 @@ fn command_backup(gpa: std.mem.Allocator, args: *const cli.Command.Backup) void 
         std.fs.cwd().deleteFile(args.output) catch {};
         backup_unreadable(args.output, err);
     };
-    const size = (std.fs.cwd().statFile(args.output) catch |err| {
+    // From the descriptor the SHA-256 was read through, not the path again.
+    const size = (output.stat() catch |err| {
         std.fs.cwd().deleteFile(args.output) catch {};
         diagnostic.fail_file(args.output, err);
     }).size;
@@ -670,6 +671,7 @@ fn import_failed(
         error.AccessDenied,
         error.PermissionDenied,
         error.IsDir,
+        error.NotRegularFile,
         => diagnostic.fail_file(input, err),
         else => diagnostic.fail_file(output, err),
     }

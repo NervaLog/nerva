@@ -487,6 +487,9 @@ def main():
         check("import missing input", imp + ["--input=" + os.path.join(tmp, "none"),
                                              os.path.join(tmp, "d.nerva")],
               "NRV-E0810", 1, "no such file")
+        check("import not a regular file", imp + ["--input=/dev/null", os.path.join(tmp, "d.nerva")],
+              "NRV-E0810", 1, "not a regular file")
+        assert not os.path.exists(os.path.join(tmp, "d.nerva"))
         check("import junk", imp + ["--input=" + junk, os.path.join(tmp, "d.nerva")],
               "NRV-E0804", 1, "junk")
         assert not os.path.exists(os.path.join(tmp, "d.nerva"))
