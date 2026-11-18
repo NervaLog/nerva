@@ -129,6 +129,8 @@ pub const StatsD = struct {
             /// emit is dropped, counted here, and never warned about.
             send_buffer_full: bool = false,
             send_dropped_count: u64 = 0,
+            /// Packets the kernel took (`send_outcome` is `.sent`); `emit` returns the growth.
+            send_sent_count: u64 = 0,
         },
         log,
     },
@@ -321,10 +323,18 @@ pub const StatsD = struct {
             }
         }
 
+        const sent_before = if (self.implementation == .udp)
+            self.implementation.udp.send_sent_count
+        else
+            0;
         const dropped_before = if (self.implementation == .udp)
             self.implementation.udp.send_dropped_count
         else
             0;
+        if (self.implementation == .udp) {
+            // Zeroed above: after the loop it holds exactly this emit's failures.
+            assert(self.implementation.udp.send_callback_error_count == 0);
+        }
         var send_offset: u32 = 0;
         for (send_sizes.const_slice()) |send_size| {
             if (self.send_in_flight_count >= self.send_completions.len) {
@@ -338,13 +348,17 @@ pub const StatsD = struct {
             send_offset += send_size;
         }
 
-        // Nerva (P427): packets dropped for a full socket buffer are not packets sent.
-        const dropped: u64 = if (self.implementation == .udp)
-            self.implementation.udp.send_dropped_count - dropped_before
-        else
-            0;
-        assert(dropped <= send_sizes.count());
-        return @intCast(send_sizes.count() - dropped);
+        // Nerva (P427): only packets the kernel took are packets sent: not those dropped for a
+        // full socket buffer, nor those it refused (no route, not allowed).
+        if (self.implementation == .udp) {
+            const sent = self.implementation.udp.send_sent_count - sent_before;
+            const dropped = self.implementation.udp.send_dropped_count - dropped_before;
+            const failed = self.implementation.udp.send_callback_error_count;
+            // Every packet ends in exactly one place: sent, dropped for a full buffer, or failed.
+            assert(sent + dropped + failed == send_sizes.count());
+            return @intCast(sent);
+        }
+        return @intCast(send_sizes.count());
     }
 
     const SendOutcome = enum { sent, buffer_full, failed };
@@ -393,7 +407,10 @@ pub const StatsD = struct {
                 // Libc returns isize, a raw syscall usize: classify on a usize either way.
                 const sent: usize = if (errno == .SUCCESS) @intCast(result) else 0;
                 switch (send_outcome(errno, sent, send_buffer.len)) {
-                    .sent => StatsD.send_callback(self, send_completion, send_buffer.len),
+                    .sent => {
+                        udp.send_sent_count += 1;
+                        StatsD.send_callback(self, send_completion, send_buffer.len);
+                    },
                     .buffer_full => {
                         // Upstream's blocking send waited for space; this drops the rest of the
                         // emit quietly instead of logging a route failure that does not exist.

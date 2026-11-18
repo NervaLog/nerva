@@ -14,6 +14,13 @@ const IO = @import("../io.zig").IO;
 const Tracer = @import("../trace.zig");
 const fixtures = @import("../testing/fixtures.zig");
 
+/// The last `metrics_statsd_packets` gauge `emit_metrics` published.
+fn packets_published(tracer: *const Tracer) i65 {
+    const event: Tracer.EventMetric = .metrics_statsd_packets;
+    const metric = tracer.events_metric[event.slot()];
+    return metric.?.value;
+}
+
 fn tracer_udp(io: *IO, address: std.net.Address, time: stdx.Time) !Tracer {
     var tracer = try Tracer.init(std.testing.allocator, time, .unknown, .{
         .statsd_options = .{ .udp = .{
@@ -42,7 +49,28 @@ test "statsd: an address that cannot be sent to starts, warns once and drops" {
         // Warned at the second emit (the first one's failures are reported by the next), once.
         try std.testing.expectEqual(round >= 1, udp.send_failure_warned);
         try std.testing.expect(udp.send_failure_errno != .SUCCESS);
+        // Every send failed: no packet was sent, and the gauge says so.
+        try std.testing.expectEqual(@as(u64, 0), udp.send_sent_count);
+        try std.testing.expectEqual(@as(i65, 0), packets_published(&tracer));
     }
+}
+
+test "statsd: an emit of several packets that all fail publishes zero" {
+    var io = try IO.init(8, 0);
+    defer io.deinit();
+    var time_sim = fixtures.init_time(.{});
+    const broadcast = std.net.Address.initIp4(.{ 255, 255, 255, 255 }, 8125);
+    var tracer = try tracer_udp(&io, broadcast, time_sim.interface());
+    defer tracer.deinit(std.testing.allocator);
+
+    // Every metric that takes no payload: one emit builds more than one packet.
+    inline for (std.meta.fields(Tracer.EventMetric)) |field| {
+        if (field.type == void) tracer.gauge(@unionInit(Tracer.EventMetric, field.name, {}), 1);
+    }
+    tracer.emit_metrics();
+    // Every packet failed, and there was more than one of them.
+    try std.testing.expect(tracer.statsd.implementation.udp.send_callback_error_count > 1);
+    try std.testing.expectEqual(@as(i65, 0), packets_published(&tracer));
 }
 
 test "statsd: a reachable collector still receives the packets" {
@@ -69,6 +97,8 @@ test "statsd: a reachable collector still receives the packets" {
     try std.testing.expect(!tracer.statsd.implementation.udp.send_failure_warned);
     const udp = &tracer.statsd.implementation.udp;
     try std.testing.expectEqual(@as(u64, 0), udp.send_callback_error_count);
+    try std.testing.expectEqual(@as(u64, 1), udp.send_sent_count);
+    try std.testing.expectEqual(@as(i65, 1), packets_published(&tracer));
 
     var packet: [1500]u8 = undefined;
     // Loopback delivery can be deferred to ksoftirqd on a loaded host: wait, bounded.
@@ -109,12 +139,16 @@ test "statsd: a clean emit re-arms the warning" {
     }
     try std.testing.expect(udp.send_failure_warned);
 
+    try std.testing.expectEqual(@as(i65, 0), packets_published(&tracer));
+
     // The route comes back: the emit that reports the last failure keeps the warning spent, the
     // next one (no failures) re-arms it.
     udp.address = good;
     tracer.gauge(.replica_commit_min, 3);
     tracer.emit_metrics();
     try std.testing.expect(udp.send_failure_warned);
+    // The window with the failures reports no packets; this one's packet was sent.
+    try std.testing.expectEqual(@as(i65, 1), packets_published(&tracer));
     tracer.gauge(.replica_commit_min, 4);
     tracer.emit_metrics();
     try std.testing.expect(!udp.send_failure_warned);
