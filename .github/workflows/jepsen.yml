@@ -9,6 +9,7 @@ on:
   push:
     branches:
       - 'jepsen/**'
+    paths-ignore: ['**.md']
   workflow_dispatch:
     inputs:
       args:
