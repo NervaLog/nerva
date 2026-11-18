@@ -106,7 +106,18 @@ class ReleaseCheck(unittest.TestCase):
             path = Path(d) / "nerva"
             path.write_text('#!/bin/sh\necho "version 0.7.1"\n[ "${2:-}" = --verbose ] && { echo "commit_keys deduplicate"; exit 3; }\nexit 0\n')
             path.chmod(0o755)
-            self.refused(run("binary", str(path), "0.7.1"), "NRV-E1113", "not the commit-key deduplication build")
+            result = run("binary", str(path), "0.7.1")
+            self.refused(result, "NRV-E1113", "'nerva version --verbose' exited non-zero")
+
+    def test_binary_whose_plain_version_command_fails(self):
+        # A plain `nerva version` that exits 4 after printing a good line: refused, naming the command.
+        # origin/main accepted this (the failed pipeline read as "no +keys-off"), a second fail-open route.
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "nerva"
+            path.write_text('#!/bin/sh\necho "version 0.7.1"\n[ "${2:-}" = --verbose ] && echo "commit_keys deduplicate"\n[ -z "${2:-}" ] && exit 4\nexit 0\n')
+            path.chmod(0o755)
+            result = run("binary", str(path), "0.7.1")
+            self.refused(result, "NRV-E1113", "'nerva version' exited non-zero")
 
     def test_binary_that_does_not_run(self):
         result = run("binary", "/nonexistent/nerva", "0.7.1")
