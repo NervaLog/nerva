@@ -55,6 +55,24 @@ test "statsd: an address that cannot be sent to starts, warns once and drops" {
     }
 }
 
+test "statsd: an emit of several packets that all fail publishes zero" {
+    var io = try IO.init(8, 0);
+    defer io.deinit();
+    var time_sim = fixtures.init_time(.{});
+    const broadcast = std.net.Address.initIp4(.{ 255, 255, 255, 255 }, 8125);
+    var tracer = try tracer_udp(&io, broadcast, time_sim.interface());
+    defer tracer.deinit(std.testing.allocator);
+
+    // Every metric that takes no payload: one emit builds more than one packet.
+    inline for (std.meta.fields(Tracer.EventMetric)) |field| {
+        if (field.type == void) tracer.gauge(@unionInit(Tracer.EventMetric, field.name, {}), 1);
+    }
+    tracer.emit_metrics();
+    // Every packet failed, and there was more than one of them.
+    try std.testing.expect(tracer.statsd.implementation.udp.send_callback_error_count > 1);
+    try std.testing.expectEqual(@as(i65, 0), packets_published(&tracer));
+}
+
 test "statsd: a reachable collector still receives the packets" {
     const collector = try std.posix.socket(
         std.posix.AF.INET,
@@ -120,6 +138,8 @@ test "statsd: a clean emit re-arms the warning" {
         tracer.emit_metrics();
     }
     try std.testing.expect(udp.send_failure_warned);
+
+    try std.testing.expectEqual(@as(i65, 0), packets_published(&tracer));
 
     // The route comes back: the emit that reports the last failure keeps the warning spent, the
     // next one (no failures) re-arms it.

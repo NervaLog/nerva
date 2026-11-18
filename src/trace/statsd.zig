@@ -327,6 +327,14 @@ pub const StatsD = struct {
             self.implementation.udp.send_sent_count
         else
             0;
+        const dropped_before = if (self.implementation == .udp)
+            self.implementation.udp.send_dropped_count
+        else
+            0;
+        if (self.implementation == .udp) {
+            // Zeroed above: after the loop it holds exactly this emit's failures.
+            assert(self.implementation.udp.send_callback_error_count == 0);
+        }
         var send_offset: u32 = 0;
         for (send_sizes.const_slice()) |send_size| {
             if (self.send_in_flight_count >= self.send_completions.len) {
@@ -344,7 +352,10 @@ pub const StatsD = struct {
         // full socket buffer, nor those it refused (no route, not allowed).
         if (self.implementation == .udp) {
             const sent = self.implementation.udp.send_sent_count - sent_before;
-            assert(sent <= send_sizes.count());
+            const dropped = self.implementation.udp.send_dropped_count - dropped_before;
+            const failed = self.implementation.udp.send_callback_error_count;
+            // Every packet ends in exactly one place: sent, dropped for a full buffer, or failed.
+            assert(sent + dropped + failed == send_sizes.count());
             return @intCast(sent);
         }
         return @intCast(send_sizes.count());
