@@ -583,6 +583,18 @@ pub fn build(b: *std.Build) !void {
         .version = options.version,
         .strip = true,
     });
+    // The past release as v0.7.1 was: `start` runs as one release and `version` does not state
+    // the capability (P490). No command-line option builds it, so that no release can; the
+    // packer must refuse it, and `bundle.py` proves it does.
+    const nerva_past_single = nerva_executable(b, .{
+        .stdx_module = stdx_module,
+        .vsr_options = vsr_options,
+        .target = target,
+        .mode = mode,
+        .version = options.version,
+        .strip = true,
+        .multiversion_start = false,
+    });
     const pack_next = b.addRunArtifact(nerva_pack);
     pack_next.addArg("--input");
     pack_next.addFileArg(nerva_next_unpacked.getEmittedBin());
@@ -591,6 +603,25 @@ pub fn build(b: *std.Build) !void {
     pack_next.addArg("--output");
     const nerva_next = pack_next.addOutputFileArg("nerva_next");
     if (mode == .Debug) pack_next.addArg("--debug");
+    // `bundle.py`'s replacement for a running `nerva_next`: the same next release, bundling the
+    // other release instead, so a replica that polls its binary sees a release it did not offer
+    // (#477).
+    const nerva_other_stripped = nerva_executable(b, .{
+        .stdx_module = stdx_module,
+        .vsr_options = vsr_options_other,
+        .target = target,
+        .mode = mode,
+        .version = options.version,
+        .strip = true,
+    });
+    const pack_next_other = b.addRunArtifact(nerva_pack);
+    pack_next_other.addArg("--input");
+    pack_next_other.addFileArg(nerva_next_unpacked.getEmittedBin());
+    pack_next_other.addArg("--past");
+    pack_next_other.addFileArg(nerva_other_stripped.getEmittedBin());
+    pack_next_other.addArg("--output");
+    const nerva_next_other = pack_next_other.addOutputFileArg("nerva_next_other");
+    if (mode == .Debug) pack_next_other.addArg("--debug");
 
     // Then an upgrade: an export from `nerva`, imported by the other release (N80), without
     // records (export version 1) and with them (version 2, P123b); then replicas imported from
@@ -612,9 +643,14 @@ pub fn build(b: *std.Build) !void {
         });
         run_release_test.addFileArg(nerva.getEmittedBin());
         if (std.mem.eql(u8, script, "bundle.py")) {
-            // The packed next release, then the packer, to try its refusals.
+            // The packed next release, then the packer, to try its refusals, then the next
+            // release bundling another past one, to replace a running binary with.
             run_release_test.addFileArg(nerva_next);
             run_release_test.addFileArg(nerva_pack.getEmittedBin());
+            run_release_test.addFileArg(nerva_next_other);
+            // The past release without the capability, and the past release `nerva` was, to
+            // format the data file the switch starts from.
+            run_release_test.addFileArg(nerva_past_single.getEmittedBin());
         } else {
             const nerva_second = if (std.mem.eql(u8, script, "origins.py"))
                 nerva_client_min
@@ -725,6 +761,8 @@ fn nerva_executable(b: *std.Build, options: struct {
     mode: std.builtin.OptimizeMode,
     version: []const u8,
     commit_keys_deduplicate: bool = true,
+    /// False: `start` runs as one release and `version` does not state the capability (P490).
+    multiversion_start: bool = true,
     /// No debug info: a ReleaseSafe pair is over `multiversion_binary_platform_size_max` with it
     /// (P417), so the test pair `nerva_next` bundles is stripped.
     strip: bool = false,
@@ -746,6 +784,7 @@ fn nerva_executable(b: *std.Build, options: struct {
     // Only this binary's `start` can turn commit-key deduplication off (R1).
     const nerva_options = b.addOptions();
     nerva_options.addOption(bool, "commit_keys_deduplicate", options.commit_keys_deduplicate);
+    nerva_options.addOption(bool, "multiversion_start", options.multiversion_start);
     nerva_options.addOption([]const u8, "version", options.version);
     nerva.root_module.addOptions("nerva_options", nerva_options);
     // Keep stack traces in release builds.

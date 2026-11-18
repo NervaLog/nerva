@@ -429,7 +429,11 @@ def main():
         assert sha(data) == digest
         os.remove(data_off)
         verbose_off = run(nerva_off, ["version", "--verbose"])
-        assert verbose_off.stdout.splitlines()[-1] == "commit_keys off", verbose_off.stdout
+        # `nerva_off` keeps `multiversion_start`, so on Linux the capability line (P490) follows.
+        off_lines = verbose_off.stdout.splitlines()
+        capability = ["multiversion offers_from_binary"] if sys.platform.startswith("linux") else []
+        assert off_lines[-1 - len(capability):] == ["commit_keys off"] + capability, \
+            verbose_off.stdout
         # `version`'s text (R6): the first line is the one the release workflow reads; then what
         # an upgrade compares. No binary bundles a past release yet (slice 3).
         for binary_run in (version, version_off):
@@ -448,9 +452,8 @@ def main():
         lines = verbose.stdout.splitlines()
         assert lines[:6] == version.stdout.splitlines(), verbose.stdout
         assert lines[6:8] == ["format_epoch 1", "superblock_version 2"], verbose.stdout
-        assert re.fullmatch(r"commit ([0-9a-f]{40}|none)", lines[8]) and len(lines) == 10, \
-            verbose.stdout
-        assert lines[9] == "commit_keys deduplicate", verbose.stdout
+        assert re.fullmatch(r"commit ([0-9a-f]{40}|none)", lines[8]), verbose.stdout
+        assert lines[9:] == ["commit_keys deduplicate"] + capability, verbose.stdout
         before = sha(data)
         check("start keys off without development",
               ["start", "--addresses=127.0.0.1:1,127.0.0.1:2,127.0.0.1:3", data],
@@ -534,6 +537,34 @@ def main():
             check("import future version",
                   imp + ["--input=" + future, os.path.join(tmp, "g.nerva")],
                   "NRV-E0805", 1, "version")
+            # Two imports of one path at once (P489): exactly one succeeds, and the other is
+            # refused cleanly (E0806 or E0814 when it met the winner's `.importing`, E0004 or
+            # E0814 when the winner had finished) without removing the winner's file. Both pass
+            # the existence checks, then pass 1 reads the whole export, so they usually meet at
+            # the exclusive create. Each round's data file is about 1.1 GiB: it is removed.
+            race_refusals = set()
+            environment = {k: v for k, v in os.environ.items() if not k.startswith("NERVA_")}
+            for round_number in range(2):
+                target = os.path.join(tmp, f"race{round_number}.nerva")
+                racers = [subprocess.Popen([nerva] + imp + ["--input=" + out, target],
+                                           stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                           text=True, env=environment) for _ in range(2)]
+                errors = [racer.communicate(timeout=120)[1] for racer in racers]
+                codes = [racer.returncode for racer in racers]
+                assert sorted(codes) == [0, 1], (codes, errors)
+                refusal = errors[codes.index(1)]
+                assert re.search(r"error\[NRV-E(0806|0814|0004)\]", refusal), refusal
+                race_refusals.add(re.search(r"NRV-E\d{4}", refusal).group(0))
+                # A whole data file: the size of one imported by itself.
+                if round_number == 0:
+                    whole = os.path.getsize(target)
+                assert os.path.getsize(target) == whole, "the winner's file is not whole"
+                assert not os.path.exists(target + ".importing"), "a staging file was left"
+                check("import concurrent: the winner's file is whole",
+                      imp + ["--input=" + out, target], "NRV-E0004", 1, "exists")
+                os.remove(target)
+            assert race_refusals, race_refusals
+            seen.extend(sorted(race_refusals & {"NRV-E0814"}))
             # A keys-off export (P426): flag bit 0 at byte 12. The end record (the last 44 bytes:
             # size, kind, the SHA-256 of every byte before it, the CRC-32 of those) is rebuilt, so
             # only the flag is refused. A release build names it (E0812); an unknown bit is corrupt.

@@ -54,11 +54,12 @@ target_commit() {
       "if the target is gone, delete the draft (gh release delete $tag) and run release.yml on the VERSION commit; otherwise run again"
   fi
   if ! version=$(gh api -H "Accept: application/vnd.github.raw" \
-    "repos/$GITHUB_REPOSITORY/contents/VERSION?ref=$commit" 2> /dev/null | head -n1 | tr -d '[:space:]'); then
+    "repos/$GITHUB_REPOSITORY/contents/VERSION?ref=$commit" 2> /dev/null); then
     refuse NRV-E1122 "cannot read VERSION at ${commit:0:7}, the commit the draft $tag targets" \
       "the commit has no VERSION file, or GitHub did not answer" \
       "if the commit has no VERSION, delete the draft (gh release delete $tag) and run release.yml on the VERSION commit; otherwise run again"
   fi
+  version=$(tr -d '[:space:]' <<< "${version%%$'\n'*}") # the first line, captured, not piped to head (#483)
   if [[ "$version" != "${tag#v}" ]]; then
     refuse NRV-E1120 "the draft $tag targets ${commit:0:7}, whose VERSION is '${version:-none}', not ${tag#v}" \
       "the draft was made from another commit than the VERSION commit, or the tag was mistyped" \
@@ -130,8 +131,18 @@ case "${1:-}" in
         "build from the commit whose VERSION is $version (build.zig reads VERSION)"
     fi
     # The keys-off build says so on its first line, whatever else it prints (#271).
-    if "$nerva" version 2> /dev/null | grep -q '+keys-off' ||
-      ! "$nerva" version --verbose 2> /dev/null | grep -qx 'commit_keys deduplicate'; then
+    # Each output is captured once and matched as text: `cmd | grep -q` under pipefail turns a
+    # match into a failure when grep exits early and the producer dies of SIGPIPE (#483).
+    for args in "" "--verbose"; do
+      # shellcheck disable=SC2086
+      if ! out=$("$nerva" version $args 2> /dev/null); then
+        refuse NRV-E1113 "the built nerva is not the commit-key deduplication build: 'nerva version${args:+ $args}' exited non-zero" \
+          "the check reads the output of 'nerva version' and 'nerva version --verbose' and refuses when either command fails, since it cannot then tell the build" \
+          "run '$nerva version${args:+ $args}' and fix what it reports; build the release without -Dtest-commit-keys=off"
+      fi
+      if [[ -z "$args" ]]; then plain=$out; else verbose=$out; fi
+    done
+    if grep -q '+keys-off' <<< "$plain" || ! grep -qx 'commit_keys deduplicate' <<< "$verbose"; then
       refuse NRV-E1113 "the built nerva is not the commit-key deduplication build" \
         "'nerva version --verbose' has no 'commit_keys deduplicate' line, or 'nerva version' carries '+keys-off': this is the test build -Dtest-commit-keys=off (#271), or an older nerva" \
         "build the release without -Dtest-commit-keys=off"
@@ -257,10 +268,11 @@ case "${1:-}" in
         "dispatch again with the draft's tag, as the releases page names it"
     fi
     if ! found=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases" \
-      --jq ".[] | select(.tag_name == \"$tag\") | [.draft, .target_commitish] | @tsv" 2> /dev/null | head -n1); then
+      --jq ".[] | select(.tag_name == \"$tag\") | [.draft, .target_commitish] | @tsv" 2> /dev/null); then
       echo "release_check.sh: cannot list the releases of $GITHUB_REPOSITORY (GitHub did not answer); run again" >&2
       exit 2
     fi
+    found=${found%%$'\n'*} # first line only: captured, not piped to head, which SIGPIPEs under pipefail (#483)
     if [[ -z "$found" ]]; then
       refuse NRV-E1119 "there is no draft release named $tag to sign into" \
         "release.yml did not make it, or it was deleted" \
@@ -284,10 +296,11 @@ case "${1:-}" in
     fi
     if ! found=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases" \
       --jq ".[] | select(.tag_name == \"$tag\") | [.draft, .target_commitish, .prerelease, (.assets | map(.name) | join(\",\"))] | @tsv" \
-      2> /dev/null | head -n1); then
+      2> /dev/null); then
       echo "release_check.sh: cannot list the releases of $GITHUB_REPOSITORY (GitHub did not answer); run again" >&2
       exit 2
     fi
+    found=${found%%$'\n'*} # first line only: captured, not piped to head, which SIGPIPEs under pipefail (#483)
     if [[ -z "$found" ]]; then
       refuse NRV-E1131 "there is no release named $tag to publish" \
         "the draft was deleted, or release.yml did not make it" \
